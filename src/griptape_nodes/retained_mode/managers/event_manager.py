@@ -20,11 +20,13 @@ from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.retained_mode.engine import EngineScoped, engine_scope
 from griptape_nodes.retained_mode.events.base_events import (
+    AppEvent,
     AppPayload,
     BaseEvent,
     EventRequest,
     EventResultFailure,
     EventResultSuccess,
+    ExecutionEvent,
     ExecutionGriptapeNodeEvent,
     ExecutionPayload,
     ProgressEvent,
@@ -331,6 +333,42 @@ class EventManager(EngineScoped):
             return
 
         event.stamp_identity(engine_id=self.engine.get_engine_id(), session_id=self.engine.get_session_id())
+
+    def emit_execution(self, payload: ExecutionPayload) -> None:
+        """Emit an execution payload to the queue, wrapped and stamped.
+
+        Prefer this over building the event yourself. It owns the wrapping the transport
+        expects and the identity stamp, so an execution event cannot reach the wire
+        unattributed or wrapped wrong.
+
+        Args:
+            payload: The execution payload to emit.
+        """
+        self.put_event(ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload)))
+
+    async def aemit_execution(self, payload: ExecutionPayload) -> None:
+        """Emit an execution payload to the queue from async context, wrapped and stamped.
+
+        Args:
+            payload: The execution payload to emit.
+        """
+        await self.aput_event(ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload)))
+
+    def emit_app(self, payload: AppPayload) -> None:
+        """Emit an app payload to the queue, wrapped and stamped.
+
+        Args:
+            payload: The app payload to emit.
+        """
+        self.put_event(AppEvent(payload=payload))
+
+    async def aemit_app(self, payload: AppPayload) -> None:
+        """Emit an app payload to the queue from async context, wrapped and stamped.
+
+        Args:
+            payload: The app payload to emit.
+        """
+        await self.aput_event(AppEvent(payload=payload))
 
     def put_event(self, event: Any) -> None:
         """Put event into async queue from sync context (non-blocking).

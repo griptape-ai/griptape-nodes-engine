@@ -421,7 +421,6 @@ class BaseNodeElement:
 
         # Import here to avoid circular dependencies
 
-        from griptape_nodes.retained_mode.events.base_events import ExecutionEvent, ExecutionGriptapeNodeEvent
         from griptape_nodes.retained_mode.events.parameter_events import AlterElementEvent
 
         # Create base event data using the existing to_event method
@@ -445,11 +444,7 @@ class BaseNodeElement:
 
         event_data.update(self._changes)
         # Publish the event
-        event = ExecutionGriptapeNodeEvent(
-            wrapped_event=ExecutionEvent(payload=AlterElementEvent(element_details=event_data))
-        )
-
-        GriptapeNodes.EventManager().put_event(event)
+        GriptapeNodes.EventManager().emit_execution(AlterElementEvent(element_details=event_data))
         self._changes.clear()
 
     def to_dict(self) -> dict[str, Any]:

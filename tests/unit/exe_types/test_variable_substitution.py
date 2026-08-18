@@ -90,9 +90,9 @@ def _list_variables_result(variables: dict) -> ListVariablesResultSuccess:
 
 
 def _display_value_from_event(captured: list) -> object:
-    """Extract the display value from the first captured put_event call."""
+    """Extract the display value from the first captured emit_execution call."""
     assert len(captured) == 1
-    return captured[0].wrapped_event.payload.element_details["value"]
+    return captured[0].element_details["value"]
 
 
 def _run_tracked_set(
@@ -121,11 +121,11 @@ def _run_tracked_set(
         )
         mock_gn.FlowManager.return_value.get_connections.return_value = MagicMock(incoming_index={})
         mock_gn.WorkflowManager.return_value.is_variable_substitution_enabled.return_value = True
-        mock_gn.EventManager.return_value.put_event.side_effect = captured.append
+        mock_gn.EventManager.return_value.emit_execution.side_effect = captured.append
         ctx: Any = patch(_GN_PATCH, mock_gn)
     else:
         minimal_mock = MagicMock()
-        minimal_mock.EventManager.return_value.put_event.side_effect = captured.append
+        minimal_mock.EventManager.return_value.emit_execution.side_effect = captured.append
         ctx = patch(_GN_PATCH, minimal_mock)
 
     if in_aprocess:
@@ -325,7 +325,7 @@ class TestTrackedOutputValuesDisplayDuringSubstitution:
 
     The display suppression logic lives inside _emit_parameter_change_event, so
     these tests let that method run its real logic and instead mock only the
-    final put_event call. The display value is read back from the captured event's
+    final emit_execution call. The display value is read back from the captured event's
     element_details dict.
     """
 

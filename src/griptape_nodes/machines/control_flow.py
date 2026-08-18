@@ -13,7 +13,6 @@ from griptape_nodes.machines.dag_builder import DagBuilder, DagNodeCategories
 from griptape_nodes.machines.fsm import FSM, State
 from griptape_nodes.machines.parallel_resolution import ParallelResolutionMachine
 from griptape_nodes.retained_mode.engine import EngineScoped, current_engine
-from griptape_nodes.retained_mode.events.base_events import ExecutionEvent, ExecutionGriptapeNodeEvent
 from griptape_nodes.retained_mode.events.execution_events import (
     ControlFlowResolvedEvent,
     CurrentControlNodeEvent,
@@ -109,11 +108,7 @@ class ResolveNodeState(State):
                     )
                 )
             # Now broadcast that we have a current control node.
-            context.engine.event_manager.put_event(
-                ExecutionGriptapeNodeEvent(
-                    wrapped_event=ExecutionEvent(payload=CurrentControlNodeEvent(node_name=current_node.name))
-                )
-            )
+            context.engine.event_manager.emit_execution(CurrentControlNodeEvent(node_name=current_node.name))
             logger.info("Resolving %s", current_node.name)
         if not context.paused:
             # Call the update. Otherwise wait
@@ -151,15 +146,11 @@ class CompleteState(State):
                 workflow_manager=context.engine.workflow_manager,
                 use_pickling=context.pickle_control_flow_result,
             )
-            context.engine.event_manager.put_event(
-                ExecutionGriptapeNodeEvent(
-                    wrapped_event=ExecutionEvent(
-                        payload=ControlFlowResolvedEvent(
-                            end_node_name=current_node.name,
-                            parameter_output_values=parameter_output_values,
-                            unique_parameter_uuid_to_values=unique_uuid_to_values or None,
-                        )
-                    )
+            context.engine.event_manager.emit_execution(
+                ControlFlowResolvedEvent(
+                    end_node_name=current_node.name,
+                    parameter_output_values=parameter_output_values,
+                    unique_parameter_uuid_to_values=unique_uuid_to_values or None,
                 )
             )
         context.end_node = None
@@ -220,11 +211,7 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
         if start_node != end_node:
             # This blocks all nodes in the entire flow from running. If we're just resolving one node, we don't want to block that.
             involved_nodes = list(flow.nodes.keys())
-            self._context.engine.event_manager.put_event(
-                ExecutionGriptapeNodeEvent(
-                    wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=involved_nodes))
-                )
-            )
+            self._context.engine.event_manager.emit_execution(InvolvedNodesEvent(involved_nodes=involved_nodes))
         await self.start(ResolveNodeState)  # Begins the flow
 
     async def update(self) -> None:

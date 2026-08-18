@@ -41,8 +41,6 @@ from griptape_nodes.node_library.library_registry import LibraryNameAndVersion, 
 from griptape_nodes.node_library.workflow_registry import LibraryNameAndNodeType
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.base_events import (
-    ExecutionEvent,
-    ExecutionGriptapeNodeEvent,
     ResultDetails,
 )
 from griptape_nodes.retained_mode.events.connection_events import (
@@ -4119,9 +4117,7 @@ class FlowManager(EngineScoped):
             if self.check_for_existing_running_flow():
                 await self.cancel_flow_run()
             raise
-        self.engine.event_manager.put_event(
-            ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=[])))
-        )
+        self.engine.event_manager.emit_execution(InvolvedNodesEvent(involved_nodes=[]))
 
     def on_extract_flow_commands_from_image_metadata(  # noqa: PLR0911, C901
         self, request: ExtractFlowCommandsFromImageMetadataRequest
@@ -4295,12 +4291,8 @@ class FlowManager(EngineScoped):
         self._global_dag_builder.clear()
         logger.debug("Cancelling flow run")
 
-        self.engine.event_manager.put_event(
-            ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=[])))
-        )
-        self.engine.event_manager.put_event(
-            ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=ControlFlowCancelledEvent()))
-        )
+        self.engine.event_manager.emit_execution(InvolvedNodesEvent(involved_nodes=[]))
+        self.engine.event_manager.emit_execution(ControlFlowCancelledEvent())
 
     def reset_global_execution_state(self) -> None:
         """Reset all global execution state - useful when clearing all workflows."""
@@ -4385,11 +4377,7 @@ class FlowManager(EngineScoped):
             self._global_dag_builder.add_node_with_dependencies(node, node.name)
             # Emit involved nodes update after adding node to DAG
             involved_nodes = list(self._global_dag_builder.node_to_reference.keys())
-            self.engine.event_manager.put_event(
-                ExecutionGriptapeNodeEvent(
-                    wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=involved_nodes))
-                )
-            )
+            self.engine.event_manager.emit_execution(InvolvedNodesEvent(involved_nodes=involved_nodes))
         else:
             # Set that we are only working on one node right now!
             self._global_single_node_resolution = True
@@ -4413,11 +4401,7 @@ class FlowManager(EngineScoped):
                 involved_nodes = list(self._global_dag_builder.node_to_reference.keys())
             # Send a InvolvedNodesRequest
 
-            self.engine.event_manager.put_event(
-                ExecutionGriptapeNodeEvent(
-                    wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=involved_nodes))
-                )
-            )
+            self.engine.event_manager.emit_execution(InvolvedNodesEvent(involved_nodes=involved_nodes))
             try:
                 await self._global_control_flow_machine.start_flow(
                     start_node=node, end_node=node, debug_mode=debug_mode
@@ -4433,20 +4417,14 @@ class FlowManager(EngineScoped):
                 logger.error("Node '%s' failed: %s", node.name, error_message)
                 self._global_single_node_resolution = False
                 self._global_control_flow_machine.context.current_nodes = []
-                self.engine.event_manager.put_event(
-                    ExecutionGriptapeNodeEvent(
-                        wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=[]))
-                    )
-                )
+                self.engine.event_manager.emit_execution(InvolvedNodesEvent(involved_nodes=[]))
                 # Re-raise with the original error message
                 raise RuntimeError(error_message or "Node resolution failed")
 
             if resolution_machine.is_complete():
                 self._global_single_node_resolution = False
                 self._global_control_flow_machine.context.current_nodes = []
-            self.engine.event_manager.put_event(
-                ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=[])))
-            )
+            self.engine.event_manager.emit_execution(InvolvedNodesEvent(involved_nodes=[]))
 
     async def single_execution_step(self, flow: ControlFlow, change_debug_mode: bool) -> None:  # noqa: FBT001
         # do a granular step

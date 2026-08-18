@@ -34,10 +34,6 @@ from griptape_nodes.retained_mode.events.app_events import (
     GetEngineVersionRequest,
     GetEngineVersionResultSuccess,
 )
-from griptape_nodes.retained_mode.events.base_events import (
-    ExecutionEvent,
-    ExecutionGriptapeNodeEvent,
-)
 from griptape_nodes.retained_mode.events.flow_events import GetTopLevelFlowRequest, GetTopLevelFlowResultSuccess
 from griptape_nodes.retained_mode.events.os_events import (
     CopyFileRequest,
@@ -110,10 +106,9 @@ class WorkflowPackager:
     def emit_progress(self, additional: float, message: str) -> None:
         """Emit a publish progress event."""
         self._progress = min(self._progress + additional, 100.0)
-        event = ExecutionGriptapeNodeEvent(
-            wrapped_event=ExecutionEvent(payload=PublishWorkflowProgressEvent(progress=self._progress, message=message))
+        GriptapeNodes.EventManager().emit_execution(
+            PublishWorkflowProgressEvent(progress=self._progress, message=message)
         )
-        GriptapeNodes.EventManager().put_event(event)
 
     # -- File copy utilities --
 

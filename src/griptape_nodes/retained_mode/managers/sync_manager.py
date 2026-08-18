@@ -16,7 +16,7 @@ from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import Griptap
 from griptape_nodes.files.path_utils import canonicalize_for_identity
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
-from griptape_nodes.retained_mode.events.base_events import AppEvent, ResultDetails
+from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.sync_events import (
     StartSyncAllCloudWorkflowsRequest,
     StartSyncAllCloudWorkflowsResultFailure,
@@ -490,7 +490,7 @@ class SyncManager(EngineScoped):
             total_workflows=total_workflows,
         )
 
-        self.engine.event_manager.put_event(AppEvent(payload=sync_complete_event))
+        self.engine.event_manager.emit_app(sync_complete_event)
 
         # Register workflows from the synced directory
         if synced_workflows:
