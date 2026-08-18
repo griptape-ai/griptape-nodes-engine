@@ -232,17 +232,25 @@ list on the next execute. The
 [`parameter-mutation-during-aprocess`](strict_mode.md) rule fires
 on direct in-execute mutations and tells you which one to use.
 
-**Hydration-time mutations skip this rule but do not propagate
-either.** `before_value_set` / `after_value_set` run during input
-hydration on the same transient worker-side node, so a
-parameter-list mutation made there is discarded when the node is —
-and under isolation these hooks never run when a value changes in
-the editor, because the orchestrator's stub copy of your class does
-not carry the overrides. The standard dynamic-pipeline pattern
-(hooks adjust the parameter list as inputs change) therefore does
-not work for a worker-hosted library. Overriding a value hook fires
-the [`value-hooks-execute-only-on-worker`](strict_mode.md) warning
-at library load.
+**`before_value_set` / `after_value_set` do not fire on editor
+changes for isolated libraries.** These hooks run inside the worker
+subprocess, on the temporary copy of your node built for each
+execute. The orchestrator holds only a stub copy of your node class
+— parameters, no code — so it never calls your overrides when a
+user edits a value in the editor. Transforming an incoming value
+still works: the hooks run as inputs are applied, just before
+`process`. But a parameter-list change made inside them is
+discarded with the temporary node. It skips the
+[`parameter-mutation-during-aprocess`](strict_mode.md) rule, and it
+does not propagate either.
+
+The practical consequence: hooks that adjust the parameter list in
+response to user input (for example, showing or hiding fields when
+a dropdown changes) only work in Shared mode. For an isolated
+library, define the full parameter list statically in `__init__`.
+Overriding a value hook fires the
+[`value-hooks-execute-only-on-worker`](strict_mode.md) warning at
+library load.
 
 ### Connection hooks never fire under isolation
 
@@ -358,14 +366,16 @@ from, prefixed with `Worker-<engine-id>` so you can tell it apart
 from orchestrator output. Look for both **WARNING** and **ERROR**
 entries.
 
-The four rules and their actual severities:
+The six rules and their actual severities:
 
-| Rule                                                      | Orchestrator | Worker  | Notes                                                                                                                                                   |
-| --------------------------------------------------------- | ------------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [`reentrant-bus-in-init`](strict_mode.md)                 | ERROR        | ERROR   | Correctness rule. The class is dropped from the library schema.                                                                                         |
-| [`parameter-behaviors-dropped-in-schema`](strict_mode.md) | WARNING      | WARNING | Fires during library load when a `Parameter` carries `converters` / `validators` / `traits` that the worker schema cannot serialize. Does not escalate. |
-| [`parameter-mutation-during-aprocess`](strict_mode.md)    | WARNING      | ERROR   | Promotes the node's result to a failure on the worker.                                                                                                  |
-| [`worker-reach-into-orchestrator`](strict_mode.md)        | n/a          | WARNING | Fires anywhere during node execution including hydration. Does not escalate; intentional writes are explicitly fine to ignore.                          |
+| Rule                                                      | Orchestrator | Worker  | Notes                                                                                                                                                                                                         |
+| --------------------------------------------------------- | ------------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`reentrant-bus-in-init`](strict_mode.md)                 | ERROR        | ERROR   | Correctness rule. The class is dropped from the library schema.                                                                                                                                               |
+| [`parameter-behaviors-dropped-in-schema`](strict_mode.md) | WARNING      | WARNING | Fires during library load when a `Parameter` carries `converters` / `validators` / `traits` that the worker schema cannot serialize. Does not escalate.                                                       |
+| [`connection-hooks-inert-on-worker`](strict_mode.md)      | WARNING      | WARNING | Fires during library load when a node class overrides a connection lifecycle hook. Those hooks run on the orchestrator against the stub, so the override never runs. Does not escalate.                       |
+| [`value-hooks-execute-only-on-worker`](strict_mode.md)    | WARNING      | WARNING | Fires during library load when a node class overrides `before_value_set` / `after_value_set`. Value transformation still works; editor-time reactivity and parameter-list mutation do not. Does not escalate. |
+| [`parameter-mutation-during-aprocess`](strict_mode.md)    | WARNING      | ERROR   | Promotes the node's result to a failure on the worker.                                                                                                                                                        |
+| [`worker-reach-into-orchestrator`](strict_mode.md)        | n/a          | WARNING | Fires anywhere during node execution including hydration. Does not escalate; intentional writes are explicitly fine to ignore.                                                                                |
 
 If a strict-mode line fires, the rule's remediation message names
 exactly which guideline above was violated and how to fix it. A
