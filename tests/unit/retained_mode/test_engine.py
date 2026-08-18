@@ -8,11 +8,8 @@ can be rebound for a scope without leaking into the rest of the process.
 import asyncio
 import threading
 from collections.abc import Iterator
-from pathlib import Path
 
 import pytest
-import static_ffmpeg.run
-from xdg_base_dirs import xdg_data_home
 
 from griptape_nodes.retained_mode.engine import (
     Engine,
@@ -23,7 +20,6 @@ from griptape_nodes.retained_mode.engine import (
     reset_root_engine,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-from griptape_nodes.utils import ffmpeg_cache
 
 
 def _engine_scoped_children(path: str, value: object) -> Iterator[tuple[str, EngineScoped]]:
@@ -276,53 +272,3 @@ class TestRootEngine:
 
         assert len(observed) == racer_count
         assert all(engine is observed[0] for engine in observed)
-
-
-class TestFfmpegCacheRedirect:
-    """Building the process's first Engine must move ffmpeg off `static_ffmpeg`'s own package directory.
-
-    That directory is read-only when the engine runs from a packaged app -- notably the Linux
-    AppImage's FUSE mount, where it made every ffmpeg-dependent node fail with Errno 30. The
-    redirect is process-wide and installed once, so `_redirect_installed` is forced to `False`
-    here to make each test's `Engine()` act as that first engine.
-    """
-
-    @pytest.fixture(autouse=True)
-    def _restore_static_ffmpeg_globals(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(static_ffmpeg.run, "SELF_DIR", static_ffmpeg.run.SELF_DIR)
-        monkeypatch.setattr(static_ffmpeg.run, "LOCK_FILE", static_ffmpeg.run.LOCK_FILE)
-        monkeypatch.setattr(ffmpeg_cache, "_redirect_installed", False)
-
-    def test_redirects_away_from_the_package_directory(self) -> None:
-        package_dir = Path(static_ffmpeg.run.__file__).parent
-
-        Engine()
-
-        assert not Path(static_ffmpeg.run.SELF_DIR).is_relative_to(package_dir)
-
-    def test_defaults_to_xdg_data_home(self) -> None:
-        Engine()
-
-        assert Path(static_ffmpeg.run.SELF_DIR) == xdg_data_home() / "griptape_nodes" / "ffmpeg"
-
-    def test_honors_config_env_var(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """`GTN_CONFIG_FFMPEG_DIRECTORY` is the hook a packaged app uses to supply its own binaries."""
-        monkeypatch.setenv("GTN_CONFIG_FFMPEG_DIRECTORY", str(tmp_path))
-
-        Engine()
-
-        assert Path(static_ffmpeg.run.SELF_DIR) == tmp_path
-
-    def test_second_engine_leaves_the_redirect_alone(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """The redirect is per process, not per engine object.
-
-        Later engines (test scopes build them freely) must not move the cache out from
-        under callers that already resolved ffmpeg through the first one.
-        """
-        monkeypatch.setenv("GTN_CONFIG_FFMPEG_DIRECTORY", str(tmp_path / "first"))
-        Engine()
-
-        monkeypatch.setenv("GTN_CONFIG_FFMPEG_DIRECTORY", str(tmp_path / "second"))
-        Engine()
-
-        assert Path(static_ffmpeg.run.SELF_DIR) == tmp_path / "first"

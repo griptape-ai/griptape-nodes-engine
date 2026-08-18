@@ -108,6 +108,7 @@ from griptape_nodes.retained_mode.managers.artifact_providers.utils import (
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.utils.async_utils import to_thread
+from griptape_nodes.utils.ffmpeg_cache import install_ffmpeg_cache_redirect
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -365,11 +366,21 @@ class ArtifactManager(EngineScoped):
     async def on_app_initialization_complete(self, _payload: AppInitializationComplete) -> None:
         """Handle app initialization complete event.
 
-        Registers default artifact providers after the system is fully initialized.
+        Installs the process-wide ffmpeg cache redirect, then registers default artifact
+        providers, after the system is fully initialized.
 
         Args:
             _payload: App initialization complete payload
         """
+        # Move ffmpeg's lock file and downloaded binaries out of `static_ffmpeg`'s own package
+        # directory, which is read-only when the engine runs from a packaged app (notably the
+        # Linux AppImage's FUSE mount). Lives here rather than in engine boot because the video
+        # artifact provider is what depends on `static_ffmpeg`, and every process that can run
+        # nodes broadcasts AppInitializationComplete before executing them. Process-wide and
+        # installed once, like `install_file_url_support`; later broadcasts (and later engines)
+        # no-op. See utils/ffmpeg_cache.py.
+        install_ffmpeg_cache_redirect(self.engine.config_manager.get_config_value("ffmpeg_directory", default=""))
+
         # Register default providers (order matters: Image, Video, Audio)
         # Generator settings are now registered automatically via _register_provider_settings()
         failures = []
