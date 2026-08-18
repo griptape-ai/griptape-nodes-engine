@@ -29,6 +29,7 @@ from griptape_nodes.exe_types.core_types import (
 )
 from griptape_nodes.exe_types.param_components.execution_status_component import ExecutionStatusComponent
 from griptape_nodes.exe_types.variable_resolver import VariableResolver
+from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.retained_mode.events.base_events import (
     ProgressEvent,
     RequestPayload,
@@ -284,6 +285,7 @@ class BaseNode(ABC):
     )
     lock: bool = False  # When lock is true, the node is locked and can't be modified. When lock is false, the node is unlocked and can be modified.
     _cancellation_requested: threading.Event  # Event indicating if cancellation has been requested for this node
+    _engine: Engine | None = None
 
     @property
     def parameters(self) -> list[Parameter]:
@@ -306,11 +308,7 @@ class BaseNode(ABC):
         # instead records the constructing engine in a task-local var for the duration of the
         # call, so it is already bound by the time this line runs and events emitted later in a
         # subclass `__init__` body (declaring parameters, for instance) resolve to it.
-        # Lazy import: library_registry imports BaseNode from this module, so importing at
-        # module load creates a cycle.
-        from griptape_nodes.node_library.library_registry import LibraryRegistry
-
-        self._engine: Engine | None = LibraryRegistry.constructing_engine()
+        self._engine = LibraryRegistry.constructing_engine()
         if metadata is None:
             self.metadata = {}
         else:
@@ -340,7 +338,9 @@ class BaseNode(ABC):
             return self._engine
 
         # Imported here rather than at module scope: `retained_mode.engine` imports
-        # `exe_types.flow`, so a top-level import would close the cycle back onto this package.
+        # `retained_mode.events.execution_events`, which imports `retained_mode.events.node_events`,
+        # which imports this module for `NodeDependencies`/`NodeResolutionState`, closing the cycle
+        # back onto this package.
         from griptape_nodes.retained_mode.engine import current_engine
 
         return current_engine()

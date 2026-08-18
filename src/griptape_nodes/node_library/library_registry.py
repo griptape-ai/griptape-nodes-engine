@@ -473,11 +473,6 @@ class LibraryRegistry:
         with cls.constructing_node(engine=engine):
             node = dest_library.create_node(node_type=node_type, name=name, metadata=metadata)
 
-        # Redundant with the constructing_engine() seed BaseNode.__init__ already applied; kept as
-        # a belt-and-braces assignment so an explicitly supplied engine is bound regardless.
-        if engine is not None:
-            node._engine = engine
-
         return node
 
     @classmethod
