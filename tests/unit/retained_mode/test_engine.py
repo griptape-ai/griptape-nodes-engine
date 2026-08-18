@@ -7,8 +7,8 @@ can be rebound for a scope without leaking into the rest of the process.
 
 import asyncio
 import threading
-from pathlib import Path
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 import static_ffmpeg.run
