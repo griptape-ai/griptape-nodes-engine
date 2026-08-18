@@ -126,12 +126,13 @@ class TestAccessManager:
             QueryModelAccessForNodeRequest(node_type="NotRegistered", specific_library_name=self._LIBRARY_NAME)
         )
         assert isinstance(result, QueryModelAccessForNodeResultFailure)
-        # The node-not-found path stringifies a KeyError(library, node_type) tuple; the
-        # handler must surface clean prose naming both, not the raw tuple repr.
+        # The library reports the missing node type by raising; the handler must surface its own
+        # clean prose naming the node type and the library, never the exception's payload.
         details = str(result.result_details)
-        assert "NotRegistered" in details
-        assert self._LIBRARY_NAME in details
-        assert "('" not in details
+        assert details == (
+            f"Attempted to query model access for node type 'NotRegistered'. "
+            f"Failed because it is not registered in library '{self._LIBRARY_NAME}'."
+        )
 
     def test_for_node_no_hook_all_models_allowed(self, griptape_nodes: GriptapeNodes) -> None:  # noqa: ARG002
         from griptape_nodes.node_library.library_declarations import ModelUsageNodeProperty

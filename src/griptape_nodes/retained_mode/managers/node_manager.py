@@ -103,7 +103,6 @@ from griptape_nodes.retained_mode.events.flow_events import (
 )
 from griptape_nodes.retained_mode.events.library_events import (
     GetLibraryMetadataRequest,
-    GetLibraryMetadataResultFailure,
     GetLibraryMetadataResultSuccess,
 )
 from griptape_nodes.retained_mode.events.node_events import (
@@ -239,6 +238,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointSubjectType,
 )
 from griptape_nodes.retained_mode.retained_mode import RetainedMode
+from griptape_nodes.utils.exception_utils import readable_exception_message
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -682,6 +682,39 @@ class NodeManager(EngineScoped):
                 denials[node.class_name] = denial
         return denials
 
+    def _describe_node_creation_failure(self, err: Exception, *, node_type: str, library_name: str | None) -> str:
+        """Explain why a node could not be created, in terms the artist can act on.
+
+        A library that loaded with problems still registers, so the raw exception is usually just
+        "node type not found" and says nothing about the real cause. The library's recorded problems
+        and any pending restart name what actually went wrong.
+
+        Args:
+            err: The exception raised while creating the node
+            node_type: Node type that was being created, used to find the library when unnamed
+            library_name: Library the node type was requested from, if the caller named one
+        """
+        message = readable_exception_message(err)
+
+        resolved_library_name = library_name
+        if resolved_library_name is None:
+            resolved_library_name = self.engine.library_manager.get_library_name_for_node_type(node_type)
+        if resolved_library_name is None:
+            return message
+
+        library_manager = self.engine.library_manager
+        parts = [message]
+
+        problems = library_manager.get_collated_problems_for_library(resolved_library_name)
+        if problems is not None:
+            parts.append(f"Library '{resolved_library_name}' reported problems when it loaded:\n{problems}")
+
+        stale_module_explanation = library_manager.explain_stale_module_failure(resolved_library_name)
+        if stale_module_explanation is not None:
+            parts.append(stale_module_explanation)
+
+        return "\n\n".join(parts)
+
     def on_create_node_request(self, request: CreateNodeRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
         # Validate as much as possible before we actually create one.
         parent_flow_name = request.override_parent_flow_name
@@ -750,8 +783,13 @@ class NodeManager(EngineScoped):
             )
         # modifying to exception to try to catch all possible issues with node creation.
         except Exception as err:
-            logger.error(err)
-            details = f"Could not create Node '{final_node_name}' of type '{request.node_type}': {err}"
+            # A node's __init__ comes from a separately versioned library, so this renders whatever
+            # it raised rather than only exceptions the engine controls.
+            details = (
+                f"Could not create Node '{final_node_name}' of type '{request.node_type}': "
+                f"{readable_exception_message(err)}"
+            )
+            logger.error(details)
 
             # Check if we should create an Error Proxy node instead of failing
             if request.create_error_proxy_on_failure:
@@ -763,17 +801,9 @@ class NodeManager(EngineScoped):
                     if denied_by_policy:
                         failure_reason = str(err)
                     else:
-                        # Use fitness problem details if available for a more actionable error message
-                        library_metadata_result = self.engine.handle_request(
-                            GetLibraryMetadataRequest(library=request.specific_library_name or "")
+                        failure_reason = self._describe_node_creation_failure(
+                            err, node_type=request.node_type, library_name=request.specific_library_name
                         )
-                        if (
-                            isinstance(library_metadata_result, GetLibraryMetadataResultFailure)
-                            and library_metadata_result.problems is not None
-                        ):
-                            failure_reason = library_metadata_result.problems
-                        else:
-                            failure_reason = str(err)
 
                     # Create ErrorProxyNode directly since it needs special initialization
                     node = ErrorProxyNode(

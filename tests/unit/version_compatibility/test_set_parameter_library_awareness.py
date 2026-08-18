@@ -4,7 +4,7 @@ Verifies that compatibility checks only apply to nodes from the standard library
 and do not interfere with identically-named nodes from extension libraries.
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -33,7 +33,10 @@ class TestFlux2RemovedParametersCheckLibraryAwareness:
 
     @pytest.fixture
     def check(self) -> Flux2RemovedParametersCheck:
-        return Flux2RemovedParametersCheck()
+        # The check resolves the current workflow name through its injected engine.
+        engine = MagicMock()
+        engine.context_manager.get_current_workflow_name.return_value = "test_workflow"
+        return Flux2RemovedParametersCheck(engine=engine)
 
     def test_applies_to_standard_library_node(self, check: Flux2RemovedParametersCheck) -> None:
         node = _make_node("Flux2ImageGeneration", STANDARD_LIBRARY)
@@ -65,11 +68,7 @@ class TestFlux2RemovedParametersCheckLibraryAwareness:
     def test_set_parameter_returns_success(self, check: Flux2RemovedParametersCheck) -> None:
         node = _make_node("Flux2ImageGeneration", STANDARD_LIBRARY)
 
-        with patch(
-            "griptape_nodes.version_compatibility.versions.v0_65_5.flux_2_removed_parameters.GriptapeNodes"
-        ) as mock_gn:
-            mock_gn.ContextManager.return_value.get_current_workflow_name.return_value = "test_workflow"
-            result = check.set_parameter_value(node, "aspect_ratio", "16:9")
+        result = check.set_parameter_value(node, "aspect_ratio", "16:9")
 
         assert isinstance(result, SetParameterValueResultSuccess)
         assert result.finalized_value is None

@@ -7,6 +7,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from griptape_nodes.retained_mode.events.secrets_events import (
+    GetAllSecretValuesRequest,
+    GetAllSecretValuesResultFailure,
+    GetAllSecretValuesResultSuccess,
+)
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
 
@@ -723,3 +728,68 @@ class TestSecretsManager:
                     assert os.environ["UNRELATED"] == "value"
                     assert "UNRELATED" in secrets_manager._managed_env_keys
                     assert_invariant(secrets_manager)
+
+
+@pytest.mark.skipif(
+    platform.system() == "Windows", reason="xdg_base_dirs cannot find XDG_CONFIG_HOME on Windows on GitHub Actions"
+)
+class TestGetAllSecretValuesRequest:
+    """An unreadable secrets file must not be reported as an empty one.
+
+    Callers that *replace* content with this result -- the workflow packager rebuilding a
+    published bundle's .env -- would otherwise turn a read failure into a silent deletion
+    of every credential from the bundle.
+    """
+
+    def test_missing_file_succeeds_with_no_values(self) -> None:
+        """No stored secrets yet is a real empty success, not a failure."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_path = Path(temp_dir)
+            global_env = workspace_path / "global.env"
+
+            config_manager = ConfigManager()
+            config_manager.workspace_path = workspace_path
+
+            with patch("griptape_nodes.retained_mode.managers.secrets_manager.ENV_VAR_PATH", global_env):
+                secrets_manager = SecretsManager(config_manager)
+                result = secrets_manager.on_handle_get_all_secret_values_request(GetAllSecretValuesRequest())
+
+            assert isinstance(result, GetAllSecretValuesResultSuccess)
+            assert result.values == {}
+
+    def test_existing_file_returns_its_values(self) -> None:
+        """The happy path is unchanged: stored secrets come back as values."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_path = Path(temp_dir)
+            global_env = workspace_path / "global.env"
+            global_env.write_text("STORED_KEY=stored_value\n")
+
+            config_manager = ConfigManager()
+            config_manager.workspace_path = workspace_path
+
+            with patch("griptape_nodes.retained_mode.managers.secrets_manager.ENV_VAR_PATH", global_env):
+                secrets_manager = SecretsManager(config_manager)
+                result = secrets_manager.on_handle_get_all_secret_values_request(GetAllSecretValuesRequest())
+
+            assert isinstance(result, GetAllSecretValuesResultSuccess)
+            assert result.values == {"STORED_KEY": "stored_value"}
+
+    def test_unreadable_file_fails_rather_than_looking_empty(self) -> None:
+        """A file that exists but cannot be read is a failure, not an empty success."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_path = Path(temp_dir)
+            global_env = workspace_path / "global.env"
+            global_env.write_text("STORED_KEY=stored_value\n")
+
+            config_manager = ConfigManager()
+            config_manager.workspace_path = workspace_path
+
+            with patch("griptape_nodes.retained_mode.managers.secrets_manager.ENV_VAR_PATH", global_env):
+                secrets_manager = SecretsManager(config_manager)
+                with patch(
+                    "griptape_nodes.retained_mode.managers.secrets_manager.dotenv_values",
+                    side_effect=OSError("permission denied"),
+                ):
+                    result = secrets_manager.on_handle_get_all_secret_values_request(GetAllSecretValuesRequest())
+
+            assert isinstance(result, GetAllSecretValuesResultFailure)

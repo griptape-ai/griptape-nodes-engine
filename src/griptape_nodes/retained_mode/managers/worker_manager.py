@@ -336,7 +336,21 @@ class WorkerManager(EngineScoped):
         orchestrator_engine_id = self.engine.engine_identity_manager.active_engine_id
         if orchestrator_engine_id is not None:
             worker_environ["GTN_ORCHESTRATOR_ENGINE_ID"] = orchestrator_engine_id
-        proc = await asyncio.create_subprocess_exec(*args, env=worker_environ)
+        # Worker stdout is a pipe when the orchestrator is hosted by a GUI app (e.g. the
+        # desktop app); unbuffered output keeps worker log lines from stalling in Python's
+        # block buffer and from being lost on a crash.
+        worker_environ["PYTHONUNBUFFERED"] = "1"
+        # Hand the orchestrator's own stdout/stderr to the worker explicitly so worker log
+        # lines land in the same stream as orchestrator logs. Implicit inheritance is
+        # POSIX-only: on Windows, redirected std handles (e.g. the desktop app's pipes) are
+        # not passed to a child unless subprocess sends them via STARTF_USESTDHANDLES, so
+        # the worker would log to an invisible console instead.
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            env=worker_environ,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+        )
         # Record the loop that owns this subprocess so termination can hop back to it.
         # All spawns run on the engine event-queue loop, so this is idempotent.
         self._spawn_loop = asyncio.get_running_loop()

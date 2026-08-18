@@ -1,11 +1,13 @@
 import contextlib
 import logging
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from griptape_nodes.exe_types.core_types import Parameter
 from griptape_nodes.exe_types.node_types import BaseNode, NodeResolutionState
+from griptape_nodes.node_library.library_registry import LibraryRegistryError
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.node_events import (
     BatchSetNodeMetadataRequest,
@@ -992,3 +994,171 @@ class TestNodeInstantiationAuthorizationCheckpoint:
                 )
             ],
         )
+
+
+class TestNodeCreationFailureDescription:
+    """The text a failed node creation shows in the log and on the Error Proxy placeholder."""
+
+    _LIBRARY_NAME = "failure-description-test-library"
+
+    @pytest.fixture(autouse=True)
+    def _clean_registry(self):  # noqa: ANN202
+        from griptape_nodes.node_library.library_registry import LibraryRegistry
+
+        LibraryRegistry._clear()
+        yield
+        LibraryRegistry._clear()
+
+    def _record_flawed_library(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
+        """Track a LOADED-but-FLAWED library whose Agent node module failed to import."""
+        from griptape_nodes.retained_mode.managers.fitness_problems.libraries.node_module_import_problem import (
+            NodeModuleImportProblem,
+        )
+        from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
+
+        library_file_path = str(tmp_path / "griptape_nodes_library.json")
+        griptape_nodes.LibraryManager()._library_file_path_to_info[library_file_path] = LibraryManager.LibraryInfo(
+            lifecycle_state=LibraryManager.LibraryLifecycleState.LOADED,
+            library_path=library_file_path,
+            is_sandbox=False,
+            library_name=self._LIBRARY_NAME,
+            library_version="1.0.0",
+            fitness=LibraryManager.LibraryFitness.FLAWED,
+            problems=[
+                NodeModuleImportProblem(
+                    class_name="Agent",
+                    file_path="agents/agent.py",
+                    error_message="cannot import name 'require_model_invocation_sync'",
+                    root_cause="cannot import name 'require_model_invocation_sync'",
+                )
+            ],
+        )
+
+    def _register_library_providing_probe(self) -> None:
+        """Register a library that provides `_GateProbe`, so its node type resolves to a library."""
+        from griptape_nodes.node_library.library_registry import (
+            LibraryMetadata,
+            LibraryRegistry,
+            LibrarySchema,
+            NodeMetadata,
+        )
+
+        schema = LibrarySchema(
+            name=self._LIBRARY_NAME,
+            library_schema_version=LibrarySchema.LATEST_SCHEMA_VERSION,
+            metadata=LibraryMetadata(
+                author="t", description="d", library_version="1.0.0", engine_version="1.0.0", tags=[]
+            ),
+            categories=[],
+            nodes=[],
+        )
+        library = LibraryRegistry.generate_new_library(library_data=schema)
+        library.register_new_node_type(_GateProbe, NodeMetadata(category="t", description="d", display_name="Probe"))
+
+    def test_description_appends_the_library_problems(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
+        self._record_flawed_library(griptape_nodes, tmp_path)
+
+        description = griptape_nodes.NodeManager()._describe_node_creation_failure(
+            LibraryRegistryError(f"Node type 'Agent' not found in library '{self._LIBRARY_NAME}'"),
+            node_type="Agent",
+            library_name=self._LIBRARY_NAME,
+        )
+
+        # A library that loaded FLAWED still registers, so its recorded problems are the only
+        # part of the message that tells the artist what to do about it.
+        assert description.startswith(f"Node type 'Agent' not found in library '{self._LIBRARY_NAME}'")
+        assert "require_model_invocation_sync" in description
+
+    def test_description_finds_the_library_by_node_type_when_unnamed(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        # Creating a node from the node palette names no library, so the failure path has to
+        # resolve the owning library itself to report its problems.
+        self._register_library_providing_probe()
+        self._record_flawed_library(griptape_nodes, tmp_path)
+
+        description = griptape_nodes.NodeManager()._describe_node_creation_failure(
+            ImportError("cannot import name 'require_model_invocation_sync'"),
+            node_type=_GateProbe.__name__,
+            library_name=None,
+        )
+
+        assert "require_model_invocation_sync" in description
+        assert self._LIBRARY_NAME in description
+
+    def test_description_finds_the_library_by_recorded_import_failure(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        # An eagerly-loaded node whose module failed to import registers nothing, so no library
+        # provides the type; the recorded failure is what names the library.
+        self._record_flawed_library(griptape_nodes, tmp_path)
+
+        description = griptape_nodes.NodeManager()._describe_node_creation_failure(
+            LibraryRegistryError("No node type 'Agent' could be found in any of the libraries registered."),
+            node_type="Agent",
+            library_name=None,
+        )
+
+        assert "require_model_invocation_sync" in description
+        assert self._LIBRARY_NAME in description
+
+    def test_description_is_just_the_message_when_the_library_is_healthy(self, griptape_nodes: GriptapeNodes) -> None:
+        description = griptape_nodes.NodeManager()._describe_node_creation_failure(
+            ValueError("node __init__ blew up"), node_type="Whatever", library_name="library-with-no-problems"
+        )
+
+        assert description == "node __init__ blew up"
+
+    def test_description_unquotes_a_sentence_raised_as_a_key_error(self, griptape_nodes: GriptapeNodes) -> None:
+        # A node's __init__ lives in a separately versioned library and can raise a sentence as a
+        # bare KeyError (`BaseNode.set_parameter_value` does). str() would repr that sentence, so
+        # the artist would read their error wrapped in quotes.
+        description = griptape_nodes.NodeManager()._describe_node_creation_failure(
+            KeyError("Attempted to set value for Parameter 'prompt' but no such Parameter could be found."),
+            node_type="Whatever",
+            library_name="library-with-no-problems",
+        )
+
+        assert description == "Attempted to set value for Parameter 'prompt' but no such Parameter could be found."
+
+    def test_description_tells_the_artist_to_restart_after_a_mid_session_reload(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        self._record_flawed_library(griptape_nodes, tmp_path)
+        # The library was reloaded after its node modules had already imported, so this engine is
+        # stuck with the old code no matter how the library is re-registered.
+        griptape_nodes.LibraryManager()._libraries_reloaded_after_import.add(self._LIBRARY_NAME)
+
+        description = griptape_nodes.NodeManager()._describe_node_creation_failure(
+            ImportError("cannot import name 'require_model_invocation_sync'"),
+            node_type="Agent",
+            library_name=self._LIBRARY_NAME,
+        )
+
+        # The import error alone gives the artist nothing to act on; the remedy is the restart.
+        assert "cannot import name 'require_model_invocation_sync'" in description
+        assert "Restart the engine" in description
+
+    def test_description_omits_the_restart_hint_for_a_library_loaded_once(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        self._record_flawed_library(griptape_nodes, tmp_path)
+
+        description = griptape_nodes.NodeManager()._describe_node_creation_failure(
+            ImportError("no module named 'torch'"),
+            node_type="Agent",
+            library_name=self._LIBRARY_NAME,
+        )
+
+        # This library was never reloaded, so its import failure is a real defect and restarting
+        # would not help. Saying otherwise would send the artist on a goose chase.
+        assert "Restart the engine" not in description
+
+    def test_description_is_just_the_message_when_the_node_type_has_no_library(
+        self, griptape_nodes: GriptapeNodes
+    ) -> None:
+        description = griptape_nodes.NodeManager()._describe_node_creation_failure(
+            ValueError("boom"), node_type="UnknownEverywhere", library_name=None
+        )
+
+        assert description == "boom"

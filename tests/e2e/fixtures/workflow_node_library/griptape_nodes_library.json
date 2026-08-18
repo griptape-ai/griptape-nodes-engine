@@ -1,0 +1,52 @@
+{
+  "name": "Workflow Node Library",
+  "library_schema_version": "0.11.0",
+  "metadata": {
+    "author": "Test Fixture",
+    "description": "Minimal library exercising nodes generated from workflow files",
+    "library_version": "0.1.0",
+    "engine_version": "0.0.0",
+    "tags": ["test"],
+    "dependencies": {
+      "pip_dependencies": []
+    }
+  },
+  "categories": [
+    {
+      "test": {
+        "title": "test",
+        "description": "Test nodes",
+        "color": "border-gray-500",
+        "icon": "Folder"
+      }
+    }
+  ],
+  "nodes": [
+    {
+      "class_name": "TextStartNode",
+      "file_path": "workflow_node_nodes.py",
+      "metadata": {"category": "test", "description": "workflow text input", "display_name": "Text Start"}
+    },
+    {
+      "class_name": "ShoutNode",
+      "file_path": "workflow_node_nodes.py",
+      "metadata": {"category": "test", "description": "uppercases text", "display_name": "Shout"}
+    },
+    {
+      "class_name": "TextEndNode",
+      "file_path": "workflow_node_nodes.py",
+      "metadata": {"category": "test", "description": "workflow text output", "display_name": "Text End"}
+    }
+  ],
+  "workflow_nodes": [
+    {
+      "node_type": "ShoutWorkflow",
+      "workflow_path": "shout_workflow.py",
+      "metadata": {
+        "category": "test",
+        "description": "Runs the shout workflow: uppercases text and appends an exclamation mark",
+        "display_name": "Shout Workflow"
+      }
+    }
+  ]
+}

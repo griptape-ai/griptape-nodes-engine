@@ -1,3 +1,4 @@
+import platform
 from collections.abc import Generator
 from pathlib import Path
 from typing import Any
@@ -245,6 +246,57 @@ class TestLocalStorageDriverCreateSignedDownloadUrl:
         assert "\\" not in url
         assert "C:/Users/foo/image.png" in url
         assert url == "http://localhost:8124/external/C:/Users/foo/image.png?t=1000"
+
+    def test_external_long_path_prefixed_file_matches_clean_spelling(
+        self,
+        local_storage_driver: LocalStorageDriver,
+        mock_workspace_path: Any,  # noqa: ARG002
+    ) -> None:
+        r"""A ``\\?\``-prefixed path must produce the same URL as the unprefixed one.
+
+        Regression: ``canonicalize_for_io`` adds the prefix unconditionally on Windows, and
+        the prefix survived into the URL as ``/external//?/C:/...``. The ``?`` terminates the
+        URL path, so the browser sent everything after it as a query string and the server
+        only ever saw the path ``/external//`` -- a broken image with no failing request to
+        point at.
+        """
+        with (
+            patch("griptape_nodes.drivers.storage.local_storage_driver.time") as mock_time,
+            patch("griptape_nodes.drivers.storage.local_storage_driver.resolve_workspace_path") as mock_resolve,
+        ):
+            mock_time.time.return_value = 1000
+            mock_resolve.return_value = Path("//?/C:/Users/foo/image.png")
+            url = local_storage_driver.create_signed_download_url(Path("C:/Users/foo/image.png"))
+
+        assert "?/" not in url.removesuffix("?t=1000")
+        assert "\\" not in url
+        assert url == "http://localhost:8124/external/C:/Users/foo/image.png?t=1000"
+
+    @pytest.mark.skipif(platform.system() != "Windows", reason="Only Windows pathlib parses a drive-letter anchor")
+    def test_long_path_prefixed_workspace_file_uses_workspace_relative_url(self) -> None:
+        r"""A prefixed path inside the workspace must take the internal branch, not ``/external/``.
+
+        This is the shape that reached users: the prefix changes a path's anchor, so
+        ``relative_to`` read a file sitting in the workspace as outside it and the URL was
+        built from the absolute path.
+        """
+        driver = LocalStorageDriver(Path("C:/ws"))
+
+        # The workspace comes from ConfigManager on every access, so it has to be patched
+        # there rather than passed to the constructor.
+        with (
+            patch("griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes") as mock_griptape,
+            patch("griptape_nodes.drivers.storage.local_storage_driver.time") as mock_time,
+            patch("griptape_nodes.drivers.storage.local_storage_driver.resolve_workspace_path") as mock_resolve,
+        ):
+            mock_config_manager = Mock()
+            mock_config_manager.workspace_path = Path("C:/ws")
+            mock_griptape.ConfigManager.return_value = mock_config_manager
+            mock_time.time.return_value = 1000
+            mock_resolve.return_value = Path(r"\\?\C:\ws\images\photo.png")
+            url = driver.create_signed_download_url(Path(r"C:\ws\images\photo.png"))
+
+        assert url == "http://localhost:8124/workspace/images/photo.png?t=1000"
 
 
 class TestSignedDownloadUrlRoundTrip:

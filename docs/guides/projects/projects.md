@@ -125,7 +125,7 @@ directories:
 | Relative | `../team-base/griptape-nodes-project.yml`                    | Preferred. Resolved against the directory of *this* project's YAML file, so the link survives moves between machines and OSes. |
 | Absolute | `/Users/alice/projects/team-base/griptape-nodes-project.yml` | Bakes in a per-machine path; works locally but does not travel.                                                                |
 
-No macros are expanded inside `parent_project_path`. Tokens like `{workspace_dir}`, `{project_dir}`, and `{outputs}` are not substituted here — a path containing them is treated literally. Macros belong in `path_macro` and `situations.*.macro` fields.
+No macros are expanded inside `parent_project_path`. Tokens like `{workspace_dir}`, `{project_dir}`, and `{outputs}` are not substituted here. Macros belong in `path_macro` and `situations.*.macro` fields. `~` and environment variables *are* expanded — see [Path values](#path-values-in-workspace_dir-libraries_dir-and-parent_project_path).
 
 ### Inheritance and tombstones
 
@@ -152,6 +152,59 @@ A parent that cannot be read or parsed surfaces as a validation error on the chi
 
 A workspace zipped on one machine and unpacked on another will keep parent links intact as long as the parent is referenced with a relative path and travels alongside the child inside the workspace. Absolute paths break across machines (different home directories, different drive letters); the relative form is what makes parent chains portable.
 
+## Path values in `workspace_dir`, `libraries_dir`, and `parent_project_path`
+
+These three fields all accept a path, and all three read it the same way, in this order:
+
+1. **`~` and environment variables expand first.** `~` becomes your home directory, and `${NAME}` (or `%NAME%` on Windows) is replaced with that variable's value.
+1. **A path that is still relative** after expansion resolves against the directory of the project file that declared it, so the value travels with the project.
+1. The result is normalized, so two spellings of the same folder mean the same folder.
+
+Expansion happening *first* is what makes this work: `${STUDIO_LIBS}/griptape-libraries` is an absolute path once `STUDIO_LIBS` is filled in, and is treated as one rather than being tacked onto the project folder.
+
+```yaml
+libraries_dir: "${STUDIO_LIBS}/griptape-libraries"   # absolute once STUDIO_LIBS is set
+workspace_dir: "~/Projects/marketing"                # your home directory
+```
+
+**Which variables count.** Only the environment the engine was launched with — what your shell, launcher, or studio pipeline exported before Griptape Nodes started. A project's own `environment:` block is deliberately **not** consulted here: those variables are applied when the project is *activated*, which happens after these fields have already been resolved. If a project's own environment could change what its workspace and libraries folders mean, a field's meaning would depend on which project happened to be open at the time.
+
+**`{macro}` tokens are not expanded.** `{workspace_dir}`, `{project_dir}`, `{outputs}`, and any other macro token is rejected rather than substituted — the engine reports the field as unresolvable instead of creating a folder literally named `{outputs}`. Macros belong in `path_macro` and `situations.*.macro` fields, which resolve against runtime state these fields cannot depend on.
+
+**One variable is always available: `${GTN_DEFAULT_LIBRARIES_ROOT}`.** The engine publishes it at startup, so unlike `${STUDIO_LIBS}` above it needs no setup on any machine. It holds the absolute directory libraries install under by default — the same place `griptape-nodes init` puts the standard library — which makes it the portable way to point a project at this engine's existing library tree instead of downloading a second copy:
+
+```yaml
+libraries_dir: "${GTN_DEFAULT_LIBRARIES_ROOT}/shared"
+```
+
+It does not follow a project's own `libraries_dir`, since that is the field reading it. See [Variables the engine publishes](../configuration.md#variables-the-engine-publishes).
+
+Three things worth knowing before you rely on a variable:
+
+- `%NAME%` expands **only on Windows**. For a value that has to work everywhere, use `${NAME}` or the per-platform mapping form.
+- A bare `$NAME` (no braces) is **not** a variable here. It is indistinguishable from a real folder name such as `$Recycle.Bin`, so it stays literal — always write `${NAME}`.
+- A variable only makes a path portable if every machine defines it. A relative path needs no such agreement, so prefer relative when the target travels with the project.
+
+### A path that cannot be resolved is an error
+
+Leaving one of these fields **out** is always fine — the project simply falls back to the next source (a parent's value, the config, the global default). But a field that *is* written and cannot produce a path means the project is asking for something this machine cannot give it, and the engine will not quietly substitute somewhere else. **The project fails to load**, reports [`UNUSABLE`](#validation-status), and its validation problems name the field, the line, and the reason. Any project that lists it as a parent fails too, with a problem pointing at its `parent_project_path`.
+
+Three things trip this:
+
+- `${STUDIO_LIBS}/libraries` when `STUDIO_LIBS` is not set — no literal `${STUDIO_LIBS}` folder is created.
+- `{outputs}/libraries` or any other `{macro}` token.
+- A per-platform mapping with no entry for the machine you are on and no `default`.
+
+That last one is the case worth planning for, and `default` is the fix. A mapping that names only `windows` says nothing about what a teammate on Linux should get, so the honest answer on their machine is a failed load rather than a guess:
+
+```yaml
+libraries_dir:
+  windows: "D:/shared-libraries"      # the fast local volume, Windows only
+  default: "./libraries"              # everyone else: beside the project
+```
+
+The failure is deliberately loud, because the alternative is worse: a shared project pinning `${STUDIO_LIBS}` would otherwise load for every teammate who has not set that variable and silently install a second copy of every library somewhere they never chose. Set the variable, add a `default`, or remove the field.
+
 ## Workspace directory
 
 The optional `workspace_dir` field names the directory this project uses as its [workspace](workspace.md). When set, it is the **highest-priority** workspace source — it overrides the per-user `project_workspaces` mapping, the `GTN_CONFIG_WORKSPACE_DIRECTORY` env var, the project-adjacent config, parent inheritance, and the global default.
@@ -171,9 +224,9 @@ workspace_dir:
   default: "./workspace"
 ```
 
-A relative path resolves against the directory of *this* project's YAML file — the same rule `parent_project_path` uses — so a relative value travels with the project across machines and operating systems. The raw value is stored verbatim and only resolved to an absolute path at workspace-resolution time; it is never absolutized on save. The target directory does not need to contain a `griptape_nodes_config.json`; an empty directory is valid.
+A relative path resolves against the directory of *this* project's YAML file — the same rule `parent_project_path` uses — so a relative value travels with the project across machines and operating systems. `~` and environment variables are expanded (see [Path values](#path-values-in-workspace_dir-libraries_dir-and-parent_project_path)). The raw value is stored verbatim and only resolved to an absolute path at workspace-resolution time; it is never absolutized on save. The target directory does not need to contain a `griptape_nodes_config.json`; an empty directory is valid.
 
-For the per-platform form, the engine picks the entry matching the current platform. When that platform's key is unset it falls back to `default`. If neither the platform key nor `default` is set, the field yields no value on that platform and workspace resolution falls through to the next source (see [Workspace resolution](workspace.md#workspace-resolution)).
+For the per-platform form, the engine picks the entry matching the current platform. When that platform's key is unset it falls back to `default`. If neither the platform key nor `default` is set, the project does not load on that platform — see [A path that cannot be resolved is an error](#a-path-that-cannot-be-resolved-is-an-error). Otherwise the resolved value feeds [Workspace resolution](workspace.md#workspace-resolution) as its highest-priority source.
 
 Unlike most fields, `workspace_dir` is **not inherited** from a parent project. It describes this project's own workspace and is taken from this project's overlay alone — a child does not adopt its parent's `workspace_dir`. (Cross-project workspace inheritance is handled separately by the resolution ladder's parent-chain step, not by the merge model.) Setting `workspace_dir: null` or omitting the field both leave the project with no declared workspace.
 
@@ -194,7 +247,7 @@ libraries_dir:
   default: "./libraries"
 ```
 
-A relative path resolves against the directory of *this* project's YAML file — the same rule `parent_project_path` and `workspace_dir` use — so a relative value travels with the project across machines. The raw value is stored verbatim and only resolved to an absolute path at resolution time; it is never absolutized on save. For the per-platform form, the engine picks the entry matching the current platform, falling back to `default`.
+A relative path resolves against the directory of *this* project's YAML file — the same rule `parent_project_path` and `workspace_dir` use — so a relative value travels with the project across machines. `~` and environment variables are expanded (see [Path values](#path-values-in-workspace_dir-libraries_dir-and-parent_project_path)). The raw value is stored verbatim and only resolved to an absolute path at resolution time; it is never absolutized on save. For the per-platform form, the engine picks the entry matching the current platform, falling back to `default`; with neither present the project does not load on that platform (see [A path that cannot be resolved is an error](#a-path-that-cannot-be-resolved-is-an-error)).
 
 ### Inheritance and resolution
 
@@ -207,6 +260,12 @@ A relative path resolves against the directory of *this* project's YAML file —
 This is the **key difference from `workspace_dir`**: `workspace_dir` is never inherited from a parent, but `libraries_dir` **is**. A child that declares no `libraries_dir` of its own adopts the nearest ancestor that declares one (only an *explicit* value is inheritable — a parent that leaves the field unset contributes nothing, and the walk continues past it). This is why the creation UI writes `libraries_dir: "./libraries"` into a **top-level** project (whose parent is the system defaults) but leaves it unset on a child: the top-level project declares an explicit, inheritable library root, and each child under it shares that root by default. A child can still declare its own `libraries_dir` to opt out, or set `libraries_dir: null` to tombstone an inherited value and fall back to the workspace-relative default.
 
 Like `workspace_dir`, `libraries_dir` is **not merge-inherited**: it is taken from this project's overlay alone and a child does not pick up the base's value through the [merge model](#the-merge-model). Cross-project inheritance is handled by the resolution order above (the parent-chain walk), not by merge.
+
+### Seeing where the paths ended up
+
+Because the answer can come from any of the three places above, you do not have to work it out yourself. `ListProjectTemplatesRequest` reports each project's effective `workspace_dir` and `libraries_root` as absolute paths, resolved exactly the way activating the project resolves them — including inheritance from a parent, so a parent and its children show the same libraries root.
+
+Both are reported for every project that loaded from a file, and are `null` only for an entry with no backing project file (the system defaults) or one that failed to load. They are never `null` because resolution gave up: a project whose declared paths cannot be resolved does not load at all.
 
 ## Validation status
 
