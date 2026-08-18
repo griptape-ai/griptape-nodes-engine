@@ -51,7 +51,7 @@ from griptape_nodes.node_library.library_declarations import (
     iter_catalog_models,
     resolve_node_models,
 )
-from griptape_nodes.node_library.library_registry import LibraryRegistry
+from griptape_nodes.node_library.library_registry import LibraryRegistry, LibraryRegistryError
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.access_events import (
     CodecAccessDirection,
@@ -238,18 +238,17 @@ class AccessManager(EngineScoped):
         """
         try:
             library = LibraryRegistry.get_library_for_node_type(node_type, specific_library_name)
-        except KeyError as exc:
-            detail = exc.args[0] if exc.args else str(exc)
+        except LibraryRegistryError as exc:
             msg = (
                 f"Attempted to query model access for node type '{node_type}'. "
-                f"Failed because the library could not be resolved: {detail}"
+                f"Failed because the library could not be resolved: {exc}"
             )
             raise _NodeLookupError(msg) from exc
 
         try:
             node_metadata = library.get_node_metadata(node_type)
-        except KeyError as exc:
-            library_name = exc.args[0] if exc.args else specific_library_name
+        except LibraryRegistryError as exc:
+            library_name = library.get_library_data().name
             msg = (
                 f"Attempted to query model access for node type '{node_type}'. "
                 f"Failed because it is not registered in library '{library_name}'."

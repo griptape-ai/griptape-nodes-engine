@@ -1,24 +1,22 @@
 """Tests for current_executing_node_name ContextVar in NodeExecutor.execute().
 
-NodeExecutor.execute now dispatches ExecuteNodeRequest through
-GriptapeNodes.ahandle_request for both local and worker execution. The
-ContextVar is set before dispatch and reset on return (or exception).
+NodeExecutor.execute now dispatches ExecuteNodeRequest through the injected
+Engine's ahandle_request for both local and worker execution. The ContextVar
+is set before dispatch and reset on return (or exception).
 """
 
 import asyncio
-from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from typing import Any, cast
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from griptape_nodes.common.node_executor import NodeExecutor, current_executing_node_name
 from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeResultSuccess
 
-_GRIPTAPE_NODES_PATH = "griptape_nodes.common.node_executor.GriptapeNodes"
-
 
 def _make_executor() -> NodeExecutor:
-    return NodeExecutor.__new__(NodeExecutor)
+    return NodeExecutor(engine=MagicMock())
 
 
 def _make_node(name: str) -> MagicMock:
@@ -50,9 +48,10 @@ class TestNodeExecutorContextVar:
             captured.append(current_executing_node_name.get())
             return _success_result()
 
-        with patch(_GRIPTAPE_NODES_PATH) as mock_gn:
-            mock_gn.ahandle_request = AsyncMock(side_effect=fake_handle)
-            await _make_executor().execute(node)
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        mock_engine.ahandle_request = AsyncMock(side_effect=fake_handle)
+        await executor.execute(node)
 
         assert captured == ["TestNode"]
 
@@ -61,9 +60,10 @@ class TestNodeExecutorContextVar:
         """The ContextVar is reset to None after execute() completes successfully."""
         node = _make_node("TestNode")
 
-        with patch(_GRIPTAPE_NODES_PATH) as mock_gn:
-            mock_gn.ahandle_request = AsyncMock(return_value=_success_result())
-            await _make_executor().execute(node)
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        mock_engine.ahandle_request = AsyncMock(return_value=_success_result())
+        await executor.execute(node)
 
         assert current_executing_node_name.get() is None
 
@@ -72,11 +72,12 @@ class TestNodeExecutorContextVar:
         """The ContextVar is reset to None even when dispatch raises an exception."""
         node = _make_node("TestNode")
 
-        with patch(_GRIPTAPE_NODES_PATH) as mock_gn:
-            mock_gn.ahandle_request = AsyncMock(side_effect=RuntimeError("node failed"))
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        mock_engine.ahandle_request = AsyncMock(side_effect=RuntimeError("node failed"))
 
-            with pytest.raises(RuntimeError, match="node failed"):
-                await _make_executor().execute(node)
+        with pytest.raises(RuntimeError, match="node failed"):
+            await executor.execute(node)
 
         assert current_executing_node_name.get() is None
 
@@ -93,14 +94,14 @@ class TestNodeExecutorContextVar:
             results[request.node_name] = current_executing_node_name.get()
             return _success_result()
 
-        with patch(_GRIPTAPE_NODES_PATH) as mock_gn:
-            mock_gn.ahandle_request = AsyncMock(side_effect=fake_handle)
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        mock_engine.ahandle_request = AsyncMock(side_effect=fake_handle)
 
-            executor = _make_executor()
-            await asyncio.gather(
-                executor.execute(node_a),
-                executor.execute(node_b),
-            )
+        await asyncio.gather(
+            executor.execute(node_a),
+            executor.execute(node_b),
+        )
 
         assert results["NodeA"] == "NodeA"
         assert results["NodeB"] == "NodeB"

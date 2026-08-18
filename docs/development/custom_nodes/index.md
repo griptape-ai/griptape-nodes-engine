@@ -106,6 +106,7 @@ class MyNode(DataNode):
 - **[Working with the Project System](project_system.md)** — Saving files through situations, macros, and `ProjectFileParameter`
 - **[Best Practices and Error Handling](error_handling.md)** — Secrets, imports, parameter payload size, validation, error handling, and logging
 - **[Authoring Libraries](authoring_libraries.md)** — Library manifests, declarations, dependency management, and contributing to the standard library
+- **[Advanced Libraries](advanced_libraries.md)** — `AdvancedNodeLibrary` lifecycle hooks, library-owned request handlers, and registering node types without listing them in the manifest
 - **[Custom Widgets](custom_widgets.md)** — Custom JavaScript widget components and the widget testbed
 - **[Patterns and Examples](examples.md)** — Advanced patterns from production nodes and quick-reference material
 - **[Node Isolation with Workers](node_isolation_with_workers.md)** — Running a library isolated in a worker subprocess

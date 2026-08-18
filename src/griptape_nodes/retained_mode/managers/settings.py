@@ -21,6 +21,11 @@ WORKER_HEARTBEAT_INTERVAL_KEY = "worker.heartbeat_interval_s"
 WORKER_HEARTBEAT_TIMEOUT_KEY = "worker.heartbeat_timeout_s"
 WORKER_HEARTBEAT_STARTUP_GRACE_KEY = "worker.heartbeat_startup_grace_s"
 DISCOVERY_MAX_DEPTH_KEY = "discovery_max_depth"
+# The `Settings.libraries_directory` field below, named here so every reader of it -- the live
+# libraries root, the provisioning preview, the offline libraries-root resolver, and the packager --
+# agrees on both the key and what a missing value means.
+LIBRARIES_DIRECTORY_KEY = "libraries_directory"
+DEFAULT_LIBRARIES_DIRECTORY = "libraries"
 LIBRARY_DEPENDENCY_INSTALL_BEHAVIOR_KEY = "library.dependency_install_behavior"
 LIBRARY_MINIMUM_RELEASE_AGE_KEY = "library.minimum_release_age"
 LIBRARY_LAZY_NODE_LOADING_KEY = "library.lazy_node_loading"

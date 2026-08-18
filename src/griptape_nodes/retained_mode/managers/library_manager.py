@@ -37,6 +37,7 @@ from griptape_nodes.common.strict_mode import (
 from griptape_nodes.common.strict_mode_checks import RULES
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import BaseNode
+from griptape_nodes.exe_types.workflow_node import WorkflowNodeDefinitionError, build_workflow_node_class
 from griptape_nodes.files.path_utils import canonicalize_for_identity, canonicalize_for_io, resolve_workspace_path
 from griptape_nodes.node_library.library_declarations import (
     LibraryDeclaration,
@@ -53,14 +54,17 @@ from griptape_nodes.node_library.library_registry import (
     LibraryMetadata,
     LibraryNameAndVersion,
     LibraryRegistry,
+    LibraryRegistryError,
     LibrarySchema,
     NodeDefinition,
     NodeMetadata,
+    WorkflowNodeDefinition,
 )
 from griptape_nodes.node_library.library_validation import (
     detect_retired_node_declarations,
     validate_library_declarations,
 )
+from griptape_nodes.node_library.workflow_registry import WorkflowMetadataError, read_workflow_metadata
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import (
     AppInitializationComplete,
@@ -227,10 +231,12 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     RequestHandlersWorkerIncompatibleProblem,
     SandboxDirectoryMissingProblem,
     UpdateConfigCategoryProblem,
+    WorkflowNodeLoadProblem,
 )
 from griptape_nodes.retained_mode.managers.os_manager import OSManager
 from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
 from griptape_nodes.retained_mode.managers.settings import (
+    LIBRARIES_DIRECTORY_KEY,
     LIBRARIES_TO_DOWNLOAD_KEY,
     LIBRARIES_TO_REGISTER_KEY,
     LIBRARY_DEPENDENCY_INSTALL_BEHAVIOR_KEY,
@@ -565,6 +571,12 @@ class LibraryManager(EngineScoped):
     # actually loads (sys.modules satisfies imports from then on) or when its library unloads.
     _pending_stable_module_loaders: dict[str, Callable[[], ModuleType]]  # stable_namespace -> module loader
     _library_to_pending_stable_namespaces: dict[str, set[str]]  # library_name -> pending stable_namespaces
+    # Libraries whose node modules were already imported when they were unloaded. Python caches
+    # modules process-wide, so re-registering such a library cannot replace the code already in
+    # memory: the helper packages its node files import stay at the version this process first
+    # imported. Only an engine restart clears that, so these names are remembered for the life of
+    # the process and used to explain import failures the artist would otherwise see bare.
+    _libraries_reloaded_after_import: set[str]
     # Meta-path finder that resolves stable namespaces for pending (lazy) node modules.
     _stable_namespace_finder: StableNamespaceImportFinder
     # Callbacks invoked immediately before all libraries are reloaded.
@@ -581,6 +593,7 @@ class LibraryManager(EngineScoped):
         self._library_to_stable_modules = {}
         self._pending_stable_module_loaders = {}
         self._library_to_pending_stable_namespaces = {}
+        self._libraries_reloaded_after_import = set()
         self._install_stable_namespace_finder()
         # Two separate handler registration systems exist in this manager:
         #
@@ -941,6 +954,90 @@ class LibraryManager(EngineScoped):
         if library_info is None:
             return None
         return self.collate_problems_for_lib_info(library_info)
+
+    def get_library_name_for_node_type(self, node_type: str) -> str | None:
+        """The library that provides a node type, or None when it cannot be pinned to one.
+
+        A node type several libraries provide has no single owner. A node type no library provides
+        may still be one whose module failed to import, which registers nothing but does record the
+        failure against the library that owns the node file.
+
+        Args:
+            node_type: Node type to find the providing library for
+        """
+        try:
+            library = LibraryRegistry.get_library_for_node_type(node_type)
+        except LibraryRegistryError:
+            return self._library_name_reporting_node_import_failure(node_type)
+        return library.get_library_data().name
+
+    def explain_stale_module_failure(self, library_name: str) -> str | None:
+        """An artist-facing explanation for an import failure caused by a mid-session reload.
+
+        Returns None when this library has not been reloaded after its modules were imported, in
+        which case an import failure means the library itself is broken and needs no restart.
+
+        Args:
+            library_name: Name of the library whose node failed to load
+        """
+        if not self._was_reloaded_after_its_modules_were_imported(library_name):
+            return None
+
+        return (
+            f"Library '{library_name}' was reloaded after this engine had already loaded its nodes, "
+            f"so the engine is still running the code it loaded first. Restart the engine to pick up "
+            f"the new code."
+        )
+
+    def _library_name_reporting_node_import_failure(self, node_type: str) -> str | None:
+        """The library that recorded an import failure for a node type, or None when none did.
+
+        A node type whose module failed to import registers nothing, so the recorded failure is the
+        only thing that can name its library.
+
+        Args:
+            node_type: Class name of the node type to look for
+        """
+        for library_info in self._library_file_path_to_info.values():
+            for problem in library_info.problems:
+                if isinstance(problem, NodeModuleImportProblem) and problem.class_name == node_type:
+                    return library_info.library_name
+        return None
+
+    def _explain_restart_after_reload(self, library_name: str) -> str | None:
+        """The restart explanation to report after reloading a library, or None when it took cleanly.
+
+        Only speaks up when the reload actually failed to import a node module. A library whose
+        nodes took the new code needs no restart, and warning on every reload would train artists
+        to ignore the message.
+
+        Args:
+            library_name: Name of the library that was just reloaded
+        """
+        if not self._library_has_node_import_problems(library_name):
+            return None
+        return self.explain_stale_module_failure(library_name)
+
+    def _was_reloaded_after_its_modules_were_imported(self, library_name: str) -> bool:
+        """Whether this library was reloaded in this session after its node modules had loaded.
+
+        See `_libraries_reloaded_after_import` for why that leaves this process on the old code.
+
+        Args:
+            library_name: Name of the library to ask about
+        """
+        return library_name in self._libraries_reloaded_after_import
+
+    def _library_has_node_import_problems(self, library_name: str) -> bool:
+        """Whether a library's last load recorded any node module that failed to import.
+
+        Args:
+            library_name: Name of the library to ask about
+        """
+        library_info = self.get_library_info_by_library_name(library_name)
+        if library_info is None:
+            return False
+        return any(isinstance(problem, NodeModuleImportProblem) for problem in library_info.problems)
 
     def on_register_event_handler(
         self,
@@ -2055,11 +2152,23 @@ class LibraryManager(EngineScoped):
 
                 library_name = metadata_result.library_schema.name
 
+                # Entering METADATA_LOADED directly, so the DISCOVERED-phase writer that
+                # normally resolves requires_worker never runs for this registration.
+                # Resolve it here too, or a library whose manifest suggests worker mode
+                # loads in-process when registered by file path (e.g. added to a running
+                # engine from the editor) -- its advanced module would then import in the
+                # orchestrator without the worker-managed dependency environment.
+                requires_worker = self._resolve_requires_worker(
+                    lib_info.registered_path if lib_info else None,
+                    metadata_result.library_schema.metadata.declarations,
+                )
+
                 # Update or create LibraryInfo
                 if lib_info:
                     lib_info.library_name = library_name
                     lib_info.library_version = metadata_result.library_schema.metadata.library_version
                     lib_info.lifecycle_state = LibraryManager.LibraryLifecycleState.METADATA_LOADED
+                    lib_info.requires_worker = requires_worker
                 else:
                     # Create new LibraryInfo since it doesn't exist yet
                     lib_info = LibraryManager.LibraryInfo(
@@ -2070,6 +2179,7 @@ class LibraryManager(EngineScoped):
                         library_version=metadata_result.library_schema.metadata.library_version,
                         fitness=LibraryManager.LibraryFitness.NOT_EVALUATED,
                         problems=[],
+                        requires_worker=requires_worker,
                     )
                     self._library_file_path_to_info[file_path] = lib_info
             else:
@@ -2364,9 +2474,26 @@ class LibraryManager(EngineScoped):
                         # Add library directory and venv site-packages to sys.path
                         await self._add_library_paths_to_sys_path(library_data.name, file_path, base_dir)
 
-                        # Load the advanced library module if specified
+                        # Load the advanced library module if specified. Worker-delegated
+                        # libraries skip this on the orchestrator, mirroring the venv/pip and
+                        # node-import skips above and below: the module executes in this
+                        # process, its third-party imports resolve against the library venv,
+                        # and the orchestrator deliberately never created that venv -- so any
+                        # manifest dependency it imports would raise ModuleNotFoundError and
+                        # kill the registration. Nothing on the orchestrator invokes the
+                        # advanced hooks for a worker library anyway (node loading, their only
+                        # load-time caller, is skipped), and generate_new_library accepts
+                        # advanced_library=None. The worker loads the module in its own
+                        # process with the venv populated.
                         advanced_library_instance = None
-                        if library_data.advanced_library_path:
+                        skip_advanced_library = library_info.requires_worker and not self._is_worker
+                        if skip_advanced_library and library_data.advanced_library_path:
+                            logger.debug(
+                                "Skipping Advanced Library load for worker-delegated library '%s' on the "
+                                "orchestrator; the worker loads it in its own process.",
+                                library_data.name,
+                            )
+                        elif library_data.advanced_library_path:
                             try:
                                 advanced_library_instance = self._load_advanced_library_module(
                                     library_data=library_data,
@@ -2896,7 +3023,11 @@ class LibraryManager(EngineScoped):
             details = f"Attempted to unload library '{request.library_name}'. Failed due to {e}"
             return UnloadLibraryFromRegistryResultFailure(result_details=details)
 
-        # Clean up all stable module aliases for this library
+        # Clean up all stable module aliases for this library. Note first whether any of its node
+        # modules had actually been imported: if so, this process is stuck with that code and the
+        # library's next load cannot replace it.
+        if self._library_to_stable_modules.get(request.library_name):
+            self._libraries_reloaded_after_import.add(request.library_name)
         self._unregister_all_stable_module_aliases_for_library(request.library_name)
 
         # Remove the library from our library info list. This prevents it from still showing
@@ -3613,6 +3744,18 @@ class LibraryManager(EngineScoped):
         if request.project_id == SYSTEM_DEFAULTS_KEY:
             merged = config_mgr.compute_system_defaults_provisioning_config()
         else:
+            # Mirror the activation gate: a project whose declared workspace_dir/libraries_dir
+            # cannot be resolved will be refused by activation, so previewing a plan built from
+            # fallback locations would show the user changes that can never be applied.
+            project_info = self.engine.project_manager.project_info_for_request(request.project_id)
+            if project_info is not None:
+                unresolvable = self.engine.project_manager.unresolvable_declared_path_messages(project_info)
+                if unresolvable:
+                    return PreviewProjectProvisioningResultFailure(
+                        result_details=f"Attempted to preview provisioning for project '{request.project_id}'. "
+                        f"Failed because its declared paths cannot be resolved, so activation would refuse it. "
+                        f"{' '.join(unresolvable)}",
+                    )
             dirs = await self.engine.project_manager.resolve_provisioning_config_dirs(request.project_id)
             if dirs is None:
                 return PreviewProjectProvisioningResultFailure(
@@ -3642,10 +3785,7 @@ class LibraryManager(EngineScoped):
         if libraries_root is not None:
             libraries_path = libraries_root
         else:
-            libraries_path = resolve_workspace_path(
-                Path(get_dot_value(merged, "libraries_directory")),
-                config_mgr.configured_global_workspace_path(),
-            )
+            libraries_path = config_mgr.default_libraries_root(get_dot_value(merged, LIBRARIES_DIRECTORY_KEY))
 
         actions = await asyncio.gather(
             *(self._plan_one_library_provisioning(download, libraries_path) for download in downloads)
@@ -4516,6 +4656,53 @@ class LibraryManager(EngineScoped):
             library_info.problems.append(library_problem)
         return True
 
+    def _register_workflow_node(
+        self,
+        workflow_node_definition: WorkflowNodeDefinition,
+        base_dir: Path,
+        library: Library,
+        library_info: LibraryInfo,
+    ) -> bool:
+        """Generate and register a node type from a saved workflow file.
+
+        The workflow's metadata header supplies the saved input/output shape that becomes the node's
+        parameters. Returns False (recording a library problem) when the header cannot be read or
+        carries no shape.
+        """
+        workflow_file_path = resolve_workspace_path(Path(workflow_node_definition.workflow_path), base_dir)
+        try:
+            workflow_metadata = read_workflow_metadata(workflow_file_path)
+        except WorkflowMetadataError as err:
+            library_info.problems.append(
+                WorkflowNodeLoadProblem(
+                    node_type=workflow_node_definition.node_type,
+                    workflow_path=str(workflow_file_path),
+                    error_message=str(err),
+                )
+            )
+            return False
+
+        try:
+            node_class = build_workflow_node_class(
+                node_type=workflow_node_definition.node_type,
+                workflow_file_path=workflow_file_path,
+                workflow_metadata=workflow_metadata,
+            )
+        except WorkflowNodeDefinitionError as err:
+            library_info.problems.append(
+                WorkflowNodeLoadProblem(
+                    node_type=workflow_node_definition.node_type,
+                    workflow_path=str(workflow_file_path),
+                    error_message=str(err),
+                )
+            )
+            return False
+
+        library_problem = library.register_new_node_type(node_class, metadata=workflow_node_definition.metadata)
+        if library_problem is not None:
+            library_info.problems.append(library_problem)
+        return True
+
     def _attempt_load_nodes_from_library(  # noqa: PLR0912, PLR0915, C901
         self,
         library_data: LibrarySchema,
@@ -4595,6 +4782,12 @@ class LibraryManager(EngineScoped):
                 )
 
             if node_registered:
+                any_nodes_loaded_successfully = True
+
+        # Nodes generated from saved workflow files. These need no Python module, so they are always
+        # built now rather than lazily: reading a workflow's metadata header is cheap.
+        for workflow_node_definition in library_data.workflow_nodes or []:
+            if self._register_workflow_node(workflow_node_definition, base_dir, library, library_info):
                 any_nodes_loaded_successfully = True
 
         # Register widgets and check for duplicates
@@ -6175,10 +6368,34 @@ class LibraryManager(EngineScoped):
 
         new_version = reload_result
 
-        details = f"Successfully updated Library '{library_name}' from version {old_version} to {new_version}."
+        return self._build_library_update_result(
+            library_name=library_name, old_version=old_version, new_version=new_version
+        )
+
+    def _build_library_update_result(
+        self, *, library_name: str, old_version: str, new_version: str
+    ) -> UpdateLibraryResultSuccess:
+        """Report an update that landed on disk, flagging a restart when this engine cannot run it.
+
+        Args:
+            library_name: Name of the updated library
+            old_version: Version the library was on before the update
+            new_version: Version now on disk
+        """
+        stale_module_explanation = self._explain_restart_after_reload(library_name)
+
+        if stale_module_explanation is None:
+            details = f"Successfully updated Library '{library_name}' from version {old_version} to {new_version}."
+            return UpdateLibraryResultSuccess(old_version=old_version, new_version=new_version, result_details=details)
+
+        details = (
+            f"Updated Library '{library_name}' from version {old_version} to {new_version} on disk. "
+            f"{stale_module_explanation}"
+        )
         return UpdateLibraryResultSuccess(
             old_version=old_version,
             new_version=new_version,
+            restart_required=True,
             result_details=details,
         )
 
@@ -6236,12 +6453,48 @@ class LibraryManager(EngineScoped):
         except GitError:
             new_ref = "unknown"
 
-        details = f"Successfully switched Library '{library_name}' from '{old_ref}' (version {old_version}) to '{new_ref}' (version {new_version})."
+        return self._build_library_ref_switch_result(
+            library_name=library_name,
+            old_ref=old_ref,
+            new_ref=new_ref,
+            old_version=old_version,
+            new_version=new_version,
+        )
+
+    def _build_library_ref_switch_result(
+        self, *, library_name: str, old_ref: str, new_ref: str, old_version: str, new_version: str
+    ) -> SwitchLibraryRefResultSuccess:
+        """Report a ref switch that landed on disk, flagging a restart when this engine cannot run it.
+
+        Args:
+            library_name: Name of the switched library
+            old_ref: Branch or tag the library was on before the switch
+            new_ref: Branch or tag now checked out
+            old_version: Version the library was on before the switch
+            new_version: Version now on disk
+        """
+        stale_module_explanation = self._explain_restart_after_reload(library_name)
+
+        if stale_module_explanation is None:
+            details = f"Successfully switched Library '{library_name}' from '{old_ref}' (version {old_version}) to '{new_ref}' (version {new_version})."
+            return SwitchLibraryRefResultSuccess(
+                old_ref=old_ref,
+                new_ref=new_ref,
+                old_version=old_version,
+                new_version=new_version,
+                result_details=details,
+            )
+
+        details = (
+            f"Switched Library '{library_name}' from '{old_ref}' (version {old_version}) to '{new_ref}' "
+            f"(version {new_version}) on disk. {stale_module_explanation}"
+        )
         return SwitchLibraryRefResultSuccess(
             old_ref=old_ref,
             new_ref=new_ref,
             old_version=old_version,
             new_version=new_version,
+            restart_required=True,
             result_details=details,
         )
 

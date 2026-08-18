@@ -23,6 +23,28 @@ from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.settings import WorkflowExecutionMode
 
 
+def _engine_with_execution_mode(mode: WorkflowExecutionMode, dag_builder: DagBuilder) -> MagicMock:
+    """Build a stub engine reporting `mode` and handing back `dag_builder` as the global one.
+
+    ControlFlowMachine reads its execution mode and its global DagBuilder off the engine it is
+    handed, so a stub engine replaces what used to be a patch of the process-wide facade.
+    """
+    engine = MagicMock()
+    engine.flow_manager.global_dag_builder = dag_builder
+    engine.config_manager.get_config_value.side_effect = lambda key, default=None: {
+        "workflow_execution_mode": mode,
+        "max_nodes_in_parallel": 5,
+    }.get(key, default)
+    return engine
+
+
+def _engine_with_connections(connections: MagicMock) -> MagicMock:
+    """Build a stub engine whose flow_manager hands back `connections`."""
+    engine = MagicMock()
+    engine.flow_manager.get_connections.return_value = connections
+    return engine
+
+
 class TestParallelFlowExecution:
     """Test cases for parallel flow execution functionality."""
 
@@ -30,31 +52,18 @@ class TestParallelFlowExecution:
         """Test that ControlFlowMachine creates ParallelResolutionMachine with DAG builder when execution type is PARALLEL."""
         flow_name = "test_flow"
 
-        # Mock the FlowManager to return a DAG builder
+        # The engine reports PARALLEL execution mode and hands back the global DAG builder
         mock_dag_builder = MagicMock(spec=DagBuilder)
+        engine = _engine_with_execution_mode(WorkflowExecutionMode.PARALLEL, mock_dag_builder)
 
-        with (
-            patch("griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes.FlowManager") as mock_flow_manager,
-            patch("griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes.ConfigManager") as mock_config_manager,
-        ):
-            mock_flow_manager.return_value.global_dag_builder = mock_dag_builder
+        # Create ControlFlowMachine - it will read PARALLEL from config
+        control_flow = ControlFlowMachine(flow_name, engine=engine)
 
-            # Mock ConfigManager to return PARALLEL execution mode
-            mock_config = MagicMock()
-            mock_config_manager.return_value = mock_config
-            mock_config.get_config_value.side_effect = lambda key, default=None: {
-                "workflow_execution_mode": WorkflowExecutionMode.PARALLEL,
-                "max_nodes_in_parallel": 5,
-            }.get(key, default)
+        # Verify that a ParallelResolutionMachine was created
+        assert isinstance(control_flow._context.resolution_machine, ParallelResolutionMachine)
 
-            # Create ControlFlowMachine - it will read PARALLEL from config
-            control_flow = ControlFlowMachine(flow_name)
-
-            # Verify that a ParallelResolutionMachine was created
-            assert isinstance(control_flow._context.resolution_machine, ParallelResolutionMachine)
-
-            # Verify that the ParallelResolutionMachine has the correct DAG builder
-            assert control_flow._context.resolution_machine._context.dag_builder is mock_dag_builder
+        # Verify that the ParallelResolutionMachine has the correct DAG builder
+        assert control_flow._context.resolution_machine._context.dag_builder is mock_dag_builder
 
     def test_control_flow_machine_uses_parallel_for_sequential_mode(self) -> None:
         """Test that ControlFlowMachine uses ParallelResolutionMachine with max_nodes_in_parallel=1 when execution type is SEQUENTIAL.
@@ -64,28 +73,17 @@ class TestParallelFlowExecution:
         flow_name = "test_flow"
 
         mock_dag_builder = MagicMock(spec=DagBuilder)
+        engine = _engine_with_execution_mode(WorkflowExecutionMode.SEQUENTIAL, mock_dag_builder)
 
-        with (
-            patch("griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes.FlowManager") as mock_flow_manager,
-            patch("griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes.ConfigManager") as mock_config_manager,
-        ):
-            mock_flow_manager.return_value.global_dag_builder = mock_dag_builder
-            mock_config = MagicMock()
-            mock_config_manager.return_value = mock_config
-            mock_config.get_config_value.side_effect = lambda key, default=None: {
-                "workflow_execution_mode": WorkflowExecutionMode.SEQUENTIAL,
-                "max_nodes_in_parallel": 5,
-            }.get(key, default)
+        # Create ControlFlowMachine - it will read SEQUENTIAL from config
+        control_flow = ControlFlowMachine(flow_name, engine=engine)
 
-            # Create ControlFlowMachine - it will read SEQUENTIAL from config
-            control_flow = ControlFlowMachine(flow_name)
-
-            # Verify ParallelResolutionMachine was created (SEQUENTIAL now maps to PARALLEL)
-            assert isinstance(control_flow._context.resolution_machine, ParallelResolutionMachine)
-            # Verify max_nodes_in_parallel was overridden to 1 for sequential behavior
-            assert control_flow._context.resolution_machine._context.max_nodes_in_parallel == 1
-            # Verify DAG builder was set correctly
-            assert control_flow._context.resolution_machine._context.dag_builder is mock_dag_builder
+        # Verify ParallelResolutionMachine was created (SEQUENTIAL now maps to PARALLEL)
+        assert isinstance(control_flow._context.resolution_machine, ParallelResolutionMachine)
+        # Verify max_nodes_in_parallel was overridden to 1 for sequential behavior
+        assert control_flow._context.resolution_machine._context.max_nodes_in_parallel == 1
+        # Verify DAG builder was set correctly
+        assert control_flow._context.resolution_machine._context.dag_builder is mock_dag_builder
 
     def test_parallel_resolution_machine_initializes_with_dag_builder(self) -> None:
         """Test that ParallelResolutionMachine properly initializes with a DAG builder."""
@@ -303,37 +301,35 @@ class TestFlowManagerDagBuilderIntegration:
     def test_dag_builder_prevents_duplicate_node_addition_after_clear(self) -> None:
         """Test that DAG builder prevents duplicate node addition and allows re-addition after clear."""
         # This test verifies the fix for the original issue
-        dag_builder = DagBuilder()
         mock_node = MagicMock(spec=BaseNode)
         mock_node.name = "test_node"
         mock_node.parameters = []
 
-        # Mock FlowManager to return no connections
-        with patch("griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes.FlowManager") as mock_flow_manager:
-            mock_connections = MagicMock()
-            mock_connections.get_connected_node.return_value = None
-            mock_flow_manager.return_value.get_connections.return_value = mock_connections
+        # The engine reports no connections
+        mock_connections = MagicMock()
+        mock_connections.get_connected_node.return_value = None
+        dag_builder = DagBuilder(_engine_with_connections(mock_connections))
 
-            # First addition should succeed
-            added_nodes_1 = dag_builder.add_node_with_dependencies(mock_node)
-            assert len(added_nodes_1) == 1
-            default_graph = dag_builder.graphs.get("default")
-            assert default_graph is not None
-            assert "test_node" in default_graph.nodes()
+        # First addition should succeed
+        added_nodes_1 = dag_builder.add_node_with_dependencies(mock_node)
+        assert len(added_nodes_1) == 1
+        default_graph = dag_builder.graphs.get("default")
+        assert default_graph is not None
+        assert "test_node" in default_graph.nodes()
 
-            # Second addition should return early (no nodes added)
-            added_nodes_2 = dag_builder.add_node_with_dependencies(mock_node)
-            assert len(added_nodes_2) == 0  # Node already exists, so no new nodes added
+        # Second addition should return early (no nodes added)
+        added_nodes_2 = dag_builder.add_node_with_dependencies(mock_node)
+        assert len(added_nodes_2) == 0  # Node already exists, so no new nodes added
 
-            # Clear DAG builder
-            dag_builder.clear()
+        # Clear DAG builder
+        dag_builder.clear()
 
-            # Third addition should succeed again after clear
-            added_nodes_3 = dag_builder.add_node_with_dependencies(mock_node)
-            assert len(added_nodes_3) == 1
-            default_graph = dag_builder.graphs.get("default")
-            assert default_graph is not None
-            assert "test_node" in default_graph.nodes()
+        # Third addition should succeed again after clear
+        added_nodes_3 = dag_builder.add_node_with_dependencies(mock_node)
+        assert len(added_nodes_3) == 1
+        default_graph = dag_builder.graphs.get("default")
+        assert default_graph is not None
+        assert "test_node" in default_graph.nodes()
 
 
 class TestDagBuilderLifecycle:
@@ -418,15 +414,14 @@ class TestCollectValuesFromUpstreamNodes:
         node_reference = MagicMock()
         node_reference.node_reference = locked_node
 
-        with (
-            patch("griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes.FlowManager") as mock_flow_manager,
-            patch("griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes.get_instance") as mock_get_instance,
-        ):
-            await ExecuteDagState.collect_values_from_upstream_nodes(node_reference)
+        engine = MagicMock()
+        engine.ahandle_request = AsyncMock()
 
-            # No connections were inspected and no set-parameter request was issued.
-            mock_flow_manager.return_value.get_connections.assert_not_called()
-            mock_get_instance.return_value.ahandle_request.assert_not_called()
+        await ExecuteDagState.collect_values_from_upstream_nodes(engine, node_reference)
+
+        # No connections were inspected and no set-parameter request was issued.
+        engine.flow_manager.get_connections.assert_not_called()
+        engine.ahandle_request.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_unlocked_node_collects_upstream_value(self) -> None:
@@ -450,31 +445,25 @@ class TestCollectValuesFromUpstreamNodes:
         node_reference = MagicMock()
         node_reference.node_reference = target_node
 
-        with (
-            patch("griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes.FlowManager") as mock_flow_manager,
-            patch("griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes.get_instance") as mock_get_instance,
-        ):
-            mock_connections = MagicMock()
-            mock_connections.get_connected_node.return_value = (upstream_node, upstream_parameter)
-            mock_flow_manager.return_value.get_connections.return_value = mock_connections
+        mock_connections = MagicMock()
+        mock_connections.get_connected_node.return_value = (upstream_node, upstream_parameter)
+        engine = _engine_with_connections(mock_connections)
 
-            mock_instance = MagicMock()
-            ahandle_request = AsyncMock(return_value=MagicMock())
-            mock_instance.ahandle_request = ahandle_request
-            mock_get_instance.return_value = mock_instance
+        ahandle_request = AsyncMock(return_value=MagicMock())
+        engine.ahandle_request = ahandle_request
 
-            await ExecuteDagState.collect_values_from_upstream_nodes(node_reference)
+        await ExecuteDagState.collect_values_from_upstream_nodes(engine, node_reference)
 
-            mock_connections.get_connected_node.assert_called_once_with(
-                target_node, target_parameter, direction=Direction.UPSTREAM
-            )
-            ahandle_request.assert_awaited_once()
-            await_args = ahandle_request.await_args
-            assert await_args is not None
-            request = await_args.args[0]
-            assert request.node_name == "target_node"
-            assert request.parameter_name == "prompt"
-            assert request.value == "hello"
+        mock_connections.get_connected_node.assert_called_once_with(
+            target_node, target_parameter, direction=Direction.UPSTREAM
+        )
+        ahandle_request.assert_awaited_once()
+        await_args = ahandle_request.await_args
+        assert await_args is not None
+        request = await_args.args[0]
+        assert request.node_name == "target_node"
+        assert request.parameter_name == "prompt"
+        assert request.value == "hello"
 
 
 class TestParallelResolutionNodeDoneWhenTaskCompletes:

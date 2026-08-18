@@ -15,6 +15,7 @@ from griptape_nodes.retained_mode.events.secrets_events import (
     DeleteSecretValueResultFailure,
     DeleteSecretValueResultSuccess,
     GetAllSecretValuesRequest,
+    GetAllSecretValuesResultFailure,
     GetAllSecretValuesResultSuccess,
     GetSecretValueRequest,
     GetSecretValueResultFailure,
@@ -172,7 +173,18 @@ class SecretsManager:
         return SetSecretValueResultSuccess(result_details=f"Successfully set secret value for key: {secret_name}")
 
     def on_handle_get_all_secret_values_request(self, request: GetAllSecretValuesRequest) -> ResultPayload:  # noqa: ARG002
-        secret_values = dotenv_values(ENV_VAR_PATH)
+        # An unreadable file fails; a missing one is a real "no secrets yet" and succeeds
+        # empty, so callers replacing content with this result cannot delete credentials
+        # because of a read error.
+        if ENV_VAR_PATH.exists():
+            try:
+                secret_values = dotenv_values(ENV_VAR_PATH)
+            except OSError as err:
+                details = f"Attempted to read stored secrets from '{ENV_VAR_PATH}'. Failed because the file could not be read: {err}"
+                logger.error(details)
+                return GetAllSecretValuesResultFailure(result_details=details)
+        else:
+            secret_values = {}
 
         return GetAllSecretValuesResultSuccess(
             values=secret_values, result_details=f"Successfully retrieved {len(secret_values)} secret values"

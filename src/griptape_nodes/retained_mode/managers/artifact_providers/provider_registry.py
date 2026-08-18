@@ -1,23 +1,31 @@
 """Registry for artifact provider classes."""
 
-import logging
+from __future__ import annotations
 
-from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_provider import (
-    BaseArtifactProvider,
-)
+import logging
+from typing import TYPE_CHECKING
+
+from griptape_nodes.retained_mode.engine import EngineScoped
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.engine import Engine
+    from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_provider import (
+        BaseArtifactProvider,
+    )
 
 logger = logging.getLogger("griptape_nodes")
 
 
-class ProviderRegistry:
+class ProviderRegistry(EngineScoped):
     """Registry for artifact provider classes with lazy instantiation.
 
     Manages provider registration, lookup by friendly name or file format,
     and lazy instantiation of provider instances.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, engine: Engine | None = None) -> None:
         """Initialize empty registry."""
+        super().__init__(engine)
         self._provider_classes: list[type[BaseArtifactProvider]] = []
         self._provider_instances: dict[type[BaseArtifactProvider], BaseArtifactProvider] = {}
         self._file_format_to_provider_class: dict[str, list[type[BaseArtifactProvider]]] = {}
@@ -100,7 +108,7 @@ class ProviderRegistry:
         """
         if provider_class not in self._provider_instances:
             try:
-                self._provider_instances[provider_class] = provider_class(registry=self)
+                self._provider_instances[provider_class] = provider_class(registry=self, engine=self.engine)
             except Exception as e:
                 logger.error("Failed to instantiate provider %s: %s", provider_class.__name__, e)
                 msg = f"Failed to instantiate provider {provider_class.__name__}: {e}"

@@ -481,7 +481,7 @@ class AgentManager(EngineScoped):
         event_manager = self.engine.event_manager
 
         def emit(event: RunEvent) -> None:
-            payload = _run_event_to_payload(event)
+            payload = _run_event_to_payload(event, thread_id)
             if payload is None:
                 return
             event_manager.put_event(
@@ -1267,26 +1267,31 @@ def _resolve_image_media_type(response: httpx.Response, url: str) -> str:
     return _DEFAULT_IMAGE_MEDIA_TYPE
 
 
-def _run_event_to_payload(event: RunEvent) -> Any:
+def _run_event_to_payload(event: RunEvent, thread_id: str) -> Any:
     """Translate a runner event into the matching ExecutionPayload.
+
+    ``thread_id`` is stamped onto every payload so a client with several chat
+    surfaces open can route each delta to the conversation it belongs to.
 
     Returns ``None`` for event kinds that don't have a UI counterpart yet.
     """
     if isinstance(event, TextDelta):
-        return AgentStreamEvent(token=event.delta)
+        return AgentStreamEvent(thread_id=thread_id, token=event.delta)
     if isinstance(event, ToolCall):
         return AgentToolCallEvent(
+            thread_id=thread_id,
             tool_call_id=event.tool_call_id,
             tool_name=event.tool_name,
             args=event.args,
         )
     if isinstance(event, ToolResult):
         return AgentToolResultEvent(
+            thread_id=thread_id,
             tool_call_id=event.tool_call_id,
             tool_name=event.tool_name,
             content=event.content,
             is_error=event.is_error,
         )
     if isinstance(event, ThinkingDelta):
-        return AgentThinkingEvent(delta=event.delta)
+        return AgentThinkingEvent(thread_id=thread_id, delta=event.delta)
     return None

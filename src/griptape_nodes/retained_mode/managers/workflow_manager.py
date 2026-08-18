@@ -6,7 +6,6 @@ import logging
 import pickle
 import re
 import sys
-import tomllib
 from collections import defaultdict
 from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import UTC, datetime
@@ -40,8 +39,16 @@ from griptape_nodes.files.project_file import SITUATION_TO_FILE_POLICY, ProjectF
 from griptape_nodes.node_library.workflow_registry import (
     Workflow,
     WorkflowMetadata,
+    WorkflowMetadataError,
+    WorkflowMetadataFileError,
+    WorkflowMetadataMissingTableError,
+    WorkflowMetadataSchemaError,
+    WorkflowMetadataSectionCountError,
+    WorkflowMetadataTomlError,
     WorkflowRegistry,
     WorkflowShape,
+    find_metadata_blocks,
+    read_workflow_metadata,
 )
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import (
@@ -627,16 +634,7 @@ class WorkflowManager(EngineScoped):
         with workflow_file_path.open("r", encoding="utf-8") as file:
             workflow_content = file.read()
 
-        # Find the metadata block.
-        regex = r"(?m)^# /// (?P<type>[a-zA-Z0-9-]+)$\s(?P<content>(^#(| .*)$\s)+)^# ///$"
-        matches = list(
-            filter(
-                lambda m: m.group("type") == block_name,
-                re.finditer(regex, workflow_content),
-            )
-        )
-
-        return matches
+        return find_metadata_blocks(workflow_content, block_name)
 
     def print_workflow_load_status(self, min_status: WorkflowStatus = WorkflowStatus.FLAWED) -> None:  # noqa: PLR0915
         workflow_file_paths = self.get_workflows_attempted_to_load()
@@ -1817,75 +1815,10 @@ class WorkflowManager(EngineScoped):
             return LoadWorkflowMetadataResultFailure(result_details=details)
 
         # Find the metadata block.
-        block_name = WorkflowManager.WORKFLOW_METADATA_HEADER
-        matches = self.get_workflow_metadata(complete_file_path, block_name=block_name)
-        if len(matches) != 1:
-            self._workflow_file_path_to_info[str(str_path)] = WorkflowManager.WorkflowInfo(
-                status=WorkflowManager.WorkflowStatus.UNUSABLE,
-                workflow_path=str_path,
-                workflow_name=None,
-                workflow_dependencies=[],
-                problems=[InvalidMetadataSectionCountProblem(section_name=block_name, count=len(matches))],
-            )
-            details = f"Attempted to load workflow metadata for a file at '{complete_file_path}'. Failed as it had {len(matches)} sections titled '{block_name}', and we expect exactly 1 such section."
-            return LoadWorkflowMetadataResultFailure(result_details=details)
-
-        # Now attempt to parse out the metadata section, stripped of comment prefixes.
-        metadata_content_toml = "".join(
-            line[2:] if line.startswith("# ") else line[1:]
-            for line in matches[0].group("content").splitlines(keepends=True)
-        )
-
-        # tomllib, not tomlkit: this is a read-only path, and tomlkit builds a
-        # formatting-preserving document model that costs ~20x more per header. Only the
-        # save path (_generate_workflow_metadata_header) needs tomlkit, to keep the
-        # formatting of headers it rewrites.
-        try:
-            toml_doc = tomllib.loads(metadata_content_toml)
-        except tomllib.TOMLDecodeError as err:
-            self._workflow_file_path_to_info[str(str_path)] = WorkflowManager.WorkflowInfo(
-                status=WorkflowManager.WorkflowStatus.UNUSABLE,
-                workflow_path=str_path,
-                workflow_name=None,
-                workflow_dependencies=[],
-                problems=[InvalidTomlFormatProblem(error_message=str(err))],
-            )
-            details = f"Attempted to load workflow metadata for a file at '{complete_file_path}'. Failed because the metadata was not valid TOML: {err}"
-            return LoadWorkflowMetadataResultFailure(result_details=details)
-
-        tool_header = "tool"
-        griptape_nodes_header = "griptape-nodes"
-        try:
-            griptape_nodes_tool_section = toml_doc[tool_header][griptape_nodes_header]
-        except (KeyError, TypeError) as err:
-            self._workflow_file_path_to_info[str(str_path)] = WorkflowManager.WorkflowInfo(
-                status=WorkflowManager.WorkflowStatus.UNUSABLE,
-                workflow_path=str_path,
-                workflow_name=None,
-                workflow_dependencies=[],
-                problems=[MissingTomlSectionProblem(section_path=f"[{tool_header}.{griptape_nodes_header}]")],
-            )
-            details = f"Attempted to load workflow metadata for a file at '{complete_file_path}'. Failed because the '[{tool_header}.{griptape_nodes_header}]' section could not be found: {err}"
-            return LoadWorkflowMetadataResultFailure(result_details=details)
-
-        try:
-            # Is it kosher?
-            workflow_metadata = WorkflowMetadata.model_validate(griptape_nodes_tool_section)
-        except Exception as err:
-            # No, it is haram.
-            self._workflow_file_path_to_info[str(str_path)] = WorkflowManager.WorkflowInfo(
-                status=WorkflowManager.WorkflowStatus.UNUSABLE,
-                workflow_path=str_path,
-                workflow_name=None,
-                workflow_dependencies=[],
-                problems=[
-                    InvalidMetadataSchemaProblem(
-                        section_path=f"[{tool_header}.{griptape_nodes_header}]", error_message=str(err)
-                    )
-                ],
-            )
-            details = f"Attempted to load workflow metadata for a file at '{complete_file_path}'. Failed because the metadata in the '[{tool_header}.{griptape_nodes_header}]' section did not match the requisite schema with error: {err}"
-            return LoadWorkflowMetadataResultFailure(result_details=details)
+        metadata_or_failure = self._read_workflow_metadata_for_request(complete_file_path, str_path)
+        if isinstance(metadata_or_failure, LoadWorkflowMetadataResultFailure):
+            return metadata_or_failure
+        workflow_metadata = metadata_or_failure
 
         # We have valid dependencies, etc.
         # TODO: validate schema versions, engine versions: https://github.com/griptape-ai/griptape-nodes/issues/617
@@ -2077,6 +2010,71 @@ class WorkflowManager(EngineScoped):
             metadata=workflow_metadata, result_details="Workflow metadata loaded successfully."
         )
 
+    def _read_workflow_metadata_for_request(
+        self, workflow_file_path: Path, workflow_path: str
+    ) -> WorkflowMetadata | LoadWorkflowMetadataResultFailure:
+        """Read a workflow's metadata header, turning each way it can fail into a reportable problem.
+
+        The parsing itself lives in `read_workflow_metadata` so the library loader and this handler
+        read headers the same way. What this adds is the editor's per-stage reporting: each failure
+        becomes the specific problem the workflow-load report displays for it.
+        """
+        try:
+            return read_workflow_metadata(workflow_file_path)
+        except WorkflowMetadataFileError as err:
+            return self._record_workflow_metadata_failure(
+                workflow_path,
+                status=WorkflowManager.WorkflowStatus.MISSING,
+                problem=WorkflowNotFoundProblem(),
+                error=err,
+            )
+        except WorkflowMetadataSectionCountError as err:
+            return self._record_workflow_metadata_failure(
+                workflow_path,
+                status=WorkflowManager.WorkflowStatus.UNUSABLE,
+                problem=InvalidMetadataSectionCountProblem(section_name=err.section_name, count=err.count),
+                error=err,
+            )
+        except WorkflowMetadataTomlError as err:
+            return self._record_workflow_metadata_failure(
+                workflow_path,
+                status=WorkflowManager.WorkflowStatus.UNUSABLE,
+                problem=InvalidTomlFormatProblem(error_message=err.error_message),
+                error=err,
+            )
+        except WorkflowMetadataMissingTableError as err:
+            return self._record_workflow_metadata_failure(
+                workflow_path,
+                status=WorkflowManager.WorkflowStatus.UNUSABLE,
+                problem=MissingTomlSectionProblem(section_path=err.section_path),
+                error=err,
+            )
+        except WorkflowMetadataSchemaError as err:
+            return self._record_workflow_metadata_failure(
+                workflow_path,
+                status=WorkflowManager.WorkflowStatus.UNUSABLE,
+                problem=InvalidMetadataSchemaProblem(section_path=err.section_path, error_message=err.error_message),
+                error=err,
+            )
+
+    def _record_workflow_metadata_failure(
+        self,
+        workflow_path: str,
+        *,
+        status: WorkflowManager.WorkflowStatus,
+        problem: WorkflowProblem,
+        error: WorkflowMetadataError,
+    ) -> LoadWorkflowMetadataResultFailure:
+        """Record why a workflow's metadata header could not be read, and fail the request."""
+        self._workflow_file_path_to_info[workflow_path] = WorkflowManager.WorkflowInfo(
+            status=status,
+            workflow_path=workflow_path,
+            workflow_name=None,
+            workflow_dependencies=[],
+            problems=[problem],
+        )
+        return LoadWorkflowMetadataResultFailure(result_details=str(error))
+
     async def register_workflows_from_config(self, config_section: str) -> None:
         workflows_to_register = self.engine.config_manager.get_config_value(config_section)
         if workflows_to_register:
@@ -2126,6 +2124,7 @@ class WorkflowManager(EngineScoped):
         success: bool
         error_details: str
         written_file: File | None = None
+        failure_reason: FileIOFailureReason | None = None
 
     class WorkflowSavePath(NamedTuple):
         """Unresolved workflow save destination plus its registry-relative form.
@@ -2259,7 +2258,11 @@ class WorkflowManager(EngineScoped):
             written_file = destination.write_text(content, encoding="utf-8")
         except FileWriteError as err:
             details = self._format_workflow_write_error(file_name, err.failure_reason, err.result_details)
-            return self.WriteWorkflowFileResult(success=False, error_details=details)
+            return self.WriteWorkflowFileResult(
+                success=False,
+                error_details=details,
+                failure_reason=err.failure_reason,
+            )
         return self.WriteWorkflowFileResult(success=True, error_details="", written_file=written_file)
 
     @staticmethod
@@ -2298,6 +2301,11 @@ class WorkflowManager(EngineScoped):
                 error_msg = "Path is a directory, not a file"
             case FileIOFailureReason.ENCODING_ERROR:
                 error_msg = f"Content encoding error: {details}"
+            case FileIOFailureReason.POLICY_NO_OVERWRITE:
+                error_msg = (
+                    "A different workflow already exists at this location. "
+                    "To replace it, save again with overwrite enabled."
+                )
             case _:
                 error_msg = details
         return f"Attempted to save workflow '{file_name}'. {error_msg}"
@@ -2308,6 +2316,7 @@ class WorkflowManager(EngineScoped):
         current_workflow_name = (
             context_manager.get_current_workflow_name() if context_manager.has_current_workflow() else None
         )
+
         try:
             save_target = self._determine_save_target(
                 requested_file_name=request.file_name,
@@ -2324,17 +2333,32 @@ class WorkflowManager(EngineScoped):
         branched_from = save_target.branched_from
         registry_key = derive_registry_key(relative_file_path)
 
+        # Re-saving the workflow that's currently open is always allowed; writing over a
+        # *different* workflow's file needs the caller's explicit say-so. Both sides are
+        # already registry keys (extension stripped, separators normalized), so compare
+        # them directly — re-deriving would truncate at the first dot in names like
+        # "03.07_18.30".
+        is_self_save = current_workflow_name == registry_key
+        if request.overwrite_existing or is_self_save:
+            policy = ExistingFilePolicy.OVERWRITE
+        else:
+            policy = ExistingFilePolicy.FAIL
+
         # OVERWRITE_EXISTING uses the registry's recorded file_path verbatim
-        # (in-place overwrite) wrapped in a ProjectFileDestination. All other
-        # scenarios carry an unresolved destination so the save_workflow
-        # situation macro resolves at write time, preserving the seed-and-retry
-        # contract for unresolved required `{x:NN}` slots.
+        # (in-place overwrite) wrapped in a ProjectFileDestination, so it is the
+        # scenario the `policy` above governs. All other scenarios carry an
+        # unresolved destination so the save_workflow situation macro resolves at
+        # write time, preserving the seed-and-retry contract for unresolved
+        # required `{x:NN}` slots — those keep the situation's own policy and
+        # intentionally ignore `policy`. That's the documented boundary: this flag
+        # guards against replacing another *registered* workflow, not against an
+        # unregistered stray .py file sitting at a freshly-computed Save-As path.
         if save_target.destination is not None:
             destination = save_target.destination
         elif save_target.file_path is not None:
             destination = ProjectFileDestination(
                 str(save_target.file_path),
-                existing_file_policy=ExistingFilePolicy.OVERWRITE,
+                existing_file_policy=policy,
             )
         else:
             msg = (
@@ -2344,10 +2368,14 @@ class WorkflowManager(EngineScoped):
             return SaveWorkflowResultFailure(result_details=msg)
 
         logger.debug(
-            "Save workflow: scenario=%s, file_name=%s, destination=%s, branched_from=%s",
+            "Save workflow: scenario=%s, file_name=%s, registry_key=%s, destination=%s, "
+            "self_save=%s, overwrite_existing=%s, branched_from=%s",
             save_target.scenario.value,
             file_name,
+            registry_key,
             destination.location,
+            is_self_save,
+            request.overwrite_existing,
             branched_from or "None",
         )
 
@@ -2424,7 +2452,13 @@ class WorkflowManager(EngineScoped):
                 f"Attempted to save workflow '{relative_file_path}'. "
                 f"Failed during file generation: {save_file_result.result_details}"
             )
-            return SaveWorkflowResultFailure(result_details=details)
+            # Carry the typed reason across the family boundary so callers can tell a
+            # refused overwrite (POLICY_NO_OVERWRITE) apart from a genuine I/O failure
+            # and offer to retry with overwrite_existing=True.
+            failure_reason = None
+            if isinstance(save_file_result, SaveWorkflowFileFromSerializedFlowResultFailure):
+                failure_reason = save_file_result.failure_reason
+            return SaveWorkflowResultFailure(result_details=details, failure_reason=failure_reason)
 
         workflow_metadata = save_file_result.workflow_metadata
 
@@ -2990,7 +3024,10 @@ class WorkflowManager(EngineScoped):
 
         write_result = self._write_workflow_file(destination, final_code_output, file_name)
         if not write_result.success:
-            return SaveWorkflowFileFromSerializedFlowResultFailure(result_details=write_result.error_details)
+            return SaveWorkflowFileFromSerializedFlowResultFailure(
+                result_details=write_result.error_details,
+                failure_reason=write_result.failure_reason,
+            )
 
         # Prefer the post-write location from ``_write_workflow_file`` — for
         # macro-driven saves this reflects the resolved-and-possibly-seeded
