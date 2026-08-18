@@ -505,14 +505,16 @@ class ContextManager(EngineScoped):
     def get_current_workflow_file_path(self) -> str | None:
         """Get the file path the current Workflow context was entered with, if any.
 
-        Returns the path passed to `push_workflow(file_path=...)`, or None when the context
-        was entered by name. Unlike `get_current_workflow_name()`, this does not depend on
+        Returns the path this context was entered with: either the one passed to
+        `push_workflow(file_path=...)`, or the one resolved from the registry at push time
+        when entered by name. Unlike `get_current_workflow_name()`, this does not depend on
         the active workspace: the name is a registry key derived against the workspace at
         push time, so switching projects re-registers workflows under a different key and
         leaves the name stale. Prefer this when you need the workflow's LOCATION.
 
         Returns:
-            The absolute file path, or None if the context was entered by name.
+            The absolute file path, or None when entered by name for a workflow that was
+            unregistered or unsaved at push time.
 
         Raises:
             NoActiveWorkflowError: If no Workflow context is active.
@@ -537,6 +539,28 @@ class ContextManager(EngineScoped):
             raise self.NoActiveWorkflowError(msg)
 
         self._workflow_stack[-1]._name = new_name
+
+    def set_current_workflow_file_path(self, new_file_path: str | None) -> None:
+        """Update the file path retained on the current Workflow context.
+
+        Anything that relocates the current workflow's file on disk (Move, Rename) must call
+        this alongside `set_current_workflow_name`. The retained path is the authoritative
+        answer for the workflow's location -- `get_current_workflow_file_path` is preferred
+        over a registry lookup precisely because it survives a workspace switch -- so leaving
+        it at the pre-move value keeps `workflow_dir` pointing at the old directory even
+        though the registry is correct.
+
+        Args:
+            new_file_path: The workflow's new path, or None when it no longer has one.
+
+        Raises:
+            NoActiveWorkflowError: If no Workflow context is active.
+        """
+        if not self.has_current_workflow():
+            msg = "No active Workflow context"
+            raise self.NoActiveWorkflowError(msg)
+
+        self._workflow_stack[-1]._file_path = new_file_path
 
     def get_current_flow(self) -> ControlFlow:
         """Get the current Flow object.
@@ -599,16 +623,16 @@ class ContextManager(EngineScoped):
     def push_workflow(self, workflow_name: str | None = None, *, file_path: str | None = None) -> str:
         """Push a new Workflow context onto the stack.
 
-        Args:
-            workflow_name: The name of the Workflow to enter. Use this when the registry key is already known.
-            file_path: Path to the workflow file. The registry key will be derived from this path,
-                using a workspace-relative path if possible. Mutually exclusive with workflow_name.
-
         The workflow's file path is captured here, while the registry key is still valid, and
         retained on the context (see `get_current_workflow_file_path`). `resolved_name` is a key
         derived against the CURRENT workspace, so it goes stale as soon as the workspace changes:
         switching projects re-registers every workflow under the new workspace, after which a
         lookup by the old key misses even though nothing about the file changed.
+
+        Args:
+            workflow_name: The name of the Workflow to enter. Use this when the registry key is already known.
+            file_path: Path to the workflow file. The registry key will be derived from this path,
+                using a workspace-relative path if possible. Mutually exclusive with workflow_name.
 
         Returns:
             The name of the Workflow that was entered.
@@ -632,7 +656,7 @@ class ContextManager(EngineScoped):
                     file_path = None
                 else:
                     if workflow.file_path is not None:
-                        file_path = str(WorkflowRegistry.get_complete_file_path(workflow.file_path))
+                        file_path = WorkflowRegistry.get_complete_file_path(workflow.file_path)
         elif file_path is not None:
             resolved = canonicalize_for_identity(file_path)
             workspace_path = canonicalize_for_identity(self.engine.config_manager.workspace_path)

@@ -833,6 +833,41 @@ class TestProjectManagerBuiltinVariables:
         assert isinstance(result, GetPathForMacroResultSuccess)
         assert result.resolved_path == Path("staticfiles/output.txt")
 
+    def test_builtin_optional_degradation_is_logged(
+        self,
+        project_manager_with_template: ProjectManager,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Dropping an unresolvable optional builtin is observable, not silent.
+
+        `{workflow_dir?:/}outputs/image.png` degrades to a PLAUSIBLE workspace-relative path
+        rather than an error, so without a log line the only symptom is media that resolves to a
+        file which was never written there. `_ProjectVariableResolver._resolve_macro_string` warns
+        on its own copy of this degradation; this is the path GetPathForMacro takes, and it is the
+        one the `workflow_dir` regression tests above drive.
+        """
+        from griptape_nodes.common.macro_parser import ParsedMacro
+
+        cast("Mock", project_manager_with_template._config_manager).workspace_path = Path("/workspace")
+
+        mock_context_manager = Mock()
+        mock_context_manager.has_current_workflow.return_value = False
+        project_manager_with_template._engine = MagicMock()
+        project_manager_with_template._engine.context_manager = mock_context_manager
+
+        parsed_macro = ParsedMacro("{workflow_dir?:/}outputs/image.png")
+        request = GetPathForMacroRequest(parsed_macro=parsed_macro, variables={})
+
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            result = project_manager_with_template.on_get_path_for_macro_request(request)
+
+        assert isinstance(result, GetPathForMacroResultSuccess)
+        assert result.resolved_path == Path("outputs/image.png")
+        warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("workflow_dir" in msg and "dropping it from the path" in msg for msg in warning_messages), (
+            f"Expected a warning about the dropped optional builtin, got: {warning_messages}"
+        )
+
     @patch("griptape_nodes.retained_mode.managers.project_manager.WorkflowRegistry")
     def test_builtin_workflow_dir_survives_stale_registry_key(
         self,
