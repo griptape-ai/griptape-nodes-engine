@@ -63,6 +63,54 @@ class TestPushWorkflow:
 
         context_manager.pop_workflow()
 
+    def test_push_workflow_retains_file_path_independent_of_workspace(self, griptape_nodes: Engine) -> None:
+        """The pushed file path is retained verbatim and does NOT move with the workspace.
+
+        Regression guard: the registry key is derived against whatever workspace is active at
+        push time, so switching projects re-registers workflows under a new key and the name
+        goes stale. The retained path is what lets `workflow_dir` keep answering afterwards.
+        """
+        context_manager = griptape_nodes.ContextManager()
+        config_manager = griptape_nodes.ConfigManager()
+
+        with tempfile.TemporaryDirectory() as workspace_dir, tempfile.TemporaryDirectory() as other_dir:
+            original = config_manager.workspace_path
+            config_manager.workspace_path = Path(workspace_dir)
+            try:
+                workflow_file = Path(other_dir) / "my_flow.py"
+                context_manager.push_workflow(file_path=str(workflow_file))
+
+                assert context_manager.get_current_workflow_file_path() == str(workflow_file)
+
+                # Simulate a project switch: the workspace moves under the open workflow.
+                config_manager.workspace_path = Path(other_dir)
+                assert context_manager.get_current_workflow_file_path() == str(workflow_file)
+            finally:
+                config_manager.workspace_path = original
+                context_manager.pop_workflow()
+
+    def test_push_workflow_by_name_captures_path_while_key_is_valid(self, griptape_nodes: Engine) -> None:
+        """Entering by key resolves the path immediately, not lazily at read time.
+
+        A key only resolves against the workspace active right now, so deferring the lookup
+        would leave nothing to answer with once the workspace changes. An unregistered name
+        legitimately has no path.
+        """
+        context_manager = griptape_nodes.ContextManager()
+
+        context_manager.push_workflow(workflow_name="not_registered_anywhere")
+        try:
+            assert context_manager.get_current_workflow_file_path() is None
+        finally:
+            context_manager.pop_workflow()
+
+    def test_get_current_workflow_file_path_requires_a_workflow(self, griptape_nodes: Engine) -> None:
+        """Asking outside a workflow context is an error, matching get_current_workflow_name."""
+        context_manager = griptape_nodes.ContextManager()
+
+        with pytest.raises(context_manager.NoActiveWorkflowError):
+            context_manager.get_current_workflow_file_path()
+
     def test_push_workflow_raises_when_both_provided(self, griptape_nodes: Engine) -> None:
         """Raises ValueError when both workflow_name and file_path are given."""
         context_manager = griptape_nodes.ContextManager()
