@@ -17,6 +17,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 import pytest
 
 from griptape_nodes.api_client.request_client import _PendingRequest
+from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events import worker_events
 from griptape_nodes.retained_mode.events.base_events import EventRequest
 from griptape_nodes.retained_mode.events.execution_events import (
@@ -70,6 +71,37 @@ def worker_manager() -> WorkerManager:
     gtn.config_manager.get_config_value.side_effect = lambda _key, default, cast_type=float: cast_type(default)
     # spawn_worker builds the child env from the orchestrator's pre-project environ;
     # hand back a real dict so {**base_environ, ...} doesn't choke on a MagicMock.
+    gtn.project_manager.get_pre_project_environ.return_value = {}
+    wm = WorkerManager(engine=gtn, event_manager=MagicMock())
+    wm.attach_transport(
+        ws_outgoing_queue=asyncio.Queue(),
+        send_message=AsyncMock(),
+        subscribe_to_topic=AsyncMock(),
+        unsubscribe_from_topic=AsyncMock(),
+        request_client=_FakeRequestClient(),  # type: ignore[arg-type]
+    )
+    return wm
+
+
+@pytest.fixture
+def worker_manager_with_stamping() -> WorkerManager:
+    """WorkerManager whose engine.event_manager really stamps identity.
+
+    orchestrator_heartbeat_loop and forward_event_to_worker send frames straight to the
+    transport without passing through EventManager's queue, so they stamp identity
+    themselves via self.engine.event_manager. A plain MagicMock engine swallows that call
+    silently, so this fixture wires a real Engine's EventManager behind the mocked engine
+    to prove the stamp actually lands on the outgoing frame.
+    """
+    real_engine = Engine()
+    real_engine.engine_identity_manager.active_engine_id = _ENGINE
+    real_engine.session_manager.active_session_id = _SESSION
+
+    gtn = MagicMock()
+    gtn.get_session_id.return_value = _SESSION
+    gtn.get_engine_id.return_value = _ENGINE
+    gtn.event_manager = real_engine.event_manager
+    gtn.config_manager.get_config_value.side_effect = lambda _key, default, cast_type=float: cast_type(default)
     gtn.project_manager.get_pre_project_environ.return_value = {}
     wm = WorkerManager(engine=gtn, event_manager=MagicMock())
     wm.attach_transport(
@@ -916,6 +948,22 @@ class TestForwardEventToWorker:
         sent_payload = json.loads(sent_body)
         assert sent_payload.get("response_topic") == _WORKER_RESPONSE_TOPIC
 
+    @pytest.mark.asyncio
+    async def test_stamps_identity_on_the_forwarded_event(self, worker_manager_with_stamping: WorkerManager) -> None:
+        """forward_event_to_worker bypasses EventManager's queue, so it has to stamp identity itself."""
+        from griptape_nodes.retained_mode.events.base_events import EventRequest
+        from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeRequest
+
+        event = EventRequest(request=ExecuteNodeRequest(node_name="TestNode", parameter_values={}))
+
+        await worker_manager_with_stamping.forward_event_to_worker(
+            event, worker_engine_id=_ENGINE, worker_request_topic=_WORKER_REQUEST_TOPIC
+        )
+
+        sent_payload = json.loads(worker_manager_with_stamping._tx.send_message.call_args[0][1])  # type: ignore[union-attr]
+        assert sent_payload["engine_id"] == _ENGINE
+        assert sent_payload["session_id"] == _SESSION
+
 
 class TestDetermineResponseTopic:
     def test_returns_session_response_topic_when_session_active(self, worker_manager: WorkerManager) -> None:
@@ -985,6 +1033,28 @@ class TestOrchestratorHeartbeatLoop:
         await asyncio.gather(task, return_exceptions=True)
 
         assert _ENGINE in worker_manager._workers
+
+    @pytest.mark.asyncio
+    async def test_stamps_identity_on_the_heartbeat_challenge(
+        self, worker_manager_with_stamping: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """orchestrator_heartbeat_loop bypasses EventManager's queue, so it has to stamp identity itself."""
+        monkeypatch.setattr(worker_manager_with_stamping, "heartbeat_interval_s", 0.01)
+        monkeypatch.setattr(worker_manager_with_stamping, "heartbeat_timeout_s", 60.0)
+        worker_manager_with_stamping._workers[_ENGINE] = WorkerRegistration(
+            request_topic=_WORKER_REQUEST_TOPIC, worker_key=None
+        )
+        worker_manager_with_stamping._worker_last_seen[_ENGINE] = time.monotonic()
+
+        task = asyncio.create_task(worker_manager_with_stamping.orchestrator_heartbeat_loop())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+        queued_message = worker_manager_with_stamping._tx.ws_outgoing_queue.get_nowait()  # type: ignore[union-attr]
+        sent_payload = json.loads(queued_message.payload)
+        assert sent_payload["engine_id"] == _ENGINE
+        assert sent_payload["session_id"] == _SESSION
 
 
 class TestBroadcastToWorkers:

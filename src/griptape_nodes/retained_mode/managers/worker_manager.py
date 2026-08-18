@@ -281,6 +281,9 @@ class WorkerManager(EngineScoped):
                     request=worker_events.WorkerHeartbeatRequest(heartbeat_id=str(uuid.uuid4())),
                     response_topic=f"sessions/{session_id}/workers/{wid}/response",
                 )
+                # Never passes through EventManager's queue, so stamp identity explicitly before
+                # it reaches the wire.
+                self.engine.event_manager.stamp_event_identity(hb)
                 await self._tx.ws_outgoing_queue.put(
                     WebSocketMessage("EventRequest", hb.json(), registration.request_topic)
                 )
@@ -674,6 +677,10 @@ class WorkerManager(EngineScoped):
         session_id = self.engine.get_session_id()
         worker_response_topic = f"sessions/{session_id}/workers/{worker_engine_id}/response"
         forwarded = event.model_copy(update={"response_topic": worker_response_topic})
+        # Never passes through EventManager's queue, so stamp identity explicitly before it
+        # reaches the wire. Fills unset fields only, so an event forwarded on behalf of another
+        # engine keeps its origin rather than being reattributed to this relay.
+        self.engine.event_manager.stamp_event_identity(forwarded)
         logger.debug("Forwarding %s to worker %s", type(event.request).__name__, worker_engine_id)
         await self._tx.send_message("EventRequest", forwarded.json(), worker_request_topic)
 

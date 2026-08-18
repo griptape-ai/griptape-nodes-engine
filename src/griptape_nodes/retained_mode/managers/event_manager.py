@@ -337,9 +337,9 @@ class EventManager(EngineScoped):
     def emit_execution(self, payload: ExecutionPayload) -> None:
         """Emit an execution payload to the queue, wrapped and stamped.
 
-        Prefer this over building the event yourself. It owns the wrapping the transport
-        expects and the identity stamp, so an execution event cannot reach the wire
-        unattributed or wrapped wrong.
+        Prefer this over building the event yourself. Every path through `put_event` stamps
+        identity, so that part is enforced regardless; what this method saves you from is
+        getting the wrapping the transport expects right by hand.
 
         Args:
             payload: The execution payload to emit.
@@ -1019,6 +1019,8 @@ class EventManager(EngineScoped):
             raise RuntimeError(msg)
 
         event_request: EventRequest = EventRequest(request=request)
+        # Never passes through the queue, so stamp identity explicitly before it reaches the wire.
+        self.stamp_event_identity(event_request)
 
         response_future = asyncio.run_coroutine_threadsafe(
             self._worker_request_client.request_to_orchestrator(
