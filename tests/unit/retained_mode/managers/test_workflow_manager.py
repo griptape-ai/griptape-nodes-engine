@@ -20,6 +20,7 @@ from griptape_nodes.exe_types.core_types import Parameter
 from griptape_nodes.exe_types.node_types import NodeDependencies
 from griptape_nodes.node_library.workflow_registry import Workflow, WorkflowMetadata, WorkflowRegistry, WorkflowShape
 from griptape_nodes.retained_mode.engine import Engine
+from griptape_nodes.retained_mode.events.app_events import WorkflowLoadComplete
 from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.flow_events import SerializedFlowCommands
 from griptape_nodes.retained_mode.events.workflow_events import (
@@ -2867,6 +2868,129 @@ class TestLibraryResolutionOnLoad:
 
         assert result is None
         ahandle_spy.assert_not_awaited()
+
+
+class TestWorkflowLoadDepthTracking:
+    """run_workflow tracks how many workflow-file loads are in flight and reports completion."""
+
+    @pytest.mark.asyncio
+    async def test_is_loading_workflow_true_during_run_and_false_after(self, griptape_nodes: Engine) -> None:
+        workflow_manager = griptape_nodes.WorkflowManager()
+        observed_during_run = None
+
+        async def fake_execute(relative_file_path: str) -> WorkflowManager.WorkflowExecutionResult:
+            nonlocal observed_during_run
+            observed_during_run = workflow_manager.is_loading_workflow()
+            return WorkflowManager.WorkflowExecutionResult(
+                execution_successful=True, execution_details=relative_file_path
+            )
+
+        assert workflow_manager.is_loading_workflow() is False
+
+        with patch.object(workflow_manager, "_execute_workflow_file", AsyncMock(side_effect=fake_execute)):
+            await workflow_manager.run_workflow("whatever.py")
+
+        assert observed_during_run is True
+        assert workflow_manager.is_loading_workflow() is False
+
+    @pytest.mark.asyncio
+    async def test_stays_true_through_a_nested_load_and_clears_only_when_outer_finishes(
+        self, griptape_nodes: Engine
+    ) -> None:
+        """A workflow importing another workflow as a referenced sub flow nests run_workflow calls."""
+        workflow_manager = griptape_nodes.WorkflowManager()
+        depth_observed_after_nested_call_returns = None
+
+        async def fake_execute(relative_file_path: str) -> WorkflowManager.WorkflowExecutionResult:
+            nonlocal depth_observed_after_nested_call_returns
+            if relative_file_path == "outer.py":
+                await workflow_manager.run_workflow("nested.py")
+                depth_observed_after_nested_call_returns = workflow_manager.is_loading_workflow()
+            return WorkflowManager.WorkflowExecutionResult(
+                execution_successful=True, execution_details=relative_file_path
+            )
+
+        with patch.object(workflow_manager, "_execute_workflow_file", AsyncMock(side_effect=fake_execute)):
+            await workflow_manager.run_workflow("outer.py")
+
+        # Still reported as loading immediately after the nested call returns: the outer load owns
+        # depth 1 and has not finished yet.
+        assert depth_observed_after_nested_call_returns is True
+        assert workflow_manager.is_loading_workflow() is False
+
+    @pytest.mark.asyncio
+    async def test_clears_even_when_execution_raises(self, griptape_nodes: Engine) -> None:
+        workflow_manager = griptape_nodes.WorkflowManager()
+
+        with (
+            patch.object(workflow_manager, "_execute_workflow_file", AsyncMock(side_effect=RuntimeError("boom"))),
+            pytest.raises(RuntimeError, match="boom"),
+        ):
+            await workflow_manager.run_workflow("whatever.py")
+
+        assert workflow_manager.is_loading_workflow() is False
+
+    @pytest.mark.asyncio
+    async def test_broadcasts_workflow_load_complete_once_for_a_nested_load(self, griptape_nodes: Engine) -> None:
+        workflow_manager = griptape_nodes.WorkflowManager()
+        broadcast_mock = AsyncMock()
+
+        async def fake_execute(relative_file_path: str) -> WorkflowManager.WorkflowExecutionResult:
+            if relative_file_path == "outer.py":
+                await workflow_manager.run_workflow("nested.py")
+            return WorkflowManager.WorkflowExecutionResult(
+                execution_successful=True, execution_details=relative_file_path
+            )
+
+        with (
+            patch.object(workflow_manager, "_execute_workflow_file", AsyncMock(side_effect=fake_execute)),
+            patch.object(griptape_nodes, "abroadcast_app_event", broadcast_mock),
+        ):
+            await workflow_manager.run_workflow("outer.py")
+
+        broadcast_mock.assert_awaited_once()
+        (event,) = broadcast_mock.await_args.args
+        assert isinstance(event, WorkflowLoadComplete)
+        assert event.successful is True
+
+    @pytest.mark.asyncio
+    async def test_broadcasts_workflow_load_complete_with_successful_false_on_failure(
+        self, griptape_nodes: Engine
+    ) -> None:
+        workflow_manager = griptape_nodes.WorkflowManager()
+        broadcast_mock = AsyncMock()
+        failure_result = WorkflowManager.WorkflowExecutionResult(execution_successful=False, execution_details="nope")
+
+        with (
+            patch.object(workflow_manager, "_execute_workflow_file", AsyncMock(return_value=failure_result)),
+            patch.object(griptape_nodes, "abroadcast_app_event", broadcast_mock),
+        ):
+            result = await workflow_manager.run_workflow("whatever.py")
+
+        assert result.execution_successful is False
+        broadcast_mock.assert_awaited_once()
+        (event,) = broadcast_mock.await_args.args
+        assert event.successful is False
+
+    @pytest.mark.asyncio
+    async def test_workflow_load_complete_reports_current_workflow_name(self, griptape_nodes: Engine) -> None:
+        workflow_manager = griptape_nodes.WorkflowManager()
+        context_manager = griptape_nodes.ContextManager()
+        broadcast_mock = AsyncMock()
+        ok_result = WorkflowManager.WorkflowExecutionResult(execution_successful=True, execution_details="ok")
+
+        context_manager.push_workflow(workflow_name="my_workflow")
+        try:
+            with (
+                patch.object(workflow_manager, "_execute_workflow_file", AsyncMock(return_value=ok_result)),
+                patch.object(griptape_nodes, "abroadcast_app_event", broadcast_mock),
+            ):
+                await workflow_manager.run_workflow("whatever.py")
+        finally:
+            context_manager.pop_workflow()
+
+        (event,) = broadcast_mock.await_args.args
+        assert event.workflow_name == "my_workflow"
 
 
 class TestWorkflowsLoadingGate:

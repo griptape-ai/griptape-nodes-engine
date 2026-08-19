@@ -300,3 +300,35 @@ class TestEnsureWorkflowAndFlowRequest:
         assert result.created_flow is True
 
         self._cleanup(griptape_nodes)
+
+
+class TestGetWorkflowContextIsLoading:
+    """GetWorkflowContext reports is_loading from WorkflowManager.is_loading_workflow()."""
+
+    def test_reports_not_loading_by_default(self, griptape_nodes: Engine) -> None:
+        from griptape_nodes.retained_mode.events.context_events import GetWorkflowContextRequest
+
+        context_manager = griptape_nodes.ContextManager()
+        context_manager.push_workflow(workflow_name="my_workflow")
+        try:
+            result = context_manager.on_get_workflow_context_request(GetWorkflowContextRequest())
+        finally:
+            context_manager.pop_workflow()
+
+        assert result.workflow_name == "my_workflow"
+        assert result.is_loading is False
+
+    def test_reports_loading_while_workflow_manager_is_loading(self, griptape_nodes: Engine) -> None:
+        from griptape_nodes.retained_mode.events.context_events import GetWorkflowContextRequest
+
+        context_manager = griptape_nodes.ContextManager()
+        workflow_manager = griptape_nodes.WorkflowManager()
+        context_manager.push_workflow(workflow_name="my_workflow")
+        try:
+            with patch.object(workflow_manager, "is_loading_workflow", return_value=True):
+                result = context_manager.on_get_workflow_context_request(GetWorkflowContextRequest())
+        finally:
+            context_manager.pop_workflow()
+
+        assert result.workflow_name == "my_workflow"
+        assert result.is_loading is True

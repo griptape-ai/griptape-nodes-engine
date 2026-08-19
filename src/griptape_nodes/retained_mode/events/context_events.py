@@ -79,10 +79,16 @@ class GetWorkflowContextSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
         workflow_name: Name of the current workflow context (None if no context set)
         is_saved: Whether the current workflow is backed by a file on disk. None when
                   no context is set or the context key is not in the registry.
+        is_loading: Whether the engine is still executing workflow_name's file. The name is
+                    pushed onto the context stack before execution starts, so this can be
+                    True while the workflow's nodes are absent or only partially built.
+                    Defaulted for backward compatibility with older engines, which never
+                    report loading and so always read as False.
     """
 
     workflow_name: str | None
     is_saved: bool | None = None
+    is_loading: bool = False
 
 
 @dataclass
