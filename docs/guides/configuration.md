@@ -40,8 +40,8 @@ Griptape Nodes employs a specific search order to load settings from environment
         1. **User config** — `~/.config/griptape_nodes/griptape_nodes_config.json`. Global settings for this machine.
         1. **Project-adjacent config** — `<project_dir>/griptape_nodes_config.json`. Loaded when a project is set as active. Use this to distribute shared defaults alongside a project file.
         1. **Workspace config** — `<workspace_dir>/griptape_nodes_config.json`. Loaded after the workspace is resolved. Use this for per-user overrides that take precedence over the shared project config. When the workspace directory is the same as the project directory, this file is the same as the project-adjacent config and is not loaded twice.
-        1. **Per-project workspace override** — When the active project's path matches a key in the `project_workspaces` mapping (in your user config), that workspace directory is applied. This sets only `workspace_directory`, overriding any value from the config files above. See [Workspace](projects/workspace.md#per-project-workspace-overrides) for details.
-        1. **Environment variables** — `GTN_CONFIG_*` prefix (highest priority). See below.
+        1. **Environment variables** — `GTN_CONFIG_*` prefix (highest priority for every setting except `workspace_directory`, where the per-project workspace override below wins). See below.
+        1. **Per-project workspace override** — When the active project declares its own `workspace_dir`, or its path matches a key in the `project_workspaces` mapping (in your user config), that workspace directory is applied. This sets only `workspace_directory` and outranks every other source of that value, including `GTN_CONFIG_WORKSPACE_DIRECTORY` — an environment-set workspace is the engine's default, and a project that pins its own workspace is the more specific intent. See [Workspace](projects/workspace.md#per-project-workspace-overrides) for details.
     - **Override Priority:** Settings in files loaded later override settings from files loaded earlier.
 
 1. **Defaults and Merging**
@@ -150,7 +150,7 @@ A top-level configuration value can be set or overridden using an environment va
 GTN_CONFIG_<SETTING_NAME>=<value>
 ```
 
-Environment variable overrides have the **highest priority** — they win over user config files, project-adjacent config files, the per-project workspace override, and built-in defaults.
+Environment variable overrides have the **highest priority** — they win over user config files, project-adjacent config files, and built-in defaults. The one exception is `workspace_directory`: a project that pins its own workspace (a `workspace_dir` field in the project file, or a `project_workspaces` mapping entry) wins over `GTN_CONFIG_WORKSPACE_DIRECTORY` while that project is active, because the environment value describes the engine's default workspace and the project pin is the more specific intent.
 
 Examples:
 
