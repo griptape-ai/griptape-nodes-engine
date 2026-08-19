@@ -378,3 +378,104 @@ class TestNodeGroupRoundTrip:
 
         restored_leaf = GriptapeNodes.NodeManager().get_node_by_name(result.node_name_mappings["Leaf"])
         assert restored_leaf.get_parameter_value("text") == _EXPECTED_TEXT
+
+
+class TestLoadingIntoAnOccupiedSession:
+    """Loading a graph next to one it collides with, rather than into an empty session.
+
+    Every test above deserializes into a cleared session, so every name comes back unchanged and
+    nothing has to be remapped. Restoring from image metadata does not clear anything: the graph
+    lands alongside whatever the artist already has open, and each name that collides is deduped.
+    """
+
+    def test_a_group_loaded_beside_a_same_named_group_gets_its_own_subflow(self, library_name: str) -> None:
+        """A group records its subflow by name, and that name is deduped like any other.
+
+        If the rebuilt group keeps the name it was saved with, it points at the subflow belonging to
+        the group already open, and the nodes just loaded are moved into someone else's group. The
+        subflow this load created is left empty, and nothing reports a problem, because the flow the
+        group names does exist -- it just is not the group's.
+        """
+        canvas = GriptapeNodes.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="OccupiedCanvas", set_as_new_context=False)
+        )
+        assert isinstance(canvas, CreateFlowResultSuccess), canvas
+        host = GriptapeNodes.handle_request(
+            CreateFlowRequest(parent_flow_name=canvas.flow_name, flow_name="GroupHost", set_as_new_context=False)
+        )
+        assert isinstance(host, CreateFlowResultSuccess), host
+
+        with GriptapeNodes.ContextManager().flow(host.flow_name):
+            group = _create_node("SubflowGroupNode", "Group", library_name)
+            leaf = _create_node("EchoNode", "Leaf", library_name, parent_group_name=group)
+
+        commands = _serialize(host.flow_name)
+
+        original_group = _get_group(group)
+        original_subflow = original_group.metadata["subflow_name"]
+
+        # No ClearAllObjectState: the group above is still open, so its name and its subflow's name
+        # are both taken.
+        with GriptapeNodes.ContextManager().flow(canvas.flow_name):
+            result = GriptapeNodes.handle_request(DeserializeFlowFromCommandsRequest(serialized_flow_commands=commands))
+        assert isinstance(result, DeserializeFlowFromCommandsResultSuccess), result
+
+        restored_group = _get_group(result.node_name_mappings["Group"])
+        restored_leaf_name = result.node_name_mappings["Leaf"]
+        restored_subflow = restored_group.metadata["subflow_name"]
+
+        # The copy got its own subflow, and its member is in that one.
+        assert restored_subflow != original_subflow
+        assert GriptapeNodes.NodeManager().get_node_parent_flow_by_name(restored_leaf_name) == restored_subflow
+        assert restored_leaf_name in restored_group.nodes
+
+        # And the group that was already open kept exactly what it had.
+        assert sorted(original_group.nodes) == [leaf]
+        assert GriptapeNodes.NodeManager().get_node_parent_flow_by_name(leaf) == original_subflow
+
+
+class TestWhichFlowClaimsAnEdge:
+    """Which Flow reports a group-wall edge, which is what keeps codegen's output loadable.
+
+    Codegen writes a Flow's subflows before its own nodes, so if a subflow reported an edge whose far
+    endpoint is a group node in the parent, that edge would be written ahead of the line assigning the
+    group's variable and the generated file would raise NameError on load. What prevents it is the
+    scope of `FlowManager._get_connections_for_flow`: a Flow collects over itself plus its direct
+    children only. Nothing else states that, so this is the test that fails if the scope ever widens.
+    """
+
+    def test_a_group_subflow_does_not_report_an_edge_reaching_the_group_node_itself(self, library_name: str) -> None:
+        """The group's own subflow must not claim the edge arriving at its wall.
+
+        `Group` lives in the parent flow and `Leaf` inside the group's subflow, so the edge from
+        `Feeder` to the group's proxy parameter has one endpoint at each level. The parent may report
+        it. The subflow may not: it does not hold `Group`, and codegen writes it first.
+        """
+        flow = GriptapeNodes.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="EdgeOwnership", set_as_new_context=False)
+        )
+        assert isinstance(flow, CreateFlowResultSuccess), flow
+
+        with GriptapeNodes.ContextManager().flow(flow.flow_name):
+            group = _create_node("SubflowGroupNode", "Group", library_name)
+            leaf = _create_node("EchoNode", "Leaf", library_name, parent_group_name=group)
+            feeder = _create_node("EchoNode", "Feeder", library_name)
+            _connect(feeder, leaf)
+
+        subflow_name = _get_group(group).metadata["subflow_name"]
+
+        # Serializing the subflow on its own is what codegen does when it recurses into it.
+        subflow_commands = _serialize(subflow_name)
+
+        # The wall edge attaches to the group node, which is not in the subflow, so the subflow must
+        # not report any edge touching it.
+        subflow_node_uuids = {node_commands.node_uuid for node_commands in subflow_commands.serialized_node_commands}
+        for connection in subflow_commands.serialized_connections:
+            assert connection.source_node_uuid in subflow_node_uuids, (
+                "the group's subflow reported an edge starting outside it, which codegen would write "
+                "before the variable it names exists"
+            )
+            assert connection.target_node_uuid in subflow_node_uuids, (
+                "the group's subflow reported an edge ending outside it, which codegen would write "
+                "before the variable it names exists"
+            )

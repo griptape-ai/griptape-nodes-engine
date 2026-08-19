@@ -1,15 +1,15 @@
 """Tests for generating workflow files whose Flows nest more than one level deep.
 
 A node group owns a subflow, so a group nested inside another group produces a subflow inside a
-subflow, to whatever depth the artist nests them. The generator has to follow that all the way down:
-when it walked only the first level, nodes below it were left out of the file entirely, the groups
-that claimed them were rebuilt with no members, and any connection touching them could not be
-written at all.
+subflow, to whatever depth the artist nests them. The generator has to follow that all the way down,
+because anything it does not walk is absent from the written file: a node left out is a node the
+group claiming it comes back without, and an edge touching it cannot be written at all.
 """
 
 from __future__ import annotations
 
 import ast
+import logging
 from typing import TYPE_CHECKING
 
 import pytest
@@ -216,8 +216,17 @@ class TestNestedFlowCodegen:
         with pytest.raises(ValueError, match="nodes in the group 'Group'"):
             _generate(griptape_nodes, commands)
 
-    def test_refuses_to_write_a_connection_whose_endpoint_is_not_in_the_file(self, griptape_nodes: Engine) -> None:
-        """A connection naming an unwritten node would emit a file that raises NameError."""
+    def test_skips_a_connection_whose_endpoint_is_not_in_the_file_rather_than_failing_the_save(
+        self, griptape_nodes: Engine, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Dropping the edge beats refusing to save: the artist keeps everything else.
+
+        Emitting the edge anyway would write a file that raises NameError on load. Raising instead
+        would mean the whole workflow cannot be persisted, and which Flow writes a given edge is a
+        traversal detail, so an untried graph shape is a likelier trigger than real corruption. The
+        edge is dropped, the file still parses, and the loss is logged at error rather than passing
+        silently.
+        """
         source = _node_commands("A")
         missing_target = _node_commands("B")
         connection = SerializedFlowCommands.IndirectConnectionSerialization(
@@ -228,8 +237,13 @@ class TestNestedFlowCodegen:
         )
         commands = _flow_commands("top", nodes=[source], connections=[connection])
 
-        with pytest.raises(ValueError, match="had not been written to the file yet"):
-            _generate(griptape_nodes, commands)
+        with caplog.at_level(logging.ERROR):
+            content = _generate(griptape_nodes, commands)
+
+        assert "CreateConnectionRequest(" not in content
+        assert "'A'" in content, "the node that could be written still has to be"
+        ast.parse(content)
+        assert "were never written to the file" in caplog.text
 
     def test_emits_valid_python(self, griptape_nodes: Engine) -> None:
         """Whatever the nesting depth, the file has to parse."""

@@ -4997,8 +4997,10 @@ class WorkflowManager(EngineScoped):
                 return []
             case _:
                 # A new way of creating a Flow was added without teaching this generator to write it.
-                # Silently returning nothing would emit a file whose Flow is never created, so the
-                # nodes inside it would land wherever the script happened to be pointing.
+                # This one does fail the save, unlike the skip-and-log guards elsewhere in codegen:
+                # emitting nothing writes a file whose Flow is never created, so every node inside it
+                # lands wherever the script happened to be pointing. That is a wrong graph that loads
+                # without complaint, which is worse than a save the artist knows did not happen.
                 msg = f"Attempted to save a workflow. Failed because a flow is created in a way this version cannot write out: {type(flow_initialization_command).__name__}."
                 raise TypeError(msg)
 
@@ -5287,15 +5289,19 @@ class WorkflowManager(EngineScoped):
                 if endpoint_uuid not in node_uuid_to_node_variable_name
             ]
             if missing_endpoints:
-                # The UUIDs are the only handle on nodes that were never written, so log them for
-                # whoever has to debug the save and keep the raised message readable.
+                # Skip rather than raise: raising here fails the save outright, and losing one edge
+                # is a smaller harm than an artist being unable to persist their work at all. Which
+                # Flow writes a given edge depends on the traversal, so a graph shape nobody has
+                # tried yet is a likelier cause than real corruption -- _get_connections_for_flow
+                # already carries one such case (transient loop-body flows). Logged at error so it
+                # surfaces as a bug rather than passing silently.
                 logger.error(
-                    "Cannot write the connection to '%s': node(s) %s were never written to the file",
+                    "Cannot write the connection to '%s': node(s) %s were never written to the file. "
+                    "Skipping this connection; the saved workflow will be missing it.",
                     connection.target_parameter_name,
                     ", ".join(missing_endpoints),
                 )
-                msg = f"Attempted to save a workflow. Failed because a connection to '{connection.target_parameter_name}' refers to {len(missing_endpoints)} node(s) that had not been written to the file yet."
-                raise ValueError(msg)
+                continue
             source_node_variable_name = node_uuid_to_node_variable_name[connection.source_node_uuid]
             target_node_variable_name = node_uuid_to_node_variable_name[connection.target_node_uuid]
 
@@ -5447,9 +5453,15 @@ class WorkflowManager(EngineScoped):
             # is always named by now. Say which node went missing if that ever stops holding, rather
             # than letting a bare KeyError escape halfway through writing the file.
             if node_uuid not in node_uuid_to_node_variable_name:
-                logger.error("Cannot write saved values: node '%s' was never written to the file", node_uuid)
-                msg = "Attempted to save a workflow. Failed because a node holding saved values had not been written to the file yet."
-                raise ValueError(msg)
+                # Skip rather than raise, for the same reason as the connection case above: this
+                # guards a traversal invariant, and failing the save means the artist cannot persist
+                # anything, which is worse than a saved file missing one node's values.
+                logger.error(
+                    "Cannot write saved values: node '%s' was never written to the file. "
+                    "Skipping its values; the saved workflow will not restore them.",
+                    node_uuid,
+                )
+                continue
             node_variable_name = node_uuid_to_node_variable_name[node_uuid]
             lock_node_command = lock_commands.get(node_uuid)
             parameter_value_asts.extend(

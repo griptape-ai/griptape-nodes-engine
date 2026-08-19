@@ -5,7 +5,7 @@ import base64
 import copy
 import logging
 import pickle
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from io import BytesIO
 from pathlib import Path
@@ -274,10 +274,15 @@ class DeserializedFlowNodes:
     Connections are serialized against a Flow's whole subtree, not just its own level, so the
     connection pass has to resolve UUIDs belonging to nodes that were rebuilt inside a subflow.
     Collecting the whole subtree first is what lets a single pass wire them all up.
+
+    Flow names are collected for the same reason node names are: a group records the name of its
+    subflow, and both names are deduped on the way back in, so a group rebuilt into a session that
+    already holds one of the same name has to be pointed at the subflow this load actually created.
     """
 
     node_uuid_to_node_name: dict[SerializedNodeCommands.NodeUUID, str] = field(default_factory=dict)
     original_name_to_node_name: dict[str, str] = field(default_factory=dict)
+    original_flow_name_to_flow_name: dict[str, str] = field(default_factory=dict)
 
     def merge(self, other: DeserializedFlowNodes) -> None:
         """Fold a subflow's rebuilt nodes into this one.
@@ -287,6 +292,7 @@ class DeserializedFlowNodes:
         """
         self.node_uuid_to_node_name.update(other.node_uuid_to_node_name)
         self.original_name_to_node_name.update(other.original_name_to_node_name)
+        self.original_flow_name_to_flow_name.update(other.original_flow_name_to_flow_name)
 
 
 class FlowManager(EngineScoped):
@@ -477,6 +483,14 @@ class FlowManager(EngineScoped):
 
         No peer manager has to be told: ``_name_to_parent_name`` is the only record of parentage, and
         NodeManager tracks a node's flow by name, which reparenting does not change.
+
+        Unlike every other structural change in retained mode, this is a plain method rather than a
+        request, so nothing is emitted and the editor is not told. That is a real gap, not a design
+        choice: there is no ``ReparentFlowRequest`` to route it through. It holds today because the
+        nesting that triggers it happens inside ``AddNodesToNodeGroupRequest``, whose own result the
+        editor already acts on, and because the editor derives group nesting from ``parent_group``
+        rather than from flow parentage. An editor feature that reads flow parentage directly would
+        need this promoted to a request first.
 
         Args:
             flow_name: The Flow to move
@@ -4033,6 +4047,14 @@ class FlowManager(EngineScoped):
             # Now apply the connections, for this Flow and every Flow beneath it.
             # We didn't know the exact name that would be used for the nodes, but we knew the node's
             # creation UUID. Tie the UUID back to the node names.
+            #
+            # The outermost Flow claims every edge, deliberately, and the recursion below it finds
+            # nothing left to do: this Flow's serialized_connections is the fully aggregated list, and
+            # each edge is created the first time it is seen. Codegen resolves the same duplication
+            # the other way round -- it recurses first, so the innermost Flow wins -- because there
+            # the edge has to be written where its endpoints are already in scope as variables. Here
+            # every node in the subtree exists before any edge is made, so there is no such
+            # constraint and claiming at the top is the simpler of the two.
             self._deserialize_connections_for_flow_and_subflows(
                 serialized_flow_commands=request.serialized_flow_commands,
                 deserialized_nodes=deserialized_nodes,
@@ -4146,44 +4168,18 @@ class FlowManager(EngineScoped):
         create_cmd = serialized_node.create_node_command
         serialized_node_for_deserialization = serialized_node
 
-        # For SubflowNodeGroups, remap node_names_to_add from UUIDs to actual node names.
-        # Create a copy to avoid mutating the original serialized data.
-        # The field is declared as plain names, but a serialized group stores its members as UUIDs
-        # because the names they will be rebuilt under are not known until they are rebuilt.
-        if create_cmd.node_names_to_add:
-            member_uuids = [SerializedNodeCommands.NodeUUID(name) for name in create_cmd.node_names_to_add]
-            unresolved_count = sum(
-                1 for member_uuid in member_uuids if member_uuid not in deserialized_nodes.node_uuid_to_node_name
+        # A saved group names things by what they were called at save time, and every one of those
+        # names is deduped on the way back in. Rewrite them to what this load actually created,
+        # copying rather than mutating so the caller's serialized data is left as it was found.
+        if serialized_node.is_node_group:
+            create_cmd_copy = replace(
+                create_cmd,
+                node_names_to_add=self._remapped_group_member_names(
+                    create_cmd=create_cmd, deserialized_nodes=deserialized_nodes
+                ),
+                metadata=self._remapped_group_metadata(create_cmd=create_cmd, deserialized_nodes=deserialized_nodes),
             )
-            # A group IS its membership, so a group that comes back holding three of its five nodes is
-            # worse than a load that stops and says so. Every member is rebuildable by the time we get
-            # here because _deserialize_nodes_for_flow_and_subflows rebuilds groups last; if that
-            # ordering ever regresses, fail loudly instead of quietly returning a hollowed-out group.
-            if unresolved_count:
-                group_name = create_cmd.node_name or create_cmd.node_type
-                msg = f"Failed while rebuilding the group '{group_name}' because {unresolved_count} of its {len(member_uuids)} nodes were not rebuilt."
-                raise FlowDeserializationError(msg)
-            remapped_names = [deserialized_nodes.node_uuid_to_node_name[member_uuid] for member_uuid in member_uuids]
-            create_cmd_copy = CreateNodeRequest(
-                node_type=create_cmd.node_type,
-                specific_library_name=create_cmd.specific_library_name,
-                node_name=create_cmd.node_name,
-                node_names_to_add=remapped_names,
-                override_parent_flow_name=create_cmd.override_parent_flow_name,
-                metadata=create_cmd.metadata,
-                resolution=create_cmd.resolution,
-                initial_setup=create_cmd.initial_setup,
-                set_as_new_context=create_cmd.set_as_new_context,
-                create_error_proxy_on_failure=create_cmd.create_error_proxy_on_failure,
-            )
-            serialized_node_for_deserialization = SerializedNodeCommands(
-                node_uuid=serialized_node.node_uuid,
-                create_node_command=create_cmd_copy,
-                element_modification_commands=serialized_node.element_modification_commands,
-                node_dependencies=serialized_node.node_dependencies,
-                lock_node_command=serialized_node.lock_node_command,
-                is_node_group=serialized_node.is_node_group,
-            )
+            serialized_node_for_deserialization = replace(serialized_node, create_node_command=create_cmd_copy)
 
         deserialize_node_request = DeserializeNodeFromCommandsRequest(
             serialized_node_commands=serialized_node_for_deserialization
@@ -4194,6 +4190,84 @@ class FlowManager(EngineScoped):
             raise FlowDeserializationError(msg)
 
         return deserialized_node_result.node_name
+
+    def _remapped_group_member_names(
+        self, create_cmd: CreateNodeRequest, deserialized_nodes: DeserializedFlowNodes
+    ) -> list[str] | None:
+        """Turn a saved group's member UUIDs into the names its members were rebuilt under.
+
+        The field is declared as plain names, but a serialized group stores its members as UUIDs,
+        because the names they will be rebuilt under are not known until they are rebuilt.
+
+        Args:
+            create_cmd: The group's creation command as it was saved
+            deserialized_nodes: Nodes rebuilt so far, holding the UUID-to-name mapping
+
+        Returns:
+            The members' rebuilt names, or None if the group was saved holding nothing
+
+        Raises:
+            FlowDeserializationError: If any member was not rebuilt
+        """
+        if not create_cmd.node_names_to_add:
+            return None
+
+        member_uuids = [SerializedNodeCommands.NodeUUID(name) for name in create_cmd.node_names_to_add]
+        unresolved_count = sum(
+            1 for member_uuid in member_uuids if member_uuid not in deserialized_nodes.node_uuid_to_node_name
+        )
+        # A group IS its membership, so a group that comes back holding three of its five nodes is
+        # worse than a load that stops and says so. Every member is rebuildable by the time we get
+        # here because _deserialize_nodes_for_flow_and_subflows rebuilds groups last; if that
+        # ordering ever regresses, fail loudly instead of quietly returning a hollowed-out group.
+        if unresolved_count:
+            group_name = create_cmd.node_name or create_cmd.node_type
+            msg = f"Failed while rebuilding the group '{group_name}' because {unresolved_count} of its {len(member_uuids)} nodes were not rebuilt."
+            raise FlowDeserializationError(msg)
+
+        return [deserialized_nodes.node_uuid_to_node_name[member_uuid] for member_uuid in member_uuids]
+
+    def _remapped_group_metadata(
+        self, create_cmd: CreateNodeRequest, deserialized_nodes: DeserializedFlowNodes
+    ) -> dict | None:
+        """Point a saved group's `subflow_name` at the subflow this load created for it.
+
+        A group records its subflow by name, and that name is deduped like any other on the way in:
+        loading a graph into a session that already holds a same-named subflow creates the group's
+        one under a new name. Left unremapped, the rebuilt group reaches for the name it was saved
+        with, finds a flow belonging to something else, and moves the nodes it just loaded into it --
+        with no error, because the flow it names does exist.
+
+        Args:
+            create_cmd: The group's creation command as it was saved
+            deserialized_nodes: Rebuilt nodes, holding the saved-to-created flow name mapping
+
+        Returns:
+            Metadata with the subflow name rewritten, or the original if there is nothing to rewrite
+        """
+        saved_metadata = create_cmd.metadata
+        if saved_metadata is None:
+            return None
+
+        saved_subflow_name = saved_metadata.get("subflow_name")
+        if saved_subflow_name is None:
+            # Copy/paste strips subflow_name so the pasted group builds a fresh subflow of its own.
+            return saved_metadata
+
+        created_subflow_name = deserialized_nodes.original_flow_name_to_flow_name.get(saved_subflow_name)
+        if created_subflow_name is None:
+            # The group's subflow was not part of this load. Its own on-demand creation path handles
+            # that, and keeping a stale name would point it at whatever now answers to it.
+            remapped_metadata = copy.deepcopy(saved_metadata)
+            remapped_metadata.pop("subflow_name", None)
+            return remapped_metadata
+
+        if created_subflow_name == saved_subflow_name:
+            return saved_metadata
+
+        remapped_metadata = copy.deepcopy(saved_metadata)
+        remapped_metadata["subflow_name"] = created_subflow_name
+        return remapped_metadata
 
     def _deserialize_subflow_nodes(self, sub_flow_commands: SerializedFlowCommands) -> DeserializedFlowNodes:
         """Create one subflow and rebuild the nodes inside it, and inside its own subflows.
@@ -4222,7 +4296,35 @@ class FlowManager(EngineScoped):
         # Nodes are created into the Flow at the top of the context stack, so enter the subflow
         # while rebuilding its contents and leave it afterwards.
         with self.engine.context_manager.flow(flow=sub_flow):
-            return self._deserialize_nodes_for_flow_and_subflows(serialized_flow_commands=sub_flow_commands)
+            sub_flow_nodes = self._deserialize_nodes_for_flow_and_subflows(serialized_flow_commands=sub_flow_commands)
+
+        # Record what this flow was saved as against what it came back as. A group node saved a
+        # reference to its subflow by name, and the name is deduped on the way in, so the group has
+        # to be pointed at the flow this load created rather than a same-named one already here.
+        original_flow_name = self._original_flow_name_of(flow_initialization_command=flow_initialization_command)
+        if original_flow_name is not None:
+            sub_flow_nodes.original_flow_name_to_flow_name[original_flow_name] = sub_flow_name
+
+        return sub_flow_nodes
+
+    def _original_flow_name_of(
+        self, flow_initialization_command: CreateFlowRequest | ImportWorkflowAsReferencedSubFlowRequest
+    ) -> str | None:
+        """The name a Flow was saved under, which is what a group's stored reference names it by.
+
+        Args:
+            flow_initialization_command: The command that brought the Flow into existence
+
+        Returns:
+            The saved name, or None if the command carries no name to map from
+        """
+        match flow_initialization_command:
+            case CreateFlowRequest():
+                return flow_initialization_command.flow_name
+            case ImportWorkflowAsReferencedSubFlowRequest():
+                # An imported workflow is referenced by workflow name, not by a flow name a group
+                # could have recorded, so there is nothing to map.
+                return None
 
     def _create_flow_for_deserialization(
         self, flow_initialization_command: CreateFlowRequest | ImportWorkflowAsReferencedSubFlowRequest
