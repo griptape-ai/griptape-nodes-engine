@@ -59,29 +59,77 @@ class BaseNodeGroup(BaseNode):
             group_settings_params.append(parameter.name)
             self.metadata[GROUP_SETTINGS_PARAMS_METADATA_KEY] = group_settings_params
 
-    def add_nodes_to_group(self, nodes: list[BaseNode]) -> None:
+    def add_nodes_to_group(self, nodes: list[BaseNode]) -> list[BaseNode]:
         """Add nodes to this group.
+
+        A plain group takes exactly the nodes it was asked for; it does not pull in tethered
+        companions the way a SubflowNodeGroup does. It does absorb nodes a previous owner
+        released alongside them — see `_remove_nodes_from_existing_parents`.
 
         Args:
             nodes: A list of nodes to add to this group
+
+        Returns:
+            The nodes actually added, including any extra nodes a previous owner released.
         """
+        nodes = nodes + self._remove_nodes_from_existing_parents(nodes)
         self._add_nodes_to_group_dict(nodes)
 
-        node_names_in_group = set(self.nodes.keys())
-        self.metadata["node_names_in_group"] = list(node_names_in_group)
+        self.metadata["node_names_in_group"] = list(self.nodes.keys())
 
-    def remove_nodes_from_group(self, nodes: list[BaseNode]) -> None:
+        return nodes
+
+    def remove_nodes_from_group(self, nodes: list[BaseNode]) -> list[BaseNode]:
         """Remove nodes from this group.
+
+        Nodes that are not members are skipped rather than raising, so callers can hand over a
+        best-effort list.
 
         Args:
             nodes: A list of nodes to remove from this group
-        """
-        for node in nodes:
-            if node.name in self.nodes:
-                del self.nodes[node.name]
 
-        node_names_in_group = set(self.nodes.keys())
-        self.metadata["node_names_in_group"] = list(node_names_in_group)
+        Returns:
+            The nodes actually removed — non-members are excluded so callers report only real changes.
+        """
+        nodes_removed = []
+        for node in nodes:
+            if node.name not in self.nodes:
+                continue
+            node.parent_group = None
+            del self.nodes[node.name]
+            nodes_removed.append(node)
+
+        self.metadata["node_names_in_group"] = list(self.nodes.keys())
+
+        return nodes_removed
+
+    def _remove_nodes_from_existing_parents(self, nodes: list[BaseNode]) -> list[BaseNode]:
+        """Detach nodes from whichever group currently owns them before reparenting them here.
+
+        Returns:
+            Any nodes detached beyond those requested. A previous owner may release more than it
+            was asked to — a SubflowNodeGroup takes tethered companions with it — and those extras
+            belong here now. Leaving them behind would eject them from every group.
+        """
+        requested_names = {node.name for node in nodes}
+        nodes_by_parent: dict[BaseNodeGroup, list[BaseNode]] = {}
+        for node in nodes:
+            parent_group = node.parent_group
+            if parent_group is self:
+                continue
+            if isinstance(parent_group, BaseNodeGroup):
+                nodes_by_parent.setdefault(parent_group, []).append(node)
+
+        extra_nodes: list[BaseNode] = []
+        extra_names: set[str] = set()
+        for parent_group, nodes_to_detach in nodes_by_parent.items():
+            for detached_node in parent_group.remove_nodes_from_group(nodes_to_detach):
+                if detached_node.name in requested_names or detached_node.name in extra_names:
+                    continue
+                extra_names.add(detached_node.name)
+                extra_nodes.append(detached_node)
+
+        return extra_nodes
 
     def _add_nodes_to_group_dict(self, nodes: list[BaseNode]) -> None:
         """Add nodes to the group's node dictionary."""

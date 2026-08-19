@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
+from griptape_nodes.files.path_utils import parse_static_server_url
 from griptape_nodes.retained_mode.events.os_events import (
     ExistingFilePolicy,
     WriteFileRequest,
@@ -296,3 +297,69 @@ class TestLocalStorageDriverCreateSignedDownloadUrl:
             url = driver.create_signed_download_url(Path(r"C:\ws\images\photo.png"))
 
         assert url == "http://localhost:8124/workspace/images/photo.png?t=1000"
+
+
+class TestSignedDownloadUrlRoundTrip:
+    """A URL built here must map back to the file it was built from.
+
+    ``create_signed_download_url`` and ``parse_static_server_url`` are inverses, and
+    nothing else enforces that: the builder lives in this driver and the parser lives in
+    ``path_utils``. The assertions elsewhere pin each side to a hardcoded string, which
+    both sides can drift away from together. Round-tripping is what catches a change to
+    one that the other does not follow -- the failure mode being that ``File.resolve()``
+    silently stops resolving URLs this driver still emits.
+    https://github.com/griptape-ai/griptape-nodes-engine/issues/5283
+    """
+
+    @pytest.fixture
+    def mock_workspace_path(self) -> Generator[None, None, None]:
+        with patch("griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes") as mock_griptape:
+            mock_config_manager = Mock()
+            mock_config_manager.workspace_path = Path("/workspace")
+            mock_griptape.ConfigManager.return_value = mock_config_manager
+            yield
+
+    def test_workspace_file_round_trips(
+        self,
+        mock_workspace_path: Any,  # noqa: ARG002
+    ) -> None:
+        """An in-workspace file survives path -> URL -> path unchanged."""
+        driver = LocalStorageDriver(Path("/workspace"))
+        original = Path("/workspace/staticfiles/clip.mp4")
+
+        with patch("griptape_nodes.drivers.storage.local_storage_driver.time") as mock_time:
+            mock_time.time.return_value = 1000
+            url = driver.create_signed_download_url(original)
+
+        assert parse_static_server_url(url, Path("/workspace")) == original
+
+    def test_nested_workspace_file_round_trips(
+        self,
+        mock_workspace_path: Any,  # noqa: ARG002
+    ) -> None:
+        """Nested subdirectories survive the round trip."""
+        driver = LocalStorageDriver(Path("/workspace"))
+        original = Path("/workspace/outputs/shots/010/clip.mp4")
+
+        with patch("griptape_nodes.drivers.storage.local_storage_driver.time") as mock_time:
+            mock_time.time.return_value = 1000
+            url = driver.create_signed_download_url(original)
+
+        assert parse_static_server_url(url, Path("/workspace")) == original
+
+    def test_cachebuster_does_not_reach_the_filename(
+        self,
+        mock_workspace_path: Any,  # noqa: ARG002
+    ) -> None:
+        """The ``?t=`` the builder appends must not survive into the resolved path.
+
+        It rode along into the filename in the original bug, so no such file existed.
+        """
+        driver = LocalStorageDriver(Path("/workspace"))
+
+        with patch("griptape_nodes.drivers.storage.local_storage_driver.time") as mock_time:
+            mock_time.time.return_value = 1000
+            url = driver.create_signed_download_url(Path("/workspace/staticfiles/clip.mp4"))
+
+        assert "?t=1000" in url
+        assert "?t=" not in str(parse_static_server_url(url, Path("/workspace")))

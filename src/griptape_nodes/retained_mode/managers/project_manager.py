@@ -337,6 +337,20 @@ class _ProjectVariableResolver:
                         # situation-macro path in on_get_path_for_macro_request. A required
                         # builtin that can't resolve is a genuine error.
                         if not var_info.is_required:
+                            # Logged because the degraded result is a PLAUSIBLE path, not an
+                            # obviously broken one: dropping `{workflow_dir}` from
+                            # `{workflow_dir?:/}outputs` silently relocates writes and reads
+                            # from the workflow's folder to the workspace root. Without this
+                            # line the only symptom is media that resolves to a file which was
+                            # never written there.
+                            logger.warning(
+                                "Optional builtin '%s' could not be resolved while resolving %s '%s'; "
+                                "dropping it from the path (%s)",
+                                ref,
+                                owner_kind,
+                                owner_name,
+                                e,
+                            )
                             continue
                         msg = (
                             f"Cannot resolve {owner_kind} '{owner_name}': "
@@ -1574,11 +1588,26 @@ class ProjectManager(EngineScoped):
         # underlying exception text so users can tell which precondition is missing.
         for var_info in variable_infos:
             unavailable_reason = builtin_resolution.unavailable.get(var_info.name)
-            if unavailable_reason is not None and var_info.is_required:
+            if unavailable_reason is None:
+                continue
+            if var_info.is_required:
                 return GetPathForMacroResultFailure(
                     failure_reason=PathResolutionFailureReason.MACRO_RESOLUTION_ERROR,
                     result_details=f"Attempted to resolve macro path. Failed because builtin variable '{var_info.name}' cannot be resolved: {unavailable_reason}",
                 )
+            # Logged for the same reason as the equivalent degradation in
+            # _ProjectVariableResolver._resolve_macro_string: the degraded result is a
+            # PLAUSIBLE path, not an obviously broken one. Dropping `{workflow_dir}` from
+            # `{workflow_dir?:/}outputs` relocates writes and reads from the workflow's folder
+            # to the workspace root, and without this line the only symptom is media that
+            # resolves to a file which was never written there.
+            logger.warning(
+                "Optional builtin '%s' could not be resolved while resolving macro '%s'; "
+                "dropping it from the path (%s)",
+                var_info.name,
+                request.parsed_macro.template,
+                unavailable_reason,
+            )
         if builtin_resolution.conflicts:
             return GetPathForMacroResultFailure(
                 failure_reason=PathResolutionFailureReason.RESERVED_NAME_COLLISION,
@@ -4677,11 +4706,27 @@ class ProjectManager(EngineScoped):
                 if not context_manager.has_current_workflow():
                     msg = "No current workflow"
                     raise RuntimeError(msg)
+                # Prefer the path the context was entered WITH. The registry key below is
+                # derived against the workspace that was active at push time, so a project
+                # switch -- which re-registers every workflow under the new workspace -- leaves
+                # the name pointing at a key that no longer exists. The lookup then raises,
+                # `{workflow_dir?:/}` swallows it as an optional reference, and `{outputs}`
+                # silently degrades from the workflow's own folder to a workspace-relative
+                # path, so saved media resolves somewhere it was never written.
+                context_file_path = context_manager.get_current_workflow_file_path()
+                if context_file_path is not None:
+                    return str(Path(context_file_path).parent)
                 workflow_name = context_manager.get_current_workflow_name()
                 try:
                     workflow = WorkflowRegistry.get_workflow_by_name(workflow_name)
                 except KeyError as e:
-                    msg = f"Workflow '{workflow_name}' has not been saved yet"
+                    # NOT the same as unsaved: the file may be on disk and saved, but keyed
+                    # under a different workspace. Say so, rather than reporting a state the
+                    # user cannot act on.
+                    msg = (
+                        f"Workflow '{workflow_name}' is not registered on this engine "
+                        f"(it may be registered under a different workspace)"
+                    )
                     raise RuntimeError(msg) from e
                 if workflow.file_path is None:
                     msg = f"Workflow '{workflow_name}' has not been saved yet"

@@ -454,6 +454,12 @@ class BaseIterativeStartNode(BaseNode):
             self.parameter_output_values[IterativeNodeParam.INDEX.value] = current_index
             self.publish_update_to_parameter(IterativeNodeParam.INDEX.value, current_index)
 
+    def get_nodes_to_group_with(self) -> list[BaseNode]:
+        """Nodes that must share this Start node's group membership, on add and on remove."""
+        if self.end_node is None:
+            return []
+        return [self.end_node]
+
     def _initialize_loop(self) -> None:
         """Initialize the loop with fresh parameter values."""
         # Reset all state for fresh loop execution
@@ -943,6 +949,12 @@ class BaseIterativeEndNode(BaseNode):
         """Reset End state for a fresh workflow run."""
         self._results_list = []
         self._output_results_list()
+
+    def get_nodes_to_group_with(self) -> list[BaseNode]:
+        """Nodes that must share this End node's group membership, on add and on remove."""
+        if self.start_node is None:
+            return []
+        return [self.start_node]
 
     def after_incoming_connection(
         self,
