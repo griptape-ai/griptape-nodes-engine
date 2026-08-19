@@ -16,6 +16,10 @@ from griptape_nodes.machines.fsm import FSM, State, WorkflowState
 from griptape_nodes.machines.node_priority_queue import NodePriorityQueue
 from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.retained_mode.engine import EngineScoped
+from griptape_nodes.retained_mode.events.base_events import (
+    ExecutionEvent,
+    ExecutionGriptapeNodeEvent,
+)
 from griptape_nodes.retained_mode.events.event_converter import safe_unstructure
 from griptape_nodes.retained_mode.events.execution_events import (
     CurrentControlNodeEvent,
@@ -200,12 +204,16 @@ class ExecuteDagState(State):
             # suppression it would overwrite the display that
             # _emit_parameter_change_event already set correctly during execution.
             display_value = current_node.get_display_value_for_output(parameter_name, value)
-            await context.engine.event_manager.aemit_execution(
-                ParameterValueUpdateEvent(
-                    node_name=current_node.name,
-                    parameter_name=parameter_name,
-                    data_type=data_type,
-                    value=safe_unstructure(display_value),
+            await context.engine.event_manager.aput_event(
+                ExecutionGriptapeNodeEvent(
+                    wrapped_event=ExecutionEvent(
+                        payload=ParameterValueUpdateEvent(
+                            node_name=current_node.name,
+                            parameter_name=parameter_name,
+                            data_type=data_type,
+                            value=safe_unstructure(display_value),
+                        )
+                    ),
                 )
             )
         # Output values should already be saved!
@@ -223,12 +231,16 @@ class ExecuteDagState(State):
             param_name: safe_unstructure(current_node.get_display_value_for_output(param_name, val))
             for param_name, val in current_node.parameter_output_values.items()
         }
-        await context.engine.event_manager.aemit_execution(
-            NodeResolvedEvent(
-                node_name=current_node.name,
-                parameter_output_values=display_output_values,
-                node_type=current_node.__class__.__name__,
-                specific_library_name=library_name,
+        await context.engine.event_manager.aput_event(
+            ExecutionGriptapeNodeEvent(
+                wrapped_event=ExecutionEvent(
+                    payload=NodeResolvedEvent(
+                        node_name=current_node.name,
+                        parameter_output_values=display_output_values,
+                        node_type=current_node.__class__.__name__,
+                        specific_library_name=library_name,
+                    )
+                )
             )
         )
         # Now the final thing to do, is to take their directed graph and update it.
@@ -304,7 +316,11 @@ class ExecuteDagState(State):
                         }
                     )
                 )
-                context.engine.event_manager.emit_execution(CurrentControlNodeEvent(node_name=next_node.name))
+                context.engine.event_manager.put_event(
+                    ExecutionGriptapeNodeEvent(
+                        wrapped_event=ExecutionEvent(payload=CurrentControlNodeEvent(node_name=next_node.name))
+                    )
+                )
             ExecuteDagState._add_and_queue_nodes(context, next_node, network_name)
 
     @staticmethod
@@ -312,7 +328,11 @@ class ExecuteDagState(State):
         """Emit update of involved nodes based on current DAG state."""
         if context.dag_builder is not None:
             involved_nodes = list(context.node_to_reference.keys())
-            context.engine.event_manager.emit_execution(InvolvedNodesEvent(involved_nodes=involved_nodes))
+            context.engine.event_manager.put_event(
+                ExecutionGriptapeNodeEvent(
+                    wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=involved_nodes))
+                )
+            )
 
     @staticmethod
     def _add_and_queue_nodes(context: ParallelResolutionContext, next_node: BaseNode, network_name: str) -> None:
@@ -534,10 +554,14 @@ class ExecuteDagState(State):
                 context.running_tasks_count -= 1  # Decrement on error
                 logger.exception("Error collecting parameter values for node '%s'", node_reference.node_reference.name)
                 error_node_name = node_reference.node_reference.name
-                await context.engine.event_manager.aemit_execution(
-                    NodeErrorEvent(
-                        node_name=error_node_name,
-                        error_message=str(e),
+                await context.engine.event_manager.aput_event(
+                    ExecutionGriptapeNodeEvent(
+                        wrapped_event=ExecutionEvent(
+                            payload=NodeErrorEvent(
+                                node_name=error_node_name,
+                                error_message=str(e),
+                            )
+                        )
                     )
                 )
                 context.error_message = f"Parameter passthrough failed for node '{error_node_name}': {e}"
@@ -553,10 +577,14 @@ class ExecuteDagState(State):
                 validation_node_name = node_reference.node_reference.name
                 msg = f"Node '{validation_node_name}' encountered problems: {exceptions}"
                 logger.error("Canceling flow run. %s", msg)
-                await context.engine.event_manager.aemit_execution(
-                    NodeErrorEvent(
-                        node_name=validation_node_name,
-                        error_message=str(exceptions),
+                await context.engine.event_manager.aput_event(
+                    ExecutionGriptapeNodeEvent(
+                        wrapped_event=ExecutionEvent(
+                            payload=NodeErrorEvent(
+                                node_name=validation_node_name,
+                                error_message=str(exceptions),
+                            )
+                        )
                     )
                 )
                 context.error_message = msg
@@ -611,7 +639,9 @@ class ExecuteDagState(State):
 
             # Send an event that this is a current data node:
 
-            await context.engine.event_manager.aemit_execution(CurrentDataNodeEvent(node_name=node))
+            await context.engine.event_manager.aput_event(
+                ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=CurrentDataNodeEvent(node_name=node)))
+            )
 
         # Wait for a task to finish - only if there are tasks running
         if context.task_to_node:
@@ -636,10 +666,14 @@ class ExecuteDagState(State):
                     logger.error("Error processing node '%s'", node_name, exc_info=exc)
                     msg = f"Node '{node_name}' encountered a problem: {exc}"
 
-                    await context.engine.event_manager.aemit_execution(
-                        NodeErrorEvent(
-                            node_name=node_name,
-                            error_message=str(exc),
+                    await context.engine.event_manager.aput_event(
+                        ExecutionGriptapeNodeEvent(
+                            wrapped_event=ExecutionEvent(
+                                payload=NodeErrorEvent(
+                                    node_name=node_name,
+                                    error_message=str(exc),
+                                )
+                            )
                         )
                     )
                     context.error_message = msg

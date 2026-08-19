@@ -124,6 +124,7 @@ from griptape_nodes.retained_mode.events.agent_events import (
     UpdateAgentProviderResultSuccess,
 )
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete, ConfigChanged
+from griptape_nodes.retained_mode.events.base_events import ExecutionEvent, ExecutionGriptapeNodeEvent, ResultPayload
 from griptape_nodes.retained_mode.events.mcp_events import (
     GetEnabledMCPServersRequest,
     GetEnabledMCPServersResultSuccess,
@@ -138,7 +139,6 @@ if TYPE_CHECKING:
     from pydantic_ai.toolsets import AbstractToolset
 
     from griptape_nodes.retained_mode.engine import Engine
-    from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.static_files_manager import StaticFilesManager
 
@@ -484,7 +484,11 @@ class AgentManager(EngineScoped):
             payload = _run_event_to_payload(event, thread_id)
             if payload is None:
                 return
-            event_manager.emit_execution(payload)
+            event_manager.put_event(
+                ExecutionGriptapeNodeEvent(
+                    wrapped_event=ExecutionEvent(payload=payload),
+                ),
+            )
 
         cancel_event = asyncio.Event()
         self._active_runs[thread_id] = _ActiveRun(cancel_event=cancel_event, loop=asyncio.get_running_loop())

@@ -82,7 +82,7 @@ from griptape_nodes.retained_mode.events.app_events import (
 )
 
 # Runtime imports for ResultDetails since it's used at runtime
-from griptape_nodes.retained_mode.events.base_events import ResultDetail, ResultDetails, ResultPayloadFailure
+from griptape_nodes.retained_mode.events.base_events import AppEvent, ResultDetail, ResultDetails, ResultPayloadFailure
 from griptape_nodes.retained_mode.events.config_events import (
     GetConfigCategoryRequest,
     GetConfigCategoryResultSuccess,
@@ -3599,14 +3599,16 @@ class LibraryManager(EngineScoped):
             if pre_register_info and pre_register_info.library_name
             else Path(lib_path).stem
         )
-        self.engine.event_manager.emit_app(
-            EngineInitializationProgress(
-                phase=InitializationPhase.LIBRARIES,
-                item_name=pending_library_name,
-                status=InitializationStatus.LOADING,
-                current=index,
-                total=total,
-                is_worker=self._is_worker,
+        self.engine.event_manager.put_event(
+            AppEvent(
+                payload=EngineInitializationProgress(
+                    phase=InitializationPhase.LIBRARIES,
+                    item_name=pending_library_name,
+                    status=InitializationStatus.LOADING,
+                    current=index,
+                    total=total,
+                    is_worker=self._is_worker,
+                )
             )
         )
 
@@ -3624,26 +3626,30 @@ class LibraryManager(EngineScoped):
                 if isinstance(load_result.result_details, ResultDetails)
                 else str(load_result.result_details)
             )
-            self.engine.event_manager.emit_app(
-                EngineInitializationProgress(
-                    phase=InitializationPhase.LIBRARIES,
-                    item_name=lib_path,
-                    status=InitializationStatus.FAILED,
-                    current=index,
-                    total=total,
-                    error=error_message,
-                    is_worker=self._is_worker,
+            self.engine.event_manager.put_event(
+                AppEvent(
+                    payload=EngineInitializationProgress(
+                        phase=InitializationPhase.LIBRARIES,
+                        item_name=lib_path,
+                        status=InitializationStatus.FAILED,
+                        current=index,
+                        total=total,
+                        error=error_message,
+                        is_worker=self._is_worker,
+                    )
                 )
             )
         elif isinstance(load_result, RegisterLibraryFromFileResultSuccess):
-            self.engine.event_manager.emit_app(
-                EngineInitializationProgress(
-                    phase=InitializationPhase.LIBRARIES,
-                    item_name=load_result.library_name,
-                    status=InitializationStatus.COMPLETE,
-                    current=index,
-                    total=total,
-                    is_worker=self._is_worker,
+            self.engine.event_manager.put_event(
+                AppEvent(
+                    payload=EngineInitializationProgress(
+                        phase=InitializationPhase.LIBRARIES,
+                        item_name=load_result.library_name,
+                        status=InitializationStatus.COMPLETE,
+                        current=index,
+                        total=total,
+                        is_worker=self._is_worker,
+                    )
                 )
             )
 
@@ -4276,10 +4282,12 @@ class LibraryManager(EngineScoped):
         # owned by the app, not the engine. The library statuses reflect real
         # fitness because workers have already reported back above.
         if not self._is_worker:
-            self.engine.event_manager.emit_app(
-                EngineReadyEvent(
-                    libraries=self._collect_library_load_statuses(),
-                    is_initial_start=True,
+            self.engine.event_manager.put_event(
+                AppEvent(
+                    payload=EngineReadyEvent(
+                        libraries=self._collect_library_load_statuses(),
+                        is_initial_start=True,
+                    )
                 )
             )
 
@@ -5520,10 +5528,12 @@ class LibraryManager(EngineScoped):
         # fitness now that workers have reported back. is_initial_start=False so the app
         # refreshes the table without re-showing the startup banner. Orchestrator only.
         if not self._is_worker:
-            self.engine.event_manager.emit_app(
-                EngineReadyEvent(
-                    libraries=self._collect_library_load_statuses(),
-                    is_initial_start=False,
+            self.engine.event_manager.put_event(
+                AppEvent(
+                    payload=EngineReadyEvent(
+                        libraries=self._collect_library_load_statuses(),
+                        is_initial_start=False,
+                    )
                 )
             )
 
@@ -5824,14 +5834,16 @@ class LibraryManager(EngineScoped):
                 if pre_register_info and pre_register_info.library_name
                 else Path(lib_path).stem
             )
-            self.engine.event_manager.emit_app(
-                EngineInitializationProgress(
-                    phase=InitializationPhase.LIBRARIES,
-                    item_name=pending_library_name,
-                    status=InitializationStatus.LOADING,
-                    current=current_library_index,
-                    total=total_libraries,
-                    is_worker=self._is_worker,
+            self.engine.event_manager.put_event(
+                AppEvent(
+                    payload=EngineInitializationProgress(
+                        phase=InitializationPhase.LIBRARIES,
+                        item_name=pending_library_name,
+                        status=InitializationStatus.LOADING,
+                        current=current_library_index,
+                        total=total_libraries,
+                        is_worker=self._is_worker,
+                    )
                 )
             )
 
@@ -5858,14 +5870,16 @@ class LibraryManager(EngineScoped):
                 loaded_count += 1
 
                 # Emit success event
-                self.engine.event_manager.emit_app(
-                    EngineInitializationProgress(
-                        phase=InitializationPhase.LIBRARIES,
-                        item_name=library_name,
-                        status=InitializationStatus.COMPLETE,
-                        current=current_library_index,
-                        total=total_libraries,
-                        is_worker=self._is_worker,
+                self.engine.event_manager.put_event(
+                    AppEvent(
+                        payload=EngineInitializationProgress(
+                            phase=InitializationPhase.LIBRARIES,
+                            item_name=library_name,
+                            status=InitializationStatus.COMPLETE,
+                            current=current_library_index,
+                            total=total_libraries,
+                            is_worker=self._is_worker,
+                        )
                     )
                 )
             else:
@@ -5878,15 +5892,17 @@ class LibraryManager(EngineScoped):
                     if isinstance(load_result.result_details, ResultDetails)
                     else str(load_result.result_details)
                 )
-                self.engine.event_manager.emit_app(
-                    EngineInitializationProgress(
-                        phase=InitializationPhase.LIBRARIES,
-                        item_name=library_name,
-                        status=InitializationStatus.FAILED,
-                        current=current_library_index,
-                        total=total_libraries,
-                        error=error_message,
-                        is_worker=self._is_worker,
+                self.engine.event_manager.put_event(
+                    AppEvent(
+                        payload=EngineInitializationProgress(
+                            phase=InitializationPhase.LIBRARIES,
+                            item_name=library_name,
+                            status=InitializationStatus.FAILED,
+                            current=current_library_index,
+                            total=total_libraries,
+                            error=error_message,
+                            is_worker=self._is_worker,
+                        )
                     )
                 )
 

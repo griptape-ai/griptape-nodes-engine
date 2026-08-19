@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, NamedTuple, Self, Type
 
 from pydantic import BaseModel
 
+from griptape_nodes.retained_mode.events.base_events import ExecutionEvent, ExecutionGriptapeNodeEvent
+
 logger = logging.getLogger("griptape_nodes")
 
 
@@ -442,7 +444,11 @@ class BaseNodeElement:
 
         event_data.update(self._changes)
         # Publish the event through the owning node so it lands on that node's engine.
-        self._node_context.engine.event_manager.emit_execution(AlterElementEvent(element_details=event_data))
+        self._node_context.engine.event_manager.put_event(
+            ExecutionGriptapeNodeEvent(
+                wrapped_event=ExecutionEvent(payload=AlterElementEvent(element_details=event_data))
+            )
+        )
         self._changes.clear()
 
     def to_dict(self) -> dict[str, Any]:

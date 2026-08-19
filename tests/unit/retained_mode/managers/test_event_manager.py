@@ -14,8 +14,6 @@ from griptape_nodes.app.worker_routing import RemoteHandler
 from griptape_nodes.retained_mode.engine import Engine, current_engine
 from griptape_nodes.retained_mode.events.app_events import ConfigChanged
 from griptape_nodes.retained_mode.events.base_events import (
-    AppEvent,
-    AppPayload,
     EventRequest,
     EventResultSuccess,
     ExecutionEvent,
@@ -1712,89 +1710,6 @@ class _OtherExecEvent(ExecutionPayload):
     """A second ExecutionPayload type to prove type-scoped delivery."""
 
     value: int = 0
-
-
-@dataclass
-class _ProbeAppEvent(AppPayload):
-    """Minimal AppPayload for exercising emit_app."""
-
-    label: str = ""
-
-
-class TestEmitApi:
-    """`emit_execution`/`emit_app` own both the wrapping and the identity stamp.
-
-    A caller cannot build the event without both: no hand-built
-    `ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=...))` nesting to get
-    wrong, and no stamp to forget.
-    """
-
-    @staticmethod
-    def _engine() -> Engine:
-        engine = Engine()
-        engine.engine_identity_manager.active_engine_id = "engine-a"
-        engine.session_manager.active_session_id = "session-a"
-        engine.event_manager.initialize_queue(asyncio.Queue())
-        return engine
-
-    def test_emit_execution_wraps_the_payload_for_the_transport(self) -> None:
-        engine = self._engine()
-
-        engine.event_manager.emit_execution(_FakeStreamEvent(text="hi"))
-
-        event = engine.event_manager.event_queue.get_nowait()
-        assert isinstance(event, ExecutionGriptapeNodeEvent)
-        assert isinstance(event.wrapped_event, ExecutionEvent)
-        assert event.wrapped_event.payload.text == "hi"
-
-    def test_emit_execution_stamps_the_event_that_reaches_the_wire(self) -> None:
-        """The transport publishes `wrapped_event`, so the inner event is the one that matters."""
-        engine = self._engine()
-
-        engine.event_manager.emit_execution(_FakeStreamEvent(text="hi"))
-
-        event = engine.event_manager.event_queue.get_nowait()
-        assert (event.wrapped_event.engine_id, event.wrapped_event.session_id) == ("engine-a", "session-a")
-
-    @pytest.mark.asyncio
-    async def test_aemit_execution_matches_the_sync_form(self) -> None:
-        engine = self._engine()
-
-        await engine.event_manager.aemit_execution(_FakeStreamEvent(text="hi"))
-
-        event = engine.event_manager.event_queue.get_nowait()
-        assert event.wrapped_event.payload.text == "hi"
-        assert (event.wrapped_event.engine_id, event.wrapped_event.session_id) == ("engine-a", "session-a")
-
-    def test_emit_app_wraps_and_stamps(self) -> None:
-        engine = self._engine()
-
-        engine.event_manager.emit_app(_ProbeAppEvent(label="ready"))
-
-        event = engine.event_manager.event_queue.get_nowait()
-        assert isinstance(event, AppEvent)
-        assert event.payload.label == "ready"
-        assert (event.engine_id, event.session_id) == ("engine-a", "session-a")
-
-    @pytest.mark.asyncio
-    async def test_aemit_app_matches_the_sync_form(self) -> None:
-        engine = self._engine()
-
-        await engine.event_manager.aemit_app(_ProbeAppEvent(label="ready"))
-
-        event = engine.event_manager.event_queue.get_nowait()
-        assert event.payload.label == "ready"
-        assert (event.engine_id, event.session_id) == ("engine-a", "session-a")
-
-    def test_emit_execution_still_reaches_execution_listeners(self) -> None:
-        """The emit path must keep feeding in-process execution-event subscribers."""
-        engine = self._engine()
-        received: list[str] = []
-        engine.event_manager.add_listener_to_execution_event(_FakeStreamEvent, lambda p: received.append(p.text))
-
-        engine.event_manager.emit_execution(_FakeStreamEvent(text="hi"))
-
-        assert received == ["hi"]
 
 
 class TestExecutionEventSubscription:

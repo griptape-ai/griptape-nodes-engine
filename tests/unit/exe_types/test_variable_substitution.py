@@ -90,9 +90,9 @@ def _list_variables_result(variables: dict) -> ListVariablesResultSuccess:
 
 
 def _display_value_from_event(captured: list) -> object:
-    """Extract the display value from the first captured emit_execution call."""
+    """Extract the display value from the first captured put_event call."""
     assert len(captured) == 1
-    return captured[0].element_details["value"]
+    return captured[0].wrapped_event.payload.element_details["value"]
 
 
 def _run_tracked_set(
@@ -117,7 +117,7 @@ def _run_tracked_set(
     captured: list = []
 
     stub_engine = MagicMock()
-    stub_engine.event_manager.emit_execution.side_effect = captured.append
+    stub_engine.event_manager.put_event.side_effect = captured.append
     node._engine = stub_engine
 
     if variables is not None:
@@ -330,7 +330,7 @@ class TestTrackedOutputValuesDisplayDuringSubstitution:
 
     The display suppression logic lives inside _emit_parameter_change_event, so
     these tests let that method run its real logic and instead mock only the
-    final emit_execution call. The display value is read back from the captured event's
+    final put_event call. The display value is read back from the captured event's
     element_details dict.
     """
 

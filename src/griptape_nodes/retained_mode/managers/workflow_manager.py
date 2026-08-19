@@ -60,7 +60,7 @@ from griptape_nodes.retained_mode.events.app_events import (
 )
 
 # Runtime imports for ResultDetails since it's used at runtime
-from griptape_nodes.retained_mode.events.base_events import ResultDetail, ResultDetails
+from griptape_nodes.retained_mode.events.base_events import AppEvent, ResultDetail, ResultDetails
 from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowRequest,
     GetTopLevelFlowRequest,
@@ -6660,13 +6660,15 @@ class WorkflowManager(EngineScoped):
             workflow_name = str(workflow_file.name)
 
             # Emit loading event
-            self.engine.event_manager.emit_app(
-                EngineInitializationProgress(
-                    phase=InitializationPhase.WORKFLOWS,
-                    item_name=workflow_name,
-                    status=InitializationStatus.LOADING,
-                    current=current_index,
-                    total=total_workflows,
+            self.engine.event_manager.put_event(
+                AppEvent(
+                    payload=EngineInitializationProgress(
+                        phase=InitializationPhase.WORKFLOWS,
+                        item_name=workflow_name,
+                        status=InitializationStatus.LOADING,
+                        current=current_index,
+                        total=total_workflows,
+                    )
                 )
             )
 
@@ -6675,26 +6677,30 @@ class WorkflowManager(EngineScoped):
             if result_name:
                 succeeded.append(result_name)
                 # Emit success event
-                self.engine.event_manager.emit_app(
-                    EngineInitializationProgress(
-                        phase=InitializationPhase.WORKFLOWS,
-                        item_name=workflow_name,
-                        status=InitializationStatus.COMPLETE,
-                        current=current_index,
-                        total=total_workflows,
+                self.engine.event_manager.put_event(
+                    AppEvent(
+                        payload=EngineInitializationProgress(
+                            phase=InitializationPhase.WORKFLOWS,
+                            item_name=workflow_name,
+                            status=InitializationStatus.COMPLETE,
+                            current=current_index,
+                            total=total_workflows,
+                        )
                     )
                 )
             else:
                 failed.append(str(workflow_file))
                 # Emit failure event
-                self.engine.event_manager.emit_app(
-                    EngineInitializationProgress(
-                        phase=InitializationPhase.WORKFLOWS,
-                        item_name=workflow_name,
-                        status=InitializationStatus.FAILED,
-                        current=current_index,
-                        total=total_workflows,
-                        error="Failed to process workflow file",
+                self.engine.event_manager.put_event(
+                    AppEvent(
+                        payload=EngineInitializationProgress(
+                            phase=InitializationPhase.WORKFLOWS,
+                            item_name=workflow_name,
+                            status=InitializationStatus.FAILED,
+                            current=current_index,
+                            total=total_workflows,
+                            error="Failed to process workflow file",
+                        )
                     )
                 )
 

@@ -31,6 +31,8 @@ from griptape_nodes.exe_types.param_components.execution_status_component import
 from griptape_nodes.exe_types.variable_resolver import VariableResolver
 from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.retained_mode.events.base_events import (
+    ExecutionEvent,
+    ExecutionGriptapeNodeEvent,
     ProgressEvent,
     RequestPayload,
 )
@@ -374,7 +376,11 @@ class BaseNode(ABC):
             # Send an event to the GUI so it knows this node has changed resolution state.
             from griptape_nodes.retained_mode.events.execution_events import NodeUnresolvedEvent
 
-            self.engine.event_manager.emit_execution(NodeUnresolvedEvent(node_name=self.name))
+            self.engine.event_manager.put_event(
+                ExecutionGriptapeNodeEvent(
+                    wrapped_event=ExecutionEvent(payload=NodeUnresolvedEvent(node_name=self.name))
+                )
+            )
         self.state = NodeResolutionState.UNRESOLVED
         # NOTE: _entry_control_parameter is NOT cleared here as it represents execution context
         # that should persist through the resolve/unresolve cycle during a single execution
@@ -1358,7 +1364,9 @@ class BaseNode(ABC):
                 value=safe_unstructure(value),
             )
 
-            self.engine.event_manager.emit_execution(payload)
+            self.engine.event_manager.put_event(
+                ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload))
+            )
         else:
             msg = f"Parameter '{parameter_name} doesn't exist on {self.name}'"
             raise RuntimeError(msg)
@@ -1615,7 +1623,7 @@ class BaseNode(ABC):
             # Publish the event
             payload = AlterElementEvent(element_details=event_data)
 
-        self.engine.event_manager.emit_execution(payload)
+        self.engine.event_manager.put_event(ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload)))
 
     def _get_element_name(self, element: str | int, element_names: list[str]) -> str:
         """Convert an element identifier (name or index) to its name.
@@ -1834,7 +1842,11 @@ class TrackedParameterOutputValues(dict[str, Any]):
             event_data["modification_type"] = "deleted" if deleted else "set"
 
             # Publish the event
-            self._node.engine.event_manager.emit_execution(AlterElementEvent(element_details=event_data))
+            self._node.engine.event_manager.put_event(
+                ExecutionGriptapeNodeEvent(
+                    wrapped_event=ExecutionEvent(payload=AlterElementEvent(element_details=event_data))
+                )
+            )
 
 
 class ControlNode(BaseNode):
