@@ -5,7 +5,7 @@ import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
-from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -327,14 +327,30 @@ A = TypeVar("A", bound=AppPayload)
 class BaseEvent(BaseModel, ABC):
     """Abstract base class for all events."""
 
-    # Instance fields for engine and session identification
-    _engine_id: ClassVar[str | None] = None
-    _session_id: ClassVar[str | None] = None
-
-    engine_id: str | None = Field(default_factory=lambda: BaseEvent._engine_id)
-    session_id: str | None = Field(default_factory=lambda: BaseEvent._session_id)
+    # Which engine and session this event came from. Unset at construction and filled in by
+    # the emitting engine's `EventManager` via `stamp_identity`, so an event is only ever
+    # attributed to the engine that actually sent it.
+    engine_id: str | None = None
+    session_id: str | None = None
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    def stamp_identity(self, *, engine_id: str | None, session_id: str | None) -> None:
+        """Record which engine and session emitted this event.
+
+        Called by the emitting engine's `EventManager` on the way to the transport.
+        Values already present are left alone, so an event forwarded on behalf of
+        another engine (a worker relaying a result, for instance) keeps its origin
+        rather than being reattributed to whoever passed it along.
+
+        Args:
+            engine_id: The emitting engine's id.
+            session_id: The emitting engine's active session id.
+        """
+        if self.engine_id is None:
+            self.engine_id = engine_id
+        if self.session_id is None:
+            self.session_id = session_id
 
     def dict(self, *args, **kwargs) -> dict[str, Any]:
         """Override dict to handle payload serialization and add event_type."""
@@ -616,6 +632,15 @@ class AppEvent[A: AppPayload](BaseEvent):
 class GriptapeNodeEvent(BaseEvent):
     wrapped_event: EventResult
 
+    def stamp_identity(self, *, engine_id: str | None, session_id: str | None) -> None:
+        """Stamp this wrapper and the result it carries.
+
+        The transport publishes `wrapped_event` rather than the wrapper, so the inner
+        event has to be stamped too or identity never reaches the wire.
+        """
+        super().stamp_identity(engine_id=engine_id, session_id=session_id)
+        self.wrapped_event.stamp_identity(engine_id=engine_id, session_id=session_id)
+
     def get_request(self) -> Payload:
         """Get the request from the wrapped event."""
         return self.wrapped_event.get_request()
@@ -623,6 +648,15 @@ class GriptapeNodeEvent(BaseEvent):
 
 class ExecutionGriptapeNodeEvent(BaseEvent):
     wrapped_event: ExecutionEvent
+
+    def stamp_identity(self, *, engine_id: str | None, session_id: str | None) -> None:
+        """Stamp this wrapper and the execution event it carries.
+
+        The transport publishes `wrapped_event` rather than the wrapper, so the inner
+        event has to be stamped too or identity never reaches the wire.
+        """
+        super().stamp_identity(engine_id=engine_id, session_id=session_id)
+        self.wrapped_event.stamp_identity(engine_id=engine_id, session_id=session_id)
 
     def get_request(self) -> Payload:
         """Get the request from the wrapped event."""

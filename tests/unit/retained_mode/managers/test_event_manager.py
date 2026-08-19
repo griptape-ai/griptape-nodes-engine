@@ -14,6 +14,7 @@ from griptape_nodes.app.worker_routing import RemoteHandler
 from griptape_nodes.retained_mode.engine import Engine, current_engine
 from griptape_nodes.retained_mode.events.app_events import ConfigChanged
 from griptape_nodes.retained_mode.events.base_events import (
+    EventRequest,
     EventResultSuccess,
     ExecutionEvent,
     ExecutionGriptapeNodeEvent,
@@ -276,6 +277,46 @@ class TestHandleRequestLoopSafety:
         assert event.result.succeeded()
 
 
+class TestHandleRequestStampsIdentity:
+    """`_handle_request_core` stamps identity on its result even when the queue is never touched.
+
+    The app's inbound path awaits `ahandle_request`/`handle_request` and broadcasts the
+    returned result straight to the transport, so a result that never reaches `put_event`/
+    `aput_event` still needs its origin recorded here.
+    """
+
+    def test_handle_request_stamps_identity_without_initializing_the_queue(self) -> None:
+        engine = Engine()
+        engine.engine_identity_manager.active_engine_id = "engine-a"
+        engine.session_manager.active_session_id = "session-a"
+
+        def sync_handler(_request: _ProbeRequest) -> _ProbeResult:
+            return _ProbeResult(result_details="ok")
+
+        engine.event_manager.assign_manager_to_request_type(_ProbeRequest, sync_handler)
+
+        result = engine.event_manager.handle_request(_ProbeRequest())
+
+        assert result.engine_id == "engine-a"
+        assert result.session_id == "session-a"
+
+    @pytest.mark.asyncio
+    async def test_ahandle_request_stamps_identity_without_initializing_the_queue(self) -> None:
+        engine = Engine()
+        engine.engine_identity_manager.active_engine_id = "engine-a"
+        engine.session_manager.active_session_id = "session-a"
+
+        async def async_handler(_request: _ProbeRequest) -> _ProbeResult:
+            return _ProbeResult(result_details="ok")
+
+        engine.event_manager.assign_manager_to_request_type(_ProbeRequest, async_handler)
+
+        result = await engine.event_manager.ahandle_request(_ProbeRequest())
+
+        assert result.engine_id == "engine-a"
+        assert result.session_id == "session-a"
+
+
 @dataclass(kw_only=True)
 class _ForwardableProbeRequest(RequestPayload):
     """Minimal request used to drive the worker-forwarding path in tests."""
@@ -342,6 +383,74 @@ class TestHandleRequestForwardingFromRunningLoop:
         assert isinstance(result, EventResultSuccess)
         assert isinstance(result.result, _ForwardableProbeResult)
         assert "forwarded" in str(result.result.result_details)
+
+
+@dataclass(kw_only=True)
+class _StampProbeRequest(RequestPayload):
+    """Minimal request used to exercise forward_to_orchestrator's real body (not stubbed out)."""
+
+
+@dataclass(kw_only=True)
+@PayloadRegistry.register
+class _StampProbeResult(ResultPayloadSuccess):
+    """Minimal registered success payload.
+
+    Registered so forward_to_orchestrator's real body can resolve it via
+    PayloadRegistry.get_type on the fake orchestrator response, the same way a real
+    result type would round-trip on the worker-forward path.
+    """
+
+
+class TestForwardToOrchestratorStampsIdentity:
+    """`forward_to_orchestrator` bypasses the queue, so it has to stamp identity itself."""
+
+    @pytest.mark.asyncio
+    async def test_forward_to_orchestrator_stamps_identity_on_the_forwarded_request(self) -> None:
+        engine = Engine()
+        engine.engine_identity_manager.active_engine_id = "engine-worker"
+        engine.session_manager.active_session_id = "session-worker"
+
+        # Spin up a dedicated loop on another thread to stand in for the websocket loop that
+        # configure_worker_forwarding expects, matching the RequestClient's real threading model.
+        ws_loop = asyncio.new_event_loop()
+        ws_thread = threading.Thread(target=ws_loop.run_forever, daemon=True)
+        ws_thread.start()
+
+        captured: dict[str, object] = {}
+
+        class _FakeRequestClient:
+            async def request_to_orchestrator(
+                self,
+                event_request: EventRequest,
+                orchestrator_request_topic: str,  # noqa: ARG002
+                worker_response_topic: str,  # noqa: ARG002
+                timeout_ms: int | None = None,  # noqa: ARG002
+            ) -> dict:
+                captured["event_request"] = event_request
+                return {
+                    "event_type": "EventResultSuccess",
+                    "result_type": _StampProbeResult.__name__,
+                    "result": {"result_details": "ok"},
+                }
+
+        engine.event_manager.configure_worker_forwarding(
+            request_client=_FakeRequestClient(),  # type: ignore[arg-type]
+            orchestrator_request_topic="orchestrator/request",
+            worker_response_topic="worker/response",
+            websocket_event_loop=ws_loop,
+        )
+
+        try:
+            await engine.event_manager.forward_to_orchestrator(_StampProbeRequest(), {})
+        finally:
+            ws_loop.call_soon_threadsafe(ws_loop.stop)
+            ws_thread.join(timeout=1.0)
+            ws_loop.close()
+
+        event_request = captured["event_request"]
+        assert isinstance(event_request, EventRequest)
+        assert event_request.engine_id == "engine-worker"
+        assert event_request.session_id == "session-worker"
 
 
 class TestBroadcastAppEventLoopSafety:

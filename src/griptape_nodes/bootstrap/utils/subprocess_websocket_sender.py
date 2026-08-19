@@ -9,8 +9,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from typing import TYPE_CHECKING
 
 from griptape_nodes.bootstrap.utils.subprocess_websocket_base import SubprocessWebSocketBaseMixin, WebSocketMessage
+from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.events.base_events import BaseEvent
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +79,20 @@ class SubprocessWebSocketSenderMixin(SubprocessWebSocketBaseMixin):
                 self._ws_send_queue.task_done()
 
         logger.debug("WebSocket send loop ended for session %s", self._session_id)
+
+    def send_engine_event(self, event_type: str, event: BaseEvent) -> None:
+        """Stamp an event with this subprocess's engine identity, then queue it for sending.
+
+        Events built here never pass through the `EventManager` queue that normally stamps
+        them, so they would otherwise reach the parent process with no engine or session id.
+        Prefer this over serializing an event and calling `send_event` directly.
+
+        Args:
+            event_type: Type of event (e.g., "execution_event", "success_result")
+            event: The event to stamp and send
+        """
+        GriptapeNodes.EventManager().stamp_event_identity(event)
+        self.send_event(event_type, event.json())
 
     def send_event(self, event_type: str, payload: str) -> None:
         """Queue an event for sending via WebSocket (non-blocking).

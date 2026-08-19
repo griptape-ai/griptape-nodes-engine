@@ -42,11 +42,18 @@ def patched_registry() -> Callable[[dict[str, type]], AbstractContextManager[Non
         lib.get_registered_nodes.return_value = list(nodes.keys())
         lib.get_node_class.side_effect = lambda name: nodes[name]
 
-        def _create_node(*, node_type: str, name: str, specific_library_name: str | None = None) -> Any:  # noqa: ARG001
-            # The real create_node sets the constructing-node flag; the probe's
-            # detectors (and the construction-time deferrals they motivated) key
-            # off it, so the mock must set it too to reproduce probe conditions.
-            with LibraryRegistry.constructing_node():
+        def _create_node(
+            *,
+            node_type: str,
+            name: str,
+            specific_library_name: str | None = None,  # noqa: ARG001
+            engine: Any = None,
+        ) -> Any:
+            # The real create_node sets the constructing-node flag and records the constructing
+            # engine; the probe's detectors (and the construction-time deferrals they motivated)
+            # key off the flag, and a probe-constructed node's own emits key off the engine, so
+            # the mock must set both to reproduce probe conditions.
+            with LibraryRegistry.constructing_node(engine=engine):
                 return nodes[node_type](name)
 
         with patch.multiple(

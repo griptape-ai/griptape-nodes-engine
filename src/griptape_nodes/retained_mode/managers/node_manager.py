@@ -780,6 +780,7 @@ class NodeManager(EngineScoped):
                 node_type=request.node_type,
                 specific_library_name=request.specific_library_name,
                 metadata=request.metadata,
+                engine=self.engine,
             )
         # modifying to exception to try to catch all possible issues with node creation.
         except Exception as err:
@@ -805,15 +806,21 @@ class NodeManager(EngineScoped):
                             err, node_type=request.node_type, library_name=request.specific_library_name
                         )
 
-                    # Create ErrorProxyNode directly since it needs special initialization
-                    node = ErrorProxyNode(
-                        name=final_node_name,
-                        original_node_type=request.node_type,
-                        original_library_name=request.specific_library_name or "Unknown",
-                        failure_reason=failure_reason,
-                        metadata=request.metadata,
-                        denied_by_policy=denied_by_policy,
-                    )
+                    # Create ErrorProxyNode directly since it needs special initialization.
+                    # Wrapped in `LibraryRegistry.constructing_node(engine=self.engine)`, since
+                    # this bypasses `LibraryRegistry.create_node` (an error proxy is created
+                    # precisely because the library couldn't do that itself), so the proxy's
+                    # constructor still binds to the owning engine and its declarative
+                    # `add_node_element` call resolves there instead of the process engine.
+                    with LibraryRegistry.constructing_node(engine=self.engine):
+                        node = ErrorProxyNode(
+                            name=final_node_name,
+                            original_node_type=request.node_type,
+                            original_library_name=request.specific_library_name or "Unknown",
+                            failure_reason=failure_reason,
+                            metadata=request.metadata,
+                            denied_by_policy=denied_by_policy,
+                        )
 
                     logger.warning(
                         "Created Error Proxy (placeholder) node '%s' to substitute for failed '%s'",
@@ -3216,6 +3223,7 @@ class NodeManager(EngineScoped):
                 name=node_name,
                 metadata=dict(request.node_metadata),
                 specific_library_name=library_name,
+                engine=self.engine,
             )
         except Exception as e:
             return ExecuteNodeResultFailure(
@@ -3662,7 +3670,7 @@ class NodeManager(EngineScoped):
             if isinstance(node, ErrorProxyNode):
                 reference_node = None
             else:
-                with LibraryRegistry.constructing_node():
+                with LibraryRegistry.constructing_node(engine=self.engine):
                     reference_node = type(node)(
                         name="REFERENCE NODE",
                         metadata={
