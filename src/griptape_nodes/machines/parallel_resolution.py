@@ -89,14 +89,6 @@ class ParallelResolutionContext(EngineScoped):
         self.max_nodes_in_parallel = max_nodes_in_parallel if max_nodes_in_parallel is not None else 5
         self.running_tasks_count = 0
         self.task_to_node = {}
-        # Identifies the current run. `reset` bumps it, so a driver that resumes
-        # from any await can tell its run was torn down and its task map and DAG
-        # no longer exist. Teardown arrives from synchronous code in another
-        # coroutine (clear-all-state, and through it run-from-scratch,
-        # load-with-clean-slate and library reload). Drivers check this at every
-        # resumption rather than only where a suspension happens to be possible
-        # today: whether a given await yields depends on unrelated code, such as
-        # the event queue being unbounded and request handlers being synchronous.
         self.generation = 0
 
     @property
@@ -118,17 +110,18 @@ class ParallelResolutionContext(EngineScoped):
     def was_reset_since(self, generation: int) -> bool:
         """Whether this run was torn down since ``generation`` was captured.
 
-        Teardown arrives from synchronous code in another coroutine, so nothing a
-        driver holds -- its task map, its DAG -- is guaranteed to still exist
-        after an await. A driver captures ``generation`` on entry and checks this
-        whenever it resumes, before touching that bookkeeping again.
+        Teardown arrives from synchronous code in another coroutine (clear-all
+        state, and through it run-from-scratch, load-with-clean-slate and library
+        reload), so nothing a driver holds -- its task map, its DAG -- is
+        guaranteed to still exist after an await. A driver captures ``generation``
+        on entry and checks this on resuming, before touching that bookkeeping
+        again.
         """
         return self.generation != generation
 
     def reset(self, *, cancel: bool = False) -> None:
         # Ends the current run as far as any parked driver is concerned: it sees
-        # the bump on waking and abandons the run instead of reaping tasks this
-        # reset is about to discard.
+        # the bump on waking and abandons the run.
         self.generation += 1
         self.paused = False
         if cancel:
@@ -142,10 +135,8 @@ class ParallelResolutionContext(EngineScoped):
             self.error_message = None
             self.last_resolved_node = None
 
-        # Drop task bookkeeping on both paths. An abandoning driver no longer
-        # drains it, so leaving finished tasks behind would hand them to the next
-        # run on this context: its first wait would return an already-completed
-        # task from the previous run and error out having executed nothing.
+        # Both paths: an abandoning driver no longer drains this, and a leftover
+        # finished task would end the next run on this context before it ran.
         self.task_to_node.clear()
 
         # Reset task counter
@@ -512,8 +503,7 @@ class ExecuteDagState(State):
                         await ExecuteDagState.handle_done_nodes(context, context.node_to_reference[node], network_name)
                         if context.was_reset_since(generation):
                             # `networks` is a snapshot, so its graphs still name
-                            # nodes a teardown has dropped from node_to_reference;
-                            # the lookups below would not find them.
+                            # nodes a teardown dropped from node_to_reference.
                             ExecuteDagState._log_abandoned(context)
                             return
 
@@ -548,11 +538,8 @@ class ExecuteDagState(State):
 
     @staticmethod
     async def on_update(context: ParallelResolutionContext) -> type[State] | None:  # noqa: C901, PLR0911, PLR0912, PLR0915
-        # Identifies this run for the rest of the call. Every await below can in
-        # principle hand control to a teardown, which drops the task map and the
-        # DAG this method is mid-way through using, so each resumption re-checks
-        # before carrying on. Abandoning returns None rather than a state, which
-        # also avoids reviving the machine the teardown just reset.
+        # See `ParallelResolutionContext.was_reset_since`. Abandoning returns None
+        # rather than a state, which avoids reviving the machine the teardown reset.
         generation = context.generation
 
         # Check if execution is paused
@@ -853,10 +840,8 @@ class ParallelResolutionMachine(FSM[ParallelResolutionContext]):
         # explicit CancelExecuteNodeRequest to each affected worker so its
         # aprocess task is cancelled on the worker side too. No-op for nodes
         # running locally on the orchestrator.
-        # Snapshot before awaiting: dispatching to a worker suspends, and a driver
-        # waking in that window can publish a finished node, which adds to
-        # node_to_reference and would break iteration mid-cancel -- leaving the
-        # remaining workers uncancelled and the flow stuck reporting "running".
+        # Snapshot: dispatching suspends, and a driver waking in that window can
+        # add to node_to_reference, breaking this iteration mid-cancel.
         node_manager = self.context.engine.node_manager
         for dag_node in list(self.context.node_to_reference.values()):
             await node_manager.cancel_worker_execution(dag_node.node_reference.name)

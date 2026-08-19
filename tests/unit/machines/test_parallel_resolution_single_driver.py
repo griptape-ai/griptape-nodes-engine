@@ -3,19 +3,9 @@
 Field crash: a run died with `KeyError: <Task finished ... execute_node ...>` from
 `ExecuteDagState.on_update`'s `task_to_node.pop(task)`. A driver suspended in
 `asyncio.wait(task_to_node.keys())` woke for a completed node task and found it
-already gone from the map. Two different things produce that, both covered here.
-
-**A second driver.** Request handlers are dispatched as concurrent tasks, so once
-a run is committed, `single_execution_step`, `single_node_step` and
-`continue_executing` all pass the "is a flow already running?" check and go on to
-drive `_global_control_flow_machine`'s resolution machine, which the run's own
-driver is already advancing. Both park on the same task set, both wake for one
-completed task, and the second `pop` finds it consumed.
-
-**A teardown.** `ParallelResolutionContext.reset()` clears `task_to_node`
-outright, from synchronous code in another coroutine (clear-all-state, and
-through it run-from-scratch, load-with-clean-slate and library reload). The
-parked driver then wakes to an empty map.
+already gone from the map. Two things produce that, both covered here: a second
+coroutine driving the same machine, and a teardown (`ParallelResolutionContext.reset()`)
+clearing the map from synchronous code in another coroutine.
 """
 
 import asyncio
@@ -88,10 +78,8 @@ class TestParallelResolutionSingleDriver:
         assert machine.context.task_to_node, "first driver should still be tracking the node task"
 
         # Let the node task finish while a second driver would be waiting on it.
-        # Without the guard that driver parks in the same asyncio.wait, both wake
-        # for this one completed task, and the second `task_to_node.pop` raises
-        # the KeyError seen in the field. With the guard the rejection below
-        # happens before the second driver ever reaches the wait.
+        # Unguarded, both wake for this one task and the second `pop` raises the
+        # KeyError seen in the field.
         release.set()
 
         with pytest.raises(RuntimeError, match="already running"):
@@ -155,9 +143,7 @@ class TestTeardownWhileDriverParked:
         await driver
 
         # The abandoning driver no longer drains the map itself, so the reset has
-        # to. A leftover finished task would be handed to the next run on this
-        # context, whose first wait would return it immediately and error out
-        # having executed nothing.
+        # to, or the leftover task lands on the next run on this context.
         assert not machine.context.task_to_node
 
 

@@ -111,16 +111,15 @@ class ObjectManager(EngineScoped):
             logger.warning(details)
             return ClearAllObjectStateResultFailure(result_details=details)
 
-        # Cancel any in-flight run before tearing its bookkeeping down. The reset
-        # below clears the task map and nulls the machine state, which makes the
-        # flow look idle, so the cancel in clear_current_workflow_data would be
-        # skipped and the previous run's node tasks would keep going: still
-        # billing API calls and still emitting parameter updates keyed by node
-        # name, which land on the same-named nodes of whatever run comes next.
+        # Cancel any in-flight run before tearing its bookkeeping down: the reset
+        # below makes the flow look idle, so the cancel in
+        # clear_current_workflow_data is skipped and the previous run's node tasks
+        # keep going -- billing API calls, and emitting parameter updates keyed by
+        # node name onto the same-named nodes of whatever run comes next.
         #
-        # Best-effort: a node that refuses to cancel must not block the teardown
-        # the user asked for. A driver left running is handled downstream, because
-        # the reset marks its run as ended and the driver abandons it on waking.
+        # Best-effort: a node that refuses to cancel must not block the teardown.
+        # A driver still parked holds its FSM claim until it wakes and abandons the
+        # run; harmless here because deleting the flows drops the machine it holds.
         if self.engine.flow_manager.check_for_existing_running_flow():
             try:
                 await self.engine.flow_manager.cancel_flow_run()

@@ -42,13 +42,9 @@ class FSM[T]:
     def __init__(self, context: T) -> None:
         self._context = context
         self._current_state = None
-        # The task currently advancing this machine, or None. State machines are
-        # single-driver: the states suspend, so two coroutines advancing one
-        # machine interleave inside those awaits and corrupt the shared
-        # context. Concretely, two drivers of a resolution machine both wait on
-        # the same set of node tasks, both wake for the same completed task, and
-        # the second one to look it up finds it already consumed. A second
-        # driver raises instead. Holding the task rather than a bool lets
+        # The task currently advancing this machine, or None. States suspend, so
+        # two coroutines advancing one machine interleave inside those awaits and
+        # corrupt the shared context. Storing the task rather than a bool lets
         # ``_advance`` tell "I hold the claim" from "someone else does".
         self._advancing_task: asyncio.Task | None = None
 
@@ -66,12 +62,7 @@ class FSM[T]:
 
     @property
     def is_advancing(self) -> bool:
-        """True while a coroutine is driving this machine.
-
-        Callers that would otherwise become a second driver check this and skip
-        their drive. The raise in ``_claim_for_advancing`` is the backstop for
-        callers that do not.
-        """
+        """True while a coroutine is driving this machine."""
         return self._advancing_task is not None
 
     async def transition_state(self, new_state: type[State] | None) -> None:
@@ -96,11 +87,11 @@ class FSM[T]:
 
     @contextmanager
     def _claim_for_advancing(self) -> Iterator[None]:
-        """Claim sole right to advance this machine for the duration of the block.
+        """Claim sole right to advance this machine until the block exits.
 
-        Claiming and releasing are paired here so that no entry point can take the
-        claim and forget to release it: a stuck claim would leave the machine
-        permanently un-advanceable.
+        The claim lasts until the driver unwinds, so one parked in a state still
+        holds it. Claim and release are paired here so that no entry point can
+        take the claim and forget to drop it.
         """
         if self._advancing_task is not None:
             msg = (
@@ -116,14 +107,10 @@ class FSM[T]:
             self._advancing_task = None
 
     async def _advance(self, new_state: type[State] | None) -> None:
-        """Drive states until one settles.
+        """Drive states until one settles. Callers must hold the claim.
 
-        Every public entry point claims the machine before calling this, so that
-        one drive holds it end to end. Reaching here without holding the claim
-        means a new entry point skipped ``_claim_for_advancing``, and the
-        single-driver guarantee is not in force. Comparing the task rather than
-        just testing for any claim catches the dangerous case: an unclaimed
-        caller arriving while another task is legitimately driving.
+        Comparing the task, rather than testing for any claim at all, catches the
+        case that matters: an unclaimed caller arriving while another task drives.
         """
         if self._advancing_task is not asyncio.current_task():
             msg = "Attempted to advance a state machine without claiming it. This is a programming error in the caller."

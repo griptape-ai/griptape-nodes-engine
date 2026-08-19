@@ -4658,10 +4658,11 @@ class FlowManager(EngineScoped):
         """True while a coroutine is already driving the running flow's machines.
 
         A continuously running flow drives itself, so a step or continue request
-        arriving mid-drive has nothing to do. Stepping anyway would make that
-        request a second driver of the same machine, which corrupts the
-        resolution machine's task bookkeeping. A paused flow is not advancing
-        (its states return immediately), so debug stepping is unaffected.
+        arriving mid-drive has nothing to do, and driving anyway would make it a
+        second driver of the same machine. A driver parked on a running node is
+        still advancing even once the paused flag is set -- it observes the flag
+        and stops when that node finishes -- which is why callers apply their
+        debug-mode change before consulting this.
         """
         if self._global_control_flow_machine is None:
             return False
@@ -4871,15 +4872,11 @@ class FlowManager(EngineScoped):
             return
         if self._global_control_flow_machine is None:
             return
-        # Raising the paused flag is what pauses a live run, and this is the only
-        # path that does it, so it has to happen whether or not we go on to drive
-        # the machine below. A driver parked on a node observes the flag and
-        # stops itself once that node finishes.
+        # The only path that pauses a live run, so it applies whether or not we go
+        # on to drive.
         if change_debug_mode:
             self._global_control_flow_machine.resolution_machine.change_debug_mode(debug_mode=True)
         if self.execution_is_advancing():
-            # The run is driving itself; stepping here would make this request a
-            # second driver of the same machine.
             return
         await self._global_control_flow_machine.granular_step()
         if self._global_control_flow_machine.resolution_machine.is_complete():
@@ -4899,12 +4896,9 @@ class FlowManager(EngineScoped):
         if self._global_control_flow_machine is None:
             return
         # Clearing the paused flag is what resumes a paused run, so it applies
-        # whether or not we go on to drive. Dropping it would leave a run that
-        # the user asked to step sitting paused.
+        # whether or not we go on to drive.
         self._global_control_flow_machine.resolution_machine.change_debug_mode(debug_mode=False)
         if self.execution_is_advancing():
-            # The run is driving itself; stepping here would make this request a
-            # second driver of the same machine.
             return
         await self._global_control_flow_machine.node_step()
         # Start the next resolution step now please.
@@ -4916,14 +4910,11 @@ class FlowManager(EngineScoped):
         )
         if not self.check_for_existing_running_flow():
             return
-        # Turn all debugging to false and continue on. This is what resumes a
-        # paused run, so it applies whether or not we go on to drive: dropping it
-        # would leave the run paused after the user asked it to continue.
+        # Turn all debugging to false and continue on. This resumes a paused run,
+        # so it applies whether or not we go on to drive.
         if self._global_control_flow_machine is not None:
             self._global_control_flow_machine.change_debug_mode(False)
         if self.execution_is_advancing():
-            # The run is driving itself; driving here would make this request a
-            # second driver of the same machine. The resume above is enough.
             return
         if self._global_control_flow_machine is not None:
             if self._global_single_node_resolution:
