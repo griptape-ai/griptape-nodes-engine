@@ -4654,6 +4654,23 @@ class FlowManager(EngineScoped):
             and self._global_control_flow_machine.context.resolution_machine.is_started()
         )
 
+    def execution_is_advancing(self) -> bool:
+        """True while a coroutine is already driving the running flow's machines.
+
+        A continuously running flow drives itself, so a step or continue request
+        arriving mid-drive has nothing to do, and driving anyway would make it a
+        second driver of the same machine. A driver parked on a running node is
+        still advancing even once the paused flag is set -- it observes the flag
+        and stops when that node finishes -- which is why callers apply their
+        debug-mode change before consulting this.
+        """
+        if self._global_control_flow_machine is None:
+            return False
+        return (
+            self._global_control_flow_machine.is_advancing
+            or self._global_control_flow_machine.resolution_machine.is_advancing
+        )
+
     async def _await_flow_completion(self, timeout_ms: int | None) -> str | None:
         """Block until the current flow resolves, erroring, or the timeout elapses.
 
@@ -4853,13 +4870,17 @@ class FlowManager(EngineScoped):
         )
         if not self.check_for_existing_running_flow():
             return
-        if self._global_control_flow_machine is not None:
-            await self._global_control_flow_machine.granular_step(change_debug_mode)
-            resolution_machine = self._global_control_flow_machine.resolution_machine
-            if self._global_single_node_resolution:
-                resolution_machine = self._global_control_flow_machine.resolution_machine
-            if resolution_machine.is_complete():
-                self._global_single_node_resolution = False
+        if self._global_control_flow_machine is None:
+            return
+        # The only path that pauses a live run, so it applies whether or not we go
+        # on to drive.
+        if change_debug_mode:
+            self._global_control_flow_machine.resolution_machine.change_debug_mode(debug_mode=True)
+        if self.execution_is_advancing():
+            return
+        await self._global_control_flow_machine.granular_step()
+        if self._global_control_flow_machine.resolution_machine.is_complete():
+            self._global_single_node_resolution = False
 
     async def single_node_step(self, flow: ControlFlow) -> None:
         # It won't call single_node_step without an existing flow running from US.
@@ -4872,8 +4893,14 @@ class FlowManager(EngineScoped):
         if self._global_single_node_resolution:
             msg = "Cannot step through the Control Flow in Single Node Execution"
             raise RuntimeError(msg)
-        if self._global_control_flow_machine is not None:
-            await self._global_control_flow_machine.node_step()
+        if self._global_control_flow_machine is None:
+            return
+        # Clearing the paused flag is what resumes a paused run, so it applies
+        # whether or not we go on to drive.
+        self._global_control_flow_machine.resolution_machine.change_debug_mode(debug_mode=False)
+        if self.execution_is_advancing():
+            return
+        await self._global_control_flow_machine.node_step()
         # Start the next resolution step now please.
         await self._handle_post_execution_queue_processing(debug_mode=True)
 
@@ -4883,9 +4910,13 @@ class FlowManager(EngineScoped):
         )
         if not self.check_for_existing_running_flow():
             return
-        # Turn all debugging to false and continue on
-        if self._global_control_flow_machine is not None and self._global_control_flow_machine is not None:
+        # Turn all debugging to false and continue on. This resumes a paused run,
+        # so it applies whether or not we go on to drive.
+        if self._global_control_flow_machine is not None:
             self._global_control_flow_machine.change_debug_mode(False)
+        if self.execution_is_advancing():
+            return
+        if self._global_control_flow_machine is not None:
             if self._global_single_node_resolution:
                 if self._global_control_flow_machine.resolution_machine.is_complete():
                     self._global_single_node_resolution = False
