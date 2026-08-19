@@ -92,6 +92,33 @@ def _fail_every_move(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(event_manager._request_type_to_manager, MoveNodeToNewFlowRequest, refuse_move)
 
 
+def _fail_the_second_move_into(target_flow_name: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Let the first move into a flow through, refuse the second, and allow everything else.
+
+    Failing every move leaves nothing to roll back -- the first node never went anywhere. Only a
+    partial failure exercises the undo, so this is what distinguishes "reported the failure" from
+    "reported the failure and put things back".
+
+    Scoped to moves heading into `target_flow_name` so the rollback, which moves nodes back out to
+    where they came from, is allowed to succeed. Refusing that too would test nothing but the
+    fixture: no rollback could complete regardless of whether one was attempted.
+    """
+    event_manager = current_engine().event_manager
+    real_handler = event_manager._request_type_to_manager[MoveNodeToNewFlowRequest]
+    moves_into_target = 0
+
+    def refuse_the_second_move_in(request: MoveNodeToNewFlowRequest) -> object:
+        nonlocal moves_into_target
+        if request.target_flow_name != target_flow_name:
+            return real_handler(request)
+        moves_into_target += 1
+        if moves_into_target == 1:
+            return real_handler(request)
+        return MoveNodeToNewFlowResultFailure(result_details="refused for this test")
+
+    monkeypatch.setitem(event_manager._request_type_to_manager, MoveNodeToNewFlowRequest, refuse_the_second_move_in)
+
+
 class TestFailedAdd:
     def test_reports_failure_rather_than_claiming_a_node_it_could_not_move(
         self, library_name: str, monkeypatch: pytest.MonkeyPatch
@@ -124,6 +151,59 @@ class TestFailedAdd:
         assert node.parent_group is None
         # The node never moved, so it is still where the artist left it.
         assert _flow_of(loose_name) == original_flow
+
+    def test_moves_back_the_node_that_did_get_in_before_a_later_one_failed(
+        self, library_name: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A partly-applied add has to undo the moves it already made, not just report the failure.
+
+        Two nodes go in and the second move is refused, so the first is already sitting in the
+        subflow when the add gives up. Leaving it there strands a node inside a group that no longer
+        claims it: the editor draws it outside while a save writes it inside.
+        """
+        flow = GriptapeNodes.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="PartialAddFlow", set_as_new_context=False)
+        )
+        assert isinstance(flow, CreateFlowResultSuccess), flow
+
+        with GriptapeNodes.ContextManager().flow(flow.flow_name):
+            group_name = _create_node("SubflowGroupNode", "Group", library_name)
+            first_name = _create_node("EchoNode", "First", library_name)
+            second_name = _create_node("EchoNode", "Second", library_name)
+
+        original_flow = _flow_of(first_name)
+        assert _flow_of(second_name) == original_flow
+
+        group = _get_group(group_name)
+        # The group creates its subflow on the first add, so drive one to learn its name, then put
+        # things back: the failure this test wants is a refused move, not a missing subflow.
+        with GriptapeNodes.ContextManager().flow(flow.flow_name):
+            setup_result = GriptapeNodes.handle_request(
+                AddNodesToNodeGroupRequest(node_names=[first_name], node_group_name=group_name)
+            )
+            assert isinstance(setup_result, AddNodesToNodeGroupResultSuccess), setup_result
+            subflow_name = group.metadata["subflow_name"]
+            undo_result = GriptapeNodes.handle_request(
+                RemoveNodeFromNodeGroupRequest(node_names=[first_name], node_group_name=group_name)
+            )
+            assert isinstance(undo_result, RemoveNodeFromNodeGroupResultSuccess), undo_result
+        assert _flow_of(first_name) == original_flow
+
+        _fail_the_second_move_into(subflow_name, monkeypatch)
+
+        with GriptapeNodes.ContextManager().flow(flow.flow_name):
+            result = GriptapeNodes.handle_request(
+                AddNodesToNodeGroupRequest(node_names=[first_name, second_name], node_group_name=group_name)
+            )
+
+        assert isinstance(result, AddNodesToNodeGroupResultFailure), result
+
+        assert group.nodes == {}
+        assert group.metadata.get("node_names_in_group") == []
+
+        # Both nodes are back where the artist left them -- including the one that did move.
+        assert _flow_of(first_name) == original_flow
+        assert _flow_of(second_name) == original_flow
 
 
 class TestFailedRemove:

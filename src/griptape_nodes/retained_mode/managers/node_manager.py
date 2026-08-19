@@ -42,7 +42,7 @@ from griptape_nodes.exe_types.core_types import (
     ParameterTypeBuiltin,
 )
 from griptape_nodes.exe_types.flow import ControlFlow
-from griptape_nodes.exe_types.node_groups import SubflowNodeGroup
+from griptape_nodes.exe_types.node_groups import NodeGroupMembershipError, SubflowNodeGroup
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
 from griptape_nodes.exe_types.node_types import (
     LOCAL_EXECUTION,
@@ -1202,10 +1202,11 @@ class NodeManager(EngineScoped):
 
         try:
             nodes_removed = node_group.remove_nodes_from_group(nodes)
-        except (ValueError, RuntimeError) as err:
-            # ValueError: a requested node is not a member. RuntimeError: a SubflowNodeGroup could not
-            # move a node back to the parent flow, which tether expansion makes likelier by doubling
-            # the moves per request.
+        except (ValueError, RuntimeError, NodeGroupMembershipError) as err:
+            # ValueError: a requested node is not a member. NodeGroupMembershipError: a
+            # SubflowNodeGroup could not move a node back to the parent flow, which tether expansion
+            # makes likelier by doubling the moves per request. RuntimeError: raised by group code
+            # predating that specific type.
             details = f"Attempted to remove nodes '{request.node_names}' from NodeGroup '{request.node_group_name}'. Failed with error: {err}"
             return RemoveNodeFromNodeGroupResultFailure(result_details=details)
 
