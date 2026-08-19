@@ -4325,6 +4325,8 @@ class FlowManager(EngineScoped):
                 # An imported workflow is referenced by workflow name, not by a flow name a group
                 # could have recorded, so there is nothing to map.
                 return None
+            case _:
+                return None
 
     def _create_flow_for_deserialization(
         self, flow_initialization_command: CreateFlowRequest | ImportWorkflowAsReferencedSubFlowRequest
