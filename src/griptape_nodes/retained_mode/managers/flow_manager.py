@@ -4022,9 +4022,9 @@ class FlowManager(EngineScoped):
         # Deserializing a flow goes in a specific order: every node in this Flow AND its subflows
         # first, then connections, then values. Connections are serialized against a Flow's whole
         # subtree (see _aggregate_connections), so an edge crossing a Flow boundary names a node
-        # that lives one or more levels down. Wiring connections before the subflows existed made
-        # every such edge fail with "node did not exist within the flow", which failed the whole
-        # load for any graph containing a node group or a nested subflow.
+        # that lives one or more levels down. Connections are wired only after every node in the
+        # subtree exists, subflows included, because any earlier and such an edge fails with "node
+        # did not exist within the flow" and fails the whole load.
         try:
             deserialized_nodes = self._deserialize_nodes_for_flow_and_subflows(
                 serialized_flow_commands=request.serialized_flow_commands

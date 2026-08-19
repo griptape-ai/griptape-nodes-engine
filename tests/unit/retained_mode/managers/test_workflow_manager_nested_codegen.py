@@ -131,8 +131,9 @@ class TestNestedFlowCodegen:
 
         content = _generate(griptape_nodes, commands)
 
-        # The child is referenced by its generated variable, and it is the variable belonging to the
-        # child rather than to the group, which is what an unresolved membership list used to lose.
+        # The child is referenced by its generated variable, and it has to be the variable belonging
+        # to the child rather than to the group: resolving membership means looking the UUID up
+        # across the whole subtree, not just the level the group is on.
         assert "node_names_to_add=[node0_name]" in content
         assert "'Child'" in content
         child_variable_line = next(line for line in content.splitlines() if "'Child'" in line)

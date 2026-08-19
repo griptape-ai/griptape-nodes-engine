@@ -166,7 +166,7 @@ class BaseNodeGroup(BaseNode):
         """
         for node in nodes:
             if node is self:
-                msg = f"Cannot add group '{self.name}' to itself."
+                msg = f"Attempted to add group '{self.name}' to itself. Failed because a group cannot contain itself."
                 raise ValueError(msg)
             if isinstance(node, BaseNodeGroup) and node.contains_node(self):
                 msg = (

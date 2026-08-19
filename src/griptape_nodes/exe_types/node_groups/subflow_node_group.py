@@ -744,6 +744,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
 
         # Create subflow on-demand if it doesn't exist
         subflow_name = self.metadata.get("subflow_name")
+        created_subflow_for_this_add = subflow_name is None
         if subflow_name is None:
             self._create_subflow()
             subflow_name = self.metadata.get("subflow_name")
@@ -760,6 +761,8 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 # The moves already rolled themselves back; this group still has to stop claiming
                 # nodes it does not hold, or it advertises members that are not in its subflow.
                 self._drop_membership(nodes)
+                if created_subflow_for_this_add:
+                    self._discard_subflow_created_for_a_failed_add()
                 raise
 
         connections = GriptapeNodes.FlowManager().get_connections()
@@ -892,6 +895,50 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             self.nodes.pop(node.name, None)
         self.metadata["node_names_in_group"] = list(self.nodes.keys())
 
+    def _discard_subflow_created_for_a_failed_add(self) -> None:
+        """Tear down a subflow that only exists because of an add that then failed in full.
+
+        The group had no subflow before this add, so leaving it behind means the artist is left owning
+        a flow they never asked for, created by an operation that reported failure. `_create_subflow`
+        already cleans up after itself when the create is what failed; this covers the case where the
+        create succeeded and a later move did not.
+
+        Anything still inside is a rollback that could not complete, and is already logged as such.
+        Deleting the flow then would take those nodes with it, so the subflow is kept and the group
+        keeps pointing at it -- a flow the artist can still see beats nodes that silently vanish.
+        """
+        subflow_name = self.metadata.get("subflow_name")
+        if subflow_name is None:
+            return
+
+        subflow = GriptapeNodes.ObjectManager().attempt_get_object_by_name_as_type(subflow_name, ControlFlow)
+        if subflow is None:
+            self.metadata.pop("subflow_name", None)
+            return
+
+        if len(subflow.nodes) > 0:
+            logger.warning(
+                "%s is keeping subflow '%s' after a failed add: it still holds %d node(s) that could not be moved back",
+                self.name,
+                subflow_name,
+                len(subflow.nodes),
+            )
+            return
+
+        delete_result = GriptapeNodes.handle_request(DeleteFlowRequest(flow_name=subflow_name))
+        if isinstance(delete_result, DeleteFlowResultFailure):
+            # Not worth failing the add twice over: it is already failing, and the message the artist
+            # gets should be why their nodes did not move, not a leftover flow they cannot see.
+            logger.warning(
+                "%s could not delete the subflow '%s' it created for a failed add: %s",
+                self.name,
+                subflow_name,
+                delete_result.result_details,
+            )
+            return
+
+        self.metadata.pop("subflow_name", None)
+
     def _move_node_to_flow(self, node: BaseNode, flow_name: str) -> None:
         """Move one node into a Flow.
 
@@ -908,7 +955,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             # Carry the engine's own reason rather than only logging it: this is the innermost thing
             # that knows why the move was refused, and the caller turns it into what the artist reads.
             msg = (
-                f"Attempted to move '{node.name}' into '{flow_name}'. "
+                f"Attempted to move '{node.name}' into '{flow_name}' for group '{self.name}'. "
                 f"Failed because the move was refused: {move_result.result_details}"
             )
             raise NodeGroupMembershipError(msg)

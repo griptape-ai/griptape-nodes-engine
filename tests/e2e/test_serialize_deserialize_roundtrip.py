@@ -1,16 +1,16 @@
 """Round-trip coverage for SerializeFlowToCommands -> DeserializeFlowFromCommands.
 
-These two halves disagreed about scope. The serializer aggregates each Flow's connections up
+The two halves have to agree about scope. The serializer aggregates each Flow's connections up
 through every level of nesting, so an edge crossing a Flow boundary is reported by the parent as
-well as the child. The deserializer used to rebuild only its own level's nodes before wiring
-connections, and created subflows last, so any edge naming a node one level down failed with "node
-did not exist within the flow" and took the whole load down with it.
+well as the child. Deserialization therefore has to create every node in the subtree, subflows
+included, before it wires anything: an aggregated edge can name a node one or more levels down, and
+wiring it early fails with "node did not exist within the flow" and takes the whole load down.
 
-That combination is what restoring a workflow embedded in image metadata does
-(ExtractFlowCommandsFromImageMetadata with deserialize=True), so a graph containing a node group --
-which always has boundary-crossing wall connections -- could not be restored at all. Nothing
-covered the pairing: the only other test that deserializes uses a single flow with no subflow, so
-there was nothing to aggregate and the disagreement stayed invisible.
+Restoring a workflow embedded in image metadata is this pairing
+(ExtractFlowCommandsFromImageMetadata with deserialize=True), and a graph containing a node group
+always has boundary-crossing wall connections, so it depends on the ordering above. These tests
+exist to hold it: the only other test that deserializes uses a single flow with no subflow, where
+there is nothing to aggregate and nothing to order.
 """
 
 from __future__ import annotations

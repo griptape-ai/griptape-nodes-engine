@@ -30,6 +30,8 @@ from griptape_nodes.retained_mode.events.node_events import (
     AddNodesToNodeGroupResultSuccess,
     CreateNodeRequest,
     CreateNodeResultSuccess,
+    DeleteNodeRequest,
+    DeleteNodeResultSuccess,
     MoveNodeToNewFlowRequest,
     MoveNodeToNewFlowResultFailure,
     RemoveNodeFromNodeGroupRequest,
@@ -151,6 +153,9 @@ class TestFailedAdd:
         assert node.parent_group is None
         # The node never moved, so it is still where the artist left it.
         assert _flow_of(loose_name) == original_flow
+        # This was the group's first add, so the subflow it made to hold the node goes too: an add
+        # that failed in full should leave the artist owning nothing it created.
+        assert "subflow_name" not in group.metadata
 
     def test_moves_back_the_node_that_did_get_in_before_a_later_one_failed(
         self, library_name: str, monkeypatch: pytest.MonkeyPatch
@@ -297,3 +302,52 @@ class TestFailedRemove:
         # The inner group's subflow follows it out, so its Leaf is still reachable from the top.
         assert GriptapeNodes.FlowManager().get_parent_flow(inner_subflow) == flow.flow_name
         assert _flow_of(inner_name) == flow.flow_name
+
+
+class TestDeletedGroup:
+    def test_deleting_an_outer_group_leaves_the_group_it_held_intact(self, library_name: str) -> None:
+        """Deleting a group has to release what it held before deleting its own subflow.
+
+        `after_node_deleted` un-nests its members and only then deletes its subflow. That ordering is
+        the whole safety property: if the inner group's subflow were still parented underneath when
+        DeleteFlowRequest ran, deleting the outer group would take the inner group's contents down
+        with it -- silent data loss on a plain delete of the outer group only.
+        """
+        flow = GriptapeNodes.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="DeleteOuterFlow", set_as_new_context=False)
+        )
+        assert isinstance(flow, CreateFlowResultSuccess), flow
+
+        with GriptapeNodes.ContextManager().flow(flow.flow_name):
+            outer_name = _create_node("SubflowGroupNode", "OuterGroup", library_name)
+            inner_name = _create_node("SubflowGroupNode", "InnerGroup", library_name)
+            leaf_name = _create_node("EchoNode", "Leaf", library_name, parent_group_name=inner_name)
+
+            nest_result = GriptapeNodes.handle_request(
+                AddNodesToNodeGroupRequest(node_names=[inner_name], node_group_name=outer_name)
+            )
+            assert isinstance(nest_result, AddNodesToNodeGroupResultSuccess), nest_result
+
+            inner_subflow = _get_group(inner_name).metadata["subflow_name"]
+            outer_subflow = _get_group(outer_name).metadata["subflow_name"]
+            assert GriptapeNodes.FlowManager().get_parent_flow(inner_subflow) == outer_subflow
+            assert _flow_of(leaf_name) == inner_subflow
+
+            delete_result = GriptapeNodes.handle_request(DeleteNodeRequest(node_name=outer_name))
+
+        assert isinstance(delete_result, DeleteNodeResultSuccess), delete_result
+
+        # The outer group and its subflow are gone.
+        assert GriptapeNodes.ObjectManager().attempt_get_object_by_name(outer_name) is None
+        assert GriptapeNodes.ObjectManager().attempt_get_object_by_name(outer_subflow) is None
+
+        # The inner group survived, reparented to the flow that held the outer group...
+        inner = _get_group(inner_name)
+        assert inner.parent_group is None
+        assert _flow_of(inner_name) == flow.flow_name
+
+        # ...and it took its own subflow, and everything in it, along.
+        assert GriptapeNodes.ObjectManager().attempt_get_object_by_name(inner_subflow) is not None
+        assert GriptapeNodes.FlowManager().get_parent_flow(inner_subflow) == flow.flow_name
+        assert leaf_name in inner.nodes
+        assert _flow_of(leaf_name) == inner_subflow
