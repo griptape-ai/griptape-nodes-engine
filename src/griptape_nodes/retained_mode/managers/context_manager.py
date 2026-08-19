@@ -334,6 +334,7 @@ class ContextManager(EngineScoped):
         return GetWorkflowContextSuccess(
             workflow_name=workflow_name,
             is_saved=is_saved,
+            is_loading=self.engine.workflow_manager.is_loading_workflow(),
             result_details=f"Successfully retrieved workflow context: {workflow_name or 'None'}",
         )
 

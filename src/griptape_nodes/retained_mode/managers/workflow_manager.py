@@ -57,6 +57,7 @@ from griptape_nodes.retained_mode.events.app_events import (
     GetEngineVersionResultSuccess,
     InitializationPhase,
     InitializationStatus,
+    WorkflowLoadComplete,
 )
 
 # Runtime imports for ResultDetails since it's used at runtime
@@ -350,6 +351,12 @@ class WorkflowManager(EngineScoped):
 
     _squelch_workflow_altered_count: int = 0
 
+    # Depth of run_workflow calls currently executing. A counter rather than a flag because a
+    # workflow file can import another workflow as a referenced sub flow while its own
+    # build_workflow() is still running, nesting one run_workflow call inside another; the
+    # outer load must stay reported until the nested one has also finished.
+    _workflow_load_depth: int = 0
+
     # Track referenced workflow import context stack
     class ReferencedWorkflowContext:
         """Context manager for tracking workflow import operations."""
@@ -417,6 +424,7 @@ class WorkflowManager(EngineScoped):
         self._workflow_file_path_to_info = {}
         self._squelch_workflow_altered_count = 0
         self._referenced_workflow_stack = []
+        self._workflow_load_depth = 0
         # Initialize as set: before refresh_workflow_registry has run, the registry
         # is simply empty. Handlers invoked during library load (e.g. from a node
         # __init__ that issues a workflow query) should return an empty result
@@ -827,6 +835,9 @@ class WorkflowManager(EngineScoped):
     def should_squelch_workflow_altered(self) -> bool:
         return self._squelch_workflow_altered_count > 0
 
+    def is_loading_workflow(self) -> bool:
+        return self._workflow_load_depth > 0
+
     def clear_object_state(self) -> None:
         """Clear per-workflow state when the engine is reset."""
         self._variable_substitution_enabled.clear()
@@ -868,6 +879,29 @@ class WorkflowManager(EngineScoped):
                 raise RuntimeError(error_message)
 
     async def run_workflow(self, relative_file_path: str) -> WorkflowExecutionResult:
+        """Execute a workflow file, tracking how many loads are in flight.
+
+        The load depth is what is_loading_workflow() reports and what GetWorkflowContext's
+        is_loading field reflects. Using a counter rather than a flag means a workflow that
+        imports another workflow as a referenced sub flow mid-build (nesting one run_workflow
+        call inside another) does not clear the flag out from under the outer load. Once the
+        depth returns to zero, WorkflowLoadComplete is broadcast so a client does not have to
+        poll to learn a load has finished.
+        """
+        self._workflow_load_depth += 1
+        execution_result = WorkflowManager.WorkflowExecutionResult(
+            execution_successful=False,
+            execution_details=f"Workflow load for '{relative_file_path}' did not complete.",
+        )
+        try:
+            execution_result = await self._execute_workflow_file(relative_file_path)
+        finally:
+            self._workflow_load_depth -= 1
+            if self._workflow_load_depth == 0:
+                await self._broadcast_workflow_load_complete(successful=execution_result.execution_successful)
+        return execution_result
+
+    async def _execute_workflow_file(self, relative_file_path: str) -> WorkflowExecutionResult:
         # Resolve path using utility function
         workspace_path = self.engine.config_manager.workspace_path
         complete_file_path = resolve_workspace_path(Path(relative_file_path), workspace_path)
@@ -916,6 +950,12 @@ class WorkflowManager(EngineScoped):
             execution_successful=True,
             execution_details=f"Succeeded in running workflow on path '{complete_file_path}'.",
         )
+
+    async def _broadcast_workflow_load_complete(self, *, successful: bool) -> None:
+        workflow_name = None
+        if self.engine.context_manager.has_current_workflow():
+            workflow_name = self.engine.context_manager.get_current_workflow_name()
+        await self.engine.abroadcast_app_event(WorkflowLoadComplete(workflow_name=workflow_name, successful=successful))
 
     async def _ensure_libraries_for_workflow(
         self, *, relative_file_path: str, complete_file_path: Path
