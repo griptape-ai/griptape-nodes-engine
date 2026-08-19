@@ -700,14 +700,14 @@ class AgentManager(EngineScoped):
         ``api_key``. Image generation driver key honored: ``model``. Other
         keys are accepted but ignored. Any change that affects the runner
         flushes the runner cache so the next run picks up the new settings.
+
+        ``active_provider`` is applied before ``prompt_driver``, because the
+        prompt driver fields are written to the active provider: a request
+        carrying both means "switch to this provider, then configure it", so
+        the new selection has to be in place before the fields land.
         """
         try:
-            changed = self._apply_prompt_driver_config(request.prompt_driver)
-            if "model" in request.image_generation_driver:
-                new_image_model = str(request.image_generation_driver["model"])
-                if new_image_model != self._image_model_name:
-                    self._image_model_name = new_image_model
-                    changed = True
+            changed = False
             if request.active_provider:
                 provider_names = {p.name for p in self._providers}
                 if request.active_provider not in provider_names:
@@ -716,6 +716,13 @@ class AgentManager(EngineScoped):
                     )
                 if request.active_provider != self._active_provider_name:
                     self._active_provider_name = request.active_provider
+                    changed = True
+            if self._apply_prompt_driver_config(request.prompt_driver):
+                changed = True
+            if "model" in request.image_generation_driver:
+                new_image_model = str(request.image_generation_driver["model"])
+                if new_image_model != self._image_model_name:
+                    self._image_model_name = new_image_model
                     changed = True
             if changed:
                 self._persist_providers()

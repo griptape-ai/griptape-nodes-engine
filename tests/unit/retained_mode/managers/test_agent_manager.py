@@ -1104,6 +1104,19 @@ class TestConfigureAgentActiveProvider:
         gc = next(p for p in providers_manager._providers if p.name == "griptape_cloud")
         assert gc.model == "gpt-5"
 
+    def test_switch_and_model_in_one_request_targets_the_new_provider(self, providers_manager: AgentManager) -> None:
+        # "Switch to my-ollama and use qwen3" must not write qwen3 onto the
+        # provider being switched away from.
+        result = providers_manager.on_handle_configure_agent_request(
+            ConfigureAgentRequest(active_provider="my-ollama", prompt_driver=PromptDriverConfig(model="qwen3"))
+        )
+
+        assert isinstance(result, ConfigureAgentResultSuccess)
+        ollama = next(p for p in providers_manager._providers if p.name == "my-ollama")
+        gc = next(p for p in providers_manager._providers if p.name == "griptape_cloud")
+        assert ollama.model == "qwen3"
+        assert gc.model == "gpt-4o"
+
 
 class TestBuildRunnerCredential:
     """The Griptape Cloud runner accepts a license, not just `GT_CLOUD_API_KEY`."""
