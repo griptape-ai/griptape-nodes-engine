@@ -1375,6 +1375,22 @@ class OSManager(EngineScoped):
     def is_linux() -> bool:
         return os_utils.is_linux()
 
+    @staticmethod
+    def platform_name() -> str:
+        """Get the platform as a `Platform` value, for anything keyed by which OS we are on.
+
+        Unlike `platform()`, this collapses the `sys.platform` spellings onto the three
+        platforms we support ("win32" and "cygwin" both being Windows, say). A platform we
+        do not recognize falls back to `sys.platform`, which is always set.
+        """
+        if OSManager.is_windows():
+            return Platform.WINDOWS
+        if OSManager.is_mac():
+            return Platform.DARWIN
+        if OSManager.is_linux():
+            return Platform.LINUX
+        return sys.platform
+
     def replace_process(self, args: list[Any]) -> None:
         """Replace the current process with a new one.
 
@@ -4366,7 +4382,7 @@ class OSManager(EngineScoped):
     def _create_system_os_instance_direct(self) -> None:
         """Create system OS instance (direct version for init)."""
         os_capabilities = {
-            "platform": self._get_platform_name(),
+            "platform": self.platform_name(),
             "arch": self._get_architecture(),
             "version": self._get_platform_version(),
         }
@@ -4453,7 +4469,7 @@ class OSManager(EngineScoped):
     def _create_system_os_instance(self) -> None:
         """Create system OS instance."""
         os_capabilities = {
-            "platform": self._get_platform_name(),
+            "platform": self.platform_name(),
             "arch": self._get_architecture(),
             "version": self._get_platform_version(),
         }
@@ -4584,19 +4600,9 @@ class OSManager(EngineScoped):
         logger.debug("MPS detected: Apple Silicon Mac")
         return True
 
-    def _get_platform_name(self) -> str:
-        """Get platform name using existing sys.platform detection."""
-        if self.is_windows():
-            return Platform.WINDOWS
-        if self.is_mac():
-            return Platform.DARWIN
-        if self.is_linux():
-            return Platform.LINUX
-        return sys.platform
-
     def _get_architecture(self) -> str:
         """Get system architecture, normalized across platforms."""
-        platform = self._get_platform_name()
+        platform = self.platform_name()
         if platform == Platform.WINDOWS:
             arch = os.environ.get("PROCESSOR_ARCHITECTURE", "unknown").lower()
         else:

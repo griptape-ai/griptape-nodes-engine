@@ -6,11 +6,11 @@ import os
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-from griptape_nodes.files import os_utils
 from griptape_nodes.retained_mode.events.app_events import (
     EngineHeartbeatRequest,
     EngineHeartbeatResultSuccess,
 )
+from griptape_nodes.retained_mode.managers.os_manager import OSManager
 
 if TYPE_CHECKING:
     import pytest
@@ -48,17 +48,18 @@ class TestEngineHeartbeatOrchestratorId:
 class TestEngineHeartbeatOperatingSystem:
     """Heartbeat reports the engine's OS so a client can tell apart engines on different machines.
 
-    The naming itself is covered by tests/unit/files/test_os_utils.py; this only checks that the
-    heartbeat carries it.
+    Which platform maps to which value is covered by TestPlatformName in
+    tests/unit/retained_mode/managers/test_os_manager.py; this only checks that the heartbeat
+    carries it.
     """
 
     def test_reports_the_os_it_is_running_on(self, griptape_nodes: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
         # Patch the seam rather than sys.platform: this asserts the heartbeat carries whatever
-        # os_utils reported, without telling the rest of the request it is on another OS. The
-        # name is one no real platform produces, so the assertion cannot pass by coincidence
-        # on a runner that happens to be that OS.
-        monkeypatch.setattr(os_utils, "os_display_name", lambda: "SentinelOS")
+        # OSManager reported, without telling the rest of the request it is on another OS. The
+        # value is one no real platform produces, so the assertion cannot pass by coincidence on
+        # a runner that happens to be that OS.
+        monkeypatch.setattr(OSManager, "platform_name", staticmethod(lambda: "sentinel-os"))
         result = griptape_nodes.handle_engine_heartbeat_request(EngineHeartbeatRequest(heartbeat_id="hb-os"))
 
         assert isinstance(result, EngineHeartbeatResultSuccess)
-        assert result.engine_os == "SentinelOS"
+        assert result.engine_os == "sentinel-os"

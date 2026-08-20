@@ -23,7 +23,6 @@ from typing import TYPE_CHECKING, Any
 import semver
 
 from griptape_nodes.exe_types.flow import ControlFlow
-from griptape_nodes.files import os_utils
 from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
 from griptape_nodes.retained_mode.events.app_events import (
     EngineHeartbeatRequest,
@@ -601,7 +600,7 @@ class Engine:
                 heartbeat_id=request.heartbeat_id,
                 engine_version=engine_version,
                 engine_name=engine_name,
-                engine_os=os_utils.os_display_name(),
+                engine_os=self._os_manager.platform_name(),
                 engine_id=self._engine_identity_manager.active_engine_id,
                 session_id=self._session_manager.active_session_id,
                 timestamp=datetime.now(tz=UTC).isoformat(),
