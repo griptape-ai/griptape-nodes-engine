@@ -445,6 +445,7 @@ class EngineHeartbeatResultSuccess(ResultPayloadSuccess):
         workflow_file_path: Path to workflow file (None if none)
         has_active_flow: Whether there's an active flow running
         engine_name: Human-readable engine name
+        engine_os: Operating system the engine is running on ("macOS", "Windows", "Linux")
         user: User information including ID, email, and name (None if not logged in)
         user_organization: User's organization information including ID and name (None if not logged in)
         orchestrator_engine_id: Engine id of the orchestrator that spawned this engine as a
@@ -477,6 +478,10 @@ class EngineHeartbeatResultSuccess(ResultPayloadSuccess):
     # (worker <=> orchestrator_engine_id is not None) and to nest it under its parent.
     # Defaulted for backward compatibility with older clients.
     orchestrator_engine_id: str | None = None
+    # Operating system the engine process is running on, as a display-ready name. Lets a client
+    # tell apart several local engines connected from different machines.
+    # Defaulted for backward compatibility with older clients.
+    engine_os: str = ""
 
 
 @dataclass

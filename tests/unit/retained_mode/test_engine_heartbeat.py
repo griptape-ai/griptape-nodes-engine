@@ -40,3 +40,22 @@ class TestEngineHeartbeatOrchestratorId:
 
         assert isinstance(result, EngineHeartbeatResultSuccess)
         assert result.orchestrator_engine_id == "eng-orchestrator"
+
+
+class TestEngineHeartbeatOperatingSystem:
+    """Heartbeat reports the engine's OS so a client can tell apart engines on different machines."""
+
+    def test_reports_macos_for_darwin(self, griptape_nodes: Engine) -> None:
+        # platform.system() says "Darwin"; a client should show "macOS".
+        with patch("platform.system", return_value="Darwin"):
+            result = griptape_nodes.handle_engine_heartbeat_request(EngineHeartbeatRequest(heartbeat_id="hb-mac"))
+
+        assert isinstance(result, EngineHeartbeatResultSuccess)
+        assert result.engine_os == "macOS"
+
+    def test_reports_other_systems_verbatim(self, griptape_nodes: Engine) -> None:
+        with patch("platform.system", return_value="Windows"):
+            result = griptape_nodes.handle_engine_heartbeat_request(EngineHeartbeatRequest(heartbeat_id="hb-win"))
+
+        assert isinstance(result, EngineHeartbeatResultSuccess)
+        assert result.engine_os == "Windows"
