@@ -1,5 +1,23 @@
 # Unreleased
 
+## `WorkflowPackager.copy_static_files` takes the workflow directory
+
+`copy_static_files` now requires a third argument naming the directory that holds the
+workflow being packaged:
+
+```python
+packager.copy_static_files(file_refs, destination, workflow_dir)
+```
+
+It needs the anchor to work out where each dependency belongs inside the bundle. Passing the
+live `{workflow_dir}` context would resolve against whichever workflow the engine happens to
+have open, so the caller supplies the one being published.
+
+Publishers that call `package_to_folder` — which is most of them, including the Folder and
+Nuke publishers — are unaffected; it derives the directory from the workflow itself. Only a
+publisher calling `copy_static_files` directly needs the change, and it fails loudly with a
+`TypeError` rather than bundling to the wrong place.
+
 ## Agent streaming payloads carry `thread_id`
 
 `AgentStreamEvent`, `AgentThinkingEvent`, `AgentToolCallEvent`, and `AgentToolResultEvent`

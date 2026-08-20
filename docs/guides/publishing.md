@@ -177,9 +177,13 @@ it guarantees the file travels with the published workflow.
     A file that lives outside your project — on an external drive or a network
     mount, say — has no place inside the bundle, so it is left where it is. The
     published workflow still looks for it at that same absolute path, which means
-    it only runs on a machine where that path exists. The publisher reports these
-    files as it works, so watch for a `file dependencies not bundled` message. To
-    make one travel, copy it into your project first and reference the copy.
+    it only runs on a machine where that path exists. To make one travel, copy it
+    into your project first and reference the copy.
+
+    Each file left out is recorded in the engine log as
+    `will not be bundled because ...`, along with the reason. If a published
+    workflow can't find a file it needs, that log line is the place to start; see
+    [Exporting engine logs](../troubleshooting.md#exporting-engine-logs).
 
 **When do I need this?** Use `SelectFromProject` for any file loaded from your
 project that doesn't show up in the published bundle — for example an image,
