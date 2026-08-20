@@ -27,7 +27,7 @@ from dotenv.main import DotEnv
 
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
 from griptape_nodes.exe_types.param_components.huggingface.huggingface_model_parameter import HuggingFaceModelParameter
-from griptape_nodes.files.path_utils import canonicalize_for_identity
+from griptape_nodes.files.path_utils import canonicalize_for_identity, resolve_path_safely
 from griptape_nodes.node_library.library_registry import LibraryNameAndVersion, LibraryRegistry
 from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
 from griptape_nodes.retained_mode.events.app_events import (
@@ -60,6 +60,7 @@ from griptape_nodes.retained_mode.events.project_events import (
     GetCurrentProjectRequest,
     GetCurrentProjectResultSuccess,
     GetPathForMacroRequest,
+    GetPathForMacroResultFailure,
     GetPathForMacroResultSuccess,
 )
 from griptape_nodes.retained_mode.events.secrets_events import (
@@ -99,6 +100,22 @@ class ResolvedFileReference(NamedTuple):
 
     absolute_path: Path
     bundle_relative_path: Path
+
+
+class FileReferenceOutcome(NamedTuple):
+    """The result of resolving a static file reference for bundling.
+
+    Attributes:
+        reference: The resolved reference, or None when the file cannot be bundled.
+        failure: Why it cannot be bundled, phrased to complete "will not be bundled because
+            ...". None when ``reference`` is set. Carried out to the caller rather than logged
+            here so every "not bundled" line comes from one place, and so the distinct
+            causes -- an unresolvable macro, a path outside the project -- stay distinct
+            instead of collapsing into one message that guesses.
+    """
+
+    reference: ResolvedFileReference | None
+    failure: str | None
 
 
 class WorkflowPackager:
@@ -581,23 +598,35 @@ dependencies = [
         return results
 
     @staticmethod
-    def _resolve_file_reference(value_str: str, anchors: list[Path]) -> ResolvedFileReference | None:
-        """Resolve a file reference to its source path and its place in the bundle, or None."""
+    def _resolve_file_reference(value_str: str, anchors: list[Path]) -> FileReferenceOutcome:
+        """Resolve a file reference to its source path and its place in the bundle."""
         from griptape_nodes.common.macro_parser import ParsedMacro
 
         absolute_path: Path | None = None
+        macro_failure: str | None = None
         try:
             parsed = ParsedMacro(value_str)
             resolve_result = GriptapeNodes.handle_request(GetPathForMacroRequest(parsed_macro=parsed, variables={}))
             if isinstance(resolve_result, GetPathForMacroResultSuccess):
                 absolute_path = resolve_result.absolute_path
+            elif isinstance(resolve_result, GetPathForMacroResultFailure):
+                macro_failure = f"its macro could not be resolved ({resolve_result.failure_reason})"
+                if resolve_result.missing_variables:
+                    macro_failure += f", with no value for {', '.join(sorted(resolve_result.missing_variables))}"
         except Exception:
             logger.debug("Macro resolution failed for %r; falling back to path resolution.", value_str, exc_info=True)
+            macro_failure = "its macro could not be parsed"
 
+        # A value the macro layer rejected can still be a usable path -- an absolute Windows
+        # path is not valid macro syntax -- so the macro failure is only reported if the
+        # fallback cannot use it either.
         if absolute_path is None:
             candidate = Path(value_str)
             if not candidate.is_absolute():
-                return None
+                return FileReferenceOutcome(
+                    reference=None,
+                    failure=macro_failure or "it is neither a resolvable macro nor an absolute path",
+                )
             absolute_path = candidate
 
         # Derived from absolute_path, never from GetPathForMacroResultSuccess.resolved_path.
@@ -607,9 +636,15 @@ dependencies = [
         # the destination, so every macro-referenced dependency silently missed the bundle.
         bundle_relative_path = WorkflowPackager._bundle_relative_path(absolute_path, anchors)
         if bundle_relative_path is None:
-            return None
+            return FileReferenceOutcome(
+                reference=None,
+                failure=f"it resolves to '{absolute_path}', which is outside the project",
+            )
 
-        return ResolvedFileReference(absolute_path=absolute_path, bundle_relative_path=bundle_relative_path)
+        return FileReferenceOutcome(
+            reference=ResolvedFileReference(absolute_path=absolute_path, bundle_relative_path=bundle_relative_path),
+            failure=None,
+        )
 
     @staticmethod
     def _bundle_relative_path(absolute_path: Path, anchors: list[Path]) -> Path | None:
@@ -627,19 +662,27 @@ dependencies = [
         A file under no anchor at all has nowhere to live in the bundle -- an external volume
         or network mount resolves to the same absolute path wherever the bundle runs, so there
         is no bundle-relative location to copy it to.
+
+        Matched on logically normalized paths, NOT symlink-resolved ones, which is why this
+        uses ``resolve_path_safely`` rather than ``canonicalize_for_identity``. A project that
+        symlinks a media directory onto shared storage is an ordinary setup, and following the
+        link would take `{inputs}/image.jpg` to the storage mount, match no anchor, and report
+        a file plainly inside the project as being outside it. Bundling through the link is
+        also the better outcome: the copy makes the bundle self-contained. This matches how
+        ``ProjectManager`` inverts an absolute path back to macro form.
         """
-        canonical_path = canonicalize_for_identity(absolute_path)
+        normalized_path = resolve_path_safely(absolute_path)
 
         best_relative_path: Path | None = None
         best_anchor_depth = -1
         for anchor in anchors:
-            canonical_anchor = canonicalize_for_identity(anchor)
-            if not canonical_path.is_relative_to(canonical_anchor):
+            normalized_anchor = resolve_path_safely(anchor)
+            if not normalized_path.is_relative_to(normalized_anchor):
                 continue
-            anchor_depth = len(canonical_anchor.parts)
+            anchor_depth = len(normalized_anchor.parts)
             if anchor_depth > best_anchor_depth:
                 best_anchor_depth = anchor_depth
-                best_relative_path = canonical_path.relative_to(canonical_anchor)
+                best_relative_path = normalized_path.relative_to(normalized_anchor)
 
         return best_relative_path
 
@@ -673,26 +716,23 @@ dependencies = [
         """
         copied: set[Path] = set()
         anchors = self._publish_anchors(workflow_dir)
-        unbundled: list[str] = []
 
         for node_name, value_str in file_param_values:
-            resolved = self._resolve_file_reference(value_str, anchors)
-            if resolved is None:
-                unbundled.append(value_str)
+            outcome = self._resolve_file_reference(value_str, anchors)
+            if outcome.reference is None:
                 logger.warning(
-                    "File '%s' for node '%s' does not resolve to a location inside the project, "
-                    "so there is nowhere in the bundle to put it. It will not be bundled.",
+                    "File '%s' for node '%s' will not be bundled because %s.",
                     value_str,
                     node_name,
+                    outcome.failure,
                 )
                 continue
 
-            absolute_path = resolved.absolute_path
+            absolute_path = outcome.reference.absolute_path
 
             if not absolute_path.exists():
-                unbundled.append(value_str)
                 logger.warning(
-                    "File '%s' for node '%s' does not exist at '%s'. It will not be bundled.",
+                    "File '%s' for node '%s' will not be bundled because there is no file at '%s'.",
                     value_str,
                     node_name,
                     absolute_path,
@@ -700,9 +740,10 @@ dependencies = [
                 continue
 
             if absolute_path in copied:
+                logger.debug("Static file for node '%s' was already bundled: %s", node_name, absolute_path)
                 continue
 
-            dest = destination / resolved.bundle_relative_path
+            dest = destination / outcome.reference.bundle_relative_path
 
             # The destination can resolve to the same file as the source when the package
             # destination lives inside the project root (e.g. the Nuke publisher writes the
@@ -723,12 +764,6 @@ dependencies = [
 
             copied.add(absolute_path)
             logger.info("Copied static file for node '%s': %s -> %s", node_name, absolute_path, dest)
-
-        # Reported alongside the publish rather than left to the log: a dependency that
-        # missed the bundle only surfaces when the published workflow runs, far from the
-        # publish that caused it.
-        if unbundled:
-            self.emit_progress(0.0, f"{len(unbundled)} file dependencies not bundled: {', '.join(unbundled)}")
 
     # -- HuggingFace model download --
 

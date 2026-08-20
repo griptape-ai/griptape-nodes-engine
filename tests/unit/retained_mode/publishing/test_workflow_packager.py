@@ -1,6 +1,7 @@
 """Tests for WorkflowPackager: library dependency resolution and clean-rebuild publishing."""
 
 import json
+import logging
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -20,7 +21,9 @@ from griptape_nodes.retained_mode.events.os_events import (
 )
 from griptape_nodes.retained_mode.events.project_events import (
     GetPathForMacroRequest,
+    GetPathForMacroResultFailure,
     GetPathForMacroResultSuccess,
+    PathResolutionFailureReason,
 )
 from griptape_nodes.retained_mode.events.secrets_events import (
     GetAllSecretValuesRequest,
@@ -29,6 +32,7 @@ from griptape_nodes.retained_mode.events.secrets_events import (
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.publishing.workflow_packager import (
     DOWNLOAD_MODELS_SCRIPT_NAME,
+    FileReferenceOutcome,
     ResolvedFileReference,
     WorkflowPackager,
 )
@@ -268,8 +272,37 @@ class TestCopyStaticFilesBundleDestination:
         mock_copy_file.assert_called_once_with(source, destination / "inputs" / "image.jpg")
         mock_copy_tree.assert_not_called()
 
-    def test_reports_a_file_that_resolves_outside_every_anchor(self, tmp_path: Path) -> None:
-        """A file on an external volume has no place in the bundle, and the publish says so."""
+    def test_bundles_file_through_a_symlinked_project_directory(self, tmp_path: Path) -> None:
+        """A media directory symlinked onto other storage still bundles.
+
+        Matching on symlink-resolved paths would take the file to the link target, match no
+        anchor, and report a file plainly inside the project as being outside it.
+        """
+        packager = WorkflowPackager("test_workflow")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        shared = tmp_path / "shared_storage"
+        (shared / "images").mkdir(parents=True)
+        (shared / "images" / "image.jpg").write_text("data")
+        (workspace / "inputs").symlink_to(shared, target_is_directory=True)
+        source = workspace / "inputs" / "images" / "image.jpg"
+        destination = tmp_path / "bundle"
+
+        with (
+            _macro_resolution_patch(resolved_path=source, absolute_path=source),
+            _workspace_patch(workspace),
+            patch.object(packager, "copy_file") as mock_copy_file,
+            patch.object(packager, "copy_tree") as mock_copy_tree,
+        ):
+            packager.copy_static_files([("node", "{inputs}/images/image.jpg")], destination, workspace)
+
+        mock_copy_file.assert_called_once_with(source, destination / "inputs" / "images" / "image.jpg")
+        mock_copy_tree.assert_not_called()
+
+    def test_reports_a_file_that_resolves_outside_every_anchor(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A file on an external volume has no place in the bundle, and the log says why."""
         packager = WorkflowPackager("test_workflow")
         workspace = tmp_path / "ws"
         workspace.mkdir()
@@ -283,13 +316,49 @@ class TestCopyStaticFilesBundleDestination:
             _workspace_patch(workspace),
             patch.object(packager, "copy_file") as mock_copy_file,
             patch.object(packager, "copy_tree") as mock_copy_tree,
-            patch.object(packager, "emit_progress") as mock_emit_progress,
+            caplog.at_level(logging.WARNING, logger="workflow_packager"),
         ):
             packager.copy_static_files([("node", "{external}/image.jpg")], destination, workspace)
 
         mock_copy_file.assert_not_called()
         mock_copy_tree.assert_not_called()
-        assert "{external}/image.jpg" in mock_emit_progress.call_args.args[1]
+        assert "{external}/image.jpg" in caplog.text
+        assert "outside the project" in caplog.text
+
+    def test_reports_an_unresolvable_macro_as_such(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        """A macro that will not resolve is not reported as a path outside the project.
+
+        The two failures are unrelated and the user acts on them differently, so the message
+        names the missing variable rather than guessing at a location.
+        """
+        packager = WorkflowPackager("test_workflow")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        destination = tmp_path / "bundle"
+
+        def handle_request(request: object) -> object:
+            if isinstance(request, GetPathForMacroRequest):
+                return GetPathForMacroResultFailure(
+                    failure_reason=PathResolutionFailureReason.MISSING_REQUIRED_VARIABLES,
+                    missing_variables={"shot_name"},
+                    result_details="missing shot_name",
+                )
+            return MagicMock()
+
+        with (
+            patch(
+                "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.handle_request",
+                side_effect=handle_request,
+            ),
+            _workspace_patch(workspace),
+            patch.object(packager, "copy_file") as mock_copy_file,
+            caplog.at_level(logging.WARNING, logger="workflow_packager"),
+        ):
+            packager.copy_static_files([("node", "{inputs}/{shot_name}.jpg")], destination, workspace)
+
+        mock_copy_file.assert_not_called()
+        assert "shot_name" in caplog.text
+        assert "outside the project" not in caplog.text
 
 
 class TestCopyStaticFiles:
@@ -305,7 +374,11 @@ class TestCopyStaticFiles:
 
         # destination is the project root itself, so dest == source.
         with (
-            patch.object(packager, "_resolve_file_reference", return_value=resolved),
+            patch.object(
+                packager,
+                "_resolve_file_reference",
+                return_value=FileReferenceOutcome(reference=resolved, failure=None),
+            ),
             patch(
                 "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.handle_request",
                 return_value=MagicMock(),
@@ -330,7 +403,11 @@ class TestCopyStaticFiles:
         destination = tmp_path / "bundle"
 
         with (
-            patch.object(packager, "_resolve_file_reference", return_value=resolved),
+            patch.object(
+                packager,
+                "_resolve_file_reference",
+                return_value=FileReferenceOutcome(reference=resolved, failure=None),
+            ),
             patch(
                 "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.handle_request",
                 return_value=MagicMock(),
