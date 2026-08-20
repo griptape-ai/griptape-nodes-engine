@@ -1,4 +1,4 @@
-"""Unit tests for the os_utils platform-detection predicates."""
+"""Unit tests for os_utils: the platform-detection predicates and the display name."""
 
 import pytest
 

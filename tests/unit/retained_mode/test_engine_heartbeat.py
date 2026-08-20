@@ -6,6 +6,7 @@ import os
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
+from griptape_nodes.files import os_utils
 from griptape_nodes.retained_mode.events.app_events import (
     EngineHeartbeatRequest,
     EngineHeartbeatResultSuccess,
@@ -52,7 +53,9 @@ class TestEngineHeartbeatOperatingSystem:
     """
 
     def test_reports_the_os_it_is_running_on(self, griptape_nodes: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr("griptape_nodes.files.os_utils.sys.platform", "win32")
+        # Patch the seam rather than sys.platform: this asserts the heartbeat carries whatever
+        # os_utils reported, without telling the rest of the request it is on another OS.
+        monkeypatch.setattr(os_utils, "os_display_name", lambda: "Windows")
         result = griptape_nodes.handle_engine_heartbeat_request(EngineHeartbeatRequest(heartbeat_id="hb-win"))
 
         assert isinstance(result, EngineHeartbeatResultSuccess)

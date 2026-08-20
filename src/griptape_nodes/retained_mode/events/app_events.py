@@ -445,10 +445,7 @@ class EngineHeartbeatResultSuccess(ResultPayloadSuccess):
         workflow_file_path: Path to workflow file (None if none)
         has_active_flow: Whether there's an active flow running
         engine_name: Human-readable engine name
-        engine_os: Operating system the engine is running on, named as a user would
-            recognize it -- usually "macOS", "Windows", or "Linux", but any other platform
-            reports whatever `sys.platform` says. Empty only on a heartbeat from an engine
-            predating this field.
+        engine_os: Operating system the engine is running on, named for display
         user: User information including ID, email, and name (None if not logged in)
         user_organization: User's organization information including ID and name (None if not logged in)
         orchestrator_engine_id: Engine id of the orchestrator that spawned this engine as a
@@ -481,10 +478,11 @@ class EngineHeartbeatResultSuccess(ResultPayloadSuccess):
     # (worker <=> orchestrator_engine_id is not None) and to nest it under its parent.
     # Defaulted for backward compatibility with older clients.
     orchestrator_engine_id: str | None = None
-    # Operating system the engine process is running on, as a display-ready name. Lets a client
-    # tell apart several local engines connected from different machines. A live engine always
-    # fills this in, so the "" default means the heartbeat came from an engine too old to
-    # report it -- a client should show nothing rather than guess.
+    # Operating system the engine process is running on, so a client can tell apart several
+    # local engines connected from different machines. Usually "macOS", "Windows", or "Linux",
+    # but the set is open: an unrecognized platform reports whatever `sys.platform` says. A
+    # live engine always fills this in, so the "" default means the heartbeat came from an
+    # engine too old to report it -- a client should show nothing rather than guess.
     engine_os: str = ""
 
 
