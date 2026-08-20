@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import logging
 import os
-import platform
 import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -24,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 import semver
 
 from griptape_nodes.exe_types.flow import ControlFlow
+from griptape_nodes.files import os_utils
 from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
 from griptape_nodes.retained_mode.events.app_events import (
     EngineHeartbeatRequest,
@@ -601,7 +601,7 @@ class Engine:
                 heartbeat_id=request.heartbeat_id,
                 engine_version=engine_version,
                 engine_name=engine_name,
-                engine_os=self._get_os_name(),
+                engine_os=os_utils.os_display_name(),
                 engine_id=self._engine_identity_manager.active_engine_id,
                 session_id=self._session_manager.active_session_id,
                 timestamp=datetime.now(tz=UTC).isoformat(),
@@ -635,17 +635,6 @@ class Engine:
         instance_info["deployment_type"] = "griptape_hosted" if any(instance_info.values()) else "local"
 
         return instance_info
-
-    def _get_os_name(self) -> str:
-        """Get the operating system name to show alongside this engine in a client.
-
-        `platform.system()` reports macOS as "Darwin", which means nothing to an artist, so
-        translate it. Any other system is reported as-is.
-        """
-        system = platform.system()
-        if system == "Darwin":
-            return "macOS"
-        return system
 
     def _get_current_workflow_info(self) -> dict[str, Any]:
         """Get information about the currently loaded workflow.

@@ -12,6 +12,8 @@ from griptape_nodes.retained_mode.events.app_events import (
 )
 
 if TYPE_CHECKING:
+    import pytest
+
     from griptape_nodes.retained_mode.engine import Engine
 
 
@@ -43,19 +45,15 @@ class TestEngineHeartbeatOrchestratorId:
 
 
 class TestEngineHeartbeatOperatingSystem:
-    """Heartbeat reports the engine's OS so a client can tell apart engines on different machines."""
+    """Heartbeat reports the engine's OS so a client can tell apart engines on different machines.
 
-    def test_reports_macos_for_darwin(self, griptape_nodes: Engine) -> None:
-        # platform.system() says "Darwin"; a client should show "macOS".
-        with patch("platform.system", return_value="Darwin"):
-            result = griptape_nodes.handle_engine_heartbeat_request(EngineHeartbeatRequest(heartbeat_id="hb-mac"))
+    The naming itself is covered by tests/unit/files/test_os_utils.py; this only checks that the
+    heartbeat carries it.
+    """
 
-        assert isinstance(result, EngineHeartbeatResultSuccess)
-        assert result.engine_os == "macOS"
-
-    def test_reports_other_systems_verbatim(self, griptape_nodes: Engine) -> None:
-        with patch("platform.system", return_value="Windows"):
-            result = griptape_nodes.handle_engine_heartbeat_request(EngineHeartbeatRequest(heartbeat_id="hb-win"))
+    def test_reports_the_os_it_is_running_on(self, griptape_nodes: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("griptape_nodes.files.os_utils.sys.platform", "win32")
+        result = griptape_nodes.handle_engine_heartbeat_request(EngineHeartbeatRequest(heartbeat_id="hb-win"))
 
         assert isinstance(result, EngineHeartbeatResultSuccess)
         assert result.engine_os == "Windows"

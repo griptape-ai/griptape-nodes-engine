@@ -26,3 +26,21 @@ def is_mac() -> bool:
 def is_linux() -> bool:
     """Return True when running on Linux."""
     return sys.platform.startswith("linux")
+
+
+def os_display_name() -> str:
+    """Return the name of this OS as a user would recognize it.
+
+    For showing the user which machine something is running on -- an engine in a client's
+    engine list, for instance. ``sys.platform`` spells macOS "darwin" and Windows "win32",
+    neither of which means anything to an artist, so each supported platform gets a
+    familiar spelling. Anything else falls back to ``sys.platform``, which is always set,
+    so the result is never empty.
+    """
+    if is_windows():
+        return "Windows"
+    if is_mac():
+        return "macOS"
+    if is_linux():
+        return "Linux"
+    return sys.platform
