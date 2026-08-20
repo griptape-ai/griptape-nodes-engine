@@ -66,6 +66,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowRequest,
     GetTopLevelFlowRequest,
     GetTopLevelFlowResultSuccess,
+    SerializedConnectionKey,
     SerializedFlowCommands,
     SerializeFlowToCommandsRequest,
     SerializeFlowToCommandsResultSuccess,
@@ -250,6 +251,61 @@ class WorkflowRegistrationResult(NamedTuple):
 
     succeeded: list[str]
     failed: list[str]
+
+
+@dataclass
+class WorkflowCodegenState:
+    """Variable names and counters shared by every Flow written into one generated workflow file.
+
+    A generated file is a single flat script, so node and flow variable names have to be unique
+    across the whole file rather than per Flow. Nested node groups also break any per-Flow view of
+    the graph: a group's ``node_names_to_add`` can name a child that was created inside a deeper
+    subflow, and a connection can join nodes that live in different subflows. Threading one of these
+    through the whole recursion keeps every level looking at the same names.
+    """
+
+    node_uuid_to_node_variable_name: dict[SerializedNodeCommands.NodeUUID, str] = field(default_factory=dict)
+    subflow_name_to_variable_name: dict[str, str] = field(default_factory=dict)
+    next_node_index: int = 0
+    next_flow_index: int = 0
+    emitted_connection_keys: set[SerializedConnectionKey] = field(default_factory=set)
+
+    def reserve_node_index(self) -> int:
+        """Claim the next unused node variable index."""
+        node_index = self.next_node_index
+        self.next_node_index += 1
+        return node_index
+
+    def reserve_flow_index(self) -> int:
+        """Claim the next unused flow variable index."""
+        flow_index = self.next_flow_index
+        self.next_flow_index += 1
+        return flow_index
+
+    def take_unemitted_connections(
+        self, connections: list[SerializedFlowCommands.IndirectConnectionSerialization]
+    ) -> list[SerializedFlowCommands.IndirectConnectionSerialization]:
+        """Filter out connections already written elsewhere in the file, claiming the rest.
+
+        Each Flow's serialized connections include those of its subflows, so the same edge is
+        offered once per level of nesting. Emitting it every time would re-create the connection
+        repeatedly, which for a node group means tearing down and rebuilding the proxy parameter
+        the edge was routed through.
+
+        Args:
+            connections: The connections the current Flow would like to emit
+
+        Returns:
+            Only the connections no other Flow has emitted yet
+        """
+        unemitted_connections = []
+        for connection in connections:
+            connection_key = connection.key()
+            if connection_key in self.emitted_connection_keys:
+                continue
+            self.emitted_connection_keys.add(connection_key)
+            unemitted_connections.append(connection)
+        return unemitted_connections
 
 
 class WorkflowManager(EngineScoped):
@@ -3213,7 +3269,7 @@ class WorkflowManager(EngineScoped):
             is_template=is_template,
         )
 
-    def _generate_workflow_file_content(  # noqa: PLR0912, PLR0915, C901
+    def _generate_workflow_file_content(
         self,
         serialized_flow_commands: SerializedFlowCommands,
         workflow_metadata: WorkflowMetadata,
@@ -3277,195 +3333,17 @@ class WorkflowManager(EngineScoped):
         # Helper returns an ast.Module; unpack its body into statements.
         main_body.extend(cast("ast.stmt", stmt) for stmt in unique_values_node.body)
 
-        # Keep track of each flow and node index we've created
-        flow_creation_index = 0
+        # Names are shared by every Flow in the file, at any nesting depth.
+        codegen_state = WorkflowCodegenState()
 
-        # See if this serialized flow has a flow initialization command; if it does, we'll need to insert that
-        flow_initialization_command = serialized_flow_commands.flow_initialization_command
-
-        match flow_initialization_command:
-            case CreateFlowRequest():
-                # Generate create flow context AST module
-                create_flow_context_module = self._generate_create_flow(
-                    flow_initialization_command, import_recorder, flow_creation_index
-                )
-                main_body.extend(cast("ast.stmt", node) for node in create_flow_context_module.body)
-            case ImportWorkflowAsReferencedSubFlowRequest():
-                # Generate import workflow context AST module
-                import_workflow_context_module = self._generate_import_workflow(
-                    flow_initialization_command, import_recorder, flow_creation_index
-                )
-                main_body.extend(cast("ast.stmt", node) for node in import_workflow_context_module.body)
-            case None:
-                # No initialization command, deserialize into current context
-                pass
-
-        # Generate assign flow context AST node, if we have any children commands
-        # Skip content generation for referenced workflows - they should only have the import command
-        is_referenced_workflow = isinstance(flow_initialization_command, ImportWorkflowAsReferencedSubFlowRequest)
-        has_content_to_serialize = (
-            len(serialized_flow_commands.serialized_node_commands) > 0
-            or len(serialized_flow_commands.serialized_connections) > 0
-            or len(serialized_flow_commands.set_parameter_value_commands) > 0
-            or len(serialized_flow_commands.sub_flows_commands) > 0
-            or len(serialized_flow_commands.set_lock_commands_per_node) > 0
-            or len(serialized_flow_commands.serialized_variable_commands) > 0
+        main_body.extend(
+            self._generate_flow_code(
+                serialized_flow_commands=serialized_flow_commands,
+                import_recorder=import_recorder,
+                codegen_state=codegen_state,
+                parent_flow_creation_index=None,
+            )
         )
-
-        if not is_referenced_workflow and has_content_to_serialize:
-            # Keep track of all of the nodes we create and the generated variable names for them
-            node_uuid_to_node_variable_name: dict[SerializedNodeCommands.NodeUUID, str] = {}
-
-            # Keep track of subflow names to their generated variable names (for node group metadata)
-            subflow_name_to_variable_name: dict[str, str] = {}
-
-            # Create the "with..." statement
-            assign_flow_context_node = self._generate_assign_flow_context(
-                flow_initialization_command=flow_initialization_command, flow_creation_index=flow_creation_index
-            )
-
-            # Emit flow-scoped variable creation INSIDE the flow "with" block, BEFORE any
-            # node creation. Ordering matters: SetVariable nodes' before_value_set hook fires
-            # during initial_setup and calls has_variable(); having the variable already
-            # present ensures that hook is a no-op adopt rather than a duplicate create.
-            flow_scoped_variable_asts = self._generate_create_variable_code(
-                serialized_variable_commands=serialized_flow_commands.serialized_variable_commands,
-                unique_values_dict_name="top_level_unique_values_dict",
-                import_recorder=import_recorder,
-            )
-            assign_flow_context_node.body.extend(flow_scoped_variable_asts)
-
-            # Separate regular nodes from NodeGroup nodes in main flow
-
-            regular_node_commands = []
-            node_group_commands = []
-            for serialized_node_command in serialized_flow_commands.serialized_node_commands:
-                # Check if this is a NodeGroup by checking the SerializedNodeCommands flag
-                if serialized_node_command.is_node_group:
-                    node_group_commands.append(serialized_node_command)
-                else:
-                    regular_node_commands.append(serialized_node_command)
-
-            # Track the running node index across all flows to ensure unique variable names
-            current_node_index = 0
-
-            # Generate regular nodes in main flow first (NOT NodeGroups yet)
-            for serialized_node_command in regular_node_commands:
-                node_creation_ast = self._generate_node_creation_code(
-                    serialized_node_command,
-                    current_node_index,
-                    import_recorder,
-                    node_uuid_to_node_variable_name=node_uuid_to_node_variable_name,
-                    subflow_name_to_variable_name=subflow_name_to_variable_name,
-                )
-                assign_flow_context_node.body.extend(node_creation_ast)
-                current_node_index += 1
-
-            # Process sub-flows - for each sub-flow, generate its nodes
-            for sub_flow_index, sub_flow_commands in enumerate(serialized_flow_commands.sub_flows_commands):
-                sub_flow_creation_index = flow_creation_index + 1 + sub_flow_index
-
-                # Generate initialization command for the sub-flow
-                sub_flow_initialization_command = sub_flow_commands.flow_initialization_command
-                if sub_flow_initialization_command is not None:
-                    # Track the subflow name to variable mapping for node groups
-                    if isinstance(sub_flow_initialization_command, CreateFlowRequest):
-                        original_subflow_name = sub_flow_initialization_command.flow_name
-                        subflow_variable_name = f"flow{sub_flow_creation_index}_name"
-                        if original_subflow_name:
-                            subflow_name_to_variable_name[original_subflow_name] = subflow_variable_name
-
-                    match sub_flow_initialization_command:
-                        case CreateFlowRequest():
-                            sub_flow_create_node = self._generate_create_flow(
-                                sub_flow_initialization_command,
-                                import_recorder,
-                                sub_flow_creation_index,
-                                parent_flow_creation_index=flow_creation_index,
-                            )
-                            assign_flow_context_node.body.append(cast("ast.stmt", sub_flow_create_node))
-                        case ImportWorkflowAsReferencedSubFlowRequest():
-                            sub_flow_import_node = self._generate_import_workflow(
-                                sub_flow_initialization_command, import_recorder, sub_flow_creation_index
-                            )
-                            assign_flow_context_node.body.append(cast("ast.stmt", sub_flow_import_node))
-
-                # Generate the nodes in this subflow (just like we do for main flow)
-                if sub_flow_commands.serialized_node_commands or sub_flow_commands.serialized_variable_commands:
-                    # Create "with" statement for subflow
-                    subflow_context_node = self._generate_assign_flow_context(
-                        flow_initialization_command=sub_flow_initialization_command,
-                        flow_creation_index=sub_flow_creation_index,
-                    )
-                    # Emit flow-scoped variable creation BEFORE any node creation in this subflow,
-                    # for the same reason as the top-level flow.
-                    subflow_variable_asts = self._generate_create_variable_code(
-                        serialized_variable_commands=sub_flow_commands.serialized_variable_commands,
-                        unique_values_dict_name="top_level_unique_values_dict",
-                        import_recorder=import_recorder,
-                    )
-                    subflow_context_node.body.extend(subflow_variable_asts)
-                    # Generate nodes in subflow, passing current index and getting next available
-                    subflow_nodes, current_node_index = self._generate_nodes_in_flow(
-                        sub_flow_commands,
-                        import_recorder,
-                        node_uuid_to_node_variable_name,
-                        current_node_index,
-                        subflow_name_to_variable_name,
-                    )
-                    subflow_context_node.body.extend(subflow_nodes)
-
-                    # Generate connections for nodes in this subflow (must be in subflow context)
-                    subflow_connection_asts = self._generate_connections_code(
-                        serialized_connections=sub_flow_commands.serialized_connections,
-                        node_uuid_to_node_variable_name=node_uuid_to_node_variable_name,
-                        import_recorder=import_recorder,
-                    )
-                    subflow_context_node.body.extend(subflow_connection_asts)
-
-                    # Generate parameter values for nodes in this subflow (must be in subflow context)
-                    subflow_parameter_value_asts = self._generate_set_parameter_value_code(
-                        set_parameter_value_commands=sub_flow_commands.set_parameter_value_commands,
-                        lock_commands=sub_flow_commands.set_lock_commands_per_node,
-                        node_uuid_to_node_variable_name=node_uuid_to_node_variable_name,
-                        unique_values_dict_name="top_level_unique_values_dict",
-                        import_recorder=import_recorder,
-                    )
-                    subflow_context_node.body.extend(subflow_parameter_value_asts)
-
-                    assign_flow_context_node.body.append(subflow_context_node)
-
-            # Generate NodeGroup nodes LAST (after subflows, so child nodes exist)
-            for serialized_node_command in node_group_commands:
-                node_creation_ast = self._generate_node_creation_code(
-                    serialized_node_command,
-                    current_node_index,
-                    import_recorder,
-                    node_uuid_to_node_variable_name=node_uuid_to_node_variable_name,
-                    subflow_name_to_variable_name=subflow_name_to_variable_name,
-                )
-                assign_flow_context_node.body.extend(node_creation_ast)
-                current_node_index += 1
-
-            # Now generate the connection code and add it to the flow context
-            connection_asts = self._generate_connections_code(
-                serialized_connections=serialized_flow_commands.serialized_connections,
-                node_uuid_to_node_variable_name=node_uuid_to_node_variable_name,
-                import_recorder=import_recorder,
-            )
-            assign_flow_context_node.body.extend(connection_asts)
-
-            # Generate parameter values for main flow only (subflow parameter values generated inside their contexts)
-            set_parameter_value_asts = self._generate_set_parameter_value_code(
-                set_parameter_value_commands=serialized_flow_commands.set_parameter_value_commands,
-                lock_commands=serialized_flow_commands.set_lock_commands_per_node,
-                node_uuid_to_node_variable_name=node_uuid_to_node_variable_name,
-                unique_values_dict_name="top_level_unique_values_dict",
-                import_recorder=import_recorder,
-            )
-            assign_flow_context_node.body.extend(set_parameter_value_asts)
-
-            main_body.append(cast("ast.stmt", assign_flow_context_node))
 
         # Wrap all graph-building statements in `async def build_workflow()` so the file is
         # inert until build_workflow() is awaited (by the engine loader or the CLI entrypoint).
@@ -4946,41 +4824,207 @@ class WorkflowManager(EngineScoped):
 
         return with_stmt
 
-    def _generate_nodes_in_flow(
+    def _generate_flow_code(
         self,
         serialized_flow_commands: SerializedFlowCommands,
         import_recorder: ImportRecorder,
-        node_uuid_to_node_variable_name: dict[SerializedNodeCommands.NodeUUID, str],
-        starting_node_index: int,
-        subflow_name_to_variable_name: dict[str, str],
-    ) -> tuple[list[ast.stmt], int]:
-        """Generate node creation code for nodes in a flow.
+        codegen_state: WorkflowCodegenState,
+        parent_flow_creation_index: int | None,
+    ) -> list[ast.stmt]:
+        """Generate the code that rebuilds one Flow, then recurse into its subflows.
+
+        Recursion is what makes nested node groups work: a group's subflow can itself hold another
+        group with its own subflow, to any depth. Handling only the first level of subflows left the
+        deeper nodes out of the file entirely, so the groups that owned them were rebuilt empty and
+        any connection reaching one of them could not be written at all.
 
         Args:
-            serialized_flow_commands: Commands for the flow
+            serialized_flow_commands: Commands for the Flow being generated
             import_recorder: Import recorder for tracking imports
-            node_uuid_to_node_variable_name: Mapping from node UUIDs to variable names
-            starting_node_index: The starting index for node variable names
-            subflow_name_to_variable_name: Mapping from subflow names to variable names
+            codegen_state: Variable names and counters shared across the whole file
+            parent_flow_creation_index: Index of the enclosing Flow's variable, or None at the top
 
         Returns:
-            Tuple of (list of AST statements, next available node index)
+            The statements that recreate this Flow and everything inside it
         """
-        node_creation_asts = []
-        current_index = starting_node_index
-        for serialized_node_command in serialized_flow_commands.serialized_node_commands:
-            node_creation_ast = self._generate_node_creation_code(
-                serialized_node_command,
-                current_index,
-                import_recorder,
-                node_uuid_to_node_variable_name=node_uuid_to_node_variable_name,
-                subflow_name_to_variable_name=subflow_name_to_variable_name,
-            )
-            node_creation_asts.extend(node_creation_ast)
-            current_index += 1
-        return node_creation_asts, current_index
+        flow_initialization_command = serialized_flow_commands.flow_initialization_command
+        flow_creation_index = codegen_state.reserve_flow_index()
 
-    def _generate_node_creation_code(  # noqa: C901, PLR0912, PLR0915
+        flow_statements = self._generate_flow_initialization_code(
+            flow_initialization_command=flow_initialization_command,
+            import_recorder=import_recorder,
+            codegen_state=codegen_state,
+            flow_creation_index=flow_creation_index,
+            parent_flow_creation_index=parent_flow_creation_index,
+        )
+
+        # A referenced workflow carries its own file, so only the import belongs here.
+        if isinstance(flow_initialization_command, ImportWorkflowAsReferencedSubFlowRequest):
+            return flow_statements
+
+        if not self._flow_has_content_to_generate(serialized_flow_commands):
+            return flow_statements
+
+        flow_context_node = self._generate_assign_flow_context(
+            flow_initialization_command=flow_initialization_command, flow_creation_index=flow_creation_index
+        )
+
+        # Emit flow-scoped variable creation INSIDE the flow "with" block, BEFORE any
+        # node creation. Ordering matters: SetVariable nodes' before_value_set hook fires
+        # during initial_setup and calls has_variable(); having the variable already
+        # present ensures that hook is a no-op adopt rather than a duplicate create.
+        flow_context_node.body.extend(
+            self._generate_create_variable_code(
+                serialized_variable_commands=serialized_flow_commands.serialized_variable_commands,
+                unique_values_dict_name="top_level_unique_values_dict",
+                import_recorder=import_recorder,
+            )
+        )
+
+        # A node group has to be created after the nodes it claims as members, and its members can
+        # live in this Flow's subflows, so groups are held back until the subflows are written.
+        regular_node_commands = []
+        node_group_commands = []
+        for serialized_node_command in serialized_flow_commands.serialized_node_commands:
+            if serialized_node_command.is_node_group:
+                node_group_commands.append(serialized_node_command)
+            else:
+                regular_node_commands.append(serialized_node_command)
+
+        for serialized_node_command in regular_node_commands:
+            flow_context_node.body.extend(
+                self._generate_node_creation_code(
+                    serialized_node_command,
+                    codegen_state.reserve_node_index(),
+                    import_recorder,
+                    node_uuid_to_node_variable_name=codegen_state.node_uuid_to_node_variable_name,
+                    subflow_name_to_variable_name=codegen_state.subflow_name_to_variable_name,
+                )
+            )
+
+        for sub_flow_commands in serialized_flow_commands.sub_flows_commands:
+            flow_context_node.body.extend(
+                self._generate_flow_code(
+                    serialized_flow_commands=sub_flow_commands,
+                    import_recorder=import_recorder,
+                    codegen_state=codegen_state,
+                    parent_flow_creation_index=flow_creation_index,
+                )
+            )
+
+        for serialized_node_command in node_group_commands:
+            flow_context_node.body.extend(
+                self._generate_node_creation_code(
+                    serialized_node_command,
+                    codegen_state.reserve_node_index(),
+                    import_recorder,
+                    node_uuid_to_node_variable_name=codegen_state.node_uuid_to_node_variable_name,
+                    subflow_name_to_variable_name=codegen_state.subflow_name_to_variable_name,
+                )
+            )
+
+        # Connections come last, once every node in this Flow's whole subtree exists — including the
+        # groups written just above, whose proxy parameters are what boundary-crossing edges attach to.
+        # Claiming edges here, after the subflows were already written, is safe: an edge is only ever
+        # collected by the Flow holding both endpoints or one level above them (_get_connections_for_flow),
+        # so a subflow can never claim an edge that reaches a group node declared out here.
+        flow_context_node.body.extend(
+            self._generate_connections_code(
+                serialized_connections=codegen_state.take_unemitted_connections(
+                    serialized_flow_commands.serialized_connections
+                ),
+                node_uuid_to_node_variable_name=codegen_state.node_uuid_to_node_variable_name,
+                import_recorder=import_recorder,
+            )
+        )
+
+        flow_context_node.body.extend(
+            self._generate_set_parameter_value_code(
+                set_parameter_value_commands=serialized_flow_commands.set_parameter_value_commands,
+                lock_commands=serialized_flow_commands.set_lock_commands_per_node,
+                node_uuid_to_node_variable_name=codegen_state.node_uuid_to_node_variable_name,
+                unique_values_dict_name="top_level_unique_values_dict",
+                import_recorder=import_recorder,
+            )
+        )
+
+        flow_statements.append(cast("ast.stmt", flow_context_node))
+        return flow_statements
+
+    def _generate_flow_initialization_code(
+        self,
+        flow_initialization_command: CreateFlowRequest | ImportWorkflowAsReferencedSubFlowRequest | None,
+        import_recorder: ImportRecorder,
+        codegen_state: WorkflowCodegenState,
+        flow_creation_index: int,
+        parent_flow_creation_index: int | None,
+    ) -> list[ast.stmt]:
+        """Generate the statements that bring one Flow into existence.
+
+        Args:
+            flow_initialization_command: How the Flow is created, or None to reuse the current one
+            import_recorder: Import recorder for tracking imports
+            codegen_state: Variable names and counters shared across the whole file
+            flow_creation_index: Index of this Flow's own variable
+            parent_flow_creation_index: Index of the enclosing Flow's variable, or None at the top
+
+        Returns:
+            The statements that create the Flow (empty when it already exists)
+
+        Raises:
+            TypeError: If the Flow is created by a command this generator does not know how to write
+        """
+        match flow_initialization_command:
+            case CreateFlowRequest():
+                # A subflow names its parent by variable so it lands in the right spot in the tree.
+                create_flow_module = self._generate_create_flow(
+                    flow_initialization_command,
+                    import_recorder,
+                    flow_creation_index,
+                    parent_flow_creation_index=parent_flow_creation_index,
+                )
+                if flow_initialization_command.flow_name:
+                    codegen_state.subflow_name_to_variable_name[flow_initialization_command.flow_name] = (
+                        f"flow{flow_creation_index}_name"
+                    )
+                return [cast("ast.stmt", node) for node in create_flow_module.body]
+            case ImportWorkflowAsReferencedSubFlowRequest():
+                import_workflow_module = self._generate_import_workflow(
+                    flow_initialization_command, import_recorder, flow_creation_index
+                )
+                return [cast("ast.stmt", node) for node in import_workflow_module.body]
+            case None:
+                # No initialization command; the contents are rebuilt into the current context.
+                return []
+            case _:
+                # A new way of creating a Flow was added without teaching this generator to write it.
+                # This one does fail the save, unlike the skip-and-log guards elsewhere in codegen:
+                # emitting nothing writes a file whose Flow is never created, so every node inside it
+                # lands wherever the script happened to be pointing. That is a wrong graph that loads
+                # without complaint, which is worse than a save the artist knows did not happen.
+                msg = f"Attempted to save a workflow. Failed because a flow is created in a way this version cannot write out: {type(flow_initialization_command).__name__}."
+                raise TypeError(msg)
+
+    @staticmethod
+    def _flow_has_content_to_generate(serialized_flow_commands: SerializedFlowCommands) -> bool:
+        """Whether a Flow holds anything worth emitting a context block for.
+
+        Args:
+            serialized_flow_commands: Commands for the Flow being generated
+
+        Returns:
+            True if the Flow has nodes, connections, values, locks, variables, or subflows
+        """
+        return (
+            len(serialized_flow_commands.serialized_node_commands) > 0
+            or len(serialized_flow_commands.serialized_connections) > 0
+            or len(serialized_flow_commands.set_parameter_value_commands) > 0
+            or len(serialized_flow_commands.sub_flows_commands) > 0
+            or len(serialized_flow_commands.set_lock_commands_per_node) > 0
+            or len(serialized_flow_commands.serialized_variable_commands) > 0
+        )
+
+    def _generate_node_creation_code(  # noqa: C901, PLR0912
         self,
         serialized_node_command: SerializedNodeCommands,
         node_index: int,
@@ -5026,27 +5070,36 @@ class WorkflowManager(EngineScoped):
                     # Special handling for node_names_to_add - these are now UUIDs, convert to variable references
                     if field_value is create_node_request.node_names_to_add and field_value:
                         # field_value is now a list of UUIDs (converted in _serialize_package_nodes_for_local_execution)
-                        # Convert each UUID to an AST Name node referencing the generated variable
-                        node_var_ast_list = []
-                        for node_uuid in field_value:
-                            if node_uuid in node_uuid_to_node_variable_name:
-                                variable_name = node_uuid_to_node_variable_name[node_uuid]
-                                node_var_ast_list.append(ast.Name(id=variable_name, ctx=ast.Load()))
-                            else:
-                                logger.info(
-                                    "NodeGroup child UUID '%s' not found in node_uuid_to_node_variable_name. Available UUIDs: %s...",
-                                    node_uuid,
-                                    list(node_uuid_to_node_variable_name.keys())[:5],
-                                )
-                        if node_var_ast_list:
-                            create_node_request_args.append(
-                                ast.keyword(arg=field.name, value=ast.List(elts=node_var_ast_list, ctx=ast.Load()))
+                        # Convert each UUID to an AST Name node referencing the generated variable.
+                        # Every member was written by now: members live in this group's subflow, and
+                        # a Flow's groups are written after its subflows (see _generate_flow_code).
+                        # Dropping the ones we cannot name would write the group out empty, which
+                        # saves cleanly and then loads as a group the artist has to refill by hand,
+                        # so fail the save instead of quietly losing the grouping.
+                        unnamed_member_uuids = [
+                            node_uuid for node_uuid in field_value if node_uuid not in node_uuid_to_node_variable_name
+                        ]
+                        if unnamed_member_uuids:
+                            group_name = create_node_request.node_name or create_node_request.node_type
+                            logger.error(
+                                "Cannot write the members of group '%s': node(s) %s were never written to the file",
+                                group_name,
+                                ", ".join(unnamed_member_uuids),
                             )
-                        else:
-                            logger.info(
-                                "NodeGroup node_names_to_add resulted in empty variable list. Original UUIDs: %s",
-                                field_value,
+                            msg = f"Attempted to save a workflow. Failed because {len(unnamed_member_uuids)} of the {len(field_value)} nodes in the group '{group_name}' had not been written to the file yet."
+                            raise ValueError(msg)
+                        create_node_request_args.append(
+                            ast.keyword(
+                                arg=field.name,
+                                value=ast.List(
+                                    elts=[
+                                        ast.Name(id=node_uuid_to_node_variable_name[node_uuid], ctx=ast.Load())
+                                        for node_uuid in field_value
+                                    ],
+                                    ctx=ast.Load(),
+                                ),
                             )
+                        )
                     else:
                         create_node_request_args.append(
                             self._keyword_from_field_value(field.name, field_value, create_node_request)
@@ -5206,6 +5259,19 @@ class WorkflowManager(EngineScoped):
         node_uuid_to_node_variable_name: dict[SerializedNodeCommands.NodeUUID, str],
         import_recorder: ImportRecorder,
     ) -> list[ast.stmt]:
+        """Write the statements that reconnect a Flow's nodes.
+
+        Args:
+            serialized_connections: The connections this Flow is responsible for writing
+            node_uuid_to_node_variable_name: Variable name written for each node so far, file-wide
+            import_recorder: Import recorder for tracking imports
+
+        Returns:
+            The statements creating each connection
+
+        Raises:
+            ValueError: If an endpoint's node has not been written into the file yet
+        """
         # Ensure necessary imports are recorded
         import_recorder.add_from_import(
             "griptape_nodes.retained_mode.events.connection_events", "CreateConnectionRequest"
@@ -5214,7 +5280,29 @@ class WorkflowManager(EngineScoped):
         connection_asts = []
 
         for connection in serialized_connections:
-            # Match the connection's node UUID back to its variable name.
+            # Match the connection's node UUID back to its variable name. Both endpoints must already
+            # have been written, since the generated file refers to them by variable. Which Flow
+            # writes a given edge depends on the traversal (see _generate_flow_code), so say what
+            # went missing if that ever slips rather than letting a bare KeyError escape mid-save.
+            missing_endpoints = [
+                endpoint_uuid
+                for endpoint_uuid in (connection.source_node_uuid, connection.target_node_uuid)
+                if endpoint_uuid not in node_uuid_to_node_variable_name
+            ]
+            if missing_endpoints:
+                # Skip rather than raise: raising here fails the save outright, and losing one edge
+                # is a smaller harm than an artist being unable to persist their work at all. Which
+                # Flow writes a given edge depends on the traversal, so a graph shape nobody has
+                # tried yet is a likelier cause than real corruption -- _get_connections_for_flow
+                # already carries one such case (transient loop-body flows). Logged at error so it
+                # surfaces as a bug rather than passing silently.
+                logger.error(
+                    "Cannot write the connection to '%s': node(s) %s were never written to the file. "
+                    "Skipping this connection; the saved workflow will be missing it.",
+                    connection.target_parameter_name,
+                    ", ".join(missing_endpoints),
+                )
+                continue
             source_node_variable_name = node_uuid_to_node_variable_name[connection.source_node_uuid]
             target_node_variable_name = node_uuid_to_node_variable_name[connection.target_node_uuid]
 
@@ -5345,8 +5433,36 @@ class WorkflowManager(EngineScoped):
         unique_values_dict_name: str,
         import_recorder: ImportRecorder,
     ) -> list[ast.stmt]:
+        """Write the statements that restore saved parameter values and lock states.
+
+        Args:
+            set_parameter_value_commands: Value commands for the nodes of one Flow, keyed by node
+            lock_commands: Lock-state commands for those same nodes
+            node_uuid_to_node_variable_name: Variable name written for each node so far, file-wide
+            unique_values_dict_name: Name of the generated dict holding the pickled values
+            import_recorder: Import recorder for tracking imports
+
+        Returns:
+            The statements setting each value
+
+        Raises:
+            ValueError: If a node carrying values has not been written into the file yet
+        """
         parameter_value_asts = []
         for node_uuid, indirect_set_parameter_value_commands in set_parameter_value_commands.items():
+            # Values are keyed per Flow and written after that Flow's nodes and subflows, so the node
+            # is always named by now. Say which node went missing if that ever stops holding, rather
+            # than letting a bare KeyError escape halfway through writing the file.
+            if node_uuid not in node_uuid_to_node_variable_name:
+                # Skip rather than raise, for the same reason as the connection case above: this
+                # guards a traversal invariant, and failing the save means the artist cannot persist
+                # anything, which is worse than a saved file missing one node's values.
+                logger.error(
+                    "Cannot write saved values: node '%s' was never written to the file. "
+                    "Skipping its values; the saved workflow will not restore them.",
+                    node_uuid,
+                )
+                continue
             node_variable_name = node_uuid_to_node_variable_name[node_uuid]
             lock_node_command = lock_commands.get(node_uuid)
             parameter_value_asts.extend(

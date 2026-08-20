@@ -111,8 +111,23 @@ class ObjectManager(EngineScoped):
             logger.warning(details)
             return ClearAllObjectStateResultFailure(result_details=details)
 
+        # Cancel any in-flight run before tearing its bookkeeping down: the reset
+        # below makes the flow look idle, so the cancel in
+        # clear_current_workflow_data is skipped and the previous run's node tasks
+        # keep going -- billing API calls, and emitting parameter updates keyed by
+        # node name onto the same-named nodes of whatever run comes next.
+        #
+        # Best-effort: a node that refuses to cancel must not block the teardown.
+        # A driver still parked holds its FSM claim until it wakes and abandons the
+        # run; harmless here because deleting the flows drops the machine it holds.
+        if self.engine.flow_manager.check_for_existing_running_flow():
+            try:
+                await self.engine.flow_manager.cancel_flow_run()
+            except Exception as e:
+                logger.warning("Could not cancel the running workflow before clearing it. Continuing anyway: %s", e)
+
         try:
-            # Reset global execution state first to eliminate all references before deletion
+            # Eliminate all execution references before deletion
             self.engine.flow_manager.reset_global_execution_state()
         except Exception as e:
             details = f"Attempted to reset global execution state. Failed with exception: {e}"

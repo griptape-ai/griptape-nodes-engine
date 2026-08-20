@@ -274,6 +274,21 @@ class GetTopLevelFlowResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess
     flow_name: str | None
 
 
+class SerializedConnectionKey(NamedTuple):
+    """Identifies one serialized connection, so a Flow and its ancestors agree on which edge it is.
+
+    A Flow's serialized connections include every connection from the Flows beneath it, so an edge
+    crossing N nesting levels is reported N+1 times. Both halves of the round trip — rebuilding a
+    saved Flow and generating a workflow file from one — need to act on each edge exactly once, and
+    they need to agree on what "the same edge" means, hence one shared key.
+    """
+
+    source_node_uuid: SerializedNodeCommands.NodeUUID
+    source_parameter_name: str
+    target_node_uuid: SerializedNodeCommands.NodeUUID
+    target_parameter_name: str
+
+
 # A Flow's state can be serialized into a sequence of commands that the engine then runs.
 @dataclass
 class SerializedFlowCommands:
@@ -318,6 +333,19 @@ class SerializedFlowCommands:
         source_parameter_name: str
         target_node_uuid: SerializedNodeCommands.NodeUUID
         target_parameter_name: str
+
+        def key(self) -> SerializedConnectionKey:
+            """Identify this connection independently of which Flow reported it.
+
+            Returns:
+                The key naming this edge's two endpoints
+            """
+            return SerializedConnectionKey(
+                source_node_uuid=self.source_node_uuid,
+                source_parameter_name=self.source_parameter_name,
+                target_node_uuid=self.target_node_uuid,
+                target_parameter_name=self.target_parameter_name,
+            )
 
     @dataclass
     class SerializedVariableCommand:

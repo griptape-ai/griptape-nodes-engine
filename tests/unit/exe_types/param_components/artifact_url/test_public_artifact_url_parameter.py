@@ -6,6 +6,7 @@ from an upstream failure -- in addition to the original UrlArtifact / bare-strin
 paths. See griptape-ai/griptape-nodes-engine#4688.
 """
 
+import re
 from typing import Any, NamedTuple
 from unittest.mock import Mock
 
@@ -20,6 +21,10 @@ from griptape_nodes.exe_types.param_components.artifact_url.public_artifact_url_
 from tests.unit.exe_types.mocks import MockNode
 
 PUBLIC_URL = "https://cloud.example/public/artifact.png"
+DATA_URI_PNG = "data:image/png;base64,iVBORw0KGgo="
+
+# _derive_upload_filename generates uuid4().hex names for values with no usable path name.
+GENERATED_NAME = r"[0-9a-f]{32}"
 
 
 class ComponentFixture(NamedTuple):
@@ -74,6 +79,44 @@ class TestGetPublicUrlForParameter:
         # The error should name the parameter so the editor points at the real cause.
         assert "image" in str(excinfo.value)
         driver.upload_file.assert_not_called()
+
+    def test_data_uri_uploads_under_generated_filename(self, mocker: Any) -> None:
+        # A data URI has no path name; the storage key must get a generated name with a
+        # real extension (the presigned download's content type is guessed from it), not
+        # a name derived from the base64 payload.
+        component, driver = _make_component(DATA_URI_PNG)
+        read_bytes_mock = mocker.patch("griptape_nodes.files.file.File.read_bytes", return_value=b"png-bytes")
+
+        assert component.get_public_url_for_parameter() == PUBLIC_URL
+
+        read_bytes_mock.assert_called_once()
+        uploaded_path = driver.upload_file.call_args.kwargs["path"]
+        assert re.fullmatch(rf"{GENERATED_NAME}\.png", uploaded_path.name)
+        assert uploaded_path.parts[0] == "artifact_url_storage"
+        assert driver.upload_file.call_args.kwargs["file_content"] == b"png-bytes"
+        assert component.gtc_file_path == uploaded_path
+
+
+class TestDeriveUploadFilename:
+    def test_url_path_name_is_preserved(self) -> None:
+        name = PublicArtifactUrlParameter._derive_upload_filename("https://example.com/dir/a.png")
+        assert name == "a.png"
+
+    def test_local_path_name_is_preserved(self) -> None:
+        name = PublicArtifactUrlParameter._derive_upload_filename("/inputs/frame.jpeg")
+        assert name == "frame.jpeg"
+
+    def test_data_uri_gets_generated_name_with_extension(self) -> None:
+        name = PublicArtifactUrlParameter._derive_upload_filename(DATA_URI_PNG)
+        assert re.fullmatch(rf"{GENERATED_NAME}\.png", name)
+
+    def test_data_uri_with_unknown_mime_gets_extensionless_generated_name(self) -> None:
+        name = PublicArtifactUrlParameter._derive_upload_filename("data:application/x-unknown-thing;base64,AAAA")
+        assert re.fullmatch(GENERATED_NAME, name)
+
+    def test_url_with_empty_path_name_gets_generated_name(self) -> None:
+        name = PublicArtifactUrlParameter._derive_upload_filename("https://example.com/")
+        assert re.fullmatch(GENERATED_NAME, name)
 
 
 class TestGetBucketId:

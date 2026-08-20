@@ -67,6 +67,7 @@ class ParallelResolutionContext(EngineScoped):
     node_priority_queue: NodePriorityQueue
     dag_builder: DagBuilder | None
     last_resolved_node: BaseNode | None  # Track the last node that was resolved
+    generation: int  # Bumped on reset so a resuming driver can tell its run was torn down
 
     def __init__(
         self,
@@ -88,6 +89,7 @@ class ParallelResolutionContext(EngineScoped):
         self.max_nodes_in_parallel = max_nodes_in_parallel if max_nodes_in_parallel is not None else 5
         self.running_tasks_count = 0
         self.task_to_node = {}
+        self.generation = 0
 
     @property
     def node_to_reference(self) -> dict[str, DagNode]:
@@ -105,7 +107,22 @@ class ParallelResolutionContext(EngineScoped):
             raise ValueError(msg)
         return self.dag_builder.graphs
 
+    def was_reset_since(self, generation: int) -> bool:
+        """Whether this run was torn down since ``generation`` was captured.
+
+        Teardown arrives from synchronous code in another coroutine (clear-all
+        state, and through it run-from-scratch, load-with-clean-slate and library
+        reload), so nothing a driver holds -- its task map, its DAG -- is
+        guaranteed to still exist after an await. A driver captures ``generation``
+        on entry and checks this on resuming, before touching that bookkeeping
+        again.
+        """
+        return self.generation != generation
+
     def reset(self, *, cancel: bool = False) -> None:
+        # Ends the current run as far as any parked driver is concerned: it sees
+        # the bump on waking and abandons the run.
+        self.generation += 1
         self.paused = False
         if cancel:
             self.workflow_state = WorkflowState.CANCELED
@@ -116,8 +133,11 @@ class ParallelResolutionContext(EngineScoped):
         else:
             self.workflow_state = WorkflowState.NO_ERROR
             self.error_message = None
-            self.task_to_node.clear()
             self.last_resolved_node = None
+
+        # Both paths: an abandoning driver no longer drains this, and a leftover
+        # finished task would end the next run on this context before it ran.
+        self.task_to_node.clear()
 
         # Reset task counter
         self.running_tasks_count = 0
@@ -447,6 +467,7 @@ class ExecuteDagState(State):
 
     @staticmethod
     async def pop_done_states(context: ParallelResolutionContext) -> None:
+        generation = context.generation
         networks = context.networks
         handled_nodes = set()  # Track nodes we've already processed to avoid duplicates
 
@@ -480,6 +501,11 @@ class ExecuteDagState(State):
                         handled_nodes.add(node)
                         # handle_done_nodes will append control successors to the set
                         await ExecuteDagState.handle_done_nodes(context, context.node_to_reference[node], network_name)
+                        if context.was_reset_since(generation):
+                            # `networks` is a snapshot, so its graphs still name
+                            # nodes a teardown dropped from node_to_reference.
+                            ExecuteDagState._log_abandoned(context)
+                            return
 
             # After processing completions in this network, check if any remaining leaf nodes can now be queued
             remaining_leaf_nodes = [n for n in network.nodes() if network.in_degree(n) == 0]
@@ -512,6 +538,10 @@ class ExecuteDagState(State):
 
     @staticmethod
     async def on_update(context: ParallelResolutionContext) -> type[State] | None:  # noqa: C901, PLR0911, PLR0912, PLR0915
+        # See `ParallelResolutionContext.was_reset_since`. Abandoning returns None
+        # rather than a state, which avoids reviving the machine the teardown reset.
+        generation = context.generation
+
         # Check if execution is paused
         if context.paused:
             return None
@@ -564,9 +594,16 @@ class ExecuteDagState(State):
                         )
                     )
                 )
+                if context.was_reset_since(generation):
+                    ExecuteDagState._log_abandoned(context)
+                    return None
                 context.error_message = f"Parameter passthrough failed for node '{error_node_name}': {e}"
                 context.workflow_state = WorkflowState.ERRORED
                 return ErrorState
+
+            if context.was_reset_since(generation):
+                ExecuteDagState._log_abandoned(context)
+                return None
 
             # Clear all of the current output values but don't broadcast the clearing.
             # to avoid any flickering in subscribers (UI).
@@ -587,6 +624,9 @@ class ExecuteDagState(State):
                         )
                     )
                 )
+                if context.was_reset_since(generation):
+                    ExecuteDagState._log_abandoned(context)
+                    return None
                 context.error_message = msg
                 context.workflow_state = WorkflowState.ERRORED
                 return ErrorState
@@ -647,6 +687,12 @@ class ExecuteDagState(State):
         if context.task_to_node:
             done, _ = await asyncio.wait(context.task_to_node.keys(), return_when=asyncio.FIRST_COMPLETED)
 
+            if context.was_reset_since(generation):
+                # Reaping here would look up tasks the teardown already discarded,
+                # which is the crash this guard exists for.
+                ExecuteDagState._log_abandoned(context)
+                return None
+
             # Decrement counter for completed tasks
             context.running_tasks_count -= len(done)
             # New node has finished - priorities are stale
@@ -676,6 +722,9 @@ class ExecuteDagState(State):
                             )
                         )
                     )
+                    if context.was_reset_since(generation):
+                        ExecuteDagState._log_abandoned(context)
+                        return None
                     context.error_message = msg
                     context.workflow_state = WorkflowState.ERRORED
                     return ErrorState
@@ -684,10 +733,18 @@ class ExecuteDagState(State):
 
         # Once a task has finished, loop back to the top.
         await ExecuteDagState.pop_done_states(context)
+        if context.was_reset_since(generation):
+            ExecuteDagState._log_abandoned(context)
+            return None
         # Remove all nodes that are done
         if context.paused:
             return None
         return ExecuteDagState
+
+    @staticmethod
+    def _log_abandoned(context: ParallelResolutionContext) -> None:
+        """Record that a drive was dropped because its run was torn down under it."""
+        logger.debug("Abandoning resolution of flow '%s': the run was torn down.", context.flow_name)
 
 
 class ErrorState(State):
@@ -783,8 +840,10 @@ class ParallelResolutionMachine(FSM[ParallelResolutionContext]):
         # explicit CancelExecuteNodeRequest to each affected worker so its
         # aprocess task is cancelled on the worker side too. No-op for nodes
         # running locally on the orchestrator.
+        # Snapshot: dispatching suspends, and a driver waking in that window can
+        # add to node_to_reference, breaking this iteration mid-cancel.
         node_manager = self.context.engine.node_manager
-        for dag_node in self.context.node_to_reference.values():
+        for dag_node in list(self.context.node_to_reference.values()):
             await node_manager.cancel_worker_execution(dag_node.node_reference.name)
 
         # Cancel all running tasks
