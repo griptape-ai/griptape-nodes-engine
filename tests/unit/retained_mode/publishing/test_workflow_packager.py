@@ -18,6 +18,10 @@ from griptape_nodes.retained_mode.events.os_events import (
     RenameFileResultFailure,
     WriteFileResultSuccess,
 )
+from griptape_nodes.retained_mode.events.project_events import (
+    GetPathForMacroRequest,
+    GetPathForMacroResultSuccess,
+)
 from griptape_nodes.retained_mode.events.secrets_events import (
     GetAllSecretValuesRequest,
     GetAllSecretValuesResultSuccess,
@@ -25,6 +29,7 @@ from griptape_nodes.retained_mode.events.secrets_events import (
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.publishing.workflow_packager import (
     DOWNLOAD_MODELS_SCRIPT_NAME,
+    ResolvedFileReference,
     WorkflowPackager,
 )
 
@@ -157,6 +162,136 @@ class TestCollectPipInstallFlagsTransitive:
         assert "--extra-index-url=https://b.example.com" in result
 
 
+def _macro_resolution_patch(resolved_path: Path, absolute_path: Path):  # noqa: ANN202
+    """Patch handle_request so a macro reference resolves to the given pair of paths.
+
+    Mirrors ProjectManager.on_get_path_for_macro_request, whose ``resolved_path`` is the macro
+    string after substitution: absolute when a directory macro is absolute-rooted, relative
+    otherwise. Any other request returns a MagicMock, so the current-project lookup fails its
+    isinstance check and leaves the project anchor out.
+    """
+
+    def handle_request(request: object) -> object:
+        if isinstance(request, GetPathForMacroRequest):
+            return GetPathForMacroResultSuccess(
+                resolved_path=resolved_path,
+                absolute_path=absolute_path,
+                result_details="resolved",
+            )
+        return MagicMock()
+
+    return patch(
+        "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.handle_request",
+        side_effect=handle_request,
+    )
+
+
+def _workspace_patch(workspace_dir: Path):  # noqa: ANN202
+    """Patch the config manager so the workspace anchor is ``workspace_dir``."""
+    return patch(
+        "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.ConfigManager",
+        return_value=MagicMock(workspace_path=workspace_dir),
+    )
+
+
+class TestCopyStaticFilesBundleDestination:
+    """copy_static_files places a dependency where the published bundle looks for it."""
+
+    def test_bundles_file_referenced_by_absolute_macro_path(self, tmp_path: Path) -> None:
+        """A macro that substitutes to an absolute path still lands inside the bundle.
+
+        The v1 default anchors `{inputs}` on `{workflow_dir}`, so `{inputs}/image.jpg`
+        substitutes to an absolute string. Joining that onto the destination discards the
+        destination, which silently dropped every macro-referenced dependency.
+        """
+        packager = WorkflowPackager("test_workflow")
+        workspace = tmp_path / "ws"
+        source = workspace / "inputs" / "image.jpg"
+        source.parent.mkdir(parents=True)
+        source.write_text("data")
+        destination = tmp_path / "bundle"
+
+        with (
+            _macro_resolution_patch(resolved_path=source, absolute_path=source),
+            _workspace_patch(workspace),
+            patch.object(packager, "copy_file") as mock_copy_file,
+            patch.object(packager, "copy_tree") as mock_copy_tree,
+        ):
+            packager.copy_static_files([("node", "{inputs}/image.jpg")], destination, workspace)
+
+        mock_copy_file.assert_called_once_with(source, destination / "inputs" / "image.jpg")
+        mock_copy_tree.assert_not_called()
+
+    def test_bundles_file_relative_to_the_workflow_not_the_workspace(self, tmp_path: Path) -> None:
+        """A workflow in a subdirectory resolves against its own directory, not the workspace.
+
+        The bundle copies the workflow file to its root, so `{inputs}` resolves there at run
+        time. Anchoring on the workspace instead would bundle the file under `shots/inputs/`,
+        where nothing looks for it.
+        """
+        packager = WorkflowPackager("test_workflow")
+        workspace = tmp_path / "ws"
+        workflow_dir = workspace / "shots"
+        source = workflow_dir / "inputs" / "image.jpg"
+        source.parent.mkdir(parents=True)
+        source.write_text("data")
+        destination = tmp_path / "bundle"
+
+        with (
+            _macro_resolution_patch(resolved_path=source, absolute_path=source),
+            _workspace_patch(workspace),
+            patch.object(packager, "copy_file") as mock_copy_file,
+            patch.object(packager, "copy_tree") as mock_copy_tree,
+        ):
+            packager.copy_static_files([("node", "{inputs}/image.jpg")], destination, workflow_dir)
+
+        mock_copy_file.assert_called_once_with(source, destination / "inputs" / "image.jpg")
+        mock_copy_tree.assert_not_called()
+
+    def test_bundles_file_referenced_by_relative_path(self, tmp_path: Path) -> None:
+        """A reference that substitutes to a relative path keeps bundling as it did before."""
+        packager = WorkflowPackager("test_workflow")
+        workspace = tmp_path / "ws"
+        source = workspace / "inputs" / "image.jpg"
+        source.parent.mkdir(parents=True)
+        source.write_text("data")
+        destination = tmp_path / "bundle"
+
+        with (
+            _macro_resolution_patch(resolved_path=Path("inputs/image.jpg"), absolute_path=source),
+            _workspace_patch(workspace),
+            patch.object(packager, "copy_file") as mock_copy_file,
+            patch.object(packager, "copy_tree") as mock_copy_tree,
+        ):
+            packager.copy_static_files([("node", "inputs/image.jpg")], destination, workspace)
+
+        mock_copy_file.assert_called_once_with(source, destination / "inputs" / "image.jpg")
+        mock_copy_tree.assert_not_called()
+
+    def test_reports_a_file_that_resolves_outside_every_anchor(self, tmp_path: Path) -> None:
+        """A file on an external volume has no place in the bundle, and the publish says so."""
+        packager = WorkflowPackager("test_workflow")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        source = tmp_path / "external" / "image.jpg"
+        source.parent.mkdir(parents=True)
+        source.write_text("data")
+        destination = tmp_path / "bundle"
+
+        with (
+            _macro_resolution_patch(resolved_path=source, absolute_path=source),
+            _workspace_patch(workspace),
+            patch.object(packager, "copy_file") as mock_copy_file,
+            patch.object(packager, "copy_tree") as mock_copy_tree,
+            patch.object(packager, "emit_progress") as mock_emit_progress,
+        ):
+            packager.copy_static_files([("node", "{external}/image.jpg")], destination, workspace)
+
+        mock_copy_file.assert_not_called()
+        mock_copy_tree.assert_not_called()
+        assert "{external}/image.jpg" in mock_emit_progress.call_args.args[1]
+
+
 class TestCopyStaticFiles:
     """copy_static_files handles the case where the destination resolves back onto the source."""
 
@@ -166,19 +301,20 @@ class TestCopyStaticFiles:
         source = tmp_path / "inputs" / "images" / "img.jpg"
         source.parent.mkdir(parents=True)
         source.write_text("data")
-        relative = Path("inputs/images/img.jpg")
+        resolved = ResolvedFileReference(absolute_path=source, bundle_relative_path=Path("inputs/images/img.jpg"))
 
         # destination is the project root itself, so dest == source.
         with (
-            patch.object(packager, "_resolve_file_reference", return_value=(source, relative)),
+            patch.object(packager, "_resolve_file_reference", return_value=resolved),
             patch(
                 "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.handle_request",
                 return_value=MagicMock(),
             ),
+            _workspace_patch(tmp_path),
             patch.object(packager, "copy_file") as mock_copy_file,
             patch.object(packager, "copy_tree") as mock_copy_tree,
         ):
-            packager.copy_static_files([("node", "img.jpg")], tmp_path)
+            packager.copy_static_files([("node", "img.jpg")], tmp_path, tmp_path)
 
         mock_copy_file.assert_not_called()
         mock_copy_tree.assert_not_called()
@@ -190,18 +326,20 @@ class TestCopyStaticFiles:
         source.parent.mkdir(parents=True)
         source.write_text("data")
         relative = Path("inputs/images/img.jpg")
+        resolved = ResolvedFileReference(absolute_path=source, bundle_relative_path=relative)
         destination = tmp_path / "bundle"
 
         with (
-            patch.object(packager, "_resolve_file_reference", return_value=(source, relative)),
+            patch.object(packager, "_resolve_file_reference", return_value=resolved),
             patch(
                 "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.handle_request",
                 return_value=MagicMock(),
             ),
+            _workspace_patch(tmp_path),
             patch.object(packager, "copy_file") as mock_copy_file,
             patch.object(packager, "copy_tree") as mock_copy_tree,
         ):
-            packager.copy_static_files([("node", "img.jpg")], destination)
+            packager.copy_static_files([("node", "img.jpg")], destination, tmp_path)
 
         mock_copy_file.assert_called_once_with(source, destination / relative)
         mock_copy_tree.assert_not_called()

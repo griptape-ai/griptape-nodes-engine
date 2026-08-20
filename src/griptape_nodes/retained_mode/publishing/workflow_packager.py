@@ -19,7 +19,7 @@ import uuid
 from contextlib import contextmanager
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, NoReturn
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, NoReturn
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
@@ -87,6 +87,18 @@ DOWNLOAD_MODELS_SCRIPT_NAME = "download_models.py"
 DOWNLOAD_MODELS_TEMPLATE_NAME = "download_models_script.py"
 
 # TODO: Read and write operations should all be using ReadtoFile and WriteToFile.  https://github.com/griptape-ai/griptape-nodes/issues/4397
+
+
+class ResolvedFileReference(NamedTuple):
+    """A static file reference resolved for bundling.
+
+    Attributes:
+        absolute_path: Where the file lives now, on the publishing machine.
+        bundle_relative_path: Where it belongs inside the bundle, relative to the bundle root.
+    """
+
+    absolute_path: Path
+    bundle_relative_path: Path
 
 
 class WorkflowPackager:
@@ -569,48 +581,128 @@ dependencies = [
         return results
 
     @staticmethod
-    def _resolve_file_reference(value_str: str, project_root: Path | None) -> tuple[Path, Path] | None:
-        """Resolve a file reference to (absolute_path, relative_path) or None."""
+    def _resolve_file_reference(value_str: str, anchors: list[Path]) -> ResolvedFileReference | None:
+        """Resolve a file reference to its source path and its place in the bundle, or None."""
         from griptape_nodes.common.macro_parser import ParsedMacro
 
+        absolute_path: Path | None = None
         try:
             parsed = ParsedMacro(value_str)
             resolve_result = GriptapeNodes.handle_request(GetPathForMacroRequest(parsed_macro=parsed, variables={}))
             if isinstance(resolve_result, GetPathForMacroResultSuccess):
-                return resolve_result.absolute_path, resolve_result.resolved_path
+                absolute_path = resolve_result.absolute_path
         except Exception:
             logger.debug("Macro resolution failed for %r; falling back to path resolution.", value_str, exc_info=True)
 
-        candidate = Path(value_str)
-        if candidate.is_absolute() and project_root and candidate.is_relative_to(project_root):
-            return candidate, candidate.relative_to(project_root)
+        if absolute_path is None:
+            candidate = Path(value_str)
+            if not candidate.is_absolute():
+                return None
+            absolute_path = candidate
 
-        return None
+        # Derived from absolute_path, never from GetPathForMacroResultSuccess.resolved_path.
+        # That field holds the macro string after substitution, which is absolute whenever a
+        # directory macro is absolute-rooted -- the v1 defaults anchor `inputs` and `outputs`
+        # on `{workflow_dir}`. Joining an absolute path onto the bundle destination discards
+        # the destination, so every macro-referenced dependency silently missed the bundle.
+        bundle_relative_path = WorkflowPackager._bundle_relative_path(absolute_path, anchors)
+        if bundle_relative_path is None:
+            return None
 
-    def copy_static_files(self, file_param_values: list[tuple[str, str]], destination: Path) -> None:
-        """Resolve file references and copy them to the destination."""
-        copied: set[Path] = set()
+        return ResolvedFileReference(absolute_path=absolute_path, bundle_relative_path=bundle_relative_path)
+
+    @staticmethod
+    def _bundle_relative_path(absolute_path: Path, anchors: list[Path]) -> Path | None:
+        """Locate a file under the anchor that becomes the bundle root, or None if under none.
+
+        Publishing collapses every anchor a reference can be rooted at onto one directory: the
+        workflow file is copied to the bundle root, ``project.yml`` is written beside it, and
+        the bundle's config points ``workspace_directory`` at the same place. Stripping the
+        anchor a file sits under therefore reproduces the path the bundle's own macro
+        resolution looks for when the published workflow runs.
+
+        The longest matching anchor wins, so a workflow saved in a subdirectory of the
+        workspace resolves against its own directory rather than the workspace root.
+
+        A file under no anchor at all has nowhere to live in the bundle -- an external volume
+        or network mount resolves to the same absolute path wherever the bundle runs, so there
+        is no bundle-relative location to copy it to.
+        """
+        canonical_path = canonicalize_for_identity(absolute_path)
+
+        best_relative_path: Path | None = None
+        best_anchor_depth = -1
+        for anchor in anchors:
+            canonical_anchor = canonicalize_for_identity(anchor)
+            if not canonical_path.is_relative_to(canonical_anchor):
+                continue
+            anchor_depth = len(canonical_anchor.parts)
+            if anchor_depth > best_anchor_depth:
+                best_anchor_depth = anchor_depth
+                best_relative_path = canonical_path.relative_to(canonical_anchor)
+
+        return best_relative_path
+
+    @staticmethod
+    def _publish_anchors(workflow_dir: Path) -> list[Path]:
+        """Collect the directories a static file reference can be rooted at.
+
+        The workflow directory, the workspace, and the project base directory all become the
+        bundle root once published, so a file under any of them has a place in the bundle. An
+        anchor that cannot be determined is simply absent.
+        """
+        anchors = [workflow_dir, GriptapeNodes.ConfigManager().workspace_path]
 
         project_result = GriptapeNodes.handle_request(GetCurrentProjectRequest())
-        project_root: Path | None = None
         if isinstance(project_result, GetCurrentProjectResultSuccess):
-            project_root = project_result.project_info.project_base_dir
+            anchors.append(project_result.project_info.project_base_dir)
+
+        return anchors
+
+    def copy_static_files(
+        self, file_param_values: list[tuple[str, str]], destination: Path, workflow_dir: Path
+    ) -> None:
+        """Resolve file references and copy them to the destination.
+
+        Args:
+            file_param_values: (node_name, file_reference) pairs to bundle.
+            destination: The bundle directory to copy into.
+            workflow_dir: Directory holding the workflow being packaged. Taken from the
+                workflow rather than the live ``{workflow_dir}`` context so the anchor a
+                reference is resolved against is the one being published.
+        """
+        copied: set[Path] = set()
+        anchors = self._publish_anchors(workflow_dir)
+        unbundled: list[str] = []
 
         for node_name, value_str in file_param_values:
-            resolved = self._resolve_file_reference(value_str, project_root)
+            resolved = self._resolve_file_reference(value_str, anchors)
             if resolved is None:
-                msg = f"Couldn't resolve file reference for {node_name}. It will not be bundled."
-                logger.warning(msg)
+                unbundled.append(value_str)
+                logger.warning(
+                    "File '%s' for node '%s' does not resolve to a location inside the project, "
+                    "so there is nowhere in the bundle to put it. It will not be bundled.",
+                    value_str,
+                    node_name,
+                )
                 continue
 
-            absolute_path, resolved_relative = resolved
+            absolute_path = resolved.absolute_path
 
-            if not absolute_path.exists() or absolute_path in copied:
-                msg = f"Couldn't resolve file reference for {node_name}. The absolute path does not exist. It will not be bundled."
-                logger.warning(msg)
+            if not absolute_path.exists():
+                unbundled.append(value_str)
+                logger.warning(
+                    "File '%s' for node '%s' does not exist at '%s'. It will not be bundled.",
+                    value_str,
+                    node_name,
+                    absolute_path,
+                )
                 continue
 
-            dest = destination / resolved_relative
+            if absolute_path in copied:
+                continue
+
+            dest = destination / resolved.bundle_relative_path
 
             # The destination can resolve to the same file as the source when the package
             # destination lives inside the project root (e.g. the Nuke publisher writes the
@@ -631,6 +723,12 @@ dependencies = [
 
             copied.add(absolute_path)
             logger.info("Copied static file for node '%s': %s -> %s", node_name, absolute_path, dest)
+
+        # Reported alongside the publish rather than left to the log: a dependency that
+        # missed the bundle only surfaces when the published workflow runs, far from the
+        # publish that caused it.
+        if unbundled:
+            self.emit_progress(0.0, f"{len(unbundled)} file dependencies not bundled: {', '.join(unbundled)}")
 
     # -- HuggingFace model download --
 
@@ -922,7 +1020,7 @@ dependencies = [
         all_nodes = self.collect_all_nodes()
         file_refs = self.gather_static_file_references(all_nodes)
         if file_refs:
-            self.copy_static_files(file_refs, destination)
+            self.copy_static_files(file_refs, destination, Path(full_path).parent)
 
         # Write HuggingFace model download script if needed
         self.emit_progress(3.0, "Checking for HuggingFace model dependencies...")
