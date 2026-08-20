@@ -1285,3 +1285,132 @@ class SetVariableSubstitutionEnabledResultNotAlteredSuccess(WorkflowNotAlteredMi
 @PayloadRegistry.register
 class SetVariableSubstitutionEnabledResultFailure(ResultPayloadFailure):
     """Variable substitution flag update failed. Common cause: no active workflow context."""
+
+
+@dataclass
+@PayloadRegistry.register
+class OpenSubflowNodeCanvasRequest(RequestPayload):
+    """Open a SubflowNode's inner canvas, creating the child flow if it does not exist yet.
+
+    Use when: The user clicks the "enter subflow" link icon on a SubflowNode. The engine
+    creates the child flow under the correct parent flow on first access and returns its
+    name so the editor can navigate to the inner canvas tab.
+
+    Args:
+        node_name: Name of the SubflowNode whose inner canvas to open.
+
+    Results: OpenSubflowNodeCanvasResultSuccess | OpenSubflowNodeCanvasResultFailure
+    """
+
+    node_name: str
+
+
+@dataclass
+@PayloadRegistry.register
+class OpenSubflowNodeCanvasResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
+    """SubflowNode inner canvas opened successfully.
+
+    Args:
+        child_flow_name: Engine name of the child flow to navigate to.
+        created: True when the child flow was created by this request; False when it already existed.
+    """
+
+    child_flow_name: str
+    created: bool
+
+
+@dataclass
+@PayloadRegistry.register
+class OpenSubflowNodeCanvasResultFailure(ResultPayloadFailure):
+    """SubflowNode inner canvas could not be opened.
+
+    Common causes: node not found, node is not a SubflowNode, child flow creation failed.
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class SyncSubflowNodeSurfaceRequest(RequestPayload):
+    """Sync a SubflowNode's surface parameters from its child flow's Start and End Flow nodes.
+
+    Use when: The user has added or removed parameters on Start/End nodes inside a SubflowNode's
+    inner canvas and the collapsed node's visible surface should be updated to match.
+
+    Args:
+        node_name: Name of the SubflowNode to sync.
+
+    Results: SyncSubflowNodeSurfaceResultSuccess | SyncSubflowNodeSurfaceResultFailure
+    """
+
+    node_name: str
+
+
+@dataclass
+@PayloadRegistry.register
+class SyncSubflowNodeSurfaceResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
+    """SubflowNode surface synced successfully.
+
+    Args:
+        added_params: Names of parameters added to the node's surface.
+        removed_params: Names of parameters removed from the node's surface.
+    """
+
+    added_params: list[str]
+    removed_params: list[str]
+
+
+@dataclass
+@PayloadRegistry.register
+class SyncSubflowNodeSurfaceResultFailure(ResultPayloadFailure):
+    """SubflowNode surface sync failed.
+
+    Common causes: node not found, node is not a SubflowNode, child flow not found,
+    no Start or End Flow nodes in the inner canvas.
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class ExportSubflowNodeRequest(RequestPayload):
+    """Export a SubflowNode's inner canvas as a portable workflow package.
+
+    Serializes the child flow to a .py file with a TOML metadata header (including the
+    workflow_shape), and writes or updates a griptape_nodes_library.json alongside it.
+    The resulting folder is self-contained: copy it into any workspace's library path and
+    register the library JSON to make the exported node type available.
+
+    Args:
+        node_name: Name of the SubflowNode to export.
+        destination_folder: Absolute path to the folder to write the package into.
+        node_type_name: Name for the exported node type. Defaults to the node's name when None.
+
+    Results: ExportSubflowNodeResultSuccess | ExportSubflowNodeResultFailure
+    """
+
+    node_name: str
+    destination_folder: str
+    node_type_name: str | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class ExportSubflowNodeResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """SubflowNode exported successfully.
+
+    Args:
+        file_path: Absolute path to the written .py file.
+        library_json_path: Path to the library JSON that now references this node type.
+    """
+
+    file_path: str
+    library_json_path: str
+
+
+@dataclass
+@PayloadRegistry.register
+class ExportSubflowNodeResultFailure(ResultPayloadFailure):
+    """SubflowNode export failed.
+
+    Common causes: node not found, node is not a SubflowNode, no child flow, no Start or
+    End Flow nodes in the inner canvas, file write error.
+    """

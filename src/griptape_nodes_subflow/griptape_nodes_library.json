@@ -1,0 +1,34 @@
+{
+  "name": "Subflow Node",
+  "library_schema_version": "0.10.0",
+  "metadata": {
+    "author": "Griptape, Inc",
+    "description": "SubflowNode — inline canvas node for packaging reusable subflows",
+    "library_version": "0.1.0",
+    "engine_version": "0.95.0",
+    "tags": ["subflow", "macro"]
+  },
+  "categories": [
+    {
+      "execution_flow": {
+        "color": "border-purple-500",
+        "title": "Execution Flow",
+        "description": "Nodes for controlling workflow execution",
+        "icon": "Layers"
+      }
+    }
+  ],
+  "nodes": [
+    {
+      "class_name": "SubflowNode",
+      "file_path": "subflow_node_entry.py",
+      "metadata": {
+        "category": "execution_flow",
+        "description": "A reusable subflow node. Open its inner canvas to build a workflow, promote parameters to the surface, and export as a package.",
+        "display_name": "Subflow Node",
+        "icon": "Layers",
+        "tags": ["subflow", "macro", "workflow", "execution"]
+      }
+    }
+  ]
+}
