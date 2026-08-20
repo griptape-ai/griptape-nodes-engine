@@ -370,6 +370,8 @@ class LibraryRegistry:
     @classmethod
     def get_library(cls, name: str) -> Library:
         if name not in cls._libraries:
+            registered = list(cls._libraries.keys())
+            logger.error("Library '%s' not found. Registered libraries: %s", name, registered)
             msg = f"Library '{name}' not found"
             raise LibraryRegistryError(msg)
         return cls._libraries[name]
