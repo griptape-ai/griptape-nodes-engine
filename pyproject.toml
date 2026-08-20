@@ -176,6 +176,10 @@ ignore = [
 "src/griptape_nodes/drivers/**" = ["TID251"]
 "src/griptape_nodes/exe_types/**" = ["TID251"]
 "src/griptape_nodes/files/**" = ["TID251"]
+# resolve_situation's only callers are ProjectFileDestination.from_situation (files/**) and the
+# project output parameter components (exe_types/**) -- both still on this list themselves, so
+# situation_resolver.py has no Engine to receive until they do. Moves with them.
+"src/griptape_nodes/common/project_templates/situation_resolver.py" = ["TID251"]
 # WorkflowRegistry is still a process-global fake singleton reaching the facade for config.
 # Making it engine-owned is its own change, since it alters what node libraries import.
 "src/griptape_nodes/node_library/workflow_registry.py" = ["TID251"]
