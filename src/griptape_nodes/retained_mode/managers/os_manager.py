@@ -1361,6 +1361,10 @@ class OSManager(EngineScoped):
 
     @staticmethod
     def platform() -> str:
+        """Get `sys.platform` as-is, spellings and all ("win32", "darwin", "linux").
+
+        For a value collapsed onto the platforms we support, use `platform_name()`.
+        """
         return sys.platform
 
     @staticmethod
@@ -1380,8 +1384,9 @@ class OSManager(EngineScoped):
         """Get the platform as a `Platform` value, for anything keyed by which OS we are on.
 
         Unlike `platform()`, this collapses the `sys.platform` spellings onto the three
-        platforms we support ("win32" and "cygwin" both being Windows, say). A platform we
-        do not recognize falls back to `sys.platform`, which is always set.
+        platforms we support -- "win32" reports as "windows", "linux" and "linux2" both as
+        "linux". A platform we do not recognize falls back to `sys.platform`, which is always
+        set, so the result is never empty.
         """
         if OSManager.is_windows():
             return Platform.WINDOWS
@@ -1458,7 +1463,7 @@ class OSManager(EngineScoped):
         logger.info("Attempting to open path: %s on platform: %s", path, sys.platform)
 
         try:
-            platform_name = sys.platform
+            raw_platform = sys.platform
             if self.is_windows():
                 # Linter complains but this is the recommended way on Windows
                 # We can ignore this warning as we've validated the path
@@ -1500,7 +1505,7 @@ class OSManager(EngineScoped):
                 )
                 logger.info("Opened path on Linux: %s", path)
             else:
-                details = f"Unsupported platform: '{platform_name}'"
+                details = f"Unsupported platform: '{raw_platform}'"
                 logger.info(details)
                 return OpenAssociatedFileResultFailure(
                     failure_reason=FileIOFailureReason.IO_ERROR, result_details=details

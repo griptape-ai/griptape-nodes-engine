@@ -2288,6 +2288,5 @@ class TestPlatformName:
 
     def test_unrecognized_platform_falls_back_to_sys_platform(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Reporting something beats reporting nothing, so the result is never empty.
-        monkeypatch.setattr("griptape_nodes.retained_mode.managers.os_manager.sys.platform", "freebsd14")
         monkeypatch.setattr("griptape_nodes.files.os_utils.sys.platform", "freebsd14")
         assert OSManager.platform_name() == "freebsd14"
