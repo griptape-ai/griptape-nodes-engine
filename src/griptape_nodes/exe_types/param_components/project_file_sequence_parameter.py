@@ -13,7 +13,7 @@ from griptape_nodes.files import file_sequence, path_utils
 from griptape_nodes.retained_mode.events import os_events, project_events
 
 _FALLBACK_SEQUENCE_MACRO = (
-    "{outputs}/{node_name?:_}{file_name_base}_v{_index:03}/{file_name_base}_v{_index:03}_{entry:04}.{file_extension}"
+    "{outputs}/{node_name?:_}{file_name_base}_v{_index:03}/{file_name_base}_v{_index:03}_####.{file_extension}"
 )
 
 
@@ -135,7 +135,7 @@ def _build_sequence_destination_from_situation(
     )
     parts = path_utils.FilenameParts.from_filename(filename)
     variables: dict[str, str | int] = {
-        "file_name_base": parts.stem,
+        "file_name_base": file_sequence.strip_sequence_token(parts.stem),
         "file_extension": parts.extension,
         **extra_vars,
     }

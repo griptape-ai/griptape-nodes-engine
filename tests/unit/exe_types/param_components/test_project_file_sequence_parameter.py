@@ -34,9 +34,7 @@ class TestBuildSequenceDestinationFromSituation:
     """Tests for _build_sequence_destination_from_situation helper."""
 
     def test_uses_situation_macro(self) -> None:
-        situation_macro = (
-            "{outputs}/{node_name?:_}{file_name_base}_v{_index:03}/{file_name_base}_{entry:04}.{file_extension}"
-        )
+        situation_macro = "{outputs}/{node_name?:_}{file_name_base}_v{_index:03}/{file_name_base}_####.{file_extension}"
         sit = _make_situation(situation_macro)
         success = project_events.GetSituationResultSuccess(situation=sit, result_details="ok")
         mock_dest = mock.MagicMock(spec=file_sequence.FileSequenceDestination)
@@ -68,7 +66,7 @@ class TestBuildSequenceDestinationFromSituation:
         assert macro_path.parsed_macro.template == project_file_sequence_parameter._FALLBACK_SEQUENCE_MACRO
 
     def test_plain_filename_parsed_into_stem_and_extension(self) -> None:
-        sit = _make_situation("{outputs}/{file_name_base}_{entry:04}.{file_extension}")
+        sit = _make_situation("{outputs}/{file_name_base}_####.{file_extension}")
         success = project_events.GetSituationResultSuccess(situation=sit, result_details="ok")
         mock_dest = mock.MagicMock(spec=file_sequence.FileSequenceDestination)
 
@@ -85,7 +83,8 @@ class TestBuildSequenceDestinationFromSituation:
         assert macro_path.variables["file_extension"] == "exr"
 
     def test_hash_pattern_filename_converted_before_parsing(self) -> None:
-        sit = _make_situation("{outputs}/{file_name_base}_{entry:04}.{file_extension}")
+        """A filename that already carries a token must not duplicate the situation's own ####."""
+        sit = _make_situation("{outputs}/{file_name_base}_####.{file_extension}")
         success = project_events.GetSituationResultSuccess(situation=sit, result_details="ok")
         mock_dest = mock.MagicMock(spec=file_sequence.FileSequenceDestination)
 
@@ -99,9 +98,28 @@ class TestBuildSequenceDestinationFromSituation:
 
         macro_path = mock_build.call_args.args[0]
         assert macro_path.variables["file_extension"] == "exr"
+        assert "#" not in macro_path.variables["file_name_base"]
+        assert macro_path.variables["file_name_base"] == "frame_"
+
+    def test_plain_filename_stem_left_unmodified(self) -> None:
+        """A filename with no token of its own passes its stem through unchanged."""
+        sit = _make_situation("{outputs}/{file_name_base}_####.{file_extension}")
+        success = project_events.GetSituationResultSuccess(situation=sit, result_details="ok")
+        mock_dest = mock.MagicMock(spec=file_sequence.FileSequenceDestination)
+
+        with (
+            mock.patch(HANDLE_REQUEST_PATH, return_value=success),
+            mock.patch(BUILD_VERSIONED_PATH, return_value=mock_dest) as mock_build,
+        ):
+            project_file_sequence_parameter._build_sequence_destination_from_situation(
+                "frame.exr", "save_file_sequence"
+            )
+
+        macro_path = mock_build.call_args.args[0]
+        assert macro_path.variables["file_name_base"] == "frame"
 
     def test_extra_vars_forwarded_to_macro(self) -> None:
-        sit = _make_situation("{outputs}/{node_name}/{file_name_base}_{entry:04}.{file_extension}")
+        sit = _make_situation("{outputs}/{node_name}/{file_name_base}_####.{file_extension}")
         success = project_events.GetSituationResultSuccess(situation=sit, result_details="ok")
         mock_dest = mock.MagicMock(spec=file_sequence.FileSequenceDestination)
 
@@ -117,7 +135,7 @@ class TestBuildSequenceDestinationFromSituation:
         assert macro_path.variables["node_name"] == "MyNode"
 
     def test_situation_overwrite_policy_forwarded(self) -> None:
-        sit = _make_situation("{outputs}/{entry:04}.exr", on_collision="OVERWRITE")
+        sit = _make_situation("{outputs}/####.exr", on_collision="OVERWRITE")
         success = project_events.GetSituationResultSuccess(situation=sit, result_details="ok")
         mock_dest = mock.MagicMock(spec=file_sequence.FileSequenceDestination)
 
@@ -133,7 +151,7 @@ class TestBuildSequenceDestinationFromSituation:
         assert call_kwargs["existing_file_policy"] == os_events.ExistingFilePolicy.OVERWRITE
 
     def test_situation_create_dirs_forwarded(self) -> None:
-        sit = _make_situation("{outputs}/{entry:04}.exr", create_dirs=False)
+        sit = _make_situation("{outputs}/####.exr", create_dirs=False)
         success = project_events.GetSituationResultSuccess(situation=sit, result_details="ok")
         mock_dest = mock.MagicMock(spec=file_sequence.FileSequenceDestination)
 
@@ -162,7 +180,7 @@ class TestBuildSequenceDestinationFromSituation:
         assert call_kwargs["existing_file_policy"] == os_events.ExistingFilePolicy.OVERWRITE
 
     def test_returns_file_sequence_destination(self) -> None:
-        sit = _make_situation("{outputs}/{entry:04}.exr")
+        sit = _make_situation("{outputs}/####.exr")
         success = project_events.GetSituationResultSuccess(situation=sit, result_details="ok")
         mock_dest = mock.MagicMock(spec=file_sequence.FileSequenceDestination)
 
@@ -177,7 +195,7 @@ class TestBuildSequenceDestinationFromSituation:
         assert result is mock_dest
 
     def test_multiple_extra_vars_all_forwarded(self) -> None:
-        sit = _make_situation("{outputs}/{file_name_base}_{entry:04}.{file_extension}")
+        sit = _make_situation("{outputs}/{file_name_base}_####.{file_extension}")
         success = project_events.GetSituationResultSuccess(situation=sit, result_details="ok")
         mock_dest = mock.MagicMock(spec=file_sequence.FileSequenceDestination)
 

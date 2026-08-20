@@ -42,8 +42,8 @@ class TestBuildDirectoryDestinationFromSituation:
             )
 
         assert isinstance(dest, directory_mod.DirectoryDestination)
-        assert isinstance(dest._dir_path, project_events.MacroPath)
-        assert dest._dir_path.parsed_macro.template == "{outputs}/{node_name}/{dir_name}_v{_index:03}"
+        assert isinstance(dest._directory._dir_path, project_events.MacroPath)
+        assert dest._directory._dir_path.parsed_macro.template == "{outputs}/{node_name}/{dir_name}_v{_index:03}"
 
     def test_falls_back_to_default_macro_when_situation_not_found(self) -> None:
         failure = project_events.GetSituationResultFailure(result_details="not found")
@@ -53,8 +53,8 @@ class TestBuildDirectoryDestinationFromSituation:
                 "renders", "missing_situation"
             )
 
-        assert isinstance(dest._dir_path, project_events.MacroPath)
-        assert dest._dir_path.parsed_macro.template == project_directory_parameter._FALLBACK_DIRECTORY_MACRO
+        assert isinstance(dest._directory._dir_path, project_events.MacroPath)
+        assert dest._directory._dir_path.parsed_macro.template == project_directory_parameter._FALLBACK_DIRECTORY_MACRO
 
     def test_wires_dirname_as_macro_variable(self) -> None:
         sit = _make_situation("{outputs}/{dir_name}_v{_index:03}")
@@ -65,8 +65,8 @@ class TestBuildDirectoryDestinationFromSituation:
                 "frames", "save_output_directory"
             )
 
-        assert isinstance(dest._dir_path, project_events.MacroPath)
-        assert dest._dir_path.variables["dir_name"] == "frames"
+        assert isinstance(dest._directory._dir_path, project_events.MacroPath)
+        assert dest._directory._dir_path.variables["dir_name"] == "frames"
 
     def test_extra_vars_forwarded_to_macro(self) -> None:
         sit = _make_situation("{outputs}/{node_name}/{dir_name}_v{_index:03}")
@@ -77,8 +77,8 @@ class TestBuildDirectoryDestinationFromSituation:
                 "renders", "save_output_directory", node_name="MyNode"
             )
 
-        assert isinstance(dest._dir_path, project_events.MacroPath)
-        assert dest._dir_path.variables["node_name"] == "MyNode"
+        assert isinstance(dest._directory._dir_path, project_events.MacroPath)
+        assert dest._directory._dir_path.variables["node_name"] == "MyNode"
 
     def test_situation_overwrite_policy_maps_to_overwrite(self) -> None:
         sit = _make_situation("{outputs}/{dir_name}", on_collision="OVERWRITE")
@@ -146,10 +146,10 @@ class TestBuildDirectoryDestinationFromSituation:
                 sub_dirs="pass_1",
             )
 
-        assert isinstance(dest._dir_path, project_events.MacroPath)
-        assert dest._dir_path.variables["node_name"] == "MyNode"
-        assert dest._dir_path.variables["sub_dirs"] == "pass_1"
-        assert dest._dir_path.variables["dir_name"] == "renders"
+        assert isinstance(dest._directory._dir_path, project_events.MacroPath)
+        assert dest._directory._dir_path.variables["node_name"] == "MyNode"
+        assert dest._directory._dir_path.variables["sub_dirs"] == "pass_1"
+        assert dest._directory._dir_path.variables["dir_name"] == "renders"
 
     def test_returns_directory_destination(self) -> None:
         sit = _make_situation("{outputs}/{dir_name}")
