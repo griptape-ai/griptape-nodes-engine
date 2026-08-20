@@ -54,9 +54,11 @@ class TestEngineHeartbeatOperatingSystem:
 
     def test_reports_the_os_it_is_running_on(self, griptape_nodes: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
         # Patch the seam rather than sys.platform: this asserts the heartbeat carries whatever
-        # os_utils reported, without telling the rest of the request it is on another OS.
-        monkeypatch.setattr(os_utils, "os_display_name", lambda: "Windows")
-        result = griptape_nodes.handle_engine_heartbeat_request(EngineHeartbeatRequest(heartbeat_id="hb-win"))
+        # os_utils reported, without telling the rest of the request it is on another OS. The
+        # name is one no real platform produces, so the assertion cannot pass by coincidence
+        # on a runner that happens to be that OS.
+        monkeypatch.setattr(os_utils, "os_display_name", lambda: "SentinelOS")
+        result = griptape_nodes.handle_engine_heartbeat_request(EngineHeartbeatRequest(heartbeat_id="hb-os"))
 
         assert isinstance(result, EngineHeartbeatResultSuccess)
-        assert result.engine_os == "Windows"
+        assert result.engine_os == "SentinelOS"
