@@ -20,6 +20,8 @@ from griptape_nodes.retained_mode.events.os_events import (
     WriteFileResultSuccess,
 )
 from griptape_nodes.retained_mode.events.project_events import (
+    GetCurrentProjectRequest,
+    GetCurrentProjectResultSuccess,
     GetPathForMacroRequest,
     GetPathForMacroResultFailure,
     GetPathForMacroResultSuccess,
@@ -32,6 +34,7 @@ from griptape_nodes.retained_mode.events.secrets_events import (
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.publishing.workflow_packager import (
     DOWNLOAD_MODELS_SCRIPT_NAME,
+    WORKFLOW_DIR_MACRO,
     FileReferenceOutcome,
     ResolvedFileReference,
     WorkflowPackager,
@@ -166,17 +169,34 @@ class TestCollectPipInstallFlagsTransitive:
         assert "--extra-index-url=https://b.example.com" in result
 
 
-def _macro_resolution_patch(resolved_path: Path, absolute_path: Path):  # noqa: ANN202
-    """Patch handle_request so a macro reference resolves to the given pair of paths.
+def _macro_handler(  # noqa: ANN202
+    resolved_path: Path,
+    absolute_path: Path,
+    workflow_dir: Path | None = None,
+):
+    """Build a handle_request stub answering macro resolution for one file reference.
 
     Mirrors ProjectManager.on_get_path_for_macro_request, whose ``resolved_path`` is the macro
     string after substitution: absolute when a directory macro is absolute-rooted, relative
-    otherwise. Any other request returns a MagicMock, so the current-project lookup fails its
-    isinstance check and leaves the project anchor out.
+    otherwise. ``{workflow_dir}`` is answered separately because copy_static_files resolves it
+    on its own to locate the workflow anchor; None makes it unresolvable, as it is for a
+    workflow that has never been saved. Any other request returns a MagicMock, so the
+    current-project lookup fails its isinstance check and leaves the project anchor out.
     """
 
     def handle_request(request: object) -> object:
         if isinstance(request, GetPathForMacroRequest):
+            if request.parsed_macro.template == WORKFLOW_DIR_MACRO:
+                if workflow_dir is None:
+                    return GetPathForMacroResultFailure(
+                        failure_reason=PathResolutionFailureReason.MACRO_RESOLUTION_ERROR,
+                        result_details="no current workflow",
+                    )
+                return GetPathForMacroResultSuccess(
+                    resolved_path=workflow_dir,
+                    absolute_path=workflow_dir,
+                    result_details="resolved",
+                )
             return GetPathForMacroResultSuccess(
                 resolved_path=resolved_path,
                 absolute_path=absolute_path,
@@ -184,10 +204,24 @@ def _macro_resolution_patch(resolved_path: Path, absolute_path: Path):  # noqa: 
             )
         return MagicMock()
 
+    return handle_request
+
+
+def _handle_request_patch(handler):  # noqa: ANN001, ANN202
+    """Patch the packager's handle_request with the given stub."""
     return patch(
         "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.handle_request",
-        side_effect=handle_request,
+        side_effect=handler,
     )
+
+
+def _macro_resolution_patch(  # noqa: ANN202
+    resolved_path: Path,
+    absolute_path: Path,
+    workflow_dir: Path | None = None,
+):
+    """Patch handle_request so a macro reference resolves to the given pair of paths."""
+    return _handle_request_patch(_macro_handler(resolved_path, absolute_path, workflow_dir))
 
 
 def _workspace_patch(workspace_dir: Path):  # noqa: ANN202
@@ -216,12 +250,12 @@ class TestCopyStaticFilesBundleDestination:
         destination = tmp_path / "bundle"
 
         with (
-            _macro_resolution_patch(resolved_path=source, absolute_path=source),
+            _macro_resolution_patch(resolved_path=source, absolute_path=source, workflow_dir=workspace),
             _workspace_patch(workspace),
             patch.object(packager, "copy_file") as mock_copy_file,
             patch.object(packager, "copy_tree") as mock_copy_tree,
         ):
-            packager.copy_static_files([("node", "{inputs}/image.jpg")], destination, workspace)
+            packager.copy_static_files([("node", "{inputs}/image.jpg")], destination)
 
         mock_copy_file.assert_called_once_with(source, destination / "inputs" / "image.jpg")
         mock_copy_tree.assert_not_called()
@@ -242,12 +276,12 @@ class TestCopyStaticFilesBundleDestination:
         destination = tmp_path / "bundle"
 
         with (
-            _macro_resolution_patch(resolved_path=source, absolute_path=source),
+            _macro_resolution_patch(resolved_path=source, absolute_path=source, workflow_dir=workflow_dir),
             _workspace_patch(workspace),
             patch.object(packager, "copy_file") as mock_copy_file,
             patch.object(packager, "copy_tree") as mock_copy_tree,
         ):
-            packager.copy_static_files([("node", "{inputs}/image.jpg")], destination, workflow_dir)
+            packager.copy_static_files([("node", "{inputs}/image.jpg")], destination)
 
         mock_copy_file.assert_called_once_with(source, destination / "inputs" / "image.jpg")
         mock_copy_tree.assert_not_called()
@@ -262,15 +296,417 @@ class TestCopyStaticFilesBundleDestination:
         destination = tmp_path / "bundle"
 
         with (
-            _macro_resolution_patch(resolved_path=Path("inputs/image.jpg"), absolute_path=source),
+            _macro_resolution_patch(
+                resolved_path=Path("inputs/image.jpg"), absolute_path=source, workflow_dir=workspace
+            ),
             _workspace_patch(workspace),
             patch.object(packager, "copy_file") as mock_copy_file,
             patch.object(packager, "copy_tree") as mock_copy_tree,
         ):
-            packager.copy_static_files([("node", "inputs/image.jpg")], destination, workspace)
+            packager.copy_static_files([("node", "inputs/image.jpg")], destination)
 
         mock_copy_file.assert_called_once_with(source, destination / "inputs" / "image.jpg")
         mock_copy_tree.assert_not_called()
+
+    def test_relative_resolution_wins_over_a_deeper_anchor(self, tmp_path: Path) -> None:
+        """A workspace-relative reference keeps its own path even when a deeper anchor contains it.
+
+        A v0 project resolves `{outputs}` relative to the workspace. With the workflow saved at
+        `<ws>/outputs/render.py`, the workflow's own directory is the deepest anchor containing
+        the file, and stripping it would drop the `outputs/` segment the bundle still resolves
+        `{outputs}` to.
+        """
+        packager = WorkflowPackager("test_workflow")
+        workspace = tmp_path / "ws"
+        workflow_dir = workspace / "outputs"
+        source = workflow_dir / "plate.png"
+        source.parent.mkdir(parents=True)
+        source.write_text("data")
+        destination = tmp_path / "bundle"
+
+        with (
+            _macro_resolution_patch(
+                resolved_path=Path("outputs/plate.png"), absolute_path=source, workflow_dir=workflow_dir
+            ),
+            _workspace_patch(workspace),
+            patch.object(packager, "copy_file") as mock_copy_file,
+        ):
+            packager.copy_static_files([("node", "{outputs}/plate.png")], destination)
+
+        mock_copy_file.assert_called_once_with(source, destination / "outputs" / "plate.png")
+
+    @pytest.mark.parametrize("escaping_reference", ["../shared/image.jpg", "~/media/image.jpg"])
+    def test_does_not_write_outside_the_bundle_for_an_escaping_reference(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, escaping_reference: str
+    ) -> None:
+        """A relative reference the resolver rewrote is anchor-checked, not trusted verbatim.
+
+        `..` and `~` are both "relative" but name somewhere the bundle has no say over. Joining
+        either onto the destination writes outside the bundle, or creates a literal `~` inside
+        it, and reports the dependency as bundled either way.
+        """
+        packager = WorkflowPackager("test_workflow")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        source = tmp_path / "shared" / "image.jpg"
+        source.parent.mkdir(parents=True)
+        source.write_text("data")
+        destination = tmp_path / "bundle"
+
+        with (
+            # resolved_path keeps the raw substituted string; absolute_path is what the resolver
+            # made of it, exactly as ProjectManager returns them.
+            _macro_resolution_patch(
+                resolved_path=Path(escaping_reference), absolute_path=source, workflow_dir=workspace
+            ),
+            _workspace_patch(workspace),
+            patch.object(packager, "copy_file") as mock_copy_file,
+            caplog.at_level(logging.WARNING, logger="workflow_packager"),
+        ):
+            packager.copy_static_files([("node", escaping_reference)], destination)
+
+        mock_copy_file.assert_not_called()
+        assert "outside the folders that travel with the bundle" in caplog.text
+
+    def test_bundles_one_source_needed_at_two_destinations(self, tmp_path: Path) -> None:
+        """A file two references place differently is copied to both places.
+
+        One reference can resolve relatively and another be anchor-stripped, so the same source
+        legitimately has two homes in the bundle. Skipping by source would bundle only the first.
+        """
+        packager = WorkflowPackager("test_workflow")
+        workspace = tmp_path / "ws"
+        workflow_dir = workspace / "shots"
+        source = workflow_dir / "inputs" / "image.jpg"
+        source.parent.mkdir(parents=True)
+        source.write_text("data")
+        destination = tmp_path / "bundle"
+
+        def handle_request(request: object) -> object:
+            if isinstance(request, GetPathForMacroRequest):
+                template = request.parsed_macro.template
+                if template == WORKFLOW_DIR_MACRO:
+                    return GetPathForMacroResultSuccess(
+                        resolved_path=workflow_dir, absolute_path=workflow_dir, result_details="resolved"
+                    )
+                # The plain relative spelling stays relative through substitution; the macro
+                # spelling resolves absolutely against the workflow directory.
+                resolved = Path("shots/inputs/image.jpg") if template.startswith("shots/") else source
+                return GetPathForMacroResultSuccess(
+                    resolved_path=resolved, absolute_path=source, result_details="resolved"
+                )
+            return MagicMock()
+
+        with (
+            _handle_request_patch(handle_request),
+            _workspace_patch(workspace),
+            patch.object(packager, "copy_file") as mock_copy_file,
+        ):
+            packager.copy_static_files([("a", "shots/inputs/image.jpg"), ("b", "{inputs}/image.jpg")], destination)
+
+        destinations = {call.args[1] for call in mock_copy_file.call_args_list}
+        assert destinations == {
+            destination / "shots" / "inputs" / "image.jpg",
+            destination / "inputs" / "image.jpg",
+        }
+
+    def test_refuses_an_anchor_reference_even_when_a_shallower_anchor_exists(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A reference equal to the workflow directory is refused, not placed under the workspace.
+
+        Every anchor collapses onto the bundle root, so `{workflow_dir}` resolves there when the
+        published workflow runs and a copy under the workspace-relative name (`shots/`) is
+        somewhere nothing looks. It is also the shape that makes `copy_tree` walk a source
+        containing its own destination when the bundle is written inside that folder.
+        """
+        packager = WorkflowPackager("test_workflow")
+        workspace = tmp_path / "ws"
+        workflow_dir = workspace / "shots"
+        workflow_dir.mkdir(parents=True)
+        destination = workflow_dir / "bundle"
+
+        with (
+            _macro_resolution_patch(resolved_path=workflow_dir, absolute_path=workflow_dir, workflow_dir=workflow_dir),
+            _workspace_patch(workspace),
+            patch.object(packager, "copy_tree") as mock_copy_tree,
+            patch.object(packager, "copy_file") as mock_copy_file,
+            caplog.at_level(logging.WARNING, logger="workflow_packager"),
+        ):
+            packager.copy_static_files([("node", "{workflow_dir}")], destination)
+
+        mock_copy_tree.assert_not_called()
+        mock_copy_file.assert_not_called()
+        assert "the folder the bundle itself replaces" in caplog.text
+
+    def test_refuses_a_relatively_resolved_reference_that_is_an_anchor(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The anchor refusal holds for a reference that resolved relatively, not just absolutely.
+
+        A v0 project resolves `shots` against the workspace onto the workflow's own directory, so
+        the relative shortcut supplies the destination and would otherwise reach `copy_tree`.
+        """
+        packager = WorkflowPackager("test_workflow")
+        workspace = tmp_path / "ws"
+        workflow_dir = workspace / "shots"
+        workflow_dir.mkdir(parents=True)
+        destination = workflow_dir / "bundle"
+
+        with (
+            _macro_resolution_patch(resolved_path=Path("shots"), absolute_path=workflow_dir, workflow_dir=workflow_dir),
+            _workspace_patch(workspace),
+            patch.object(packager, "copy_tree") as mock_copy_tree,
+            caplog.at_level(logging.WARNING, logger="workflow_packager"),
+        ):
+            packager.copy_static_files([("node", "shots")], destination)
+
+        mock_copy_tree.assert_not_called()
+        assert "the folder the bundle itself replaces" in caplog.text
+
+    def test_refuses_a_directory_that_contains_the_bundle(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A referenced directory the bundle is written inside is refused, anchor or not.
+
+        `copy_tree` walks the source lazily while creating directories in it, so copying a folder
+        into a bundle nested inside that folder never terminates. `{outputs}` is no anchor, so no
+        anchor comparison can catch this one.
+        """
+        packager = WorkflowPackager("test_workflow")
+        workspace = tmp_path / "ws"
+        source = workspace / "outputs"
+        source.mkdir(parents=True)
+        destination = source / "mybundle"
+
+        with (
+            _macro_resolution_patch(resolved_path=source, absolute_path=source, workflow_dir=workspace),
+            _workspace_patch(workspace),
+            patch.object(packager, "copy_tree") as mock_copy_tree,
+            caplog.at_level(logging.WARNING, logger="workflow_packager"),
+        ):
+            packager.copy_static_files([("node", "{outputs}")], destination)
+
+        mock_copy_tree.assert_not_called()
+        assert "the bundle is being written inside it" in caplog.text
+
+    def test_reports_an_unresolvable_absolute_macro_by_its_cause(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An absolute macro with an unset variable names the variable, not a location.
+
+        The string still carries its braces, so treating it as a plain absolute path would report
+        where it "resolves to" and bury the reason.
+        """
+        packager = WorkflowPackager("test_workflow")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        destination = tmp_path / "bundle"
+
+        def handle_request(request: object) -> object:
+            if isinstance(request, GetPathForMacroRequest):
+                return GetPathForMacroResultFailure(
+                    failure_reason=PathResolutionFailureReason.MISSING_REQUIRED_VARIABLES,
+                    missing_variables={"shot"},
+                    result_details="missing shot",
+                )
+            return MagicMock()
+
+        with (
+            _handle_request_patch(handle_request),
+            _workspace_patch(workspace),
+            patch.object(packager, "copy_file") as mock_copy_file,
+            caplog.at_level(logging.WARNING, logger="workflow_packager"),
+        ):
+            packager.copy_static_files([("node", "/Volumes/plates/{shot}/bg.exr")], destination)
+
+        mock_copy_file.assert_not_called()
+        assert "missing shot" in caplog.text
+        assert "outside the folders that travel with the bundle" not in caplog.text
+
+    def test_bundles_an_absolute_path_when_the_macro_layer_cannot_resolve(self, tmp_path: Path) -> None:
+        """A variable-free absolute path still bundles when resolution fails for other reasons.
+
+        Resolution fails with no current project, but the value is a literal path, so the
+        fallback can still place it.
+        """
+        packager = WorkflowPackager("test_workflow")
+        workspace = tmp_path / "ws"
+        source = workspace / "inputs" / "image.jpg"
+        source.parent.mkdir(parents=True)
+        source.write_text("data")
+        destination = tmp_path / "bundle"
+
+        def handle_request(request: object) -> object:
+            if isinstance(request, GetPathForMacroRequest):
+                return GetPathForMacroResultFailure(
+                    failure_reason=PathResolutionFailureReason.MACRO_RESOLUTION_ERROR,
+                    result_details="no current project",
+                )
+            return MagicMock()
+
+        with (
+            _handle_request_patch(handle_request),
+            _workspace_patch(workspace),
+            patch.object(packager, "copy_file") as mock_copy_file,
+        ):
+            packager.copy_static_files([("node", str(source))], destination)
+
+        mock_copy_file.assert_called_once_with(source, destination / "inputs" / "image.jpg")
+
+    def test_bundles_a_directory_under_an_anchor(self, tmp_path: Path) -> None:
+        """A directory reference inside an anchor is copied as a tree."""
+        packager = WorkflowPackager("test_workflow")
+        workspace = tmp_path / "ws"
+        source = workspace / "inputs" / "plates"
+        source.mkdir(parents=True)
+        (source / "p.exr").write_text("data")
+        destination = tmp_path / "bundle"
+
+        with (
+            _macro_resolution_patch(resolved_path=source, absolute_path=source, workflow_dir=workspace),
+            _workspace_patch(workspace),
+            patch.object(packager, "copy_tree") as mock_copy_tree,
+            patch.object(packager, "copy_file") as mock_copy_file,
+        ):
+            packager.copy_static_files([("node", "{inputs}/plates")], destination)
+
+        mock_copy_tree.assert_called_once_with(source, destination / "inputs" / "plates")
+        mock_copy_file.assert_not_called()
+
+    def test_bundles_a_file_under_the_project_anchor(self, tmp_path: Path) -> None:
+        """A file under the project base directory but outside the workspace still bundles.
+
+        The project directory can sit above the workspace, so it is the only anchor that places
+        such a file.
+        """
+        packager = WorkflowPackager("test_workflow")
+        project_dir = tmp_path / "project"
+        workspace = project_dir / "workspace"
+        workspace.mkdir(parents=True)
+        source = project_dir / "assets" / "logo.png"
+        source.parent.mkdir(parents=True)
+        source.write_text("data")
+        destination = tmp_path / "bundle"
+
+        def handle_request(request: object) -> object:
+            if isinstance(request, GetPathForMacroRequest):
+                if request.parsed_macro.template == WORKFLOW_DIR_MACRO:
+                    return GetPathForMacroResultSuccess(
+                        resolved_path=workspace, absolute_path=workspace, result_details="resolved"
+                    )
+                return GetPathForMacroResultSuccess(
+                    resolved_path=source, absolute_path=source, result_details="resolved"
+                )
+            if isinstance(request, GetCurrentProjectRequest):
+                return GetCurrentProjectResultSuccess(
+                    project_info=MagicMock(project_base_dir=project_dir), result_details="current"
+                )
+            return MagicMock()
+
+        with (
+            _handle_request_patch(handle_request),
+            _workspace_patch(workspace),
+            patch.object(packager, "copy_file") as mock_copy_file,
+        ):
+            packager.copy_static_files([("node", "{project_dir}/assets/logo.png")], destination)
+
+        mock_copy_file.assert_called_once_with(source, destination / "assets" / "logo.png")
+
+    def test_skips_a_reference_that_is_an_anchor_itself(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        """A directory reference resolving to an anchor is not copied into the bundle root.
+
+        `relative_to` yields `.` for a path equal to its anchor, which would make the whole
+        workspace -- including the bundle being written inside it -- the thing being copied. The
+        reason given says the bundle replaces that folder, not that it lies outside the project.
+        """
+        packager = WorkflowPackager("test_workflow")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        destination = workspace / "bundle"
+
+        with (
+            _macro_resolution_patch(resolved_path=workspace, absolute_path=workspace, workflow_dir=workspace),
+            _workspace_patch(workspace),
+            patch.object(packager, "copy_file") as mock_copy_file,
+            patch.object(packager, "copy_tree") as mock_copy_tree,
+            caplog.at_level(logging.WARNING, logger="workflow_packager"),
+        ):
+            packager.copy_static_files([("node", "{workspace_dir}")], destination)
+
+        mock_copy_tree.assert_not_called()
+        mock_copy_file.assert_not_called()
+        assert "the folder the bundle itself replaces" in caplog.text
+        assert "outside the folders that travel with the bundle" not in caplog.text
+
+    def test_bundles_when_an_anchor_and_the_file_are_spelled_differently(self, tmp_path: Path) -> None:
+        """An anchor that resolved its symlinks still matches a path that did not.
+
+        ``ConfigManager.workspace_path`` resolves symlinks; a `{workflow_dir}`-derived path keeps
+        the spelling the context was entered with. A workspace reached through a symlinked parent
+        would otherwise match no anchor and drop every dependency.
+        """
+        packager = WorkflowPackager("test_workflow")
+        real_workspace = tmp_path / "real_ws"
+        (real_workspace / "inputs").mkdir(parents=True)
+        (real_workspace / "inputs" / "image.jpg").write_text("data")
+        linked_workspace = tmp_path / "linked_ws"
+        linked_workspace.symlink_to(real_workspace, target_is_directory=True)
+        source = linked_workspace / "inputs" / "image.jpg"
+        destination = tmp_path / "bundle"
+
+        with (
+            _macro_resolution_patch(resolved_path=source, absolute_path=source),
+            _workspace_patch(real_workspace),
+            patch.object(packager, "copy_file") as mock_copy_file,
+        ):
+            packager.copy_static_files([("node", "{inputs}/image.jpg")], destination)
+
+        mock_copy_file.assert_called_once_with(source, destination / "inputs" / "image.jpg")
+
+    def test_warns_when_two_files_claim_one_bundle_destination(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Two sources landing on one bundle path is reported, since one node reads the other's file."""
+        packager = WorkflowPackager("test_workflow")
+        workspace = tmp_path / "ws"
+        workflow_dir = workspace / "shots"
+        from_workspace = workspace / "inputs" / "image.jpg"
+        from_workflow = workflow_dir / "inputs" / "image.jpg"
+        for source in (from_workspace, from_workflow):
+            source.parent.mkdir(parents=True)
+            source.write_text("data")
+        destination = tmp_path / "bundle"
+
+        resolutions = {
+            "{workspace_dir}/inputs/image.jpg": from_workspace,
+            "{inputs}/image.jpg": from_workflow,
+        }
+
+        def handle_request(request: object) -> object:
+            if isinstance(request, GetPathForMacroRequest):
+                template = request.parsed_macro.template
+                if template == WORKFLOW_DIR_MACRO:
+                    return GetPathForMacroResultSuccess(
+                        resolved_path=workflow_dir, absolute_path=workflow_dir, result_details="resolved"
+                    )
+                resolved = resolutions[template]
+                return GetPathForMacroResultSuccess(
+                    resolved_path=resolved, absolute_path=resolved, result_details="resolved"
+                )
+            return MagicMock()
+
+        with (
+            _handle_request_patch(handle_request),
+            _workspace_patch(workspace),
+            patch.object(packager, "copy_file"),
+            caplog.at_level(logging.WARNING, logger="workflow_packager"),
+        ):
+            packager.copy_static_files(
+                [("a", "{workspace_dir}/inputs/image.jpg"), ("b", "{inputs}/image.jpg")], destination
+            )
+
+        assert "both belong at" in caplog.text
 
     def test_bundles_file_through_a_symlinked_project_directory(self, tmp_path: Path) -> None:
         """A media directory symlinked onto other storage still bundles.
@@ -289,12 +725,12 @@ class TestCopyStaticFilesBundleDestination:
         destination = tmp_path / "bundle"
 
         with (
-            _macro_resolution_patch(resolved_path=source, absolute_path=source),
+            _macro_resolution_patch(resolved_path=source, absolute_path=source, workflow_dir=workspace),
             _workspace_patch(workspace),
             patch.object(packager, "copy_file") as mock_copy_file,
             patch.object(packager, "copy_tree") as mock_copy_tree,
         ):
-            packager.copy_static_files([("node", "{inputs}/images/image.jpg")], destination, workspace)
+            packager.copy_static_files([("node", "{inputs}/images/image.jpg")], destination)
 
         mock_copy_file.assert_called_once_with(source, destination / "inputs" / "images" / "image.jpg")
         mock_copy_tree.assert_not_called()
@@ -312,18 +748,18 @@ class TestCopyStaticFilesBundleDestination:
         destination = tmp_path / "bundle"
 
         with (
-            _macro_resolution_patch(resolved_path=source, absolute_path=source),
+            _macro_resolution_patch(resolved_path=source, absolute_path=source, workflow_dir=workspace),
             _workspace_patch(workspace),
             patch.object(packager, "copy_file") as mock_copy_file,
             patch.object(packager, "copy_tree") as mock_copy_tree,
             caplog.at_level(logging.WARNING, logger="workflow_packager"),
         ):
-            packager.copy_static_files([("node", "{external}/image.jpg")], destination, workspace)
+            packager.copy_static_files([("node", "{external}/image.jpg")], destination)
 
         mock_copy_file.assert_not_called()
         mock_copy_tree.assert_not_called()
         assert "{external}/image.jpg" in caplog.text
-        assert "outside the project" in caplog.text
+        assert "outside the folders that travel with the bundle" in caplog.text
 
     def test_reports_an_unresolvable_macro_as_such(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
         """A macro that will not resolve is not reported as a path outside the project.
@@ -354,11 +790,11 @@ class TestCopyStaticFilesBundleDestination:
             patch.object(packager, "copy_file") as mock_copy_file,
             caplog.at_level(logging.WARNING, logger="workflow_packager"),
         ):
-            packager.copy_static_files([("node", "{inputs}/{shot_name}.jpg")], destination, workspace)
+            packager.copy_static_files([("node", "{inputs}/{shot_name}.jpg")], destination)
 
         mock_copy_file.assert_not_called()
         assert "shot_name" in caplog.text
-        assert "outside the project" not in caplog.text
+        assert "outside the folders that travel with the bundle" not in caplog.text
 
 
 class TestCopyStaticFiles:
@@ -387,7 +823,7 @@ class TestCopyStaticFiles:
             patch.object(packager, "copy_file") as mock_copy_file,
             patch.object(packager, "copy_tree") as mock_copy_tree,
         ):
-            packager.copy_static_files([("node", "img.jpg")], tmp_path, tmp_path)
+            packager.copy_static_files([("node", "img.jpg")], tmp_path)
 
         mock_copy_file.assert_not_called()
         mock_copy_tree.assert_not_called()
@@ -416,7 +852,7 @@ class TestCopyStaticFiles:
             patch.object(packager, "copy_file") as mock_copy_file,
             patch.object(packager, "copy_tree") as mock_copy_tree,
         ):
-            packager.copy_static_files([("node", "img.jpg")], destination, tmp_path)
+            packager.copy_static_files([("node", "img.jpg")], destination)
 
         mock_copy_file.assert_called_once_with(source, destination / relative)
         mock_copy_tree.assert_not_called()
