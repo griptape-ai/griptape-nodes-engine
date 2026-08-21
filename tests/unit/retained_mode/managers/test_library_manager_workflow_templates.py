@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import sys
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -13,12 +15,14 @@ from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
 from griptape_nodes.retained_mode.events.app_events import LibraryWorkflowTemplatesChanged
 from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileRequest,
+    ReloadAllLibrariesRequest,
     UnloadLibraryFromRegistryRequest,
 )
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.managers.workflow_manager import WorkflowRegistrationResult
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from pathlib import Path
 
     from griptape_nodes.retained_mode.engine import Engine
@@ -279,77 +283,181 @@ class TestUnregisterWorkflowFilesForLibrary:
 class TestRegistrationHookGating:
     """The hook in `register_library_from_file_request` must stay out of bulk library loads.
 
-    `WorkflowManager.on_load_workflow_metadata_request` waits on
-    `_libraries_loading_complete`, which `load_all_libraries_from_config` holds closed while it
-    loads each library through this handler. Registering templates from the handler during that
-    window would await an event only the enclosing loop can set, and the engine would never
-    finish starting.
+    Two reasons, and the tests below cover both. `WorkflowManager.on_load_workflow_metadata_request`
+    waits on `_libraries_loading_complete`, which `load_all_libraries_from_config` holds closed
+    while it loads each library through this handler -- registering there would await an event
+    only the enclosing loop can set. The legacy `load_libraries_request` loop leaves that event
+    alone, but registering per library there would resolve a template's library references
+    against a partially loaded set.
     """
 
-    @pytest.fixture
-    def stubbed_lifecycle(self, griptape_nodes: Engine, tmp_path: Path) -> object:
-        library_info = _library_info(tmp_path / "lib.json")
-        return patch.multiple(
-            griptape_nodes.library_manager,
-            _establish_register_library_prerequisites=AsyncMock(
-                return_value=LibraryManager.RegisterLibraryPrerequisites(
-                    library_info=library_info, file_path=library_info.library_path
-                )
-            ),
-            _progress_library_through_lifecycle=AsyncMock(return_value=None),
-            _register_workflow_files_for_library=AsyncMock(return_value=None),
+    @contextlib.contextmanager
+    def _stub_lifecycle(
+        self,
+        library_manager: LibraryManager,
+        library_info: LibraryManager.LibraryInfo,
+        register_one: AsyncMock | None = None,
+    ) -> Iterator[None]:
+        """Patch out everything before the fitness match so only the hook's gating is exercised.
+
+        Pass `register_one` to stand in for `_register_workflow_files_for_library` and assert on
+        whether it was awaited; leave it out to let the real one run.
+        """
+        prerequisites = LibraryManager.RegisterLibraryPrerequisites(
+            library_info=library_info, file_path=library_info.library_path
         )
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                patch.object(
+                    library_manager,
+                    "_establish_register_library_prerequisites",
+                    AsyncMock(return_value=prerequisites),
+                )
+            )
+            stack.enter_context(
+                patch.object(library_manager, "_progress_library_through_lifecycle", AsyncMock(return_value=None))
+            )
+            if register_one is not None:
+                stack.enter_context(patch.object(library_manager, "_register_workflow_files_for_library", register_one))
+            yield
 
     @pytest.mark.asyncio
-    async def test_registers_templates_for_a_mid_session_install(
-        self, griptape_nodes: Engine, stubbed_lifecycle: object
-    ) -> None:
+    async def test_registers_templates_for_a_mid_session_install(self, griptape_nodes: Engine, tmp_path: Path) -> None:
         library_manager = griptape_nodes.library_manager
         library_manager._libraries_loading_complete.set()
+        library_manager._bulk_library_load_in_progress = False
+        register_one = AsyncMock(return_value=None)
 
-        with stubbed_lifecycle:  # type: ignore[attr-defined]
+        with self._stub_lifecycle(library_manager, _library_info(tmp_path / "lib.json"), register_one):
             result = await library_manager.register_library_from_file_request(
                 RegisterLibraryFromFileRequest(file_path="/fake/lib.json")
             )
 
-            assert result.succeeded()
-            library_manager._register_workflow_files_for_library.assert_awaited_once()  # type: ignore[attr-defined]
+        assert result.succeeded()
+        register_one.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_skips_templates_while_libraries_are_still_loading(
-        self, griptape_nodes: Engine, stubbed_lifecycle: object
+        self, griptape_nodes: Engine, tmp_path: Path
     ) -> None:
         library_manager = griptape_nodes.library_manager
         library_manager._libraries_loading_complete.clear()
+        register_one = AsyncMock(return_value=None)
 
-        with stubbed_lifecycle:  # type: ignore[attr-defined]
+        with self._stub_lifecycle(library_manager, _library_info(tmp_path / "lib.json"), register_one):
             result = await library_manager.register_library_from_file_request(
                 RegisterLibraryFromFileRequest(file_path="/fake/lib.json")
             )
 
-            assert result.succeeded()
-            library_manager._register_workflow_files_for_library.assert_not_awaited()  # type: ignore[attr-defined]
+        assert result.succeeded()
+        register_one.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_skips_templates_during_a_bulk_load_that_leaves_the_gate_open(
+        self, griptape_nodes: Engine, tmp_path: Path
+    ) -> None:
+        """The legacy `load_libraries_request` loop does not close `_libraries_loading_complete`.
+
+        Inferring "am I in a bulk load?" from that event alone would let this loop register each
+        library's templates as it went, checking them against a partially loaded library set.
+        """
+        library_manager = griptape_nodes.library_manager
+        library_manager._libraries_loading_complete.set()
+        library_manager._bulk_library_load_in_progress = True
+        register_one = AsyncMock(return_value=None)
+
+        with self._stub_lifecycle(library_manager, _library_info(tmp_path / "lib.json"), register_one):
+            result = await library_manager.register_library_from_file_request(
+                RegisterLibraryFromFileRequest(file_path="/fake/lib.json")
+            )
+
+        assert result.succeeded()
+        register_one.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_skips_templates_for_an_unusable_library(self, griptape_nodes: Engine, tmp_path: Path) -> None:
         library_manager = griptape_nodes.library_manager
         library_manager._libraries_loading_complete.set()
+        library_manager._bulk_library_load_in_progress = False
         library_info = _library_info(tmp_path / "lib.json")
         library_info.fitness = LibraryManager.LibraryFitness.UNUSABLE
+        register_one = AsyncMock(return_value=None)
 
-        with patch.multiple(
-            library_manager,
-            _establish_register_library_prerequisites=AsyncMock(
-                return_value=LibraryManager.RegisterLibraryPrerequisites(
-                    library_info=library_info, file_path=library_info.library_path
-                )
-            ),
-            _progress_library_through_lifecycle=AsyncMock(return_value=None),
-            _register_workflow_files_for_library=AsyncMock(return_value=None),
-        ):
+        with self._stub_lifecycle(library_manager, library_info, register_one):
             result = await library_manager.register_library_from_file_request(
                 RegisterLibraryFromFileRequest(file_path="/fake/lib.json")
             )
 
-            assert not result.succeeded()
-            library_manager._register_workflow_files_for_library.assert_not_awaited()  # type: ignore[attr-defined]
+        assert not result.succeeded()
+        register_one.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_registering_with_the_gate_closed_does_not_hang(self, griptape_nodes: Engine, tmp_path: Path) -> None:
+        """Guards the hazard itself, not just the `if` that avoids it.
+
+        The real `_register_workflow_files_for_library` runs here against a library that declares
+        a template. If the gate were ever dropped, this reaches
+        `on_load_workflow_metadata_request`, which awaits the `_libraries_loading_complete` event
+        this test holds closed, and the call never returns -- so a regression shows up as a
+        timeout rather than as a silently different result.
+        """
+        library_manager = griptape_nodes.library_manager
+        library_manager._libraries_loading_complete.clear()
+        library_manager._bulk_library_load_in_progress = True
+        (tmp_path / "example.py").write_text("# /// script\n# ///\n", encoding="utf-8")
+
+        with (
+            self._stub_lifecycle(library_manager, _library_info(tmp_path / "lib.json")),
+            patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.get_library", return_value=_library(["example.py"])),
+        ):
+            result = await asyncio.wait_for(
+                library_manager.register_library_from_file_request(
+                    RegisterLibraryFromFileRequest(file_path="/fake/lib.json")
+                ),
+                timeout=10,
+            )
+
+        assert result.succeeded()
+        assert LIBRARY_NAME not in library_manager._library_to_workflow_keys
+
+
+class TestBulkRegistrationIsWiredUp:
+    """The whole no-deadlock design rests on the bulk call running after each batch load.
+
+    Without these, deleting either call site drops every library template with no failing test.
+    """
+
+    @pytest.mark.asyncio
+    async def test_reload_re_registers_templates(self, griptape_nodes: Engine) -> None:
+        register_all = AsyncMock(return_value=None)
+
+        with (
+            patch.object(griptape_nodes.library_manager, "_register_all_library_workflow_files", register_all),
+            patch.object(griptape_nodes.library_manager, "load_all_libraries_from_config", AsyncMock(return_value=[])),
+            patch.object(
+                griptape_nodes.library_manager,
+                "_maybe_start_workers_for_existing_session",
+                AsyncMock(return_value=None),
+            ),
+            patch.object(griptape_nodes.library_manager, "_await_pending_workers", AsyncMock(return_value=None)),
+        ):
+            result = await griptape_nodes.library_manager._run_reload_libraries(ReloadAllLibrariesRequest())
+
+        assert result.succeeded()
+        register_all.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_refresh_workflow_registry_re_registers_templates(self, griptape_nodes: Engine) -> None:
+        """A rescan clears the registry, so it has to put library templates back before returning."""
+        register_all = AsyncMock(return_value=None)
+
+        with (
+            patch.object(griptape_nodes.library_manager, "_register_all_library_workflow_files", register_all),
+            patch.object(
+                griptape_nodes.workflow_manager, "_process_workflows_for_registration", AsyncMock(return_value=None)
+            ),
+            patch.object(WorkflowRegistry, "clear_user_workflows"),
+        ):
+            await griptape_nodes.workflow_manager.refresh_workflow_registry(workflows_to_register=[])
+
+        register_all.assert_awaited_once()
