@@ -44,6 +44,9 @@ from griptape_nodes.retained_mode.managers.settings import (
     EXECUTION_LEASE_BALANCER_TIMEOUT_KEY,
     EXECUTION_LEASE_ENABLED_KEY,
     EXECUTION_LEASE_RENEW_INTERVAL_KEY,
+    EXECUTION_LEASE_SESSION_GRACE_KEY,
+    EXECUTION_LEASE_SESSION_LIFETIME_KEY,
+    EXECUTION_LEASE_SESSION_TIMEOUT_KEY,
     EXECUTION_LEASE_TEARDOWN_TIMEOUT_KEY,
 )
 
@@ -98,6 +101,15 @@ class ExecutionLeaseManager(EngineScoped):
     # sending its first beacon, mirroring the worker heartbeat startup grace.
     DEFAULT_BALANCER_GRACE_S: float = 600.0
 
+    # Session heartbeats cross a LAN from an artist's laptop that may be
+    # briefly busy or suspended, so the timeout tolerates several missed beats
+    # (the worker-local 15s default would be far too aggressive here).
+    DEFAULT_SESSION_TIMEOUT_S: float = 60.0
+
+    # Covers engine boot plus the artist's client connecting and sending its
+    # first heartbeat.
+    DEFAULT_SESSION_GRACE_S: float = 600.0
+
     # After asking the process to shut down gracefully, how long to wait before
     # forcing the exit -- a wedged shutdown must not leave a zombie engine
     # claiming GPU memory on a box the balancer has already given up on.
@@ -112,6 +124,10 @@ class ExecutionLeaseManager(EngineScoped):
         self._lease_id: str | None = None
         self._lease_scope: str = "workflow"
         self._acquire_pending: bool = False
+        # The lease id of the acquire currently waiting for admission, and
+        # whether a cancel has been requested for it (cancel-while-queued).
+        self._pending_lease_id: str | None = None
+        self._pending_cancelled: bool = False
         self._lease_lost: bool = False
         self._state_lock = asyncio.Lock()
 
@@ -139,6 +155,19 @@ class ExecutionLeaseManager(EngineScoped):
             engine.event_manager.add_listener_to_app_event(
                 execution_lease_events.ExecutionBalancerHeartbeatEvent, self._on_balancer_heartbeat
             )
+        self.session_lifetime_enabled: bool = config.get_config_value(
+            EXECUTION_LEASE_SESSION_LIFETIME_KEY, default=False, cast_type=bool
+        )
+        self.session_timeout_s: float = config.get_config_value(
+            EXECUTION_LEASE_SESSION_TIMEOUT_KEY,
+            default=ExecutionLeaseManager.DEFAULT_SESSION_TIMEOUT_S,
+            cast_type=float,
+        )
+        self.session_grace_s: float = config.get_config_value(
+            EXECUTION_LEASE_SESSION_GRACE_KEY,
+            default=ExecutionLeaseManager.DEFAULT_SESSION_GRACE_S,
+            cast_type=float,
+        )
         self.renew_interval_s: float = config.get_config_value(
             EXECUTION_LEASE_RENEW_INTERVAL_KEY,
             default=ExecutionLeaseManager.DEFAULT_RENEW_INTERVAL_S,
@@ -193,24 +222,7 @@ class ExecutionLeaseManager(EngineScoped):
         if not self.enabled:
             return
 
-        if self._transport is None:
-            msg = (
-                "Attempted to start execution on a managed engine. Failed because the "
-                "execution manager (load balancer) link is not connected; this engine "
-                "refuses to run unmanaged. Contact your administrator."
-            )
-            raise RuntimeError(msg)
-
-        # The balancer dials in, so "is it connected" is only observable via
-        # its beacons. Without this check an acquire would wait forever on a
-        # topic nobody is subscribed to -- fail closed with a message instead.
-        if self._balancer_last_seen == 0.0:
-            msg = (
-                "Attempted to start execution on a managed engine. Failed because no "
-                "load balancer has connected to this engine yet; this engine refuses "
-                "to run unmanaged. Contact your administrator."
-            )
-            raise RuntimeError(msg)
+        transport = self._require_admission_authority()
 
         async with self._state_lock:
             if self._acquire_pending:
@@ -223,7 +235,9 @@ class ExecutionLeaseManager(EngineScoped):
                 self._restart_watchdog()
                 return
             self._acquire_pending = True
+            self._pending_cancelled = False
             lease_id = uuid.uuid4().hex
+            self._pending_lease_id = lease_id
 
         request = execution_lease_events.AcquireExecutionLeaseRequest(
             engine_id=self._engine_id(),
@@ -232,7 +246,7 @@ class ExecutionLeaseManager(EngineScoped):
             scope=scope,
         )
         try:
-            result = await self._transport.send_request(type(request).__name__, self._payload_of(request))
+            result = await transport.send_request(type(request).__name__, self._payload_of(request))
         except asyncio.CancelledError:
             # The waiting caller gave up its place in line; tell the balancer.
             await self._send_cancel(lease_id)
@@ -246,6 +260,12 @@ class ExecutionLeaseManager(EngineScoped):
         finally:
             async with self._state_lock:
                 self._acquire_pending = False
+                self._pending_lease_id = None
+
+        async with self._state_lock:
+            acquire_was_cancelled = self._pending_cancelled
+        if acquire_was_cancelled:
+            await self._refuse_cancelled_acquire(result, lease_id)
 
         if result.get("result_type") != execution_lease_events.AcquireExecutionLeaseResultSuccess.__name__:
             msg = f"Attempted to start execution. The execution manager refused: {self._details_of(result)}"
@@ -278,6 +298,75 @@ class ExecutionLeaseManager(EngineScoped):
         async with self._state_lock:
             if self._lease_id is not None:
                 await self._release_locked("returned: execution failed to start")
+
+    async def cancel_pending_acquire(self) -> bool:
+        """Abandon this engine's waiting acquire, if one exists.
+
+        The cancel path for a run still waiting for admission: nothing is
+        running yet, so giving up its place in line IS the cancel. The blocked
+        gate call unblocks when the balancer answers the abandoned acquire;
+        the cancelled mark is the engine-side guard that refuses a grant that
+        raced the cancel (the engine does not trust the balancer to have won
+        that race).
+
+        Returns:
+            Whether a waiting acquire existed to cancel.
+        """
+        if not self.enabled:
+            return False
+        async with self._state_lock:
+            lease_id = self._pending_lease_id
+            if lease_id is None:
+                return False
+            self._pending_cancelled = True
+        await self._send_cancel(lease_id)
+        return True
+
+    def _require_admission_authority(self) -> _LeaseTransport:
+        """Fail closed unless an admission authority is reachable.
+
+        The balancer dials in, so "is it connected" is only observable via its
+        beacons. Without the beacon check an acquire would wait forever on a
+        topic nobody is subscribed to.
+
+        Returns:
+            The attached transport.
+
+        Raises:
+            RuntimeError: When no transport is attached or no balancer has
+                ever beaconed.
+        """
+        if self._transport is None:
+            msg = (
+                "Attempted to start execution on a managed engine. Failed because the "
+                "execution manager (load balancer) link is not connected; this engine "
+                "refuses to run unmanaged. Contact your administrator."
+            )
+            raise RuntimeError(msg)
+        if self._balancer_last_seen == 0.0:
+            msg = (
+                "Attempted to start execution on a managed engine. Failed because no "
+                "load balancer has connected to this engine yet; this engine refuses "
+                "to run unmanaged. Contact your administrator."
+            )
+            raise RuntimeError(msg)
+        return self._transport
+
+    async def _refuse_cancelled_acquire(self, result: dict[str, Any], lease_id: str) -> None:
+        """Refuse a start whose wait was cancelled; hand back a racing grant.
+
+        Raises:
+            RuntimeError: Always -- a cancelled wait never starts.
+        """
+        if result.get("result_type") == execution_lease_events.AcquireExecutionLeaseResultSuccess.__name__:
+            # The grant raced the cancel; hand it back rather than start a
+            # run the artist already cancelled.
+            async with self._state_lock:
+                self._lease_id = lease_id
+                self._lease_lost = False
+                await self._release_locked("returned: cancelled while waiting for admission")
+        msg = "This run was cancelled while it was waiting for its turn to run."
+        raise RuntimeError(msg)
 
     async def _run_pre_release_teardown(self) -> None:
         """Release execution-scoped memory before the lease is returned.
@@ -438,6 +527,38 @@ class ExecutionLeaseManager(EngineScoped):
                     "Load balancer heartbeat lost (%s); this engine is shutting down "
                     "(managed engines do not outlive their admission authority).",
                     f"{elapsed:.0f}s since last beacon" if last_seen else "never connected",
+                )
+                await self._terminate_process()
+                return
+
+    async def run_session_liveness_monitor(self) -> None:
+        """Self-terminate when the artist's session heartbeats stop.
+
+        The other half of a managed engine's lifetime (design section 4.5):
+        the balancer monitor watches the admission authority, this one watches
+        the artist. An engine whose artist went away has no one to serve --
+        heartbeat-driven, not idle-driven, so an open editor doing nothing
+        keeps its engine alive indefinitely, and no heartbeats means no
+        engine even mid-run (the lease releases with teardown on the way out).
+
+        Gated separately from `enabled` because it requires a client actually
+        sending SessionHeartbeatRequest on a cadence; enabling it against a
+        client that never heartbeats would kill every engine at the grace
+        deadline.
+        """
+        if not self.enabled or not self.session_lifetime_enabled:
+            return
+        await asyncio.sleep(self.session_grace_s)
+        poll_s = max(0.05, min(self.session_timeout_s / 3.0, 10.0))
+        while True:
+            await asyncio.sleep(poll_s)
+            last_seen = self.engine.session_manager.last_heartbeat_monotonic
+            elapsed = time.monotonic() - last_seen if last_seen else float("inf")
+            if elapsed > self.session_timeout_s:
+                logger.critical(
+                    "Session heartbeat lost (%s); this engine is shutting down "
+                    "(a managed engine lives only as long as its artist's session).",
+                    f"{elapsed:.0f}s since last heartbeat" if last_seen else "never received one",
                 )
                 await self._terminate_process()
                 return

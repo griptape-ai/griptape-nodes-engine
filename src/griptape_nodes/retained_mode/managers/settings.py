@@ -37,6 +37,16 @@ EXECUTION_LEASE_TEARDOWN_TIMEOUT_KEY = "execution_lease.teardown_timeout_s"
 # startup grace covers engine boot + balancer linking before enforcement.
 EXECUTION_LEASE_BALANCER_TIMEOUT_KEY = "execution_lease.balancer_heartbeat_timeout_s"
 EXECUTION_LEASE_BALANCER_GRACE_KEY = "execution_lease.balancer_startup_grace_s"
+# Session-heartbeat lifetime: a managed engine lives exactly as long as its
+# artist's session heartbeats keep arriving -- no heartbeats past the timeout,
+# no engine (its run dies with it; the lease releases with teardown on the way
+# out). Off by default until clients send SessionHeartbeatRequest on a cadence;
+# the timeout is deliberately conservative because the heartbeats cross a LAN
+# from a laptop that may be briefly busy or suspended -- a single missed beat
+# must never kill an engine.
+EXECUTION_LEASE_SESSION_LIFETIME_KEY = "execution_lease.session_lifetime_enabled"
+EXECUTION_LEASE_SESSION_TIMEOUT_KEY = "execution_lease.session_heartbeat_timeout_s"
+EXECUTION_LEASE_SESSION_GRACE_KEY = "execution_lease.session_startup_grace_s"
 DISCOVERY_MAX_DEPTH_KEY = "discovery_max_depth"
 # The `Settings.libraries_directory` field below, named here so every reader of it -- the live
 # libraries root, the provisioning preview, the offline libraries-root resolver, and the packager --
@@ -300,6 +310,79 @@ class WorkerSettings(BaseModel):
     )
 
 
+class ExecutionLeaseSettings(BaseModel):
+    """Managed execution on a shared machine (execution leases).
+
+    When enabled, this engine asks an external admission authority (the load
+    balancer) for an execution lease before starting any node or workflow run,
+    so several artists' engines on one GPU machine take turns instead of
+    fighting for memory. Defaults here must match ExecutionLeaseManager's.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Acquire an execution lease from the load balancer before starting any node or "
+            "workflow run, and refuse to run if the balancer is unreachable (fail closed). "
+            "Leave off for a standalone engine; brokered engines on a shared GPU machine "
+            "run with this on."
+        ),
+    )
+    renew_interval_s: float = Field(
+        default=30.0,
+        description="Interval in seconds between lease renewals while a run is in flight.",
+    )
+    teardown_timeout_s: float = Field(
+        default=120.0,
+        description=(
+            "Ceiling in seconds on the memory teardown that runs before a lease is released. "
+            "Generous by default -- clearing a multi-gigabyte pipeline takes real time -- but "
+            "bounded, so a wedged teardown cannot hold the admission queue forever."
+        ),
+    )
+    balancer_heartbeat_timeout_s: float = Field(
+        default=30.0,
+        description=(
+            "Seconds without a load-balancer beacon before this engine shuts itself down. "
+            "A managed engine does not outlive its admission authority: it cannot run "
+            "without one and would only hold memory."
+        ),
+    )
+    balancer_startup_grace_s: float = Field(
+        default=600.0,
+        description=(
+            "Grace period in seconds after engine start before balancer beacons are "
+            "required. Covers library loading and the balancer connecting and sending "
+            "its first beacon."
+        ),
+    )
+    session_lifetime_enabled: bool = Field(
+        default=False,
+        description=(
+            "End this engine when its artist's session heartbeats stop. Requires a client "
+            "that sends SessionHeartbeatRequest on a cadence; enabling it without one kills "
+            "the engine when the startup grace expires."
+        ),
+    )
+    session_heartbeat_timeout_s: float = Field(
+        default=60.0,
+        description=(
+            "Seconds without a session heartbeat before this engine shuts itself down. "
+            "Deliberately conservative: heartbeats cross the network from an artist's "
+            "machine that may be briefly busy or suspended, and a single missed beat "
+            "must never end a session."
+        ),
+    )
+    session_startup_grace_s: float = Field(
+        default=600.0,
+        description=(
+            "Grace period in seconds after engine start before session heartbeats are "
+            "required. Covers library loading plus the artist's client connecting and "
+            "sending its first heartbeat."
+        ),
+    )
+
+
 class AgentSettings(BaseModel):
     system_prompt: str = Field(
         default="",
@@ -446,6 +529,10 @@ class Settings(BaseModel):
     worker: WorkerSettings = Field(
         category=EXECUTION,
         default_factory=WorkerSettings,
+    )
+    execution_lease: ExecutionLeaseSettings = Field(
+        category=EXECUTION,
+        default_factory=ExecutionLeaseSettings,
     )
     storage_backend: Literal["local", "gtc"] = Field(
         category=STORAGE,

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -74,6 +75,10 @@ class SessionManager:
         self._engine_identity_manager = engine_identity_manager
         self._sessions_data = self._load_sessions_data()
         self._active_session_id = self._get_or_initialize_active_session()
+        # Monotonic timestamp of the last SessionHeartbeatRequest; 0.0 = never.
+        # Read by ExecutionLeaseManager's session liveness monitor, which ends
+        # a managed engine whose artist stopped heartbeating.
+        self.last_heartbeat_monotonic: float = 0.0
         BaseEvent._session_id = self._active_session_id
         if event_manager is not None:
             event_manager.assign_manager_to_request_type(AppStartSessionRequest, self.handle_session_start_request)
@@ -312,7 +317,8 @@ class SessionManager:
     def handle_session_heartbeat_request(self, request: SessionHeartbeatRequest) -> ResultPayload:  # noqa: ARG002
         """Handle session heartbeat requests.
 
-        Simply verifies that the session is active and responds with success.
+        Verifies that the session is active, stamps the liveness timestamp the
+        session liveness monitor watches, and responds with success.
         """
         try:
             active_session_id = self.active_session_id
@@ -321,6 +327,7 @@ class SessionManager:
                 logger.warning(details)
                 return SessionHeartbeatResultFailure(result_details=details)
 
+            self.last_heartbeat_monotonic = time.monotonic()
             details = f"Session heartbeat successful for session: {active_session_id}"
             return SessionHeartbeatResultSuccess(result_details=details)
         except Exception as err:
