@@ -159,19 +159,40 @@ These mirror the gate in `get_parameter_value`: there is only a template worth p
 
 ### Never write a resolved value into `parameter_values`
 
-Display suppression reads the template out of `parameter_values`. A caller that copies execution results back onto a node and routes them through `set_parameter_value` (or `SetParameterValueRequest`) destroys that template, and the loss is permanent rather than cosmetic: a browser refresh cannot recover it, and the next save persists the substituted string.
+Display suppression reads the template out of `parameter_values`. A caller that copies execution results back onto a node and routes them through `set_parameter_value` (or a plain `SetParameterValueRequest`) destroys that template, and the loss is permanent rather than cosmetic: a browser refresh cannot recover it, and the next save persists the substituted string.
 
-Copy-back sites guard with `BaseNode.should_preserve_stored_template()` and write to `parameter_output_values` only:
+Copy-back sites guard with `BaseNode.should_preserve_stored_template()` and confine the write to `parameter_output_values`:
 
 ```python
+# node_executor._apply_last_iteration_to_packaged_nodes — direct write
 if not target_node.should_preserve_stored_template(target_param_name, param_value):
     target_node.set_parameter_value(target_param_name, param_value)
 target_node.parameter_output_values[target_param_name] = param_value
 ```
 
-Both `should_preserve_stored_template()` and `get_display_value_for_output()` delegate to `_variable_template_to_preserve()`, so the predicate and the display value cannot drift apart. Current call sites: `_apply_last_iteration_to_packaged_nodes` (parallel-loop path) and `_apply_parameter_values_to_node` (sequential group / subflow path).
+```python
+# node_executor._apply_parameter_values_to_node — via the request handler
+is_output = target_node.should_preserve_stored_template(target_param_name, param_value)
+self.engine.node_manager.on_set_parameter_value_request(
+    SetParameterValueRequest(..., value=param_value, is_output=is_output)
+)
+```
 
-Skipping the write also skips everything `set_parameter_value` does on the way through: converters and validators, `before_value_set` / `after_value_set` hooks, container-parent recomputation for `ParameterList`/`ParameterDictionary` children, and `unresolve_future_nodes()`. Only the last matters here — the others operate on stored state that is intentionally left alone — so `_apply_parameter_values_to_node` calls `_unresolve_future_nodes_for_skipped_write()` on the skip branch to keep downstream invalidation intact. (`_apply_last_iteration_to_packaged_nodes` never invalidated downstream in the first place; it calls `set_parameter_value` directly, outside the request handler.)
+Prefer the second shape wherever a request handler is already in play. `is_output=True` makes `_set_and_pass_through_values` write to `parameter_output_values` and return early, so the handler's bookkeeping — notably `unresolve_future_nodes`, still gated on the value having actually changed — is kept instead of hand-rolled. It deliberately also skips `make_node_unresolved` on the target and the downstream property pass-through; downstream delivery is pull-based (`parallel_resolution.collect_values_from_upstream_nodes` reads `parameter_output_values`), so a node that resolves this run still sees the value. A downstream node that never resolves keeps its older `parameter_values` — acceptable, since it has just been unresolved and will recompute.
+
+#### The write guard is narrower than the display guard
+
+`get_display_value_for_output()` and `should_preserve_stored_template()` both delegate to `_variable_template_to_preserve()`, so they cannot drift in the dangerous direction — a skipped write always implies a suppressed display. But the write guard adds one more condition, `_references_a_live_variable()`, and the asymmetry is deliberate:
+
+- `contains_variable_macro` is the cheap `\{[A-Za-z_]` regex. It also matches LaTeX (`\textbf{x}`), Handlebars (`{{name}}`), CSS (`{color: red}`), and prose mentioning a dict literal.
+- For **display**, a false positive misdraws a field and a false negative is the leak this whole section exists to prevent — so bias toward suppressing, and the heuristic is the right trade.
+- For a **stored-state write**, both directions are permanent: a false negative loses the template, a false positive freezes the parameter so no group run ever updates it again. So confirm the text actually names a live variable first.
+
+`_references_a_live_variable` does **not** require the reference to have resolved to something different — a template naming a variable the user has not created yet is still their template. Where the variable dict is unavailable (substitution off, or a transient worker node with no parent flow) it falls back to trusting the heuristic.
+
+#### What skipping `set_parameter_value` costs
+
+Going around `set_parameter_value` also skips converters and validators, the `before_value_set` / `after_value_set` hooks, and container-parent recomputation for `ParameterList`/`ParameterDictionary` children. The `is_output=True` form above recovers `unresolve_future_nodes`, but **not** the hooks. That is a real, accepted gap, not a no-op: `after_value_set` is not confined to stored state — nodes in this repo use it to add/remove parameters, flip `allowed_modes` (e.g. `param_components/seed_parameter.py`), and recompute derived outputs, which is why `on_set_parameter_value_request` snapshots `parameter_output_values` around it. A node with a templated PROPERTY parameter *and* an `after_value_set` that derives state from it will not see that derivation run on group copy-back. Preserving the template takes priority; if a node needs both, the fix belongs in the node.
 
 ## Worker-side variable seeding
 

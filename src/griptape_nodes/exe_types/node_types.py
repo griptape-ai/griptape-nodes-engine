@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import StrEnum, auto
-from typing import TYPE_CHECKING, Any, Final, NamedTuple, TypeVar
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 from griptape_nodes.common.strict_mode import STRICT_MODE
 from griptape_nodes.common.strict_mode_checks import RULES
@@ -116,17 +116,17 @@ _sanctioned_mutation: ContextVar[bool] = ContextVar("_node_types_sanctioned_muta
 _in_aprocess: ContextVar[bool] = ContextVar("_node_types_in_aprocess", default=False)
 
 
-class _NoTemplateToPreserve:
-    """Type of the sentinel returned when a resolved output needs no suppression.
+class _PreservedTemplate(NamedTuple):
+    """A stored {VAR} template that must survive a resolved output value.
 
-    A dedicated type rather than a bare ``object()`` so the return annotation on
-    ``BaseNode._variable_template_to_preserve`` names it: a future caller that
-    forgets the ``is _NO_TEMPLATE_TO_PRESERVE`` check is then visible to pyright
-    instead of silently treating the sentinel as a template.
+    A one-field wrapper rather than returning the template bare: the template can
+    itself be any value, so a ``Any | <sentinel>`` return type would collapse to
+    ``Any`` and pyright would not flag a caller that forgot the sentinel check.
+    Wrapping makes ``_variable_template_to_preserve`` return ``... | None``, so
+    forgetting the check is a real type error.
     """
 
-
-_NO_TEMPLATE_TO_PRESERVE: Final = _NoTemplateToPreserve()
+    value: Any
 
 
 def _differs(raw_value: Any, output_value: Any) -> bool:
@@ -135,11 +135,15 @@ def _differs(raw_value: Any, output_value: Any) -> bool:
     ``!=`` is not guaranteed to return a bool: numpy arrays and DataFrames
     return elementwise results whose truthiness raises. A stored template is a
     str/dict/list (that is what ``contains_variable_macro`` matches), but the
-    output it is compared against can be any type a node chose to emit, and this
-    comparison sits inside ``parameter_output_values.__setitem__`` -- raising
-    here would fail the node's execution rather than merely misdraw a field.
-    Fall back to "same", which keeps the pre-existing behaviour of showing and
-    storing the real output.
+    output it is compared against can be any type a node chose to emit. Fall back
+    to "same", which keeps the pre-existing behaviour of showing and storing the
+    real output.
+
+    This does not make such outputs safe in general: the ``old_value != value``
+    comparison in ``TrackedParameterOutputValues.__setitem__`` is unguarded and
+    raises first on every write after the first. Guarding only here keeps an
+    elementwise ``__ne__`` from turning template preservation into a new failure
+    mode; it does not fix the pre-existing one.
     """
     try:
         return bool(raw_value != output_value)
@@ -1348,12 +1352,16 @@ class BaseNode(ABC):
         else:
             self.parameter_output_values[parameter_name] = value
 
-        # The write above emitted a display-suppressed AlterElementEvent. ProgressEvent
-        # carries a streamed *delta* that the UI concatenates into the same field, so
-        # emitting it would rebuild the resolved text on top of the preserved template
-        # one chunk at a time -- the same leak shape as publish_update_to_parameter.
-        # Streaming is display-only; the accumulated output value above is what
-        # downstream nodes read.
+        # ProgressEvent carries a streamed *delta* that the UI concatenates into the
+        # same field, so emitting it would rebuild the resolved text on top of the
+        # preserved template one chunk at a time -- the same leak shape as
+        # publish_update_to_parameter. Streaming is display-only; the accumulated
+        # output value above is what downstream nodes read.
+        #
+        # Suppression has to be re-checked here rather than inferred from the write
+        # above: the assignment branches emitted a display-suppressed
+        # AlterElementEvent via __setitem__, but the in-place `.append()` fallback
+        # never goes through __setitem__ and so emitted nothing at all.
         if self.should_preserve_stored_template(parameter_name, self.parameter_output_values[parameter_name]):
             return
 
@@ -1559,13 +1567,40 @@ class BaseNode(ABC):
             return text
         return VariableResolver.resolve_string(text, variables, self.name)
 
-    def _variable_template_to_preserve(self, parameter_name: str, output_value: Any) -> Any | _NoTemplateToPreserve:
+    def _references_a_live_variable(self, raw_value: Any) -> bool:
+        r"""Whether `raw_value` names a variable that currently exists.
+
+        Display suppression settles for ``contains_variable_macro``, the cheap
+        ``\\{[A-Za-z_]`` heuristic, because a false positive there only misdraws a
+        field while a false negative is the leak the guard exists to stop.
+        Declining a stored-state write is not so forgiving. The heuristic also
+        fires on LaTeX (``\\textbf{x}``), Handlebars (``{{name}}``), CSS
+        (``{color: red}``) and prose that mentions a dict literal, and declining
+        the write for one of those would freeze that parameter's stored value for
+        good -- no group run would ever update it again. So confirm against the
+        live variable set first.
+
+        Note this deliberately does NOT require the reference to have resolved to
+        something different: a template naming a variable the user has not created
+        yet is still their template and must survive.
+
+        Copy-back callers run on the orchestrator, where the variable dict is
+        available. Where it is not -- substitution off, or a node with no parent
+        flow, as transient worker nodes have -- fall back to trusting the
+        heuristic, which errs toward keeping the user's text rather than
+        overwriting it.
+        """
+        variables = VariableResolver.get_variables_if_enabled(self.name)
+        if variables is None:
+            return True
+        return any(VariableResolver.references_variable(raw_value, name) for name in variables)
+
+    def _variable_template_to_preserve(self, parameter_name: str, output_value: Any) -> _PreservedTemplate | None:
         """Return the stored {VAR} template that must survive `output_value`.
 
-        Returns the ``_NO_TEMPLATE_TO_PRESERVE`` sentinel when the resolved
-        output can be used as-is. Single source of truth for both display
-        suppression and for callers that write execution results back onto a
-        node.
+        Returns None when the resolved output can be used as-is. Single source of
+        truth for both display suppression and for callers that write execution
+        results back onto a node.
 
         The conditions mirror the substitution gate in ``get_parameter_value``:
         there is only a template worth preserving where substitution would
@@ -1575,10 +1610,10 @@ class BaseNode(ABC):
         stored value must stay writable.
         """
         if not VariableResolver.is_substitution_enabled():
-            return _NO_TEMPLATE_TO_PRESERVE
+            return None
         parameter = self.get_parameter_by_name(parameter_name)
         if parameter is None:
-            return _NO_TEMPLATE_TO_PRESERVE
+            return None
         raw_value = self.parameter_values.get(parameter_name, parameter.default_value)
         # One short-circuiting chain rather than a ladder of early returns, so the
         # cheap checks stay ordered ahead of the expensive ones. The connection
@@ -1591,19 +1626,20 @@ class BaseNode(ABC):
             and _differs(raw_value, output_value)
             and not self._param_has_incoming_connection(parameter_name)
         )
-        return raw_value if substitution_would_have_applied else _NO_TEMPLATE_TO_PRESERVE
+        return _PreservedTemplate(raw_value) if substitution_would_have_applied else None
 
     def get_display_value_for_output(self, parameter_name: str, output_value: Any) -> Any:
         """Return the UI display value for an output parameter.
 
-        For PROPERTY parameters whose stored template contains a variable macro
-        and the output differs from the template, returns the template so users
-        always see and can edit the {VAR} syntax rather than the resolved value.
+        Returns the stored template, so users always see and can edit the {VAR}
+        syntax rather than the resolved value, whenever
+        ``_variable_template_to_preserve`` finds one worth preserving (see there
+        for the full set of conditions). Otherwise returns `output_value`.
         """
         template = self._variable_template_to_preserve(parameter_name, output_value)
-        if template is _NO_TEMPLATE_TO_PRESERVE:
+        if template is None:
             return output_value
-        return template
+        return template.value
 
     def should_preserve_stored_template(self, parameter_name: str, output_value: Any) -> bool:
         """Whether writing `output_value` into stored state would destroy a {VAR} template.
@@ -1614,8 +1650,17 @@ class BaseNode(ABC):
         returns True -- doing so makes the loss permanent rather than cosmetic
         (a browser refresh cannot recover it, and a save persists the substituted
         string). Such callers should write to ``parameter_output_values`` only.
+
+        Strictly narrower than display suppression: it adds
+        ``_references_a_live_variable`` on top, because getting this wrong in
+        either direction is permanent, whereas a wrongly suppressed *display* is
+        only cosmetic. The two cannot disagree in the dangerous direction -- a
+        skipped write always implies a suppressed display.
         """
-        return self._variable_template_to_preserve(parameter_name, output_value) is not _NO_TEMPLATE_TO_PRESERVE
+        template = self._variable_template_to_preserve(parameter_name, output_value)
+        if template is None:
+            return False
+        return self._references_a_live_variable(template.value)
 
     def _report_parameter_mutation_if_in_aprocess(self, *, parameter_name: str, mutation: str) -> None:
         """Report parameter-mutation-during-aprocess when a node mutates its own params directly.

@@ -109,6 +109,27 @@ def _payloads_of_type(captured: list, payload_type: type) -> list:
     return [p for p in payloads if isinstance(p, payload_type)]
 
 
+def _capturing_gn_mock(captured: list, variables: dict, *, connected_params: set[str] | None = None) -> Any:
+    """A GN patch that captures events and makes every suppression gate explicit.
+
+    Every gate in ``_variable_template_to_preserve`` is configured here rather than
+    left to MagicMock's defaults. Leaving them implicit is how these tests used to
+    pass: ``_param_has_incoming_connection`` did ``param_name in <MagicMock>``, which
+    is False only because ``MagicMock.__contains__`` defaults to False, so any
+    refactor of that lookup would flip every assertion for the wrong reason.
+    """
+    mock_gn = MagicMock()
+    mock_gn.NodeManager.return_value.get_node_parent_flow_by_name.return_value = "test_flow"
+    mock_gn.handle_request.side_effect = lambda req: (
+        _list_variables_result(variables) if isinstance(req, ListVariablesRequest) else MagicMock()
+    )
+    incoming_index = {"mock_node": dict.fromkeys(connected_params, True)} if connected_params else {}
+    mock_gn.FlowManager.return_value.get_connections.return_value = MagicMock(incoming_index=incoming_index)
+    mock_gn.WorkflowManager.return_value.is_variable_substitution_enabled.return_value = True
+    mock_gn.EventManager.return_value.put_event.side_effect = captured.append
+    return patch(_GN_PATCH, mock_gn)
+
+
 def _run_tracked_set(
     node: MockNode,
     param_name: str,
@@ -119,28 +140,13 @@ def _run_tracked_set(
 ) -> tuple[list, TrackedParameterOutputValues]:
     """Set a value on TrackedParameterOutputValues and return (events, tracker).
 
-    When `variables` is provided, a full GN mock (substitution + event capture) is
-    used. Otherwise only EventManager is mocked (for display-suppression-only tests
-    where the values set contain no {Letter} patterns and thus bypass substitution).
+    `variables` defaults to empty, which leaves substitution enabled but with nothing
+    to substitute -- what display-suppression-only tests want, since the values they
+    set contain no resolvable {VAR} references.
     """
     tracked = TrackedParameterOutputValues(node)
     captured: list = []
-
-    if variables is not None:
-        # Build a unified mock that handles both substitution and event capture.
-        mock_gn = MagicMock()
-        mock_gn.NodeManager.return_value.get_node_parent_flow_by_name.return_value = "test_flow"
-        mock_gn.handle_request.side_effect = lambda req: (
-            _list_variables_result(variables) if isinstance(req, ListVariablesRequest) else MagicMock()
-        )
-        mock_gn.FlowManager.return_value.get_connections.return_value = MagicMock(incoming_index={})
-        mock_gn.WorkflowManager.return_value.is_variable_substitution_enabled.return_value = True
-        mock_gn.EventManager.return_value.put_event.side_effect = captured.append
-        ctx: Any = patch(_GN_PATCH, mock_gn)
-    else:
-        minimal_mock = MagicMock()
-        minimal_mock.EventManager.return_value.put_event.side_effect = captured.append
-        ctx = patch(_GN_PATCH, minimal_mock)
+    ctx = _capturing_gn_mock(captured, variables if variables is not None else {})
 
     if in_aprocess:
         with ctx, aprocess_scope():
@@ -158,12 +164,11 @@ def _run_publish_update(
     value: object,
     *,
     in_aprocess: bool,
+    variables: dict | None = None,
 ) -> list:
     """Call publish_update_to_parameter and return the captured put_event calls."""
     captured: list = []
-    minimal_mock = MagicMock()
-    minimal_mock.EventManager.return_value.put_event.side_effect = captured.append
-    ctx: Any = patch(_GN_PATCH, minimal_mock)
+    ctx = _capturing_gn_mock(captured, variables if variables is not None else {})
 
     if in_aprocess:
         with ctx, aprocess_scope():
@@ -759,6 +764,44 @@ class TestTemplatePreservationGates:
         with _mock_gn({"SHOT": "sc001"}):
             assert node.should_preserve_stored_template("text", "sc001") is True
 
+    def test_write_guard_declines_text_that_only_looks_templated(self) -> None:
+        r"""`{color: red}` matches the `\{[A-Za-z_]` heuristic but names no variable.
+
+        Display may still suppress on the heuristic -- a misdrawn field is cosmetic
+        -- but declining the stored-state write would freeze the value for good, so
+        the write guard has to be exact.
+        """
+        node = MockNode(name="mock_node")
+        node.add_parameter(_make_property_output_param("text", "body {color: red}"))
+        node.parameter_values["text"] = "body {color: red}"
+
+        with _mock_gn({"SHOT": "sc001"}):
+            assert node.should_preserve_stored_template("text", "computed") is False
+
+    def test_write_guard_preserves_template_naming_an_undefined_variable(self) -> None:
+        """A template naming a variable the user has not created yet is still theirs.
+
+        `_references_a_live_variable` is checked against the live variable set, so
+        this only holds because SHOT is defined -- see the sibling test for the
+        genuinely-unknown name.
+        """
+        node = MockNode(name="mock_node")
+        node.add_parameter(_make_property_output_param("text", "{SHOT} and {NOT_YET}"))
+        node.parameter_values["text"] = "{SHOT} and {NOT_YET}"
+
+        with _mock_gn({"SHOT": "sc001"}):
+            assert node.should_preserve_stored_template("text", "sc001 and {NOT_YET}") is True
+
+    def test_write_guard_declines_template_whose_only_variable_is_unknown(self) -> None:
+        node = MockNode(name="mock_node")
+        node.add_parameter(_make_property_output_param("text", "{NOT_A_VARIABLE}"))
+        node.parameter_values["text"] = "{NOT_A_VARIABLE}"
+
+        with _mock_gn({"SHOT": "sc001"}):
+            # Display still suppresses on the heuristic; only the write guard is exact.
+            assert node.get_display_value_for_output("text", "computed") == "{NOT_A_VARIABLE}"
+            assert node.should_preserve_stored_template("text", "computed") is False
+
     def test_incomparable_output_does_not_raise(self) -> None:
         """`!=` returning a non-bool must not propagate out of the guard.
 
@@ -822,6 +865,25 @@ class TestAppendValueToParameterDisplay:
             node.append_value_to_parameter("text", "chunk")
 
         assert [p.value for p in _payloads_of_type(captured, ProgressEvent)] == ["chunk"]
+
+    def test_no_progress_event_when_template_preserved_inside_aprocess(self) -> None:
+        """The shape that actually ships: streaming only ever happens inside aprocess.
+
+        The sibling tests run outside aprocess_scope, which real streaming never
+        does. Inside the scope __setitem__ also resolves the accumulated value, so
+        this additionally pins that the suppression survives that path.
+        """
+        node = MockNode(name="mock_node")
+        node.add_parameter(_make_property_output_param("text", "{SHOT}"))
+        node.parameter_values["text"] = "{SHOT}"
+
+        captured: list = []
+        with _capturing_gn_mock(captured, {"SHOT": "sc001"}), aprocess_scope({"SHOT": "sc001"}):
+            node.append_value_to_parameter("text", "sc0")
+            node.append_value_to_parameter("text", "01")
+
+        assert _payloads_of_type(captured, ProgressEvent) == []
+        assert node.parameter_output_values["text"] == "sc001"
 
 
 class TestVariableSubstitutionDisableToggle:

@@ -3756,26 +3756,24 @@ class NodeExecutor(EngineScoped):
             # Provide source node/parameter to bypass connection conflict validation
             # These values are coming from execution results, treat as upstream values
             if target_param.type != ParameterTypeBuiltin.CONTROL_TYPE:
-                # Skip the stored-value write when the parameter holds a {VAR} template:
-                # param_value is the resolved text, and writing it into parameter_values
-                # would destroy the template the user typed rather than merely hiding it.
-                # The output value below still carries the resolved text downstream.
-                if target_node.should_preserve_stored_template(target_param_name, param_value):
-                    # Still invalidate downstream. The request we are skipping would have
-                    # done this via unresolve_future_nodes, and without it an already
-                    # RESOLVED downstream node keeps stale inputs for template parameters
-                    # while non-template parameters on the same node invalidate normally.
-                    self._unresolve_future_nodes_for_skipped_write(target_node)
-                else:
-                    self.engine.node_manager.on_set_parameter_value_request(
-                        SetParameterValueRequest(
-                            node_name=target_node_name,
-                            parameter_name=target_param_name,
-                            value=param_value,
-                            incoming_connection_source_node_name=node.name,
-                            incoming_connection_source_parameter_name=target_param_name,
-                        )
+                # A parameter holding a {VAR} template gets the value as an *output* only.
+                # param_value is the resolved text, and letting the handler put it in
+                # parameter_values would destroy the template the user typed rather than
+                # merely hiding it. is_output=True keeps the handler's bookkeeping --
+                # notably unresolve_future_nodes, still gated on the value having actually
+                # changed -- while confining the write to parameter_output_values, which is
+                # what downstream nodes read anyway.
+                is_output = target_node.should_preserve_stored_template(target_param_name, param_value)
+                self.engine.node_manager.on_set_parameter_value_request(
+                    SetParameterValueRequest(
+                        node_name=target_node_name,
+                        parameter_name=target_param_name,
+                        value=param_value,
+                        is_output=is_output,
+                        incoming_connection_source_node_name=node.name,
+                        incoming_connection_source_parameter_name=target_param_name,
                     )
+                )
             target_node.parameter_output_values[target_param_name] = param_value
 
             logger.debug(
@@ -3783,22 +3781,6 @@ class NodeExecutor(EngineScoped):
                 target_param_name,
                 target_node_name,
                 param_value,
-            )
-
-    def _unresolve_future_nodes_for_skipped_write(self, target_node: BaseNode) -> None:
-        """Invalidate downstream nodes for a copy-back whose stored-value write was skipped.
-
-        Mirrors what ``on_set_parameter_value_request`` does after a value actually
-        changes. Failures are logged rather than raised: the copy-back has already
-        applied the output value, and losing invalidation is a stale-recompute
-        problem, not a reason to fail the run.
-        """
-        try:
-            self.engine.flow_manager.get_connections().unresolve_future_nodes(target_node)
-        except Exception:
-            logger.warning(
-                "Could not unresolve nodes downstream of '%s' after preserving its variable template",
-                target_node.name,
             )
 
     def _apply_last_iteration_to_packaged_nodes(
