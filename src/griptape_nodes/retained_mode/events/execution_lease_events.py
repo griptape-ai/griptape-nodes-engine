@@ -38,6 +38,15 @@ from griptape_nodes.retained_mode.events.base_events import (
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 
+# Transport binding for the lease protocol over websocket_direct. The engine
+# publishes its lease requests on the request topic (the balancer subscribes to
+# it on connect); the balancer publishes responses and admission-status events
+# on the response topic (the engine's correlation filter watches it). Defined
+# beside the events because the two sides must agree on them exactly as they
+# must agree on the event shapes.
+LEASE_REQUEST_TOPIC = "execution_lease/request"
+LEASE_RESPONSE_TOPIC = "execution_lease/response"
+
 
 @dataclass
 @PayloadRegistry.register
@@ -215,6 +224,58 @@ class CancelExecutionLeaseResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSu
 @PayloadRegistry.register
 class CancelExecutionLeaseResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """The lease could not be cancelled -- unknown to the balancer."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ExecutionBalancerHeartbeatEvent(AppPayload):
+    """Periodic liveness beacon from the admission authority to each engine.
+
+    Part of the wire contract: the balancer publishes this on the lease
+    response topic every few seconds per linked engine. Its absence is the
+    engine's ONLY way to observe balancer loss -- the balancer dials in, so
+    the engine holds no connection state of its own -- and a brokered engine
+    whose beacons stop past the configured timeout self-terminates (engines
+    die with their admission authority: fail closed, no orphans holding GPU
+    memory). It also lets the gate fail fast with a clear message when no
+    balancer has ever connected, instead of waiting forever on an acquire
+    nobody will answer.
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class ExecutionLeaseReleasing(AppPayload):
+    """Broadcast inside the engine just before its execution lease is returned.
+
+    ENGINE-INTERNAL, not part of the balancer wire contract above: this never
+    crosses to the admission authority. The release watchdog broadcasts it and
+    **awaits every listener to completion** before sending
+    ReleaseExecutionLeaseRequest, so anything a listener frees is genuinely
+    free before the next engine is admitted. That ordering is the event's
+    entire reason to exist -- on a shared GPU machine, serialized admission
+    buys nothing if the previous run's pipelines still occupy memory.
+
+    Libraries holding execution-scoped memory (model/pipeline caches) opt in
+    from ``after_library_nodes_loaded``::
+
+        GriptapeNodes.EventManager().add_listener_to_app_event(
+            ExecutionLeaseReleasing, self._clear_pipeline_cache
+        )
+
+    Async listeners are supported and awaited. A listener that raises does not
+    block the release (the failure is logged and release proceeds), and a
+    listener that hangs is abandoned after the configured teardown timeout --
+    a wedged teardown must not hold the admission queue forever. Libraries
+    must deregister their listener in ``before_library_unregistered``.
+
+    Args:
+        lease_id: The lease about to be returned.
+        scope: The scope string from the lease's acquire request.
+    """
+
+    lease_id: str
+    scope: str = "workflow"
 
 
 @dataclass

@@ -29,6 +29,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
+import signal
 import time
 import uuid
 from dataclasses import dataclass
@@ -38,8 +40,11 @@ from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events import execution_lease_events
 from griptape_nodes.retained_mode.events.event_converter import converter
 from griptape_nodes.retained_mode.managers.settings import (
+    EXECUTION_LEASE_BALANCER_GRACE_KEY,
+    EXECUTION_LEASE_BALANCER_TIMEOUT_KEY,
     EXECUTION_LEASE_ENABLED_KEY,
     EXECUTION_LEASE_RENEW_INTERVAL_KEY,
+    EXECUTION_LEASE_TEARDOWN_TIMEOUT_KEY,
 )
 
 if TYPE_CHECKING:
@@ -85,6 +90,19 @@ class ExecutionLeaseManager(EngineScoped):
 
     DEFAULT_RENEW_INTERVAL_S: float = 30.0
 
+    DEFAULT_TEARDOWN_TIMEOUT_S: float = 120.0
+
+    DEFAULT_BALANCER_TIMEOUT_S: float = 30.0
+
+    # Generous: covers engine boot (library load) plus the balancer linking and
+    # sending its first beacon, mirroring the worker heartbeat startup grace.
+    DEFAULT_BALANCER_GRACE_S: float = 600.0
+
+    # After asking the process to shut down gracefully, how long to wait before
+    # forcing the exit -- a wedged shutdown must not leave a zombie engine
+    # claiming GPU memory on a box the balancer has already given up on.
+    _TERMINATE_ESCALATION_S: float = 15.0
+
     def __init__(self, *, engine: Engine) -> None:
         super().__init__(engine)
         self._transport: _LeaseTransport | None = None
@@ -92,6 +110,7 @@ class ExecutionLeaseManager(EngineScoped):
         # The held lease id, or None. Guarded by _state_lock together with
         # _acquire_pending so concurrent gate calls serialize their decisions.
         self._lease_id: str | None = None
+        self._lease_scope: str = "workflow"
         self._acquire_pending: bool = False
         self._lease_lost: bool = False
         self._state_lock = asyncio.Lock()
@@ -100,11 +119,34 @@ class ExecutionLeaseManager(EngineScoped):
         # is reused for a follow-on run (queued starts draining back-to-back).
         self._watchdog_task: asyncio.Task | None = None
 
+        # Monotonic timestamp of the last balancer beacon; 0.0 = never seen.
+        # Written only by _on_balancer_heartbeat.
+        self._balancer_last_seen: float = 0.0
+
         config = engine.config_manager
         self.enabled: bool = config.get_config_value(EXECUTION_LEASE_ENABLED_KEY, default=False, cast_type=bool)
+        self.balancer_timeout_s: float = config.get_config_value(
+            EXECUTION_LEASE_BALANCER_TIMEOUT_KEY,
+            default=ExecutionLeaseManager.DEFAULT_BALANCER_TIMEOUT_S,
+            cast_type=float,
+        )
+        self.balancer_grace_s: float = config.get_config_value(
+            EXECUTION_LEASE_BALANCER_GRACE_KEY,
+            default=ExecutionLeaseManager.DEFAULT_BALANCER_GRACE_S,
+            cast_type=float,
+        )
+        if self.enabled:
+            engine.event_manager.add_listener_to_app_event(
+                execution_lease_events.ExecutionBalancerHeartbeatEvent, self._on_balancer_heartbeat
+            )
         self.renew_interval_s: float = config.get_config_value(
             EXECUTION_LEASE_RENEW_INTERVAL_KEY,
             default=ExecutionLeaseManager.DEFAULT_RENEW_INTERVAL_S,
+            cast_type=float,
+        )
+        self.teardown_timeout_s: float = config.get_config_value(
+            EXECUTION_LEASE_TEARDOWN_TIMEOUT_KEY,
+            default=ExecutionLeaseManager.DEFAULT_TEARDOWN_TIMEOUT_S,
             cast_type=float,
         )
 
@@ -159,6 +201,17 @@ class ExecutionLeaseManager(EngineScoped):
             )
             raise RuntimeError(msg)
 
+        # The balancer dials in, so "is it connected" is only observable via
+        # its beacons. Without this check an acquire would wait forever on a
+        # topic nobody is subscribed to -- fail closed with a message instead.
+        if self._balancer_last_seen == 0.0:
+            msg = (
+                "Attempted to start execution on a managed engine. Failed because no "
+                "load balancer has connected to this engine yet; this engine refuses "
+                "to run unmanaged. Contact your administrator."
+            )
+            raise RuntimeError(msg)
+
         async with self._state_lock:
             if self._acquire_pending:
                 msg = (
@@ -195,12 +248,12 @@ class ExecutionLeaseManager(EngineScoped):
                 self._acquire_pending = False
 
         if result.get("result_type") != execution_lease_events.AcquireExecutionLeaseResultSuccess.__name__:
-            details = result.get("result_details", "no reason given")
-            msg = f"Attempted to start execution. The execution manager refused: {details}"
+            msg = f"Attempted to start execution. The execution manager refused: {self._details_of(result)}"
             raise RuntimeError(msg)
 
         async with self._state_lock:
             self._lease_id = lease_id
+            self._lease_scope = scope
             self._lease_lost = False
             # A run that started while this acquire waited wins; return the
             # lease rather than piling a second run onto the engine.
@@ -230,10 +283,34 @@ class ExecutionLeaseManager(EngineScoped):
         """Release execution-scoped memory before the lease is returned.
 
         Ordering is the point: teardown happens BEFORE the release is sent, so
-        the next admitted engine starts against a reclaimed machine. The
-        teardown broadcast itself ships separately; until then this is the
-        seam it plugs into.
+        the next admitted engine starts against a reclaimed machine. Broadcasts
+        ExecutionLeaseReleasing and awaits every listener (libraries clearing
+        their pipeline caches). A failing listener is logged and release
+        proceeds; a hung one is abandoned at the teardown timeout -- either
+        way, a broken teardown must not hold the admission queue forever.
         """
+        if self._lease_id is None:
+            return
+        event = execution_lease_events.ExecutionLeaseReleasing(
+            lease_id=self._lease_id,
+            scope=self._lease_scope,
+        )
+        try:
+            await asyncio.wait_for(
+                self.engine.event_manager.abroadcast_app_event(event),
+                timeout=self.teardown_timeout_s,
+            )
+        except TimeoutError:
+            logger.error(
+                "Execution memory teardown did not finish within %.0fs; releasing the lease anyway. "
+                "The machine may still hold this run's memory.",
+                self.teardown_timeout_s,
+            )
+        except ExceptionGroup:
+            logger.exception(
+                "Execution memory teardown listener(s) failed; releasing the lease anyway. "
+                "The machine may still hold this run's memory."
+            )
 
     def _restart_watchdog(self) -> None:
         """(Re)start the release watchdog for a new run under the current lease."""
@@ -298,7 +375,7 @@ class ExecutionLeaseManager(EngineScoped):
             self._lease_lost = True
             logger.error(
                 "Execution lease was not renewed (%s); this engine no longer holds admission.",
-                result.get("result_details", "no reason given"),
+                self._details_of(result),
             )
 
     async def _release_locked(self, reason: str) -> None:
@@ -319,7 +396,7 @@ class ExecutionLeaseManager(EngineScoped):
             return
         if result.get("result_type") != execution_lease_events.ReleaseExecutionLeaseResultSuccess.__name__:
             # Already reclaimed (crash eviction won a race) -- treat as released.
-            logger.info("Execution lease release answered: %s", result.get("result_details", ""))
+            logger.info("Execution lease release answered: %s", self._details_of(result))
         else:
             logger.debug("Execution lease released (%s)", reason)
 
@@ -335,6 +412,64 @@ class ExecutionLeaseManager(EngineScoped):
         engine_id = self.engine.engine_identity_manager.active_engine_id
         return engine_id if engine_id is not None else "unknown-engine"
 
+    async def run_balancer_liveness_monitor(self) -> None:
+        """Self-terminate when balancer beacons stop: engines die with their balancer.
+
+        The balancer dials in and connection state is invisible to Python, so
+        beacon receipt is the only liveness signal. After the startup grace
+        (covering boot + first link), a beacon gap past the timeout means the
+        admission authority is gone -- and a brokered engine without one must
+        not linger: it cannot run (fail closed) and would only hold memory.
+        Termination goes through the process's own signal handlers so shutdown
+        is graceful, with a hard exit escalation if that wedges.
+
+        Mirrors worker_heartbeat_monitor's shape; a no-op on unmanaged engines.
+        """
+        if not self.enabled:
+            return
+        await asyncio.sleep(self.balancer_grace_s)
+        poll_s = max(0.05, min(self.balancer_timeout_s / 3.0, 10.0))
+        while True:
+            await asyncio.sleep(poll_s)
+            last_seen = self._balancer_last_seen
+            elapsed = time.monotonic() - last_seen if last_seen else float("inf")
+            if elapsed > self.balancer_timeout_s:
+                logger.critical(
+                    "Load balancer heartbeat lost (%s); this engine is shutting down "
+                    "(managed engines do not outlive their admission authority).",
+                    f"{elapsed:.0f}s since last beacon" if last_seen else "never connected",
+                )
+                await self._terminate_process()
+                return
+
+    def _on_balancer_heartbeat(self, _event: Any) -> None:
+        self._balancer_last_seen = time.monotonic()
+
+    async def _terminate_process(self) -> None:
+        """Ask this process to shut down; force the exit if that wedges."""
+        os.kill(os.getpid(), signal.SIGTERM)
+        await asyncio.sleep(ExecutionLeaseManager._TERMINATE_ESCALATION_S)
+        logger.critical("Graceful shutdown did not complete; forcing exit.")
+        os._exit(1)
+
     @staticmethod
     def _payload_of(request: Any) -> dict[str, Any]:
         return converter.unstructure(request)
+
+    @staticmethod
+    def _details_of(result: dict[str, Any]) -> str:
+        """Flatten a result envelope's human-readable details.
+
+        On the wire, a result payload's ``result_details`` is the unstructured
+        ``ResultDetails`` object -- ``{"result_details": [{"level", "message"}]}``
+        nested under the envelope's ``result`` key -- not a plain string.
+        """
+        details = result.get("result", {}).get("result_details", "")
+        if isinstance(details, str):
+            return details or "no reason given"
+        if isinstance(details, dict):
+            details = details.get("result_details", [])
+        if isinstance(details, list):
+            messages = [entry.get("message", "") for entry in details if isinstance(entry, dict)]
+            return " ".join(m for m in messages if m) or "no reason given"
+        return "no reason given"

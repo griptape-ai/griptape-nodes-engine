@@ -27,6 +27,16 @@ WORKER_HEARTBEAT_STARTUP_GRACE_KEY = "worker.heartbeat_startup_grace_s"
 # brokered and runs exactly as before.
 EXECUTION_LEASE_ENABLED_KEY = "execution_lease.enabled"
 EXECUTION_LEASE_RENEW_INTERVAL_KEY = "execution_lease.renew_interval_s"
+# Ceiling on the pre-release memory teardown (the ExecutionLeaseReleasing
+# broadcast). Generous by default -- clearing a multi-gigabyte video pipeline
+# transits components through system RAM and takes real time -- but bounded,
+# so a wedged library teardown cannot hold the admission queue forever.
+EXECUTION_LEASE_TEARDOWN_TIMEOUT_KEY = "execution_lease.teardown_timeout_s"
+# Balancer liveness: the balancer beacons every few seconds; an engine whose
+# beacons stop past the timeout self-terminates (fail closed, no orphans). The
+# startup grace covers engine boot + balancer linking before enforcement.
+EXECUTION_LEASE_BALANCER_TIMEOUT_KEY = "execution_lease.balancer_heartbeat_timeout_s"
+EXECUTION_LEASE_BALANCER_GRACE_KEY = "execution_lease.balancer_startup_grace_s"
 DISCOVERY_MAX_DEPTH_KEY = "discovery_max_depth"
 # The `Settings.libraries_directory` field below, named here so every reader of it -- the live
 # libraries root, the provisioning preview, the offline libraries-root resolver, and the packager --
