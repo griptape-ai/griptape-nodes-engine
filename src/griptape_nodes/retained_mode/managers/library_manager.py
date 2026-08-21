@@ -441,13 +441,16 @@ class LibraryManager(EngineScoped):
     # lets unloading a library remove its templates instead of leaking them for the life of
     # the process.
     _library_to_workflow_keys: dict[str, list[str]]  # library_name -> workflow registry keys
-    # True while a bulk load is walking every configured library through
+    # How many bulk loads are currently walking every configured library through
     # `register_library_from_file_request`. The per-library template hook in that handler stands
-    # down for the duration and the bulk path registers templates once at the end, so a
+    # down while this is above zero and the bulk path registers templates once at the end, so a
     # template's library references are resolved against the full set of libraries rather than
     # however many happened to load first. Tracked explicitly because two separate loops do
-    # bulk loads and only one of them closes `_libraries_loading_complete`.
-    _bulk_library_load_in_progress: bool
+    # bulk loads and only one of them closes `_libraries_loading_complete`. A count rather than
+    # a flag because both loops await inside their bodies and are both reachable from the
+    # request queue, so they can overlap -- with a flag, whichever finished first would re-arm
+    # the hook underneath the other one.
+    _bulk_library_load_depth: int
 
     class LibraryLifecycleState(StrEnum):
         """Lifecycle states for library loading."""
@@ -634,7 +637,7 @@ class LibraryManager(EngineScoped):
         self._is_initializing: bool = False
         self._pre_reload_callbacks: list[Callable[[], Awaitable[None]]] = []
         self._library_to_workflow_keys = {}
-        self._bulk_library_load_in_progress = False
+        self._bulk_library_load_depth = 0
         # True when this process is a dedicated worker
         self._is_worker: bool = False
         # The libraries this process is restricted to loading (set on workers).
@@ -2152,34 +2155,15 @@ class LibraryManager(EngineScoped):
         `register_library_from_file_request` -- engine start, installing from a file,
         installing from a requirement specifier, and reloading after a git update -- so this
         is the one place that has to know a library can ship templates.
+
+        A bulk load stands down here and registers templates once at the end instead, because
+        registering per library would resolve a template's library references against however
+        many libraries happened to load first and could mark a shipped template unusable for
+        the rest of the session.
         """
-        await self._register_workflow_files_for_library_unless_bulk_loading(library_info)
+        if self._bulk_library_load_depth == 0:
+            await self._register_workflow_files_for_library(library_info)
         return RegisterLibraryFromFileResultSuccess(library_name=library_name, result_details=result_details)
-
-    async def _register_workflow_files_for_library_unless_bulk_loading(
-        self, library_info: LibraryManager.LibraryInfo
-    ) -> None:
-        """Register one library's workflow templates unless a bulk load will do it at the end.
-
-        A bulk load stands down for two reasons. `load_all_libraries_from_config` holds
-        `_libraries_loading_complete` closed for the duration, and registering a template
-        awaits that same event through `WorkflowManager.on_load_workflow_metadata_request`, so
-        registering mid-load would await an event only the enclosing loop can set and the
-        engine would never finish starting. The legacy `load_libraries_request` loop does not
-        close that event, but registering per-library there would resolve a template's library
-        references against however many libraries happened to load first and could mark a
-        shipped template unusable for the rest of the session.
-
-        Both loops call `_register_all_library_workflow_files` once they finish instead.
-        """
-        if self._bulk_library_load_in_progress:
-            return
-        # Belt and braces for a bulk path that forgets to set the flag: registering while this
-        # event is closed deadlocks, so never do it regardless of who closed the event.
-        if not self._libraries_loading_complete.is_set():
-            return
-
-        await self._register_workflow_files_for_library(library_info)
 
     async def _establish_register_library_prerequisites(  # noqa: C901, PLR0911, PLR0912 (prerequisite validation needs branches)
         self, request: RegisterLibraryFromFileRequest
@@ -3308,7 +3292,11 @@ class LibraryManager(EngineScoped):
         return f"{self.STABLE_NAMESPACE_PREFIX}{safe_library_name}.{safe_file_name}"
 
     def _init_stable_module_tracking(self) -> None:
-        """Initialize the stable module namespace mappings described at the top of the class."""
+        """Initialize the stable module namespace mappings described at the top of the class.
+
+        Extracted from `__init__` only to keep it under ruff's statement limit; there is one
+        caller and no other reason to invoke this.
+        """
         self._dynamic_to_stable_module_mapping = {}
         self._stable_to_dynamic_module_mapping = {}
         self._library_to_stable_modules = {}
@@ -3814,9 +3802,9 @@ class LibraryManager(EngineScoped):
             total_libraries = len(libraries_to_load)
 
             # Templates are registered after the loop, not per library inside it -- see
-            # _register_workflow_files_for_library_unless_bulk_loading. Only the loop is guarded;
-            # every early return above happens before the flag is ever set.
-            self._bulk_library_load_in_progress = True
+            # _finish_successful_library_registration. Only the loop is guarded; every early return
+            # above happens before the count is ever raised.
+            self._bulk_library_load_depth += 1
             try:
                 for current_library_index, lib_path in enumerate(libraries_to_load, start=1):
                     # When running as a dedicated library worker, skip libraries that don't match the target.
@@ -3829,7 +3817,7 @@ class LibraryManager(EngineScoped):
 
                     await self._load_and_track_library(lib_path, current_library_index, total_libraries)
             finally:
-                self._bulk_library_load_in_progress = False
+                self._bulk_library_load_depth -= 1
 
             # Remove any missing libraries AFTER we've loaded them for the user.
             user_libraries_section = LIBRARIES_TO_REGISTER_KEY
@@ -4416,10 +4404,12 @@ class LibraryManager(EngineScoped):
             )
 
     async def _register_all_library_workflow_files(self) -> None:
-        """Register the workflow templates declared by every library this engine has loaded.
+        """Rebuild the workflow templates declared by every library this engine has loaded.
 
-        Idempotent, and called from every point where the set of registered templates could
-        have fallen behind the set of loaded libraries:
+        Safe to repeat -- each library's templates are dropped and re-registered, so calling
+        this twice leaves the same keys registered rather than two copies of each. Called from
+        every point where the set of registered templates could have fallen behind the set of
+        loaded libraries:
 
         - the end of `WorkflowManager.refresh_workflow_registry`, which has just cleared the
           registry and so needs the templates put back (engine start and any workspace change
@@ -4439,8 +4429,21 @@ class LibraryManager(EngineScoped):
             # on-disk copy actually loaded.
             library_info = self.get_library_info_by_library_name(library_name)
             if library_info is None:
-                logger.error("Could not find a file path for library '%s'", library_name)
+                # Expected, not a fault: LibraryRegistry is process-global, so in a process
+                # running more than one Engine this lists libraries another engine registered
+                # and this one has never seen. Their templates are that engine's business.
+                logger.debug("Library '%s' is not known to this engine; skipping its templates.", library_name)
                 continue
+            # Rebuild this library's templates rather than adding to what is already recorded.
+            # A template's registry key is workspace-relative when the file sits inside the
+            # workspace and absolute otherwise, so changing the workspace changes the key --
+            # and `clear_user_workflows` spares entries whose header sets `is_griptape_provided`,
+            # so the old key can outlive the change. Dropping first means the template ends up
+            # registered under exactly one key instead of appearing twice, the second time
+            # pointing at a path that no longer resolves. Dropped silently because the
+            # re-registration below announces the keys that actually landed; announcing a
+            # removal first would tell clients a template vanished when it did not.
+            self._drop_recorded_workflow_keys(library_name)
             await self._register_workflow_files_for_library(library_info)
 
     async def _register_workflow_files_for_library(self, library_info: LibraryManager.LibraryInfo) -> None:
@@ -4455,6 +4458,19 @@ class LibraryManager(EngineScoped):
         """
         library_name = library_info.library_name
         if library_name is None or self._is_worker:
+            return
+
+        # Registering a template reaches `WorkflowManager.on_load_workflow_metadata_request`,
+        # which awaits `_libraries_loading_complete`. Doing that while the event is closed would
+        # await an event only the enclosing library load can set, and the engine would never
+        # finish starting. Every caller is reached after a batch of libraries has finished
+        # loading, so this should never fire -- it is here because hanging the engine is a far
+        # worse outcome than a template arriving one reload late.
+        if not self._libraries_loading_complete.is_set():
+            logger.debug(
+                "Skipped registering workflow templates for library '%s': libraries are still loading.",
+                library_name,
+            )
             return
 
         workflow_files = self._collect_workflow_files_for_library(library_info)
@@ -4522,24 +4538,7 @@ class LibraryManager(EngineScoped):
         accumulates stale templates and a reload keeps serving templates from libraries that
         are no longer present.
         """
-        registered_keys = self._library_to_workflow_keys.pop(library_name, [])
-        if not registered_keys:
-            return
-
-        removed_keys = []
-        for registry_key in registered_keys:
-            try:
-                WorkflowRegistry.delete_workflow_by_name(registry_key)
-            except KeyError:
-                # Already gone -- the user deleted the workflow, or something else removed it.
-                logger.debug(
-                    "Workflow template '%s' from library '%s' was already absent from the registry.",
-                    registry_key,
-                    library_name,
-                )
-                continue
-            removed_keys.append(registry_key)
-
+        removed_keys = self._drop_recorded_workflow_keys(library_name)
         if not removed_keys:
             return
 
@@ -4552,6 +4551,33 @@ class LibraryManager(EngineScoped):
                 )
             )
         )
+
+    def _drop_recorded_workflow_keys(self, library_name: str) -> list[str]:
+        """Delete the registry entries recorded for a library and forget that it owned them.
+
+        Announces nothing: the two callers differ in what the removal means -- an unload is a
+        removal a client should hear about, a rebuild is followed immediately by the
+        registration that replaces it -- so each decides for itself.
+
+        Returns the keys that were actually deleted, which can be fewer than were recorded.
+        """
+        registered_keys = self._library_to_workflow_keys.pop(library_name, [])
+
+        removed_keys = []
+        for registry_key in registered_keys:
+            try:
+                WorkflowRegistry.delete_workflow_by_name(registry_key)
+            except KeyError:
+                # Already gone -- the user deleted the workflow, `clear_user_workflows` dropped
+                # it, or something else removed it.
+                logger.debug(
+                    "Workflow template '%s' from library '%s' was already absent from the registry.",
+                    registry_key,
+                    library_name,
+                )
+                continue
+            removed_keys.append(registry_key)
+        return removed_keys
 
     async def _on_session_started(self, _event: AppSessionStartedEvent) -> None:
         """Spawn workers for all libraries that require one now that a session is active.
@@ -6057,11 +6083,11 @@ class LibraryManager(EngineScoped):
         # the duration and templates are registered once at the end -- otherwise a template
         # that references a library later in the batch would be checked against a library set
         # that does not contain it yet and be recorded unusable for the rest of the session.
-        self._bulk_library_load_in_progress = True
+        self._bulk_library_load_depth += 1
         try:
             result = await self._load_libraries_from_config_in_bulk()
         finally:
-            self._bulk_library_load_in_progress = False
+            self._bulk_library_load_depth -= 1
 
         await self._register_all_library_workflow_files()
         return result
