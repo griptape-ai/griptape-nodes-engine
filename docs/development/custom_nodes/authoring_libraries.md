@@ -192,10 +192,14 @@ library that provides them:
 - Updating or reloading the library re-registers them, so an edited template file is picked up.
 - Uninstalling the library removes its templates from the picker.
 
-**Set `is_griptape_provided = true` in the template's metadata header.** The header is written by the
-editor when you save, so open the workflow and set the flag there. Templates without it are treated
-as ordinary user workflows and are dropped from the picker the next time the workspace is rescanned —
-which happens at engine start and on every project switch.
+Set `is_template = true` in each template's metadata header so the editor offers it as a starting
+point rather than listing it as an ordinary workflow. The header is written by the editor when you
+save, so open the workflow and set the flag there.
+
+Templates survive a workspace rescan — which happens at engine start and whenever the workspace
+directory changes — because the engine re-registers them from your library afterwards. You do not
+need `is_griptape_provided = true` for that; set it only if you want the workflow treated as
+engine-provided in other contexts, such as being saved as a copy rather than overwritten.
 
 Templates are registered by reading the metadata header only; the engine does not run them or import
 any node class to do it. A template that names a library version you do not have installed still

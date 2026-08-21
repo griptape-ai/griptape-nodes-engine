@@ -632,16 +632,16 @@ class WorkflowManager(EngineScoped):
         return SetVariableSubstitutionEnabledResultSuccess(result_details=details)
 
     async def refresh_workflow_registry(self, workflows_to_register: list[str] | None = None) -> None:
-        # All of the libraries have loaded, and any workflows they came with have been registered.
-        # Clear any previously registered user/workspace workflows before re-registering, so that
-        # a workspace change (e.g. project switch) takes effect cleanly. Library-provided workflows
-        # (is_griptape_provided=True) registered above this call are preserved.
-        WorkflowRegistry.clear_user_workflows()
-
-        # Discover workflows from both config and workspace.
+        # Close the gate before touching the registry, not after. on_list_all_workflows_request
+        # and its siblings wait on this event, so clearing the registry first leaves a window
+        # where they answer from a half-empty registry.
         self._workflows_loading_complete.clear()
 
         try:
+            # Clear any previously registered user/workspace workflows before re-registering, so
+            # that a workspace change (e.g. project switch) takes effect cleanly.
+            WorkflowRegistry.clear_user_workflows()
+
             default_workflow_section = "app_events.on_app_initialization_complete.workflows_to_register"
             config_mgr = self.engine.config_manager
 
@@ -673,6 +673,16 @@ class WorkflowManager(EngineScoped):
                         workflow for workflow in workflows_to_register if workflow.lower() not in paths_to_remove
                     ]
                     config_mgr.set_config_value(default_workflow_section, workflows_to_register)
+
+            # Put library-provided templates back, last, so a template follows the library that
+            # ships it instead of depending on a metadata flag its author may have omitted:
+            # clear_user_workflows above spares only entries marked is_griptape_provided, and the
+            # workspace scan deliberately skips library directories, so without this a template
+            # without that flag would vanish here and never come back. Doing it inside the gate
+            # means no caller sees the registry mid-rebuild. Idempotent -- a template still in
+            # the registry comes back already-registered, so it is neither re-recorded nor
+            # re-announced.
+            await self.engine.library_manager._register_all_library_workflow_files()
         finally:
             self._workflows_loading_complete.set()
 
@@ -6846,9 +6856,11 @@ class WorkflowManager(EngineScoped):
 
         # Build the set of registered-library roots (excluding sandbox) so their bundled
         # workflow files are skipped during the workspace scan. Library-declared workflows
-        # (listed in griptape_nodes_library.json) are registered separately via
-        # LibraryManager._collect_library_workflow_files before this scan runs. Sandbox
-        # libraries are intentionally left scannable so in-development workflows appear.
+        # (listed in griptape_nodes_library.json) only ever enter the registry through
+        # LibraryManager, which registers them per library as it loads and re-registers them
+        # at the end of refresh_workflow_registry -- so this scan must never claim them, in
+        # either order. Sandbox libraries are intentionally left scannable so in-development
+        # workflows appear.
         library_exclusion_roots: list[Path] = []
         for library_info in self.engine.library_manager._library_file_path_to_info.values():
             if library_info.is_sandbox:
