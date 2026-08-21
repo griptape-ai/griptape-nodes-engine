@@ -585,7 +585,7 @@ class TestBalancerLiveness:
         manager, _, _ = make_manager(engine, monkeypatch)
         manager._balancer_last_seen = 0.0
 
-        with pytest.raises(RuntimeError, match=r"no .*load balancer has connected"):
+        with pytest.raises(RuntimeError, match=r"load balancer\) has not connected to this engine yet"):
             await manager.gate_execution_start()
 
     @pytest.mark.asyncio

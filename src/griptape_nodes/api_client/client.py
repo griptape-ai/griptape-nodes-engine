@@ -52,14 +52,31 @@ class Client:
         self,
         api_key: str | None = None,
         url: str | None = None,
+        *,
+        max_reconnect_delay_s: float | None = None,
+        pre_reconnect_check: Callable[[], Awaitable[bool]] | None = None,
     ):
         """Initialize Nodes API client.
 
         Args:
             api_key: API key for authentication (defaults to GT_CLOUD_API_KEY from SecretsManager)
             url: WebSocket URL to connect to (defaults to Nodes API endpoint)
+            max_reconnect_delay_s: Cap on the wait between reconnect attempts.
+                The default reconnect path (the websockets library's iterator)
+                backs off exponentially to a ~90s ceiling, which suits a
+                long-lived cloud relay but strands a consumer whose peers
+                CHURN: a fresh server on a recycled address can sit unreached
+                for up to that ceiling. Setting this switches to a bounded
+                retry loop. None keeps the library behavior.
+            pre_reconnect_check: Awaited before each bounded reconnect attempt;
+                returning False skips the dial (and its log line) for one
+                delay. Lets a consumer substitute a cheap, silent liveness
+                test (e.g. a TCP probe) for dial-and-fail against an address
+                that is usually dead. Implies the bounded retry loop.
         """
         self.url = url if url is not None else get_default_websocket_url()
+        self._max_reconnect_delay_s = max_reconnect_delay_s
+        self._pre_reconnect_check = pre_reconnect_check
 
         # Get API key from SecretsManager if not provided
         if api_key is None:
@@ -221,10 +238,13 @@ class Client:
         automatically reconnecting on failures.
         """
         try:
-            async for websocket in connect(self.url, additional_headers=self.headers):
-                should_reconnect = await self._handle_websocket_session(websocket)
-                if not should_reconnect:
-                    break
+            if self._max_reconnect_delay_s is not None or self._pre_reconnect_check is not None:
+                await self._manage_connection_bounded()
+            else:
+                async for websocket in connect(self.url, additional_headers=self.headers):
+                    should_reconnect = await self._handle_websocket_session(websocket)
+                    if not should_reconnect:
+                        break
         except InvalidStatus as e:
             if e.response.status_code in (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN):
                 logger.error(
@@ -257,6 +277,29 @@ class Client:
             )
         except asyncio.CancelledError:
             logger.debug("Connection manager task cancelled")
+
+    async def _manage_connection_bounded(self) -> None:
+        """Reconnect on a bounded cadence instead of the library's backoff.
+
+        Fatal configuration failures (bad URL, rejected credentials, SSL) still
+        bubble to _manage_connection's handlers and end the manager, exactly as
+        the iterator path does; only transient dial failures retry here.
+        """
+        delay = self._max_reconnect_delay_s if self._max_reconnect_delay_s is not None else 5.0
+        while True:
+            if self._pre_reconnect_check is not None and not await self._pre_reconnect_check():
+                await asyncio.sleep(delay)
+                continue
+            try:
+                websocket = await connect(self.url, additional_headers=self.headers)
+            except (OSError, TimeoutError):
+                # The address was reachable a moment ago (or unchecked) but the
+                # dial failed; one bounded wait, then look again.
+                await asyncio.sleep(delay)
+                continue
+            should_reconnect = await self._handle_websocket_session(websocket)
+            if not should_reconnect:
+                return
 
     async def _handle_websocket_session(self, websocket: Any) -> bool:
         """Handle a single WebSocket session: log, resubscribe, and receive messages.
