@@ -1289,17 +1289,17 @@ class SetVariableSubstitutionEnabledResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class OpenSubflowNodeCanvasRequest(RequestPayload):
-    """Open a SubflowNode's inner canvas, creating the child flow if it does not exist yet.
+class OpenNodeInnerCanvasRequest(RequestPayload):
+    """Open a node's inner canvas, creating the child flow if it does not exist yet.
 
-    Use when: The user clicks the "enter subflow" link icon on a SubflowNode. The engine
-    creates the child flow under the correct parent flow on first access and returns its
-    name so the editor can navigate to the inner canvas tab.
+    Use when: The user clicks the "enter subflow" link icon on a node that has an inner
+    canvas. The engine creates the child flow under the correct parent flow on first access
+    and returns its name so the editor can navigate to the inner canvas tab.
 
     Args:
-        node_name: Name of the SubflowNode whose inner canvas to open.
+        node_name: Name of the node whose inner canvas to open.
 
-    Results: OpenSubflowNodeCanvasResultSuccess | OpenSubflowNodeCanvasResultFailure
+    Results: OpenNodeInnerCanvasResultSuccess | OpenNodeInnerCanvasResultFailure
     """
 
     node_name: str
@@ -1307,8 +1307,8 @@ class OpenSubflowNodeCanvasRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class OpenSubflowNodeCanvasResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
-    """SubflowNode inner canvas opened successfully.
+class OpenNodeInnerCanvasResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
+    """Node inner canvas opened successfully.
 
     Args:
         child_flow_name: Engine name of the child flow to navigate to.
@@ -1321,25 +1321,25 @@ class OpenSubflowNodeCanvasResultSuccess(WorkflowAlteredMixin, ResultPayloadSucc
 
 @dataclass
 @PayloadRegistry.register
-class OpenSubflowNodeCanvasResultFailure(ResultPayloadFailure):
-    """SubflowNode inner canvas could not be opened.
+class OpenNodeInnerCanvasResultFailure(ResultPayloadFailure):
+    """Node inner canvas could not be opened.
 
-    Common causes: node not found, node is not a SubflowNode, child flow creation failed.
+    Common causes: node not found, node does not support an inner canvas, child flow creation failed.
     """
 
 
 @dataclass
 @PayloadRegistry.register
-class SyncSubflowNodeSurfaceRequest(RequestPayload):
-    """Sync a SubflowNode's surface parameters from its child flow's Start and End Flow nodes.
+class SyncInnerFlowSurfaceRequest(RequestPayload):
+    """Sync a node's surface parameters from its inner flow's Start and End Flow nodes.
 
-    Use when: The user has added or removed parameters on Start/End nodes inside a SubflowNode's
+    Use when: The user has added or removed parameters on Start/End nodes inside a node's
     inner canvas and the collapsed node's visible surface should be updated to match.
 
     Args:
-        node_name: Name of the SubflowNode to sync.
+        node_name: Name of the node whose surface to sync.
 
-    Results: SyncSubflowNodeSurfaceResultSuccess | SyncSubflowNodeSurfaceResultFailure
+    Results: SyncInnerFlowSurfaceResultSuccess | SyncInnerFlowSurfaceResultFailure
     """
 
     node_name: str
@@ -1347,8 +1347,8 @@ class SyncSubflowNodeSurfaceRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class SyncSubflowNodeSurfaceResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
-    """SubflowNode surface synced successfully.
+class SyncInnerFlowSurfaceResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
+    """Node surface synced successfully from its inner flow.
 
     Args:
         added_params: Names of parameters added to the node's surface.
@@ -1361,41 +1361,41 @@ class SyncSubflowNodeSurfaceResultSuccess(WorkflowAlteredMixin, ResultPayloadSuc
 
 @dataclass
 @PayloadRegistry.register
-class SyncSubflowNodeSurfaceResultFailure(ResultPayloadFailure):
-    """SubflowNode surface sync failed.
+class SyncInnerFlowSurfaceResultFailure(ResultPayloadFailure):
+    """Node surface sync failed.
 
-    Common causes: node not found, node is not a SubflowNode, child flow not found,
+    Common causes: node not found, node does not have an inner flow, inner flow not found,
     no Start or End Flow nodes in the inner canvas.
     """
 
 
 @dataclass
 @PayloadRegistry.register
-class ExportSubflowNodeRequest(RequestPayload):
-    """Export a SubflowNode's inner canvas as a portable workflow package.
+class ExportFlowAsLibraryNodeRequest(RequestPayload):
+    """Export a flow as a portable workflow-node package.
 
-    Serializes the child flow to a .py file with a TOML metadata header (including the
+    Serializes the flow to a .py file with a TOML metadata header (including the
     workflow_shape), and writes or updates a griptape_nodes_library.json alongside it.
     The resulting folder is self-contained: copy it into any workspace's library path and
     register the library JSON to make the exported node type available.
 
     Args:
-        node_name: Name of the SubflowNode to export.
+        flow_name: Name of the flow to export.
         destination_folder: Absolute path to the folder to write the package into.
-        node_type_name: Name for the exported node type. Defaults to the node's name when None.
+        node_type_name: Name for the exported node type. Defaults to the flow name when None.
 
-    Results: ExportSubflowNodeResultSuccess | ExportSubflowNodeResultFailure
+    Results: ExportFlowAsLibraryNodeResultSuccess | ExportFlowAsLibraryNodeResultFailure
     """
 
-    node_name: str
+    flow_name: str
     destination_folder: str
     node_type_name: str | None = None
 
 
 @dataclass
 @PayloadRegistry.register
-class ExportSubflowNodeResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
-    """SubflowNode exported successfully.
+class ExportFlowAsLibraryNodeResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Flow exported as a library node successfully.
 
     Args:
         file_path: Absolute path to the written .py file.
@@ -1408,9 +1408,8 @@ class ExportSubflowNodeResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucce
 
 @dataclass
 @PayloadRegistry.register
-class ExportSubflowNodeResultFailure(ResultPayloadFailure):
-    """SubflowNode export failed.
+class ExportFlowAsLibraryNodeResultFailure(ResultPayloadFailure):
+    """Flow export as library node failed.
 
-    Common causes: node not found, node is not a SubflowNode, no child flow, no Start or
-    End Flow nodes in the inner canvas, file write error.
+    Common causes: flow not found, no Start or End Flow nodes in the flow, file write error.
     """

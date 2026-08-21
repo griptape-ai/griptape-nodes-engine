@@ -742,6 +742,12 @@ class NodeManager(EngineScoped):
         requested_node_name = request.node_name
         if requested_node_name is None:
             # The ask is to use the node's DISPLAY name if no name was specified. If that's blank, we'll use the node type.
+            logger.info(
+                "CreateNode: node_type=%r specific_library_name=%r registered_libraries=%r",
+                request.node_type,
+                request.specific_library_name,
+                LibraryRegistry.list_libraries(),
+            )
             try:
                 dest_library = LibraryRegistry.get_library_for_node_type(
                     node_type=request.node_type, specific_library_name=request.specific_library_name

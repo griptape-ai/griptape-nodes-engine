@@ -3425,6 +3425,30 @@ class LibraryManager(EngineScoped):
         else:
             return is_compatible, current_engine_version
 
+    @staticmethod
+    def _find_module_for_file(file_path: Path) -> ModuleType | None:
+        """Return the sys.modules entry whose __file__ resolves to file_path, or None.
+
+        Used to detect when a library node file is already loaded as a named package
+        module (e.g. ``griptape_nodes.exe_types.subflow_node``). Reusing it avoids
+        loading the same source twice under different names, which would create
+        duplicate class objects and break ``isinstance()`` checks.
+        """
+        try:
+            resolved = file_path.resolve()
+        except (OSError, ValueError):
+            return None
+        for mod in list(sys.modules.values()):
+            mod_file = getattr(mod, "__file__", None)
+            if mod_file is None:
+                continue
+            try:
+                if Path(mod_file).resolve() == resolved:
+                    return mod
+            except (OSError, ValueError):
+                continue
+        return None
+
     def _load_module_from_file(self, file_path: Path | str, library_name: str) -> ModuleType:
         """Dynamically load a module from a Python file with support for hot reloading.
 
@@ -3440,6 +3464,14 @@ class LibraryManager(EngineScoped):
         """
         # Ensure file_path is a Path object
         file_path = Path(file_path)
+
+        # If this source file is already registered as a named package module (e.g. a
+        # top-level engine import like ``griptape_nodes.exe_types.subflow_node``), return
+        # it directly. Loading the same file under a second dynamic module name would
+        # produce a duplicate class hierarchy that breaks ``isinstance()`` checks.
+        existing_module = self._find_module_for_file(file_path)
+        if existing_module is not None:
+            return existing_module
 
         # Generate a unique module name
         module_name = f"gtn_dynamic_module_{file_path.name.replace('.', '_')}_{hash(str(file_path))}"
@@ -3500,6 +3532,9 @@ class LibraryManager(EngineScoped):
                 # Register stable alias
                 self._register_stable_module_alias(module_name, stable_namespace, module, library_name)
             except Exception as err:
+                # Remove the partial module so future calls don't land in the hot-reload
+                # path and report a confusing "Error reloading" message for the same failure.
+                sys.modules.pop(module_name, None)
                 msg = f"Module at '{file_path}' failed to load with error: {err}"
                 raise ImportError(msg) from err
 
@@ -5480,6 +5515,7 @@ class LibraryManager(EngineScoped):
             self._is_initializing = False
 
     async def _run_reload_libraries(self, request: ReloadAllLibrariesRequest) -> ResultPayload:  # noqa: ARG002
+        logger.warning("DEBUG: _run_reload_libraries STARTED — current libraries: %r", list(LibraryRegistry._libraries.keys()))
         # Start with a clean slate.
         clear_all_request = ClearAllObjectStateRequest(i_know_what_im_doing=True)
         clear_all_result = await self.engine.ahandle_request(clear_all_request)
@@ -5544,6 +5580,7 @@ class LibraryManager(EngineScoped):
             details = "Reloaded libraries but reconcile reported problem(s): " + "; ".join(reconcile_failures)
             return ReloadAllLibrariesResultFailure(result_details=details)
 
+        logger.warning("DEBUG: _run_reload_libraries COMPLETE — libraries after reload: %r", list(LibraryRegistry._libraries.keys()))
         details = (
             "Successfully reloaded all libraries. All object state was cleared and previous libraries were unloaded."
         )
@@ -5955,6 +5992,14 @@ class LibraryManager(EngineScoped):
                     )
                 )
 
+        # Add bundled libraries shipped with the engine package. These are always
+        # registered without any user configuration, so core node types like SubflowNode
+        # are available immediately after install. Bundled paths are added to seen_paths
+        # so the config scan doesn't load the same JSON a second time.
+        bundled = await self._discover_bundled_library_entries()
+        seen_paths.update(Path(e.registration.path) for e in bundled)
+        discovered_entries.extend(bundled)
+
         # Add from config
         config_libraries = config_mgr.get_config_value(user_libraries_section, default=[])
         for entry in normalize_library_registrations(config_libraries):
@@ -5976,6 +6021,28 @@ class LibraryManager(EngineScoped):
                 await process_path(manifest_path, enabled=True, registered_path=str(manifest_path))
 
         return discovered_entries
+
+    async def _discover_bundled_library_entries(self) -> list[LibraryManager.DiscoveredLibraryEntry]:
+        """Return discovery entries for libraries bundled with the engine package.
+
+        Scans the ``griptape_nodes/bundled_libraries/`` directory that ships inside the
+        installed wheel so bundled node types (e.g. SubflowNode) are always available
+        without any user configuration.
+        """
+        try:
+            bundled_root = Path(str(files("griptape_nodes") / "bundled_libraries"))
+            if not await anyio.Path(bundled_root).is_dir():
+                return []
+            return [
+                LibraryManager.DiscoveredLibraryEntry(
+                    registration=LibraryRegistration(path=str(lib_path), enabled=True),
+                    registered_path=str(lib_path),
+                )
+                for lib_path in await find_files_recursive(bundled_root, LibraryManager.LIBRARY_CONFIG_GLOB_PATTERN)
+            ]
+        except Exception:
+            logger.debug("Could not scan bundled libraries directory", exc_info=True)
+            return []
 
     @staticmethod
     def _resolve_discovery_path(entry: LibraryRegistration, workspace_path: Path) -> ResolvedDiscoveryPath | None:

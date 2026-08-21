@@ -2,10 +2,10 @@
 
 Unlike WorkflowNode (which loads from a saved .py file on disk), SubflowNode holds a
 live child flow that the user builds interactively. The editor opens the child flow in a
-dedicated tab via OpenSubflowNodeCanvasRequest. Users add Start Flow / End Flow nodes and
+dedicated tab via OpenNodeInnerCanvasRequest. Users add Start Flow / End Flow nodes and
 connect parameters to those nodes to promote them onto the collapsed node's visible surface.
-SyncSubflowNodeSurfaceRequest re-derives the surface after the inner canvas changes.
-ExportSubflowNodeRequest serializes the child flow to a portable .py package.
+SyncInnerFlowSurfaceRequest re-derives the surface after the inner canvas changes.
+ExportFlowAsLibraryNodeRequest serializes the child flow to a portable .py package.
 """
 
 from __future__ import annotations
@@ -14,9 +14,8 @@ import logging
 from typing import Any
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode, ParameterTypeBuiltin
-from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_types import ControlNode
-from griptape_nodes.exe_types.workflow_node import SUBFLOW_NAME_KEY, WORKFLOW_NODE_KEY
+from griptape_nodes.exe_types.workflow_node import SUBFLOW_NAME_KEY, WORKFLOW_NODE_KEY, _get_flow_or_none
 from griptape_nodes.node_library.workflow_registry import WorkflowShape
 from griptape_nodes.retained_mode.events.execution_events import (
     StartLocalSubflowRequest,
@@ -39,11 +38,11 @@ SURFACE_PARAMS_DATA_KEY = "surface_params_data"
 class SubflowNode(ControlNode):
     """A node backed by a live child flow the user edits interactively.
 
-    The inner canvas is opened via OpenSubflowNodeCanvasRequest, which creates the child
+    The inner canvas is opened via OpenNodeInnerCanvasRequest, which creates the child
     flow on first access and returns its name for the editor to navigate to. Users add
     nodes and connect Start Flow / End Flow parameter ports to promote those parameters
-    onto the collapsed node's surface. SyncSubflowNodeSurfaceRequest re-derives the
-    surface. ExportSubflowNodeRequest writes the child flow to a portable .py package.
+    onto the collapsed node's surface. SyncInnerFlowSurfaceRequest re-derives the
+    surface. ExportFlowAsLibraryNodeRequest writes the child flow to a portable .py package.
     """
 
     def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
@@ -227,5 +226,3 @@ def _build_surface_parameter(name: str, param_dict: dict, allowed_modes: set[Par
     )
 
 
-def _get_flow_or_none(flow_name: str) -> ControlFlow | None:
-    return GriptapeNodes.ObjectManager().attempt_get_object_by_name_as_type(flow_name, ControlFlow)

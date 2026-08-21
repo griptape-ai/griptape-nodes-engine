@@ -119,9 +119,9 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     DeleteWorkflowRequest,
     DeleteWorkflowResultFailure,
     DeleteWorkflowResultSuccess,
-    ExportSubflowNodeRequest,
-    ExportSubflowNodeResultFailure,
-    ExportSubflowNodeResultSuccess,
+    ExportFlowAsLibraryNodeRequest,
+    ExportFlowAsLibraryNodeResultFailure,
+    ExportFlowAsLibraryNodeResultSuccess,
     GetPublishOptionsRequest,
     GetPublishOptionsResultFailure,
     GetPublishOptionsResultSuccess,
@@ -161,9 +161,9 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     MoveWorkflowRequest,
     MoveWorkflowResultFailure,
     MoveWorkflowResultSuccess,
-    OpenSubflowNodeCanvasRequest,
-    OpenSubflowNodeCanvasResultFailure,
-    OpenSubflowNodeCanvasResultSuccess,
+    OpenNodeInnerCanvasRequest,
+    OpenNodeInnerCanvasResultFailure,
+    OpenNodeInnerCanvasResultSuccess,
     PublishWorkflowRegisteredEventData,
     PublishWorkflowRequest,
     PublishWorkflowResultFailure,
@@ -209,9 +209,9 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     SetWorkflowMetadataRequest,
     SetWorkflowMetadataResultFailure,
     SetWorkflowMetadataResultSuccess,
-    SyncSubflowNodeSurfaceRequest,
-    SyncSubflowNodeSurfaceResultFailure,
-    SyncSubflowNodeSurfaceResultSuccess,
+    SyncInnerFlowSurfaceRequest,
+    SyncInnerFlowSurfaceResultFailure,
+    SyncInnerFlowSurfaceResultSuccess,
     WorkflowDependencyInfo,
     WorkflowDependencyStatus,
     WorkflowInfoSummary,
@@ -570,16 +570,16 @@ class WorkflowManager(EngineScoped):
             self.on_register_workflows_from_config_request,
         )
         event_manager.assign_manager_to_request_type(
-            OpenSubflowNodeCanvasRequest,
-            self.on_open_subflow_node_canvas_request,
+            OpenNodeInnerCanvasRequest,
+            self.on_open_node_inner_canvas_request,
         )
         event_manager.assign_manager_to_request_type(
-            SyncSubflowNodeSurfaceRequest,
-            self.on_sync_subflow_node_surface_request,
+            SyncInnerFlowSurfaceRequest,
+            self.on_sync_inner_flow_surface_request,
         )
         event_manager.assign_manager_to_request_type(
-            ExportSubflowNodeRequest,
-            self.on_export_subflow_node_request,
+            ExportFlowAsLibraryNodeRequest,
+            self.on_export_flow_as_library_node_request,
         )
 
     def has_current_referenced_workflow(self) -> bool:
@@ -6889,21 +6889,21 @@ class WorkflowManager(EngineScoped):
             return registry_key
         return None
 
-    def on_open_subflow_node_canvas_request(self, request: OpenSubflowNodeCanvasRequest) -> ResultPayload:
+    def on_open_node_inner_canvas_request(self, request: OpenNodeInnerCanvasRequest) -> ResultPayload:
         node = self.engine.object_manager.attempt_get_object_by_name_as_type(request.node_name, BaseNode)
         if node is None:
             details = f"Attempted to open inner canvas of '{request.node_name}'. Failed because the node was not found."
-            return OpenSubflowNodeCanvasResultFailure(result_details=details)
+            return OpenNodeInnerCanvasResultFailure(result_details=details)
         if not isinstance(node, SubflowNode):
             details = (
                 f"Attempted to open inner canvas of '{request.node_name}'. "
-                "Failed because the node is not a SubflowNode."
+                "Failed because the node does not support an inner canvas."
             )
-            return OpenSubflowNodeCanvasResultFailure(result_details=details)
+            return OpenNodeInnerCanvasResultFailure(result_details=details)
 
         existing_name = node.metadata.get(SUBFLOW_NAME_KEY)
         if existing_name is not None and _get_subflow_or_none(existing_name) is not None:
-            return OpenSubflowNodeCanvasResultSuccess(
+            return OpenNodeInnerCanvasResultSuccess(
                 child_flow_name=existing_name,
                 created=False,
                 result_details=f"Inner canvas for '{request.node_name}' already exists.",
@@ -6915,7 +6915,7 @@ class WorkflowManager(EngineScoped):
                 f"Attempted to open inner canvas of '{request.node_name}'. "
                 f"Failed because the parent flow could not be found: {flow_result.result_details}"
             )
-            return OpenSubflowNodeCanvasResultFailure(result_details=details)
+            return OpenNodeInnerCanvasResultFailure(result_details=details)
 
         parent_flow_name = flow_result.flow_name
         child_flow_name = f"{request.node_name}_subflow"
@@ -6931,25 +6931,26 @@ class WorkflowManager(EngineScoped):
                 f"Attempted to open inner canvas of '{request.node_name}'. "
                 f"Failed because the child flow could not be created: {create_result.result_details}"
             )
-            return OpenSubflowNodeCanvasResultFailure(result_details=details)
+            return OpenNodeInnerCanvasResultFailure(result_details=details)
 
         node.metadata[SUBFLOW_NAME_KEY] = create_result.flow_name
-        return OpenSubflowNodeCanvasResultSuccess(
+        return OpenNodeInnerCanvasResultSuccess(
             child_flow_name=create_result.flow_name,
             created=True,
             result_details=f"Inner canvas for '{request.node_name}' created as '{create_result.flow_name}'.",
         )
 
-    def on_sync_subflow_node_surface_request(self, request: SyncSubflowNodeSurfaceRequest) -> ResultPayload:
+    def on_sync_inner_flow_surface_request(self, request: SyncInnerFlowSurfaceRequest) -> ResultPayload:
         node = self.engine.object_manager.attempt_get_object_by_name_as_type(request.node_name, BaseNode)
         if node is None:
             details = f"Attempted to sync surface of '{request.node_name}'. Failed because the node was not found."
-            return SyncSubflowNodeSurfaceResultFailure(result_details=details)
+            return SyncInnerFlowSurfaceResultFailure(result_details=details)
         if not isinstance(node, SubflowNode):
             details = (
-                f"Attempted to sync surface of '{request.node_name}'. Failed because the node is not a SubflowNode."
+                f"Attempted to sync surface of '{request.node_name}'. "
+                "Failed because the node does not have an inner flow surface."
             )
-            return SyncSubflowNodeSurfaceResultFailure(result_details=details)
+            return SyncInnerFlowSurfaceResultFailure(result_details=details)
 
         child_flow_name = node.metadata.get(SUBFLOW_NAME_KEY)
         if child_flow_name is None:
@@ -6957,7 +6958,7 @@ class WorkflowManager(EngineScoped):
                 f"Attempted to sync surface of '{request.node_name}'. "
                 "Failed because the node has no inner canvas yet. Open the inner canvas first."
             )
-            return SyncSubflowNodeSurfaceResultFailure(result_details=details)
+            return SyncInnerFlowSurfaceResultFailure(result_details=details)
 
         try:
             shape_dict = self.extract_workflow_shape(workflow_name=request.node_name, flow_name=child_flow_name)
@@ -6966,7 +6967,7 @@ class WorkflowManager(EngineScoped):
                 f"Attempted to sync surface of '{request.node_name}'. "
                 f"Failed because the inner canvas has no Start Flow or End Flow nodes: {err}"
             )
-            return SyncSubflowNodeSurfaceResultFailure(result_details=details)
+            return SyncInnerFlowSurfaceResultFailure(result_details=details)
 
         workflow_shape = WorkflowShape(inputs=shape_dict["input"], outputs=shape_dict["output"])
         added, removed = node.sync_surface_params(workflow_shape)
@@ -6974,49 +6975,38 @@ class WorkflowManager(EngineScoped):
             f"Synced surface of '{request.node_name}': "
             f"{len(added)} parameter(s) added, {len(removed)} parameter(s) removed."
         )
-        return SyncSubflowNodeSurfaceResultSuccess(
+        return SyncInnerFlowSurfaceResultSuccess(
             added_params=added,
             removed_params=removed,
             result_details=ResultDetails(message=details, level=logging.INFO),
         )
 
-    async def on_export_subflow_node_request(self, request: ExportSubflowNodeRequest) -> ResultPayload:  # noqa: PLR0911
-        node = self.engine.object_manager.attempt_get_object_by_name_as_type(request.node_name, BaseNode)
-        if node is None:
-            details = f"Attempted to export '{request.node_name}'. Failed because the node was not found."
-            return ExportSubflowNodeResultFailure(result_details=details)
-        if not isinstance(node, SubflowNode):
-            details = f"Attempted to export '{request.node_name}'. Failed because the node is not a SubflowNode."
-            return ExportSubflowNodeResultFailure(result_details=details)
-
-        child_flow_name = node.metadata.get(SUBFLOW_NAME_KEY)
-        if child_flow_name is None:
-            details = (
-                f"Attempted to export '{request.node_name}'. "
-                "Failed because the node has no inner canvas yet. Open the inner canvas first."
-            )
-            return ExportSubflowNodeResultFailure(result_details=details)
+    async def on_export_flow_as_library_node_request(self, request: ExportFlowAsLibraryNodeRequest) -> ResultPayload:
+        flow_name = request.flow_name
+        if _get_subflow_or_none(flow_name) is None:
+            details = f"Attempted to export flow '{flow_name}'. Failed because the flow was not found."
+            return ExportFlowAsLibraryNodeResultFailure(result_details=details)
 
         try:
-            shape_dict = self.extract_workflow_shape(workflow_name=request.node_name, flow_name=child_flow_name)
+            shape_dict = self.extract_workflow_shape(workflow_name=flow_name, flow_name=flow_name)
         except ValueError as err:
             details = (
-                f"Attempted to export '{request.node_name}'. "
-                f"Failed because the inner canvas has no Start Flow or End Flow nodes: {err}. "
-                "Add Start Flow and End Flow nodes to the inner canvas before exporting."
+                f"Attempted to export flow '{flow_name}'. "
+                f"Failed because the flow has no Start Flow or End Flow nodes: {err}. "
+                "Add Start Flow and End Flow nodes to the flow before exporting."
             )
-            return ExportSubflowNodeResultFailure(result_details=details)
+            return ExportFlowAsLibraryNodeResultFailure(result_details=details)
 
         workflow_shape = WorkflowShape(inputs=shape_dict["input"], outputs=shape_dict["output"])
 
         serialized_result = await self.engine.ahandle_request(
-            SerializeFlowToCommandsRequest(flow_name=child_flow_name, include_create_flow_command=True)
+            SerializeFlowToCommandsRequest(flow_name=flow_name, include_create_flow_command=True)
         )
         if not isinstance(serialized_result, SerializeFlowToCommandsResultSuccess):
             details = (
-                f"Attempted to export '{request.node_name}'. Failed because the inner canvas could not be serialized."
+                f"Attempted to export flow '{flow_name}'. Failed because the flow could not be serialized."
             )
-            return ExportSubflowNodeResultFailure(result_details=details)
+            return ExportFlowAsLibraryNodeResultFailure(result_details=details)
 
         serialized_commands = serialized_result.serialized_flow_commands
         if isinstance(serialized_commands.flow_initialization_command, CreateFlowRequest):
@@ -7027,7 +7017,7 @@ class WorkflowManager(EngineScoped):
                 metadata=serialized_commands.flow_initialization_command.metadata,
             )
 
-        node_type_name = request.node_type_name or request.node_name
+        node_type_name = request.node_type_name or flow_name
         destination_folder = Path(request.destination_folder)
         py_file_path = destination_folder / f"{node_type_name}.py"
 
@@ -7046,10 +7036,10 @@ class WorkflowManager(EngineScoped):
         )
         if save_result.failed():
             details = (
-                f"Attempted to export '{request.node_name}'. "
+                f"Attempted to export flow '{flow_name}'. "
                 f"Failed because the workflow file could not be written: {save_result.result_details}"
             )
-            return ExportSubflowNodeResultFailure(result_details=details)
+            return ExportFlowAsLibraryNodeResultFailure(result_details=details)
 
         library_json_path = destination_folder / "griptape_nodes_library.json"
         self._upsert_subflow_export_library_json(
@@ -7058,8 +7048,8 @@ class WorkflowManager(EngineScoped):
             py_file_name=f"{node_type_name}.py",
         )
 
-        details = f"Exported SubflowNode '{request.node_name}' to '{py_file_path}'."
-        return ExportSubflowNodeResultSuccess(
+        details = f"Exported flow '{flow_name}' as library node '{node_type_name}' to '{py_file_path}'."
+        return ExportFlowAsLibraryNodeResultSuccess(
             file_path=str(py_file_path),
             library_json_path=str(library_json_path),
             result_details=ResultDetails(message=details, level=logging.INFO),

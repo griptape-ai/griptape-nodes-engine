@@ -184,6 +184,7 @@ class NodeMetadata(BaseModel):
     group: str | None = None
     deprecation: NodeDeprecationMetadata | None = None
     is_node_group: bool | None = None
+    subflow_node: bool | None = None
     # Declarative properties / capabilities for this node.
     # See griptape_nodes.node_library.library_declarations for the supported types.
     declarations: list[NodeDeclaration] = Field(default_factory=list)
@@ -370,8 +371,6 @@ class LibraryRegistry:
     @classmethod
     def get_library(cls, name: str) -> Library:
         if name not in cls._libraries:
-            registered = list(cls._libraries.keys())
-            logger.error("Library '%s' not found. Registered libraries: %s", name, registered)
             msg = f"Library '{name}' not found"
             raise LibraryRegistryError(msg)
         return cls._libraries[name]
