@@ -3755,7 +3755,15 @@ class NodeExecutor(EngineScoped):
             # Set the value on the target node
             # Provide source node/parameter to bypass connection conflict validation
             # These values are coming from execution results, treat as upstream values
-            if target_param.type != ParameterTypeBuiltin.CONTROL_TYPE:
+            #
+            # Skip the stored-value write when the parameter holds a {VAR} template:
+            # param_value is the resolved text, and writing it into parameter_values
+            # would destroy the template the user typed rather than merely hiding it.
+            # The output value below still carries the resolved text downstream.
+            if (
+                target_param.type != ParameterTypeBuiltin.CONTROL_TYPE
+                and not target_node.should_preserve_stored_template(target_param_name, param_value)
+            ):
                 self.engine.node_manager.on_set_parameter_value_request(
                     SetParameterValueRequest(
                         node_name=target_node_name,
@@ -3831,8 +3839,15 @@ class NodeExecutor(EngineScoped):
                 logger.debug("Skipping control parameter '%s' on node '%s'", target_param_name, target_node_name)
                 continue
 
-            # Set the value on the target node
-            target_node.set_parameter_value(target_param_name, param_value)
+            # Set the value on the target node.
+            #
+            # Skip the stored-value write when the parameter holds a {VAR} template:
+            # param_value is the last iteration's resolved text, and writing it into
+            # parameter_values would destroy the template the user typed rather than
+            # merely hiding it. The output value below still reflects the last
+            # iteration for downstream consumers and artifacts.
+            if not target_node.should_preserve_stored_template(target_param_name, param_value):
+                target_node.set_parameter_value(target_param_name, param_value)
             target_node.parameter_output_values[target_param_name] = param_value
 
             logger.debug(

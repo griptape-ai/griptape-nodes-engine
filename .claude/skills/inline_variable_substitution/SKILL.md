@@ -135,12 +135,14 @@ During the hierarchical walk, the PROJECT tier resolves computed names fresh (`r
 
 ## Display preservation
 
-The UI must always show the template the user typed (`{SHOT}`), not the resolved value (`25`). Four code paths can overwrite the display — all are suppressed via `BaseNode.get_display_value_for_output()`:
+The UI must always show the template the user typed (`{SHOT}`), not the resolved value (`25`). Every code path that pushes a value to the UI can overwrite the display — all are suppressed via `BaseNode.get_display_value_for_output()`:
 
 1. **During execution** (`TrackedParameterOutputValues.__setitem__`): fires `AlterElementEvent` with the template, not the resolved value.
 2. **After execution** (`parallel_resolution.py` `handle_done_nodes`): `ParameterValueUpdateEvent` and `NodeResolvedEvent` both apply `get_display_value_for_output()` before serialising.
 3. **Browser refresh / reload** (`node_manager._set_param_to_value`): applies `get_display_value_for_output()` when building `element_id_to_value` from `parameter_output_values`.
 4. **Dict/list parameters** (JSON Input): `TrackedParameterOutputValues.__setitem__` calls `_resolve_variables_in_value()` inside `aprocess_scope()` so downstream nodes get the substituted dict while `parameter_values` and the UI keep the template.
+5. **Mid-execution progress updates** (`BaseNode.publish_update_to_parameter`): suppresses before building `ParameterValueUpdateEvent`. This method also writes `parameter_output_values`, so one call emits two events; without suppression the second overwrites the template the first just set.
+6. **Group / worker copy-back** (`node_executor.execute`): writes land in `parameter_output_values` **after** `aprocess_scope` has exited, so the `__setitem__` guard must not be gated on `_in_aprocess`.
 
 `get_display_value_for_output()` returns the stored template when:
 - parameter has `ParameterMode.PROPERTY` in its allowed modes, AND
@@ -148,6 +150,20 @@ The UI must always show the template the user typed (`{SHOT}`), not the resolved
 - the resolved output differs from the template
 
 It is read-only — it never modifies `parameter_output_values`.
+
+### Never write a resolved value into `parameter_values`
+
+Display suppression reads the template out of `parameter_values`. A caller that copies execution results back onto a node and routes them through `set_parameter_value` (or `SetParameterValueRequest`) destroys that template, and the loss is permanent rather than cosmetic: a browser refresh cannot recover it, and the next save persists the substituted string.
+
+Copy-back sites guard with `BaseNode.should_preserve_stored_template()` and write to `parameter_output_values` only:
+
+```python
+if not target_node.should_preserve_stored_template(target_param_name, param_value):
+    target_node.set_parameter_value(target_param_name, param_value)
+target_node.parameter_output_values[target_param_name] = param_value
+```
+
+Both `should_preserve_stored_template()` and `get_display_value_for_output()` delegate to `_variable_template_to_preserve()`, so the predicate and the display value cannot drift apart. Current call sites: `_apply_last_iteration_to_packaged_nodes` (parallel-loop path) and `_apply_parameter_values_to_node` (sequential group / subflow path).
 
 ## Worker-side variable seeding
 

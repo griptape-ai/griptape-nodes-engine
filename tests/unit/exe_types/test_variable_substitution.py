@@ -6,6 +6,8 @@ from unittest.mock import MagicMock, patch
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import TrackedParameterOutputValues, aprocess_scope
+from griptape_nodes.retained_mode.events.execution_events import ParameterValueUpdateEvent
+from griptape_nodes.retained_mode.events.parameter_events import AlterElementEvent
 from griptape_nodes.retained_mode.events.variable_events import (
     ListVariablesRequest,
     ListVariablesResultSuccess,
@@ -95,6 +97,11 @@ def _display_value_from_event(captured: list) -> object:
     return captured[0].wrapped_event.payload.element_details["value"]
 
 
+def _payloads_of_type(captured: list, payload_type: type) -> list:
+    """All captured payloads of a given event type, in emission order."""
+    return [e.wrapped_event.payload for e in captured if isinstance(e.wrapped_event.payload, payload_type)]
+
+
 def _run_tracked_set(
     node: MockNode,
     param_name: str,
@@ -136,6 +143,29 @@ def _run_tracked_set(
             tracked[param_name] = value
 
     return captured, tracked
+
+
+def _run_publish_update(
+    node: MockNode,
+    param_name: str,
+    value: object,
+    *,
+    in_aprocess: bool,
+) -> list:
+    """Call publish_update_to_parameter and return the captured put_event calls."""
+    captured: list = []
+    minimal_mock = MagicMock()
+    minimal_mock.EventManager.return_value.put_event.side_effect = captured.append
+    ctx: Any = patch(_GN_PATCH, minimal_mock)
+
+    if in_aprocess:
+        with ctx, aprocess_scope():
+            node.publish_update_to_parameter(param_name, value)
+    else:
+        with ctx:
+            node.publish_update_to_parameter(param_name, value)
+
+    return captured
 
 
 class TestVariableSubstitutionDuringExecution:
@@ -368,15 +398,32 @@ class TestTrackedOutputValuesDisplayDuringSubstitution:
 
         assert _display_value_from_event(captured) == expected_count
 
-    def test_ui_suppression_only_active_during_aprocess(self) -> None:
-        """Outside aprocess, the computed value is always emitted as-is."""
+    def test_ui_shows_template_outside_aprocess(self) -> None:
+        """Suppression must not depend on aprocess_scope.
+
+        The orchestrator copies worker/group outputs back into
+        parameter_output_values *after* aprocess_scope has exited. Gating
+        suppression on _in_aprocess made that copy-back emit the resolved
+        value, so a node inside a ForEach/ForLoop group showed the last
+        iteration's substituted text instead of the template.
+        """
         node = MockNode(name="mock_node")
         node.add_parameter(_make_property_output_param("text", "{SHOT}"))
         node.parameter_values["text"] = "{SHOT}"
 
         captured, _ = _run_tracked_set(node, "text", "sc001", in_aprocess=False)
 
-        assert _display_value_from_event(captured) == "sc001"
+        assert _display_value_from_event(captured) == "{SHOT}"
+
+    def test_stored_output_keeps_resolved_value_outside_aprocess(self) -> None:
+        """Suppression is display-only: the copied-back output value is untouched."""
+        node = MockNode(name="mock_node")
+        node.add_parameter(_make_property_output_param("text", "{SHOT}"))
+        node.parameter_values["text"] = "{SHOT}"
+
+        _, tracked = _run_tracked_set(node, "text", "sc001", in_aprocess=False)
+
+        assert tracked["text"] == "sc001"
 
     def test_ui_shows_computed_when_raw_matches_output(self) -> None:
         """If the output value equals the raw template, no suppression — show normally."""
@@ -569,6 +616,82 @@ class TestGetDisplayValueForOutput:
 
         assert display == raw
         assert node.parameter_output_values["data"] == substituted
+
+
+class TestPublishUpdateToParameterDisplay:
+    """publish_update_to_parameter must not leak the resolved value to the UI.
+
+    It emits two events for one call: writing parameter_output_values fires the
+    guarded AlterElementEvent, then ParameterValueUpdateEvent follows. If the
+    second one carries the raw value it overwrites the template the first one
+    just set, so both have to agree.
+    """
+
+    def test_parameter_value_update_event_shows_template(self) -> None:
+        node = MockNode(name="mock_node")
+        node.add_parameter(_make_property_output_param("text", "{SHOT}"))
+        node.parameter_values["text"] = "{SHOT}"
+
+        captured = _run_publish_update(node, "text", "sc001", in_aprocess=True)
+
+        updates = _payloads_of_type(captured, ParameterValueUpdateEvent)
+        assert [u.value for u in updates] == ["{SHOT}"]
+
+    def test_all_emitted_events_agree_on_the_template(self) -> None:
+        """No event in the batch may carry the resolved value, whatever the order."""
+        node = MockNode(name="mock_node")
+        node.add_parameter(_make_property_output_param("text", "{SHOT}"))
+        node.parameter_values["text"] = "{SHOT}"
+
+        captured = _run_publish_update(node, "text", "sc001", in_aprocess=True)
+
+        alters = _payloads_of_type(captured, AlterElementEvent)
+        updates = _payloads_of_type(captured, ParameterValueUpdateEvent)
+        assert [a.element_details["value"] for a in alters] == ["{SHOT}"]
+        assert [u.value for u in updates] == ["{SHOT}"]
+
+    def test_stored_output_keeps_resolved_value(self) -> None:
+        """Suppression is display-only: downstream nodes still get the resolved value."""
+        node = MockNode(name="mock_node")
+        node.add_parameter(_make_property_output_param("text", "{SHOT}"))
+        node.parameter_values["text"] = "{SHOT}"
+
+        _run_publish_update(node, "text", "sc001", in_aprocess=True)
+
+        assert node.parameter_output_values["text"] == "sc001"
+
+    def test_shows_template_outside_aprocess(self) -> None:
+        """Group/worker execution publishes after aprocess_scope has exited."""
+        node = MockNode(name="mock_node")
+        node.add_parameter(_make_property_output_param("text", "{SHOT}"))
+        node.parameter_values["text"] = "{SHOT}"
+
+        captured = _run_publish_update(node, "text", "sc001", in_aprocess=False)
+
+        updates = _payloads_of_type(captured, ParameterValueUpdateEvent)
+        assert [u.value for u in updates] == ["{SHOT}"]
+
+    def test_computed_value_published_when_no_template(self) -> None:
+        """Parameters without a macro publish their real value as before."""
+        expected = 3
+        node = MockNode(name="mock_node")
+        node.add_parameter(
+            Parameter(
+                name="index_count",
+                default_value=0,
+                input_types=["int"],
+                output_type="int",
+                type="int",
+                allowed_modes={ParameterMode.OUTPUT, ParameterMode.PROPERTY},
+                tooltip="test",
+            )
+        )
+        node.parameter_values["index_count"] = 0
+
+        captured = _run_publish_update(node, "index_count", expected, in_aprocess=True)
+
+        updates = _payloads_of_type(captured, ParameterValueUpdateEvent)
+        assert [u.value for u in updates] == [expected]
 
 
 class TestVariableSubstitutionDisableToggle:

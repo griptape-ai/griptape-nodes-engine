@@ -115,6 +115,11 @@ _sanctioned_mutation: ContextVar[bool] = ContextVar("_node_types_sanctioned_muta
 # the broader RUNTIME_EXECUTE scope would false-positive on every such node.
 _in_aprocess: ContextVar[bool] = ContextVar("_node_types_in_aprocess", default=False)
 
+# Sentinel returned by BaseNode._variable_template_to_preserve when a resolved
+# output value needs no display suppression. A dedicated sentinel is required
+# because None is itself a legitimate stored template value to compare against.
+_NO_TEMPLATE_TO_PRESERVE = object()
+
 
 @contextmanager
 def sanctioned_parameter_mutation() -> Iterator[None]:
@@ -1330,11 +1335,14 @@ class BaseNode(ABC):
         if parameter:
             data_type = parameter.type
             self.parameter_output_values[parameter_name] = value
+            # The write above already emitted a display-suppressed AlterElementEvent.
+            # Suppress here too, or this event lands second and overwrites the
+            # template the UI was just told to keep.
             payload = ParameterValueUpdateEvent(
                 node_name=self.name,
                 parameter_name=parameter_name,
                 data_type=data_type,
-                value=safe_unstructure(value),
+                value=safe_unstructure(self.get_display_value_for_output(parameter_name, value)),
             )
 
             GriptapeNodes.EventManager().put_event(
@@ -1516,27 +1524,52 @@ class BaseNode(ABC):
             return text
         return VariableResolver.resolve_string(text, variables, self.name)
 
+    def _variable_template_to_preserve(self, parameter_name: str, output_value: Any) -> Any:
+        """Return the stored {VAR} template that must survive `output_value`.
+
+        Returns the ``_NO_TEMPLATE_TO_PRESERVE`` sentinel when the resolved
+        output can be used as-is. Single source of truth for both display
+        suppression and for callers that write execution results back onto a
+        node.
+
+        Honors the per-workflow substitution toggle: when substitution is disabled
+        the template never stands in for the real output.
+        """
+        if not VariableResolver.is_substitution_enabled():
+            return _NO_TEMPLATE_TO_PRESERVE
+        parameter = self.get_parameter_by_name(parameter_name)
+        if parameter is None:
+            return _NO_TEMPLATE_TO_PRESERVE
+        if ParameterMode.PROPERTY not in parameter.allowed_modes:
+            return _NO_TEMPLATE_TO_PRESERVE
+        raw_value = self.parameter_values.get(parameter_name, parameter.default_value)
+        if VariableResolver.contains_variable_macro(raw_value) and raw_value != output_value:
+            return raw_value
+        return _NO_TEMPLATE_TO_PRESERVE
+
     def get_display_value_for_output(self, parameter_name: str, output_value: Any) -> Any:
         """Return the UI display value for an output parameter.
 
         For PROPERTY parameters whose stored template contains a variable macro
         and the output differs from the template, returns the template so users
         always see and can edit the {VAR} syntax rather than the resolved value.
-
-        Honors the per-workflow substitution toggle: when substitution is disabled
-        the template is never shown in place of the real output.
         """
-        if not VariableResolver.is_substitution_enabled():
+        template = self._variable_template_to_preserve(parameter_name, output_value)
+        if template is _NO_TEMPLATE_TO_PRESERVE:
             return output_value
-        parameter = self.get_parameter_by_name(parameter_name)
-        if parameter is None:
-            return output_value
-        if ParameterMode.PROPERTY not in parameter.allowed_modes:
-            return output_value
-        raw_value = self.parameter_values.get(parameter_name, parameter.default_value)
-        if VariableResolver.contains_variable_macro(raw_value) and raw_value != output_value:
-            return raw_value
-        return output_value
+        return template
+
+    def should_preserve_stored_template(self, parameter_name: str, output_value: Any) -> bool:
+        """Whether writing `output_value` into stored state would destroy a {VAR} template.
+
+        ``parameter_values`` is where ``get_display_value_for_output`` reads the
+        template from, so a caller that copies execution results back onto a node
+        must not route a resolved value through ``set_parameter_value`` when this
+        returns True -- doing so makes the loss permanent rather than cosmetic
+        (a browser refresh cannot recover it, and a save persists the substituted
+        string). Such callers should write to ``parameter_output_values`` only.
+        """
+        return self._variable_template_to_preserve(parameter_name, output_value) is not _NO_TEMPLATE_TO_PRESERVE
 
     def _report_parameter_mutation_if_in_aprocess(self, *, parameter_name: str, mutation: str) -> None:
         """Report parameter-mutation-during-aprocess when a node mutates its own params directly.
@@ -1819,8 +1852,16 @@ class TrackedParameterOutputValues(dict[str, Any]):
             # typed. Only suppress when substitution actually changed the value
             # (raw contains "{" and differs from the output); other PROPERTY|OUTPUT
             # parameters like loop counters show their computed value normally.
+            #
+            # Deliberately NOT gated on _in_aprocess: the orchestrator copies
+            # worker/group outputs back into parameter_output_values after
+            # aprocess_scope has exited, so gating here let a node inside a
+            # ForEach/ForLoop group display the last iteration's resolved text.
+            # get_display_value_for_output is itself narrow enough to be safe
+            # unconditionally -- it only substitutes for a PROPERTY parameter
+            # whose stored value contains a macro and differs from the output.
             display_value = value
-            if not deleted and _in_aprocess.get():
+            if not deleted:
                 display_value = self._node.get_display_value_for_output(parameter_name, value)
             event_data["value"] = display_value
 

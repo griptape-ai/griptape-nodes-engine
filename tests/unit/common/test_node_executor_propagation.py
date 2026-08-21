@@ -16,10 +16,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from griptape_nodes.common.node_executor import NodeExecutor
+from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import TrackedParameterOutputValues
 from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeResultSuccess
+from tests.unit.exe_types.mocks import MockNode
 
 _EXPECTED_FRESH_OUTPUT_EMITS = 2
+
+# GriptapeNodes is lazy-imported inside the event emitters; patch it at the
+# source module so those imports pick up the mock at call time.
+_GN_PATCH = "griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes"
 
 
 def _make_executor() -> NodeExecutor:
@@ -101,3 +107,94 @@ class TestLocalExecuteCopyBack:
         # Two fresh keys; each __setitem__ sees old_value None != new_value.
         assert mock_emit.call_count == _EXPECTED_FRESH_OUTPUT_EMITS
         assert node.parameter_output_values == {"a": 1, "b": 2}
+
+
+def _make_template_node(name: str = "PromptNode", template: str = "{SHOT}") -> MockNode:
+    """Real node whose PROPERTY|OUTPUT parameter holds a variable template."""
+    node = MockNode(name=name)
+    node.add_parameter(
+        Parameter(
+            name="prompt",
+            default_value=template,
+            input_types=["str"],
+            output_type="str",
+            type="str",
+            allowed_modes={ParameterMode.OUTPUT, ParameterMode.PROPERTY},
+            tooltip="test",
+        )
+    )
+    node.parameter_values["prompt"] = template
+    return node
+
+
+def _make_end_mapping(sanitized_name: str, node_name: str, param_name: str) -> MagicMock:
+    mapping = MagicMock()
+    mapping.node_name = node_name
+    mapping.parameter_name = param_name
+    package_result = MagicMock()
+    end_mapping = MagicMock()
+    end_mapping.parameter_mappings = {sanitized_name: mapping}
+    package_result.parameter_name_mappings = [MagicMock(), end_mapping]
+    return package_result
+
+
+class TestGroupCopyBackPreservesTemplate:
+    """Group/loop copy-back must never write a resolved value into parameter_values.
+
+    parameter_values is where get_display_value_for_output reads the template
+    from, so overwriting it destroys the user's `{VAR}` text permanently -- a
+    browser refresh cannot bring it back and a save persists the substituted
+    string.
+    """
+
+    def test_last_iteration_does_not_overwrite_stored_template(self) -> None:
+        node = _make_template_node()
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        mock_engine.node_manager.get_node_by_name.return_value = node
+        package_result = _make_end_mapping("PromptNode_prompt", "PromptNode", "prompt")
+
+        with patch(_GN_PATCH, MagicMock()):
+            executor._apply_last_iteration_to_packaged_nodes({"PromptNode_prompt": "hyperreal"}, package_result)
+
+        assert node.parameter_values["prompt"] == "{SHOT}"
+
+    def test_last_iteration_still_applies_the_output_value(self) -> None:
+        """The resolved value must still land in parameter_output_values."""
+        node = _make_template_node()
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        mock_engine.node_manager.get_node_by_name.return_value = node
+        package_result = _make_end_mapping("PromptNode_prompt", "PromptNode", "prompt")
+
+        with patch(_GN_PATCH, MagicMock()):
+            executor._apply_last_iteration_to_packaged_nodes({"PromptNode_prompt": "hyperreal"}, package_result)
+
+        assert node.parameter_output_values["prompt"] == "hyperreal"
+
+    def test_last_iteration_still_writes_non_template_values(self) -> None:
+        """Parameters without a macro keep the existing write-through behaviour."""
+        node = _make_template_node(template="plain text")
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        mock_engine.node_manager.get_node_by_name.return_value = node
+        package_result = _make_end_mapping("PromptNode_prompt", "PromptNode", "prompt")
+
+        with patch(_GN_PATCH, MagicMock()):
+            executor._apply_last_iteration_to_packaged_nodes({"PromptNode_prompt": "hyperreal"}, package_result)
+
+        assert node.parameter_values["prompt"] == "hyperreal"
+
+    def test_apply_parameter_values_does_not_overwrite_stored_template(self) -> None:
+        """The sequential-group copy-back has the same hazard via a set-value request."""
+        node = _make_template_node()
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        package_result = _make_end_mapping("PromptNode_prompt", "PromptNode", "prompt")
+
+        with patch(_GN_PATCH, MagicMock()):
+            executor._apply_parameter_values_to_node(node, {"PromptNode_prompt": "hyperreal"}, package_result)
+
+        mock_engine.node_manager.on_set_parameter_value_request.assert_not_called()
+        assert node.parameter_values["prompt"] == "{SHOT}"
+        assert node.parameter_output_values["prompt"] == "hyperreal"
