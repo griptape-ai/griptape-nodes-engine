@@ -679,9 +679,15 @@ class WorkflowManager(EngineScoped):
             # clear_user_workflows above spares only entries marked is_griptape_provided, and the
             # workspace scan deliberately skips library directories, so without this a template
             # without that flag would vanish here and never come back. Doing it inside the gate
-            # means no caller sees the registry mid-rebuild. Idempotent -- a template still in
-            # the registry comes back already-registered, so it is neither re-recorded nor
-            # re-announced.
+            # means no caller sees the registry mid-rebuild. Safe to repeat: LibraryManager
+            # rebuilds each library's templates from scratch, so a second refresh leaves the
+            # same keys registered rather than a second copy of each.
+            #
+            # Reaching into LibraryManager's private method is deliberate. Which templates a
+            # library ships, and which registry keys it currently owns, is LibraryManager's
+            # bookkeeping; this manager only knows that it just emptied the registry and has to
+            # ask for them back. Only the rebuild paths inside LibraryManager and this one line
+            # call it, so it stays private rather than becoming part of the manager's contract.
             await self.engine.library_manager._register_all_library_workflow_files()
         finally:
             self._workflows_loading_complete.set()
