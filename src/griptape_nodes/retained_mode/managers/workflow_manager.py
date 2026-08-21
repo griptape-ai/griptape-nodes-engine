@@ -25,6 +25,7 @@ from rich.text import Text
 
 from griptape_nodes.common.macro_parser import MacroSyntaxError, MacroVariables, ParsedMacro
 from griptape_nodes.common.project_templates.situation import BuiltInSituation, SituationFilePolicy
+from griptape_nodes.common.project_templates.situation_resolver import SITUATION_TO_FILE_POLICY
 from griptape_nodes.exe_types.core_types import ParameterTypeBuiltin
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_types import BaseNode, EndNode, StartNode
@@ -35,7 +36,7 @@ from griptape_nodes.files.path_utils import (
     derive_registry_key,
     resolve_workspace_path,
 )
-from griptape_nodes.files.project_file import SITUATION_TO_FILE_POLICY, ProjectFileDestination
+from griptape_nodes.files.project_file import ProjectFileDestination
 from griptape_nodes.node_library.workflow_registry import (
     Workflow,
     WorkflowMetadata,
