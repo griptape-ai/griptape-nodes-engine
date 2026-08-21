@@ -11,6 +11,8 @@ release, and lease-loss handling.
 from __future__ import annotations
 
 import asyncio
+import os
+import signal
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -700,3 +702,52 @@ class TestSessionLiveness:
             assert not terminated.is_set()
         finally:
             monitor.cancel()
+
+
+class TestGracefulTermination:
+    """How a managed engine ends its own life (design 4.5, 8.4).
+
+    The exit must be graceful on EVERY platform: the watchdog releases the
+    lease with memory teardown on the way out, so the next artist is admitted
+    into a box that is actually free.
+    """
+
+    @pytest.mark.asyncio
+    async def test_shutdown_hook_is_preferred_over_signalling(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A registered host shutdown wins, and no signal is sent.
+
+        os.kill(SIGTERM) is a graceful request only on POSIX; on Windows it is
+        an unconditional TerminateProcess with no handler, so the lease release
+        and teardown would be skipped. Hosts register their own cooperative
+        shutdown to make the path portable.
+        """
+        manager, _, _ = make_manager(engine, monkeypatch)
+        reasons: list[str] = []
+        manager.set_shutdown_hook(reasons.append)
+
+        killed: list[tuple[int, int]] = []
+        monkeypatch.setattr("os.kill", lambda pid, sig: killed.append((pid, sig)))
+        # The escalation sleep would otherwise hold the test for 15s; stub the
+        # forced exit so only the request path is exercised.
+        monkeypatch.setattr(ExecutionLeaseManager, "_TERMINATE_ESCALATION_S", 0.01)
+        monkeypatch.setattr("os._exit", lambda _code: None)
+
+        await manager._terminate_process("session heartbeats stopped")
+
+        assert reasons == ["session heartbeats stopped"]
+        assert killed == []
+
+    @pytest.mark.asyncio
+    async def test_without_a_hook_it_signals_itself(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The fallback stays: an embedder with no cooperative shutdown."""
+        manager, _, _ = make_manager(engine, monkeypatch)
+        killed: list[tuple[int, int]] = []
+        monkeypatch.setattr("os.kill", lambda pid, sig: killed.append((pid, sig)))
+        monkeypatch.setattr(ExecutionLeaseManager, "_TERMINATE_ESCALATION_S", 0.01)
+        monkeypatch.setattr("os._exit", lambda _code: None)
+
+        await manager._terminate_process()
+
+        assert killed == [(os.getpid(), signal.SIGTERM)]

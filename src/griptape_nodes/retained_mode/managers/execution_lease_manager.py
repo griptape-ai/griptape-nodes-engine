@@ -124,6 +124,11 @@ class ExecutionLeaseManager(EngineScoped):
     def __init__(self, *, engine: Engine) -> None:
         super().__init__(engine)
         self._transport: _LeaseTransport | None = None
+        # How to ask this process to shut down gracefully. The host registers
+        # its own cooperative shutdown (see set_shutdown_hook); the fallback
+        # signals ourselves, which is correct on POSIX but on Windows means
+        # TerminateProcess -- no lease release, no teardown.
+        self._shutdown_hook: Callable[[str], None] | None = None
 
         # The held lease id, or None. Guarded by _state_lock together with
         # _acquire_pending so concurrent gate calls serialize their decisions.
@@ -202,6 +207,27 @@ class ExecutionLeaseManager(EngineScoped):
         gate call on an enabled engine fails closed.
         """
         self._transport = _LeaseTransport(send_request=send_request, send_no_response=send_no_response)
+
+    def set_shutdown_hook(self, hook: Callable[[str], None]) -> None:
+        """Register how this process shuts itself down gracefully.
+
+        A managed engine ends its own life when its artist or its balancer goes
+        away (design 4.5, 8.4), and that exit must be GRACEFUL: the watchdog
+        releases the lease with memory teardown on the way out, so the next
+        artist is admitted into a box that is actually free.
+
+        The default path signals ourselves with SIGTERM, which the host turns
+        into a cooperative shutdown -- correct on POSIX, but on Windows
+        `os.kill` with anything but a CTRL_* event is TerminateProcess, an
+        unconditional kill with no handler and therefore no release and no
+        teardown. Hosts that own a cooperative shutdown register it here so
+        every platform gets the same graceful path.
+
+        Args:
+            hook: Called with a short reason; must initiate (not await) an
+                orderly shutdown of this process.
+        """
+        self._shutdown_hook = hook
 
     async def gate_execution_start(self, *, scope: str = "workflow") -> None:
         """Acquire the execution lease; called exactly where a run is about to start.
@@ -599,9 +625,19 @@ class ExecutionLeaseManager(EngineScoped):
     def _on_balancer_heartbeat(self, _event: Any) -> None:
         self._balancer_last_seen = time.monotonic()
 
-    async def _terminate_process(self) -> None:
-        """Ask this process to shut down; force the exit if that wedges."""
-        os.kill(os.getpid(), signal.SIGTERM)
+    async def _terminate_process(self, reason: str = "managed engine lifetime ended") -> None:
+        """Ask this process to shut down; force the exit if that wedges.
+
+        Prefers the host's cooperative shutdown (portable, and the only
+        graceful option on Windows); falls back to signalling ourselves when no
+        host registered one. Either way the escalation timer below guarantees
+        the process dies, so a wedged shutdown cannot leave an engine holding
+        GPU memory on a box the balancer has already written off.
+        """
+        if self._shutdown_hook is not None:
+            self._shutdown_hook(reason)
+        else:
+            os.kill(os.getpid(), signal.SIGTERM)
         await asyncio.sleep(ExecutionLeaseManager._TERMINATE_ESCALATION_S)
         logger.critical("Graceful shutdown did not complete; forcing exit.")
         os._exit(1)
