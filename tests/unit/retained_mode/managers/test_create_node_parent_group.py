@@ -190,3 +190,48 @@ class TestAddNodesToGroupMechanism:
 
         parent_group_name = node.parent_group.name if node.parent_group else None
         assert parent_group_name is None
+
+
+class TestCreateNodeWithUnresolvableParentGroup:
+    """An unresolvable parent_group_name must degrade to an ungrouped node, not blow up the request.
+
+    `NodeManager.get_node_by_name` signals a missing node with ValueError, so catching KeyError here
+    let that ValueError escape on_create_node_request entirely: the caller got an exception instead of
+    a result, and the node — already registered — was left orphaned.
+    """
+
+    def _bootstrap(self, griptape_nodes: GriptapeNodes) -> None:
+        from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
+
+        griptape_nodes.ContextManager().push_workflow("parent_group_wf")
+        result = griptape_nodes.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="parent_group_flow", set_as_new_context=True)
+        )
+        assert isinstance(result, CreateFlowResultSuccess)
+
+    def test_missing_parent_group_still_returns_success(self, griptape_nodes: GriptapeNodes) -> None:
+        """A parent_group_name naming nothing is logged and skipped; creation still succeeds."""
+        self._bootstrap(griptape_nodes)
+
+        result = griptape_nodes.handle_request(
+            CreateNodeRequest(node_type="Note", node_name="Orphan", parent_group_name="NoSuchGroup")
+        )
+
+        assert isinstance(result, CreateNodeResultSuccess), result
+        assert result.parent_group_name is None
+        node = griptape_nodes.NodeManager().get_node_by_name(result.node_name)
+        assert node.parent_group is None
+
+    def test_parent_group_name_that_is_not_a_group_still_returns_success(self, griptape_nodes: GriptapeNodes) -> None:
+        """Pointing parent_group_name at an ordinary node is refused without failing the create."""
+        self._bootstrap(griptape_nodes)
+
+        existing = griptape_nodes.handle_request(CreateNodeRequest(node_type="Note", node_name="PlainNode"))
+        assert isinstance(existing, CreateNodeResultSuccess)
+
+        result = griptape_nodes.handle_request(
+            CreateNodeRequest(node_type="Note", node_name="Orphan", parent_group_name=existing.node_name)
+        )
+
+        assert isinstance(result, CreateNodeResultSuccess), result
+        assert result.parent_group_name is None

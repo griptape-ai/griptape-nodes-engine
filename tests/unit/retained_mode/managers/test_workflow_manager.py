@@ -602,11 +602,15 @@ class TestWorkflowManager:
             patch.object(context_mgr, "has_current_workflow", return_value=True),
             patch.object(context_mgr, "get_current_workflow_name", return_value="my_workflow"),
             patch.object(context_mgr, "set_current_workflow_name") as mock_set_name,
+            patch.object(context_mgr, "set_current_workflow_file_path") as mock_set_file_path,
         ):
             result = workflow_manager.on_move_workflow_request(request)
 
         assert isinstance(result, MoveWorkflowResultSuccess)
         mock_set_name.assert_called_once_with("subdir/my_workflow")
+        # The retained path travels with the key: `workflow_dir` reads it in preference to the
+        # registry, so a rekey without a repoint leaves the builtin on the pre-move directory.
+        mock_set_file_path.assert_called_once_with(str(config_mgr.workspace_path / "subdir" / "my_workflow.py"))
 
     def test_on_move_workflow_request_does_not_update_context_for_other_workflow(self, griptape_nodes: Engine) -> None:
         workflow_manager = griptape_nodes.WorkflowManager()
@@ -633,6 +637,58 @@ class TestWorkflowManager:
 
         assert isinstance(result, MoveWorkflowResultSuccess)
         mock_set_name.assert_not_called()
+
+    def test_on_move_workflow_request_updates_context_file_path_for_current_workflow(
+        self, griptape_nodes: Engine, tmp_path: Path
+    ) -> None:
+        """Moving the open workflow repoints the context's retained path at the new directory.
+
+        `workflow_dir` answers from the retained path in preference to the registry, so a Move
+        that rekeys the registry but leaves that path alone keeps resolving `{workflow_dir?:/}`
+        against the folder the file just left -- media written and read somewhere the workflow
+        no longer lives, with no error. Driven against the real registry and filesystem because
+        the bug is precisely that the two disagree.
+        """
+        from datetime import UTC, datetime
+
+        from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
+
+        workflow_manager = griptape_nodes.WorkflowManager()
+        context_manager = griptape_nodes.ContextManager()
+        config_manager = griptape_nodes.ConfigManager()
+
+        workspace = tmp_path.resolve()
+        (workspace / "my_workflow.py").write_text("# stub")
+        metadata = WorkflowMetadata(
+            name="my_workflow",
+            schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
+            engine_version_created_with="test",
+            node_libraries_referenced=[],
+            creation_date=datetime.now(UTC),
+        )
+
+        original_workspace = config_manager.workspace_path
+        config_manager.workspace_path = workspace
+        try:
+            with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+                WorkflowRegistry.generate_new_workflow(
+                    registry_key="my_workflow", metadata=metadata, file_path="my_workflow.py"
+                )
+                context_manager.push_workflow(workflow_name="my_workflow")
+                try:
+                    result = workflow_manager.on_move_workflow_request(
+                        MoveWorkflowRequest(workflow_name="my_workflow", target_directory="subdir")
+                    )
+
+                    assert isinstance(result, MoveWorkflowResultSuccess)
+                    assert context_manager.get_current_workflow_name() == "subdir/my_workflow"
+                    assert context_manager.get_current_workflow_file_path() == str(
+                        workspace / "subdir" / "my_workflow.py"
+                    )
+                finally:
+                    context_manager.pop_workflow()
+        finally:
+            config_manager.workspace_path = original_workspace
 
     # --- Save workflow: unsaved -> saved transition ---
 
@@ -735,6 +791,10 @@ class TestWorkflowManager:
 
                 # Context stack: the active workflow name is the new key
                 assert context_manager.get_current_workflow_name() == saved_key
+                # ...and it now carries the location it gained by being saved. `workflow_dir`
+                # prefers this over a registry lookup, and the lookup is what goes stale on the
+                # next project switch.
+                assert context_manager.get_current_workflow_file_path() == str(saved_full_path)
             finally:
                 if context_manager.has_current_workflow():
                     context_manager.pop_workflow()
@@ -995,6 +1055,33 @@ class TestWorkflowManager:
         # The new absolute path is handed to the external-registration helper.
         persist_calls = captured["persist_calls"]
         assert persist_calls == [call("/ext/new_name.py")]
+
+    def test_rename_updates_context_file_path(self, griptape_nodes: Engine) -> None:
+        """Renaming the open workflow moves the context's retained path onto the new file.
+
+        Rename keeps the directory, so `workflow_dir` survives either way; the path itself would
+        otherwise keep naming a file that no longer exists on disk.
+        """
+        context_manager = griptape_nodes.ContextManager()
+
+        context_manager.push_workflow(workflow_name="bar/workflow")
+        context_manager.set_current_workflow_file_path("/workspace/bar/workflow.py")
+        try:
+            self._run_rename(
+                griptape_nodes.WorkflowManager(),
+                self._RenameScenario(
+                    workflow_name="bar/workflow",
+                    requested_name="new_name",
+                    source_file_path="bar/workflow.py",
+                    save_file_path="/workspace/bar/new_name.py",
+                    save_workflow_name="bar/new_name",
+                ),
+            )
+
+            assert context_manager.get_current_workflow_name() == "bar/new_name"
+            assert context_manager.get_current_workflow_file_path() == "/workspace/bar/new_name.py"
+        finally:
+            context_manager.pop_workflow()
 
     def test_rename_returns_new_registry_key(self, griptape_nodes: Engine) -> None:
         """The returned new_workflow_name is the real directory-qualified key, not the bare stem."""

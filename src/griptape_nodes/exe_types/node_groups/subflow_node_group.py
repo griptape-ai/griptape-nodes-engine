@@ -25,7 +25,16 @@ from griptape_nodes.retained_mode.events.connection_events import (
     DeleteConnectionRequest,
     DeleteConnectionResultSuccess,
 )
-from griptape_nodes.retained_mode.events.flow_events import DeleteFlowRequest, DeleteFlowResultFailure
+from griptape_nodes.retained_mode.events.flow_events import (
+    CreateFlowRequest,
+    CreateFlowResultSuccess,
+    DeleteFlowRequest,
+    DeleteFlowResultFailure,
+)
+from griptape_nodes.retained_mode.events.node_events import (
+    MoveNodeToNewFlowRequest,
+    MoveNodeToNewFlowResultSuccess,
+)
 from griptape_nodes.retained_mode.events.parameter_events import (
     AddParameterToNodeRequest,
     AddParameterToNodeResultSuccess,
@@ -43,6 +52,17 @@ logger = logging.getLogger("griptape_nodes")
 NODE_GROUP_FLOW = "NodeGroupFlow"
 LEFT_PARAMETERS_KEY = "left_parameters"
 RIGHT_PARAMETERS_KEY = "right_parameters"
+
+
+class NodeGroupMembershipError(Exception):
+    """A group could not take on or release a node.
+
+    Changing a subflow group's membership means moving nodes between Flows, and any of those moves
+    can be refused. Raising this specific type lets the rollback paths catch exactly the failures
+    the moves report, rather than every ValueError coming out of the request handlers they call
+    into. The message is user-facing and reaches the editor as the reason the change was refused,
+    so phrase it as "Attempted to X. Failed because Y."
+    """
 
 
 class SubflowNodeGroup(BaseNodeGroup, ABC):
@@ -102,40 +122,63 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         self._add_subflow_execution_parameters()
 
     def _create_subflow(self) -> None:
-        """Create a dedicated subflow for this NodeGroup's nodes.
+        """Create the dedicated subflow that will hold this NodeGroup's nodes.
 
-        Note: This is called during __init__, so the node may not yet be added to a flow.
-        The subflow will be created without a parent initially, and can be reparented later.
+        Called on demand from add_nodes_to_group, the first time this group is given anything to
+        hold, so the group already knows where it lives and which group (if any) encloses it. That
+        is what lets _get_subflow_parent_flow_name put the subflow in the right place immediately
+        rather than parenting it arbitrarily and reparenting it later.
+
+        Raises:
+            RuntimeError: If the subflow could not be created
         """
-        from griptape_nodes.retained_mode.events.flow_events import (
-            CreateFlowRequest,
-            CreateFlowResultSuccess,
-        )
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
         subflow_name = f"{self.name}_subflow"
         self.metadata["subflow_name"] = subflow_name
-
-        # Get current flow to set as parent so subflow will be serialized with parent
-        current_flow = GriptapeNodes.ContextManager().get_current_flow()
-        parent_flow_name = current_flow.name if current_flow else None
 
         # Create metadata with flow_type
         subflow_metadata = {"flow_type": NODE_GROUP_FLOW}
 
         request = CreateFlowRequest(
             flow_name=subflow_name,
-            parent_flow_name=parent_flow_name,
+            parent_flow_name=self._get_subflow_parent_flow_name(),
             set_as_new_context=False,
             metadata=subflow_metadata,
         )
         result = GriptapeNodes.handle_request(request)
-        if isinstance(result, CreateFlowResultSuccess):
-            # Final name may be different that initial name due to de-dupe.
-            self.metadata["subflow_name"] = result.flow_name
-
         if not isinstance(result, CreateFlowResultSuccess):
+            # Drop the name we optimistically recorded: no such flow exists, and leaving it set
+            # makes every later lookup point at a phantom flow.
+            self.metadata.pop("subflow_name", None)
+            # The engine-side detail goes to the log; the raised message stays readable, since it
+            # surfaces in the editor as the reason the group could not be filled.
             logger.warning("%s failed to create subflow '%s': %s", self.name, subflow_name, result.result_details)
+            msg = f"Attempted to create the group '{self.name}'. Failed because the space to hold its nodes could not be created."
+            raise RuntimeError(msg)  # noqa: TRY004 - the request failed at runtime; this is not a type error.
+
+        # Final name may be different that initial name due to de-dupe.
+        self.metadata["subflow_name"] = result.flow_name
+
+    def _get_subflow_parent_flow_name(self) -> str | None:
+        """Pick the flow that should own this group's subflow.
+
+        When this group is nested, its subflow belongs under the enclosing group's subflow so the
+        flow hierarchy mirrors the nesting. Otherwise it goes under the flow that is currently
+        being built, matching where the group node itself lives.
+
+        Returns:
+            The parent flow name, or None to let the engine parent it to the current context
+        """
+        parent_group = self.parent_group
+        if isinstance(parent_group, SubflowNodeGroup):
+            enclosing_subflow_name = parent_group.metadata.get("subflow_name")
+            if isinstance(enclosing_subflow_name, str):
+                return enclosing_subflow_name
+
+        # A group can be built with no Flow on the context stack, so this may find nothing.
+        context_manager = GriptapeNodes.ContextManager()
+        if not context_manager.has_current_flow():
+            return None
+        return context_manager.get_current_flow().name
 
     def _add_start_flow_parameters(self) -> None:
         """Add parameters from all registered StartFlow nodes to this SubflowNodeGroup.
@@ -325,11 +368,20 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         return proxy_param
 
     def get_all_nodes(self) -> dict[str, BaseNode]:
-        all_nodes = {}
+        """Collect this group's members and every node nested beneath them, at any depth.
+
+        Recurses through nested groups rather than descending a single level, so callers that
+        package a group for execution (remote/private/iterative) see the whole body instead of
+        silently dropping nodes below depth 2.
+
+        Returns:
+            All nested nodes keyed by name, including the nested groups themselves
+        """
+        all_nodes: dict[str, BaseNode] = {}
         for node_name, node in self.nodes.items():
             all_nodes[node_name] = node
             if isinstance(node, SubflowNodeGroup):
-                all_nodes.update(node.nodes)
+                all_nodes.update(node.get_all_nodes())
         return all_nodes
 
     def map_external_connection(self, conn: Connection, *, is_incoming: bool) -> bool:
@@ -470,17 +522,6 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                     if create_result.failed():
                         msg = f"{self.name}: Failed to create direct incoming connection from {connection.source_node.name}.{connection.source_parameter.name} to {node.name}.{parameter_name}: {create_result.result_details}"
                         raise RuntimeError(msg)
-
-    def _remove_nodes_from_existing_parents(self, nodes: list[BaseNode]) -> None:
-        """Remove nodes from their existing parent groups."""
-        child_nodes = {}
-        for node in nodes:
-            if node.parent_group is not None:
-                existing_parent_group = node.parent_group
-                if isinstance(existing_parent_group, SubflowNodeGroup):
-                    child_nodes.setdefault(existing_parent_group, []).append(node)
-        for parent_group, node_list in child_nodes.items():
-            parent_group.remove_nodes_from_group(node_list)
 
     def _cleanup_proxy_parameter(self, proxy_parameter: Parameter, metadata_key: str) -> None:
         """Clean up proxy parameter if it has no more connections.
@@ -678,41 +719,282 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         super().after_value_set(parameter, value)
         self.subflow_execution_component.after_value_set(parameter, value)
 
-    def add_nodes_to_group(self, nodes: list[BaseNode]) -> None:
+    def add_nodes_to_group(self, nodes: list[BaseNode]) -> list[BaseNode]:
         """Add nodes to the group and track their connections.
 
         Args:
             nodes: List of nodes to add to the group
-        """
-        from griptape_nodes.retained_mode.events.node_events import (
-            MoveNodeToNewFlowRequest,
-            MoveNodeToNewFlowResultSuccess,
-        )
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
-        self._remove_nodes_from_existing_parents(nodes)
-        self._add_nodes_to_group_dict(nodes)
+        Returns:
+            The nodes actually added, including any tethered companions pulled in and any extra
+            nodes a previous owner released alongside them.
+
+        Raises:
+            ValueError: If the nodes cannot be nested
+            NodeGroupMembershipError: If the nodes could not all be moved into the group
+        """
+        # Pull in companions this group does not already hold, so a Start/End pair joins together.
+        nodes = self._expand_with_tethered_nodes(nodes, companion_must_be_member=False)
+
+        # Reject impossible nesting and secure the subflow BEFORE touching any membership state:
+        # both can fail, and a half-applied add leaves the group and its members disagreeing about
+        # who owns what, which later reads as a silently unresolved graph. Validated after the
+        # expansion above, since a tethered companion can itself be a group.
+        self._validate_nodes_can_be_nested(nodes)
 
         # Create subflow on-demand if it doesn't exist
         subflow_name = self.metadata.get("subflow_name")
+        created_subflow_for_this_add = subflow_name is None
         if subflow_name is None:
             self._create_subflow()
             subflow_name = self.metadata.get("subflow_name")
 
+        nodes = nodes + self._remove_nodes_from_existing_parents(nodes)
+        self._add_nodes_to_group_dict(nodes)
+
         if subflow_name is not None:
-            for node in nodes:
-                move_request = MoveNodeToNewFlowRequest(node_name=node.name, target_flow_name=subflow_name)
-                move_result = GriptapeNodes.handle_request(move_request)
-                if not isinstance(move_result, MoveNodeToNewFlowResultSuccess):
-                    msg = "%s failed to move node '%s' to subflow: %s", self.name, node.name, move_result.result_details
-                    logger.error(msg)
-                    raise RuntimeError(msg)  # noqa: TRY004
+            try:
+                self._relocate_nodes(
+                    nodes, destination_flow_name=subflow_name, rollback_flow_name=self.parent_flow_name
+                )
+            except NodeGroupMembershipError:
+                # The moves already rolled themselves back; this group still has to stop claiming
+                # nodes it does not hold, or it advertises members that are not in its subflow.
+                self._drop_membership(nodes)
+                if created_subflow_for_this_add:
+                    self._discard_subflow_created_for_a_failed_add()
+                raise
 
         connections = GriptapeNodes.FlowManager().get_connections()
         node_names_in_group = set(self.nodes.keys())
         self.metadata["node_names_in_group"] = list(node_names_in_group)
         self.remap_to_internal(nodes, connections)
         self._map_external_connections_for_nodes(nodes, connections, node_names_in_group)
+
+        return nodes
+
+    def _expand_with_tethered_nodes(self, nodes: list[BaseNode], *, companion_must_be_member: bool) -> list[BaseNode]:
+        """Expand a node list with its tethered companions, so a Start/End pair is never split.
+
+        Only subflow groups enforce this: they own a real subflow, so a split pair would leave one
+        half in the subflow and the other in the parent flow. A plain BaseNodeGroup is a visual
+        grouping with no flow of its own, so it groups exactly what it was asked to.
+
+        Args:
+            nodes: The requested nodes.
+            companion_must_be_member: Which direction is being expanded. On removal (`True`) only
+                companions this group currently holds can be pulled out. On addition (`False`) only
+                companions it does not already hold are worth adding — a companion owned by a
+                different group follows its partner here, and
+                `_remove_nodes_from_existing_parents` detaches it from the old owner so no group
+                advertises a node it no longer holds.
+
+        Returns:
+            The requested nodes plus any companions, with duplicates skipped.
+        """
+        expanded = list(nodes)
+        for node in nodes:
+            for companion in node.get_nodes_to_group_with():
+                if companion in expanded:
+                    continue
+                if (companion.name in self.nodes) is not companion_must_be_member:
+                    continue
+                expanded.append(companion)
+
+        return expanded
+
+    def _relocate_nodes(
+        self, nodes: list[BaseNode], destination_flow_name: str, rollback_flow_name: str | None
+    ) -> None:
+        """Move every node into one flow, or put back whatever moved and report the failure.
+
+        Both directions of a membership change are the same move: adding sends the nodes into this
+        group's subflow, removing sends them back out to the flow holding the group, and either way a
+        node that is itself a group brings its own subflow along. Neither direction may stop halfway.
+        A half-applied move leaves the group and the flow hierarchy disagreeing about where a node
+        lives, which the editor draws one way and a save writes the other.
+
+        Args:
+            nodes: The nodes to move, all of which end up in the destination or none do
+            destination_flow_name: The flow that should hold them all afterwards
+            rollback_flow_name: The flow they came from, to put them back in if the move fails, or
+                None if it could not be determined — then a failed move is only logged, since there
+                is nowhere to put them back
+
+        Raises:
+            NodeGroupMembershipError: If any node could not be moved, after the successful moves
+                have been undone
+        """
+        moved_nodes: list[BaseNode] = []
+        try:
+            for node in nodes:
+                self._move_node_to_flow(node, flow_name=destination_flow_name)
+                moved_nodes.append(node)
+
+            # Nest the inner groups only once every node is where it belongs, so a failed move above
+            # has not yet disturbed the flow hierarchy.
+            for node in nodes:
+                self._nest_subflow_of(node, parent_subflow_name=destination_flow_name)
+        except NodeGroupMembershipError:
+            self._move_nodes_back(moved_nodes, destination_flow_name=rollback_flow_name)
+            raise
+
+    def _move_nodes_back(self, moved_nodes: list[BaseNode], destination_flow_name: str | None) -> None:
+        """Undo moves after a membership change failed, taking each node's own subflow along.
+
+        Best effort by nature: this runs while a membership change is already failing, so a move
+        that also fails is logged rather than raised, otherwise the original cause would be lost.
+
+        Args:
+            moved_nodes: The nodes to put back
+            destination_flow_name: The flow they should end up in again, or None if it is unknown —
+                then the nodes are left where they are and the situation is logged
+        """
+        if destination_flow_name is None:
+            logger.error(
+                "%s could not find the flow to return %d node(s) to, so they may be left in the wrong flow",
+                self.name,
+                len(moved_nodes),
+            )
+            return
+
+        for node in moved_nodes:
+            try:
+                self._move_node_to_flow(node, flow_name=destination_flow_name)
+            except NodeGroupMembershipError:
+                logger.exception(
+                    "%s could not move '%s' back into '%s'; it may be left in the wrong flow",
+                    self.name,
+                    node.name,
+                    destination_flow_name,
+                )
+                continue
+            try:
+                self._nest_subflow_of(node, parent_subflow_name=destination_flow_name)
+            except NodeGroupMembershipError:
+                logger.exception(
+                    "%s moved '%s' back into '%s' but could not move its contents along",
+                    self.name,
+                    node.name,
+                    destination_flow_name,
+                )
+
+    def _drop_membership(self, nodes: list[BaseNode]) -> None:
+        """Stop claiming nodes after an add failed, so the group does not advertise what it lost.
+
+        The nodes are dropped whether or not they made it back to their old flow: the add is failing,
+        so claiming them would be a lie either way. A node that was in another group before the add
+        is left group-less rather than returned to it, since that group has already released it --
+        the artist has to drag it back in.
+
+        Args:
+            nodes: Every node the failed add tried to take on
+        """
+        for node in nodes:
+            node.parent_group = None
+            self.nodes.pop(node.name, None)
+        self.metadata["node_names_in_group"] = list(self.nodes.keys())
+
+    def _discard_subflow_created_for_a_failed_add(self) -> None:
+        """Tear down a subflow that only exists because of an add that then failed in full.
+
+        The group had no subflow before this add, so leaving it behind means the artist is left owning
+        a flow they never asked for, created by an operation that reported failure. `_create_subflow`
+        already cleans up after itself when the create is what failed; this covers the case where the
+        create succeeded and a later move did not.
+
+        Anything still inside is a rollback that could not complete, and is already logged as such.
+        Deleting the flow then would take those nodes with it, so the subflow is kept and the group
+        keeps pointing at it -- a flow the artist can still see beats nodes that silently vanish.
+        """
+        subflow_name = self.metadata.get("subflow_name")
+        if subflow_name is None:
+            return
+
+        subflow = GriptapeNodes.ObjectManager().attempt_get_object_by_name_as_type(subflow_name, ControlFlow)
+        if subflow is None:
+            self.metadata.pop("subflow_name", None)
+            return
+
+        if len(subflow.nodes) > 0:
+            logger.warning(
+                "%s is keeping subflow '%s' after a failed add: it still holds %d node(s) that could not be moved back",
+                self.name,
+                subflow_name,
+                len(subflow.nodes),
+            )
+            return
+
+        delete_result = GriptapeNodes.handle_request(DeleteFlowRequest(flow_name=subflow_name))
+        if isinstance(delete_result, DeleteFlowResultFailure):
+            # Not worth failing the add twice over: it is already failing, and the message the artist
+            # gets should be why their nodes did not move, not a leftover flow they cannot see.
+            logger.warning(
+                "%s could not delete the subflow '%s' it created for a failed add: %s",
+                self.name,
+                subflow_name,
+                delete_result.result_details,
+            )
+            return
+
+        self.metadata.pop("subflow_name", None)
+
+    def _move_node_to_flow(self, node: BaseNode, flow_name: str) -> None:
+        """Move one node into a Flow.
+
+        Args:
+            node: The node to move
+            flow_name: The Flow it should end up in
+
+        Raises:
+            NodeGroupMembershipError: If the engine refused the move, carrying the reason it gave
+        """
+        move_request = MoveNodeToNewFlowRequest(node_name=node.name, target_flow_name=flow_name)
+        move_result = GriptapeNodes.handle_request(move_request)
+        if not isinstance(move_result, MoveNodeToNewFlowResultSuccess):
+            # Carry the engine's own reason rather than only logging it: this is the innermost thing
+            # that knows why the move was refused, and the caller turns it into what the artist reads.
+            msg = (
+                f"Attempted to move '{node.name}' into '{flow_name}' for group '{self.name}'. "
+                f"Failed because the move was refused: {move_result.result_details}"
+            )
+            raise NodeGroupMembershipError(msg)
+
+    def _nest_subflow_of(self, node: BaseNode, parent_subflow_name: str) -> None:
+        """Move a nested group's own subflow so it sits under the flow now holding the group.
+
+        Keeps the flow hierarchy mirroring the group nesting, in both directions: when a group is
+        added, its subflow moves under this group's subflow; when it is removed, its subflow moves
+        back out to this group's parent flow. Without this the inner group's subflow stays parented
+        to whatever flow was current when it was created, so saving walks right past it and the inner
+        group's members are lost on load.
+
+        Args:
+            node: The node whose membership just changed; only groups own a subflow
+            parent_subflow_name: The flow that should now own that group's subflow
+
+        Raises:
+            NodeGroupMembershipError: If the nested group's subflow could not be moved
+        """
+        if not isinstance(node, SubflowNodeGroup):
+            return
+
+        child_subflow_name = node.metadata.get("subflow_name")
+        if not isinstance(child_subflow_name, str):
+            # The nested group has no subflow yet; it will be created under this one on first add.
+            return
+
+        # Deliberately not swallowed: a group whose subflow was not moved still looks right in the
+        # editor but loses its contents on save, so the caller has to hear about it. Both callers
+        # turn this into a failure result (see NodeManager.on_add_nodes_to_node_group_request).
+        try:
+            GriptapeNodes.FlowManager().reparent_flow(child_subflow_name, parent_subflow_name)
+        except ValueError as err:
+            msg = (
+                f"Attempted to change what group '{node.name}' belongs to. "
+                f"Failed because its contents could not be moved to '{parent_subflow_name}': {err}"
+            )
+            raise NodeGroupMembershipError(msg) from err
 
     def _map_external_connections_for_nodes(
         self, nodes: list[BaseNode], connections: Connections, node_names_in_group: set[str]
@@ -724,6 +1006,10 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             connections: Connections object from FlowManager
             node_names_in_group: Set of all node names currently in the group
         """
+        # TODO(https://github.com/griptape-ai/griptape-nodes-engine/issues/5272): Skip hidden iterative
+        # tether params here. When a Start/End pair straddles the group boundary, proxying their tethers
+        # deletes the originals and every replacement hop is rejected, destroying the pairing.
+
         # Group outgoing connections by (source_node, source_parameter) to reuse proxy parameters
         # Skip connections that already go to the NodeGroup itself (existing proxy parameters)
         outgoing_by_source: dict[tuple[str, str], list[Connection]] = {}
@@ -904,44 +1190,51 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             self.nodes.pop(node.name)
         self.metadata["node_names_in_group"] = list(self.nodes.keys())
 
-    def remove_nodes_from_group(self, nodes: list[BaseNode]) -> None:
-        """Remove nodes from the group and untrack their connections.
+    def remove_nodes_from_group(self, nodes: list[BaseNode]) -> list[BaseNode]:
+        """Move nodes back out to this group's own flow and stop claiming them.
 
         Args:
             nodes: List of nodes to remove from the group
-        """
-        from griptape_nodes.retained_mode.events.node_events import (
-            MoveNodeToNewFlowRequest,
-            MoveNodeToNewFlowResultSuccess,
-        )
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
+        Returns:
+            The nodes actually removed, including any tethered companions pulled out.
+
+        Raises:
+            ValueError: If the nodes are not in this group
+            NodeGroupMembershipError: If this group holds a subflow but its own flow cannot be
+                found, or if any node could not be moved back out to it
+        """
+        # Pull out companions this group holds, so removing a Start node does not leave its End node
+        # behind — the same split state the add path prevents, reached from the other direction.
+        # Expand before validating: restricting to current members means expansion cannot introduce a
+        # node that _validate_nodes_in_group would reject.
+        nodes = self._expand_with_tethered_nodes(nodes, companion_must_be_member=True)
         self._validate_nodes_in_group(nodes)
 
-        parent_flow_name = None
-        try:
-            parent_flow_name = GriptapeNodes.NodeManager().get_node_parent_flow_by_name(self.name)
-        except KeyError:
-            logger.warning("%s has no parent flow, cannot move nodes back", self.name)
+        # Establish where the nodes are going before disturbing anything. A group holding a subflow
+        # keeps its members inside it, so with no destination flow there is no way to get them back
+        # out, and dropping the membership regardless would leave them stranded in a subflow nothing
+        # claims. A group with no subflow never moved its members anywhere, so it needs no
+        # destination and nothing has to move.
+        parent_flow_name = self.parent_flow_name
+        subflow_name = self.metadata.get("subflow_name")
+        if subflow_name is not None and parent_flow_name is None:
+            node_names = ", ".join(f"'{node.name}'" for node in nodes)
+            msg = (
+                f"Attempted to remove {node_names} from group '{self.name}'. "
+                f"Failed because the flow holding the group could not be found, "
+                f"so there is nowhere to move them back to."
+            )
+            raise NodeGroupMembershipError(msg)
+
+        if parent_flow_name is not None:
+            # Rolling back means going the way they came: into this group's subflow.
+            self._relocate_nodes(nodes, destination_flow_name=parent_flow_name, rollback_flow_name=subflow_name)
 
         connections = GriptapeNodes.FlowManager().get_connections()
         for node in nodes:
             node.parent_group = None
             self.nodes.pop(node.name)
-
-            if parent_flow_name is not None:
-                move_request = MoveNodeToNewFlowRequest(node_name=node.name, target_flow_name=parent_flow_name)
-                move_result = GriptapeNodes.handle_request(move_request)
-                if not isinstance(move_result, MoveNodeToNewFlowResultSuccess):
-                    msg = (
-                        "%s failed to move node '%s' back to parent flow: %s",
-                        self.name,
-                        node.name,
-                        move_result.result_details,
-                    )
-                    logger.error(msg)
-                    raise RuntimeError(msg)
-
         for node in nodes:
             self.unmap_node_connections(node, connections)
 
@@ -951,6 +1244,8 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         if remaining_nodes:
             node_names_in_group = set(self.nodes.keys())
             self._map_external_connections_for_nodes(remaining_nodes, connections, node_names_in_group)
+
+        return nodes
 
     async def execute_subflow(self) -> None:
         """Execute the subflow and propagate output values.
@@ -1047,6 +1342,19 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 logger.warning(msg)
             # Delete the subflow name since now there is no subflow attached.
             self.metadata.pop("subflow_name")
+
+    @property
+    def parent_flow_name(self) -> str | None:
+        """The Flow this group node itself lives in, which is where its members came from.
+
+        None when the group is not in a Flow at all, which the membership paths treat as "there is
+        nowhere to put these nodes" rather than an error in itself.
+        """
+        try:
+            return GriptapeNodes.NodeManager().get_node_parent_flow_by_name(self.name)
+        except KeyError:
+            logger.warning("%s has no parent flow", self.name)
+            return None
 
     @property
     def subflow_execution_component(self) -> SubflowExecutionComponent:

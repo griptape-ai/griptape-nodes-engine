@@ -232,12 +232,38 @@ list on the next execute. The
 [`parameter-mutation-during-aprocess`](strict_mode.md) rule fires
 on direct in-execute mutations and tells you which one to use.
 
-**Hydration-time mutations are explicitly sanctioned.** The standard
-dynamic-pipeline pattern — `before_value_set` / `after_value_set`
-adjusts the parameter list as inputs change — does **not** trip this
-rule. The rule only fires once the framework has entered
-`aprocess_scope()`, which it opens specifically around `process`
-execution, not around the input-hydration pass.
+**`before_value_set` / `after_value_set` do not fire on editor
+changes for isolated libraries.** These hooks run inside the worker
+subprocess, on the temporary copy of your node built for each
+execute. The orchestrator holds only a stub copy of your node class
+— parameters, no code — so it never calls your overrides when a
+user edits a value in the editor. Transforming an incoming value
+still works: the hooks run as inputs are applied, just before
+`process`. But a parameter-list change made inside them is
+discarded with the temporary node. It skips the
+[`parameter-mutation-during-aprocess`](strict_mode.md) rule, and it
+does not propagate either.
+
+The practical consequence: hooks that adjust the parameter list in
+response to user input (for example, showing or hiding fields when
+a dropdown changes) only work in Shared mode. For an isolated
+library, define the full parameter list statically in `__init__`.
+Overriding a value hook fires the
+[`value-hooks-execute-only-on-worker`](strict_mode.md) warning at
+library load.
+
+### Connection hooks never fire under isolation
+
+`after_incoming_connection`, `after_outgoing_connection`, the
+`allow_*` validators, and the `*_removed` variants are invoked on
+the orchestrator when connections change — connections are
+orchestrator-owned state, and the worker is not consulted. For a
+worker-hosted library those calls land on the stub class, so an
+override you write never runs, silently. Overriding a connection
+hook fires the
+[`connection-hooks-inert-on-worker`](strict_mode.md) warning at
+library load. If your node needs to react to wiring (the
+dynamic-parameter pattern), run the library in Shared mode.
 
 ### Parameter `converters`, `validators`, and `traits` do not cross to the orchestrator
 
@@ -320,6 +346,11 @@ logs a `WARNING` so the asymmetry is visible.
     `GriptapeNodes.handle_request(...)` instead
 - [ ] Cross-node / flow state passed in via parameters, not fetched
     from inside `process`
+- [ ] No connection hooks (`after_incoming_connection` and siblings)
+    overridden -- they never fire for a worker-hosted library
+- [ ] `before_value_set` / `after_value_set` used only for value
+    transformation, not editor-time reactivity or parameter-list
+    mutation
 - [ ] Custom `converters` / `validators` / `traits` either re-run
     inside `process` or accepted as orchestrator-only UI sugar
 - [ ] `pip_dependencies` pinned to specific versions
@@ -335,14 +366,16 @@ from, prefixed with `Worker-<engine-id>` so you can tell it apart
 from orchestrator output. Look for both **WARNING** and **ERROR**
 entries.
 
-The four rules and their actual severities:
+The six rules and their actual severities:
 
-| Rule                                                      | Orchestrator | Worker  | Notes                                                                                                                                                   |
-| --------------------------------------------------------- | ------------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [`reentrant-bus-in-init`](strict_mode.md)                 | ERROR        | ERROR   | Correctness rule. The class is dropped from the library schema.                                                                                         |
-| [`parameter-behaviors-dropped-in-schema`](strict_mode.md) | WARNING      | WARNING | Fires during library load when a `Parameter` carries `converters` / `validators` / `traits` that the worker schema cannot serialize. Does not escalate. |
-| [`parameter-mutation-during-aprocess`](strict_mode.md)    | WARNING      | ERROR   | Promotes the node's result to a failure on the worker.                                                                                                  |
-| [`worker-reach-into-orchestrator`](strict_mode.md)        | n/a          | WARNING | Fires anywhere during node execution including hydration. Does not escalate; intentional writes are explicitly fine to ignore.                          |
+| Rule                                                      | Orchestrator | Worker  | Notes                                                                                                                                                                                                         |
+| --------------------------------------------------------- | ------------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`reentrant-bus-in-init`](strict_mode.md)                 | ERROR        | ERROR   | Correctness rule. The class is dropped from the library schema.                                                                                                                                               |
+| [`parameter-behaviors-dropped-in-schema`](strict_mode.md) | WARNING      | WARNING | Fires during library load when a `Parameter` carries `converters` / `validators` / `traits` that the worker schema cannot serialize. Does not escalate.                                                       |
+| [`connection-hooks-inert-on-worker`](strict_mode.md)      | WARNING      | WARNING | Fires during library load when a node class overrides a connection lifecycle hook. Those hooks run on the orchestrator against the stub, so the override never runs. Does not escalate.                       |
+| [`value-hooks-execute-only-on-worker`](strict_mode.md)    | WARNING      | WARNING | Fires during library load when a node class overrides `before_value_set` / `after_value_set`. Value transformation still works; editor-time reactivity and parameter-list mutation do not. Does not escalate. |
+| [`parameter-mutation-during-aprocess`](strict_mode.md)    | WARNING      | ERROR   | Promotes the node's result to a failure on the worker.                                                                                                                                                        |
+| [`worker-reach-into-orchestrator`](strict_mode.md)        | n/a          | WARNING | Fires anywhere during node execution including hydration. Does not escalate; intentional writes are explicitly fine to ignore.                                                                                |
 
 If a strict-mode line fires, the rule's remediation message names
 exactly which guideline above was violated and how to fix it. A

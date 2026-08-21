@@ -63,6 +63,7 @@ if TYPE_CHECKING:
 
     from pydantic_ai._run_context import RunContext
     from pydantic_ai.messages import ModelMessage, UserContent
+    from pydantic_ai.settings import ModelSettings
     from pydantic_ai.toolsets import AbstractToolset
     from pydantic_ai.usage import UsageLimits
 
@@ -139,6 +140,10 @@ class AgentRunResult:
         cancelled: ``True`` when the run was stopped via its cancel event before
             completing. A cancelled run does not persist its turn to the thread,
             so ``message_count`` reflects the pre-run history length.
+        truncated: ``True`` when the model stopped because it hit the output
+            token limit rather than finishing its reply. ``output`` holds the
+            partial text, which is complete-looking but ends mid-thought, so
+            callers should tell the user rather than render it as a normal turn.
     """
 
     thread_id: str
@@ -146,6 +151,7 @@ class AgentRunResult:
     message_count: int
     image_urls: list[str] = field(default_factory=list)
     cancelled: bool = False
+    truncated: bool = False
 
 
 @dataclass
@@ -166,6 +172,7 @@ class PydanticAgentRunner:
     auto_load_skills: bool = True
     skills_directory: str = DEFAULT_SKILLS_DIRECTORY
     usage_limits: UsageLimits | None = None
+    model_settings: ModelSettings | None = None
 
     _agent: Agent[Any, str] = field(init=False)
     _image_toolset: ImageGenerationToolset | None = field(init=False, default=None)
@@ -181,23 +188,35 @@ class PydanticAgentRunner:
         }
         if self.system_prompt:
             agent_kwargs["system_prompt"] = self.system_prompt
-        self._agent = Agent(
-            build_model(self.model_name, provider=self.provider, api_key=self.api_key, base_url=self.base_url),
-            **agent_kwargs,
+        # `build_model` resolves `settings=None` to the catalog preset for this
+        # model, so read the cap back off the built model rather than off
+        # `self.model_settings` — the latter is None on the normal sidebar path.
+        model = build_model(
+            self.model_name,
+            provider=self.provider,
+            api_key=self.api_key,
+            base_url=self.base_url,
+            settings=self.model_settings,
         )
+        self._agent = Agent(model, **agent_kwargs)
         if self.image_config is not None:
             if self.static_files_manager is None:
                 msg = "image_config requires a static_files_manager to persist generated images."
                 raise ValueError(msg)
             self._image_toolset = register_image_tools(self._agent, self.image_config, self.static_files_manager)
+        resolved_settings = model.settings or {}
         logger.info(
-            "PydanticAgentRunner ready: model=%s workspace=%s mcp_servers=%d image_tool=%s skills=%d usage_limits=%s",
+            "PydanticAgentRunner ready: model=%s workspace=%s mcp_servers=%d image_tool=%s skills=%d "
+            "usage_limits=%s max_tokens=%s",
             self.model_name,
             self.workspace_root,
             len(self.mcp_servers),
             self._image_toolset is not None,
             len(capabilities),
             self.usage_limits,
+            # "provider default" is the honest description of sending no
+            # max_tokens: the ceiling exists, we just don't choose it.
+            resolved_settings.get("max_tokens", "provider default"),
         )
 
     def _build_instructions(self) -> str | None:
@@ -354,30 +373,16 @@ class PydanticAgentRunner:
 
         elapsed = time.monotonic() - started
         text = "".join(text_buffer)
-        logger.info(
-            "[run %s] done in %.2fs: requests=%d tool_calls=%d "
-            "input_tokens=%d output_tokens=%d new_messages=%d output=%r",
-            run_id,
-            elapsed,
-            usage.requests,
-            counters.tool_calls,
-            usage.input_tokens,
-            usage.output_tokens,
-            len(new_messages),
-            _preview(text),
+        truncated = _hit_output_limit(new_messages)
+        _log_run_outcome(
+            run_id=run_id,
+            elapsed=elapsed,
+            usage=usage,
+            counters=counters,
+            new_messages=new_messages,
+            text=text,
+            truncated=truncated,
         )
-        if not text and counters.tool_calls == 0:
-            logger.warning(
-                "[run %s] empty assistant turn: model returned no text and no tool calls.",
-                run_id,
-            )
-        elif not text:
-            logger.warning(
-                "[run %s] assistant produced no final text after %d tool calls. "
-                "The chat sidebar may render this turn as silent.",
-                run_id,
-                counters.tool_calls,
-            )
 
         # We persist `history + new_messages` rather than `all_messages()`, which
         # assumes the loaded history is a sequence of complete turns ending in a
@@ -405,6 +410,7 @@ class PydanticAgentRunner:
             output=text,
             message_count=len(messages_to_save),
             image_urls=list(counters.image_urls),
+            truncated=truncated,
         )
 
     @staticmethod
@@ -605,6 +611,82 @@ def _apply_persist_prompt(messages: list[ModelMessage], persist_prompt: str | Se
             new_parts[index] = replace(part, content=persist_prompt)
             message.parts = new_parts
             return
+
+
+def _log_run_outcome(  # noqa: PLR0913
+    *,
+    run_id: str,
+    elapsed: float,
+    usage: Any,
+    counters: _RunCounters,
+    new_messages: Sequence[ModelMessage],
+    text: str,
+    truncated: bool,
+) -> None:
+    """Log the one-line run summary plus any warnings the outcome warrants.
+
+    Split out of :meth:`PydanticAgentRunner.run` to keep that method under the
+    complexity limit; it is pure logging and has no effect on the result.
+    """
+    logger.info(
+        "[run %s] done in %.2fs: requests=%d tool_calls=%d "
+        "input_tokens=%d output_tokens=%d new_messages=%d finish_reason=%s output=%r",
+        run_id,
+        elapsed,
+        usage.requests,
+        counters.tool_calls,
+        usage.input_tokens,
+        usage.output_tokens,
+        len(new_messages),
+        _final_finish_reason(new_messages),
+        _preview(text),
+    )
+    if truncated:
+        # Worth a warning even though the run "succeeded": the reply ends
+        # mid-thought and looks identical to a completed one, so without this
+        # line a cap is indistinguishable from a dropped stream.
+        logger.warning(
+            "[run %s] response truncated at the output token limit (output_tokens=%d). "
+            "The reply is incomplete; raise max_tokens for this model to allow longer responses.",
+            run_id,
+            usage.output_tokens,
+        )
+    if not text and counters.tool_calls == 0:
+        logger.warning(
+            "[run %s] empty assistant turn: model returned no text and no tool calls.",
+            run_id,
+        )
+    elif not text:
+        logger.warning(
+            "[run %s] assistant produced no final text after %d tool calls. "
+            "The chat sidebar may render this turn as silent.",
+            run_id,
+            counters.tool_calls,
+        )
+
+
+def _final_finish_reason(messages: Sequence[ModelMessage]) -> str | None:
+    """Return the ``finish_reason`` of the turn's last model response, if any.
+
+    Pydantic AI normalizes provider-specific reasons onto OpenTelemetry values
+    (``stop``, ``length``, ``content_filter``, ``tool_call``, ``error``). The
+    final response is the one that ended the turn; earlier ones in a multi-step
+    run finish with ``tool_call`` and say nothing about how the turn ended.
+    Returns ``None`` when the provider reported no reason.
+    """
+    for message in reversed(messages):
+        if isinstance(message, ModelResponse):
+            return message.finish_reason
+    return None
+
+
+def _hit_output_limit(messages: Sequence[ModelMessage]) -> bool:
+    """Return True when the turn ended because the model ran out of output tokens.
+
+    ``length`` is the normalized reason for hitting ``max_tokens`` — or, when no
+    ``max_tokens`` was sent, whatever default the upstream provider imposed.
+    """
+    return _final_finish_reason(messages) == "length"
 
 
 def _preview(value: str) -> str:

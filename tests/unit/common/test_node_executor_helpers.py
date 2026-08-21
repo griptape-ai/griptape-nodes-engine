@@ -18,7 +18,7 @@ These tests describe the observable contract of:
 """
 
 import pickle
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -29,11 +29,9 @@ from griptape_nodes.exe_types.node_types import LOCAL_EXECUTION, PRIVATE_EXECUTI
 from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeResultSuccess
 from griptape_nodes.retained_mode.events.workflow_events import PublishWorkflowRequest
 
-_GRIPTAPE_NODES_PATH = "griptape_nodes.common.node_executor.GriptapeNodes"
-
 
 def _make_executor() -> NodeExecutor:
-    return NodeExecutor.__new__(NodeExecutor)
+    return NodeExecutor(engine=MagicMock())
 
 
 def _make_subflow_node(execution_type: str) -> MagicMock:
@@ -53,24 +51,26 @@ class TestGetWorkflowHandler:
 
     def test_returns_registered_handler_for_known_library(self) -> None:
         sentinel_handler = object()
-        with patch(_GRIPTAPE_NODES_PATH) as mock_gn:
-            mock_lm = MagicMock()
-            mock_lm.get_registered_event_handlers.return_value = {"my_lib": sentinel_handler}
-            mock_gn.LibraryManager.return_value = mock_lm
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        mock_lm = MagicMock()
+        mock_lm.get_registered_event_handlers.return_value = {"my_lib": sentinel_handler}
+        mock_engine.library_manager = mock_lm
 
-            handler = _make_executor().get_workflow_handler("my_lib")
+        handler = executor.get_workflow_handler("my_lib")
 
         assert handler is sentinel_handler
         mock_lm.get_registered_event_handlers.assert_called_once_with(PublishWorkflowRequest)
 
     def test_raises_value_error_when_library_unregistered(self) -> None:
-        with patch(_GRIPTAPE_NODES_PATH) as mock_gn:
-            mock_lm = MagicMock()
-            mock_lm.get_registered_event_handlers.return_value = {}
-            mock_gn.LibraryManager.return_value = mock_lm
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        mock_lm = MagicMock()
+        mock_lm.get_registered_event_handlers.return_value = {}
+        mock_engine.library_manager = mock_lm
 
-            with pytest.raises(ValueError, match="missing_lib"):
-                _make_executor().get_workflow_handler("missing_lib")
+        with pytest.raises(ValueError, match="missing_lib"):
+            executor.get_workflow_handler("missing_lib")
 
 
 class TestDeserializeParameterValue:
@@ -170,47 +170,47 @@ class TestExecuteSubflowNodeGroupBranches:
     async def test_private_execution_calls_private_workflow_path(self) -> None:
         node = _make_subflow_node(PRIVATE_EXECUTION)
 
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
         with (
-            patch(_GRIPTAPE_NODES_PATH) as mock_gn,
             patch.object(NodeExecutor, "_execute_private_workflow", new_callable=AsyncMock) as mock_private,
             patch.object(NodeExecutor, "_execute_library_workflow", new_callable=AsyncMock) as mock_library,
         ):
-            mock_gn.ahandle_request = AsyncMock()
-            await _make_executor().execute(node)
+            mock_engine.ahandle_request = AsyncMock()
+            await executor.execute(node)
 
         mock_private.assert_awaited_once_with(node)
         mock_library.assert_not_awaited()
         node.aprocess.assert_not_awaited()
-        mock_gn.ahandle_request.assert_not_awaited()
+        mock_engine.ahandle_request.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_library_execution_routes_through_library_workflow(self) -> None:
         """A non-Local, non-Private execution_environment is treated as a library name."""
         node = _make_subflow_node("some_library_name")
 
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
         with (
-            patch(_GRIPTAPE_NODES_PATH) as mock_gn,
             patch.object(NodeExecutor, "_execute_private_workflow", new_callable=AsyncMock) as mock_private,
             patch.object(NodeExecutor, "_execute_library_workflow", new_callable=AsyncMock) as mock_library,
         ):
-            mock_gn.ahandle_request = AsyncMock()
-            await _make_executor().execute(node)
+            mock_engine.ahandle_request = AsyncMock()
+            await executor.execute(node)
 
         mock_library.assert_awaited_once_with(node, "some_library_name")
         mock_private.assert_not_awaited()
         node.aprocess.assert_not_awaited()
-        mock_gn.ahandle_request.assert_not_awaited()
+        mock_engine.ahandle_request.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_subprocess_paths_clear_execution_state_first(self) -> None:
         """Both PRIVATE and library paths must clear execution state before running."""
         node = _make_subflow_node(PRIVATE_EXECUTION)
 
-        with (
-            patch(_GRIPTAPE_NODES_PATH),
-            patch.object(NodeExecutor, "_execute_private_workflow", new_callable=AsyncMock),
-        ):
-            await _make_executor().execute(node)
+        executor = _make_executor()
+        with patch.object(NodeExecutor, "_execute_private_workflow", new_callable=AsyncMock):
+            await executor.execute(node)
 
         node.subflow_execution_component.clear_execution_state.assert_called_once()
 
@@ -219,8 +219,7 @@ class TestExecuteSubflowNodeGroupBranches:
         """LOCAL_EXECUTION runs aprocess directly; clearing subprocess state is unnecessary."""
         node = _make_subflow_node(LOCAL_EXECUTION)
 
-        with patch(_GRIPTAPE_NODES_PATH):
-            await _make_executor().execute(node)
+        await _make_executor().execute(node)
 
         node.subflow_execution_component.clear_execution_state.assert_not_called()
 
@@ -238,11 +237,12 @@ class TestExecuteUnexpectedResultType:
 
         not_a_payload: Any = "not a payload at all"
 
-        with patch(_GRIPTAPE_NODES_PATH) as mock_gn:
-            mock_gn.ahandle_request = AsyncMock(return_value=not_a_payload)
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        mock_engine.ahandle_request = AsyncMock(return_value=not_a_payload)
 
-            with pytest.raises(RuntimeError, match="Weird"):
-                await _make_executor().execute(node)
+        with pytest.raises(RuntimeError, match="Weird"):
+            await executor.execute(node)
 
 
 class TestExecuteSuccessReturnsNone:
@@ -256,11 +256,12 @@ class TestExecuteSuccessReturnsNone:
         node.parameter_output_values = {}
         node.metadata = {}
 
-        with patch(_GRIPTAPE_NODES_PATH) as mock_gn:
-            mock_gn.ahandle_request = AsyncMock(
-                return_value=ExecuteNodeResultSuccess(result_details="ok", parameter_output_values={"x": 1}),
-            )
-            result = await _make_executor().execute(node)
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        mock_engine.ahandle_request = AsyncMock(
+            return_value=ExecuteNodeResultSuccess(result_details="ok", parameter_output_values={"x": 1}),
+        )
+        result = await executor.execute(node)
 
         assert result is None
 

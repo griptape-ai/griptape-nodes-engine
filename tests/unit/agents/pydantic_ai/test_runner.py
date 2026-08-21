@@ -7,6 +7,7 @@ plumbing without hitting Griptape Cloud.
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
@@ -22,6 +23,7 @@ from pydantic_ai.messages import (
     ToolCallPart,
     UserPromptPart,
 )
+from pydantic_ai.models import Model
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 
 from griptape_nodes.agents.pydantic_ai.runner import (
@@ -31,11 +33,31 @@ from griptape_nodes.agents.pydantic_ai.runner import (
     ToolCall,
     ToolResult,
 )
+from griptape_nodes.drivers.cloud_models import MODEL_SETTINGS
 from griptape_nodes.drivers.thread_storage.local_thread_storage_driver import LocalThreadStorageDriver
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
     from pathlib import Path
+
+    from pydantic_ai.messages import FinishReason
+    from pydantic_ai.settings import ModelSettings
+
+# Anthropic's own default output cap, applied when a request carries no
+# `max_tokens`. Deliberately a local literal rather than an import from
+# pydantic-ai: the assertion's point is that we no longer depend on that value.
+_PROVIDER_DEFAULT_MAX_TOKENS = 4096
+
+
+def _model_settings_of(runner: PydanticAgentRunner) -> ModelSettings:
+    """Return the settings baked into the runner's model.
+
+    `Agent.model` is typed as `Model | KnownModelName | None`, so narrow to
+    `Model` before reading `.settings` off it.
+    """
+    model = runner.agent.model
+    assert isinstance(model, Model)
+    return model.settings or {}
 
 
 def _runner_with_function_model(
@@ -402,3 +424,155 @@ async def test_history_rehydrator_transforms_loaded_history_before_model_call(tm
     ]
     assert any(isinstance(item, ImageUrl) for part in prior_user_parts for item in part.content)
     assert not any(isinstance(item, BinaryContent) for part in prior_user_parts for item in part.content)
+
+
+class _FinishReasonModel(FunctionModel):
+    """A `FunctionModel` whose streamed response reports a chosen `finish_reason`.
+
+    The runner always takes the streaming path (it passes an
+    `event_stream_handler`), and `FunctionModel`'s `stream_function` yields only
+    text deltas — it never sets `finish_reason`, which lives on the
+    `StreamedResponse` and is read when the final `ModelResponse` is built. So
+    the reason is stamped onto the response object before the stream is consumed.
+    """
+
+    _finish_reason: FinishReason | None
+
+    def __init__(self, text: str, finish_reason: FinishReason | None) -> None:
+        async def stream(_messages: list[ModelMessage], _info: AgentInfo) -> AsyncIterator[str]:
+            yield text
+
+        super().__init__(stream_function=stream)
+        self._finish_reason = finish_reason
+
+    @asynccontextmanager
+    async def request_stream(
+        self,
+        messages: list[ModelMessage],
+        model_settings: Any = None,
+        model_request_parameters: Any = None,
+        run_context: Any = None,
+    ) -> AsyncIterator[Any]:
+        async with super().request_stream(
+            messages, model_settings, model_request_parameters, run_context
+        ) as streamed_response:
+            streamed_response.finish_reason = self._finish_reason
+            yield streamed_response
+
+
+def _runner_with_finish_reason(
+    workspace: Path,
+    threads_dir: Path,
+    text: str,
+    finish_reason: FinishReason | None,
+) -> PydanticAgentRunner:
+    """Build a runner whose model streams `text` and reports `finish_reason`."""
+    storage = LocalThreadStorageDriver(threads_dir, config_manager=None, secrets_manager=None)  # type: ignore[arg-type]
+    runner = PydanticAgentRunner(
+        model_name="test",
+        api_key="dummy",
+        workspace_root=workspace,
+        storage=storage,
+    )
+    runner._agent = Agent(_FinishReasonModel(text, finish_reason))
+    return runner
+
+
+@pytest.mark.asyncio
+async def test_run_flags_truncation_when_output_limit_hit(tmp_path: Path) -> None:
+    """A `length` finish reason surfaces as `truncated=True` on the result."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    threads_dir = tmp_path / "threads"
+
+    runner = _runner_with_finish_reason(workspace, threads_dir, "an essay that stops mid-", "length")
+    result = await runner.run("write a long essay")
+
+    assert result.truncated is True
+    # The partial text is still returned and persisted — a capped reply is
+    # incomplete, not worthless, and the user should see what they got.
+    assert result.output == "an essay that stops mid-"
+    assert result.message_count >= 2  # noqa: PLR2004
+
+
+@pytest.mark.asyncio
+async def test_run_does_not_flag_truncation_on_normal_stop(tmp_path: Path) -> None:
+    """A `stop` finish reason is an ordinary completed turn."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    threads_dir = tmp_path / "threads"
+
+    runner = _runner_with_finish_reason(workspace, threads_dir, "all done.", "stop")
+    result = await runner.run("say something short")
+
+    assert result.truncated is False
+    assert result.output == "all done."
+
+
+@pytest.mark.asyncio
+async def test_run_does_not_flag_truncation_when_reason_absent(tmp_path: Path) -> None:
+    """A provider that reports no finish reason must not read as truncated."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    threads_dir = tmp_path / "threads"
+
+    runner = _runner_with_finish_reason(workspace, threads_dir, "no reason given", None)
+    result = await runner.run("go")
+
+    assert result.truncated is False
+
+
+@pytest.mark.asyncio
+async def test_streamed_run_is_not_truncated(tmp_path: Path) -> None:
+    """The normal streaming path reports `truncated=False`, not None-ish."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    threads_dir = tmp_path / "threads"
+
+    async def stream(_messages: list[ModelMessage], _info: AgentInfo) -> AsyncIterator[str]:
+        yield "fine"
+
+    runner = _runner_with_function_model(workspace, threads_dir, stream)
+    result = await runner.run("go")
+
+    assert result.truncated is False
+
+
+def test_runner_applies_catalog_max_tokens_to_the_model(tmp_path: Path) -> None:
+    """The sidebar's default construction sends the catalog's max_tokens.
+
+    This is the regression guard for the reported bug: the runner passed no
+    settings at all, so the provider's own 4096-token default silently capped
+    every Claude reply.
+    """
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    storage = LocalThreadStorageDriver(tmp_path / "threads", config_manager=None, secrets_manager=None)  # type: ignore[arg-type]
+
+    runner = PydanticAgentRunner(
+        model_name="claude-opus-5",
+        api_key="dummy",
+        workspace_root=workspace,
+        storage=storage,
+    )
+
+    settings = _model_settings_of(runner)
+    assert settings.get("max_tokens") == MODEL_SETTINGS["claude-opus-5"]["max_tokens"]
+    assert settings.get("max_tokens", 0) > _PROVIDER_DEFAULT_MAX_TOKENS
+
+
+def test_runner_explicit_settings_override_the_catalog(tmp_path: Path) -> None:
+    """An explicit `model_settings` wins over the catalog preset."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    storage = LocalThreadStorageDriver(tmp_path / "threads", config_manager=None, secrets_manager=None)  # type: ignore[arg-type]
+
+    runner = PydanticAgentRunner(
+        model_name="claude-opus-5",
+        api_key="dummy",
+        workspace_root=workspace,
+        storage=storage,
+        model_settings={"max_tokens": 1234},
+    )
+
+    assert _model_settings_of(runner).get("max_tokens") == 1234  # noqa: PLR2004
