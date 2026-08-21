@@ -1362,7 +1362,15 @@ class BaseNode(ABC):
         # above: the assignment branches emitted a display-suppressed
         # AlterElementEvent via __setitem__, but the in-place `.append()` fallback
         # never goes through __setitem__ and so emitted nothing at all.
-        if self.should_preserve_stored_template(parameter_name, self.parameter_output_values[parameter_name]):
+        #
+        # This is a display decision, so it asks _variable_template_to_preserve --
+        # the same predicate __setitem__ used -- and not the narrower
+        # should_preserve_stored_template. Disagreeing with __setitem__ would leave
+        # the field suppressed but still receiving deltas, which is the leak.
+        if (
+            self._variable_template_to_preserve(parameter_name, self.parameter_output_values[parameter_name])
+            is not None
+        ):
             return
 
         # Publish the event up!
@@ -1567,22 +1575,22 @@ class BaseNode(ABC):
             return text
         return VariableResolver.resolve_string(text, variables, self.name)
 
-    def _references_a_live_variable(self, raw_value: Any) -> bool:
-        r"""Whether `raw_value` names a variable that currently exists.
+    def _substitution_would_rewrite(self, raw_value: Any) -> bool:
+        r"""Whether substitution would actually rewrite a token in `raw_value`.
 
         Display suppression settles for ``contains_variable_macro``, the cheap
-        ``\\{[A-Za-z_]`` heuristic, because a false positive there only misdraws a
+        ``\{[A-Za-z_]`` heuristic, because a false positive there only misdraws a
         field while a false negative is the leak the guard exists to stop.
         Declining a stored-state write is not so forgiving. The heuristic also
-        fires on LaTeX (``\\textbf{x}``), Handlebars (``{{name}}``), CSS
-        (``{color: red}``) and prose that mentions a dict literal, and declining
-        the write for one of those would freeze that parameter's stored value for
-        good -- no group run would ever update it again. So confirm against the
-        live variable set first.
+        fires on LaTeX (``\textbf{x}``), CSS (``{color: red}``) and prose that
+        mentions a dict literal, and declining the write for one of those would
+        freeze that parameter's stored value for good -- no group run would ever
+        update it again. So parse the tokens instead of trusting the brace.
 
-        Note this deliberately does NOT require the reference to have resolved to
-        something different: a template naming a variable the user has not created
-        yet is still their template and must survive.
+        Delegates the token-level judgement to ``VariableResolver.would_substitute``,
+        which counts an optional ``{VAR?}`` as a rewrite whether or not the variable
+        exists (it substitutes to ""). Skipping that case would be the worse
+        failure: the write would go through and take the user's template with it.
 
         Copy-back callers run on the orchestrator, where the variable dict is
         available. Where it is not -- substitution off, or a node with no parent
@@ -1590,10 +1598,13 @@ class BaseNode(ABC):
         heuristic, which errs toward keeping the user's text rather than
         overwriting it.
         """
-        variables = VariableResolver.get_variables_if_enabled(self.name)
+        # get_variables_without_memoizing, not get_variables_if_enabled: this runs
+        # outside aprocess_scope(), where the latter's memo write has no reset token
+        # and would leave a stale variable dict on the surrounding context.
+        variables = VariableResolver.get_variables_without_memoizing(self.name)
         if variables is None:
             return True
-        return any(VariableResolver.references_variable(raw_value, name) for name in variables)
+        return VariableResolver.would_substitute(raw_value, variables)
 
     def _variable_template_to_preserve(self, parameter_name: str, output_value: Any) -> _PreservedTemplate | None:
         """Return the stored {VAR} template that must survive `output_value`.
@@ -1652,15 +1663,19 @@ class BaseNode(ABC):
         string). Such callers should write to ``parameter_output_values`` only.
 
         Strictly narrower than display suppression: it adds
-        ``_references_a_live_variable`` on top, because getting this wrong in
+        ``_substitution_would_rewrite`` on top, because getting this wrong in
         either direction is permanent, whereas a wrongly suppressed *display* is
         only cosmetic. The two cannot disagree in the dangerous direction -- a
         skipped write always implies a suppressed display.
+
+        Because of that asymmetry this is the wrong predicate for a display
+        decision; use ``get_display_value_for_output`` or
+        ``_variable_template_to_preserve`` for those.
         """
         template = self._variable_template_to_preserve(parameter_name, output_value)
         if template is None:
             return False
-        return self._references_a_live_variable(template.value)
+        return self._substitution_would_rewrite(template.value)
 
     def _report_parameter_mutation_if_in_aprocess(self, *, parameter_name: str, mutation: str) -> None:
         """Report parameter-mutation-during-aprocess when a node mutates its own params directly.

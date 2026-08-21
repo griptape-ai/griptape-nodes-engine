@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import TrackedParameterOutputValues, aprocess_scope
+from griptape_nodes.exe_types.variable_resolver import _aprocess_variable_cache
 from griptape_nodes.retained_mode.events.base_events import ProgressEvent
 from griptape_nodes.retained_mode.events.execution_events import ParameterValueUpdateEvent
 from griptape_nodes.retained_mode.events.parameter_events import AlterElementEvent
@@ -781,7 +782,7 @@ class TestTemplatePreservationGates:
     def test_write_guard_preserves_template_naming_an_undefined_variable(self) -> None:
         """A template naming a variable the user has not created yet is still theirs.
 
-        `_references_a_live_variable` is checked against the live variable set, so
+        `_substitution_would_rewrite` is checked against the live variable set, so
         this only holds because SHOT is defined -- see the sibling test for the
         genuinely-unknown name.
         """
@@ -801,6 +802,47 @@ class TestTemplatePreservationGates:
             # Display still suppresses on the heuristic; only the write guard is exact.
             assert node.get_display_value_for_output("text", "computed") == "{NOT_A_VARIABLE}"
             assert node.should_preserve_stored_template("text", "computed") is False
+
+    def test_write_guard_preserves_optional_template_for_undefined_variable(self) -> None:
+        """`{SHOT?}` substitutes to "" whether or not SHOT exists, so it is a real rewrite.
+
+        Requiring the name to be *defined* would decline the write guard here while
+        display still suppressed, and the copy-back would then store the empty
+        resolved text over the user's template -- unrecoverable.
+        """
+        node = MockNode(name="mock_node")
+        node.add_parameter(_make_property_output_param("text", "a {SHOT?} b"))
+        node.parameter_values["text"] = "a {SHOT?} b"
+
+        with _mock_gn({"OTHER": "x"}):
+            # resolve_macro_token drops a missing optional token, so the output differs.
+            assert node.get_display_value_for_output("text", "a  b") == "a {SHOT?} b"
+            assert node.should_preserve_stored_template("text", "a  b") is True
+
+    def test_write_guard_preserves_optional_template_for_defined_variable(self) -> None:
+        node = MockNode(name="mock_node")
+        node.add_parameter(_make_property_output_param("text", "{SHOT?}"))
+        node.parameter_values["text"] = "{SHOT?}"
+
+        with _mock_gn({"SHOT": "sc001"}):
+            assert node.should_preserve_stored_template("text", "sc001") is True
+
+    def test_write_guard_leaves_no_variable_cache_behind(self) -> None:
+        """The guard runs outside aprocess_scope, so its lookup must not memoise.
+
+        ``get_variables_if_enabled`` caches into a ContextVar with no reset token.
+        Calling it from here would pin that dict onto the ambient context, and every
+        later read on the same task -- the next node's copy-back, or the next test in
+        this worker -- would silently reuse it.
+        """
+        node = MockNode(name="mock_node")
+        node.add_parameter(_make_property_output_param("text", "{SHOT}"))
+        node.parameter_values["text"] = "{SHOT}"
+
+        assert _aprocess_variable_cache.get() is None
+        with _mock_gn({"SHOT": "sc001"}):
+            assert node.should_preserve_stored_template("text", "sc001") is True
+        assert _aprocess_variable_cache.get() is None
 
     def test_incomparable_output_does_not_raise(self) -> None:
         """`!=` returning a non-bool must not propagate out of the guard.
@@ -837,12 +879,7 @@ class TestAppendValueToParameterDisplay:
         node.parameter_values["text"] = "{SHOT}"
 
         captured: list = []
-        mock_gn = MagicMock()
-        mock_gn.WorkflowManager.return_value.is_variable_substitution_enabled.return_value = True
-        mock_gn.FlowManager.return_value.get_connections.return_value = MagicMock(incoming_index={})
-        mock_gn.EventManager.return_value.put_event.side_effect = captured.append
-
-        with patch(_GN_PATCH, mock_gn):
+        with _capturing_gn_mock(captured, {"SHOT": "sc001"}):
             node.append_value_to_parameter("text", "sc0")
             node.append_value_to_parameter("text", "01")
 
@@ -856,15 +893,31 @@ class TestAppendValueToParameterDisplay:
         node.parameter_values["text"] = "plain"
 
         captured: list = []
-        mock_gn = MagicMock()
-        mock_gn.WorkflowManager.return_value.is_variable_substitution_enabled.return_value = True
-        mock_gn.FlowManager.return_value.get_connections.return_value = MagicMock(incoming_index={})
-        mock_gn.EventManager.return_value.put_event.side_effect = captured.append
-
-        with patch(_GN_PATCH, mock_gn):
+        with _capturing_gn_mock(captured, {"SHOT": "sc001"}):
             node.append_value_to_parameter("text", "chunk")
 
         assert [p.value for p in _payloads_of_type(captured, ProgressEvent)] == ["chunk"]
+
+    def test_no_progress_event_when_only_display_suppresses(self) -> None:
+        """Streaming must follow the *display* predicate, not the narrower write guard.
+
+        `{NOT_A_VARIABLE}` suppresses the AlterElementEvent (display is deliberately
+        loose) but does not pass the write guard. Asking the write guard here would
+        let the deltas through and rebuild the resolved text over a field the UI was
+        just told to keep -- the original leak, one chunk at a time.
+        """
+        node = MockNode(name="mock_node")
+        node.add_parameter(_make_property_output_param("text", "{NOT_A_VARIABLE}"))
+        node.parameter_values["text"] = "{NOT_A_VARIABLE}"
+
+        captured: list = []
+        with _capturing_gn_mock(captured, {"SHOT": "sc001"}):
+            node.append_value_to_parameter("text", "chu")
+            node.append_value_to_parameter("text", "nk")
+            # The two predicates genuinely disagree here; streaming follows display.
+            assert node.should_preserve_stored_template("text", "chunk") is False
+
+        assert _payloads_of_type(captured, ProgressEvent) == []
 
     def test_no_progress_event_when_template_preserved_inside_aprocess(self) -> None:
         """The shape that actually ships: streaming only ever happens inside aprocess.

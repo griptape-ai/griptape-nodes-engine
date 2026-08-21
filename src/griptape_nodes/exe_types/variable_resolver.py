@@ -203,6 +203,58 @@ class VariableResolver:
         return False
 
     @staticmethod
+    def would_substitute(value: Any, variables: dict[str, str | int]) -> bool:
+        """Return True if substitution would actually rewrite a {VAR} token in value.
+
+        The exact form of the ``contains_variable_macro`` heuristic: each token is
+        parsed the way ``resolve_macro_token`` parses it rather than matched against
+        a brace pattern, so text that merely looks templated (``body {color: red}``
+        with no ``color`` variable) does not count. Recurses into dicts and lists.
+
+        A token counts when it names a variable in `variables`, or when it is
+        optional (``{VAR?}``) -- ``resolve_macro_token`` replaces an optional token
+        with "" whether or not the variable exists, so it rewrites the text either
+        way. A *required* token naming an unknown variable is left verbatim and so
+        does not count.
+        """
+        if isinstance(value, str):
+            for match in VariableResolver._MACRO_TOKEN.finditer(value):
+                try:
+                    parsed = ParsedMacro(match.group(0))
+                except MacroSyntaxError:
+                    continue
+                for segment in parsed.segments:
+                    if isinstance(segment, ParsedVariable) and (
+                        not segment.info.is_required or segment.info.name in variables
+                    ):
+                        return True
+            return False
+        if isinstance(value, dict):
+            return any(VariableResolver.would_substitute(v, variables) for v in value.values())
+        if isinstance(value, list):
+            return any(VariableResolver.would_substitute(item, variables) for item in value)
+        return False
+
+    @staticmethod
+    def get_variables_without_memoizing(node_name: str) -> dict[str, str | int] | None:
+        """Like `get_variables_if_enabled`, but never leaves the memo cache set.
+
+        ``get_variables_if_enabled`` memoises its lookup into the ContextVar without
+        a reset token. That is fine inside ``aprocess_scope()``, which owns the cache
+        and resets it on exit, but callers on the orchestrator run outside any scope:
+        there the ``set()`` is unpaired and leaves a variable dict visible -- and
+        going stale -- to everything that follows on the same task. Use this from
+        outside ``aprocess_scope()``. An already-populated cache is left untouched.
+        """
+        if _aprocess_variable_cache.get() is not None:
+            return VariableResolver.get_variables_if_enabled(node_name)
+        token = _aprocess_variable_cache.set(None)
+        try:
+            return VariableResolver.get_variables_if_enabled(node_name)
+        finally:
+            _aprocess_variable_cache.reset(token)
+
+    @staticmethod
     def _filter_for_substitution(variables: dict[str, Any]) -> dict[str, str | int]:
         """Filter a name→value dict to only str/int values (excluding bool) for macro substitution."""
         return {

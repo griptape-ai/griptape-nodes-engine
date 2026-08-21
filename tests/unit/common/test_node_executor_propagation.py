@@ -160,8 +160,9 @@ def _make_end_mapping(
 def _gn_mock_with_variable(name: str = "SHOT") -> Any:
     """A GN patch where `name` is a real, defined flow variable.
 
-    `should_preserve_stored_template` confirms the stored text names a live
-    variable before declining a write, so these tests have to define one. A bare
+    `should_preserve_stored_template` confirms substitution would actually rewrite
+    the stored text before declining a write, so these tests have to define a
+    variable for the template to name (or use an optional token). A bare
     MagicMock would also let the assertions pass -- the variable lookup would
     return a non-ListVariablesResultSuccess and fall back to trusting the regex
     heuristic -- but then they would no longer be testing the intended path.
@@ -246,12 +247,33 @@ class TestGroupCopyBackPreservesTemplate:
 
         assert node.parameter_values["prompt"] == "hyperreal"
 
-    def test_apply_parameter_values_sends_the_write_as_output_only(self) -> None:
+    def test_last_iteration_preserves_an_optional_template(self) -> None:
+        """`{SHOT?}` resolves to "" when SHOT is undefined -- still the user's template.
+
+        The write guard must not require the name to be *defined*: an optional token
+        substitutes either way, so declining to notice it would store the resolved
+        text and take the template with it.
+        """
+        node = _make_template_node(template="{SHOT?}")
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        mock_engine.node_manager.get_node_by_name.return_value = node
+        package_result = _make_end_mapping("PromptNode_prompt", "PromptNode", "prompt")
+
+        with _gn_mock_with_variable(name="SOMETHING_ELSE"):
+            executor._apply_last_iteration_to_packaged_nodes({"PromptNode_prompt": "hyperreal"}, package_result)
+
+        assert node.parameter_values["prompt"] == "{SHOT?}"
+        assert node.parameter_output_values["prompt"] == "hyperreal"
+
+    def test_apply_parameter_values_skips_the_request_for_a_template(self) -> None:
         """The sequential-group copy-back has the same hazard via a set-value request.
 
-        It still issues the request -- that is what keeps the handler's downstream
-        invalidation -- but with is_output=True so the value lands in
-        parameter_output_values and never in parameter_values.
+        The request is skipped entirely rather than sent with is_output=True: the
+        handler gates unresolve_future_nodes on the value having changed, and for an
+        output write that is only true when the key already held something different,
+        so an is_output request would drop downstream invalidation instead of keeping
+        it. The output value still reaches downstream nodes via the direct write.
         """
         node = _make_template_node()
         executor = _make_executor()
@@ -261,17 +283,47 @@ class TestGroupCopyBackPreservesTemplate:
         with _gn_mock_with_variable():
             executor._apply_parameter_values_to_node(node, {"PromptNode_prompt": "hyperreal"}, package_result)
 
-        request = mock_engine.node_manager.on_set_parameter_value_request.call_args.args[0]
-        assert request.is_output is True
-        assert request.parameter_name == "prompt"
-        assert request.value == "hyperreal"
-        # The mocked handler performs no write, so stored state is untouched either way;
-        # is_output=True above is what guarantees the real handler leaves it alone.
+        mock_engine.node_manager.on_set_parameter_value_request.assert_not_called()
         assert node.parameter_values["prompt"] == "{SHOT}"
         assert node.parameter_output_values["prompt"] == "hyperreal"
 
+    def test_apply_parameter_values_still_invalidates_downstream_nodes(self) -> None:
+        """Skipping the request must not skip the invalidation the request would have done.
+
+        Without this, a group run leaves downstream nodes resolved against the
+        previous value and they never recompute.
+        """
+        node = _make_template_node()
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        package_result = _make_end_mapping("PromptNode_prompt", "PromptNode", "prompt")
+
+        with _gn_mock_with_variable():
+            executor._apply_parameter_values_to_node(node, {"PromptNode_prompt": "hyperreal"}, package_result)
+
+        unresolve = mock_engine.flow_manager.get_connections.return_value.unresolve_future_nodes
+        unresolve.assert_called_once_with(node)
+
+    def test_apply_parameter_values_skips_invalidation_when_output_unchanged(self) -> None:
+        """An output that already holds this value did not change, so nothing is stale.
+
+        Mirrors the `modified` gate the request handler applies, so a re-run that
+        produces the same value does not needlessly unresolve the graph.
+        """
+        node = _make_template_node()
+        node.parameter_output_values["prompt"] = "hyperreal"
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        package_result = _make_end_mapping("PromptNode_prompt", "PromptNode", "prompt")
+
+        with _gn_mock_with_variable():
+            executor._apply_parameter_values_to_node(node, {"PromptNode_prompt": "hyperreal"}, package_result)
+
+        unresolve = mock_engine.flow_manager.get_connections.return_value.unresolve_future_nodes
+        unresolve.assert_not_called()
+
     def test_apply_parameter_values_writes_non_template_values_normally(self) -> None:
-        """Without a template the request must be a normal stored-value write."""
+        """Without a template the request must still be sent as a stored-value write."""
         node = _make_template_node(template="plain text")
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
@@ -282,3 +334,5 @@ class TestGroupCopyBackPreservesTemplate:
 
         request = mock_engine.node_manager.on_set_parameter_value_request.call_args.args[0]
         assert request.is_output is False
+        assert request.parameter_name == "prompt"
+        assert request.value == "hyperreal"
