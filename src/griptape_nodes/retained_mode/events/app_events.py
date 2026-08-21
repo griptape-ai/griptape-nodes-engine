@@ -269,6 +269,27 @@ class LibraryLoadedNotification(AppPayload):
 
 @dataclass
 @PayloadRegistry.register
+class WorkflowLoadComplete(AppPayload):
+    """Notification that a workflow file finished executing, successfully or not.
+
+    A workflow's name is pushed onto the engine's context stack before its file starts
+    executing, so GetWorkflowContext reports that name as the current workflow for the
+    whole duration of the load, even while its nodes are still being built. This event
+    tells a client once the load has actually finished, so it can wait for it instead of
+    treating a name in context as proof the workflow is ready.
+
+    Args:
+        workflow_name: Name of the workflow that finished loading, or None if the engine
+            has no current workflow when the load completes.
+        successful: Whether the workflow executed without error.
+    """
+
+    workflow_name: str | None
+    successful: bool
+
+
+@dataclass
+@PayloadRegistry.register
 class ConfigChanged(AppPayload):
     """Configuration value changed notification.
 
