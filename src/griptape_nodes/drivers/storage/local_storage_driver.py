@@ -5,11 +5,8 @@ from urllib.parse import urljoin
 
 import httpx
 
-from griptape_nodes.common.project_templates.situation import BuiltInSituation
 from griptape_nodes.drivers.storage.base_storage_driver import BaseStorageDriver, CreateSignedUploadUrlResponse
-from griptape_nodes.files.file import FileLoadError
 from griptape_nodes.files.path_utils import canonicalize_to_posix, strip_windows_long_path_prefix
-from griptape_nodes.files.project_file import ProjectFileDestination
 from griptape_nodes.retained_mode.events.os_events import ExistingFilePolicy, WriteFileRequest, WriteFileResultSuccess
 from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import SidecarContent
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
@@ -223,19 +220,15 @@ class LocalStorageDriver(BaseStorageDriver):
     def get_asset_url(self, path: Path) -> str:
         """Get the permanent URL for a local asset.
 
-        Builds the canonical path using the ``copy_external_file`` situation and returns
-        it as an absolute path string.  Falls back to the absolute path of the original
-        file if the situation cannot be resolved (e.g. no project loaded).
+        The caller hands in the file's actual location (already resolved via its
+        situation where one applies); this must not re-derive a location from a
+        write situation, which would point at where a hypothetical new file would
+        land rather than where this file is.
 
         Args:
-            path: The path of the file
+            path: The path of the file, workspace-relative or absolute
 
         Returns:
-            Absolute path string for the resolved asset path
+            Absolute path string for the asset
         """
-        destination = ProjectFileDestination.from_situation(path.name, BuiltInSituation.COPY_EXTERNAL_FILE)
-        try:
-            resolved_path = Path(destination.resolve())
-        except FileLoadError:
-            return str(resolve_workspace_path(path, self.workspace_directory))
-        return str(resolved_path)
+        return str(resolve_workspace_path(path, self.workspace_directory))
