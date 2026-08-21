@@ -162,9 +162,14 @@ class ConfigManager(EngineScoped):
     def set_workspace_override(self, path: Path | None) -> None:
         """Set a runtime workspace directory override.
 
-        This override takes precedence over config-file-based workspace_directory
-        values (default, user, project, workspace configs) but is still overridden
-        by the GTN_CONFIG_WORKSPACE_DIRECTORY environment variable.
+        This override takes precedence over every other workspace_directory source,
+        including the GTN_CONFIG_WORKSPACE_DIRECTORY environment variable: it is only
+        ever set by decide_workspace branches that deliberately outrank env (a
+        project's own workspace_dir field, the per-user project_workspaces mapping)
+        or that fire only when no env workspace exists (parent inheritance, the
+        global default), so honoring it here is what makes that ladder real. An
+        env-set workspace (e.g. a broker's per-engine scratch stamp) is the engine's
+        default; an activated project's own workspace is the more specific intent.
 
         Used by ProjectManager to apply project_workspaces mappings and
         auto-default-to-project-dir behavior. Also updates workspace_path immediately
@@ -201,19 +206,24 @@ class ConfigManager(EngineScoped):
         """Resolve workspace_directory across the config layers, in load_configs' precedence order.
 
         Single source of truth for how workspace_directory is layered (highest priority first):
-        env var, then the runtime override (only when `include_runtime_override`), then workspace
+        the runtime override (only when `include_runtime_override`), then the env var, then workspace
         config, project-adjacent config, user config, and finally the Settings default. load_configs
         uses this WITH the override to set the active workspace_path; configured_global_workspace_path
         uses it WITHOUT, to get the engine's workspace independent of any single project's pin. Keeping
         both on this one helper is what stops the two precedences from drifting. The Settings default
         always populates default_config, so a value is always returned.
         """
-        # env is applied last in load_configs, so it is highest priority; the runtime override sits
-        # just below env and above the config files.
-        if (env_value := get_dot_value(self.env_config, "workspace_directory", None)) is not None:
-            return env_value
+        # The runtime override outranks the env var, matching decide_workspace's ladder: the
+        # override is only ever set by decisions that deliberately beat env (a project's own
+        # workspace_dir field, the per-user project_workspaces mapping) or that fire only when no
+        # env workspace exists at all (parent inheritance, the global default). An env-set
+        # workspace -- a broker's per-engine scratch stamp, an on-prem deployment default --
+        # describes where the ENGINE's workspace lives, and activating a project that declares
+        # its own workspace is the more specific intent.
         if include_runtime_override and self._workspace_dir_override is not None:
             return self._workspace_dir_override
+        if (env_value := get_dot_value(self.env_config, "workspace_directory", None)) is not None:
+            return env_value
         for layer in (self.workspace_config, self.project_config, self.user_config):
             if (configured := get_dot_value(layer, "workspace_directory", None)) is not None:
                 return configured
@@ -389,7 +399,8 @@ class ConfigManager(EngineScoped):
 
         Sets default_config, user_config, project_config, workspace_config, env_config,
         and merged_config attributes. Priority order (later entries win):
-        defaults → user → project-adjacent → workspace → env vars.
+        defaults → user → project-adjacent → workspace → env vars → runtime workspace override
+        (the override applies to workspace_directory only).
         """
         self.default_config = Settings().model_dump()
         merged_config = self.default_config
@@ -415,15 +426,18 @@ class ConfigManager(EngineScoped):
         else:
             self.workspace_config = {}
 
-        # Apply runtime workspace override (from ProjectManager's project_workspaces lookup
-        # or auto-default-to-project-dir). Sits above config files but below env vars.
-        if self._workspace_dir_override is not None:
-            merged_config["workspace_directory"] = self._workspace_dir_override
-
         self.env_config = self._load_config_from_env_vars()
         if self.env_config:
             merged_config = merge_dicts(merged_config, self.env_config)
             logger.debug("Merged config from environment variables: %s", list(self.env_config.keys()))
+
+        # Apply runtime workspace override (from ProjectManager's project_workspaces lookup
+        # or auto-default-to-project-dir) AFTER the env merge: it outranks env vars, matching
+        # decide_workspace's ladder and _resolve_configured_workspace_directory. A project that
+        # pins its own workspace must win over an env-set engine default (e.g. a broker's
+        # per-engine scratch stamp).
+        if self._workspace_dir_override is not None:
+            merged_config["workspace_directory"] = self._workspace_dir_override
 
         # Re-assign workspace path in case env var or project config overrides it. Uses the shared
         # precedence resolver (WITH the runtime override) so the active workspace and
@@ -474,7 +488,7 @@ class ConfigManager(EngineScoped):
         """Return the merged config a project WOULD activate with, mutating nothing.
 
         Mirrors load_configs()'s layer order (defaults -> user -> project-adjacent ->
-        workspace -> workspace override -> env vars) for the given project and
+        workspace -> env vars -> workspace override) for the given project and
         workspace directories, reading files fresh into a local dict. The
         provisioning preview uses this so its plan reflects the same effective
         `libraries_to_register` / `requires_engine` that _reconcile_libraries_from_config
@@ -512,16 +526,17 @@ class ConfigManager(EngineScoped):
         if workspace_config_path != project_config_path:
             merged = merge_dicts(merged, self._load_config_from_file(workspace_config_path, "workspace"))
 
-        # Apply the runtime workspace override conditionally, mirroring _activate_project:
-        # only the project_workspaces, parent-chain inheritance, and global-default branches
-        # pin it (apply_override), and the value is resolved exactly as set_workspace_override
-        # would so preview and live agree. It sits above config files but below env vars.
-        if apply_override:
-            merged["workspace_directory"] = str(Path(workspace_dir).expanduser().resolve())
-
         env_config = self._load_config_from_env_vars()
         if env_config:
             merged = merge_dicts(merged, env_config)
+
+        # Apply the runtime workspace override conditionally, mirroring _activate_project:
+        # only the template workspace_dir, project_workspaces, parent-chain inheritance, and
+        # global-default branches pin it (apply_override), and the value is resolved exactly as
+        # set_workspace_override would so preview and live agree. Applied AFTER the env merge:
+        # the override outranks env vars, matching load_configs.
+        if apply_override:
+            merged["workspace_directory"] = str(Path(workspace_dir).expanduser().resolve())
 
         return merged
 

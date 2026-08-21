@@ -243,9 +243,7 @@ class TestAdmissionEntitlement:
 
         def denying_hook(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
             seen.append(checkpoint)
-            return CheckpointDenial(
-                failures=(CheckpointFailure(detail="Your license does not include GPU queueing."),)
-            )
+            return CheckpointDenial(failures=(CheckpointFailure(detail="Your license does not include GPU queueing."),))
 
         engine.event_manager.add_authorization_hook(denying_hook)
         try:

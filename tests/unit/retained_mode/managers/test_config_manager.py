@@ -145,6 +145,36 @@ class TestConfigManager:
                 assert manager.workspace_path == override_workspace.resolve()
                 assert manager.get_config_value("workspace_directory") == str(override_workspace)
 
+    def test_project_workspace_override_beats_env_var(self) -> None:
+        """The runtime project override outranks GTN_CONFIG_WORKSPACE_DIRECTORY.
+
+        The override is only ever set by decide_workspace branches that deliberately
+        beat env (a project's own workspace_dir field, the project_workspaces mapping),
+        so the resolver must honor it or the ladder's documented priority is a lie: an
+        engine whose workspace was stamped via env (e.g. a broker's per-engine scratch
+        directory) would silently ignore an activated project's own workspace pin.
+        Clearing the override must restore the env value as the engine default.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_workspace = Path(temp_dir) / "env_workspace"
+            env_workspace.mkdir()
+            project_workspace = Path(temp_dir) / "project_workspace"
+            project_workspace.mkdir()
+
+            with patch.dict(os.environ, {"GTN_CONFIG_WORKSPACE_DIRECTORY": str(env_workspace)}, clear=True):
+                manager = ConfigManager()
+                manager.load_configs()
+                assert manager.workspace_path == env_workspace.resolve()
+
+                manager.set_workspace_override(project_workspace)
+                manager.load_configs()
+                assert manager.workspace_path == project_workspace.resolve()
+                assert manager.get_config_value("workspace_directory") == str(project_workspace.resolve())
+
+                manager.set_workspace_override(None)
+                manager.load_configs()
+                assert manager.workspace_path == env_workspace.resolve()
+
     def test_resolved_libraries_root_default_is_global_workspace_relative(self, isolate_user_config: Path) -> None:
         """With no override, the root is libraries_directory resolved against the GLOBAL workspace.
 
@@ -546,22 +576,6 @@ class TestConfigManager:
 
                 assert manager.workspace_path == override_dir.resolve()
                 assert manager.merged_config["workspace_directory"] == str(override_dir.resolve())
-
-    def test_workspace_override_loses_to_env_var(self) -> None:
-        """Test that GTN_CONFIG_WORKSPACE_DIRECTORY still wins over the runtime override."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            override_dir = Path(temp_dir) / "override"
-            override_dir.mkdir()
-            env_dir = Path(temp_dir) / "env"
-            env_dir.mkdir()
-
-            with patch.dict(os.environ, {"GTN_CONFIG_WORKSPACE_DIRECTORY": str(env_dir)}, clear=True):
-                manager = ConfigManager()
-                manager.set_workspace_override(override_dir)
-
-                manager.load_configs()
-
-                assert manager.workspace_path == env_dir.resolve()
 
     def test_workspace_override_cleared_on_reset(self) -> None:
         """Test that reset_user_config clears the runtime workspace override."""
