@@ -62,6 +62,9 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.context_manager import ContextManager
     from griptape_nodes.retained_mode.managers.engine_identity_manager import EngineIdentityManager
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
+    from griptape_nodes.retained_mode.managers.execution_lease_manager import (
+        ExecutionLeaseManager,
+    )
     from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
     from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
     from griptape_nodes.retained_mode.managers.manifest_manager import ManifestManager
@@ -182,6 +185,9 @@ class Engine:
         from griptape_nodes.retained_mode.managers.context_manager import ContextManager
         from griptape_nodes.retained_mode.managers.engine_identity_manager import EngineIdentityManager
         from griptape_nodes.retained_mode.managers.event_manager import EventManager
+        from griptape_nodes.retained_mode.managers.execution_lease_manager import (
+            ExecutionLeaseManager,
+        )
         from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
         from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
         from griptape_nodes.retained_mode.managers.manifest_manager import ManifestManager
@@ -223,6 +229,7 @@ class Engine:
         self._flow_manager = FlowManager(self._event_manager, engine=self)
         self._context_manager = ContextManager(self._event_manager, engine=self)
         self._worker_manager = WorkerManager(engine=self, event_manager=self._event_manager)
+        self._execution_lease_manager = ExecutionLeaseManager(engine=self)
         self._library_manager = LibraryManager(self._event_manager, worker_manager=self._worker_manager, engine=self)
         self._model_manager = ModelManager(self._event_manager, engine=self)
         self._access_manager = AccessManager(self._event_manager, engine=self)
@@ -361,6 +368,10 @@ class Engine:
     @property
     def worker_manager(self) -> WorkerManager:
         return self._worker_manager
+
+    @property
+    def execution_lease_manager(self) -> ExecutionLeaseManager:
+        return self._execution_lease_manager
 
     # Node libraries and saved workflows do `app = GriptapeNodes()` and then call these
     # PascalCase accessors on the result. `GriptapeNodes()` hands back an `Engine`, so

@@ -4497,6 +4497,12 @@ class FlowManager(EngineScoped):
             errormsg = "This workflow is already in progress. Please wait for the current process to finish before starting again."
             raise RuntimeError(errormsg)
 
+        # Managed execution: acquire the execution lease exactly where the
+        # running-flow signal is about to transition False -> True. No-op on
+        # unmanaged engines. Placed before the queue pop so a refused start
+        # leaves the execution queue intact.
+        await self.engine.execution_lease_manager.gate_execution_start()
+
         if start_node is None:
             if self._global_flow_queue.empty():
                 errormsg = "No Flow exists. You must create at least one control connection."
@@ -4516,6 +4522,9 @@ class FlowManager(EngineScoped):
         except Exception:
             if self.check_for_existing_running_flow():
                 await self.cancel_flow_run()
+            # The run never launched; return the lease now rather than holding
+            # admission until the watchdog's startup grace expires.
+            await self.engine.execution_lease_manager.on_execution_start_failed()
             raise
         self.engine.event_manager.put_event(
             ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=[])))
@@ -4775,23 +4784,39 @@ class FlowManager(EngineScoped):
         if not self.check_for_existing_running_flow():
             if self._global_flow_queue.empty():
                 raise RuntimeError(error_message)
+            # Managed execution: this is a cold start (running-flow signal is
+            # False and about to go True), so it gates like start_flow does.
+            await self.engine.execution_lease_manager.gate_execution_start()
             queue_item = self._global_flow_queue.get()
             start_node = queue_item.node
             self._global_flow_queue.task_done()
             # Get or create machine
             if self._global_control_flow_machine is None:
                 self._global_control_flow_machine = ControlFlowMachine(flow.name, engine=self.engine)
-            await self._global_control_flow_machine.start_flow(start_node, debug_mode=debug_mode)
+            try:
+                await self._global_control_flow_machine.start_flow(start_node, debug_mode=debug_mode)
+            except Exception:
+                await self.engine.execution_lease_manager.on_execution_start_failed()
+                raise
 
     async def _handle_post_execution_queue_processing(self, *, debug_mode: bool) -> None:
         """Handle execution queue processing after execution completes."""
         if not self.check_for_existing_running_flow() and not self._global_flow_queue.empty():
+            # Managed execution: draining the next queued start is a fresh
+            # False -> True transition. The manager reuses the still-held lease
+            # when the watchdog has not released yet, so back-to-back queued
+            # runs do not thrash acquire/release.
+            await self.engine.execution_lease_manager.gate_execution_start()
             queue_item = self._global_flow_queue.get()
             start_node = queue_item.node
             self._global_flow_queue.task_done()
             machine = self._global_control_flow_machine
             if machine is not None:
-                await machine.start_flow(start_node, debug_mode=debug_mode)
+                try:
+                    await machine.start_flow(start_node, debug_mode=debug_mode)
+                except Exception:
+                    await self.engine.execution_lease_manager.on_execution_start_failed()
+                    raise
 
     async def resolve_singular_node(self, flow: ControlFlow, node: BaseNode, *, debug_mode: bool = False) -> None:
         # We are now going to have different behavior depending on how the node is behaving.
@@ -4806,6 +4831,10 @@ class FlowManager(EngineScoped):
                 )
             )
         else:
+            # Managed execution: a cold single-node run gates like a workflow
+            # start. The mid-run DAG-add branch above deliberately does NOT
+            # gate -- it joins a run that already holds the lease.
+            await self.engine.execution_lease_manager.gate_execution_start(scope="single_node")
             # Set that we are only working on one node right now!
             self._global_single_node_resolution = True
             # Get or create machine
@@ -4841,6 +4870,7 @@ class FlowManager(EngineScoped):
                 logger.exception("Exception during single node resolution")
                 if self.check_for_existing_running_flow():
                     await self.cancel_flow_run()
+                await self.engine.execution_lease_manager.on_execution_start_failed()
                 raise RuntimeError(e) from e
 
             if resolution_machine.is_errored():
