@@ -336,7 +336,17 @@ class LibraryRegistry:
                 )
                 # Continue — a failing teardown must not prevent unregistration.
 
-        # Deregister tracked handlers.
+        cls._deregister_tracked_handlers(library, event_manager=event_manager)
+
+        # Clean up registered widgets for this library
+        cls.unregister_widgets_for_library(library_name)
+
+        # Now delete the library from the registry.
+        del cls._libraries[library_name]
+
+    @classmethod
+    def _deregister_tracked_handlers(cls, library: Library, *, event_manager: EventManager) -> None:
+        """Remove everything the engine registered on the library's behalf at load time."""
         if library._registered_app_event_listeners:
             for event_type, listener in library._registered_app_event_listeners:
                 event_manager.remove_listener_for_app_event(event_type, listener)
@@ -347,16 +357,15 @@ class LibraryRegistry:
                 event_manager.remove_pre_dispatch_hook(hook)
             library._registered_pre_dispatch_hooks.clear()
 
+        if library._registered_post_dispatch_hooks:
+            for request_type, hook in library._registered_post_dispatch_hooks:
+                event_manager.remove_post_dispatch_hook(request_type, hook)
+            library._registered_post_dispatch_hooks.clear()
+
         if library._registered_request_handler_types:
             for request_type in library._registered_request_handler_types:
                 event_manager.remove_manager_from_request_type(request_type)
             library._registered_request_handler_types.clear()
-
-        # Clean up registered widgets for this library
-        cls.unregister_widgets_for_library(library_name)
-
-        # Now delete the library from the registry.
-        del cls._libraries[library_name]
 
     @classmethod
     def get_library(cls, name: str) -> Library:
@@ -581,6 +590,7 @@ class Library:
     # deregistered automatically when the library is unloaded.
     _registered_app_event_listeners: list[tuple[type, Callable]]
     _registered_pre_dispatch_hooks: list[Callable]
+    _registered_post_dispatch_hooks: list[tuple[type, Callable]]
     _registered_request_handler_types: list[type]
 
     def __init__(
@@ -603,6 +613,7 @@ class Library:
         self._advanced_library = advanced_library
         self._registered_app_event_listeners = []
         self._registered_pre_dispatch_hooks = []
+        self._registered_post_dispatch_hooks = []
         self._registered_request_handler_types = []
 
     def get_registered_app_event_listeners(self) -> list[tuple[type, Callable]]:
@@ -610,6 +621,14 @@ class Library:
 
     def get_registered_pre_dispatch_hooks(self) -> list[Callable]:
         return list(self._registered_pre_dispatch_hooks)
+
+    def get_registered_post_dispatch_hooks(self) -> list[tuple[type, Callable]]:
+        """Return the (request_type, callback) pairs this library has registered as post-dispatch hooks.
+
+        The request type is tracked alongside the callback because removal is
+        per-request-type. Returns a copy; mutating the returned list has no effect.
+        """
+        return list(self._registered_post_dispatch_hooks)
 
     def get_registered_request_handler_types(self) -> list[type]:
         """Return the request payload types whose handlers this library has registered.

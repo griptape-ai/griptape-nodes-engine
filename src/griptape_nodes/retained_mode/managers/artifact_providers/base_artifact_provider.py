@@ -8,11 +8,13 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
 
+from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.managers.artifact_providers.utils import (
     normalize_friendly_name_to_key,
 )
 
 if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_preview_generator import (
         BaseArtifactPreviewGenerator,
     )
@@ -40,7 +42,7 @@ class BaseArtifactMetadata(BaseModel):
     """
 
 
-class BaseArtifactProvider(ABC):
+class BaseArtifactProvider(EngineScoped, ABC):
     """Abstract base class for artifact type providers.
 
     Providers define how to handle specific artifact types (images, video, audio)
@@ -50,12 +52,14 @@ class BaseArtifactProvider(ABC):
     Instance attributes may hold heavyweight dependencies (e.g., PIL, ffmpeg) loaded lazily.
     """
 
-    def __init__(self, registry: ProviderRegistry) -> None:
+    def __init__(self, registry: ProviderRegistry, engine: Engine | None = None) -> None:
         """Initialize provider with registry reference.
 
         Args:
             registry: The ProviderRegistry that manages this provider
+            engine: The engine this provider belongs to
         """
+        super().__init__(engine)
         self._registry = registry
 
     @classmethod
@@ -231,7 +235,12 @@ class BaseArtifactProvider(ABC):
 
         # FAILURE CASE: Instantiate generator
         generator = generator_class(
-            source_file_location, preview_format, destination_preview_directory, destination_preview_file_name, params
+            source_file_location,
+            preview_format,
+            destination_preview_directory,
+            destination_preview_file_name,
+            params,
+            engine=self.engine,
         )
 
         # FAILURE CASE: Execute generator and get result

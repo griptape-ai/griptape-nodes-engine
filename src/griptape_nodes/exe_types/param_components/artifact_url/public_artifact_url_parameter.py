@@ -1,3 +1,4 @@
+import mimetypes
 import os
 from pathlib import Path
 from typing import Any, ClassVar
@@ -175,7 +176,7 @@ class PublicArtifactUrlParameter:
         from griptape_nodes.files.file import File
 
         file_contents = File(url).read_bytes()
-        filename = Path(urlparse(url).path).name
+        filename = self._derive_upload_filename(url)
 
         self.gtc_file_path = Path("artifact_url_storage") / uuid4().hex / filename
 
@@ -188,3 +189,19 @@ class PublicArtifactUrlParameter:
         if not self.gtc_file_path:
             return
         self._storage_driver.delete_file(self.gtc_file_path)
+
+    @staticmethod
+    def _derive_upload_filename(url: str) -> str:
+        """Pick the storage filename for a value being uploaded.
+
+        A data URI has no path component to take a name from -- deriving one from the URI
+        would embed the (potentially megabytes-long) base64 payload in the storage key --
+        so it gets a generated name instead. The extension matters beyond aesthetics: the
+        presigned download URL's content type is guessed from the uploaded path's
+        extension, so a bare name would serve the media without a content type.
+        """
+        if url.startswith("data:"):
+            mime_type = url.removeprefix("data:").split(";", 1)[0].split(",", 1)[0]
+            extension = mimetypes.guess_extension(mime_type) or ""
+            return f"{uuid4().hex}{extension}"
+        return Path(urlparse(url).path).name or uuid4().hex

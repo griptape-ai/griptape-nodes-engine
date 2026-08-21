@@ -40,6 +40,7 @@ from griptape_nodes.files.path_utils import derive_registry_key
 from griptape_nodes.machines.dag_builder import DagBuilder
 from griptape_nodes.node_library.library_registry import Library, LibraryRegistry
 from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
+from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.agent_events import AgentStreamEvent
 from griptape_nodes.retained_mode.events.base_events import ForwardedException, ProgressEvent
 from griptape_nodes.retained_mode.events.connection_events import (
@@ -112,7 +113,6 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     SaveWorkflowFileFromSerializedFlowRequest,
     SaveWorkflowFileFromSerializedFlowResultSuccess,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.event_manager import (
     EventSuppressionContext,
     EventTranslationContext,
@@ -214,12 +214,12 @@ class LoopBodyNodes(NamedTuple):
     node_group_name: str | None
 
 
-class NodeExecutor:
-    """Singleton executor that executes nodes dynamically."""
+class NodeExecutor(EngineScoped):
+    """Executes nodes dynamically. One instance per engine, owned by FlowManager."""
 
     def get_workflow_handler(self, library_name: str) -> LibraryManager.RegisteredEventHandler:
         """Get the PublishWorkflowRequest handler for a library, or None if not available."""
-        library_manager = GriptapeNodes.LibraryManager()
+        library_manager = self.engine.library_manager
         registered_handlers = library_manager.get_registered_event_handlers(PublishWorkflowRequest)
         if library_name in registered_handlers:
             return registered_handlers[library_name]
@@ -271,7 +271,7 @@ class NodeExecutor:
             # Single entry point for both local and worker execution. The
             # ExecuteNodeRequest handler routes to a worker subprocess when the
             # node's library requires it, otherwise runs aprocess in-process.
-            result = await GriptapeNodes.ahandle_request(
+            result = await self.engine.ahandle_request(
                 ExecuteNodeRequest(
                     node_name=node.name,
                     parameter_values=dict(node.parameter_values),
@@ -298,8 +298,7 @@ class NodeExecutor:
         finally:
             current_executing_node_name.reset(token)
 
-    @staticmethod
-    def _resolve_variables_for_node(node_name: str) -> dict[str, str | int]:
+    def _resolve_variables_for_node(self, node_name: str) -> dict[str, str | int]:
         """Resolve the variable dict for a node's flow on the orchestrator.
 
         Workers run transient nodes that are never added to ObjectManager, so the
@@ -309,10 +308,10 @@ class NodeExecutor:
         if not VariableResolver.is_substitution_enabled():
             return {}
         try:
-            flow_name = GriptapeNodes.NodeManager().get_node_parent_flow_by_name(node_name)
+            flow_name = self.engine.node_manager.get_node_parent_flow_by_name(node_name)
         except KeyError:
             return {}
-        var_result = GriptapeNodes.handle_request(
+        var_result = self.engine.handle_request(
             ListVariablesRequest(starting_flow=flow_name, lookup_scope=VariableScope.HIERARCHICAL)
         )
         if not isinstance(var_result, ListVariablesResultSuccess):
@@ -561,7 +560,7 @@ class NodeExecutor:
             entry_control_parameter_name=None,
             node_group_name=node_group_name,
         )
-        package_result = GriptapeNodes.handle_request(request)
+        package_result = self.engine.handle_request(request)
         if not isinstance(package_result, PackageNodesAsSerializedFlowResultSuccess):
             msg = f"Failed to package node '{node.name}'. Error: {package_result.result_details}"
             raise RuntimeError(msg)  # noqa: TRY004
@@ -574,7 +573,7 @@ class NodeExecutor:
             pickle_control_flow_result=True,
         )
 
-        workflow_result = await GriptapeNodes.ahandle_request(workflow_file_request)
+        workflow_result = await self.engine.ahandle_request(workflow_file_request)
         if not isinstance(workflow_result, SaveWorkflowFileFromSerializedFlowResultSuccess):
             msg = f"Failed to Save Workflow File from Serialized Flow for node '{node.name}'. Error: {workflow_result.result_details}"
             raise RuntimeError(msg)  # noqa: TRY004
@@ -600,7 +599,7 @@ class NodeExecutor:
 
         subprocess_workflow_publisher = SubprocessWorkflowPublisher(on_event=on_event)
         published_filename = f"{Path(workflow_result.file_path).stem}_published"
-        published_workflow_filename = GriptapeNodes.ConfigManager().workspace_path / (published_filename + ".py")
+        published_workflow_filename = self.engine.config_manager.workspace_path / (published_filename + ".py")
 
         async with subprocess_workflow_publisher:
             await subprocess_workflow_publisher.arun(
@@ -739,7 +738,7 @@ class NodeExecutor:
         all_nodes: set[str] = set()
         visited_deps: set[str] = set()
 
-        node_manager = GriptapeNodes.NodeManager()
+        node_manager = self.engine.node_manager
         # Exclude the start node from packaging. And, we don't want their dependencies.
         nodes_in_control_flow.discard(start_node.name)
         for node_name in nodes_in_control_flow:
@@ -785,7 +784,7 @@ class NodeExecutor:
         Returns:
             PackageNodesAsSerializedFlowResultSuccess if successful, None if empty loop body
         """
-        flow_manager = GriptapeNodes.FlowManager()
+        flow_manager = self.engine.flow_manager
         connections = flow_manager.get_connections()
 
         # Collect all nodes in the forward control path from start to end
@@ -834,7 +833,7 @@ class NodeExecutor:
             node_group_name=node_group_name,
         )
 
-        package_result = GriptapeNodes.handle_request(request)
+        package_result = self.engine.handle_request(request)
         if not isinstance(package_result, PackageNodesAsSerializedFlowResultSuccess):
             msg = f"Failed to package loop nodes for '{end_node.name}'. Error: {package_result.result_details}"
             raise TypeError(msg)
@@ -849,7 +848,7 @@ class NodeExecutor:
         # Mark all packaged nodes as RESOLVED to prevent them from executing in the outer flow.
         # This is critical for nested loops: when an inner loop's body is packaged, those nodes
         # exist in the outer flow but should not execute there - they only execute in the packaged iterations.
-        node_manager = GriptapeNodes.NodeManager()
+        node_manager = self.engine.node_manager
         for node_name in all_nodes:
             node = node_manager.get_node_by_name(node_name)
             if node:
@@ -880,7 +879,7 @@ class NodeExecutor:
 
         # Check if there are direct data connections from start to end
         list_connections_request = ListConnectionsForNodeRequest(node_name=start_node.name)
-        list_connections_result = GriptapeNodes.handle_request(list_connections_request)
+        list_connections_result = self.engine.handle_request(list_connections_request)
 
         connected_source_param = None
         if isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
@@ -939,7 +938,7 @@ class NodeExecutor:
         """
         # Get incoming connections to the end_loop_node (the iterative group)
         list_connections_request = ListConnectionsForNodeRequest(node_name=end_loop_node.name)
-        list_connections_result = GriptapeNodes.handle_request(list_connections_request)
+        list_connections_result = self.engine.handle_request(list_connections_request)
         if not isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
             logger.warning("Failed to list connections for node %s", end_loop_node.name)
             return IterationControlAction.ADD
@@ -993,7 +992,7 @@ class NodeExecutor:
             logger.debug("_check_control_source_fired: no deserialized name for '%s'", source_node_name)
             return False
 
-        node_manager = GriptapeNodes.NodeManager()
+        node_manager = self.engine.node_manager
         try:
             deserialized_source_node = node_manager.get_node_by_name(deserialized_source_name)
         except ValueError:
@@ -1073,15 +1072,15 @@ class NodeExecutor:
         # where a raise after creation but before execution would leak the flow. deserialized_flows
         # is populated the instant the flow is created. (The flow is also tagged transient at
         # packaging time, so a mid-run save cannot bake it into the workflow regardless.)
-        context_manager = GriptapeNodes.ContextManager()
-        event_manager = GriptapeNodes.EventManager()
+        context_manager = self.engine.context_manager
+        event_manager = self.engine.event_manager
         deserialized_flows: list[tuple[int, str, dict[str, str]]] = []
         try:
             with EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS):
                 deserialize_request = DeserializeFlowFromCommandsRequest(
                     serialized_flow_commands=package_result.serialized_flow_commands
                 )
-                deserialize_result = GriptapeNodes.handle_request(deserialize_request)
+                deserialize_result = self.engine.handle_request(deserialize_request)
                 if not isinstance(deserialize_result, DeserializeFlowFromCommandsResultSuccess):
                     msg = f"Failed to deserialize flow for sequential loop. Error: {deserialize_result.result_details}"
                     raise TypeError(msg)
@@ -1134,7 +1133,7 @@ class NodeExecutor:
                         parameter_name=startflow_param_name,
                         value=value_to_set,
                     )
-                    set_value_result = await GriptapeNodes.ahandle_request(set_value_request)
+                    set_value_result = await self.engine.ahandle_request(set_value_request)
                     if not isinstance(set_value_result, SetParameterValueResultSuccess):
                         logger.warning(
                             "Failed to set parameter '%s' on Start node '%s' for iteration %d: %s",
@@ -1158,7 +1157,7 @@ class NodeExecutor:
                         start_node=packaged_start_node_name,
                         pickle_control_flow_result=False,
                     )
-                    start_subflow_result = await GriptapeNodes.ahandle_request(start_subflow_request)
+                    start_subflow_result = await self.engine.ahandle_request(start_subflow_request)
 
                 if not isinstance(start_subflow_result, StartLocalSubflowResultSuccess):
                     logger.warning(
@@ -1589,7 +1588,7 @@ class NodeExecutor:
         condition_met = False
         last_iteration_values: dict[str, Any] = {}
         total_iterations = max_iterations + 1  # first iteration + re-iterations
-        event_manager = GriptapeNodes.EventManager()
+        event_manager = self.engine.event_manager
 
         try:
             condition_met = await self._run_while_loop_iterations(
@@ -1617,7 +1616,7 @@ class NodeExecutor:
             # Clean up the deserialized flow
             with EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS):
                 delete_request = DeleteFlowRequest(flow_name=flow_name)
-                delete_result = GriptapeNodes.handle_request(delete_request)
+                delete_result = self.engine.handle_request(delete_request)
                 if isinstance(delete_result, DeleteFlowResultFailure):
                     logger.warning("Failed to clean up while group flow '%s': %s", flow_name, delete_result)
 
@@ -1655,13 +1654,13 @@ class NodeExecutor:
         Returns:
             Tuple of (flow_name, node_name_mappings, packaged_start_node_name)
         """
-        context_manager = GriptapeNodes.ContextManager()
-        event_manager = GriptapeNodes.EventManager()
+        context_manager = self.engine.context_manager
+        event_manager = self.engine.event_manager
         with EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS):
             deserialize_request = DeserializeFlowFromCommandsRequest(
                 serialized_flow_commands=package_result.serialized_flow_commands
             )
-            deserialize_result = GriptapeNodes.handle_request(deserialize_request)
+            deserialize_result = self.engine.handle_request(deserialize_request)
             if not isinstance(deserialize_result, DeserializeFlowFromCommandsResultSuccess):
                 msg = f"Failed to deserialize flow for while group. Error: {deserialize_result.result_details}"
                 raise TypeError(msg)
@@ -1724,7 +1723,7 @@ class NodeExecutor:
                     start_node=packaged_start_node_name,
                     pickle_control_flow_result=False,
                 )
-                start_subflow_result = await GriptapeNodes.ahandle_request(start_subflow_request)
+                start_subflow_result = await self.engine.ahandle_request(start_subflow_request)
 
             execution_failed = isinstance(start_subflow_result, StartLocalSubflowResultFailure)
 
@@ -1770,7 +1769,7 @@ class NodeExecutor:
                 parameter_name=startflow_param_name,
                 value=value_to_set,
             )
-            set_value_result = await GriptapeNodes.ahandle_request(set_value_request)
+            set_value_result = await self.engine.ahandle_request(set_value_request)
             if not isinstance(set_value_result, SetParameterValueResultSuccess):
                 logger.warning(
                     "Failed to set parameter '%s' on Start node '%s' for iteration %d: %s",
@@ -1864,7 +1863,7 @@ class NodeExecutor:
         Returns:
             Tuple of (resolved_node_name, resolved_param_name)
         """
-        node_manager = GriptapeNodes.NodeManager()
+        node_manager = self.engine.node_manager
         try:
             target_node = node_manager.get_node_by_name(target_node_name)
         except ValueError:
@@ -1873,7 +1872,7 @@ class NodeExecutor:
         if not isinstance(target_node, SubflowNodeGroup):
             return (target_node_name, target_param_name)
 
-        flow_manager = GriptapeNodes.FlowManager()
+        flow_manager = self.engine.flow_manager
         connections = flow_manager.get_connections()
         proxy_param = target_node.get_parameter_by_name(target_param_name)
         if proxy_param:
@@ -1904,7 +1903,7 @@ class NodeExecutor:
         iteration_params: list[str] = []
 
         list_connections_request = ListConnectionsForNodeRequest(node_name=node.name)
-        list_connections_result = GriptapeNodes.handle_request(list_connections_request)
+        list_connections_result = self.engine.handle_request(list_connections_request)
         if not isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
             logger.warning("Failed to list connections for while group node %s", node.name)
             return iteration_params
@@ -1947,7 +1946,7 @@ class NodeExecutor:
             WhileControlParam.DONE, WhileControlParam.CONTINUE, or None
         """
         list_connections_request = ListConnectionsForNodeRequest(node_name=while_node.name)
-        list_connections_result = GriptapeNodes.handle_request(list_connections_request)
+        list_connections_result = self.engine.handle_request(list_connections_request)
         if not isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
             logger.warning("Failed to list connections for while group node %s", while_node.name)
             return None
@@ -2000,7 +1999,7 @@ class NodeExecutor:
         Returns:
             List of (source_node_name, source_parameter_name) tuples
         """
-        flow_manager = GriptapeNodes.FlowManager()
+        flow_manager = self.engine.flow_manager
         connections = flow_manager.get_connections()
         sources: list[tuple[str, str]] = []
 
@@ -2012,7 +2011,7 @@ class NodeExecutor:
             source_param_name = conn.source_parameter_name
 
             # If source is a SubflowNodeGroup, follow the internal connection to get the actual source
-            node_manager = GriptapeNodes.NodeManager()
+            node_manager = self.engine.node_manager
             try:
                 source_node = node_manager.get_node_by_name(source_node_name)
             except ValueError:
@@ -2040,7 +2039,7 @@ class NodeExecutor:
         # on_each only exists on iterative groups; non-iterative subflows fall back to implicit child-discovery.
         if not isinstance(node, BaseIterativeNodeGroup):
             return None, None
-        flow_manager = GriptapeNodes.FlowManager()
+        flow_manager = self.engine.flow_manager
         connections = flow_manager.get_connections()
         # Use node.on_each.name instead of a literal so renames stay in sync.
         # Control outputs are single-target (enforced in connections.py), so index 0 is the only connection.
@@ -2109,7 +2108,7 @@ class NodeExecutor:
             node_group_name=node.name,
         )
 
-        package_result = GriptapeNodes.handle_request(request)
+        package_result = self.engine.handle_request(request)
         if not isinstance(package_result, PackageNodesAsSerializedFlowResultSuccess):
             msg = f"Failed to package {label} '{node.name}'. Error: {package_result.result_details}"
             raise TypeError(msg)
@@ -2122,7 +2121,7 @@ class NodeExecutor:
         )
 
         # Mark packaged nodes as RESOLVED to prevent outer flow execution
-        node_manager = GriptapeNodes.NodeManager()
+        node_manager = self.engine.node_manager
         for node_name in node_names:
             node_reference = node_manager.get_node_by_name(node_name)
             if node_reference:
@@ -2455,7 +2454,7 @@ class NodeExecutor:
         index_values = iteration_source.get_all_iteration_values()
 
         list_connections_request = ListConnectionsForNodeRequest(node_name=iteration_source.name)
-        list_connections_result = GriptapeNodes.handle_request(list_connections_request)
+        list_connections_result = self.engine.handle_request(list_connections_request)
         if not isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
             msg = (
                 f"Failed to list connections for node {iteration_source.name}: {list_connections_result.result_details}"
@@ -2519,9 +2518,9 @@ class NodeExecutor:
         Returns:
             Dict mapping startflow_param_name -> value from resolved upstream node
         """
-        flow_manager = GriptapeNodes.FlowManager()
+        flow_manager = self.engine.flow_manager
         connections = flow_manager.get_connections()
-        node_manager = GriptapeNodes.NodeManager()
+        node_manager = self.engine.node_manager
 
         # Get Start node's parameter mappings (index 0 in the list)
         start_node_mapping = self.get_node_parameter_mappings(package_result, "start")
@@ -2628,7 +2627,7 @@ class NodeExecutor:
         Returns:
             The value from the resolved external source, or None if not found
         """
-        flow_manager = GriptapeNodes.FlowManager()
+        flow_manager = self.engine.flow_manager
         connections = flow_manager.get_connections()
 
         # Find the incoming connection TO the proxy parameter on the group
@@ -2717,8 +2716,8 @@ class NodeExecutor:
                 source_param_name = conn.source_parameter_name
 
                 # If source is a NodeGroup, follow the internal connection to get the actual source
-                node_manager = GriptapeNodes.NodeManager()
-                flow_manager = GriptapeNodes.FlowManager()
+                node_manager = self.engine.node_manager
+                flow_manager = self.engine.flow_manager
                 try:
                     source_node = node_manager.get_node_by_name(source_node_name)
                 except ValueError:
@@ -2781,7 +2780,7 @@ class NodeExecutor:
         """
         # Step 1: Get incoming connections TO the end_loop_node
         list_connections_request = ListConnectionsForNodeRequest(node_name=end_loop_node.name)
-        list_connections_result = GriptapeNodes.handle_request(list_connections_request)
+        list_connections_result = self.engine.handle_request(list_connections_request)
         if not isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
             msg = f"Failed to list connections for node {end_loop_node.name}: {list_connections_result.result_details}"
             raise RuntimeError(msg)  # noqa: TRY004
@@ -2806,7 +2805,7 @@ class NodeExecutor:
         # Step 4: Extract values from each iteration's EndFlow node
         packaged_end_node_name = end_node_mapping.node_name
         iteration_results = {}
-        node_manager = GriptapeNodes.NodeManager()
+        node_manager = self.engine.node_manager
 
         for iteration_index, flow_name, node_name_mappings in deserialized_flows:
             deserialized_end_node_name = node_name_mappings.get(packaged_end_node_name)
@@ -2885,7 +2884,7 @@ class NodeExecutor:
             return {}
 
         # Get the End node instance
-        node_manager = GriptapeNodes.NodeManager()
+        node_manager = self.engine.node_manager
         try:
             deserialized_end_node = node_manager.get_node_by_name(deserialized_end_node_name)
         except Exception as e:
@@ -2926,9 +2925,9 @@ class NodeExecutor:
         with EventSuppressionContext(event_manager, {DeleteFlowResultSuccess, DeleteFlowResultFailure}):
             for iteration_index, flow_name, _ in deserialized_flows:
                 # Skip flows already torn down (e.g. a partially-run iteration cleaned itself up).
-                if GriptapeNodes.ObjectManager().attempt_get_object_by_name(flow_name) is None:
+                if self.engine.object_manager.attempt_get_object_by_name(flow_name) is None:
                     continue
-                delete_result = await GriptapeNodes.ahandle_request(DeleteFlowRequest(flow_name=flow_name))
+                delete_result = await self.engine.ahandle_request(DeleteFlowRequest(flow_name=flow_name))
                 if not isinstance(delete_result, DeleteFlowResultSuccess):
                     logger.error(
                         "Failed to delete iteration flow '%s' (iteration %d): %s. This flow may leak into a "
@@ -2975,11 +2974,11 @@ class NodeExecutor:
         # flows are also tagged transient at packaging time, so a mid-run save can never bake them
         # into the workflow even in the window before cleanup runs.)
         deserialized_flows = []
-        context_manager = GriptapeNodes.ContextManager()
+        context_manager = self.engine.context_manager
         saved_context_flow = context_manager.get_current_flow() if context_manager.has_current_flow() else None
 
         # Suppress events during deserialization to prevent sending them to websockets
-        event_manager = GriptapeNodes.EventManager()
+        event_manager = self.engine.event_manager
         try:
             with EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS):
                 for iteration_index in range(total_iterations):
@@ -2996,7 +2995,7 @@ class NodeExecutor:
                     deserialize_request = DeserializeFlowFromCommandsRequest(
                         serialized_flow_commands=package_result.serialized_flow_commands
                     )
-                    deserialize_result = GriptapeNodes.handle_request(deserialize_request)
+                    deserialize_result = self.engine.handle_request(deserialize_request)
                     if not isinstance(deserialize_result, DeserializeFlowFromCommandsResultSuccess):
                         msg = f"Failed to deserialize flow for iteration {iteration_index}. Error: {deserialize_result.result_details}"
                         raise TypeError(msg)
@@ -3028,7 +3027,7 @@ class NodeExecutor:
                         start_node=start_node_name,
                         pickle_control_flow_result=False,
                     )
-                    start_subflow_result = await GriptapeNodes.ahandle_request(start_subflow_request)
+                    start_subflow_result = await self.engine.ahandle_request(start_subflow_request)
                     success = isinstance(start_subflow_result, StartLocalSubflowResultSuccess)
                     return iteration_index, success
 
@@ -3063,7 +3062,7 @@ class NodeExecutor:
                         parameter_name=startflow_param_name,
                         value=value_to_set,
                     )
-                    set_value_result = await GriptapeNodes.ahandle_request(set_value_request)
+                    set_value_result = await self.engine.ahandle_request(set_value_request)
                     if not isinstance(set_value_result, SetParameterValueResultSuccess):
                         logger.warning(
                             "Failed to set parameter '%s' on Start node '%s' for iteration %d: %s",
@@ -3385,7 +3384,7 @@ class NodeExecutor:
             pickle_control_flow_result=pickle_control_flow_result,
         )
 
-        workflow_result = await GriptapeNodes.ahandle_request(workflow_file_request)
+        workflow_result = await self.engine.ahandle_request(workflow_file_request)
         if not isinstance(workflow_result, SaveWorkflowFileFromSerializedFlowResultSuccess):
             msg = f"Failed to save workflow file for private loop execution: {workflow_result.result_details}"
             raise TypeError(msg)
@@ -3425,7 +3424,7 @@ class NodeExecutor:
 
         # Find which EndFlow parameter corresponds to new_item_to_add
         list_connections_request = ListConnectionsForNodeRequest(node_name=end_loop_node.name)
-        list_connections_result = GriptapeNodes.handle_request(list_connections_request)
+        list_connections_result = self.engine.handle_request(list_connections_request)
 
         endflow_param_name = None
         if isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
@@ -3568,7 +3567,7 @@ class NodeExecutor:
             pickle_control_flow_result=True,
         )
 
-        workflow_result = await GriptapeNodes.ahandle_request(workflow_file_request)
+        workflow_result = await self.engine.ahandle_request(workflow_file_request)
         if not isinstance(workflow_result, SaveWorkflowFileFromSerializedFlowResultSuccess):
             msg = f"Failed to save workflow file for loop: {workflow_result.result_details}"
             raise RuntimeError(msg)  # noqa: TRY004 - This is a runtime failure, not a type validation error
@@ -3644,8 +3643,8 @@ class NodeExecutor:
         Args:
             packaged_node_names: Set of node names that were packaged
         """
-        flow_manager = GriptapeNodes.FlowManager()
-        node_manager = GriptapeNodes.NodeManager()
+        flow_manager = self.engine.flow_manager
+        node_manager = self.engine.node_manager
 
         # Get the nodes from the names
         packaged_nodes = set()
@@ -3757,7 +3756,7 @@ class NodeExecutor:
             # Provide source node/parameter to bypass connection conflict validation
             # These values are coming from execution results, treat as upstream values
             if target_param.type != ParameterTypeBuiltin.CONTROL_TYPE:
-                GriptapeNodes.NodeManager().on_set_parameter_value_request(
+                self.engine.node_manager.on_set_parameter_value_request(
                     SetParameterValueRequest(
                         node_name=target_node_name,
                         parameter_name=target_param_name,
@@ -3798,7 +3797,7 @@ class NodeExecutor:
         end_node_mapping = self.get_node_parameter_mappings(package_result, "end")
         end_node_param_mappings = end_node_mapping.parameter_mappings
 
-        node_manager = GriptapeNodes.NodeManager()
+        node_manager = self.engine.node_manager
 
         # For each parameter in the End node, map it back to the original node and set the value
         for sanitized_param_name, param_value in last_iteration_values.items():
@@ -3850,7 +3849,7 @@ class NodeExecutor:
     async def _delete_workflow(self, workflow_path: Path) -> None:
         # Derive the registry key from the workflow path using workspace-relative logic so it
         # matches the key used during registration (push_workflow(file_path=__file__) in the workflow).
-        workspace_path = await anyio.Path(GriptapeNodes.ConfigManager().workspace_path).resolve()
+        workspace_path = await anyio.Path(self.engine.config_manager.workspace_path).resolve()
         resolved = await anyio.Path(workflow_path).resolve()
         if resolved.is_relative_to(workspace_path):
             path_for_key = str(resolved.relative_to(workspace_path))
@@ -3862,14 +3861,14 @@ class NodeExecutor:
             # Register the workflow so DeleteWorkflowRequest can find and remove it.
             # A subprocess may have registered it in its own process but not in the main process.
             load_workflow_metadata_request = LoadWorkflowMetadata(file_name=workflow_path.name)
-            result = await GriptapeNodes.ahandle_request(load_workflow_metadata_request)
+            result = await self.engine.ahandle_request(load_workflow_metadata_request)
             if isinstance(result, LoadWorkflowMetadataResultSuccess):
                 WorkflowRegistry.generate_new_workflow(
                     registry_key=workflow_name, metadata=result.metadata, file_path=path_for_key
                 )
 
         delete_request = DeleteWorkflowRequest(name=workflow_name)
-        delete_result = await GriptapeNodes.ahandle_request(delete_request)
+        delete_result = await self.engine.ahandle_request(delete_request)
         if isinstance(delete_result, DeleteWorkflowResultFailure):
             logger.error(
                 "Failed to delete workflow '%s'. Error: %s",
@@ -3884,7 +3883,7 @@ class NodeExecutor:
             )
 
     async def _get_storage_backend(self) -> StorageBackend:
-        storage_backend_str = GriptapeNodes.ConfigManager().get_config_value("storage_backend")
+        storage_backend_str = self.engine.config_manager.get_config_value("storage_backend")
         # Convert string to StorageBackend enum
         try:
             storage_backend = StorageBackend(storage_backend_str)

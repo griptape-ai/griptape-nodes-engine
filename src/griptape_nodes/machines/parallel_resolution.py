@@ -15,6 +15,7 @@ from griptape_nodes.machines.dag_builder import NodeState
 from griptape_nodes.machines.fsm import FSM, State, WorkflowState
 from griptape_nodes.machines.node_priority_queue import NodePriorityQueue
 from griptape_nodes.node_library.library_registry import LibraryRegistry
+from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.base_events import (
     ExecutionEvent,
     ExecutionGriptapeNodeEvent,
@@ -32,11 +33,11 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueRequest,
     SetParameterValueResultFailure,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 if TYPE_CHECKING:
     from griptape_nodes.common.directed_graph import DirectedGraph
     from griptape_nodes.machines.dag_builder import DagBuilder, DagNode
+    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
 
 logger = logging.getLogger("griptape_nodes")
@@ -54,7 +55,7 @@ class NodeStatesResult(NamedTuple):
     leaf_nodes: set[str]
 
 
-class ParallelResolutionContext:
+class ParallelResolutionContext(EngineScoped):
     paused: bool
     flow_name: str
     error_message: str | None
@@ -66,10 +67,16 @@ class ParallelResolutionContext:
     node_priority_queue: NodePriorityQueue
     dag_builder: DagBuilder | None
     last_resolved_node: BaseNode | None  # Track the last node that was resolved
+    generation: int  # Bumped on reset so a resuming driver can tell its run was torn down
 
     def __init__(
-        self, flow_name: str, max_nodes_in_parallel: int | None = None, dag_builder: DagBuilder | None = None
+        self,
+        flow_name: str,
+        max_nodes_in_parallel: int | None = None,
+        dag_builder: DagBuilder | None = None,
+        engine: Engine | None = None,
     ) -> None:
+        super().__init__(engine)
         self.flow_name = flow_name
         self.paused = False
         self.error_message = None
@@ -82,6 +89,7 @@ class ParallelResolutionContext:
         self.max_nodes_in_parallel = max_nodes_in_parallel if max_nodes_in_parallel is not None else 5
         self.running_tasks_count = 0
         self.task_to_node = {}
+        self.generation = 0
 
     @property
     def node_to_reference(self) -> dict[str, DagNode]:
@@ -99,7 +107,22 @@ class ParallelResolutionContext:
             raise ValueError(msg)
         return self.dag_builder.graphs
 
+    def was_reset_since(self, generation: int) -> bool:
+        """Whether this run was torn down since ``generation`` was captured.
+
+        Teardown arrives from synchronous code in another coroutine (clear-all
+        state, and through it run-from-scratch, load-with-clean-slate and library
+        reload), so nothing a driver holds -- its task map, its DAG -- is
+        guaranteed to still exist after an await. A driver captures ``generation``
+        on entry and checks this on resuming, before touching that bookkeeping
+        again.
+        """
+        return self.generation != generation
+
     def reset(self, *, cancel: bool = False) -> None:
+        # Ends the current run as far as any parked driver is concerned: it sees
+        # the bump on waking and abandons the run.
+        self.generation += 1
         self.paused = False
         if cancel:
             self.workflow_state = WorkflowState.CANCELED
@@ -110,8 +133,11 @@ class ParallelResolutionContext:
         else:
             self.workflow_state = WorkflowState.NO_ERROR
             self.error_message = None
-            self.task_to_node.clear()
             self.last_resolved_node = None
+
+        # Both paths: an abandoning driver no longer drains this, and a leftover
+        # finished task would end the next run on this context before it ran.
+        self.task_to_node.clear()
 
         # Reset task counter
         self.running_tasks_count = 0
@@ -134,7 +160,7 @@ class ExecuteDagState(State):
         if context.dag_builder is not None:
             newly_available = context.dag_builder.remove_node_from_dependencies(current_node_name, network_name)
             for data_node_name in newly_available:
-                data_node = GriptapeNodes.NodeManager().get_node_by_name(data_node_name)
+                data_node = context.engine.node_manager.get_node_by_name(data_node_name)
                 added_nodes = context.dag_builder.add_node_with_dependencies(data_node, data_node_name)
                 if added_nodes:
                     for added_node in added_nodes:
@@ -198,7 +224,7 @@ class ExecuteDagState(State):
             # suppression it would overwrite the display that
             # _emit_parameter_change_event already set correctly during execution.
             display_value = current_node.get_display_value_for_output(parameter_name, value)
-            await GriptapeNodes.EventManager().aput_event(
+            await context.engine.event_manager.aput_event(
                 ExecutionGriptapeNodeEvent(
                     wrapped_event=ExecutionEvent(
                         payload=ParameterValueUpdateEvent(
@@ -225,7 +251,7 @@ class ExecuteDagState(State):
             param_name: safe_unstructure(current_node.get_display_value_for_output(param_name, val))
             for param_name, val in current_node.parameter_output_values.items()
         }
-        await GriptapeNodes.EventManager().aput_event(
+        await context.engine.event_manager.aput_event(
             ExecutionGriptapeNodeEvent(
                 wrapped_event=ExecutionEvent(
                     payload=NodeResolvedEvent(
@@ -244,7 +270,7 @@ class ExecuteDagState(State):
     @staticmethod
     def get_next_control_graph(context: ParallelResolutionContext, node: BaseNode, network_name: str) -> None:
         """Get next control flow nodes and add them to the DAG graph."""
-        flow_manager = GriptapeNodes.FlowManager()
+        flow_manager = context.engine.flow_manager
 
         # Early returns for various conditions
         if ExecuteDagState._should_skip_control_flow(context, node, network_name, flow_manager):
@@ -310,7 +336,7 @@ class ExecuteDagState(State):
                         }
                     )
                 )
-                GriptapeNodes.EventManager().put_event(
+                context.engine.event_manager.put_event(
                     ExecutionGriptapeNodeEvent(
                         wrapped_event=ExecutionEvent(payload=CurrentControlNodeEvent(node_name=next_node.name))
                     )
@@ -322,7 +348,7 @@ class ExecuteDagState(State):
         """Emit update of involved nodes based on current DAG state."""
         if context.dag_builder is not None:
             involved_nodes = list(context.node_to_reference.keys())
-            GriptapeNodes.EventManager().put_event(
+            context.engine.event_manager.put_event(
                 ExecutionGriptapeNodeEvent(
                     wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=involved_nodes))
                 )
@@ -370,7 +396,7 @@ class ExecuteDagState(State):
                 context.node_priority_queue.add_node(dag_node)
 
     @staticmethod
-    async def collect_values_from_upstream_nodes(node_reference: DagNode) -> None:
+    async def collect_values_from_upstream_nodes(engine: Engine, node_reference: DagNode) -> None:
         """Collect output values from resolved upstream nodes and pass them to the current node.
 
         This method iterates through all input parameters of the current node, finds their
@@ -378,6 +404,7 @@ class ExecuteDagState(State):
         values and passes them through using SetParameterValueRequest.
 
         Args:
+            engine (Engine): The engine whose connections and request bus this run belongs to.
             node_reference (DagOrchestrator.DagNode): The node to collect values for.
         """
         current_node = node_reference.node_reference
@@ -390,7 +417,7 @@ class ExecuteDagState(State):
         if current_node.lock:
             return
 
-        connections = GriptapeNodes.FlowManager().get_connections()
+        connections = engine.flow_manager.get_connections()
 
         for parameter in current_node.parameters:
             # Get the connected upstream node for this parameter
@@ -405,7 +432,7 @@ class ExecuteDagState(State):
                     output_value = upstream_node.get_parameter_value(upstream_parameter.name)
 
                 # Pass the value through using the same mechanism as normal resolution
-                result = await GriptapeNodes.get_instance().ahandle_request(
+                result = await engine.ahandle_request(
                     SetParameterValueRequest(
                         parameter_name=parameter.name,
                         node_name=current_node.name,
@@ -440,6 +467,7 @@ class ExecuteDagState(State):
 
     @staticmethod
     async def pop_done_states(context: ParallelResolutionContext) -> None:
+        generation = context.generation
         networks = context.networks
         handled_nodes = set()  # Track nodes we've already processed to avoid duplicates
 
@@ -473,6 +501,11 @@ class ExecuteDagState(State):
                         handled_nodes.add(node)
                         # handle_done_nodes will append control successors to the set
                         await ExecuteDagState.handle_done_nodes(context, context.node_to_reference[node], network_name)
+                        if context.was_reset_since(generation):
+                            # `networks` is a snapshot, so its graphs still name
+                            # nodes a teardown dropped from node_to_reference.
+                            ExecuteDagState._log_abandoned(context)
+                            return
 
             # After processing completions in this network, check if any remaining leaf nodes can now be queued
             remaining_leaf_nodes = [n for n in network.nodes() if network.in_degree(n) == 0]
@@ -483,8 +516,8 @@ class ExecuteDagState(State):
                 ExecuteDagState._try_queue_waiting_node(context, leaf_node)
 
     @staticmethod
-    async def execute_node(current_node: DagNode) -> None:
-        executor = GriptapeNodes.FlowManager().node_executor
+    async def execute_node(engine: Engine, current_node: DagNode) -> None:
+        executor = engine.flow_manager.node_executor
         await executor.execute(current_node.node_reference)
 
     @staticmethod
@@ -505,6 +538,10 @@ class ExecuteDagState(State):
 
     @staticmethod
     async def on_update(context: ParallelResolutionContext) -> type[State] | None:  # noqa: C901, PLR0911, PLR0912, PLR0915
+        # See `ParallelResolutionContext.was_reset_since`. Abandoning returns None
+        # rather than a state, which avoids reviving the machine the teardown reset.
+        generation = context.generation
+
         # Check if execution is paused
         if context.paused:
             return None
@@ -542,12 +579,12 @@ class ExecuteDagState(State):
 
             # Collect parameter values from upstream nodes before executing
             try:
-                await ExecuteDagState.collect_values_from_upstream_nodes(node_reference)
+                await ExecuteDagState.collect_values_from_upstream_nodes(context.engine, node_reference)
             except Exception as e:
                 context.running_tasks_count -= 1  # Decrement on error
                 logger.exception("Error collecting parameter values for node '%s'", node_reference.node_reference.name)
                 error_node_name = node_reference.node_reference.name
-                await GriptapeNodes.EventManager().aput_event(
+                await context.engine.event_manager.aput_event(
                     ExecutionGriptapeNodeEvent(
                         wrapped_event=ExecutionEvent(
                             payload=NodeErrorEvent(
@@ -557,9 +594,16 @@ class ExecuteDagState(State):
                         )
                     )
                 )
+                if context.was_reset_since(generation):
+                    ExecuteDagState._log_abandoned(context)
+                    return None
                 context.error_message = f"Parameter passthrough failed for node '{error_node_name}': {e}"
                 context.workflow_state = WorkflowState.ERRORED
                 return ErrorState
+
+            if context.was_reset_since(generation):
+                ExecuteDagState._log_abandoned(context)
+                return None
 
             # Clear all of the current output values but don't broadcast the clearing.
             # to avoid any flickering in subscribers (UI).
@@ -570,7 +614,7 @@ class ExecuteDagState(State):
                 validation_node_name = node_reference.node_reference.name
                 msg = f"Node '{validation_node_name}' encountered problems: {exceptions}"
                 logger.error("Canceling flow run. %s", msg)
-                await GriptapeNodes.EventManager().aput_event(
+                await context.engine.event_manager.aput_event(
                     ExecutionGriptapeNodeEvent(
                         wrapped_event=ExecutionEvent(
                             payload=NodeErrorEvent(
@@ -580,6 +624,9 @@ class ExecuteDagState(State):
                         )
                     )
                 )
+                if context.was_reset_since(generation):
+                    ExecuteDagState._log_abandoned(context)
+                    return None
                 context.error_message = msg
                 context.workflow_state = WorkflowState.ERRORED
                 return ErrorState
@@ -626,19 +673,25 @@ class ExecuteDagState(State):
             node_reference.node_state = NodeState.PROCESSING
             node_reference.node_reference.state = NodeResolutionState.RESOLVING
 
-            node_task = asyncio.create_task(ExecuteDagState.execute_node(node_reference))
+            node_task = asyncio.create_task(ExecuteDagState.execute_node(context.engine, node_reference))
             context.task_to_node[node_task] = node_reference
             node_reference.task_reference = node_task
 
             # Send an event that this is a current data node:
 
-            await GriptapeNodes.EventManager().aput_event(
+            await context.engine.event_manager.aput_event(
                 ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=CurrentDataNodeEvent(node_name=node)))
             )
 
         # Wait for a task to finish - only if there are tasks running
         if context.task_to_node:
             done, _ = await asyncio.wait(context.task_to_node.keys(), return_when=asyncio.FIRST_COMPLETED)
+
+            if context.was_reset_since(generation):
+                # Reaping here would look up tasks the teardown already discarded,
+                # which is the crash this guard exists for.
+                ExecuteDagState._log_abandoned(context)
+                return None
 
             # Decrement counter for completed tasks
             context.running_tasks_count -= len(done)
@@ -659,7 +712,7 @@ class ExecuteDagState(State):
                     logger.error("Error processing node '%s'", node_name, exc_info=exc)
                     msg = f"Node '{node_name}' encountered a problem: {exc}"
 
-                    await GriptapeNodes.EventManager().aput_event(
+                    await context.engine.event_manager.aput_event(
                         ExecutionGriptapeNodeEvent(
                             wrapped_event=ExecutionEvent(
                                 payload=NodeErrorEvent(
@@ -669,6 +722,9 @@ class ExecuteDagState(State):
                             )
                         )
                     )
+                    if context.was_reset_since(generation):
+                        ExecuteDagState._log_abandoned(context)
+                        return None
                     context.error_message = msg
                     context.workflow_state = WorkflowState.ERRORED
                     return ErrorState
@@ -677,10 +733,18 @@ class ExecuteDagState(State):
 
         # Once a task has finished, loop back to the top.
         await ExecuteDagState.pop_done_states(context)
+        if context.was_reset_since(generation):
+            ExecuteDagState._log_abandoned(context)
+            return None
         # Remove all nodes that are done
         if context.paused:
             return None
         return ExecuteDagState
+
+    @staticmethod
+    def _log_abandoned(context: ParallelResolutionContext) -> None:
+        """Record that a drive was dropped because its run was torn down under it."""
+        logger.debug("Abandoning resolution of flow '%s': the run was torn down.", context.flow_name)
 
 
 class ErrorState(State):
@@ -746,17 +810,21 @@ class ParallelResolutionMachine(FSM[ParallelResolutionContext]):
     """State machine for building DAG structure without execution."""
 
     def __init__(
-        self, flow_name: str, max_nodes_in_parallel: int | None = None, dag_builder: DagBuilder | None = None
+        self,
+        flow_name: str,
+        max_nodes_in_parallel: int | None = None,
+        dag_builder: DagBuilder | None = None,
+        engine: Engine | None = None,
     ) -> None:
         resolution_context = ParallelResolutionContext(
-            flow_name, max_nodes_in_parallel=max_nodes_in_parallel, dag_builder=dag_builder
+            flow_name, max_nodes_in_parallel=max_nodes_in_parallel, dag_builder=dag_builder, engine=engine
         )
         super().__init__(resolution_context)
 
     async def resolve_node(self, node: BaseNode | None = None) -> None:  # noqa: ARG002
         """Execute the DAG structure using the existing DagBuilder."""
         if self.context.dag_builder is None:
-            self.context.dag_builder = GriptapeNodes.FlowManager().global_dag_builder
+            self.context.dag_builder = self.context.engine.flow_manager.global_dag_builder
         await self.start(ExecuteDagState)
 
     async def cancel_all_nodes(self) -> None:
@@ -772,8 +840,10 @@ class ParallelResolutionMachine(FSM[ParallelResolutionContext]):
         # explicit CancelExecuteNodeRequest to each affected worker so its
         # aprocess task is cancelled on the worker side too. No-op for nodes
         # running locally on the orchestrator.
-        node_manager = GriptapeNodes.NodeManager()
-        for dag_node in self.context.node_to_reference.values():
+        # Snapshot: dispatching suspends, and a driver waking in that window can
+        # add to node_to_reference, breaking this iteration mid-cancel.
+        node_manager = self.context.engine.node_manager
+        for dag_node in list(self.context.node_to_reference.values()):
             await node_manager.cancel_worker_execution(dag_node.node_reference.name)
 
         # Cancel all running tasks

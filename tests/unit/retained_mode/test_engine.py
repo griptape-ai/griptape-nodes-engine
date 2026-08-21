@@ -7,6 +7,7 @@ can be rebound for a scope without leaking into the rest of the process.
 
 import asyncio
 import threading
+from collections.abc import Iterator
 
 import pytest
 
@@ -19,6 +20,41 @@ from griptape_nodes.retained_mode.engine import (
     reset_root_engine,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+
+def _engine_scoped_children(path: str, value: object) -> Iterator[tuple[str, EngineScoped]]:
+    """Yield the engine-scoped objects held directly by one attribute value."""
+    if isinstance(value, EngineScoped):
+        yield path, value
+    elif isinstance(value, (list, tuple, set)):
+        for index, item in enumerate(value):
+            if isinstance(item, EngineScoped):
+                yield f"{path}[{index}]", item
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(item, EngineScoped):
+                yield f"{path}[{key!r}]", item
+
+
+def _unbound_engine_scoped_descendants(root: EngineScoped, engine: Engine, path: str) -> list[str]:
+    """Report every engine-scoped object reachable from `root` that is not bound to `engine`."""
+    unbound: list[str] = []
+    visited: set[int] = set()
+    pending: list[tuple[str, EngineScoped]] = [(path, root)]
+
+    while pending:
+        owner_path, owner = pending.pop()
+        if id(owner) in visited:
+            continue
+        visited.add(id(owner))
+
+        for attribute_name, value in vars(owner).items():
+            for child_path, child in _engine_scoped_children(f"{owner_path}.{attribute_name}", value):
+                if child._engine is not engine:
+                    unbound.append(f"{child_path} ({type(child).__name__})")
+                pending.append((child_path, child))
+
+    return unbound
 
 
 class TestEngineIndependence:
@@ -48,6 +84,28 @@ class TestEngineIndependence:
             and isinstance(manager := getattr(engine, name), EngineScoped)
             and manager._engine is not engine
         ]
+
+        assert unbound == []
+
+    def test_every_engine_scoped_object_owned_by_a_manager_is_bound(self) -> None:
+        """Managers must inject their engine into the engine-scoped objects they build.
+
+        The manager-level check stops at `Engine`'s own attributes, so a registry or helper
+        constructed bare inside a manager's `__init__` still falls back to `current_engine()`
+        and runs its whole subtree on whatever engine happens to be ambient at call time.
+        """
+        engine = Engine()
+        unbound: list[str] = []
+
+        for attribute_name in dir(Engine):
+            if not attribute_name.endswith("_manager"):
+                continue
+
+            manager = getattr(engine, attribute_name)
+            if not isinstance(manager, EngineScoped):
+                continue
+
+            unbound.extend(_unbound_engine_scoped_descendants(manager, engine, attribute_name))
 
         assert unbound == []
 
