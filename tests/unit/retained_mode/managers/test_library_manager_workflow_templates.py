@@ -14,6 +14,8 @@ from griptape_nodes.node_library.library_registry import Library, LibraryMetadat
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowRegistry
 from griptape_nodes.retained_mode.events.app_events import LibraryWorkflowTemplatesChanged
 from griptape_nodes.retained_mode.events.library_events import (
+    LoadLibrariesRequest,
+    LoadLibrariesResultSuccess,
     RegisterLibraryFromFileRequest,
     ReloadAllLibrariesRequest,
     UnloadLibraryFromRegistryRequest,
@@ -26,6 +28,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from griptape_nodes.retained_mode.engine import Engine
+    from griptape_nodes.retained_mode.events.base_events import ResultPayload
 
 LIBRARY_MANAGER_MODULE = "griptape_nodes.retained_mode.managers.library_manager"
 LIBRARY_NAME = "TestLib"
@@ -128,13 +131,18 @@ class TestCollectWorkflowFilesForLibrary:
 
         assert collected == []
 
-    def test_returns_nothing_when_the_library_is_not_registered(self, griptape_nodes: Engine, tmp_path: Path) -> None:
+    def test_returns_none_when_the_library_is_not_registered(self, griptape_nodes: Engine, tmp_path: Path) -> None:
+        """Distinct from the empty list above, and the caller relies on the difference.
+
+        "Declares no templates" means the recorded keys are stale and should go; "could not read
+        what it declares" means leave them alone.
+        """
         library_json = tmp_path / "griptape_nodes_library.json"
 
         with patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.get_library", side_effect=KeyError(LIBRARY_NAME)):
             collected = griptape_nodes.library_manager._collect_workflow_files_for_library(_library_info(library_json))
 
-        assert collected == []
+        assert collected is None
 
 
 class TestRegisterWorkflowFilesForLibrary:
@@ -174,6 +182,106 @@ class TestRegisterWorkflowFilesForLibrary:
 
         assert not library_manager._library_to_workflow_keys.get(LIBRARY_NAME)
         assert _emitted_template_changes(event_manager) == []
+
+    @pytest.mark.asyncio
+    async def test_leaves_a_key_that_has_not_moved_alone(self, griptape_nodes: Engine, tmp_path: Path) -> None:
+        """Reconciling twice must not remove and re-add a template that did not change.
+
+        The stale sweep exists for keys the library would no longer produce. Sweeping every
+        recorded key instead would work out to the same registry contents, but every listener
+        would be told the template vanished and came back on every engine start and reload.
+        """
+        library_manager = griptape_nodes.library_manager
+        library_manager._library_to_workflow_keys[LIBRARY_NAME] = ["example"]
+        register = AsyncMock(return_value=WorkflowRegistrationResult(succeeded=[], failed=[]))
+        event_manager = MagicMock()
+
+        with (
+            patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.get_library", return_value=_library(["example.py"])),
+            patch.object(griptape_nodes.workflow_manager, "registry_key_for_workflow_file", return_value="example"),
+            patch.object(griptape_nodes.workflow_manager, "register_list_of_workflows", register),
+            patch.object(griptape_nodes, "_event_manager", event_manager),
+        ):
+            await library_manager._register_workflow_files_for_library(_library_info(tmp_path / "lib.json"))
+
+        assert library_manager._library_to_workflow_keys[LIBRARY_NAME] == ["example"]
+        assert _emitted_template_changes(event_manager) == []
+
+    @pytest.mark.asyncio
+    async def test_unregisters_a_key_the_library_no_longer_produces(
+        self, griptape_nodes: Engine, tmp_path: Path
+    ) -> None:
+        library_manager = griptape_nodes.library_manager
+        library_manager._library_to_workflow_keys[LIBRARY_NAME] = ["stale/example"]
+        register = AsyncMock(return_value=WorkflowRegistrationResult(succeeded=["fresh/example"], failed=[]))
+        event_manager = MagicMock()
+
+        with (
+            patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.get_library", return_value=_library(["example.py"])),
+            patch.object(
+                griptape_nodes.workflow_manager, "registry_key_for_workflow_file", return_value="fresh/example"
+            ),
+            patch.object(griptape_nodes.workflow_manager, "register_list_of_workflows", register),
+            patch.dict(WorkflowRegistry._workflows, {"stale/example": MagicMock()}, clear=True),
+            patch.object(griptape_nodes, "_event_manager", event_manager),
+        ):
+            await library_manager._register_workflow_files_for_library(_library_info(tmp_path / "lib.json"))
+
+            assert "stale/example" not in WorkflowRegistry._workflows
+
+        assert library_manager._library_to_workflow_keys[LIBRARY_NAME] == ["fresh/example"]
+        removals = [change for change in _emitted_template_changes(event_manager) if not change.registered]
+        additions = [change for change in _emitted_template_changes(event_manager) if change.registered]
+        assert [change.workflow_names for change in removals] == [["stale/example"]]
+        assert [change.workflow_names for change in additions] == [["fresh/example"]]
+
+    @pytest.mark.asyncio
+    async def test_bailing_out_never_unregisters_anything(self, griptape_nodes: Engine, tmp_path: Path) -> None:
+        """Every early exit is above the stale sweep, so a bail-out is not a removal.
+
+        This is the shape of the bug the sweep replaced: dropping the recorded keys before the
+        registration that puts them back means anything that stops the registration -- a worker,
+        a closed gate, an unreadable library -- silently unregisters the library's templates.
+        """
+        library_manager = griptape_nodes.library_manager
+        library_manager._library_to_workflow_keys[LIBRARY_NAME] = ["templates/example"]
+        event_manager = MagicMock()
+
+        with (
+            patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.get_library", side_effect=KeyError(LIBRARY_NAME)),
+            patch.dict(WorkflowRegistry._workflows, {"templates/example": MagicMock()}, clear=True),
+            patch.object(griptape_nodes, "_event_manager", event_manager),
+        ):
+            await library_manager._register_workflow_files_for_library(_library_info(tmp_path / "lib.json"))
+
+            assert "templates/example" in WorkflowRegistry._workflows
+
+        assert library_manager._library_to_workflow_keys[LIBRARY_NAME] == ["templates/example"]
+        assert _emitted_template_changes(event_manager) == []
+
+    @pytest.mark.asyncio
+    async def test_unregisters_everything_when_the_library_stops_declaring_templates(
+        self, griptape_nodes: Engine, tmp_path: Path
+    ) -> None:
+        """An empty list is a real answer -- the templates are gone and listeners are told."""
+        library_manager = griptape_nodes.library_manager
+        library_manager._library_to_workflow_keys[LIBRARY_NAME] = ["templates/example"]
+        event_manager = MagicMock()
+
+        with (
+            patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.get_library", return_value=_library(None)),
+            patch.dict(WorkflowRegistry._workflows, {"templates/example": MagicMock()}, clear=True),
+            patch.object(griptape_nodes, "_event_manager", event_manager),
+        ):
+            await library_manager._register_workflow_files_for_library(_library_info(tmp_path / "lib.json"))
+
+            assert "templates/example" not in WorkflowRegistry._workflows
+
+        assert LIBRARY_NAME not in library_manager._library_to_workflow_keys
+        changes = _emitted_template_changes(event_manager)
+        assert len(changes) == 1
+        assert changes[0].workflow_names == ["templates/example"]
+        assert changes[0].registered is False
 
     @pytest.mark.asyncio
     async def test_does_nothing_on_a_worker(self, griptape_nodes: Engine, tmp_path: Path) -> None:
@@ -217,7 +325,7 @@ class TestRegisterAllLibraryWorkflowFiles:
             patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.list_libraries", return_value=[LIBRARY_NAME]),
             patch.object(library_manager, "_register_workflow_files_for_library", register_one),
         ):
-            await library_manager._register_all_library_workflow_files()
+            await library_manager.reconcile_all_library_workflow_templates()
 
         register_one.assert_awaited_once_with(loaded_info)
 
@@ -244,7 +352,7 @@ class TestRegisterAllLibraryWorkflowFiles:
             patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.list_libraries", return_value=[LIBRARY_NAME]),
             patch.object(library_manager, "_register_workflow_files_for_library", register_one),
         ):
-            await library_manager._register_all_library_workflow_files()
+            await library_manager.reconcile_all_library_workflow_templates()
 
         register_one.assert_awaited_once_with(live_info)
 
@@ -274,7 +382,14 @@ class TestUnregisterWorkflowFilesForLibrary:
         assert changes[0].workflow_names == ["templates/example"]
         assert changes[0].registered is False
 
-    def test_tolerates_a_template_that_is_already_gone(self, griptape_nodes: Engine) -> None:
+    def test_announces_a_template_that_was_already_gone(self, griptape_nodes: Engine) -> None:
+        """Something else got there first, but the listener still has to hear about it.
+
+        The recorded keys are exactly the ones registration announced. Staying quiet because the
+        registry entry had already been deleted -- by `clear_user_workflows`, or by the user
+        deleting the file -- leaves a listener that was told the template appeared with no
+        matching removal.
+        """
         library_manager = griptape_nodes.library_manager
         library_manager._library_to_workflow_keys[LIBRARY_NAME] = ["templates/example"]
         event_manager = MagicMock()
@@ -286,6 +401,18 @@ class TestUnregisterWorkflowFilesForLibrary:
             library_manager._unregister_workflow_files_for_library(LIBRARY_NAME)
 
         assert LIBRARY_NAME not in library_manager._library_to_workflow_keys
+        changes = _emitted_template_changes(event_manager)
+        assert len(changes) == 1
+        assert changes[0].workflow_names == ["templates/example"]
+        assert changes[0].registered is False
+
+    def test_says_nothing_for_a_library_that_contributed_no_templates(self, griptape_nodes: Engine) -> None:
+        library_manager = griptape_nodes.library_manager
+        event_manager = MagicMock()
+
+        with patch.object(griptape_nodes, "_event_manager", event_manager):
+            library_manager._unregister_workflow_files_for_library(LIBRARY_NAME)
+
         assert _emitted_template_changes(event_manager) == []
 
     def test_unloading_a_library_removes_its_templates(self, griptape_nodes: Engine) -> None:
@@ -390,21 +517,58 @@ class TestRegistrationHookGating:
 
         Both await inside their loops and both are reachable from the request queue, so a plain
         boolean would let whichever finished first register templates underneath the other one.
+        This drives the real bulk entry points rather than setting the count by hand: one is held
+        open mid-load while the other runs to completion, and the hook has to stay down until the
+        held one lets go too.
         """
         library_manager = griptape_nodes.library_manager
         library_manager._libraries_loading_complete.set()
-        library_manager._bulk_library_load_depth = 2
+        library_manager._bulk_library_load_depth = 0
         register_one = AsyncMock(return_value=None)
+        reconcile_all = AsyncMock(return_value=None)
+        held_open = asyncio.Event()
 
-        library_manager._bulk_library_load_depth -= 1
+        async def block_until_released() -> ResultPayload:
+            await held_open.wait()
+            return LoadLibrariesResultSuccess(result_details="the bulk load held open by this test")
 
-        with self._stub_lifecycle(library_manager, _library_info(tmp_path / "lib.json"), register_one):
-            result = await library_manager.register_library_from_file_request(
-                RegisterLibraryFromFileRequest(file_path="/fake/lib.json")
-            )
+        async def register_one_library() -> bool:
+            with self._stub_lifecycle(library_manager, _library_info(tmp_path / "lib.json"), register_one):
+                result = await library_manager.register_library_from_file_request(
+                    RegisterLibraryFromFileRequest(file_path="/fake/lib.json")
+                )
+            return result.succeeded()
 
-        assert result.succeeded()
-        register_one.assert_not_awaited()
+        with (
+            patch.object(library_manager, "_load_libraries_from_config_in_bulk", block_until_released),
+            patch.object(library_manager, "reconcile_all_library_workflow_templates", reconcile_all),
+        ):
+            first_bulk_load = asyncio.create_task(library_manager.load_libraries_request(LoadLibrariesRequest()))
+            # Let the task get as far as its own await so the count is genuinely raised by it.
+            await asyncio.sleep(0)
+            assert library_manager._bulk_library_load_depth == 1
+
+            # A second bulk load starts and finishes entirely inside the first one, which is still
+            # parked on `held_open`.
+            with patch.object(
+                library_manager,
+                "_load_libraries_from_config_in_bulk",
+                AsyncMock(return_value=LoadLibrariesResultSuccess(result_details="the second bulk load")),
+            ):
+                await library_manager.load_libraries_request(LoadLibrariesRequest())
+
+            # The finished load must not have taken the count to zero underneath the one still
+            # running, which is exactly what a boolean flag would have done.
+            assert library_manager._bulk_library_load_depth == 1
+            assert await register_one_library()
+            register_one.assert_not_awaited()
+
+            held_open.set()
+            await first_bulk_load
+
+        assert library_manager._bulk_library_load_depth == 0
+        assert await register_one_library()
+        register_one.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_skips_templates_for_an_unusable_library(self, griptape_nodes: Engine, tmp_path: Path) -> None:
@@ -465,7 +629,7 @@ class TestBulkRegistrationIsWiredUp:
         register_all = AsyncMock(return_value=None)
 
         with (
-            patch.object(griptape_nodes.library_manager, "_register_all_library_workflow_files", register_all),
+            patch.object(griptape_nodes.library_manager, "reconcile_all_library_workflow_templates", register_all),
             patch.object(griptape_nodes.library_manager, "load_all_libraries_from_config", AsyncMock(return_value=[])),
             patch.object(
                 griptape_nodes.library_manager,
@@ -500,7 +664,7 @@ class TestBulkRegistrationIsWiredUp:
             patch.object(WorkflowRegistry, "clear_user_workflows") as clear_user_workflows,
             patch.object(
                 griptape_nodes.library_manager,
-                "_register_all_library_workflow_files",
+                "reconcile_all_library_workflow_templates",
                 AsyncMock(side_effect=record_state),
             ),
             patch.object(workflow_manager, "_process_workflows_for_registration", AsyncMock(return_value=None)),
@@ -537,13 +701,13 @@ class TestTemplatesSurviveAWorkspaceChange:
             patch.dict(WorkflowRegistry._workflows, {}, clear=True),
             patch.object(type(config_manager), "workspace_path", first_workspace),
         ):
-            await library_manager._register_all_library_workflow_files()
+            await library_manager.reconcile_all_library_workflow_templates()
             registered_in_first_workspace = list(WorkflowRegistry._workflows)
 
             # The workspace moves but the library does not, which is what a project switch that
             # leaves library config alone does.
             with patch.object(type(config_manager), "workspace_path", tmp_path / "second_workspace"):
-                await library_manager._register_all_library_workflow_files()
+                await library_manager.reconcile_all_library_workflow_templates()
                 registered_in_second_workspace = list(WorkflowRegistry._workflows)
 
         # Inside the workspace the key is relative to it; once the workspace moves away from the
@@ -551,3 +715,45 @@ class TestTemplatesSurviveAWorkspaceChange:
         assert registered_in_first_workspace == ["libraries/test_lib/example"]
         assert registered_in_second_workspace == [str(library_dir / "example")]
         assert library_manager._library_to_workflow_keys[LIBRARY_NAME] == registered_in_second_workspace
+
+    @pytest.mark.asyncio
+    async def test_a_template_without_the_griptape_provided_flag_survives_a_rescan(
+        self, griptape_nodes: Engine, tmp_path: Path
+    ) -> None:
+        """Through the real `refresh_workflow_registry`, with the real `clear_user_workflows`.
+
+        The template's header sets `is_template` but not `is_griptape_provided`, so the clear at
+        the top of a rescan deletes it. It comes back only because the rescan asks LibraryManager
+        for the library's templates afterwards -- which is the point: a template follows the
+        library that ships it rather than depending on a flag its author may have omitted.
+        """
+        library_manager = griptape_nodes.library_manager
+        workflow_manager = griptape_nodes.workflow_manager
+        config_manager = griptape_nodes.config_manager
+        workspace = tmp_path / "workspace"
+        library_dir = workspace / "libraries" / "test_lib"
+        library_dir.mkdir(parents=True)
+        (library_dir / "example.py").write_text(_workflow_header(), encoding="utf-8")
+        library_info = _library_info(library_dir / "griptape_nodes_library.json")
+        registry_key = "libraries/test_lib/example"
+
+        with (
+            patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.get_library", return_value=_library(["example.py"])),
+            patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.list_libraries", return_value=[LIBRARY_NAME]),
+            patch.dict(library_manager._library_file_path_to_info, {library_info.library_path: library_info}),
+            patch.dict(WorkflowRegistry._workflows, {}, clear=True),
+            patch.object(type(config_manager), "workspace_path", workspace),
+        ):
+            await library_manager.reconcile_all_library_workflow_templates()
+
+            # Nothing spares this entry from the clear, so surviving the rescan cannot be an
+            # accident of the flag.
+            assert WorkflowRegistry.get_workflow_by_name(registry_key).metadata.is_griptape_provided is False
+
+            # An empty list skips the workspace scan; the clear and the library re-registration
+            # are the parts under test.
+            await workflow_manager.refresh_workflow_registry(workflows_to_register=[])
+
+            assert list(WorkflowRegistry._workflows) == [registry_key]
+
+        assert library_manager._library_to_workflow_keys[LIBRARY_NAME] == [registry_key]

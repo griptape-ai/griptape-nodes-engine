@@ -680,15 +680,13 @@ class WorkflowManager(EngineScoped):
             # workspace scan deliberately skips library directories, so without this a template
             # without that flag would vanish here and never come back. Doing it inside the gate
             # means no caller sees the registry mid-rebuild. Safe to repeat: LibraryManager
-            # rebuilds each library's templates from scratch, so a second refresh leaves the
-            # same keys registered rather than a second copy of each.
+            # reconciles each library's templates against the keys it already recorded, so a
+            # second refresh leaves the same keys registered rather than a second copy of each.
             #
-            # Reaching into LibraryManager's private method is deliberate. Which templates a
-            # library ships, and which registry keys it currently owns, is LibraryManager's
-            # bookkeeping; this manager only knows that it just emptied the registry and has to
-            # ask for them back. Only the rebuild paths inside LibraryManager and this one line
-            # call it, so it stays private rather than becoming part of the manager's contract.
-            await self.engine.library_manager._register_all_library_workflow_files()
+            # Which templates a library ships, and which registry keys it currently owns, is
+            # LibraryManager's bookkeeping; this manager only knows that it just emptied the
+            # registry and has to ask for them back.
+            await self.engine.library_manager.reconcile_all_library_workflow_templates()
         finally:
             self._workflows_loading_complete.set()
 
@@ -2200,12 +2198,22 @@ class WorkflowManager(EngineScoped):
     async def register_list_of_workflows(self, workflows_to_register: list[str]) -> WorkflowRegistrationResult:
         """Register every workflow found at the given paths, returning which ones landed.
 
-        The `succeeded` registry keys are the caller's only reliable handle on what was
-        registered: a key is derived from the file path relative to the workspace when the
-        file lives inside it and from the absolute path otherwise, so callers that need to
-        undo a registration later must keep these rather than re-deriving them.
+        Only newly registered keys appear in `succeeded`; a path whose key is already in the
+        registry is skipped and shows up in neither list. Callers that need the key for a file
+        regardless of whether this call is what registered it should use
+        `registry_key_for_workflow_file`.
         """
         return await self._process_workflows_for_registration(workflows_to_register)
+
+    def registry_key_for_workflow_file(self, workflow_file: Path) -> str:
+        """The registry key `register_list_of_workflows` would use for this file.
+
+        The key depends on the workspace: workspace-relative for a file inside it, absolute
+        otherwise. So the same file registers under a different key after the workspace moves,
+        and a caller reconciling what it registered earlier against what it would register now
+        has to ask rather than remember.
+        """
+        return derive_registry_key(self._workflow_path_to_register(workflow_file))
 
     def _register_workflow(self, workflow_to_register: str, workflow_metadata: WorkflowMetadata) -> bool:
         """Registers a workflow from a file.
@@ -6990,16 +6998,7 @@ class WorkflowManager(EngineScoped):
             logger.debug("Skipping workflow with invalid metadata: %s", workflow_file)
             return None
 
-        # Convert to relative path if the workflow is under workspace_path before checking registry
-        config_mgr = self.engine.config_manager
-        workspace_path = config_mgr.workspace_path
-
-        if workflow_file.is_relative_to(workspace_path):
-            relative_path = workflow_file.relative_to(workspace_path)
-            file_path_to_register = str(relative_path)
-        else:
-            file_path_to_register = str(workflow_file)
-
+        file_path_to_register = self._workflow_path_to_register(workflow_file)
         registry_key = derive_registry_key(file_path_to_register)
 
         # Check if workflow is already registered using the path-based registry key
@@ -7012,6 +7011,13 @@ class WorkflowManager(EngineScoped):
         if self._register_workflow(file_path_to_register, load_metadata_result.metadata):
             return registry_key
         return None
+
+    def _workflow_path_to_register(self, workflow_file: Path) -> str:
+        """The path a workflow file is registered under: workspace-relative when it can be."""
+        workspace_path = self.engine.config_manager.workspace_path
+        if workflow_file.is_relative_to(workspace_path):
+            return str(workflow_file.relative_to(workspace_path))
+        return str(workflow_file)
 
 
 class ASTContainer:
