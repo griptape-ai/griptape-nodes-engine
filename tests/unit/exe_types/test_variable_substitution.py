@@ -845,11 +845,15 @@ class TestTemplatePreservationGates:
         assert _aprocess_variable_cache.get() is None
 
     def test_incomparable_output_does_not_raise(self) -> None:
-        """`!=` returning a non-bool must not propagate out of the guard.
+        """`!=` returning a non-bool must not propagate out of the *guard's* comparison.
 
         A node is free to emit a value whose __ne__ is elementwise (numpy array,
-        DataFrame). This comparison runs inside parameter_output_values.__setitem__,
-        so raising here would fail the node's execution.
+        DataFrame), and the guard runs on the __setitem__ path, so an escaping
+        ValueError there would fail the node's execution. Scope: this pins `_differs`
+        only. `__setitem__`'s own `old_value != value` dedup check is a separate,
+        pre-existing comparison that is not protected -- such a value already raised
+        there before display suppression existed, and fixing that is not this change's
+        job. This test calls the two guards directly for that reason.
         """
 
         class _Elementwise:

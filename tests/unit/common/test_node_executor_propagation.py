@@ -247,6 +247,26 @@ class TestGroupCopyBackPreservesTemplate:
 
         assert node.parameter_values["prompt"] == "hyperreal"
 
+    def test_last_iteration_writes_when_a_format_spec_cannot_apply(self) -> None:
+        """`{SHOT:03}` with SHOT="hyperreal" is left verbatim by the resolver -- so write it.
+
+        `NumericPaddingFormat.apply` raises on a non-numeric value and
+        `resolve_macro_token` returns the token unchanged. Naming a live variable is
+        therefore not enough to call something a template: the write guard has to ask
+        the resolver, not just look the name up, or this parameter's stored value would
+        be frozen for good.
+        """
+        node = _make_template_node(template="{SHOT:03}")
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        mock_engine.node_manager.get_node_by_name.return_value = node
+        package_result = _make_end_mapping("PromptNode_prompt", "PromptNode", "prompt")
+
+        with _gn_mock_with_variable():
+            executor._apply_last_iteration_to_packaged_nodes({"PromptNode_prompt": "hyperreal"}, package_result)
+
+        assert node.parameter_values["prompt"] == "hyperreal"
+
     def test_last_iteration_preserves_an_optional_template(self) -> None:
         """`{SHOT?}` resolves to "" when SHOT is undefined -- still the user's template.
 
@@ -311,12 +331,16 @@ class TestGroupCopyBackPreservesTemplate:
         produces the same value does not needlessly unresolve the graph.
         """
         node = _make_template_node()
-        node.parameter_output_values["prompt"] = "hyperreal"
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
         package_result = _make_end_mapping("PromptNode_prompt", "PromptNode", "prompt")
 
         with _gn_mock_with_variable():
+            # Seeded inside the patch: this assignment goes through
+            # TrackedParameterOutputValues.__setitem__, which consults the display
+            # guard and emits an event, so it needs the same mocked singletons the
+            # call under test does.
+            node.parameter_output_values["prompt"] = "hyperreal"
             executor._apply_parameter_values_to_node(node, {"PromptNode_prompt": "hyperreal"}, package_result)
 
         unresolve = mock_engine.flow_manager.get_connections.return_value.unresolve_future_nodes

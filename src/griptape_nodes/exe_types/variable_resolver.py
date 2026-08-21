@@ -206,29 +206,25 @@ class VariableResolver:
     def would_substitute(value: Any, variables: dict[str, str | int]) -> bool:
         """Return True if substitution would actually rewrite a {VAR} token in value.
 
-        The exact form of the ``contains_variable_macro`` heuristic: each token is
-        parsed the way ``resolve_macro_token`` parses it rather than matched against
-        a brace pattern, so text that merely looks templated (``body {color: red}``
-        with no ``color`` variable) does not count. Recurses into dicts and lists.
+        The exact form of the ``contains_variable_macro`` heuristic, which only asks
+        whether the text contains a brace followed by a letter. Text that merely
+        looks templated (``body {color: red}`` with no ``color`` variable) does not
+        count here. Recurses into dicts and lists.
 
-        A token counts when it names a variable in `variables`, or when it is
-        optional (``{VAR?}``) -- ``resolve_macro_token`` replaces an optional token
-        with "" whether or not the variable exists, so it rewrites the text either
-        way. A *required* token naming an unknown variable is left verbatim and so
-        does not count.
+        Exactness comes from asking ``resolve_macro_token`` itself rather than
+        re-deriving its rules, which is what makes the answer trustworthy for a
+        stored-state write. Every reason a token is left verbatim -- unknown required
+        variable, unparseable token, a format spec that raises on the variable's
+        actual value (``{SHOT:03}`` where ``SHOT`` is ``"hero"``) -- is honoured for
+        free, and cannot drift as the resolver gains rules. Note an optional
+        ``{VAR?}`` counts as a rewrite whether or not the variable exists, because
+        the resolver substitutes "" for it either way.
         """
         if isinstance(value, str):
-            for match in VariableResolver._MACRO_TOKEN.finditer(value):
-                try:
-                    parsed = ParsedMacro(match.group(0))
-                except MacroSyntaxError:
-                    continue
-                for segment in parsed.segments:
-                    if isinstance(segment, ParsedVariable) and (
-                        not segment.info.is_required or segment.info.name in variables
-                    ):
-                        return True
-            return False
+            return any(
+                VariableResolver.resolve_macro_token(match.group(0), variables) != match.group(0)
+                for match in VariableResolver._MACRO_TOKEN.finditer(value)
+            )
         if isinstance(value, dict):
             return any(VariableResolver.would_substitute(v, variables) for v in value.values())
         if isinstance(value, list):

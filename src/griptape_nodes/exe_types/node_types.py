@@ -1588,15 +1588,23 @@ class BaseNode(ABC):
         update it again. So parse the tokens instead of trusting the brace.
 
         Delegates the token-level judgement to ``VariableResolver.would_substitute``,
-        which counts an optional ``{VAR?}`` as a rewrite whether or not the variable
-        exists (it substitutes to ""). Skipping that case would be the worse
-        failure: the write would go through and take the user's template with it.
+        which asks the resolver itself rather than re-deriving its rules.
 
         Copy-back callers run on the orchestrator, where the variable dict is
-        available. Where it is not -- substitution off, or a node with no parent
-        flow, as transient worker nodes have -- fall back to trusting the
-        heuristic, which errs toward keeping the user's text rather than
-        overwriting it.
+        available. Where it is not -- a node with no parent flow, as transient worker
+        nodes have -- fall back to trusting the heuristic, which errs toward keeping
+        the user's text rather than overwriting it. (Substitution being off is not
+        one of those cases: ``_variable_template_to_preserve`` has already returned
+        early by then, so the only caller never reaches here.)
+
+        The dict is resolved per call, keyed on *this* node's name, rather than reusing
+        the one the run substituted with. That leaves a narrow skew -- delete a variable
+        between the run and the copy-back and the write goes through -- but the
+        alternatives are worse: seeding one dict for a whole copy-back loop would hand
+        one flow's variables to a node in another (see the no-per-flow-key note on
+        ``get_variables_if_enabled``), and ``_resolve_variables_for_node`` cannot be
+        swapped in as-is because it returns ``{}`` where this returns ``None``, and
+        those two invert the guard.
         """
         # get_variables_without_memoizing, not get_variables_if_enabled: this runs
         # outside aprocess_scope(), where the latter's memo write has no reset token

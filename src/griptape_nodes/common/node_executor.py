@@ -3813,9 +3813,19 @@ class NodeExecutor(EngineScoped):
         so the same bookkeeping has to happen here or downstream nodes keep stale
         results from before the group ran.
 
-        "Changed" is judged against ``parameter_output_values``, the dictionary the
-        caller's write lands in. An absent key counts as changed, matching the
-        comparison the handler would have made against the stored template.
+        This is deliberately *not* handler parity. The handler compares stored values,
+        and on this path those always differ (``_differs`` is a precondition of
+        ``should_preserve_stored_template``), so it would unresolve unconditionally.
+        The rule here is narrower and states the thing that actually matters: changed
+        relative to the value downstream already consumed. An absent key counts as
+        changed; an identical resolved output means nothing downstream is stale.
+
+        Two other things the handler's ``modified`` flag drives are also not
+        reproduced. ``make_node_unresolved`` on the target would be overwritten
+        immediately -- the resolution machine marks the node RESOLVED once the
+        executor returns. The downstream property pass-through is redundant because
+        delivery is pull-based: ``collect_values_from_upstream_nodes`` re-reads
+        upstream ``parameter_output_values`` before each node runs.
         """
         current_outputs = target_node.parameter_output_values
         if target_param_name in current_outputs and _values_are_equal(current_outputs[target_param_name], param_value):
