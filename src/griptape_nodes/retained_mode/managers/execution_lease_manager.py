@@ -403,10 +403,14 @@ class ExecutionLeaseManager(EngineScoped):
             )
             raise RuntimeError(msg)
         if self._balancer_last_seen == 0.0:
+            # Usually a fresh engine the balancer has not re-dialed yet -- a
+            # transient measured in seconds -- so the message leads with the
+            # action that will actually work, not with escalation.
             msg = (
-                "Attempted to start execution on a managed engine. Failed because no "
-                "load balancer has connected to this engine yet; this engine refuses "
-                "to run unmanaged. Contact your administrator."
+                "Attempted to start execution on a managed engine. Failed because the "
+                "execution manager (load balancer) has not connected to this engine "
+                "yet. This usually resolves within a few seconds -- try again. If it "
+                "persists, contact your administrator."
             )
             raise RuntimeError(msg)
         return self._transport
