@@ -2181,8 +2181,15 @@ class WorkflowManager(EngineScoped):
         if workflows_to_register:
             await self.register_list_of_workflows(workflows_to_register)
 
-    async def register_list_of_workflows(self, workflows_to_register: list[str]) -> None:
-        await self._process_workflows_for_registration(workflows_to_register)
+    async def register_list_of_workflows(self, workflows_to_register: list[str]) -> WorkflowRegistrationResult:
+        """Register every workflow found at the given paths, returning which ones landed.
+
+        The `succeeded` registry keys are the caller's only reliable handle on what was
+        registered: a key is derived from the file path relative to the workspace when the
+        file lives inside it and from the absolute path otherwise, so callers that need to
+        undo a registration later must keep these rather than re-deriving them.
+        """
+        return await self._process_workflows_for_registration(workflows_to_register)
 
     def _register_workflow(self, workflow_to_register: str, workflow_metadata: WorkflowMetadata) -> bool:
         """Registers a workflow from a file.
@@ -2197,10 +2204,11 @@ class WorkflowManager(EngineScoped):
         Returns:
             bool: True if the workflow was successfully registered, False otherwise.
         """
-        # Presently, this will not fail if a workflow with that name is already registered. That failure happens with a later check.
-        # However, the table of WorkflowInfo DOES get updated in this request, which may present a confusing state of affairs to the user.
-        # On one hand, we want the user to know how a specific workflow fared, but also not let them think it was registered when it wasn't.
-        # TODO: https://github.com/griptape-ai/griptape-nodes/issues/996
+        # Re-registering an already-registered key fails rather than silently overwriting:
+        # WorkflowRegistry.generate_new_workflow raises KeyError, which surfaces here as a
+        # RegisterWorkflowResultFailure. Callers that re-scan paths (library reinstall, the
+        # workspace scan) check WorkflowRegistry.has_workflow_with_name first and skip, so
+        # that failure is reserved for genuine key collisions between distinct files.
 
         # Register it as a success.
         workflow_register_request = RegisterWorkflowRequest(
