@@ -135,21 +135,27 @@ During the hierarchical walk, the PROJECT tier resolves computed names fresh (`r
 
 ## Display preservation
 
-The UI must always show the template the user typed (`{SHOT}`), not the resolved value (`25`). Every code path that pushes a value to the UI can overwrite the display — all are suppressed via `BaseNode.get_display_value_for_output()`:
+The UI must always show the template the user typed (`{SHOT}`), not the resolved value (`25`). Each of the following push paths would otherwise overwrite the display; each suppresses via `BaseNode.get_display_value_for_output()`. The list is the set of paths known and fixed, **not** a proof of completeness — a new emit site is a new leak until it goes through the guard.
 
 1. **During execution** (`TrackedParameterOutputValues.__setitem__`): fires `AlterElementEvent` with the template, not the resolved value.
 2. **After execution** (`parallel_resolution.py` `handle_done_nodes`): `ParameterValueUpdateEvent` and `NodeResolvedEvent` both apply `get_display_value_for_output()` before serialising.
 3. **Browser refresh / reload** (`node_manager._set_param_to_value`): applies `get_display_value_for_output()` when building `element_id_to_value` from `parameter_output_values`.
 4. **Dict/list parameters** (JSON Input): `TrackedParameterOutputValues.__setitem__` calls `_resolve_variables_in_value()` inside `aprocess_scope()` so downstream nodes get the substituted dict while `parameter_values` and the UI keep the template.
 5. **Mid-execution progress updates** (`BaseNode.publish_update_to_parameter`): suppresses before building `ParameterValueUpdateEvent`. This method also writes `parameter_output_values`, so one call emits two events; without suppression the second overwrites the template the first just set.
-6. **Group / worker copy-back** (`node_executor.execute`): writes land in `parameter_output_values` **after** `aprocess_scope` has exited, so the `__setitem__` guard must not be gated on `_in_aprocess`.
+6. **Streaming appends** (`BaseNode.append_value_to_parameter`): returns before emitting its `ProgressEvent` when the accumulated output would replace a template. `ProgressEvent` goes onto the event queue **bare**, not wrapped in `ExecutionGriptapeNodeEvent` — worth knowing when writing tests that inspect captured events.
+7. **Group / worker copy-back** (`node_executor.execute`): writes land in `parameter_output_values` **after** `aprocess_scope` has exited, so the `__setitem__` guard must not be gated on `_in_aprocess`.
 
-`get_display_value_for_output()` returns the stored template when:
-- parameter has `ParameterMode.PROPERTY` in its allowed modes, AND
-- the stored template contains a variable macro, AND
-- the resolved output differs from the template
+`get_display_value_for_output()` returns the stored template when all of:
+- substitution is enabled (`VariableResolver.is_substitution_enabled()`), AND
+- the parameter exists and has `ParameterMode.PROPERTY` in its allowed modes, AND
+- the parameter has `allow_variable_substitution=True`, AND
+- the stored value contains a variable macro, AND
+- the resolved output differs from the stored value, AND
+- the parameter has no incoming connection (a connected value is upstream data, not a template the user typed)
 
-It is read-only — it never modifies `parameter_output_values`.
+These mirror the gate in `get_parameter_value`: there is only a template worth preserving where substitution would actually have replaced it. The check is read-only — it never modifies `parameter_output_values`.
+
+**Deliberate exception — `GetParameterValueRequest` returns the resolved value.** It is a data read, not a UI push: the scripting API (`retained_mode.py`), the MCP server (`mcp.py`), and `node_manager`'s connection-source lookup all read through it and need the value that actually flowed. Suppressing there would hand callers the template string as if it were data.
 
 ### Never write a resolved value into `parameter_values`
 
@@ -164,6 +170,8 @@ target_node.parameter_output_values[target_param_name] = param_value
 ```
 
 Both `should_preserve_stored_template()` and `get_display_value_for_output()` delegate to `_variable_template_to_preserve()`, so the predicate and the display value cannot drift apart. Current call sites: `_apply_last_iteration_to_packaged_nodes` (parallel-loop path) and `_apply_parameter_values_to_node` (sequential group / subflow path).
+
+Skipping the write also skips everything `set_parameter_value` does on the way through: converters and validators, `before_value_set` / `after_value_set` hooks, container-parent recomputation for `ParameterList`/`ParameterDictionary` children, and `unresolve_future_nodes()`. Only the last matters here — the others operate on stored state that is intentionally left alone — so `_apply_parameter_values_to_node` calls `_unresolve_future_nodes_for_skipped_write()` on the skip branch to keep downstream invalidation intact. (`_apply_last_iteration_to_packaged_nodes` never invalidated downstream in the first place; it calls `set_parameter_value` directly, outside the request handler.)
 
 ## Worker-side variable seeding
 

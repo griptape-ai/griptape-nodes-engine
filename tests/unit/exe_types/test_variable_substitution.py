@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import TrackedParameterOutputValues, aprocess_scope
+from griptape_nodes.retained_mode.events.base_events import ProgressEvent
 from griptape_nodes.retained_mode.events.execution_events import ParameterValueUpdateEvent
 from griptape_nodes.retained_mode.events.parameter_events import AlterElementEvent
 from griptape_nodes.retained_mode.events.variable_events import (
@@ -98,8 +99,14 @@ def _display_value_from_event(captured: list) -> object:
 
 
 def _payloads_of_type(captured: list, payload_type: type) -> list:
-    """All captured payloads of a given event type, in emission order."""
-    return [e.wrapped_event.payload for e in captured if isinstance(e.wrapped_event.payload, payload_type)]
+    """All captured payloads of a given event type, in emission order.
+
+    Handles both shapes put on the event manager: payloads wrapped in
+    ExecutionGriptapeNodeEvent (AlterElementEvent, ParameterValueUpdateEvent) and
+    payloads emitted bare (ProgressEvent).
+    """
+    payloads = [e.wrapped_event.payload if hasattr(e, "wrapped_event") else e for e in captured]
+    return [p for p in payloads if isinstance(p, payload_type)]
 
 
 def _run_tracked_set(
@@ -692,6 +699,129 @@ class TestPublishUpdateToParameterDisplay:
 
         updates = _payloads_of_type(captured, ParameterValueUpdateEvent)
         assert [u.value for u in updates] == [expected]
+
+
+class TestTemplatePreservationGates:
+    """A template is only preserved where substitution would actually have replaced it.
+
+    `should_preserve_stored_template` gates a *write* to parameter_values, so a
+    condition missing here does not just misdraw a field -- it silently drops a
+    legitimate stored-value update on the group copy-back path.
+    """
+
+    def test_no_preservation_when_substitution_not_allowed(self) -> None:
+        """allow_variable_substitution=False means the macro is never resolved."""
+        node = MockNode(name="mock_node")
+        node.add_parameter(
+            Parameter(
+                name="text",
+                default_value="{SHOT}",
+                input_types=["str"],
+                output_type="str",
+                type="str",
+                allowed_modes={ParameterMode.OUTPUT, ParameterMode.PROPERTY},
+                allow_variable_substitution=False,
+                tooltip="test",
+            )
+        )
+        node.parameter_values["text"] = "{SHOT}"
+
+        with _mock_gn({"SHOT": "sc001"}):
+            assert node.get_display_value_for_output("text", "SOMETHING ELSE") == "SOMETHING ELSE"
+            assert node.should_preserve_stored_template("text", "SOMETHING ELSE") is False
+
+    def test_no_preservation_when_param_has_incoming_connection(self) -> None:
+        """A connected parameter is fed by upstream, so its stored text is stale, not a template."""
+        node = MockNode(name="mock_node")
+        node.add_parameter(_make_property_output_param("text", "{SHOT}"))
+        node.parameter_values["text"] = "{SHOT}"
+
+        with _mock_gn({"SHOT": "sc001"}, connected_params={"text"}):
+            assert node.get_display_value_for_output("text", "from_upstream") == "from_upstream"
+            assert node.should_preserve_stored_template("text", "from_upstream") is False
+
+    def test_no_preservation_when_substitution_disabled(self) -> None:
+        """The per-workflow toggle governs the write guard, not just get_parameter_value."""
+        node = MockNode(name="mock_node")
+        node.add_parameter(_make_property_output_param("text", "{SHOT}"))
+        node.parameter_values["text"] = "{SHOT}"
+
+        with _mock_gn({"SHOT": "sc001"}, substitution_enabled=False):
+            assert node.get_display_value_for_output("text", "sc001") == "sc001"
+            assert node.should_preserve_stored_template("text", "sc001") is False
+
+    def test_preservation_for_plain_template_param(self) -> None:
+        """The positive case: an unconnected, substitution-enabled PROPERTY template."""
+        node = MockNode(name="mock_node")
+        node.add_parameter(_make_property_output_param("text", "{SHOT}"))
+        node.parameter_values["text"] = "{SHOT}"
+
+        with _mock_gn({"SHOT": "sc001"}):
+            assert node.should_preserve_stored_template("text", "sc001") is True
+
+    def test_incomparable_output_does_not_raise(self) -> None:
+        """`!=` returning a non-bool must not propagate out of the guard.
+
+        A node is free to emit a value whose __ne__ is elementwise (numpy array,
+        DataFrame). This comparison runs inside parameter_output_values.__setitem__,
+        so raising here would fail the node's execution.
+        """
+
+        class _Elementwise:
+            def __ne__(self, other: object) -> Any:
+                msg = "truth value of an array with more than one element is ambiguous"
+                raise ValueError(msg)
+
+            def __hash__(self) -> int:
+                return 0
+
+        node = MockNode(name="mock_node")
+        node.add_parameter(_make_property_output_param("text", "{SHOT}"))
+        node.parameter_values["text"] = "{SHOT}"
+        output = _Elementwise()
+
+        with _mock_gn({"SHOT": "sc001"}):
+            assert node.get_display_value_for_output("text", output) is output
+            assert node.should_preserve_stored_template("text", output) is False
+
+
+class TestAppendValueToParameterDisplay:
+    """Streamed deltas must not rebuild the resolved text over a preserved template."""
+
+    def test_no_progress_event_when_template_preserved(self) -> None:
+        node = MockNode(name="mock_node")
+        node.add_parameter(_make_property_output_param("text", "{SHOT}"))
+        node.parameter_values["text"] = "{SHOT}"
+
+        captured: list = []
+        mock_gn = MagicMock()
+        mock_gn.WorkflowManager.return_value.is_variable_substitution_enabled.return_value = True
+        mock_gn.FlowManager.return_value.get_connections.return_value = MagicMock(incoming_index={})
+        mock_gn.EventManager.return_value.put_event.side_effect = captured.append
+
+        with patch(_GN_PATCH, mock_gn):
+            node.append_value_to_parameter("text", "sc0")
+            node.append_value_to_parameter("text", "01")
+
+        assert _payloads_of_type(captured, ProgressEvent) == []
+        # The accumulated output value is still correct for downstream nodes.
+        assert node.parameter_output_values["text"] == "sc001"
+
+    def test_progress_event_still_emitted_without_template(self) -> None:
+        node = MockNode(name="mock_node")
+        node.add_parameter(_make_property_output_param("text", "plain"))
+        node.parameter_values["text"] = "plain"
+
+        captured: list = []
+        mock_gn = MagicMock()
+        mock_gn.WorkflowManager.return_value.is_variable_substitution_enabled.return_value = True
+        mock_gn.FlowManager.return_value.get_connections.return_value = MagicMock(incoming_index={})
+        mock_gn.EventManager.return_value.put_event.side_effect = captured.append
+
+        with patch(_GN_PATCH, mock_gn):
+            node.append_value_to_parameter("text", "chunk")
+
+        assert [p.value for p in _payloads_of_type(captured, ProgressEvent)] == ["chunk"]
 
 
 class TestVariableSubstitutionDisableToggle:

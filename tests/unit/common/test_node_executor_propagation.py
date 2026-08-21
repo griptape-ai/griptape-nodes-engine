@@ -19,6 +19,11 @@ from griptape_nodes.common.node_executor import NodeExecutor
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import TrackedParameterOutputValues
 from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeResultSuccess
+from griptape_nodes.retained_mode.events.flow_events import (
+    OriginalNodeParameter,
+    PackagedNodeParameterMapping,
+    PackageNodesAsSerializedFlowResultSuccess,
+)
 from tests.unit.exe_types.mocks import MockNode
 
 _EXPECTED_FRESH_OUTPUT_EMITS = 2
@@ -127,15 +132,27 @@ def _make_template_node(name: str = "PromptNode", template: str = "{SHOT}") -> M
     return node
 
 
-def _make_end_mapping(sanitized_name: str, node_name: str, param_name: str) -> MagicMock:
-    mapping = MagicMock()
-    mapping.node_name = node_name
-    mapping.parameter_name = param_name
-    package_result = MagicMock()
-    end_mapping = MagicMock()
-    end_mapping.parameter_mappings = {sanitized_name: mapping}
-    package_result.parameter_name_mappings = [MagicMock(), end_mapping]
-    return package_result
+def _make_end_mapping(
+    sanitized_name: str, node_name: str, param_name: str
+) -> PackageNodesAsSerializedFlowResultSuccess:
+    """A package result whose End-node mappings point `sanitized_name` at `node_name.param_name`.
+
+    The mappings are the real NamedTuples rather than mocks: the code under test
+    compares `original.node_name` / `.parameter_name` against live values, and a
+    MagicMock attribute would satisfy a lookup it should not.
+    """
+    end_mapping = PackagedNodeParameterMapping(
+        node_name="End_Package_MultiNode",
+        parameter_mappings={sanitized_name: OriginalNodeParameter(node_name=node_name, parameter_name=param_name)},
+    )
+    start_mapping = PackagedNodeParameterMapping(node_name="Start_Package_MultiNode", parameter_mappings={})
+    return PackageNodesAsSerializedFlowResultSuccess(
+        result_details="ok",
+        serialized_flow_commands=cast("Any", None),
+        workflow_shape=cast("Any", {}),
+        packaged_node_names=[node_name],
+        parameter_name_mappings=[start_mapping, end_mapping],
+    )
 
 
 class TestGroupCopyBackPreservesTemplate:

@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import StrEnum, auto
-from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
+from typing import TYPE_CHECKING, Any, Final, NamedTuple, TypeVar
 
 from griptape_nodes.common.strict_mode import STRICT_MODE
 from griptape_nodes.common.strict_mode_checks import RULES
@@ -115,10 +115,36 @@ _sanctioned_mutation: ContextVar[bool] = ContextVar("_node_types_sanctioned_muta
 # the broader RUNTIME_EXECUTE scope would false-positive on every such node.
 _in_aprocess: ContextVar[bool] = ContextVar("_node_types_in_aprocess", default=False)
 
-# Sentinel returned by BaseNode._variable_template_to_preserve when a resolved
-# output value needs no display suppression. A dedicated sentinel is required
-# because None is itself a legitimate stored template value to compare against.
-_NO_TEMPLATE_TO_PRESERVE = object()
+
+class _NoTemplateToPreserve:
+    """Type of the sentinel returned when a resolved output needs no suppression.
+
+    A dedicated type rather than a bare ``object()`` so the return annotation on
+    ``BaseNode._variable_template_to_preserve`` names it: a future caller that
+    forgets the ``is _NO_TEMPLATE_TO_PRESERVE`` check is then visible to pyright
+    instead of silently treating the sentinel as a template.
+    """
+
+
+_NO_TEMPLATE_TO_PRESERVE: Final = _NoTemplateToPreserve()
+
+
+def _differs(raw_value: Any, output_value: Any) -> bool:
+    """Whether a stored template and a resolved output are different values.
+
+    ``!=`` is not guaranteed to return a bool: numpy arrays and DataFrames
+    return elementwise results whose truthiness raises. A stored template is a
+    str/dict/list (that is what ``contains_variable_macro`` matches), but the
+    output it is compared against can be any type a node chose to emit, and this
+    comparison sits inside ``parameter_output_values.__setitem__`` -- raising
+    here would fail the node's execution rather than merely misdraw a field.
+    Fall back to "same", which keeps the pre-existing behaviour of showing and
+    storing the real output.
+    """
+    try:
+        return bool(raw_value != output_value)
+    except Exception:
+        return False
 
 
 @contextmanager
@@ -1321,8 +1347,17 @@ class BaseNode(ABC):
                     raise RuntimeError(msg) from e
         else:
             self.parameter_output_values[parameter_name] = value
-        # Publish the event up!
 
+        # The write above emitted a display-suppressed AlterElementEvent. ProgressEvent
+        # carries a streamed *delta* that the UI concatenates into the same field, so
+        # emitting it would rebuild the resolved text on top of the preserved template
+        # one chunk at a time -- the same leak shape as publish_update_to_parameter.
+        # Streaming is display-only; the accumulated output value above is what
+        # downstream nodes read.
+        if self.should_preserve_stored_template(parameter_name, self.parameter_output_values[parameter_name]):
+            return
+
+        # Publish the event up!
         GriptapeNodes.EventManager().put_event(
             ProgressEvent(value=value, node_name=self.name, parameter_name=parameter_name)
         )
@@ -1524,7 +1559,7 @@ class BaseNode(ABC):
             return text
         return VariableResolver.resolve_string(text, variables, self.name)
 
-    def _variable_template_to_preserve(self, parameter_name: str, output_value: Any) -> Any:
+    def _variable_template_to_preserve(self, parameter_name: str, output_value: Any) -> Any | _NoTemplateToPreserve:
         """Return the stored {VAR} template that must survive `output_value`.
 
         Returns the ``_NO_TEMPLATE_TO_PRESERVE`` sentinel when the resolved
@@ -1532,20 +1567,31 @@ class BaseNode(ABC):
         suppression and for callers that write execution results back onto a
         node.
 
-        Honors the per-workflow substitution toggle: when substitution is disabled
-        the template never stands in for the real output.
+        The conditions mirror the substitution gate in ``get_parameter_value``:
+        there is only a template worth preserving where substitution would
+        actually have replaced it. A parameter that opts out
+        (``allow_variable_substitution=False``) or that is fed by an incoming
+        connection never gets substituted, so its output is genuine and its
+        stored value must stay writable.
         """
         if not VariableResolver.is_substitution_enabled():
             return _NO_TEMPLATE_TO_PRESERVE
         parameter = self.get_parameter_by_name(parameter_name)
         if parameter is None:
             return _NO_TEMPLATE_TO_PRESERVE
-        if ParameterMode.PROPERTY not in parameter.allowed_modes:
-            return _NO_TEMPLATE_TO_PRESERVE
         raw_value = self.parameter_values.get(parameter_name, parameter.default_value)
-        if VariableResolver.contains_variable_macro(raw_value) and raw_value != output_value:
-            return raw_value
-        return _NO_TEMPLATE_TO_PRESERVE
+        # One short-circuiting chain rather than a ladder of early returns, so the
+        # cheap checks stay ordered ahead of the expensive ones. The connection
+        # lookup is last: it reaches through the GriptapeNodes singleton to the
+        # FlowManager, and the checks before it already rule out the common case.
+        substitution_would_have_applied = (
+            ParameterMode.PROPERTY in parameter.allowed_modes
+            and parameter.allow_variable_substitution
+            and VariableResolver.contains_variable_macro(raw_value)
+            and _differs(raw_value, output_value)
+            and not self._param_has_incoming_connection(parameter_name)
+        )
+        return raw_value if substitution_would_have_applied else _NO_TEMPLATE_TO_PRESERVE
 
     def get_display_value_for_output(self, parameter_name: str, output_value: Any) -> Any:
         """Return the UI display value for an output parameter.
@@ -1630,7 +1676,11 @@ class BaseNode(ABC):
             )
         else:
             event_data = parameter.to_event(self)
-            # Mirror display-preservation guard from TrackedParameterOutputValues._emit_parameter_change_event.
+            # Display-preservation guard. Gated on _in_aprocess here, unlike
+            # TrackedParameterOutputValues._emit_parameter_change_event, because this
+            # value comes from Parameter.to_event -> node.get_parameter_value(), which
+            # only substitutes inside aprocess. Outside it the value is already the
+            # template, so the guard would be a no-op.
             if _in_aprocess.get() and "value" in event_data:
                 event_data["value"] = self.get_display_value_for_output(parameter.name, event_data["value"])
             # Publish the event
