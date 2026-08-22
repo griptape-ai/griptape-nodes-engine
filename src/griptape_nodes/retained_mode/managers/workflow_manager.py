@@ -632,16 +632,16 @@ class WorkflowManager(EngineScoped):
         return SetVariableSubstitutionEnabledResultSuccess(result_details=details)
 
     async def refresh_workflow_registry(self, workflows_to_register: list[str] | None = None) -> None:
-        # All of the libraries have loaded, and any workflows they came with have been registered.
-        # Clear any previously registered user/workspace workflows before re-registering, so that
-        # a workspace change (e.g. project switch) takes effect cleanly. Library-provided workflows
-        # (is_griptape_provided=True) registered above this call are preserved.
-        WorkflowRegistry.clear_user_workflows()
-
-        # Discover workflows from both config and workspace.
+        # Close the gate before touching the registry, not after. on_list_all_workflows_request
+        # and its siblings wait on this event, so clearing the registry first leaves a window
+        # where they answer from a half-empty registry.
         self._workflows_loading_complete.clear()
 
         try:
+            # Clear any previously registered user/workspace workflows before re-registering, so
+            # that a workspace change (e.g. project switch) takes effect cleanly.
+            WorkflowRegistry.clear_user_workflows()
+
             default_workflow_section = "app_events.on_app_initialization_complete.workflows_to_register"
             config_mgr = self.engine.config_manager
 
@@ -673,6 +673,20 @@ class WorkflowManager(EngineScoped):
                         workflow for workflow in workflows_to_register if workflow.lower() not in paths_to_remove
                     ]
                     config_mgr.set_config_value(default_workflow_section, workflows_to_register)
+
+            # Put library-provided templates back, last, so a template follows the library that
+            # ships it instead of depending on a metadata flag its author may have omitted:
+            # clear_user_workflows above spares only entries marked is_griptape_provided, and the
+            # workspace scan deliberately skips library directories, so without this a template
+            # without that flag would vanish here and never come back. Doing it inside the gate
+            # means no caller sees the registry mid-rebuild. Safe to repeat: LibraryManager
+            # reconciles each library's templates against the keys it already recorded, so a
+            # second refresh leaves the same keys registered rather than a second copy of each.
+            #
+            # Which templates a library ships, and which registry keys it currently owns, is
+            # LibraryManager's bookkeeping; this manager only knows that it just emptied the
+            # registry and has to ask for them back.
+            await self.engine.library_manager.reconcile_all_library_workflow_templates()
         finally:
             self._workflows_loading_complete.set()
 
@@ -2144,8 +2158,25 @@ class WorkflowManager(EngineScoped):
         if workflows_to_register:
             await self.register_list_of_workflows(workflows_to_register)
 
-    async def register_list_of_workflows(self, workflows_to_register: list[str]) -> None:
-        await self._process_workflows_for_registration(workflows_to_register)
+    async def register_list_of_workflows(self, workflows_to_register: list[str]) -> WorkflowRegistrationResult:
+        """Register every workflow found at the given paths, returning which ones landed.
+
+        Only newly registered keys appear in `succeeded`; a path whose key is already in the
+        registry is skipped and shows up in neither list. Callers that need the key for a file
+        regardless of whether this call is what registered it should use
+        `registry_key_for_workflow_file`.
+        """
+        return await self._process_workflows_for_registration(workflows_to_register)
+
+    def registry_key_for_workflow_file(self, workflow_file: Path) -> str:
+        """The registry key `register_list_of_workflows` would use for this file.
+
+        The key depends on the workspace: workspace-relative for a file inside it, absolute
+        otherwise. So the same file registers under a different key after the workspace moves,
+        and a caller reconciling what it registered earlier against what it would register now
+        has to ask rather than remember.
+        """
+        return derive_registry_key(self._workflow_path_to_register(workflow_file))
 
     def _register_workflow(self, workflow_to_register: str, workflow_metadata: WorkflowMetadata) -> bool:
         """Registers a workflow from a file.
@@ -2160,10 +2191,11 @@ class WorkflowManager(EngineScoped):
         Returns:
             bool: True if the workflow was successfully registered, False otherwise.
         """
-        # Presently, this will not fail if a workflow with that name is already registered. That failure happens with a later check.
-        # However, the table of WorkflowInfo DOES get updated in this request, which may present a confusing state of affairs to the user.
-        # On one hand, we want the user to know how a specific workflow fared, but also not let them think it was registered when it wasn't.
-        # TODO: https://github.com/griptape-ai/griptape-nodes/issues/996
+        # Re-registering an already-registered key fails rather than silently overwriting:
+        # WorkflowRegistry.generate_new_workflow raises KeyError, which surfaces here as a
+        # RegisterWorkflowResultFailure. Callers that re-scan paths (library reinstall, the
+        # workspace scan) check WorkflowRegistry.has_workflow_with_name first and skip, so
+        # that failure is reserved for genuine key collisions between distinct files.
 
         # Register it as a success.
         workflow_register_request = RegisterWorkflowRequest(
@@ -6712,9 +6744,11 @@ class WorkflowManager(EngineScoped):
 
         # Build the set of registered-library roots (excluding sandbox) so their bundled
         # workflow files are skipped during the workspace scan. Library-declared workflows
-        # (listed in griptape_nodes_library.json) are registered separately via
-        # LibraryManager._collect_library_workflow_files before this scan runs. Sandbox
-        # libraries are intentionally left scannable so in-development workflows appear.
+        # (listed in griptape_nodes_library.json) only ever enter the registry through
+        # LibraryManager, which registers them per library as it loads and re-registers them
+        # at the end of refresh_workflow_registry -- so this scan must never claim them, in
+        # either order. Sandbox libraries are intentionally left scannable so in-development
+        # workflows appear.
         library_exclusion_roots: list[Path] = []
         for library_info in self.engine.library_manager._library_file_path_to_info.values():
             if library_info.is_sandbox:
@@ -6836,16 +6870,7 @@ class WorkflowManager(EngineScoped):
             logger.debug("Skipping workflow with invalid metadata: %s", workflow_file)
             return None
 
-        # Convert to relative path if the workflow is under workspace_path before checking registry
-        config_mgr = self.engine.config_manager
-        workspace_path = config_mgr.workspace_path
-
-        if workflow_file.is_relative_to(workspace_path):
-            relative_path = workflow_file.relative_to(workspace_path)
-            file_path_to_register = str(relative_path)
-        else:
-            file_path_to_register = str(workflow_file)
-
+        file_path_to_register = self._workflow_path_to_register(workflow_file)
         registry_key = derive_registry_key(file_path_to_register)
 
         # Check if workflow is already registered using the path-based registry key
@@ -6858,6 +6883,13 @@ class WorkflowManager(EngineScoped):
         if self._register_workflow(file_path_to_register, load_metadata_result.metadata):
             return registry_key
         return None
+
+    def _workflow_path_to_register(self, workflow_file: Path) -> str:
+        """The path a workflow file is registered under: workspace-relative when it can be."""
+        workspace_path = self.engine.config_manager.workspace_path
+        if workflow_file.is_relative_to(workspace_path):
+            return str(workflow_file.relative_to(workspace_path))
+        return str(workflow_file)
 
 
 class ASTContainer:

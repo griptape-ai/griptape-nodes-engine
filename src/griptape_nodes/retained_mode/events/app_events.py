@@ -269,6 +269,31 @@ class LibraryLoadedNotification(AppPayload):
 
 @dataclass
 @PayloadRegistry.register
+class LibraryWorkflowTemplatesChanged(AppPayload):
+    """Notification that a library's bundled workflow templates were added or removed.
+
+    Emitted when a library that declares `workflows` in its `griptape_nodes_library.json`
+    finishes registering them (engine start, library install, library reload) and when a
+    library is unloaded and its templates are removed. Clients refetch the workflow list on
+    this event rather than polling for it.
+
+    Enqueued with `put_event`, like `EngineReadyEvent`, so it reaches the application layer
+    and the GUI. In-process Python subscribers registered via `add_listener_to_app_event` do
+    not see it -- those only fire for events passed to `broadcast_app_event`.
+
+    Args:
+        library_name: Name of the library whose templates changed.
+        workflow_names: Registry keys of the templates that were added or removed.
+        registered: True when the templates were added, False when they were removed.
+    """
+
+    library_name: str
+    workflow_names: list[str]
+    registered: bool
+
+
+@dataclass
+@PayloadRegistry.register
 class ConfigChanged(AppPayload):
     """Configuration value changed notification.
 

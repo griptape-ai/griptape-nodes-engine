@@ -112,7 +112,7 @@ Bundle nodes into libraries for sharing. Create `griptape_nodes_library.json`:
 - **nodes**: List node classes, file paths, and metadata
 - **advanced_library_path**: Optional Python file declaring an `AdvancedNodeLibrary` subclass, for libraries that need to run code at load and unload, own a request type, or register node types the manifest does not list (see [Advanced Libraries](advanced_libraries.md))
 - **workflow_nodes**: Nodes generated from saved workflow files instead of Python classes. See [Nodes From Workflow Files](#nodes-from-workflow-files) below.
-- **workflows**: Template workflow files
+- **workflows**: Template workflow files shipped with the library. See [Workflow Templates](#workflow-templates) below.
 
 **Important:** The `secrets_to_register` array tells the system which secrets your library needs. Users will be prompted to configure these secrets through the UI or environment variables.
 
@@ -174,6 +174,54 @@ a library problem and its node is not registered.
 The workflow is also registered as a workflow in its own right, so it shows up in the editor's
 workflow picker. To keep a workflow that only exists to back a node out of that list, set
 `is_internal = true` in its metadata header.
+
+### Workflow Templates
+
+The `workflows` array ships ready-made workflows with your library. Each entry is a path to a saved
+workflow `.py`, relative to `griptape_nodes_library.json`:
+
+```jsonc
+"workflows": ["workflows/example_workflow.py"]
+```
+
+Templates appear in the editor's workflow picker alongside the user's own workflows. They follow the
+library that provides them:
+
+- Installing the library registers its templates. This happens whether the library is installed from
+    a file, from a requirement specifier, or picked up at engine start.
+- Updating or reloading the library re-registers them, so an edited template file is picked up.
+- Uninstalling the library removes its templates from the picker.
+
+Set two flags in each template's metadata header. The header is the `# /// script` block at the top
+of the saved `.py`; edit the `[tool.griptape-nodes]` table in it, the same way as `is_internal` above:
+
+```python
+# /// script
+# dependencies = []
+#
+# [tool.griptape-nodes]
+# name = "example_workflow"
+# is_template = true
+# is_griptape_provided = true
+# ///
+```
+
+- **`is_template`** makes the editor offer the workflow as a starting point rather than listing it as
+    an ordinary workflow.
+- **`is_griptape_provided`** makes saving produce a new copy in the user's workspace. Set it on
+    anything you ship.
+
+Both are needed for the copy-on-save behavior. With `is_template` alone, the editor still offers the
+workflow as a starting point, but saving writes back over the template file inside your library — so
+the original is gone and the user's work is overwritten the next time they update the library.
+
+Templates survive a workspace rescan — which happens at engine start and whenever the workspace
+directory changes — because the engine re-registers them from your library afterwards. That holds
+whether or not you set `is_griptape_provided`.
+
+Templates are registered by reading the metadata header only; the engine does not run them or import
+any node class to do it. A template that names a library version you do not have installed still
+registers, and reports the mismatch as a workflow problem when the user opens it.
 
 ### Library and Node Declarations
 
