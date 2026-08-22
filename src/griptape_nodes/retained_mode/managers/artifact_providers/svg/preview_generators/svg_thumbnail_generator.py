@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import resvg_py
+from defusedxml import ElementTree
 from PIL import Image
 from pydantic import PositiveInt  # noqa: TC002 - Runtime validation, not type-only
 
@@ -30,6 +31,7 @@ if TYPE_CHECKING:
 
 # JPEG has no alpha channel -- flatten onto white instead of leaving resvg's default transparent canvas.
 _JPEG_BACKGROUND = "#ffffff"
+_XLINK_HREF = "{http://www.w3.org/1999/xlink}href"
 
 
 class SVGThumbnailParameters(BaseGeneratorParameters):
@@ -135,6 +137,7 @@ class SVGThumbnailGenerator(BaseArtifactPreviewGenerator):
 
         svg_data = read_result.content
         svg_text = svg_data.decode("utf-8") if isinstance(svg_data, bytes) else svg_data
+        self._validate_embedded_href_safety(svg_text)
 
         is_jpeg_target = self.preview_format.lower() in ("jpg", "jpeg")
         try:
@@ -173,3 +176,26 @@ class SVGThumbnailGenerator(BaseArtifactPreviewGenerator):
             raise OSError(msg)
 
         return self.destination_preview_file_name
+
+    @staticmethod
+    def _validate_embedded_href_safety(svg_text: str) -> None:
+        """Reject SVGs that use non-data hrefs in image/use elements."""
+        try:
+            root = ElementTree.fromstring(svg_text)
+        except ElementTree.ParseError as e:
+            msg = f"Invalid SVG XML: {e}"
+            raise TypeError(msg) from e
+
+        for element in root.iter():
+            tag = element.tag
+            local_name = tag.rsplit("}", 1)[-1] if "}" in tag else tag
+            if local_name not in {"image", "use"}:
+                continue
+
+            href = element.attrib.get("href") or element.attrib.get(_XLINK_HREF)
+            if href is None:
+                continue
+
+            if not href.strip().lower().startswith("data:"):
+                msg = "Unsafe SVG: only data: URIs are allowed in image/use href attributes"
+                raise TypeError(msg)

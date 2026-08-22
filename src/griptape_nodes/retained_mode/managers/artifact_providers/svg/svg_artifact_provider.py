@@ -46,6 +46,7 @@ class SVGArtifactProvider(BaseArtifactProvider):
 
     # Generous enough to clear an XML declaration/DOCTYPE prologue while still being a cheap sniff.
     _SNIFF_HEAD_BYTES: ClassVar[int] = 2048
+    _UTF8_BOM: ClassVar[bytes] = b"\xef\xbb\xbf"
 
     @classmethod
     def get_friendly_name(cls) -> str:
@@ -62,7 +63,7 @@ class SVGArtifactProvider(BaseArtifactProvider):
 
     @classmethod
     def get_preview_formats(cls) -> set[str]:
-        return {"png", "webp"}
+        return {"png", "webp", "jpg"}
 
     @classmethod
     def get_default_preview_generator(cls) -> str:
@@ -89,15 +90,65 @@ class SVGArtifactProvider(BaseArtifactProvider):
     def detect_format(cls, data: bytes) -> str | None:
         """Sniff SVG content.
 
-        Unlike raster formats, SVG has no magic bytes -- it's XML text, optionally preceded by a
-        BOM/XML declaration or DOCTYPE. Decoding a generous head window and checking for the `<svg`
-        tag (the same idea already used ad hoc in `griptape_nodes/utils/image_preview.py`) is single
-        source of truth for that sniff here.
+        Unlike raster formats, SVG has no magic bytes -- it's XML text. To stay safe on arbitrary
+        payloads (this runs on every byte write), only claim SVG when `<svg` is the first real
+        element after optional BOM/XML prologue constructs (whitespace, processing instructions,
+        comments, and DOCTYPE).
         """
-        head = data[: cls._SNIFF_HEAD_BYTES].decode("utf-8", errors="ignore").lower()
-        if "<svg" in head:
-            return "svg"
-        return None
+        print('data: ', data)
+        head = data[: cls._SNIFF_HEAD_BYTES]
+        print('head: ', head)
+        if head.startswith(cls._UTF8_BOM):
+            head = head[len(cls._UTF8_BOM) :]
+
+        while True:
+            head = head.lstrip()
+            lower_head = head.lower()
+
+            if lower_head.startswith(b"<?"):
+                end = head.find(b"?>")
+                if end < 0:
+                    return None
+                head = head[end + 2 :]
+                continue
+
+            if head.startswith(b"<!--"):
+                end = head.find(b"-->")
+                if end < 0:
+                    return None
+                head = head[end + 3 :]
+                continue
+
+            if lower_head.startswith(b"<!doctype"):
+                i = len(b"<!doctype")
+                bracket_depth = 0
+                quote: bytes | None = None
+
+                while i < len(head):
+                    char = head[i : i + 1]
+
+                    if quote is not None:
+                        if char == quote:
+                            quote = None
+                    else:
+                        if char in (b'"', b"'"):
+                            quote = char
+                        elif char == b"[":
+                            bracket_depth += 1
+                        elif char == b"]":
+                            bracket_depth = max(0, bracket_depth - 1)
+                        elif char == b">" and bracket_depth == 0:
+                            break
+
+                    i += 1
+
+                end = i if i < len(head) else -1
+                if end < 0:
+                    return None
+                head = head[end + 1 :]
+                continue
+
+            return "svg" if lower_head.startswith(b"<svg") and (len(head) == 4 or head[4:5] in b" \t\r\n/>") else None
 
     @classmethod
     def get_artifact_metadata(cls, source_path: str) -> SVGArtifactMetadata | None:
