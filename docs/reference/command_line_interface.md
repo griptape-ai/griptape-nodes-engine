@@ -135,14 +135,14 @@ griptape-nodes doctor
 
 ## Configuration
 
-Griptape Nodes stores its configuration in the following locations. It uses the same layout on every platform, so on Windows these are under your home folder rather than in `AppData`:
+Griptape Nodes stores its configuration in the following locations.
 
 - Configuration directory: `~/.config/griptape_nodes` (macOS/Linux) or `%USERPROFILE%\.config\griptape_nodes` (Windows)
 - Data directory: `~/.local/share/griptape_nodes` (macOS/Linux) or `%USERPROFILE%\.local\share\griptape_nodes` (Windows)
 - Configuration file: `griptape_nodes_config.json` in the configuration directory
 - Environment file: `.env` in the configuration directory
 
-Griptape Nodes Desktop is the exception: it keeps these two directories inside its own application data folder so they don't collide with a manually installed engine. See [Uninstalling Griptape Nodes](../uninstalling.md#griptape-nodes-desktop) for those paths.
+Griptape Nodes Desktop keeps these two directories inside its own application data folder so they don't collide with a manually installed engine. See [Uninstalling Griptape Nodes](../uninstalling.md#griptape-nodes-desktop) for those paths.
 
 ## Workflow
 

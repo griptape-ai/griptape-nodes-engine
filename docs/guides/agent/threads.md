@@ -16,7 +16,7 @@ Threads are saved to your local filesystem and persist across sessions. Each thr
 | `thread_{id}.json`      | Full message history             |
 | `thread_{id}.meta.json` | Title, timestamps, message count |
 
-The storage location follows the [XDG Base Directory](https://specifications.freedesktop.org/basedir-spec/latest/) convention on every platform, so on Windows it lands under your home folder rather than in `AppData`:
+The storage location follows the [XDG Base Directory](https://specifications.freedesktop.org/basedir-spec/latest/) convention.
 
 | Platform      | Path                                                 |
 | ------------- | ---------------------------------------------------- |

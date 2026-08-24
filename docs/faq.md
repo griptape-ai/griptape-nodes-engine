@@ -92,15 +92,7 @@ The migration guide includes replacements for all deprecated image processing, d
 
 ## How do I uninstall Griptape Nodes?
 
-If you use Griptape Nodes Desktop, uninstall the application the way you would any other app on your platform. If you installed the engine yourself, run:
-
-```bash
-griptape-nodes self uninstall
-```
-
-Neither one removes your workspace, your downloaded models, or a few shared caches. For the full teardown, including what each uninstaller does and doesn't remove, see [Uninstalling Griptape Nodes](uninstalling.md).
-
-To reinstall, follow the instructions on the [installation](installation.md) page.
+See [Uninstalling Griptape Nodes](uninstalling.md).
 
 ## How do I update Griptape Nodes?
 

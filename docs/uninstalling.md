@@ -1,13 +1,11 @@
 # Uninstalling Griptape Nodes
 
-Removing Griptape Nodes takes two passes. First you run the uninstaller for however you installed it, which gets rid of the application or the engine itself. Then you delete the folders no uninstaller touches: your workspace, downloaded models, and a few caches that are left alone on purpose because other software shares them.
-
 Start with the section that matches how you installed:
 
 - **[Griptape Nodes Desktop](#griptape-nodes-desktop)** — the desktop application you downloaded from [griptapenodes.com](https://griptapenodes.com).
 - **[Manual engine install](#manual-engine-install)** — the engine you installed yourself with `uv tool install griptape-nodes`.
 
-Then finish with [What's left behind](#whats-left-behind). If you used both the application and a manual install on the same machine, work through both sections: they keep their files in different places and neither one cleans up after the other.
+Then finish with [What's left behind](#whats-left-behind).
 
 !!! warning "Your workflows are not removed for you"
 
@@ -26,7 +24,7 @@ Then finish with [What's left behind](#whats-left-behind). If you used both the 
 
 ## Griptape Nodes Desktop
 
-The application bundles the engine it manages the engine's directories inside its own data folder.
+The application bundles the engine and manages the engine's directories inside its own data folder.
 
 ### macOS
 
@@ -49,7 +47,7 @@ The Windows uninstaller cleans up more than the other platforms do. It removes:
 - The **Installed apps** entry itself.
 - Both of the application's data folders, `%APPDATA%\Griptape Nodes` and `%LOCALAPPDATA%\Griptape Nodes`. Griptape Nodes hooks into the uninstaller to delete these for you, so app settings, your sign-in session, activated license keys, log files, and the engine's configuration and secrets all go with it.
 
-It does not remove your workspace, the engine's session state, or downloaded models. Skip ahead to [What's left behind](#whats-left-behind).
+It does not remove your workspace or downloaded models. Skip ahead to [What's left behind](#whats-left-behind).
 
 ### Linux
 
@@ -81,7 +79,7 @@ Once those are gone, continue with [What's left behind](#whats-left-behind).
 
 ## Manual engine install
 
-### 1. Run the uninstaller
+Run the uninstaller:
 
 ```bash
 gtn self uninstall
@@ -114,18 +112,9 @@ Remove-Item -Recurse -Force "$env:USERPROFILE\.config\griptape_nodes"
 Remove-Item -Recurse -Force "$env:USERPROFILE\.local\share\griptape_nodes"
 ```
 
-### 2. Tidy up your `PATH`
-
-Installing put uv's executable directory on your `PATH` — `~/.local/bin`, or `%USERPROFILE%\.local\bin` on Windows — and uninstalling doesn't undo that. Leave it alone if you use other uv tools. Otherwise:
-
-- **macOS and Linux**: the install script ran `uv tool update-shell`, which added a line to a shell profile such as `~/.bashrc`, `~/.zshrc`, `~/.profile`, or a file under `~/.config/fish/conf.d/`. Open the file and delete the line uv added.
-- **Windows**: uv's installer added the directory to your user `PATH` environment variable. Remove it from **Settings → System → About → Advanced system settings → Environment Variables**.
-
 Then continue with [What's left behind](#whats-left-behind).
 
 ## What's left behind
-
-Everything below applies whether you used the desktop application or a manual engine install. None of it is removed for you, and all of it is safe to delete once you're sure you don't want it.
 
 ### Remove your workspace
 
@@ -138,17 +127,6 @@ Either way you may have pointed it somewhere else, which is why it's worth [noti
 
 Copy out anything you want to keep, then delete the folder.
 
-### Remove the engine's session state
-
-Both install methods record session state in the same place, and neither uninstaller removes it:
-
-| Platform      | Path                                        |
-| ------------- | ------------------------------------------- |
-| macOS / Linux | `~/.local/state/griptape_nodes`             |
-| Windows       | `%USERPROFILE%\.local\state\griptape_nodes` |
-
-It's small and harmless to leave behind, and safe to delete.
-
 ### Remove downloaded models
 
 Models that nodes pull from the Hugging Face Hub go into the shared Hugging Face cache, not into anything Griptape Nodes owns.
@@ -158,7 +136,7 @@ Models that nodes pull from the Hugging Face Hub go into the shared Hugging Face
 | macOS / Linux | `~/.cache/huggingface/hub`             |
 | Windows       | `%USERPROFILE%\.cache\huggingface\hub` |
 
-Other software shares this cache. If anything else on your machine downloads from Hugging Face, don't delete the whole folder. With a manual engine install you can clear out just the Griptape Nodes models before you uninstall:
+If anything else on your machine downloads from Hugging Face, don't delete the whole folder. With a manual engine install you can clear out just the Griptape Nodes models before you uninstall:
 
 ```bash
 gtn models list
@@ -167,16 +145,11 @@ gtn models delete <model_id>
 
 You can also do this from the editor's **Model Management** window while Griptape Nodes is still installed. See [Managing models and libraries](guides/editor/managing_models_and_libraries.md).
 
-### Remove uv and its caches
+### Remove uv
 
-Only do this if you don't use [uv](https://docs.astral.sh/uv/) for anything else. Griptape Nodes uses it to build the virtual environments for node libraries, which means uv keeps downloaded packages and Python interpreters of its own.
+Griptape Nodes uses [uv](https://docs.astral.sh/uv/) to build the virtual environments for node libraries, so uv keeps caches and Python interpreters of its own. If uv is on your machine only because you installed Griptape Nodes, follow uv's [uninstallation instructions](https://docs.astral.sh/uv/getting-started/installation/#uninstallation) to remove those along with uv itself.
 
-```bash
-uv cache clean
-uv python uninstall --all
-```
-
-If uv exists on your machine only because you installed Griptape Nodes, you can then remove uv itself. Delete its executable from `~/.local/bin` (`%USERPROFILE%\.local\bin` on Windows) along with its data directory: `~/.local/share/uv` on macOS and Linux, or `%APPDATA%\uv\data` on Windows.
+Those instructions leave your `PATH` alone. Installing Griptape Nodes put uv's executable directory (`~/.local/bin`, or `%USERPROFILE%\.local\bin` on Windows) on it, so once uv is gone you can drop that entry too: on macOS and Linux delete the line uv added to your shell profile, and on Windows remove it under **Settings → System → About → Advanced system settings → Environment Variables**.
 
 ## Reinstalling
 
