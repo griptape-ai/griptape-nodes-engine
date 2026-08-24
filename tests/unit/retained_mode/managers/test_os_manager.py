@@ -58,6 +58,7 @@ from griptape_nodes.retained_mode.events.os_events import (
 from griptape_nodes.retained_mode.events.project_events import MacroPath
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.os_manager import OSManager, WindowsSpecialFolderError
+from griptape_nodes.retained_mode.managers.resource_types.os_resource import Platform
 
 # Windows MAX_PATH constant for tests
 WINDOWS_MAX_PATH = 260
@@ -2264,3 +2265,28 @@ class TestCopyFile:
         # The copy succeeds: contents are on disk and the byte count is returned.
         assert dst.read_text() == content
         assert bytes_copied == len(content.encode())
+
+
+class TestPlatformName:
+    """platform_name collapses sys.platform onto the Platform values keyed off elsewhere.
+
+    Values are asserted against a patched ``sys.platform`` so the tests run identically on
+    any host OS.
+    """
+
+    def test_windows(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("griptape_nodes.files.os_utils.sys.platform", "win32")
+        assert OSManager.platform_name() == Platform.WINDOWS
+
+    def test_mac(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("griptape_nodes.files.os_utils.sys.platform", "darwin")
+        assert OSManager.platform_name() == Platform.DARWIN
+
+    def test_linux(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("griptape_nodes.files.os_utils.sys.platform", "linux")
+        assert OSManager.platform_name() == Platform.LINUX
+
+    def test_unrecognized_platform_falls_back_to_sys_platform(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Reporting something beats reporting nothing, so the result is never empty.
+        monkeypatch.setattr("griptape_nodes.files.os_utils.sys.platform", "freebsd14")
+        assert OSManager.platform_name() == "freebsd14"
