@@ -158,6 +158,8 @@ A previous uninstall didn't fully complete, leaving Griptape Nodes' virtual envi
     griptape-nodes self uninstall
     ```
 
+    If that command no longer runs at all, remove the install by hand using the steps in [Uninstalling Griptape Nodes](uninstalling.md#manual-engine-install).
+
 1. Reinstall by following the [installation](installation.md) instructions.
 
 ## "Attempted to create a Flow with a parent 'None'" / usually harmless
