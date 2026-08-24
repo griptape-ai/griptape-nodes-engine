@@ -45,7 +45,7 @@ The Windows uninstaller cleans up more than the other platforms do. It removes:
 - The application, from `%LOCALAPPDATA%\ai.griptape.nodes.desktop`, including any downloaded update packages kept alongside it.
 - Start menu and desktop shortcuts.
 - The **Installed apps** entry itself.
-- Both of the application's data folders, `%APPDATA%\Griptape Nodes` and `%LOCALAPPDATA%\Griptape Nodes`. Griptape Nodes hooks into the uninstaller to delete these for you, so app settings, your sign-in session, activated license keys, log files, and the engine's configuration and secrets all go with it.
+- Both of the application's data folders, `%APPDATA%\Griptape Nodes` and `%LOCALAPPDATA%\Griptape Nodes`. Griptape Nodes hooks into the uninstaller to delete these for you, so the app's settings and logs, and everything the engine wrote including your API keys, go with them.
 
 It does not remove your workspace or downloaded models. Skip ahead to [What's left behind](#whats-left-behind).
 
@@ -87,8 +87,7 @@ gtn self uninstall
 
 Press Enter when it prints `When done, press Enter to exit.` so it can finish removing the executable. It removes:
 
-- The **configuration directory**, `~/.config/griptape_nodes`, holding `griptape_nodes_config.json` and the `.env` file with your API keys and other secrets.
-- The **data directory**, `~/.local/share/griptape_nodes`, holding engine registrations, agent conversation threads, model download records, the ffmpeg binaries the engine downloads for video previews, node libraries installed before libraries moved into the workspace, and the private copy of `uv` the install script may have placed there.
+- The engine's **configuration** and **data** directories, `~/.config/griptape_nodes` and `~/.local/share/griptape_nodes`, including the `.env` file with your API keys and other secrets.
 - The `griptape-nodes` and `gtn` commands, by running `uv tool uninstall griptape-nodes`.
 
 If it prints a **Caveats** section, read it. It lists configuration files it deliberately left alone, which are the ones inside your workspace and project folders, along with anything it couldn't delete and you should remove by hand.
@@ -150,6 +149,8 @@ You can also do this from the editor's **Model Management** window while Griptap
 Griptape Nodes uses [uv](https://docs.astral.sh/uv/) to build the virtual environments for node libraries, so uv keeps caches and Python interpreters of its own. If uv is on your machine only because you installed Griptape Nodes, follow uv's [uninstallation instructions](https://docs.astral.sh/uv/getting-started/installation/#uninstallation) to remove those along with uv itself.
 
 Those instructions leave your `PATH` alone. Installing Griptape Nodes put uv's executable directory (`~/.local/bin`, or `%USERPROFILE%\.local\bin` on Windows) on it, so once uv is gone you can drop that entry too: on macOS and Linux delete the line uv added to your shell profile, and on Windows remove it under **Settings → System → About → Advanced system settings → Environment Variables**.
+
+If you never had uv before installing Griptape Nodes, the install script's private copy of it is already gone with the data directory, but uv's cache is not. Delete `~/.cache/uv` (`%LOCALAPPDATA%\uv\cache` on Windows) by hand.
 
 ## Reinstalling
 
