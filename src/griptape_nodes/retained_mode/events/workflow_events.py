@@ -1413,3 +1413,54 @@ class ExportFlowAsLibraryNodeResultFailure(ResultPayloadFailure):
 
     Common causes: flow not found, no Start or End Flow nodes in the flow, file write error.
     """
+
+
+@dataclass
+@PayloadRegistry.register
+class ConvertNodesToSubflowRequest(RequestPayload):
+    """Convert a set of nodes into a new SubflowNode atomically.
+
+    Creates a SubflowNode in the parent flow, moves the selected nodes into its inner flow,
+    wires any boundary connections (edges crossing the selection boundary) through
+    auto-created StartFlow and EndFlow nodes, and promotes those connections to the
+    SubflowNode's surface.
+
+    Args:
+        node_names: Names of the nodes to move into the new SubflowNode.
+        flow_name: Parent flow name (None to infer from the nodes themselves).
+        position: Canvas position for the new SubflowNode as {"x": ..., "y": ...}.
+            If None, the centroid of the selected nodes is used.
+
+    Results: ConvertNodesToSubflowResultSuccess | ConvertNodesToSubflowResultFailure
+    """
+
+    node_names: list[str]
+    flow_name: str | None = None
+    position: dict[str, float] | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class ConvertNodesToSubflowResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
+    """Nodes successfully converted into a SubflowNode.
+
+    Args:
+        subflow_node_name: Name of the newly created SubflowNode.
+        child_flow_name: Name of the inner flow that now contains the moved nodes.
+        promoted_params: Names of the parameters promoted to the SubflowNode's surface
+            from boundary connections.
+    """
+
+    subflow_node_name: str
+    child_flow_name: str
+    promoted_params: list[str]
+
+
+@dataclass
+@PayloadRegistry.register
+class ConvertNodesToSubflowResultFailure(ResultPayloadFailure):
+    """Nodes could not be converted to a SubflowNode.
+
+    Common causes: empty node list, nodes not found, nodes in different flows,
+    SubflowNode or inner flow creation failed.
+    """

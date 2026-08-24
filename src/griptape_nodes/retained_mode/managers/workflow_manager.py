@@ -65,6 +65,10 @@ from griptape_nodes.retained_mode.events.app_events import (
 
 # Runtime imports for ResultDetails since it's used at runtime
 from griptape_nodes.retained_mode.events.base_events import AppEvent, ResultDetail, ResultDetails
+from griptape_nodes.retained_mode.events.connection_events import (
+    CreateConnectionRequest,
+    DeleteConnectionRequest,
+)
 from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowRequest,
     CreateFlowResultSuccess,
@@ -85,8 +89,12 @@ from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileRequest,
 )
 from griptape_nodes.retained_mode.events.node_events import (
+    CreateNodeRequest,
+    CreateNodeResultSuccess,
     GetFlowForNodeRequest,
     GetFlowForNodeResultSuccess,
+    MoveNodeToNewFlowRequest,
+    MoveNodeToNewFlowResultSuccess,
 )
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.os_events import (
@@ -98,6 +106,9 @@ from griptape_nodes.retained_mode.events.os_events import (
     GetFileInfoRequest,
     GetFileInfoResultFailure,
     GetFileInfoResultSuccess,
+)
+from griptape_nodes.retained_mode.events.parameter_events import (
+    AddParameterToNodeRequest,
 )
 from griptape_nodes.retained_mode.events.project_events import (
     AttemptMatchPathAgainstMacroRequest,
@@ -113,6 +124,9 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     CompareWorkflowsRequest,
     CompareWorkflowsResultFailure,
     CompareWorkflowsResultSuccess,
+    ConvertNodesToSubflowRequest,
+    ConvertNodesToSubflowResultFailure,
+    ConvertNodesToSubflowResultSuccess,
     CreateWorkflowFromTemplateRequest,
     CreateWorkflowFromTemplateResultFailure,
     CreateWorkflowFromTemplateResultSuccess,
@@ -576,6 +590,10 @@ class WorkflowManager(EngineScoped):
         event_manager.assign_manager_to_request_type(
             SyncInnerFlowSurfaceRequest,
             self.on_sync_inner_flow_surface_request,
+        )
+        event_manager.assign_manager_to_request_type(
+            ConvertNodesToSubflowRequest,
+            self.on_convert_nodes_to_subflow_request,
         )
         event_manager.assign_manager_to_request_type(
             ExportFlowAsLibraryNodeRequest,
@@ -6979,6 +6997,349 @@ class WorkflowManager(EngineScoped):
             added_params=added,
             removed_params=removed,
             result_details=ResultDetails(message=details, level=logging.INFO),
+        )
+
+    def on_convert_nodes_to_subflow_request(self, request: ConvertNodesToSubflowRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
+        """Convert a set of nodes into a new SubflowNode atomically.
+
+        Creates the SubflowNode, opens its inner canvas, creates StartFlow and EndFlow
+        inside, moves the selected nodes in, wires boundary connections through the
+        Start/End nodes, and syncs the SubflowNode's surface parameters.
+        """
+        if not request.node_names:
+            return ConvertNodesToSubflowResultFailure(
+                result_details="Attempted to convert nodes to subflow. Failed because no node names were provided."
+            )
+
+        obj_mgr = self.engine.object_manager
+
+        # 1. Validate all nodes exist.
+        errors = []
+        nodes: list[BaseNode] = []
+        for node_name in request.node_names:
+            node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
+            if node is None:
+                errors.append(f"Node '{node_name}' was not found.")
+            else:
+                nodes.append(node)
+
+        if errors:
+            details = f"Attempted to convert nodes to subflow. Failed: {' '.join(errors)}"
+            return ConvertNodesToSubflowResultFailure(result_details=details)
+
+        # 2. Verify all nodes are in the same flow.
+        parent_flow_name: str | None = None
+        for node in nodes:
+            flow_result = self.engine.handle_request(GetFlowForNodeRequest(node_name=node.name))
+            if not isinstance(flow_result, GetFlowForNodeResultSuccess):
+                return ConvertNodesToSubflowResultFailure(
+                    result_details=f"Attempted to convert nodes to subflow. Failed because the flow for node '{node.name}' could not be found."
+                )
+            if parent_flow_name is None:
+                parent_flow_name = flow_result.flow_name
+            elif flow_result.flow_name != parent_flow_name:
+                return ConvertNodesToSubflowResultFailure(
+                    result_details=f"Attempted to convert nodes to subflow. Failed because nodes span multiple flows ('{parent_flow_name}' and '{flow_result.flow_name}')."
+                )
+
+        if parent_flow_name is None:
+            return ConvertNodesToSubflowResultFailure(
+                result_details="Attempted to convert nodes to subflow. Failed because no parent flow could be determined."
+            )
+
+        if request.flow_name is not None and request.flow_name != parent_flow_name:
+            return ConvertNodesToSubflowResultFailure(
+                result_details=f"Attempted to convert nodes to subflow. Failed because the specified flow '{request.flow_name}' does not match the nodes' actual flow '{parent_flow_name}'."
+            )
+
+        # 3. Collect boundary connections before moving nodes.
+        #    Connections are global so they survive the move; we snapshot them now to know
+        #    which ones cross the selection boundary.
+        node_names_set = {node.name for node in nodes}
+        connections = self.engine.flow_manager.get_connections()
+
+        incoming_boundary: list[tuple[str, str, str, str]] = []
+        outgoing_boundary: list[tuple[str, str, str, str]] = []
+
+        for node in nodes:
+            incoming_boundary.extend(
+                (conn.source_node.name, conn.source_parameter.name, conn.target_node.name, conn.target_parameter.name)
+                for conn in connections.get_all_incoming_connections(node)
+                if conn.source_node.name not in node_names_set
+            )
+            outgoing_boundary.extend(
+                (conn.source_node.name, conn.source_parameter.name, conn.target_node.name, conn.target_parameter.name)
+                for conn in connections.get_all_outgoing_connections(node)
+                if conn.target_node.name not in node_names_set
+            )
+
+        # 4. Calculate position for the new SubflowNode.
+        if request.position is not None:
+            pos_x = float(request.position.get("x", 0.0))
+            pos_y = float(request.position.get("y", 0.0))
+        else:
+            pos_xs: list[float] = []
+            pos_ys: list[float] = []
+            for node in nodes:
+                pos = node.metadata.get("position", {"x": 0.0, "y": 0.0})
+                if isinstance(pos, dict):
+                    pos_xs.append(float(pos.get("x", 0.0)))
+                    pos_ys.append(float(pos.get("y", 0.0)))
+                elif isinstance(pos, (list, tuple)) and len(pos) >= 2:  # noqa: PLR2004
+                    pos_xs.append(float(pos[0]))
+                    pos_ys.append(float(pos[1]))
+            pos_x = sum(pos_xs) / len(pos_xs) if pos_xs else 0.0
+            pos_y = sum(pos_ys) / len(pos_ys) if pos_ys else 0.0
+
+        # 5. Create the SubflowNode in the parent flow.
+        create_node_result = self.engine.handle_request(
+            CreateNodeRequest(
+                node_type="SubflowNode",
+                override_parent_flow_name=parent_flow_name,
+                metadata={"position": {"x": pos_x, "y": pos_y}},
+                create_error_proxy_on_failure=False,
+            )
+        )
+        if not isinstance(create_node_result, CreateNodeResultSuccess):
+            return ConvertNodesToSubflowResultFailure(
+                result_details=f"Attempted to convert nodes to subflow. Failed to create SubflowNode: {create_node_result.result_details}"
+            )
+        subflow_node_name = create_node_result.node_name
+
+        # 6. Open the inner canvas (creates the child flow and links it to the SubflowNode).
+        open_result = self.engine.handle_request(OpenNodeInnerCanvasRequest(node_name=subflow_node_name))
+        if not isinstance(open_result, OpenNodeInnerCanvasResultSuccess):
+            return ConvertNodesToSubflowResultFailure(
+                result_details=f"Attempted to convert nodes to subflow. Failed to open inner canvas for '{subflow_node_name}': {open_result.result_details}"
+            )
+        child_flow_name = open_result.child_flow_name
+
+        # 7. Create StartFlow and EndFlow inside the child flow.
+        create_start_result = self.engine.handle_request(
+            CreateNodeRequest(
+                node_type="StartFlow",
+                override_parent_flow_name=child_flow_name,
+                create_error_proxy_on_failure=False,
+            )
+        )
+        if not isinstance(create_start_result, CreateNodeResultSuccess):
+            return ConvertNodesToSubflowResultFailure(
+                result_details=f"Attempted to convert nodes to subflow. Failed to create StartFlow: {create_start_result.result_details}"
+            )
+        start_flow_name = create_start_result.node_name
+
+        create_end_result = self.engine.handle_request(
+            CreateNodeRequest(
+                node_type="EndFlow",
+                override_parent_flow_name=child_flow_name,
+                create_error_proxy_on_failure=False,
+            )
+        )
+        if not isinstance(create_end_result, CreateNodeResultSuccess):
+            return ConvertNodesToSubflowResultFailure(
+                result_details=f"Attempted to convert nodes to subflow. Failed to create EndFlow: {create_end_result.result_details}"
+            )
+        end_flow_name = create_end_result.node_name
+
+        # 8. Move each selected node into the child flow.
+        #    Connections are global and survive the move unchanged.
+        for node in nodes:
+            move_result = self.engine.handle_request(
+                MoveNodeToNewFlowRequest(
+                    node_name=node.name,
+                    target_flow_name=child_flow_name,
+                    source_flow_name=parent_flow_name,
+                )
+            )
+            if not isinstance(move_result, MoveNodeToNewFlowResultSuccess):
+                return ConvertNodesToSubflowResultFailure(
+                    result_details=f"Attempted to convert nodes to subflow. Failed to move node '{node.name}' into the inner flow: {move_result.result_details}"
+                )
+
+        # 9. Wire incoming boundary connections (external → selected) through StartFlow.
+        promoted_params: list[str] = []
+        used_start_names: set[str] = set()
+        incoming_bridge_map: list[tuple[str, str, str, str, str]] = []
+
+        for ext_src_node, ext_src_param, tgt_node, tgt_param in incoming_boundary:
+            candidate = tgt_param
+            if candidate in used_start_names:
+                candidate = f"{tgt_node}_{tgt_param}"
+            suffix = 1
+            while candidate in used_start_names:
+                candidate = f"{tgt_node}_{tgt_param}_{suffix}"
+                suffix += 1
+            bridge_name = candidate
+            used_start_names.add(bridge_name)
+            incoming_bridge_map.append((ext_src_node, ext_src_param, tgt_node, tgt_param, bridge_name))
+
+            ext_src_node_obj = obj_mgr.attempt_get_object_by_name_as_type(ext_src_node, BaseNode)
+            ext_src_param_obj = (
+                ext_src_node_obj.get_parameter_by_name(ext_src_param) if ext_src_node_obj is not None else None
+            )
+            tgt_node_obj = obj_mgr.attempt_get_object_by_name_as_type(tgt_node, BaseNode)
+            tgt_param_obj = (
+                tgt_node_obj.get_parameter_by_name(tgt_param) if tgt_node_obj is not None else None
+            )
+
+            output_type = ext_src_param_obj.output_type if ext_src_param_obj is not None else None
+            input_types = tgt_param_obj.input_types if tgt_param_obj is not None else None
+
+            add_result = self.engine.handle_request(
+                AddParameterToNodeRequest(
+                    node_name=start_flow_name,
+                    parameter_name=bridge_name,
+                    output_type=output_type,
+                    input_types=input_types,
+                    mode_allowed_input=False,
+                    mode_allowed_property=True,
+                    mode_allowed_output=True,
+                )
+            )
+            if not add_result.succeeded():
+                logger.warning(
+                    "ConvertNodesToSubflow: could not add bridge param '%s' to StartFlow: %s",
+                    bridge_name,
+                    add_result.result_details,
+                )
+                continue
+
+            # Wire StartFlow bridge → internal target parameter.
+            self.engine.handle_request(
+                CreateConnectionRequest(
+                    source_node_name=start_flow_name,
+                    source_parameter_name=bridge_name,
+                    target_node_name=tgt_node,
+                    target_parameter_name=tgt_param,
+                )
+            )
+
+            # Remove the now-invalid cross-flow connection (external → internal).
+            self.engine.handle_request(
+                DeleteConnectionRequest(
+                    source_node_name=ext_src_node,
+                    source_parameter_name=ext_src_param,
+                    target_node_name=tgt_node,
+                    target_parameter_name=tgt_param,
+                )
+            )
+
+            promoted_params.append(bridge_name)
+
+        # Wire outgoing boundary connections (selected → external) through EndFlow.
+        used_end_names: set[str] = set()
+
+        outgoing_bridge_map: list[tuple[str, str, str, str, str]] = []
+
+        for src_node, src_param, ext_tgt_node, ext_tgt_param in outgoing_boundary:
+            candidate = src_param
+            if candidate in used_end_names:
+                candidate = f"{src_node}_{src_param}"
+            suffix = 1
+            while candidate in used_end_names:
+                candidate = f"{src_node}_{src_param}_{suffix}"
+                suffix += 1
+            bridge_name = candidate
+            used_end_names.add(bridge_name)
+            outgoing_bridge_map.append((src_node, src_param, ext_tgt_node, ext_tgt_param, bridge_name))
+
+            src_node_obj = obj_mgr.attempt_get_object_by_name_as_type(src_node, BaseNode)
+            src_param_obj = (
+                src_node_obj.get_parameter_by_name(src_param) if src_node_obj is not None else None
+            )
+            ext_tgt_node_obj = obj_mgr.attempt_get_object_by_name_as_type(ext_tgt_node, BaseNode)
+            ext_tgt_param_obj = (
+                ext_tgt_node_obj.get_parameter_by_name(ext_tgt_param) if ext_tgt_node_obj is not None else None
+            )
+
+            output_type = src_param_obj.output_type if src_param_obj is not None else None
+            input_types = ext_tgt_param_obj.input_types if ext_tgt_param_obj is not None else None
+
+            add_result = self.engine.handle_request(
+                AddParameterToNodeRequest(
+                    node_name=end_flow_name,
+                    parameter_name=bridge_name,
+                    output_type=output_type,
+                    input_types=input_types,
+                    mode_allowed_input=True,
+                    mode_allowed_property=False,
+                    mode_allowed_output=False,
+                )
+            )
+            if not add_result.succeeded():
+                logger.warning(
+                    "ConvertNodesToSubflow: could not add bridge param '%s' to EndFlow: %s",
+                    bridge_name,
+                    add_result.result_details,
+                )
+                continue
+
+            # Wire internal source parameter → EndFlow bridge.
+            self.engine.handle_request(
+                CreateConnectionRequest(
+                    source_node_name=src_node,
+                    source_parameter_name=src_param,
+                    target_node_name=end_flow_name,
+                    target_parameter_name=bridge_name,
+                )
+            )
+
+            # Remove the now-invalid cross-flow connection (internal → external).
+            self.engine.handle_request(
+                DeleteConnectionRequest(
+                    source_node_name=src_node,
+                    source_parameter_name=src_param,
+                    target_node_name=ext_tgt_node,
+                    target_parameter_name=ext_tgt_param,
+                )
+            )
+
+            if bridge_name not in promoted_params:
+                promoted_params.append(bridge_name)
+
+        # 10. Sync the SubflowNode surface from the StartFlow/EndFlow params.
+        sync_result = self.engine.handle_request(SyncInnerFlowSurfaceRequest(node_name=subflow_node_name))
+        if not isinstance(sync_result, SyncInnerFlowSurfaceResultSuccess):
+            logger.warning(
+                "ConvertNodesToSubflow: surface sync failed for '%s': %s",
+                subflow_node_name,
+                sync_result.result_details,
+            )
+
+        # 11. Re-wire external connections to the SubflowNode's new surface parameters.
+        for ext_src_node, ext_src_param, _tgt_node, _tgt_param, bridge_name in incoming_bridge_map:
+            if bridge_name not in promoted_params:
+                continue
+            self.engine.handle_request(
+                CreateConnectionRequest(
+                    source_node_name=ext_src_node,
+                    source_parameter_name=ext_src_param,
+                    target_node_name=subflow_node_name,
+                    target_parameter_name=bridge_name,
+                )
+            )
+
+        for _src_node, _src_param, ext_tgt_node, ext_tgt_param, bridge_name in outgoing_bridge_map:
+            if bridge_name not in promoted_params:
+                continue
+            self.engine.handle_request(
+                CreateConnectionRequest(
+                    source_node_name=subflow_node_name,
+                    source_parameter_name=bridge_name,
+                    target_node_name=ext_tgt_node,
+                    target_parameter_name=ext_tgt_param,
+                )
+            )
+
+        details = (
+            f"Successfully converted {len(nodes)} node(s) into SubflowNode '{subflow_node_name}' "
+            f"with inner flow '{child_flow_name}'. Promoted {len(promoted_params)} boundary parameter(s)."
+        )
+        return ConvertNodesToSubflowResultSuccess(
+            result_details=ResultDetails(message=details, level=logging.INFO),
+            subflow_node_name=subflow_node_name,
+            child_flow_name=child_flow_name,
+            promoted_params=promoted_params,
         )
 
     async def on_export_flow_as_library_node_request(self, request: ExportFlowAsLibraryNodeRequest) -> ResultPayload:
