@@ -7,7 +7,7 @@ Start with the section that matches how you installed:
 - **[Griptape Nodes Desktop](#griptape-nodes-desktop)** — the desktop application you downloaded from [griptapenodes.com](https://griptapenodes.com).
 - **[Manual engine install](#manual-engine-install)** — the engine you installed yourself with `uv tool install griptape-nodes`.
 
-Then finish with [Remove what no uninstaller touches](#remove-what-no-uninstaller-touches). If you used both the application and a manual install on the same machine, work through both sections: they keep their files in different places and neither one cleans up after the other.
+Then finish with [What's left behind](#whats-left-behind). If you used both the application and a manual install on the same machine, work through both sections: they keep their files in different places and neither one cleans up after the other.
 
 !!! warning "Your workflows are not removed for you"
 
@@ -26,7 +26,7 @@ Then finish with [Remove what no uninstaller touches](#remove-what-no-uninstalle
 
 ## Griptape Nodes Desktop
 
-The application ships the engine, the Python interpreter it runs on, and git inside the application itself. Removing the application removes all three, and there is no separate engine to uninstall. It also keeps the engine's configuration and secrets inside its own data folder rather than in the shared locations a manual engine install uses, so you never have to hunt through your home directory for engine files the app created.
+The application bundles the engine it manages the engine's directories inside its own data folder.
 
 ### macOS
 
@@ -49,7 +49,7 @@ The Windows uninstaller cleans up more than the other platforms do. It removes:
 - The **Installed apps** entry itself.
 - Both of the application's data folders, `%APPDATA%\Griptape Nodes` and `%LOCALAPPDATA%\Griptape Nodes`. Griptape Nodes hooks into the uninstaller to delete these for you, so app settings, your sign-in session, activated license keys, log files, and the engine's configuration and secrets all go with it.
 
-It does not remove your workspace, the engine's session state, or downloaded models. Skip ahead to [Remove what no uninstaller touches](#remove-what-no-uninstaller-touches).
+It does not remove your workspace, the engine's session state, or downloaded models. Skip ahead to [What's left behind](#whats-left-behind).
 
 ### Linux
 
@@ -77,7 +77,7 @@ The application data folder is the big one. It holds app settings, your sign-in 
 
     Before you uninstall, open **App Settings** and scroll to [App Data Locations](guides/desktop/app_settings.md#app-data-locations). It shows the application data folder for your machine, with an **Open** button to reveal it in Finder or your file manager. Log files and update packages aren't listed there, so use the table above for those.
 
-Once those are gone, continue with [Remove what no uninstaller touches](#remove-what-no-uninstaller-touches).
+Once those are gone, continue with [What's left behind](#whats-left-behind).
 
 ## Manual engine install
 
@@ -121,9 +121,9 @@ Installing put uv's executable directory on your `PATH` — `~/.local/bin`, or `
 - **macOS and Linux**: the install script ran `uv tool update-shell`, which added a line to a shell profile such as `~/.bashrc`, `~/.zshrc`, `~/.profile`, or a file under `~/.config/fish/conf.d/`. Open the file and delete the line uv added.
 - **Windows**: uv's installer added the directory to your user `PATH` environment variable. Remove it from **Settings → System → About → Advanced system settings → Environment Variables**.
 
-Then continue with [Remove what no uninstaller touches](#remove-what-no-uninstaller-touches).
+Then continue with [What's left behind](#whats-left-behind).
 
-## Remove what no uninstaller touches
+## What's left behind
 
 Everything below applies whether you used the desktop application or a manual engine install. None of it is removed for you, and all of it is safe to delete once you're sure you don't want it.
 
@@ -135,8 +135,6 @@ Your [workspace directory](guides/projects/workspace.md) is where your work live
 - A `GriptapeNodes` folder inside whichever directory you first ran `gtn` from, if you installed the engine yourself.
 
 Either way you may have pointed it somewhere else, which is why it's worth [noting the path before you uninstall](#before-you-start).
-
-Alongside your projects, workflows, and generated assets, it contains a `staticfiles` folder of previews and uploads, a `libraries` folder where each installed node library carries its own Python virtual environment, a `sandbox_library` folder, a `synced_workflows` folder, and its own `griptape_nodes_config.json` and `.env`. The library virtual environments make this folder much larger than the files you actually authored, often several gigabytes.
 
 Copy out anything you want to keep, then delete the folder.
 
@@ -153,7 +151,7 @@ It's small and harmless to leave behind, and safe to delete.
 
 ### Remove downloaded models
 
-Models that nodes pull from the Hugging Face Hub go into the shared Hugging Face cache, not into anything Griptape Nodes owns. On a machine that has run local image or language models this is usually the largest thing left on disk, easily tens or hundreds of gigabytes.
+Models that nodes pull from the Hugging Face Hub go into the shared Hugging Face cache, not into anything Griptape Nodes owns.
 
 | Platform      | Path                                   |
 | ------------- | -------------------------------------- |

@@ -158,7 +158,7 @@ A previous uninstall didn't fully complete, leaving Griptape Nodes' virtual envi
     griptape-nodes self uninstall
     ```
 
-    If that command no longer runs at all, remove the install by hand using the steps in [Uninstalling Griptape Nodes](uninstalling.md#manual-engine-install).
+    The broken virtual environment can also stop `griptape-nodes` itself from starting, since the command runs out of that same environment. If you get the same error trying to uninstall, remove the install by hand using the steps in [Uninstalling Griptape Nodes](uninstalling.md#manual-engine-install).
 
 1. Reinstall by following the [installation](installation.md) instructions.
 
