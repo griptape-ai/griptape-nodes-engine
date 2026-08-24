@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -42,6 +43,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("griptape_nodes")
 
+# How long a driver waits on the new-work flag when it has nothing running and nothing it
+# can dispatch. Short enough to stay responsive, long enough not to busy-loop.
+_IDLE_RECHECK_SECONDS = 0.05
+
 
 class NodeStatesResult(NamedTuple):
     """Result of building node states from the DAG networks.
@@ -68,6 +73,7 @@ class ParallelResolutionContext(EngineScoped):
     dag_builder: DagBuilder | None
     last_resolved_node: BaseNode | None  # Track the last node that was resolved
     generation: int  # Bumped on reset so a resuming driver can tell its run was torn down
+    new_work_event: asyncio.Event  # Set when the priority queue changes, so a parked driver wakes
 
     def __init__(
         self,
@@ -90,6 +96,7 @@ class ParallelResolutionContext(EngineScoped):
         self.running_tasks_count = 0
         self.task_to_node = {}
         self.generation = 0
+        self.new_work_event = asyncio.Event()
 
     @property
     def node_to_reference(self) -> dict[str, DagNode]:
@@ -119,6 +126,15 @@ class ParallelResolutionContext(EngineScoped):
         """
         return self.generation != generation
 
+    def signal_new_work(self) -> None:
+        """Announce that this run's priority queue changed, unparking the driver.
+
+        Safe to call from a coroutine other than the driver. Level-triggered on
+        purpose: the driver consumes the flag immediately before it reads the
+        queue, so a signal that races the driver's wait is never lost.
+        """
+        self.new_work_event.set()
+
     def reset(self, *, cancel: bool = False) -> None:
         # Ends the current run as far as any parked driver is concerned: it sees
         # the bump on waking and abandons the run.
@@ -145,6 +161,13 @@ class ParallelResolutionContext(EngineScoped):
         # Clear the priority queue when resetting
         # Create a new instance to ensure clean state
         self.node_priority_queue = NodePriorityQueue(self)
+
+        # Unpark a driver sitting in asyncio.wait so it takes its abandon path now,
+        # rather than holding the FSM's single-driver claim until some old node task
+        # finishes. Note the Event object itself is deliberately NOT replaced the way
+        # the priority queue above is: an abandoning driver may still be waiting on a
+        # waiter derived from it, and rebinding would orphan that waiter forever.
+        self.new_work_event.set()
 
         # Clear DAG builder state to allow re-adding nodes on subsequent runs
         if self.dag_builder:
@@ -560,6 +583,15 @@ class ExecuteDagState(State):
             # Set state to workflow complete.
             context.workflow_state = WorkflowState.CANCELED
             return DagCompleteState
+
+        # Consume the new-work flag before reading the queue. Anything signalled from
+        # here on survives into the wait below; anything signalled before here is
+        # honored by the drain that immediately follows, because there is no await
+        # between this clear and that drain. Keeping those two adjacent is what makes
+        # wakeups lossless AND keeps the waiter below from completing instantly on a
+        # stale flag and spinning this loop.
+        context.new_work_event.clear()
+
         # Create tasks only while we have capacity
         while context.running_tasks_count < context.max_nodes_in_parallel:
             # Get next highest priority node
@@ -683,9 +715,22 @@ class ExecuteDagState(State):
                 ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=CurrentDataNodeEvent(node_name=node)))
             )
 
-        # Wait for a task to finish - only if there are tasks running
+        # Wait for a running node to finish, or for work to be injected into this run -
+        # whichever comes first. asyncio.wait snapshots its awaitable set, so without a
+        # waiter on the new-work flag a node injected into a live run could not start
+        # until some already-running node happened to finish.
         if context.task_to_node:
-            done, _ = await asyncio.wait(context.task_to_node.keys(), return_when=asyncio.FIRST_COMPLETED)
+            # The waiter is deliberately kept OUT of task_to_node: everything that walks
+            # that map (the reap below, ErrorState, cancel_all_nodes' gather) treats its
+            # members as node tasks. Cancelling in a finally, rather than on each way out
+            # of on_update, makes every return path below leak-free by construction.
+            wakeup_waiter = asyncio.create_task(context.new_work_event.wait())
+            try:
+                done, _ = await asyncio.wait(
+                    {*context.task_to_node, wakeup_waiter}, return_when=asyncio.FIRST_COMPLETED
+                )
+            finally:
+                wakeup_waiter.cancel()
 
             if context.was_reset_since(generation):
                 # Reaping here would look up tasks the teardown already discarded,
@@ -693,12 +738,17 @@ class ExecuteDagState(State):
                 ExecuteDagState._log_abandoned(context)
                 return None
 
-            # Decrement counter for completed tasks
-            context.running_tasks_count -= len(done)
-            # New node has finished - priorities are stale
-            context.node_priority_queue.mark_priorities_stale()
+            # Membership in task_to_node is the authoritative "is a node task" test, so
+            # filter on it rather than popping everything that came back done.
+            done_node_tasks = [task for task in done if task in context.task_to_node]
+
+            if done_node_tasks:
+                # Decrement counter for completed tasks
+                context.running_tasks_count -= len(done_node_tasks)
+                # New node has finished - priorities are stale
+                context.node_priority_queue.mark_priorities_stale()
             # Check for task exceptions and handle them properly.
-            for task in done:
+            for task in done_node_tasks:
                 dag_node = context.task_to_node.pop(task)
                 if task.cancelled():
                     # Task was cancelled - this is expected during flow cancellation
@@ -730,6 +780,22 @@ class ExecuteDagState(State):
                     return ErrorState
 
                 dag_node.node_state = NodeState.DONE
+        else:
+            # Nothing running and nothing dispatchable, but leaf nodes remain (something
+            # is gating them). Returning ExecuteDagState from here re-enters on_update
+            # through the FSM's advance loop with no suspension point in between, which
+            # would wedge the whole event loop - including the injector that could
+            # unblock us. Yield on the new-work flag so the retry loop is preserved but
+            # the loop keeps turning.
+            logger.warning(
+                "Flow '%s': no nodes are running and none can be dispatched yet; waiting for new work.",
+                context.flow_name,
+            )
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(context.new_work_event.wait(), timeout=_IDLE_RECHECK_SECONDS)
+            if context.was_reset_since(generation):
+                ExecuteDagState._log_abandoned(context)
+                return None
 
         # Once a task has finished, loop back to the top.
         await ExecuteDagState.pop_done_states(context)
@@ -826,6 +892,38 @@ class ParallelResolutionMachine(FSM[ParallelResolutionContext]):
         if self.context.dag_builder is None:
             self.context.dag_builder = self.context.engine.flow_manager.global_dag_builder
         await self.start(ExecuteDagState)
+
+    def inject_node(self, node: BaseNode, graph_name: str | None = None) -> list[BaseNode]:
+        """Add a node and its unresolved dependencies to this already-running run.
+
+        Queues whatever is ready and unparks the driver, so the node starts as soon as a
+        parallel slot frees up instead of waiting for an in-flight node to finish.
+
+        Synchronous on purpose. The driver only sees an injection as one atomic change to
+        its DAG and queue because the caller does its liveness check and this call with no
+        await in between. Do not make this ``async``.
+
+        Returns the nodes added to the DAG, for the caller to report as involved nodes.
+        """
+        context = self.context
+        if context.dag_builder is None:
+            msg = f"Attempted to run '{node.name}' as part of the current run, but that run has no dependency graph to add it to. Cancel the run and try again."
+            raise ValueError(msg)
+
+        added_nodes = context.dag_builder.add_node_with_dependencies(node, graph_name or node.name)
+        if node not in added_nodes:
+            added_nodes.append(node)
+        for added_node in added_nodes:
+            ExecuteDagState._try_queue_waiting_node(context, added_node.name)
+        context.signal_new_work()
+
+        if context.paused:
+            logger.info(
+                "Node '%s' was added to the paused run on flow '%s'. It will run when the run is stepped or continued.",
+                node.name,
+                context.flow_name,
+            )
+        return added_nodes
 
     async def cancel_all_nodes(self) -> None:
         """Cancel all executing tasks and set cancellation flags on all nodes."""
