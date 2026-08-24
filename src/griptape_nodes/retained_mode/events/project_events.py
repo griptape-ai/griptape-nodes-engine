@@ -372,7 +372,13 @@ class GetPathForMacroResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess
     """Path resolved successfully from macro.
 
     Args:
-        resolved_path: The relative project path after macro substitution (e.g., "outputs/file.png")
+        resolved_path: The macro string after substitution (e.g., "outputs/file.png"). Relative
+            when the macro resolves relatively, and absolute when a directory or builtin it
+            references resolves to an absolute path -- the v1 default directories anchor on
+            `{workflow_dir}`, so they resolve absolutely. Do NOT join this onto another root to
+            relocate a file: `Path.__truediv__` discards the left operand when the right side is
+            absolute, so the join silently yields the original path. Use `absolute_path` and
+            re-anchor it against the root you are relocating from.
         absolute_path: The absolute filesystem path (e.g., "/workspace/outputs/file.png")
     """
 
