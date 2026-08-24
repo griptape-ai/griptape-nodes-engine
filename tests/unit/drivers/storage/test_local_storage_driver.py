@@ -363,3 +363,49 @@ class TestSignedDownloadUrlRoundTrip:
 
         assert "?t=1000" in url
         assert "?t=" not in str(parse_static_server_url(url, Path("/workspace")))
+
+
+class TestLocalStorageDriverGetAssetUrl:
+    """Test LocalStorageDriver.get_asset_url() method.
+
+    ``get_asset_url`` must be path-faithful: callers hand in the file's actual,
+    already-resolved location. Re-deriving one from the ``copy_external_file``
+    situation pointed at where a hypothetical NEW import would land instead --
+    for a thumbnail living in ``.griptape-nodes-thumbnails/`` it fabricated
+    ``<workspace>/inputs/<name>``, and resolving ``{inputs}`` logged an
+    "Optional builtin 'workflow_dir'" warning on every read-only request
+    (e.g. once per thumbnail in the File -> Open workflow list).
+    https://github.com/griptape-ai/griptape-nodes-engine/issues/5330
+
+    The only mocking here is the ConfigManager workspace lookup that every
+    driver method shares; the absence of situation/macro mocking is deliberate,
+    because the method must not touch that machinery at all.
+    """
+
+    @pytest.fixture
+    def mock_workspace_path(self) -> Generator[None, None, None]:
+        """Mock ConfigManager to return /workspace for all tests."""
+        with patch("griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes") as mock_griptape:
+            mock_config_manager = Mock()
+            mock_config_manager.workspace_path = Path("/workspace")
+            mock_griptape.ConfigManager.return_value = mock_config_manager
+            yield
+
+    def test_relative_path_keeps_its_directory(
+        self,
+        mock_workspace_path: Any,  # noqa: ARG002
+    ) -> None:
+        """A workspace-relative path resolves in place, not re-derived from the filename."""
+        driver = LocalStorageDriver(Path("/workspace"))
+
+        url = driver.get_asset_url(Path(".griptape-nodes-thumbnails/thumb.png"))
+
+        assert url == str((Path("/workspace") / ".griptape-nodes-thumbnails/thumb.png").resolve())
+
+    def test_absolute_path_is_returned_resolved(self) -> None:
+        """An absolute path passes through untouched apart from normalization."""
+        driver = LocalStorageDriver(Path("/workspace"))
+
+        url = driver.get_asset_url(Path("/elsewhere/media/photo.png"))
+
+        assert url == str(Path("/elsewhere/media/photo.png").resolve())

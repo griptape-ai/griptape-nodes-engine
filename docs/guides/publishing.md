@@ -172,6 +172,24 @@ it guarantees the file travels with the published workflow.
     than an absolute path. That keeps the reference valid after the bundle is
     moved to another machine or deployed to the cloud.
 
+!!! warning "Files outside your project folder don't travel"
+
+    A file reached from outside the folders that travel with the bundle — an
+    external drive or a network mount, whether referenced directly or through a
+    [directory](projects/directories.md) you pointed there — has no place inside
+    the bundle, so it is left where it is. The published workflow still looks for
+    it at that same absolute path, so it runs anywhere that path exists and fails
+    anywhere it doesn't.
+
+    That is what you want for shared storage a render farm already mounts. For a
+    file that should travel, copy it into your project folder and reference the
+    copy.
+
+    Each file left out is recorded in the engine log as
+    `will not be bundled because ...`, along with the reason. If a published
+    workflow can't find a file it needs, that log line is the place to start; see
+    [Exporting engine logs](../troubleshooting.md#exporting-engine-logs).
+
 **When do I need this?** Use `SelectFromProject` for any file loaded from your
 project that doesn't show up in the published bundle — for example an image,
 audio clip, video, or text file that a node reads but that goes missing after you

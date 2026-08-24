@@ -1361,6 +1361,10 @@ class OSManager(EngineScoped):
 
     @staticmethod
     def platform() -> str:
+        """Get `sys.platform` as-is, spellings and all ("win32", "darwin", "linux").
+
+        For a value collapsed onto the platforms we support, use `platform_name()`.
+        """
         return sys.platform
 
     @staticmethod
@@ -1374,6 +1378,23 @@ class OSManager(EngineScoped):
     @staticmethod
     def is_linux() -> bool:
         return os_utils.is_linux()
+
+    @staticmethod
+    def platform_name() -> str:
+        """Get the platform as a `Platform` value, for anything keyed by which OS we are on.
+
+        Unlike `platform()`, this collapses the `sys.platform` spellings onto the three
+        platforms we support -- "win32" reports as "windows", "linux" and "linux2" both as
+        "linux". A platform we do not recognize falls back to `sys.platform`, which is always
+        set, so the result is never empty.
+        """
+        if OSManager.is_windows():
+            return Platform.WINDOWS
+        if OSManager.is_mac():
+            return Platform.DARWIN
+        if OSManager.is_linux():
+            return Platform.LINUX
+        return sys.platform
 
     def replace_process(self, args: list[Any]) -> None:
         """Replace the current process with a new one.
@@ -1442,7 +1463,7 @@ class OSManager(EngineScoped):
         logger.info("Attempting to open path: %s on platform: %s", path, sys.platform)
 
         try:
-            platform_name = sys.platform
+            raw_platform = sys.platform
             if self.is_windows():
                 # Linter complains but this is the recommended way on Windows
                 # We can ignore this warning as we've validated the path
@@ -1484,7 +1505,7 @@ class OSManager(EngineScoped):
                 )
                 logger.info("Opened path on Linux: %s", path)
             else:
-                details = f"Unsupported platform: '{platform_name}'"
+                details = f"Unsupported platform: '{raw_platform}'"
                 logger.info(details)
                 return OpenAssociatedFileResultFailure(
                     failure_reason=FileIOFailureReason.IO_ERROR, result_details=details
@@ -4366,7 +4387,7 @@ class OSManager(EngineScoped):
     def _create_system_os_instance_direct(self) -> None:
         """Create system OS instance (direct version for init)."""
         os_capabilities = {
-            "platform": self._get_platform_name(),
+            "platform": self.platform_name(),
             "arch": self._get_architecture(),
             "version": self._get_platform_version(),
         }
@@ -4453,7 +4474,7 @@ class OSManager(EngineScoped):
     def _create_system_os_instance(self) -> None:
         """Create system OS instance."""
         os_capabilities = {
-            "platform": self._get_platform_name(),
+            "platform": self.platform_name(),
             "arch": self._get_architecture(),
             "version": self._get_platform_version(),
         }
@@ -4584,19 +4605,9 @@ class OSManager(EngineScoped):
         logger.debug("MPS detected: Apple Silicon Mac")
         return True
 
-    def _get_platform_name(self) -> str:
-        """Get platform name using existing sys.platform detection."""
-        if self.is_windows():
-            return Platform.WINDOWS
-        if self.is_mac():
-            return Platform.DARWIN
-        if self.is_linux():
-            return Platform.LINUX
-        return sys.platform
-
     def _get_architecture(self) -> str:
         """Get system architecture, normalized across platforms."""
-        platform = self._get_platform_name()
+        platform = self.platform_name()
         if platform == Platform.WINDOWS:
             arch = os.environ.get("PROCESSOR_ARCHITECTURE", "unknown").lower()
         else:

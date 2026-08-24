@@ -1603,7 +1603,7 @@ class WorkflowManager(EngineScoped):
         return GetWorkflowRunCommandResultSuccess(
             run_command=run_command,
             workflow_shape=workflow_shape,
-            engine_os=self.engine.os_manager._get_platform_name(),
+            engine_os=self.engine.os_manager.platform_name(),
             result_details=ResultDetails(message=f"Run command: {run_command}", level=logging.DEBUG),
         )
 
