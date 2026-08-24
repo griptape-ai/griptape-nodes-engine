@@ -150,8 +150,6 @@ Griptape Nodes uses [uv](https://docs.astral.sh/uv/) to build the virtual enviro
 
 Those instructions leave your `PATH` alone. Installing Griptape Nodes put uv's executable directory (`~/.local/bin`, or `%USERPROFILE%\.local\bin` on Windows) on it, so once uv is gone you can drop that entry too: on macOS and Linux delete the line uv added to your shell profile, and on Windows remove it under **Settings → System → About → Advanced system settings → Environment Variables**.
 
-If you never had uv before installing Griptape Nodes, the install script's private copy of it is already gone with the data directory, but uv's cache is not. Delete `~/.cache/uv` (`%LOCALAPPDATA%\uv\cache` on Windows) by hand.
-
 ## Reinstalling
 
 Nothing here blocks a future install. To come back, follow [Installing Griptape Nodes](installation.md) again. If you kept your workspace, point the new install at it and your projects and workflows are waiting where you left them.
