@@ -11,17 +11,6 @@ Then finish with [What's left behind](#whats-left-behind).
 
     Nothing an uninstaller does touches your workspace directory, so your projects, workflows, and generated assets survive. That also means they are still there after you think you're done. Copy anything you want to keep somewhere safe *before* you get to [Remove your workspace](#remove-your-workspace).
 
-## Before you start
-
-1. **Quit Griptape Nodes.** In the desktop application, quit the app and let it stop the engine. If you run the engine in a terminal, stop it with Ctrl+C. Uninstalling while the engine is running can leave files locked, which is a common cause of a half-finished uninstall on Windows.
-
-1. **Write down your workspace directory.** You'll want it later, and the tools that can tell you where it is are about to be removed.
-
-    - Desktop application: open **App Settings** and read **Workspace Directory** under [Workspace & Libraries](guides/desktop/app_settings.md#workspace-libraries).
-    - Manual install: run `gtn config show workspace_directory`.
-
-1. **Export your logs if you plan to file a bug.** Uninstalling deletes them. See [Exporting engine logs](troubleshooting.md#exporting-engine-logs).
-
 ## Griptape Nodes Desktop
 
 The application bundles the engine and manages the engine's directories inside its own data folder.
@@ -32,7 +21,7 @@ The application bundles the engine and manages the engine's directories inside i
 1. Open **Applications** in Finder and drag **Griptape Nodes** to the Trash.
 1. Empty the Trash.
 
-That's the application and the engine inside it. Its data folder stays behind — see [Remove the application's data](#remove-the-applications-data-macos-and-linux).
+This does not remove the data folder -- see [Remove the application's data](#remove-the-applications-data-macos-and-linux).
 
 ### Windows
 
@@ -47,7 +36,7 @@ The Windows uninstaller cleans up more than the other platforms do. It removes:
 - The **Installed apps** entry itself.
 - Both of the application's data folders, `%APPDATA%\Griptape Nodes` and `%LOCALAPPDATA%\Griptape Nodes`. Griptape Nodes hooks into the uninstaller to delete these for you, so the app's settings and logs, and everything the engine wrote including your API keys, go with them.
 
-It does not remove your workspace or downloaded models. Skip ahead to [What's left behind](#whats-left-behind).
+Skip ahead to [What's left behind](#whats-left-behind).
 
 ### Linux
 
