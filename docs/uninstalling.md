@@ -9,7 +9,7 @@ Then finish with [What's left behind](#whats-left-behind).
 
 !!! warning "Your workflows are not removed for you"
 
-    Nothing an uninstaller does touches your workspace directory, so your projects, workflows, and generated assets survive. That also means they are still there after you think you're done. Copy anything you want to keep somewhere safe *before* you get to [Remove your workspace](#remove-your-workspace).
+    No uninstaller touches your workspace directory, so your projects, workflows, and generated assets stay on disk until you delete them yourself. Copy anything you want to keep somewhere safe *before* you get to [Remove your workspace](#remove-your-workspace).
 
 ## Griptape Nodes Desktop
 
@@ -21,7 +21,7 @@ The application bundles the engine and manages the engine's directories inside i
 1. Open **Applications** in Finder and drag **Griptape Nodes** to the Trash.
 1. Empty the Trash.
 
-This does not remove the data folder -- see [Remove the application's data](#remove-the-applications-data-macos-and-linux).
+This leaves the data folder in place. See [Remove the application's data](#remove-the-applications-data-macos-and-linux).
 
 ### Windows
 
@@ -29,14 +29,14 @@ This does not remove the data folder -- see [Remove the application's data](#rem
 1. Open **Settings → Apps → Installed apps**.
 1. Find **Griptape Nodes**, open its **...** menu, and choose **Uninstall**.
 
-The Windows uninstaller cleans up more than the other platforms do. It removes:
+The Windows uninstaller removes:
 
 - The application, from `%LOCALAPPDATA%\ai.griptape.nodes.desktop`, including any downloaded update packages kept alongside it.
 - Start menu and desktop shortcuts.
-- The **Installed apps** entry itself.
-- Both of the application's data folders, `%APPDATA%\Griptape Nodes` and `%LOCALAPPDATA%\Griptape Nodes`. Griptape Nodes hooks into the uninstaller to delete these for you, so the app's settings and logs, and everything the engine wrote including your API keys, go with them.
+- The **Installed apps** entry.
+- Both of the application's data folders, `%APPDATA%\Griptape Nodes` and `%LOCALAPPDATA%\Griptape Nodes`. That covers the app's settings and logs plus everything the engine wrote, including your API keys.
 
-Skip ahead to [What's left behind](#whats-left-behind).
+Continue with [What's left behind](#whats-left-behind).
 
 ### Linux
 
@@ -44,13 +44,13 @@ Griptape Nodes Desktop ships as an AppImage: a single file that isn't installed 
 
 1. Quit Griptape Nodes.
 1. Delete the `.AppImage` file you downloaded.
-1. If you registered the AppImage with a helper such as AppImageLauncher, remove it through that tool instead, so it also removes the launcher entry it created under `~/.local/share/applications`.
+1. If you registered the AppImage with a helper such as AppImageLauncher, remove it through that tool instead so the launcher entry under `~/.local/share/applications` goes with it.
 
 Then continue with [Remove the application's data](#remove-the-applications-data-macos-and-linux).
 
 ### Remove the application's data (macOS and Linux)
 
-On macOS and Linux, deleting the application leaves its data behind. Delete these folders to finish the job. (On Windows the uninstaller already removed the equivalents.)
+On macOS and Linux, deleting the application leaves its data behind. Delete these folders too. On Windows the uninstaller already removed the equivalents.
 
 | What                       | macOS                                                 | Linux                           |
 | -------------------------- | ----------------------------------------------------- | ------------------------------- |
@@ -58,13 +58,13 @@ On macOS and Linux, deleting the application leaves its data behind. Delete thes
 | Log files                  | `~/Library/Logs/Griptape Nodes`                       | `~/.config/Griptape Nodes/logs` |
 | Downloaded update packages | `~/Library/Caches/velopack/ai.griptape.nodes.desktop` | —                               |
 
-The application data folder is the big one. It holds app settings, your sign-in session, any license keys you activated, and the files the engine wrote: `griptape_nodes_config.json`, the `.env` file with your API keys and other secrets, agent conversation threads, model download records, and the ffmpeg binaries the engine downloads for video previews. Your node libraries are not in here: they live in your workspace, which is [handled separately](#remove-your-workspace). On Linux, updates are staged in a temporary directory rather than a folder of the app's own, so there is nothing to clean up there.
+The application data folder holds app settings, your sign-in session, any license keys you activated, and the files the engine wrote: `griptape_nodes_config.json`, the `.env` file with your API keys and other secrets, agent conversation threads, model download records, and the ffmpeg binaries the engine downloads for video previews. Your node libraries are not in here; they live in your workspace, which is [handled separately](#remove-your-workspace). On Linux, updates are staged in a temporary directory, so there is nothing to clean up there.
 
 !!! tip "Find the exact path from inside the app"
 
     Before you uninstall, open **App Settings** and scroll to [App Data Locations](guides/desktop/app_settings.md#app-data-locations). It shows the application data folder for your machine, with an **Open** button to reveal it in Finder or your file manager. Log files and update packages aren't listed there, so use the table above for those.
 
-Once those are gone, continue with [What's left behind](#whats-left-behind).
+Then continue with [What's left behind](#whats-left-behind).
 
 ## Manual engine install
 
@@ -79,13 +79,13 @@ Press Enter when it prints `When done, press Enter to exit.` so it can finish re
 - The engine's **configuration** and **data** directories, `~/.config/griptape_nodes` and `~/.local/share/griptape_nodes`, including the `.env` file with your API keys and other secrets.
 - The `griptape-nodes` and `gtn` commands, by running `uv tool uninstall griptape-nodes`.
 
-If it prints a **Caveats** section, read it. It lists configuration files it deliberately left alone, which are the ones inside your workspace and project folders, along with anything it couldn't delete and you should remove by hand.
+If it prints a **Caveats** section, read it. It lists the configuration files it left alone, the ones inside your workspace and project folders, along with anything it couldn't delete and you should remove by hand.
 
 !!! note "Where those folders are on Windows"
 
-    The engine uses the same layout on every platform, so on Windows the two folders are `%USERPROFILE%\.config\griptape_nodes` and `%USERPROFILE%\.local\share\griptape_nodes` — under your home folder, not in `AppData`.
+    The engine uses the same layout on every platform, so on Windows the two folders are `%USERPROFILE%\.config\griptape_nodes` and `%USERPROFILE%\.local\share\griptape_nodes`. Both sit under your home folder, not in `AppData`.
 
-If `gtn` won't run anymore, which happens when a previous uninstall left a broken virtual environment behind, do the same work by hand:
+If `gtn` no longer runs, usually because a previous uninstall left a broken virtual environment behind, do the same work by hand:
 
 ```bash
 uv tool uninstall griptape-nodes
@@ -106,18 +106,18 @@ Then continue with [What's left behind](#whats-left-behind).
 
 ### Remove your workspace
 
-Your [workspace directory](guides/projects/workspace.md) is where your work lives, so it is never deleted automatically. It defaults to:
+Your [workspace directory](guides/projects/workspace.md) holds your projects, workflows, generated assets, and node libraries, and is never deleted automatically. It defaults to:
 
 - `Documents/GriptapeNodes` if you used the desktop application.
 - A `GriptapeNodes` folder inside whichever directory you first ran `gtn` from, if you installed the engine yourself.
 
-Either way you may have pointed it somewhere else, which is why it's worth [noting the path before you uninstall](#before-you-start).
+You may have pointed it somewhere else, so note the path before you uninstall.
 
 Copy out anything you want to keep, then delete the folder.
 
 ### Remove downloaded models
 
-Models that nodes pull from the Hugging Face Hub go into the shared Hugging Face cache, not into anything Griptape Nodes owns.
+Models that nodes pull from the Hugging Face Hub go into the shared Hugging Face cache, not into a Griptape Nodes directory.
 
 | Platform      | Path                                   |
 | ------------- | -------------------------------------- |
@@ -135,10 +135,10 @@ You can also do this from the editor's **Model Management** window while Griptap
 
 ### Remove uv
 
-Griptape Nodes uses [uv](https://docs.astral.sh/uv/) to build the virtual environments for node libraries, so uv keeps caches and Python interpreters of its own. If uv is on your machine only because you installed Griptape Nodes, follow uv's [uninstallation instructions](https://docs.astral.sh/uv/getting-started/installation/#uninstallation) to remove those along with uv itself.
+Griptape Nodes uses [uv](https://docs.astral.sh/uv/) to build the virtual environments for node libraries, and uv keeps caches and Python interpreters of its own. If uv is on your machine only because you installed Griptape Nodes, follow uv's [uninstallation instructions](https://docs.astral.sh/uv/getting-started/installation/#uninstallation) to remove those along with uv itself.
 
-Those instructions leave your `PATH` alone. Installing Griptape Nodes put uv's executable directory (`~/.local/bin`, or `%USERPROFILE%\.local\bin` on Windows) on it, so once uv is gone you can drop that entry too: on macOS and Linux delete the line uv added to your shell profile, and on Windows remove it under **Settings → System → About → Advanced system settings → Environment Variables**.
+Those instructions leave your `PATH` alone. uv's installer added its executable directory (`~/.local/bin`, or `%USERPROFILE%\.local\bin` on Windows) to it, so once uv is gone you can drop that entry: on macOS and Linux delete the line uv added to your shell profile, and on Windows remove it under **Settings → System → About → Advanced system settings → Environment Variables**.
 
 ## Reinstalling
 
-Nothing here blocks a future install. To come back, follow [Installing Griptape Nodes](installation.md) again. If you kept your workspace, point the new install at it and your projects and workflows are waiting where you left them.
+To come back, follow [Installing Griptape Nodes](installation.md) again. If you kept your workspace, point the new install at it and your projects and workflows are where you left them.

@@ -137,4 +137,4 @@ Organization admins looking to issue and manage license keys should start with t
 
 Next, on to learning how to actually work inside Griptape Nodes! [Begin](tutorials/index.md)
 
-Need to go the other way? See [Uninstalling Griptape Nodes](uninstalling.md).
+To remove Griptape Nodes, see [Uninstalling Griptape Nodes](uninstalling.md).
