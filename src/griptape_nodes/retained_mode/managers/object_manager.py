@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 import logging
 import re
 from re import Pattern
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from griptape_nodes.exe_types.core_types import (
     BaseNodeElement,
@@ -28,7 +30,10 @@ from griptape_nodes.retained_mode.events.object_events import (
 from griptape_nodes.retained_mode.events.parameter_events import (
     RemoveParameterFromNodeRequest,
 )
-from griptape_nodes.retained_mode.managers.event_manager import EventManager
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.managers.event_manager import EventManager
+    from griptape_nodes.retained_mode.managers.undo import UndoManager
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -46,13 +51,28 @@ class ObjectManager(EngineScoped):
             request_type=ClearAllObjectStateRequest, callback=self.on_clear_all_object_state_request
         )
 
+    def register_undo_policy(self, undo_manager: UndoManager) -> None:
+        """Declare the object domain's undo policy: which of its requests a snapshot can capture.
+
+        Renaming reaches the flow's contents (a node's name is part of the snapshot), so it is a
+        snapshot point. Clearing all object state is not: it replaces the whole object graph, which
+        the undo system treats as a history-invalidating lifecycle event instead of an edit.
+        Called from GriptapeNodes wiring after construction; isolated unit tests that build an
+        ObjectManager directly simply skip it.
+        """
+        undo_manager.register_undoable({RenameObjectRequest: "Rename"})
+
     def on_rename_object_request(self, request: RenameObjectRequest) -> ResultPayload:
         # Does the source object exist?
         if request.object_name == request.requested_name:
-            return RenameObjectResultSuccess(
+            unchanged = RenameObjectResultSuccess(
                 final_name=request.requested_name,
                 result_details=f"Object '{request.requested_name}' already has the requested name",
             )
+            # Nothing changed, so this is not an edit: it must not dirty the workflow or consume an
+            # undo slot that would replay as a no-op.
+            unchanged.altered_workflow_state = False
+            return unchanged
         source_obj = self.attempt_get_object_by_name(request.object_name)
         if source_obj is None:
             details = f"Attempted to rename object '{request.object_name}', but no object of that name could be found."

@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from griptape_nodes.node_library.library_registry import LibrarySchema
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
+    from griptape_nodes.retained_mode.managers.undo import UndoManager
     from griptape_nodes.retained_mode.managers.worker_manager import WorkerManager
     from griptape_nodes.retained_mode.managers.workflow_manager import WorkflowManager
 from griptape_nodes.exe_types.base_iterative_nodes import (
@@ -409,6 +410,39 @@ class NodeManager(EngineScoped):
         )
         event_manager.assign_manager_to_request_type(ExecuteNodeRequest, self.on_execute_node_request)
         event_manager.assign_manager_to_request_type(CancelExecuteNodeRequest, self.on_cancel_execute_node_request)
+
+    def register_undo_policy(self, undo_manager: UndoManager) -> None:
+        """Declare the node domain's undo policy: which of its requests a snapshot can capture.
+
+        Declaring is opt-in because the snapshot strategy models only flow contents (nodes,
+        connections, parameter values, metadata, locks); an undeclared request is never a snapshot
+        point, so it costs no capture and cannot commit a batch that would revert nothing.
+        Execution/runtime requests are therefore omitted deliberately: running or unresolving a node
+        is not a workflow edit. So are moves between flows (including into and out of node groups):
+        a snapshot records only the top-level flow's direct contents, so undoing one would recreate
+        the moved node alongside the original rather than move it back. So are parameter *structure*
+        edits (adding, removing, renaming, reordering, or altering a parameter or group): restore
+        reconciles a survivor node's values, metadata, lock, and connections, not the set of
+        parameters it carries, so declaring them would report a successful undo that changed nothing.
+        ``tests/unit/retained_mode/managers/test_undo_policy.py`` guards this list. Called from
+        GriptapeNodes wiring after construction; isolated unit tests that build a NodeManager
+        directly simply skip it.
+        """
+        undo_manager.register_undoable(
+            {
+                CreateNodeRequest: "Create node",
+                DeleteNodeRequest: "Delete node",
+                SetParameterValueRequest: "Change value",
+                # Node metadata is dominated by position, so these name the gesture that produces
+                # it. A style or annotation change goes through the same request and reads as a move.
+                SetNodeMetadataRequest: "Move node",
+                BatchSetNodeMetadataRequest: "Move nodes",
+                ResetNodeToDefaultsRequest: "Reset node",
+                DuplicateSelectedNodesRequest: "Duplicate nodes",
+                DeserializeNodeFromCommandsRequest: "Paste node",
+                DeserializeSelectedNodesFromCommandsRequest: "Paste nodes",
+            }
+        )
 
     def handle_node_rename(self, old_name: str, new_name: str) -> None:
         # Get the node itself
