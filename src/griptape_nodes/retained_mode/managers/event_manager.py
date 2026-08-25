@@ -1118,12 +1118,19 @@ class EventManager(EngineScoped):
                 context=result_context,
             )
 
+        # Let the UndoManager observe the dispatch so user-initiated mutations can be recorded
+        # (or invalidate history when they cannot be).
+        undo_manager = self.engine.undo_manager
+        undo_capture = undo_manager.begin_request_dispatch(request, result_context.get("request_id"))
+        dispatched_result: ResultPayload | None = None
+
         # Expose the dispatching request type to detectors (see current_request_type).
         token = _active_request_type.set(request_type)
         try:
             try:
                 # Actually make the handler callback (support both sync and async):
                 result_payload: ResultPayload = await call_function(callback, request)
+                dispatched_result = result_payload
 
                 # Queue flush request for async context (unless result type should skip flush)
                 with operation_depth_mgr:
@@ -1139,6 +1146,9 @@ class EventManager(EngineScoped):
                 context=result_context,
             )
         finally:
+            # Runs after _handle_request_core so the result's altered_workflow_state has been
+            # squelch-adjusted. A None result means the callback raised.
+            undo_manager.end_request_dispatch(undo_capture, request, dispatched_result)
             _active_request_type.reset(token)
 
     def handle_request(
@@ -1176,11 +1186,18 @@ class EventManager(EngineScoped):
                 context=result_context,
             )
 
+        # Let the UndoManager observe the dispatch so user-initiated mutations can be recorded
+        # (or invalidate history when they cannot be).
+        undo_manager = self.engine.undo_manager
+        undo_capture = undo_manager.begin_request_dispatch(request, result_context.get("request_id"))
+        dispatched_result: ResultPayload | None = None
+
         # Expose the dispatching request type to detectors (see current_request_type).
         token = _active_request_type.set(request_type)
         try:
             try:
                 result_payload = self._invoke_handler_from_sync(callback, request)
+                dispatched_result = result_payload
 
                 # Queue flush request for sync context (unless result type should skip flush)
                 with operation_depth_mgr:
@@ -1196,6 +1213,9 @@ class EventManager(EngineScoped):
                 context=result_context,
             )
         finally:
+            # Runs after _handle_request_core so the result's altered_workflow_state has been
+            # squelch-adjusted. A None result means the callback raised.
+            undo_manager.end_request_dispatch(undo_capture, request, dispatched_result)
             _active_request_type.reset(token)
 
     def _invoke_handler_from_sync(self, callback: Callable, request: RequestPayload) -> ResultPayload:

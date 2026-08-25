@@ -81,6 +81,7 @@ if TYPE_CHECKING:
         StaticFilesManager,
     )
     from griptape_nodes.retained_mode.managers.sync_manager import SyncManager
+    from griptape_nodes.retained_mode.managers.undo import UndoManager
     from griptape_nodes.retained_mode.managers.user_manager import UserManager
     from griptape_nodes.retained_mode.managers.variable_manager import (
         VariablesManager,
@@ -170,6 +171,7 @@ class Engine:
     _artifact_manager: ArtifactManager
     _manifest_manager: ManifestManager
     _worker_manager: WorkerManager
+    _undo_manager: UndoManager
 
     def __init__(self) -> None:  # noqa: PLR0915
         from griptape_nodes.retained_mode.managers.access_manager import AccessManager
@@ -201,6 +203,7 @@ class Engine:
             StaticFilesManager,
         )
         from griptape_nodes.retained_mode.managers.sync_manager import SyncManager
+        from griptape_nodes.retained_mode.managers.undo import UndoManager
         from griptape_nodes.retained_mode.managers.user_manager import UserManager
         from griptape_nodes.retained_mode.managers.variable_manager import (
             VariablesManager,
@@ -214,6 +217,8 @@ class Engine:
         )
 
         self._event_manager = EventManager(engine=self)
+        # Created early so domain managers can register their undo policy below.
+        self._undo_manager = UndoManager(self._event_manager, engine=self)
         self._resource_manager = ResourceManager(self._event_manager)
         self._config_manager = ConfigManager(self._event_manager, engine=self)
         self._os_manager = OSManager(self._event_manager, engine=self)
@@ -362,6 +367,10 @@ class Engine:
     def worker_manager(self) -> WorkerManager:
         return self._worker_manager
 
+    @property
+    def undo_manager(self) -> UndoManager:
+        return self._undo_manager
+
     # Node libraries and saved workflows do `app = GriptapeNodes()` and then call these
     # PascalCase accessors on the result. `GriptapeNodes()` hands back an `Engine`, so
     # the compat surface has to live here. Engine-internal code uses the snake_case
@@ -450,6 +459,9 @@ class Engine:
 
     def WorkerManager(self) -> WorkerManager:
         return self._worker_manager
+
+    def UndoManager(self) -> UndoManager:
+        return self._undo_manager
 
     def get_instance(self) -> Engine:
         """Back-compat for callers that reach for the instance through an instance."""
