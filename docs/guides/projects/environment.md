@@ -57,13 +57,13 @@ Prefer the `{NAME}` form for all new projects — it composes cleanly, expands c
 
 Builtin variables are automatically available in all macros. You do not define them — the system provides their values at runtime. They cannot be overridden.
 
-| Variable           | Type      | Description                                                                                                                                                                  |
-| ------------------ | --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `project_dir`      | directory | Absolute path to the project base directory (the folder containing `griptape-nodes-project.yml`, or the workspace directory when no project file is present)                 |
-| `workspace_dir`    | directory | Absolute path to the workspace directory (defaults to the project directory when no explicit workspace is configured; see [Workspace](workspace.md#config-resolution-order)) |
-| `workflow_name`    | string    | Name of the currently running workflow                                                                                                                                       |
-| `workflow_dir`     | directory | Absolute path to the directory containing the current workflow file                                                                                                          |
-| `static_files_dir` | string    | Name of the static files subdirectory (from settings, defaults to `staticfiles`)                                                                                             |
+| Variable           | Type      | Description                                                                                                                                                                       |
+| ------------------ | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `project_dir`      | directory | Absolute path to the project base directory (the folder containing `griptape-nodes-project.yml`, or the workspace directory when no project file is present)                      |
+| `workspace_dir`    | directory | Absolute path to the workspace directory (defaults to the project directory when no explicit workspace is configured; see [Workspace](workspace.md#config-resolution-order))      |
+| `workflow_name`    | string    | Name of the currently running workflow                                                                                                                                            |
+| `workflow_dir`     | directory | Absolute path to the directory containing the current workflow file, or — for a workflow that has not been saved yet — the folder it was created in, when the editor supplied one |
+| `static_files_dir` | string    | Name of the static files subdirectory (from settings, defaults to `staticfiles`)                                                                                                  |
 
 ### How builtins are resolved
 
@@ -83,7 +83,15 @@ The `save_static_file` situation uses `workflow_dir` and `static_files_dir`:
 {workflow_dir?:/}{static_files_dir}/{file_name_base}.{file_extension}
 ```
 
-If `workflow_dir` is available, the static files go into a subdirectory of the workflow folder. If not (the workflow hasn't been saved yet), the `{workflow_dir?:/}` block is omitted.
+If `workflow_dir` is available, the static files go into a subdirectory of the workflow folder. If not, the `{workflow_dir?:/}` block is omitted and the path becomes workspace-relative.
+
+### Unsaved workflows
+
+A workflow that has never been saved has no file, so there is no directory to derive `workflow_dir` from. When you create a workflow while browsing a folder, the editor tells the engine which folder that was, and `workflow_dir` answers with it until the workflow is saved. Files you generate before the first save land in that folder rather than at the workspace root.
+
+Once the workflow is saved, `workflow_dir` switches to the directory of the saved file — which may be somewhere else, if you saved it to a different folder. Files written before that point stay where they were written.
+
+If the editor did not supply a folder, `workflow_dir` stays unavailable until the first save, and `{workflow_dir?:/}` is omitted as described above.
 
 ## Variable priority
 

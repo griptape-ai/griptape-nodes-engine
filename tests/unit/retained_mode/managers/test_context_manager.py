@@ -1,6 +1,7 @@
 """Tests for ContextManager.push_workflow."""
 
 import ast
+import logging
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -10,6 +11,11 @@ import pytest
 
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowRegistry
 from griptape_nodes.retained_mode.engine import Engine
+from griptape_nodes.retained_mode.events.context_events import (
+    SetWorkflowContextFailure,
+    SetWorkflowContextRequest,
+    SetWorkflowContextSuccess,
+)
 
 
 class TestPushWorkflow:
@@ -194,6 +200,242 @@ class TestPushWorkflow:
         assert "." not in result
 
         context_manager.pop_workflow()
+
+
+class TestWorkflowWorkingDirectory:
+    """Tests for the folder an unsaved workflow belongs to.
+
+    A workflow that has never been saved has no file, so `{workflow_dir}` -- and every project
+    directory built on it -- has nothing to anchor to and degrades to a workspace-relative
+    path. Files generated before the first save land at the workspace root rather than in the
+    folder the user created the workflow in. `working_directory` is what the caller passes so
+    the engine can answer with the intended folder in the meantime.
+    """
+
+    def _resolve_outputs(self, griptape_nodes: Engine) -> Path:
+        """Resolve `{workflow_dir?:/}outputs/img.png` the way a saving node would."""
+        from griptape_nodes.common.macro_parser import ParsedMacro
+        from griptape_nodes.retained_mode.events.project_events import (
+            GetPathForMacroRequest,
+            GetPathForMacroResultSuccess,
+        )
+
+        result = griptape_nodes.handle_request(
+            GetPathForMacroRequest(parsed_macro=ParsedMacro("{workflow_dir?:/}outputs/img.png"), variables={})
+        )
+        assert isinstance(result, GetPathForMacroResultSuccess)
+        return result.absolute_path
+
+    def test_unsaved_workflow_outputs_land_in_the_supplied_folder(self, griptape_nodes: Engine) -> None:
+        """The whole point: an unsaved workflow's outputs resolve under the folder it was created in."""
+        context_manager = griptape_nodes.ContextManager()
+        config_manager = griptape_nodes.ConfigManager()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            browsed = workspace / "shots" / "sh010"
+            browsed.mkdir(parents=True)
+            original = config_manager.workspace_path
+            config_manager.workspace_path = workspace
+            try:
+                result = griptape_nodes.handle_request(
+                    SetWorkflowContextRequest(display_name="Untitled", working_directory=str(browsed))
+                )
+                assert isinstance(result, SetWorkflowContextSuccess)
+                # The folder is NOT the registry key: the workflow is still unsaved.
+                assert result.workflow_name.startswith(WorkflowRegistry.UNSAVED_KEY_PREFIX)
+                assert context_manager.get_current_workflow_file_path() is None
+
+                assert self._resolve_outputs(griptape_nodes) == browsed / "outputs" / "img.png"
+            finally:
+                config_manager.workspace_path = original
+                while context_manager.has_current_workflow():
+                    context_manager.pop_workflow()
+
+    def test_omitting_the_folder_keeps_the_workspace_root_fallback(self, griptape_nodes: Engine) -> None:
+        """The field is optional, so the pre-existing behavior has to survive untouched.
+
+        Only one of the places the editor creates a workflow has a folder to offer; the others
+        pass a display name and nothing else.
+        """
+        context_manager = griptape_nodes.ContextManager()
+        config_manager = griptape_nodes.ConfigManager()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            original = config_manager.workspace_path
+            config_manager.workspace_path = workspace
+            try:
+                result = griptape_nodes.handle_request(SetWorkflowContextRequest(display_name="Untitled"))
+                assert isinstance(result, SetWorkflowContextSuccess)
+                assert context_manager.get_current_workflow_working_directory() is None
+
+                assert self._resolve_outputs(griptape_nodes) == workspace / "outputs" / "img.png"
+            finally:
+                config_manager.workspace_path = original
+                while context_manager.has_current_workflow():
+                    context_manager.pop_workflow()
+
+    def test_relative_folder_is_anchored_to_the_workspace(self, griptape_nodes: Engine) -> None:
+        """A relative folder resolves against the workspace, not the process working directory.
+
+        The path a caller holds is often built from the project base directory, which sits a
+        level above the workspace that macro resolution is relative to, so the value is
+        normalized on the way in rather than being trusted as-is.
+        """
+        context_manager = griptape_nodes.ContextManager()
+        config_manager = griptape_nodes.ConfigManager()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir).resolve()
+            original = config_manager.workspace_path
+            config_manager.workspace_path = workspace
+            try:
+                result = griptape_nodes.handle_request(
+                    SetWorkflowContextRequest(display_name="Untitled", working_directory="shots/sh020")
+                )
+                assert isinstance(result, SetWorkflowContextSuccess)
+
+                expected = workspace / "shots" / "sh020"
+                assert context_manager.get_current_workflow_working_directory() == str(expected)
+                assert self._resolve_outputs(griptape_nodes) == expected / "outputs" / "img.png"
+            finally:
+                config_manager.workspace_path = original
+                while context_manager.has_current_workflow():
+                    context_manager.pop_workflow()
+
+    def test_saved_location_wins_over_the_supplied_folder(self, griptape_nodes: Engine) -> None:
+        """Saving elsewhere repoints `{workflow_dir}`; the creation folder does not linger.
+
+        The folder is only an answer for a workflow with no file of its own. Once there is a
+        file -- and the user may well have saved it somewhere other than where they started --
+        that file's own directory is the better answer.
+        """
+        context_manager = griptape_nodes.ContextManager()
+        config_manager = griptape_nodes.ConfigManager()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            browsed = workspace / "shots" / "sh010"
+            browsed.mkdir(parents=True)
+            original = config_manager.workspace_path
+            config_manager.workspace_path = workspace
+            try:
+                result = griptape_nodes.handle_request(
+                    SetWorkflowContextRequest(display_name="Untitled", working_directory=str(browsed))
+                )
+                assert isinstance(result, SetWorkflowContextSuccess)
+                assert self._resolve_outputs(griptape_nodes) == browsed / "outputs" / "img.png"
+
+                # What the save path does once the workflow gets a file.
+                saved_to = workspace / "elsewhere" / "my_flow.py"
+                context_manager.set_current_workflow_file_path(str(saved_to))
+
+                assert self._resolve_outputs(griptape_nodes) == saved_to.parent / "outputs" / "img.png"
+            finally:
+                config_manager.workspace_path = original
+                while context_manager.has_current_workflow():
+                    context_manager.pop_workflow()
+
+    def test_supplying_a_file_as_the_folder_is_refused(self, griptape_nodes: Engine) -> None:
+        """A file where a folder was meant fails loudly rather than writing beside the file.
+
+        The value becomes the parent of everything the workflow writes, so accepting a file
+        would silently put outputs next to it -- a plausible location, which is exactly what
+        makes it hard to notice.
+        """
+        context_manager = griptape_nodes.ContextManager()
+        config_manager = griptape_nodes.ConfigManager()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            not_a_folder = workspace / "notes.txt"
+            not_a_folder.write_text("not a folder")
+            original = config_manager.workspace_path
+            config_manager.workspace_path = workspace
+            try:
+                result = griptape_nodes.handle_request(
+                    SetWorkflowContextRequest(display_name="Untitled", working_directory=str(not_a_folder))
+                )
+
+                assert isinstance(result, SetWorkflowContextFailure)
+                # Rejected before the context was pushed, so there is nothing to unwind.
+                assert not context_manager.has_current_workflow()
+            finally:
+                config_manager.workspace_path = original
+                while context_manager.has_current_workflow():
+                    context_manager.pop_workflow()
+
+    def test_folder_need_not_exist_yet(self, griptape_nodes: Engine) -> None:
+        """A folder that has not been created yet is accepted.
+
+        Project directories are created on demand at write time, so requiring the folder to
+        exist up front would reject the ordinary case of creating a workflow in a new folder.
+        """
+        context_manager = griptape_nodes.ContextManager()
+        config_manager = griptape_nodes.ConfigManager()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            not_yet = workspace / "shots" / "sh030"
+            original = config_manager.workspace_path
+            config_manager.workspace_path = workspace
+            try:
+                result = griptape_nodes.handle_request(
+                    SetWorkflowContextRequest(display_name="Untitled", working_directory=str(not_yet))
+                )
+
+                assert isinstance(result, SetWorkflowContextSuccess)
+                assert self._resolve_outputs(griptape_nodes) == not_yet / "outputs" / "img.png"
+            finally:
+                config_manager.workspace_path = original
+                while context_manager.has_current_workflow():
+                    context_manager.pop_workflow()
+
+    def test_folder_silences_the_unresolved_workflow_dir_warning(
+        self, griptape_nodes: Engine, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """With a folder to answer with, `{workflow_dir?:/}` no longer degrades.
+
+        The degradation is warned about precisely because the result is a plausible path rather
+        than an obvious error, so the absence of the warning is the signal that nothing was
+        dropped.
+        """
+        context_manager = griptape_nodes.ContextManager()
+        config_manager = griptape_nodes.ConfigManager()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            browsed = workspace / "shots" / "sh010"
+            browsed.mkdir(parents=True)
+            original = config_manager.workspace_path
+            config_manager.workspace_path = workspace
+            try:
+                result = griptape_nodes.handle_request(
+                    SetWorkflowContextRequest(display_name="Untitled", working_directory=str(browsed))
+                )
+                assert isinstance(result, SetWorkflowContextSuccess)
+
+                with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+                    self._resolve_outputs(griptape_nodes)
+
+                dropped = [
+                    r.message
+                    for r in caplog.records
+                    if r.levelno == logging.WARNING and "dropping it from the path" in r.message
+                ]
+                assert dropped == []
+            finally:
+                config_manager.workspace_path = original
+                while context_manager.has_current_workflow():
+                    context_manager.pop_workflow()
+
+    def test_get_working_directory_requires_a_workflow(self, griptape_nodes: Engine) -> None:
+        """Asking outside a workflow context is an error, matching the other context accessors."""
+        context_manager = griptape_nodes.ContextManager()
+
+        with pytest.raises(context_manager.NoActiveWorkflowError):
+            context_manager.get_current_workflow_working_directory()
 
 
 class TestGeneratedWorkflowCode:

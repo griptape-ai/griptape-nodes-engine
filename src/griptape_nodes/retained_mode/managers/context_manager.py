@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from griptape_nodes.exe_types.flow import ControlFlow
@@ -58,9 +59,10 @@ class ContextManager(EngineScoped):
 
         _name: str
         _file_path: str | None
+        _working_directory: str | None
         _flow_stack: list[ContextManager.FlowContextState]
 
-        def __init__(self, name: str, file_path: str | None = None):
+        def __init__(self, name: str, file_path: str | None = None, working_directory: str | None = None):
             self._name = name
             # The path this context was entered WITH, when it was entered by path. Retained
             # because `_name` is a registry key derived against the workspace that was active
@@ -69,6 +71,11 @@ class ContextManager(EngineScoped):
             # Callers that want the workflow's location (see ProjectManager's `workflow_dir`
             # builtin) read this instead of round-tripping through WorkflowRegistry.
             self._file_path = file_path
+            # The folder this workflow belongs to while it has no file of its own: the folder the
+            # user was browsing when they created it. A DIRECTORY, unlike `_file_path`, which is
+            # a file whose PARENT is the directory. Always loses to `_file_path` -- once the
+            # workflow has been saved, the saved file's own location is the better answer.
+            self._working_directory = working_directory
             self._flow_stack = []
 
         def push_flow(self, flow: ControlFlow) -> ControlFlow:
@@ -275,6 +282,25 @@ class ContextManager(EngineScoped):
             msg = f"Attempted to set the Workflow '{request.workflow_name}' as the Current Context. Failed because an existing workflow, '{self.get_current_workflow_name()}', is already in the Current Context. In order to clear the existing workflow and remove all objects and references to it, issue a ClearAllObjectState request."
             return SetWorkflowContextFailure(result_details=msg)
 
+        # Normalized here rather than at read time so `workflow_dir` never has to care whether
+        # the caller sent an absolute path, a workspace-relative one, or one with a `~` in it.
+        working_directory = None
+        if request.working_directory is not None:
+            working_directory = str(
+                canonicalize_for_identity(request.working_directory, base=self.engine.config_manager.workspace_path)
+            )
+            # A file where a folder was meant is the one mistake worth rejecting: the value
+            # becomes the parent of every path the workflow writes, so accepting it would put
+            # outputs beside the file rather than in the folder the caller named -- a plausible
+            # location, which is what makes it hard to notice.
+            existing = Path(working_directory)
+            if existing.exists() and not existing.is_dir():
+                msg = (
+                    f"Attempted to set the folder for a new Workflow to '{request.working_directory}'. "
+                    f"Failed because that path is a file, not a folder."
+                )
+                return SetWorkflowContextFailure(result_details=msg)
+
         # When no workflow_name is supplied, mint a fresh "unsaved:<uuid>" key here so the
         # engine owns the namespace. Callers doing "create a new workflow" should omit the
         # name and read the resolved key off the success result.
@@ -294,7 +320,7 @@ class ContextManager(EngineScoped):
                 )
                 return SetWorkflowContextFailure(result_details=msg)
 
-        self.push_workflow(resolved_name)
+        self.push_workflow(resolved_name, working_directory=working_directory)
         msg = f"Successfully set the Workflow '{resolved_name}' as the Current Context."
         return SetWorkflowContextSuccess(workflow_name=resolved_name, result_details=msg)
 
@@ -333,6 +359,7 @@ class ContextManager(EngineScoped):
                 SetWorkflowContextRequest(
                     workflow_name=request.workflow_name,
                     display_name=request.display_name,
+                    working_directory=request.working_directory,
                 )
             )
             if not isinstance(set_workflow_result, SetWorkflowContextSuccess):
@@ -525,6 +552,29 @@ class ContextManager(EngineScoped):
 
         return self._workflow_stack[-1]._file_path
 
+    def get_current_workflow_working_directory(self) -> str | None:
+        """Get the folder the current Workflow context belongs to, if one was supplied.
+
+        This is the folder a workflow was created in before it had a file of its own -- the
+        folder the caller was browsing at the time. It is a DIRECTORY, whereas
+        `get_current_workflow_file_path` returns a FILE whose parent is the directory.
+
+        Only meaningful while the workflow is unsaved: `workflow_dir` prefers the retained
+        file path whenever there is one, so this stops mattering the moment the workflow is
+        saved. It is deliberately not cleared on save -- the file path simply wins.
+
+        Returns:
+            The absolute directory path, or None when no folder was supplied.
+
+        Raises:
+            NoActiveWorkflowError: If no Workflow context is active.
+        """
+        if not self.has_current_workflow():
+            msg = "No active Workflow context"
+            raise self.NoActiveWorkflowError(msg)
+
+        return self._workflow_stack[-1]._working_directory
+
     def set_current_workflow_name(self, new_name: str) -> None:
         """Update the name of the current Workflow context.
 
@@ -620,7 +670,13 @@ class ContextManager(EngineScoped):
         current_node = current_flow._node_stack[-1]
         return current_node.get_current_element()
 
-    def push_workflow(self, workflow_name: str | None = None, *, file_path: str | None = None) -> str:
+    def push_workflow(
+        self,
+        workflow_name: str | None = None,
+        *,
+        file_path: str | None = None,
+        working_directory: str | None = None,
+    ) -> str:
         """Push a new Workflow context onto the stack.
 
         The workflow's file path is captured here, while the registry key is still valid, and
@@ -633,6 +689,11 @@ class ContextManager(EngineScoped):
             workflow_name: The name of the Workflow to enter. Use this when the registry key is already known.
             file_path: Path to the workflow file. The registry key will be derived from this path,
                 using a workspace-relative path if possible. Mutually exclusive with workflow_name.
+            working_directory: Folder the Workflow belongs to while it has no file of its own,
+                for a workflow that has never been saved. A DIRECTORY, not a file path. Never
+                affects the registry key, and never overrides `file_path`: a workflow that has
+                a file answers with that file's own directory. Expected to be absolute --
+                `on_set_workflow_context_request` normalizes before it reaches here.
 
         Returns:
             The name of the Workflow that was entered.
@@ -669,7 +730,9 @@ class ContextManager(EngineScoped):
             msg = "Either workflow_name or file_path must be provided."
             raise ValueError(msg)
 
-        workflow_context_state = self.WorkflowContextState(resolved_name, file_path=file_path)
+        workflow_context_state = self.WorkflowContextState(
+            resolved_name, file_path=file_path, working_directory=working_directory
+        )
         self._workflow_stack.append(workflow_context_state)
         return resolved_name
 

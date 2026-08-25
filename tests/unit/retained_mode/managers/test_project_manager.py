@@ -340,6 +340,7 @@ class TestProjectManagerMacroHandlers:
         mock_context_manager.has_current_workflow.return_value = True
         mock_context_manager.get_current_workflow_name.return_value = "My Cool Workflow"
         mock_context_manager.get_current_workflow_file_path.return_value = None
+        mock_context_manager.get_current_workflow_working_directory.return_value = None
         project_manager._engine = MagicMock()
         project_manager._engine.context_manager = mock_context_manager
 
@@ -651,6 +652,7 @@ class TestProjectManagerBuiltinVariables:
         mock_context_manager.has_current_workflow.return_value = True
         mock_context_manager.get_current_workflow_name.return_value = "my_workflow"
         mock_context_manager.get_current_workflow_file_path.return_value = None
+        mock_context_manager.get_current_workflow_working_directory.return_value = None
         project_manager_with_template._engine = MagicMock()
         project_manager_with_template._engine.context_manager = mock_context_manager
 
@@ -717,6 +719,7 @@ class TestProjectManagerBuiltinVariables:
         mock_context_manager.has_current_workflow.return_value = True
         mock_context_manager.get_current_workflow_name.return_value = "my_workflow"
         mock_context_manager.get_current_workflow_file_path.return_value = None
+        mock_context_manager.get_current_workflow_working_directory.return_value = None
         project_manager_with_template._engine = MagicMock()
         project_manager_with_template._engine.context_manager = mock_context_manager
 
@@ -788,6 +791,7 @@ class TestProjectManagerBuiltinVariables:
         mock_context_manager.has_current_workflow.return_value = True
         mock_context_manager.get_current_workflow_name.return_value = "workflow_5"
         mock_context_manager.get_current_workflow_file_path.return_value = None
+        mock_context_manager.get_current_workflow_working_directory.return_value = None
         project_manager_with_template._engine = MagicMock()
         project_manager_with_template._engine.context_manager = mock_context_manager
 
@@ -820,6 +824,7 @@ class TestProjectManagerBuiltinVariables:
         mock_context_manager.has_current_workflow.return_value = True
         mock_context_manager.get_current_workflow_name.return_value = "workflow_5"
         mock_context_manager.get_current_workflow_file_path.return_value = None
+        mock_context_manager.get_current_workflow_working_directory.return_value = None
         project_manager_with_template._engine = MagicMock()
         project_manager_with_template._engine.context_manager = mock_context_manager
 
@@ -6723,6 +6728,7 @@ class TestProjectEnvironmentVariableRecursion:
             mock_context.has_current_workflow.return_value = True
             mock_context.get_current_workflow_name.return_value = "my_workflow"
             mock_context.get_current_workflow_file_path.return_value = None
+            mock_context.get_current_workflow_working_directory.return_value = None
             mock_engine.context_manager = mock_context
 
             mock_workflow = Mock()
