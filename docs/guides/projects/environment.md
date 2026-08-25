@@ -89,7 +89,7 @@ If `workflow_dir` is available, the static files go into a subdirectory of the w
 
 A workflow that has never been saved has no file, so there is no directory to derive `workflow_dir` from. When you create a workflow while browsing a folder, the editor tells the engine which folder that was, and `workflow_dir` answers with it until the workflow is saved. Files you generate before the first save land in that folder rather than at the workspace root.
 
-Once the workflow is saved, `workflow_dir` switches to the directory of the saved file — which may be somewhere else, if you saved it to a different folder. Files written before that point stay where they were written.
+Once the workflow is saved, `workflow_dir` switches to the directory of the saved file — which may be somewhere else, if you saved it to a different folder. The files themselves stay where they were written, but any stored references built on `{workflow_dir}` now resolve into the new folder, so outputs generated before the save may appear missing from the node even though the bytes are on disk.
 
 If the editor did not supply a folder, `workflow_dir` stays unavailable until the first save, and `{workflow_dir?:/}` is omitted as described above.
 
