@@ -4711,6 +4711,9 @@ class ProjectManager(EngineScoped):
                 msg = f"Unknown builtin variable: {var_name}"
                 raise ValueError(msg)
 
+        msg = f"Unknown builtin variable: {var_name}"
+        raise ValueError(msg)
+
     def _resolve_workflow_dir(self) -> str:
         """Resolve the `workflow_dir` builtin: the folder the current workflow belongs to.
 
