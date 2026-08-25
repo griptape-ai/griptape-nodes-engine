@@ -418,12 +418,8 @@ class TestWorkflowWorkingDirectory:
                 with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
                     self._resolve_outputs(griptape_nodes)
 
-                dropped = [
-                    r.message
-                    for r in caplog.records
-                    if r.levelno == logging.WARNING and "dropping it from the path" in r.message
-                ]
-                assert dropped == []
+                warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+                assert not warnings, f"Expected no degradation warnings but got: {[r.getMessage() for r in warnings]}"
             finally:
                 config_manager.workspace_path = original
                 while context_manager.has_current_workflow():
