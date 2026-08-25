@@ -270,20 +270,23 @@ class LibraryLoadedNotification(AppPayload):
 @dataclass
 @PayloadRegistry.register
 class WorkflowLoadComplete(AppPayload):
-    """Notification that a workflow file finished executing, successfully or not.
+    """Notification that a requested workflow load has finished, successfully or not.
 
-    A workflow's name is pushed onto the engine's context stack before its file starts
-    executing, so GetWorkflowContext reports that name as the current workflow for the
-    whole duration of the load, even while its nodes are still being built. This event
-    tells a client once the load has actually finished, so it can wait for it instead of
-    treating a name in context as proof the workflow is ready.
+    Broadcast by the load-request handlers (RunWorkflowFromScratch, RunWorkflowWithCurrentState,
+    RunWorkflowFromRegistry) once a load and any cleanup it required have both settled, so a
+    client does not have to poll GetWorkflowContext to learn a load is done. Importing a
+    workflow as a referenced sub flow into an already-open canvas is not a load and never
+    triggers this event.
 
     Args:
-        workflow_name: Name of the workflow that finished loading, or None if the engine
-            has no current workflow when the load completes.
+        relative_file_path: Path of the workflow file that was requested to load, exactly as
+            given to the request, or as registered when the load was requested by workflow name.
+        workflow_name: Name the workflow resolved to once its file executed, or None if the
+            load failed before a workflow name was established.
         successful: Whether the workflow executed without error.
     """
 
+    relative_file_path: str
     workflow_name: str | None
     successful: bool
 
