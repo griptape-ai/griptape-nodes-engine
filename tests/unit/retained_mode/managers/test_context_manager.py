@@ -232,7 +232,7 @@ class TestWorkflowWorkingDirectory:
         config_manager = griptape_nodes.ConfigManager()
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            workspace = Path(tmp_dir)
+            workspace = Path(tmp_dir).resolve()
             browsed = workspace / "shots" / "sh010"
             browsed.mkdir(parents=True)
             original = config_manager.workspace_path
@@ -262,7 +262,7 @@ class TestWorkflowWorkingDirectory:
         config_manager = griptape_nodes.ConfigManager()
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            workspace = Path(tmp_dir)
+            workspace = Path(tmp_dir).resolve()
             original = config_manager.workspace_path
             config_manager.workspace_path = workspace
             try:
@@ -315,7 +315,7 @@ class TestWorkflowWorkingDirectory:
         config_manager = griptape_nodes.ConfigManager()
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            workspace = Path(tmp_dir)
+            workspace = Path(tmp_dir).resolve()
             browsed = workspace / "shots" / "sh010"
             browsed.mkdir(parents=True)
             original = config_manager.workspace_path
@@ -376,7 +376,7 @@ class TestWorkflowWorkingDirectory:
         config_manager = griptape_nodes.ConfigManager()
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            workspace = Path(tmp_dir)
+            workspace = Path(tmp_dir).resolve()
             not_yet = workspace / "shots" / "sh030"
             original = config_manager.workspace_path
             config_manager.workspace_path = workspace
