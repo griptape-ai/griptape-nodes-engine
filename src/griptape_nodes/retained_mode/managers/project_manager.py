@@ -4711,6 +4711,8 @@ class ProjectManager(EngineScoped):
                 msg = f"Unknown builtin variable: {var_name}"
                 raise ValueError(msg)
 
+        # Unreachable at runtime — `case _:` above catches everything. Present so
+        # static analyzers (CodeQL) can prove the function never implicitly returns None.
         msg = f"Unknown builtin variable: {var_name}"
         raise ValueError(msg)
 
