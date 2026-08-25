@@ -33,9 +33,10 @@ class SetWorkflowContextRequest(RequestPayload):
                       of its own yet. `{workflow_dir}` -- and so every project directory
                       built on it, `{outputs}` among them -- answers with this until the
                       workflow is saved, at which point the saved file's own directory takes
-                      over. A DIRECTORY, not a file path. Absolute is preferred; a relative
-                      path is taken as relative to the workspace directory. Optional: when
-                      None, an unsaved workflow has no folder and `{workflow_dir?:/}` keeps
+                      over. A DIRECTORY, not a file path. Absolute paths are recommended;
+                      if you supply a relative path it is anchored to the workspace directory
+                      (not the project base directory, which may sit one level above). Optional:
+                      when None, an unsaved workflow has no folder and `{workflow_dir?:/}` keeps
                       degrading to a workspace-relative path as before.
 
     Results: SetWorkflowContextSuccess (carries the resolved workflow_name) |
