@@ -53,6 +53,7 @@ if TYPE_CHECKING:
         StaticFilesManager,
     )
     from griptape_nodes.retained_mode.managers.sync_manager import SyncManager
+    from griptape_nodes.retained_mode.managers.undo import UndoManager
     from griptape_nodes.retained_mode.managers.user_manager import UserManager
     from griptape_nodes.retained_mode.managers.variable_manager import (
         VariablesManager,
@@ -226,3 +227,7 @@ class GriptapeNodes(metaclass=_EngineRootMeta):
     @classmethod
     def WorkerManager(cls) -> WorkerManager:
         return current_engine().worker_manager
+
+    @classmethod
+    def UndoManager(cls) -> UndoManager:
+        return current_engine().undo_manager
