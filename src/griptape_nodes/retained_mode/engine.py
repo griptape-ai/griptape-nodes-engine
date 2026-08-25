@@ -226,6 +226,10 @@ class Engine:
         self._object_manager = ObjectManager(self._event_manager, engine=self)
         self._node_manager = NodeManager(self._event_manager, engine=self)
         self._flow_manager = FlowManager(self._event_manager, engine=self)
+        # Wire the domain managers' undo policy now that both they and the UndoManager exist.
+        self._object_manager.register_undo_policy(self._undo_manager)
+        self._node_manager.register_undo_policy(self._undo_manager)
+        self._flow_manager.register_undo_policy(self._undo_manager)
         self._context_manager = ContextManager(self._event_manager, engine=self)
         self._worker_manager = WorkerManager(engine=self, event_manager=self._event_manager)
         self._library_manager = LibraryManager(self._event_manager, worker_manager=self._worker_manager, engine=self)

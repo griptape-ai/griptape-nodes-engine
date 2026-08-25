@@ -107,6 +107,7 @@ plugins:
           - guides/editor/index.md: Orientation tour of the visual editor (canvas, header, menus, sidebars)
           - guides/editor/keyboard_shortcuts.md: Complete keyboard shortcut reference
           - guides/editor/working_with_nodes.md: Adding, selecting, wiring, and editing nodes on the canvas
+          - guides/editor/undo_and_redo.md: What undo and redo cover, what they don't, and when history is cleared
           - guides/editor/node_groups.md: Groups, subflows, and iterative group types (ForEach, For Loop, Retry)
           - guides/editor/running_workflows.md: Running, stopping, logs, error history, and saving
           - guides/editor/media_editors.md: Built-in viewers and editors for images, video, audio, 3D, and splats
@@ -279,6 +280,7 @@ nav:
           - Overview: guides/editor/index.md
           - Keyboard Shortcuts: guides/editor/keyboard_shortcuts.md
           - Working with Nodes: guides/editor/working_with_nodes.md
+          - Undo and Redo: guides/editor/undo_and_redo.md
           - Node Groups: guides/editor/node_groups.md
           - Running Workflows: guides/editor/running_workflows.md
           - Media Viewers and Editors: guides/editor/media_editors.md

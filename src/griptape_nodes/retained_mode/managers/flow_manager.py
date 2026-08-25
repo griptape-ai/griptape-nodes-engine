@@ -183,6 +183,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
+    from griptape_nodes.retained_mode.managers.undo import UndoManager
     from griptape_nodes.retained_mode.managers.workflow_manager import WorkflowShapeNodes
     from griptape_nodes.retained_mode.variable_types import FlowVariable
 
@@ -359,6 +360,29 @@ class FlowManager(EngineScoped):
         self._global_single_node_resolution = False
         self._global_dag_builder = DagBuilder(self.engine)
         self._node_executor = NodeExecutor(self.engine)
+
+    def register_undo_policy(self, undo_manager: UndoManager) -> None:
+        """Declare the flow domain's undo policy: which of its requests a snapshot can capture.
+
+        Declaring is opt-in because the snapshot strategy models only flow contents; an undeclared
+        request is never a snapshot point, so it costs no capture and cannot commit a batch that
+        would revert nothing. Execution requests are therefore omitted deliberately: they alter
+        workflow state but undo is about editing, not running.
+        ``tests/unit/retained_mode/managers/test_undo_policy.py`` guards this list. Called from
+        GriptapeNodes wiring after construction; isolated unit tests that build a FlowManager
+        directly simply skip it.
+        """
+        undo_manager.register_undoable(
+            {
+                CreateFlowRequest: "Create flow",
+                DeleteFlowRequest: "Delete flow",
+                SetFlowMetadataRequest: "Change flow properties",
+                AutoLayoutFlowRequest: "Auto-layout",
+                CreateConnectionRequest: "Connect",
+                DeleteConnectionRequest: "Disconnect",
+                DeserializeFlowFromCommandsRequest: "Paste flow",
+            }
+        )
 
     @property
     def global_single_node_resolution(self) -> bool:
