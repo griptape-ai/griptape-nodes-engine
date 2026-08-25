@@ -9,12 +9,17 @@ from unittest.mock import patch
 
 import pytest
 
+from griptape_nodes.common.macro_parser import ParsedMacro
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowRegistry
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.context_events import (
     SetWorkflowContextFailure,
     SetWorkflowContextRequest,
     SetWorkflowContextSuccess,
+)
+from griptape_nodes.retained_mode.events.project_events import (
+    GetPathForMacroRequest,
+    GetPathForMacroResultSuccess,
 )
 
 
@@ -214,12 +219,6 @@ class TestWorkflowWorkingDirectory:
 
     def _resolve_outputs(self, griptape_nodes: Engine) -> Path:
         """Resolve `{workflow_dir?:/}outputs/img.png` the way a saving node would."""
-        from griptape_nodes.common.macro_parser import ParsedMacro
-        from griptape_nodes.retained_mode.events.project_events import (
-            GetPathForMacroRequest,
-            GetPathForMacroResultSuccess,
-        )
-
         result = griptape_nodes.handle_request(
             GetPathForMacroRequest(parsed_macro=ParsedMacro("{workflow_dir?:/}outputs/img.png"), variables={})
         )
