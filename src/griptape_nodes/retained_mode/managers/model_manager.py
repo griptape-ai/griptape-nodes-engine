@@ -903,12 +903,27 @@ class ModelManager(EngineScoped):
             query_info=query_info,
         )
 
-    async def on_app_initialization_complete(self, _payload: AppInitializationComplete) -> None:
+    async def on_app_initialization_complete(self, payload: AppInitializationComplete) -> None:
         """Handle app initialization complete event by downloading configured models and resuming unfinished downloads.
+
+        No-op on a worker. Workers share the orchestrator's config and model status
+        directory, so a worker that downloaded too would duplicate every transfer and
+        write the same status files the orchestrator is writing. Downloads land in the
+        shared cache either way, so a worker still finds the models it needs. Explicit
+        DownloadModelRequest handling is unaffected.
+
+        Worker identity comes from the payload rather than LibraryManager.is_worker
+        because both managers listen for this event and their tasks run concurrently:
+        LibraryManager assigns its flag partway through its own handler, so reading it
+        here would see the default False.
 
         Args:
             payload: The app initialization complete payload
         """
+        if payload.is_worker:
+            logger.debug("Worker process; the orchestrator owns startup model downloads")
+            return
+
         # Get models to download from configuration
         config_manager = self.engine.config_manager
         models_to_download = config_manager.get_config_value(MODELS_TO_DOWNLOAD_KEY, default=[])

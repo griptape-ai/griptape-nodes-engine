@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from griptape_nodes.exe_types.node_types import BaseNode
+from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.base_events import RequestPayload
 from griptape_nodes.retained_mode.events.model_events import (
     DeclareModelInvocationRequest,
@@ -537,3 +538,40 @@ class TestDownloadModelTaskSubprocess:
 
         assert captured_cmd[3] == "download"
         assert "org/model" in captured_cmd
+
+
+class TestAppInitializationCompleteWorkerGuard:
+    """Startup model downloads belong to the orchestrator alone."""
+
+    @pytest.mark.asyncio
+    async def test_worker_skips_startup_downloads(self, model_manager: ModelManager) -> None:
+        """A worker must not scan or resume downloads.
+
+        Every worker shares the orchestrator's status directory. When workers resumed
+        too, they read those files while the orchestrator was writing them, which on
+        Windows surfaces as PermissionError from the writer's exclusive lock and took
+        down the whole AppInitializationComplete broadcast.
+        """
+        with (
+            patch.object(model_manager, "_find_unfinished_downloads") as find_unfinished,
+            patch.object(model_manager, "on_handle_download_model_request") as handle_download,
+        ):
+            await model_manager.on_app_initialization_complete(AppInitializationComplete(is_worker=True))
+
+        find_unfinished.assert_not_called()
+        handle_download.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_orchestrator_resumes_unfinished_downloads(self, model_manager: ModelManager) -> None:
+        """The orchestrator still resumes, so the guard cannot be read as "never resume"."""
+        engine = SimpleNamespace(config_manager=SimpleNamespace(get_config_value=lambda *_args, **_kwargs: []))
+
+        with (
+            patch.object(type(model_manager), "engine", property(lambda _self: engine)),
+            patch.object(model_manager, "_find_unfinished_downloads", return_value=["org/model"]) as find_unfinished,
+            patch.object(model_manager, "on_handle_download_model_request", new_callable=AsyncMock) as handle_download,
+        ):
+            await model_manager.on_app_initialization_complete(AppInitializationComplete(is_worker=False))
+
+        find_unfinished.assert_called_once()
+        assert handle_download.await_args_list[0].args[0].model_id == "org/model"
