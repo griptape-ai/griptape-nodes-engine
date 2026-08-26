@@ -591,23 +591,6 @@ class TestGetWorkflowContextIsLoading:
         assert isinstance(result, GetWorkflowContextSuccess)
         assert result.is_loading is True
 
-    def test_reports_not_loading_for_a_workflow_no_load_entered(self, griptape_nodes: Engine) -> None:
-        """A referenced sub-flow import mid-build must not read as loading the outer workflow.
-
-        The import runs the imported file without entering a load scope, so nothing stamps the
-        open workflow and it keeps reporting itself as loaded.
-        """
-        context_manager = griptape_nodes.ContextManager()
-        context_manager.push_workflow(workflow_name="my_workflow")
-        try:
-            result = context_manager.on_get_workflow_context_request(GetWorkflowContextRequest())
-        finally:
-            context_manager.pop_workflow()
-
-        assert isinstance(result, GetWorkflowContextSuccess)
-        assert result.workflow_name == "my_workflow"
-        assert result.is_loading is False
-
     @pytest.mark.asyncio
     async def test_reports_not_loading_once_the_load_that_entered_the_workflow_finished(
         self, griptape_nodes: Engine
