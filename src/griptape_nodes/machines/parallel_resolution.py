@@ -349,22 +349,15 @@ class ExecuteDagState(State):
             )
             next_node.set_entry_control_parameter(next_parameter)
             # Prepare next node for execution
+            next_node.prepare_to_run_again()
+            # Locked nodes are not becoming the current control node, so they get no event.
             if not next_node.lock:
-                next_node.make_node_unresolved(
-                    current_states_to_trigger_change_event=set(
-                        {
-                            NodeResolutionState.UNRESOLVED,
-                            NodeResolutionState.RESOLVED,
-                            NodeResolutionState.RESOLVING,
-                        }
-                    )
-                )
                 context.engine.event_manager.put_event(
                     ExecutionGriptapeNodeEvent(
                         wrapped_event=ExecutionEvent(payload=CurrentControlNodeEvent(node_name=next_node.name))
                     )
                 )
-            ExecuteDagState._add_and_queue_nodes(context, next_node, network_name)
+            ExecuteDagState.add_and_queue_nodes(context, next_node, network_name)
 
     @staticmethod
     def _emit_involved_nodes_update(context: ParallelResolutionContext) -> None:
@@ -378,17 +371,29 @@ class ExecuteDagState(State):
             )
 
     @staticmethod
-    def _add_and_queue_nodes(context: ParallelResolutionContext, next_node: BaseNode, network_name: str) -> None:
-        """Add nodes to DAG and queue them if ready."""
-        if context.dag_builder is not None:
-            added_nodes = context.dag_builder.add_node_with_dependencies(next_node, network_name)
-            if next_node not in added_nodes:
-                added_nodes.append(next_node)
+    def add_and_queue_nodes(
+        context: ParallelResolutionContext, next_node: BaseNode, network_name: str
+    ) -> list[BaseNode]:
+        """Add a node and its dependencies to the DAG, queueing whatever is ready to run.
 
-            # Queue nodes that are ready for execution
-            if added_nodes:
-                for added_node in added_nodes:
-                    ExecuteDagState._try_queue_waiting_node(context, added_node.name)
+        Public because ``ParallelResolutionMachine.inject_node`` shares it: adding to the DAG
+        and queueing what that pulled in is one invariant, and it must not drift between the
+        control-flow path and the injection path.
+
+        Returns the nodes added to the DAG, for callers that report them as involved nodes.
+        """
+        if context.dag_builder is None:
+            return []
+
+        added_nodes = context.dag_builder.add_node_with_dependencies(next_node, network_name)
+        if next_node not in added_nodes:
+            added_nodes.append(next_node)
+
+        # Queue nodes that are ready for execution
+        for added_node in added_nodes:
+            ExecuteDagState._try_queue_waiting_node(context, added_node.name)
+
+        return added_nodes
 
     @staticmethod
     def _try_queue_waiting_node(context: ParallelResolutionContext, node_name: str) -> None:
@@ -724,11 +729,8 @@ class ExecuteDagState(State):
             # that map (the reap below, ErrorState, cancel_all_nodes' gather) treats its
             # members as node tasks. Cancelling in a finally, rather than on each way out
             # of on_update, makes every return path below leak-free by construction.
-            # The cancel is deliberately not awaited: Event.wait can only ever raise
-            # CancelledError (so it never warns about an unretrieved exception), it unhooks
-            # itself from Event._waiters on the next loop turn, and Event.set skips
-            # already-done futures - so no wakeup is lost and nothing accumulates. Awaiting
-            # it here would instead risk masking a cancellation aimed at this driver, which
+            # The cancel is deliberately not awaited. Awaiting here would add a suspension
+            # point that could swallow a cancellation aimed at this driver, which
             # isolated-subflow teardown relies on propagating.
             wakeup_waiter = asyncio.create_task(context.new_work_event.wait())
             try:
@@ -913,11 +915,7 @@ class ParallelResolutionMachine(FSM[ParallelResolutionContext]):
             msg = f"Attempted to run '{node.name}' as part of the current run, but that run has no dependency graph to add it to. Cancel the run and try again."
             raise ValueError(msg)
 
-        added_nodes = context.dag_builder.add_node_with_dependencies(node, graph_name or node.name)
-        if node not in added_nodes:
-            added_nodes.append(node)
-        for added_node in added_nodes:
-            ExecuteDagState._try_queue_waiting_node(context, added_node.name)
+        added_nodes = ExecuteDagState.add_and_queue_nodes(context, node, graph_name or node.name)
         context.signal_new_work()
 
         if context.paused:

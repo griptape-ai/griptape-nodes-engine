@@ -4807,14 +4807,7 @@ class FlowManager(EngineScoped):
             # The cold path below unresolves the node before queueing it, and so must this
             # one: otherwise an already-resolved node is treated as a duplicate completion
             # and never re-runs, and the editor keeps showing it as resolved.
-            if not node.lock:
-                node.make_node_unresolved(
-                    current_states_to_trigger_change_event={
-                        NodeResolutionState.UNRESOLVED,
-                        NodeResolutionState.RESOLVED,
-                        NodeResolutionState.RESOLVING,
-                    }
-                )
+            node.prepare_to_run_again()
             machine.resolution_machine.inject_node(node)
             # Emit involved nodes update after adding node to DAG
             involved_nodes = list(self._global_dag_builder.node_to_reference.keys())
