@@ -214,7 +214,7 @@ class VariableResolver:
         Exactness comes from asking ``resolve_macro_token`` itself rather than
         re-deriving its rules, which is what makes the answer trustworthy for a
         stored-state write. Every reason a token is left verbatim -- unknown required
-        variable, unparseable token, a format spec that raises on the variable's
+        variable, unparsable token, a format spec that raises on the variable's
         actual value (``{SHOT:03}`` where ``SHOT`` is ``"hero"``) -- is honoured for
         free, and cannot drift as the resolver gains rules. Note an optional
         ``{VAR?}`` counts as a rewrite whether or not the variable exists, because

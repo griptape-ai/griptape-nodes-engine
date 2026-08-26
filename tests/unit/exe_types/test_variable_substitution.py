@@ -857,10 +857,19 @@ class TestTemplatePreservationGates:
         """
 
         class _Elementwise:
-            def __ne__(self, other: object) -> Any:
-                msg = "truth value of an array with more than one element is ambiguous"
-                raise ValueError(msg)
+            _MSG = "truth value of an array with more than one element is ambiguous"
 
+            # Both operators raise, as they do on the real types being stood in for:
+            # numpy and pandas return an elementwise result from `==` just as from
+            # `!=`. Keeping them symmetric also means a future `_differs` written as
+            # `not (a == b)` is still covered by this test.
+            def __eq__(self, other: object) -> Any:
+                raise ValueError(self._MSG)
+
+            def __ne__(self, other: object) -> Any:
+                raise ValueError(self._MSG)
+
+            # Defining __eq__ would otherwise set __hash__ to None.
             def __hash__(self) -> int:
                 return 0
 
