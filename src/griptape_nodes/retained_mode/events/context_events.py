@@ -29,13 +29,24 @@ class SetWorkflowContextRequest(RequestPayload):
                       Ignored when the workflow is already in the registry. Defaults to
                       None; in that case the auto-registered entry gets a placeholder
                       name.
+        working_directory: Folder this workflow belongs to, for a workflow that has no file
+                      of its own yet. `{workflow_dir}` -- and so every project directory
+                      built on it, `{outputs}` among them -- answers with this until the
+                      workflow is saved, at which point the saved file's own directory takes
+                      over. A DIRECTORY, not a file path. Absolute paths are recommended;
+                      if you supply a relative path it is anchored to the workspace directory
+                      (not the project base directory, which may sit one level above). Optional:
+                      when None, an unsaved workflow has no folder and `{workflow_dir?:/}` keeps
+                      degrading to a workspace-relative path as before.
 
     Results: SetWorkflowContextSuccess (carries the resolved workflow_name) |
-             SetWorkflowContextFailure (workflow not found)
+             SetWorkflowContextFailure (workflow not found, working_directory names an
+             existing non-directory)
     """
 
     workflow_name: str | None = None
     display_name: str | None = None
+    working_directory: str | None = None
 
 
 @dataclass
@@ -111,6 +122,9 @@ class EnsureWorkflowAndFlowRequest(RequestPayload):
             workflow_name is supplied.
         flow_name: Name to use if a new flow must be created. Ignored when a flow is
             already in context. Defaults to the engine-assigned name.
+        working_directory: Folder the workflow belongs to until it is saved, forwarded to
+            SetWorkflowContextRequest. Ignored when a workflow is already in context. See
+            SetWorkflowContextRequest for what the value means and how it is normalized.
 
     Results: EnsureWorkflowAndFlowResultSuccess | EnsureWorkflowAndFlowResultFailure
     """
@@ -118,6 +132,7 @@ class EnsureWorkflowAndFlowRequest(RequestPayload):
     workflow_name: str | None = None
     display_name: str | None = None
     flow_name: str | None = None
+    working_directory: str | None = None
 
 
 @dataclass

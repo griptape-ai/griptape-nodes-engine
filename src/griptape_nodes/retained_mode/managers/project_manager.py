@@ -4669,7 +4669,7 @@ class ProjectManager(EngineScoped):
                 conflicts.add(var_name)
         return _BuiltinResolutionResult(conflicts=conflicts, unavailable=unavailable)
 
-    def _get_builtin_variable_value(self, var_name: str, project_info: ProjectInfo) -> str:  # noqa: C901
+    def _get_builtin_variable_value(self, var_name: str, project_info: ProjectInfo) -> str:
         """Get the value of a single builtin variable.
 
         Args:
@@ -4702,37 +4702,7 @@ class ProjectManager(EngineScoped):
                 return context_manager.get_current_workflow_name()
 
             case "workflow_dir":
-                context_manager = self.engine.context_manager
-                if not context_manager.has_current_workflow():
-                    msg = "No current workflow"
-                    raise RuntimeError(msg)
-                # Prefer the path the context was entered WITH. The registry key below is
-                # derived against the workspace that was active at push time, so a project
-                # switch -- which re-registers every workflow under the new workspace -- leaves
-                # the name pointing at a key that no longer exists. The lookup then raises,
-                # `{workflow_dir?:/}` swallows it as an optional reference, and `{outputs}`
-                # silently degrades from the workflow's own folder to a workspace-relative
-                # path, so saved media resolves somewhere it was never written.
-                context_file_path = context_manager.get_current_workflow_file_path()
-                if context_file_path is not None:
-                    return str(Path(context_file_path).parent)
-                workflow_name = context_manager.get_current_workflow_name()
-                try:
-                    workflow = WorkflowRegistry.get_workflow_by_name(workflow_name)
-                except KeyError as e:
-                    # NOT the same as unsaved: the file may be on disk and saved, but keyed
-                    # under a different workspace. Say so, rather than reporting a state the
-                    # user cannot act on.
-                    msg = (
-                        f"Workflow '{workflow_name}' is not registered on this engine "
-                        f"(it may be registered under a different workspace)"
-                    )
-                    raise RuntimeError(msg) from e
-                if workflow.file_path is None:
-                    msg = f"Workflow '{workflow_name}' has not been saved yet"
-                    raise RuntimeError(msg)
-                workflow_file_path = Path(WorkflowRegistry.get_complete_file_path(workflow.file_path))
-                return str(workflow_file_path.parent)
+                return self._resolve_workflow_dir()
 
             case "static_files_dir":
                 return self._config_manager.get_config_value("static_files_directory", default="staticfiles")
@@ -4740,6 +4710,66 @@ class ProjectManager(EngineScoped):
             case _:
                 msg = f"Unknown builtin variable: {var_name}"
                 raise ValueError(msg)
+
+        # Unreachable at runtime — `case _:` above catches everything. Present so
+        # static analyzers (CodeQL) can prove the function never implicitly returns None.
+        msg = f"Unknown builtin variable: {var_name}"
+        raise ValueError(msg)
+
+    def _resolve_workflow_dir(self) -> str:
+        """Resolve the `workflow_dir` builtin: the folder the current workflow belongs to.
+
+        Three sources, in descending order of authority:
+
+        1. The file path retained on the context. The registry key is derived against the
+           workspace that was active at push time, so a project switch -- which re-registers
+           every workflow under the new workspace -- leaves the name pointing at a key that no
+           longer exists. The lookup then raises, `{workflow_dir?:/}` swallows it as an
+           optional reference, and `{outputs}` silently degrades from the workflow's own folder
+           to a workspace-relative path, so saved media resolves somewhere it was never written.
+        2. The registry entry for the context's name.
+        3. The folder the workflow was created in, for a workflow that has never been saved and
+           so has no file to answer from. Last because a saved workflow's own location always
+           beats the folder it was created in -- the two differ as soon as the user saves
+           somewhere else.
+
+        Raises:
+            RuntimeError: If no workflow is in context, or the workflow has neither a file nor
+                a folder to answer with.
+        """
+        context_manager = self.engine.context_manager
+        if not context_manager.has_current_workflow():
+            msg = "No current workflow"
+            raise RuntimeError(msg)
+
+        context_file_path = context_manager.get_current_workflow_file_path()
+        if context_file_path is not None:
+            return str(Path(context_file_path).parent)
+
+        workflow_name = context_manager.get_current_workflow_name()
+        working_directory = context_manager.get_current_workflow_working_directory()
+        try:
+            workflow = WorkflowRegistry.get_workflow_by_name(workflow_name)
+        except KeyError as e:
+            if working_directory is not None:
+                return working_directory
+            # NOT the same as unsaved: the file may be on disk and saved, but keyed
+            # under a different workspace. Say so, rather than reporting a state the
+            # user cannot act on.
+            msg = (
+                f"Workflow '{workflow_name}' is not registered on this engine "
+                f"(it may be registered under a different workspace)"
+            )
+            raise RuntimeError(msg) from e
+
+        if workflow.file_path is None:
+            if working_directory is not None:
+                return working_directory
+            msg = f"Workflow '{workflow_name}' has not been saved yet"
+            raise RuntimeError(msg)
+
+        workflow_file_path = Path(WorkflowRegistry.get_complete_file_path(workflow.file_path))
+        return str(workflow_file_path.parent)
 
     def _absolute_path_to_macro_path(self, absolute_path: Path, project_info: ProjectInfo) -> str | None:
         """Convert an absolute path to macro form using longest prefix matching.
