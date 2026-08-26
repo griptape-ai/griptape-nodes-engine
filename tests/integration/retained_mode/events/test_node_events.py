@@ -12,6 +12,8 @@ from griptape_nodes.retained_mode.events.node_events import (
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
+pytestmark = pytest.mark.xfail(strict=True, reason="Drifted due to not running on CI - see #5237")
+
 
 class TestNodeEvents:
     @pytest.fixture

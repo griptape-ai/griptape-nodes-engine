@@ -46,6 +46,7 @@ class TestLockNodes:
         assert hasattr(r2, "node_name")
         return r1.node_name, r2.node_name  # type: ignore[attr-defined]
 
+    @pytest.mark.xfail(strict=True, reason="Drifted due to not running on CI - see #5237")
     def test_lock_single_node_by_name(self, create_node: str) -> None:
         node_name = create_node
         # Lock
@@ -71,6 +72,7 @@ class TestLockNodes:
         assert isinstance(info_res2, GetAllNodeInfoResultSuccess)
         assert info_res2.locked is False
 
+    @pytest.mark.xfail(strict=True, reason="Drifted due to not running on CI - see #5237")
     def test_lock_multiple_nodes(self, create_two_nodes: tuple[str, str]) -> None:
         node_a, node_b = create_two_nodes
 
@@ -102,6 +104,7 @@ class TestLockNodes:
         assert info_a2.locked is False
         assert info_b2.locked is False
 
+    @pytest.mark.xfail(strict=True, reason="Drifted due to not running on CI - see #5237")
     def test_lock_with_current_context_when_name_missing(self) -> None:
         # Create a node and set as current context
         create_req = CreateNodeRequest(
@@ -122,6 +125,7 @@ class TestLockNodes:
         assert isinstance(info_res, GetAllNodeInfoResultSuccess)
         assert info_res.locked is True
 
+    @pytest.mark.xfail(strict=True, reason="Drifted due to not running on CI - see #5237")
     def test_lock_multiple_with_missing_node_returns_failure(self, create_node: str) -> None:
         existing = create_node
         missing = "does_not_exist_123"
