@@ -357,8 +357,7 @@ class WorkflowManager(EngineScoped):
         """One load-request handler's in-flight load: what it is loading, how it ended, whether it is done.
 
         Every workflow context the load enters holds a reference to this record, so `in_progress`
-        going false settles all of them at once. See `_tracking_workflow_load` for how a handler
-        owns and fills one in.
+        going false settles all of them at once. See `_tracking_workflow_load`.
         """
 
         relative_file_path: str
@@ -886,12 +885,9 @@ class WorkflowManager(EngineScoped):
     async def run_workflow(self, relative_file_path: str) -> WorkflowExecutionResult:
         """Execute a workflow file's build_workflow() (or, for legacy files, its top-level code).
 
-        Shared by every caller that needs to run a workflow file: the three load-request
-        handlers, and importing a workflow as a referenced sub flow. Reports only whether
-        execution succeeded; it has no notion of a load being in progress. A caller that needs
-        to report load progress to a client does so itself (see `_tracking_workflow_load`),
-        because only the caller knows whether this particular execution is a load a client is
-        waiting on or an import into an already-open canvas.
+        Shared by every caller that runs a workflow file, including a referenced sub flow import.
+        Reports only success/failure; it has no notion of a load being in progress. A caller that
+        needs to report load progress does so itself (see `_tracking_workflow_load`).
         """
         workspace_path = self.engine.config_manager.workspace_path
         complete_file_path = resolve_workspace_path(Path(relative_file_path), workspace_path)
@@ -945,32 +941,10 @@ class WorkflowManager(EngineScoped):
     async def _tracking_workflow_load(self, relative_file_path: str) -> AsyncIterator[WorkflowLoadRecord]:
         """Own the in-flight load a load-request handler is executing, for its entire handler body.
 
-        Wraps `on_run_workflow_from_scratch_request`, `on_run_workflow_with_current_state_request`,
-        and `on_run_workflow_from_registry_request`, the three handlers that load a workflow file on
-        a caller's behalf. Each yields a WorkflowLoadRecord it fills in as its load proceeds:
-        `workflow_name` and `successful` are set once the file has finished executing (see
-        `_record_load_outcome`), before any cleanup the handler still has to do, such as clearing all
-        object state after a failed load. Broadcasting WorkflowLoadComplete only once this scope's
-        caller (the handler's own body) has run to completion means a client that reacts to the event
-        by re-querying engine state sees a settled engine, not one about to be cleaned up.
-
-        ContextManager holds the record for the duration and stamps it onto every workflow context
-        the load enters, which is how GetWorkflowContext answers `is_loading`. The record is the one
-        source of truth for whether the load is still running, so clearing `in_progress` here settles
-        every context that references it without any per-context unwinding.
-
-        Importing a workflow as a referenced sub flow calls `run_workflow` directly rather than
-        through one of these three handlers, so it never enters this scope: an already-open canvas
-        importing another workflow into itself never becomes an in-flight load, and the canvas keeps
-        reporting itself as loaded. If a load handler is ever re-entered while a load is still in
-        flight, the inner call gets a scratch record of its own: it does not own the scope, so it
-        neither stamps contexts nor broadcasts, and writing its outcome into a record nobody reads
-        keeps it from corrupting the owner's `workflow_name` and `successful`.
-
-        Concurrent top-level loads on one engine are unsupported independent of anything tracked
-        here: `on_run_workflow_from_scratch_request` clears all object state before loading, so two
-        such loads running at once already corrupt each other's engine state regardless of how their
-        progress is reported.
+        Wraps the three load-request handlers. `_record_load_outcome` fills in the yielded record
+        once the file has executed; WorkflowLoadComplete broadcasts only after the handler's own
+        cleanup, so a client re-querying engine state sees it settled. A re-entrant call gets a
+        scratch record of its own: it neither stamps contexts nor broadcasts.
         """
         context_manager = self.engine.context_manager
         if context_manager.get_in_flight_workflow_load() is not None:
@@ -990,36 +964,22 @@ class WorkflowManager(EngineScoped):
     ) -> None:
         """Fill in a load's outcome right after its file finishes executing, before any cleanup.
 
-        A failed from-registry load still clears all object state afterward, which wipes Context;
-        reading the resolved workflow name here keeps WorkflowLoadComplete naming the workflow
-        that was actually loading rather than whatever Context holds once that cleanup settles.
+        Must run before cleanup: a failed from-registry load clears Context afterward, which would
+        otherwise erase the workflow name this reads.
         """
         load_record.successful = execution_result.execution_successful
         if self.engine.context_manager.has_current_workflow():
             load_record.workflow_name = self.engine.context_manager.get_current_workflow_name()
 
     async def _broadcast_workflow_load_complete(self, load_record: WorkflowManager.WorkflowLoadRecord) -> None:
-        """Broadcast that a load has finished, without letting a listener failure affect the load.
-
-        abroadcast_app_event deliberately propagates listener failures, as an ExceptionGroup raised
-        by the asyncio.TaskGroup it runs them in. That failure must not replace the exception or
-        result already unwinding from the load this broadcast is reporting on.
-        """
-        try:
-            await self.engine.abroadcast_app_event(
-                WorkflowLoadComplete(
-                    relative_file_path=load_record.relative_file_path,
-                    workflow_name=load_record.workflow_name,
-                    successful=load_record.successful,
-                )
+        """Broadcast that a load has finished."""
+        await self.engine.abroadcast_app_event(
+            WorkflowLoadComplete(
+                relative_file_path=load_record.relative_file_path,
+                workflow_name=load_record.workflow_name,
+                successful=load_record.successful,
             )
-        except ExceptionGroup:
-            details = (
-                f"Attempted to notify listeners that workflow '{load_record.relative_file_path}' finished "
-                "loading. Failed due to an error raised by a WorkflowLoadComplete listener. The workflow "
-                "load itself was unaffected."
-            )
-            logger.exception(details)
+        )
 
     async def _ensure_libraries_for_workflow(
         self, *, relative_file_path: str, complete_file_path: Path

@@ -3005,43 +3005,6 @@ class TestTrackingWorkflowLoad:
         assert event.successful is False
 
     @pytest.mark.asyncio
-    async def test_broadcast_failure_does_not_mask_an_exception_raised_by_the_scope_body(
-        self, griptape_nodes: Engine
-    ) -> None:
-        """A WorkflowLoadComplete listener failing must not replace the exception the scope body raised."""
-        workflow_manager = griptape_nodes.WorkflowManager()
-        context_manager = griptape_nodes.ContextManager()
-        broadcast_failure = ExceptionGroup("listener failed", [RuntimeError("listener boom")])
-
-        async def _raise_inside_the_scope() -> None:
-            async with workflow_manager._tracking_workflow_load("whatever.py"):
-                msg = "boom"
-                raise RuntimeError(msg)
-
-        with (
-            patch.object(griptape_nodes, "abroadcast_app_event", AsyncMock(side_effect=broadcast_failure)),
-            pytest.raises(RuntimeError, match="boom"),
-        ):
-            await _raise_inside_the_scope()
-
-        assert context_manager.get_in_flight_workflow_load() is None
-
-    @pytest.mark.asyncio
-    async def test_broadcast_failure_does_not_raise_out_of_a_scope_that_otherwise_completed_cleanly(
-        self, griptape_nodes: Engine
-    ) -> None:
-        """A WorkflowLoadComplete listener failing must not affect a load that otherwise completed cleanly."""
-        workflow_manager = griptape_nodes.WorkflowManager()
-        context_manager = griptape_nodes.ContextManager()
-        broadcast_failure = ExceptionGroup("listener failed", [RuntimeError("listener boom")])
-
-        with patch.object(griptape_nodes, "abroadcast_app_event", AsyncMock(side_effect=broadcast_failure)):
-            async with workflow_manager._tracking_workflow_load("whatever.py") as load_record:
-                load_record.successful = True
-
-        assert context_manager.get_in_flight_workflow_load() is None
-
-    @pytest.mark.asyncio
     async def test_broadcasts_the_requested_path_and_the_records_workflow_name_and_success(
         self, griptape_nodes: Engine
     ) -> None:
