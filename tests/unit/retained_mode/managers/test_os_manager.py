@@ -1174,17 +1174,16 @@ class TestExpandPath:
         yield
         griptape_nodes.ConfigManager().workspace_path = original_workspace
 
-    def test_expand_path_relative_resolved_against_cwd(
+    def test_expand_path_relative_anchored_on_workspace(
         self,
         griptape_nodes: GriptapeNodes,
         temp_dir: Path,  # noqa: ARG002
     ) -> None:
-        """Relative path is resolved against current working directory."""
+        """A path that is still relative after expansion is anchored on the workspace directory."""
         os_manager = griptape_nodes.OSManager()
         result = os_manager._expand_path("subdir")
-        # resolve_path_safely resolves relative paths against Path.cwd()
-        assert result.is_absolute()
-        assert result.name == "subdir"
+        expected = griptape_nodes.ConfigManager().workspace_path / "subdir"
+        assert result == expected
 
     def test_expand_path_expands_vars_and_tilde(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
         """Expandvars and expanduser are applied when not a Windows special folder."""
@@ -1220,6 +1219,71 @@ class TestExpandPath:
         result = os_manager._expand_path("~/Downloads")
         expected = resolve_path_safely(Path.home() / "Downloads")
         assert result == expected
+
+
+class TestResolveFilePath:
+    """Test OSManager._resolve_file_path anchoring behaviour."""
+
+    UNSET_VAR_NAME = "GRIPTAPE_UNSET_VAR_FOR_TEST"
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        """Create a temporary directory for testing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    @pytest.fixture(autouse=True)
+    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+        """Set workspace to temp_dir for tests."""
+        original_workspace = griptape_nodes.ConfigManager().workspace_path
+        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        yield
+        griptape_nodes.ConfigManager().workspace_path = original_workspace
+
+    @pytest.mark.parametrize(
+        "path_str",
+        [
+            "report$.txt",
+            "foo%20bar.txt",
+            "config.json",
+            "data/nested.json",
+        ],
+    )
+    def test_relative_path_anchored_on_workspace(self, griptape_nodes: GriptapeNodes, path_str: str) -> None:
+        """Relative paths resolve against the workspace directory, not the process CWD."""
+        os_manager = griptape_nodes.OSManager()
+        result = os_manager._resolve_file_path(path_str)
+        expected = griptape_nodes.ConfigManager().workspace_path / path_str
+        assert result == expected
+
+    def test_unresolvable_variable_anchored_on_workspace(
+        self, griptape_nodes: GriptapeNodes, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A path naming an undefined variable stays literal and is anchored on the workspace."""
+        monkeypatch.delenv(self.UNSET_VAR_NAME, raising=False)
+        os_manager = griptape_nodes.OSManager()
+        result = os_manager._resolve_file_path(f"${self.UNSET_VAR_NAME}/sub")
+        expected = griptape_nodes.ConfigManager().workspace_path / f"${self.UNSET_VAR_NAME}" / "sub"
+        assert result == expected
+
+    def test_tilde_path_not_anchored_on_workspace(self, griptape_nodes: GriptapeNodes) -> None:
+        """A ~ path expands to the user's home directory rather than the workspace."""
+        if platform.system() == "Windows":
+            pytest.skip("Windows resolves ~/Downloads through the Shell API special folder path")
+        os_manager = griptape_nodes.OSManager()
+        workspace_path = griptape_nodes.ConfigManager().workspace_path
+        result = os_manager._resolve_file_path("~/Downloads")
+        assert result == resolve_path_safely(Path.home() / "Downloads")
+        assert not result.is_relative_to(workspace_path)
+
+    def test_absolute_path_not_anchored_on_workspace(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
+        """An absolute path is returned unchanged rather than being joined onto the workspace."""
+        os_manager = griptape_nodes.OSManager()
+        workspace_path = griptape_nodes.ConfigManager().workspace_path
+        absolute_path = resolve_path_safely(tmp_path / "elsewhere" / "file.txt")
+        result = os_manager._resolve_file_path(str(absolute_path))
+        assert result == absolute_path
+        assert not result.is_relative_to(workspace_path)
 
 
 class TestWindowsLongPathHandling:

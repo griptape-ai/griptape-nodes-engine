@@ -543,7 +543,9 @@ class OSManager(EngineScoped):
             path_str: Path string that may contain ~, environment variables, or special folder names
 
         Returns:
-            Expanded Path object
+            Expanded, absolute Path object. A result that is still relative after expansion is
+            anchored on the workspace directory. Windows special folders resolve to their
+            actual system paths (e.g. OneDrive redirection).
         """
         resolved = None
         if self.is_windows():
@@ -562,17 +564,25 @@ class OSManager(EngineScoped):
             expanded_user = os.path.expanduser(expanded_vars)  # noqa: PTH111
             final_path = Path(expanded_user)
 
+        # Anchor a relative expansion result on the workspace directory. Expansion leaves a
+        # path relative when the string contains '%' or '$' but no resolvable variable
+        # (e.g. "foo%20bar.txt", "report$.txt", "$UNSET_VAR/sub").
+        if not final_path.is_absolute():
+            final_path = self._get_workspace_path() / final_path
+
         return resolve_path_safely(final_path)
 
     def _resolve_file_path(self, path_str: str, *, workspace_only: bool = False) -> Path:
         """Resolve a file path, handling absolute, relative, and tilde paths.
 
         Args:
-            path_str: Path string that may be absolute, relative, or start with ~
+            path_str: Path string that may be absolute, start with ~, or be a path relative
+                to the workspace directory
             workspace_only: If True and path is invalid, fall back to workspace directory
 
         Returns:
-            Resolved Path object
+            Absolute, resolved Path object. Relative paths resolve against the workspace
+            directory.
         """
         try:
             if path_needs_expansion(path_str):
