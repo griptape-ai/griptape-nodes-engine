@@ -724,6 +724,12 @@ class ExecuteDagState(State):
             # that map (the reap below, ErrorState, cancel_all_nodes' gather) treats its
             # members as node tasks. Cancelling in a finally, rather than on each way out
             # of on_update, makes every return path below leak-free by construction.
+            # The cancel is deliberately not awaited: Event.wait can only ever raise
+            # CancelledError (so it never warns about an unretrieved exception), it unhooks
+            # itself from Event._waiters on the next loop turn, and Event.set skips
+            # already-done futures - so no wakeup is lost and nothing accumulates. Awaiting
+            # it here would instead risk masking a cancellation aimed at this driver, which
+            # isolated-subflow teardown relies on propagating.
             wakeup_waiter = asyncio.create_task(context.new_work_event.wait())
             try:
                 done, _ = await asyncio.wait(
@@ -786,11 +792,8 @@ class ExecuteDagState(State):
             # through the FSM's advance loop with no suspension point in between, which
             # would wedge the whole event loop - including the injector that could
             # unblock us. Yield on the new-work flag so the retry loop is preserved but
-            # the loop keeps turning.
-            logger.warning(
-                "Flow '%s': no nodes are running and none can be dispatched yet; waiting for new work.",
-                context.flow_name,
-            )
+            # the loop keeps turning. Deliberately not logged: this branch re-runs every
+            # _IDLE_RECHECK_SECONDS while parked, so even a debug line would be spam.
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(context.new_work_event.wait(), timeout=_IDLE_RECHECK_SECONDS)
             if context.was_reset_since(generation):
