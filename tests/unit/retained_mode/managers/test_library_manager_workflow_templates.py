@@ -173,6 +173,19 @@ class TestCollectWorkflowFilesForLibrary:
 
         assert collected is None
 
+    def test_reports_a_library_with_no_name_as_unreadable(self, griptape_nodes: Engine, tmp_path: Path) -> None:
+        """`None` rather than `[]`, because a nameless library cannot be looked up at all.
+
+        The empty list is reserved for a library that was read and declares no templates, which
+        the reconcile treats as authority to unregister whatever it recorded earlier.
+        """
+        library_info = _library_info(tmp_path / "lib.json")
+        library_info.library_name = None
+
+        collected = griptape_nodes.library_manager._collect_workflow_template_files_for_library(library_info)
+
+        assert collected is None
+
 
 class TestRegisterWorkflowFilesForLibrary:
     @pytest.mark.asyncio
@@ -425,8 +438,56 @@ class TestRegisterAllLibraryWorkflowFiles:
 
         register_one.assert_awaited_once_with(live_info)
 
+    @pytest.mark.asyncio
+    async def test_skips_a_library_this_engine_never_registered(self, griptape_nodes: Engine) -> None:
+        """`LibraryRegistry` is process-global, so it can list a library another Engine registered.
+
+        Their templates are that engine's business, and this one has no `LibraryInfo` for them to
+        resolve the declared paths against anyway.
+        """
+        library_manager = griptape_nodes.library_manager
+        register_one = AsyncMock(return_value=None)
+
+        with (
+            patch.dict(library_manager._library_file_path_to_info, {}, clear=True),
+            patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.list_libraries", return_value=["AnotherEnginesLib"]),
+            patch.object(library_manager, "_reconcile_workflow_templates_for_library", register_one),
+        ):
+            await library_manager.reconcile_all_library_workflow_templates()
+
+        register_one.assert_not_awaited()
+
 
 class TestUnregisterWorkflowFilesForLibrary:
+    def test_keeps_the_keys_it_was_not_asked_to_remove(self, griptape_nodes: Engine) -> None:
+        """A stale sweep can take one of a library's templates and leave the rest.
+
+        The recorded list is rewritten rather than dropped in that case, and only the key that went
+        away is announced -- naming the survivors in a removal would have listeners discard
+        templates that are still registered.
+        """
+        library_manager = griptape_nodes.library_manager
+        library_manager._library_to_workflow_keys[LIBRARY_NAME] = ["templates/gone", "templates/kept"]
+        event_manager = MagicMock()
+
+        with (
+            patch.dict(
+                WorkflowRegistry._workflows,
+                {"templates/gone": MagicMock(), "templates/kept": MagicMock()},
+                clear=True,
+            ),
+            patch.object(griptape_nodes, "_event_manager", event_manager),
+        ):
+            library_manager._remove_workflow_template_keys(LIBRARY_NAME, ["templates/gone"])
+
+            assert list(WorkflowRegistry._workflows) == ["templates/kept"]
+
+        assert library_manager._library_to_workflow_keys[LIBRARY_NAME] == ["templates/kept"]
+        changes = _emitted_template_changes(event_manager)
+        assert len(changes) == 1
+        assert changes[0].workflow_names == ["templates/gone"]
+        assert changes[0].registered is False
+
     def test_removes_the_libraries_templates_and_announces_them(self, griptape_nodes: Engine) -> None:
         library_manager = griptape_nodes.library_manager
         library_manager._library_to_workflow_keys[LIBRARY_NAME] = ["templates/example"]
@@ -543,14 +604,34 @@ class TestRegistrationHookGating:
                 )
             yield
 
+    @pytest.mark.parametrize(
+        "fitness",
+        [
+            LibraryManager.LibraryFitness.GOOD,
+            LibraryManager.LibraryFitness.FLAWED,
+            LibraryManager.LibraryFitness.NOT_EVALUATED,
+        ],
+    )
     @pytest.mark.asyncio
-    async def test_registers_templates_for_a_mid_session_install(self, griptape_nodes: Engine, tmp_path: Path) -> None:
+    async def test_registers_templates_for_a_mid_session_install(
+        self, griptape_nodes: Engine, tmp_path: Path, fitness: LibraryManager.LibraryFitness
+    ) -> None:
+        """Every fitness the handler reports success for, not just the healthy one.
+
+        `FLAWED` means some of the library's nodes failed to load and `NOT_EVALUATED` means node
+        loading is deferred to a worker. Either way the library is registered and its templates
+        belong in the list: registering one parses the file's TOML header and never imports a node
+        class, so there is nothing to wait for. `UNUSABLE` is the fitness that does not get here,
+        covered below.
+        """
         library_manager = griptape_nodes.library_manager
         library_manager._libraries_loading_complete.set()
         library_manager._bulk_library_load_depth = 0
+        library_info = _library_info(tmp_path / "lib.json")
+        library_info.fitness = fitness
         register_one = AsyncMock(return_value=None)
 
-        with self._stub_lifecycle(library_manager, _library_info(tmp_path / "lib.json"), register_one):
+        with self._stub_lifecycle(library_manager, library_info, register_one):
             result = await library_manager.register_library_from_file_request(
                 RegisterLibraryFromFileRequest(file_path="/fake/lib.json")
             )
@@ -635,8 +716,9 @@ class TestRegistrationHookGating:
             register_one.assert_not_awaited()
 
             held_open.set()
-            await first_bulk_load
+            first_bulk_load_result = await first_bulk_load
 
+        assert first_bulk_load_result.succeeded()
         assert library_manager._bulk_library_load_depth == 0
         assert await register_one_library()
         register_one.assert_awaited_once()
@@ -701,10 +783,13 @@ class TestBatchLibraryOperation:
         library_manager = griptape_nodes.library_manager
         library_manager._bulk_library_load_depth = 0
 
-        batch_failure = RuntimeError("the batch blew up")
+        def fail_partway_through_a_batch() -> None:
+            message = "the batch blew up"
+            with library_manager._batch_library_operation():
+                raise RuntimeError(message)
 
-        with pytest.raises(RuntimeError, match="the batch blew up"), library_manager._batch_library_operation():
-            raise batch_failure
+        with pytest.raises(RuntimeError, match="the batch blew up"):
+            fail_partway_through_a_batch()
 
         assert library_manager._bulk_library_load_depth == 0
 
