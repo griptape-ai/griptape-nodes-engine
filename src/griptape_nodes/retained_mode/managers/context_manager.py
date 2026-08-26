@@ -93,10 +93,7 @@ class ContextManager(EngineScoped):
         def is_loading(self) -> bool:
             """Whether a load is still populating this Workflow context.
 
-            A workflow is entered before its nodes exist, so a name being current is not proof
-            the workflow is usable. This reports the gap. Reading through to the load record
-            rather than caching a bool means the load finishing settles every context it
-            entered at once, with no unwinding to get wrong.
+            A workflow is entered before its nodes exist, so a current name is not proof it's usable.
             """
             return self._load is not None and self._load.in_progress
 
@@ -604,9 +601,8 @@ class ContextManager(EngineScoped):
     def is_current_workflow_loading(self) -> bool:
         """Whether a load is still populating the current Workflow context.
 
-        Answers about the workflow this context IS, not about whatever the engine happens to be
-        executing: importing a referenced sub flow into an already-open workflow reads False,
-        because that workflow is not the thing being loaded.
+        Answers about the workflow this context IS, not whatever the engine happens to be
+        executing: importing a referenced sub flow into an already-open workflow reads False.
 
         Raises:
             NoActiveWorkflowError: If no Workflow context is active.
@@ -719,12 +715,8 @@ class ContextManager(EngineScoped):
     def begin_workflow_load(self, load: WorkflowManager.WorkflowLoadRecord) -> None:
         """Mark `load` as the load populating context, until the matching `end_workflow_load`.
 
-        Every workflow entered from here on is stamped with `load` by `push_workflow`, which is
-        what `is_current_workflow_loading` reports. The workflow that is ALREADY current is
-        stamped too, because a load into an open canvas (RunWorkflowWithCurrentState) mutates
-        that workflow in place instead of entering a new one, and a client watching it needs to
-        know its graph is mid-build. A load that starts with no workflow current stamps nothing
-        yet; the workflow its file enters gets stamped when it is pushed.
+        Stamps the current workflow (if any) as well as every workflow `push_workflow` enters from
+        here on, so a load that rebuilds an already-open workflow in place is reported too.
 
         Called by WorkflowManager, which owns loads. See `WorkflowManager._tracking_workflow_load`.
         """
@@ -735,8 +727,8 @@ class ContextManager(EngineScoped):
     def end_workflow_load(self) -> None:
         """Stop stamping newly entered workflows with the in-flight load.
 
-        Does not settle the workflows already stamped with it. They read the load's own
-        `in_progress`, which its owner clears, so they settle together rather than one at a time.
+        Does not settle the workflows already stamped with it; they read the load's own
+        `in_progress`, which its owner clears, so they all settle together.
         """
         self._in_flight_workflow_load = None
 

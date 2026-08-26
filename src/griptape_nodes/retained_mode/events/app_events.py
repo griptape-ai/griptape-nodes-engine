@@ -272,11 +272,9 @@ class LibraryLoadedNotification(AppPayload):
 class WorkflowLoadComplete(AppPayload):
     """Notification that a requested workflow load has finished, successfully or not.
 
-    Broadcast by the load-request handlers (RunWorkflowFromScratch, RunWorkflowWithCurrentState,
-    RunWorkflowFromRegistry) once a load and any cleanup it required have both settled, so a
-    client does not have to poll GetWorkflowContext to learn a load is done. Importing a
-    workflow as a referenced sub flow into an already-open canvas is not a load and never
-    triggers this event.
+    Broadcast once a load-request handler (RunWorkflowFromScratch, RunWorkflowWithCurrentState,
+    RunWorkflowFromRegistry) and its own cleanup have settled. Importing a workflow as a
+    referenced sub flow is not a load and never triggers this event.
 
     Args:
         relative_file_path: Path of the workflow file that was requested to load, exactly as
