@@ -384,29 +384,31 @@ class TestBroadcastAppEventListenerIsolation:
         """
         event_manager = EventManager()
         completed: list[str] = []
+        failed = asyncio.Event()
 
         async def failing_listener(_event: ConfigChanged) -> None:
+            failed.set()
             msg = "listener blew up"
             raise PermissionError(msg)
 
-        async def slow_listener(_event: ConfigChanged) -> None:
-            # Yields after the sibling has already raised, so it only completes if the
-            # failure did not cancel the TaskGroup.
-            await asyncio.sleep(0)
-            await asyncio.sleep(0)
-            completed.append("slow")
+        async def surviving_listener(_event: ConfigChanged) -> None:
+            # Resumes only after the sibling raised, so it completes only if that failure
+            # did not cancel the TaskGroup. Listeners are stored in a set, so this cannot
+            # rely on creation order.
+            await failed.wait()
+            completed.append("survivor")
 
         def sync_listener(_event: ConfigChanged) -> None:
             completed.append("sync")
 
         event_manager.add_listener_to_app_event(ConfigChanged, failing_listener)
-        event_manager.add_listener_to_app_event(ConfigChanged, slow_listener)
+        event_manager.add_listener_to_app_event(ConfigChanged, surviving_listener)
         event_manager.add_listener_to_app_event(ConfigChanged, sync_listener)
 
         with caplog.at_level(logging.ERROR, logger="griptape_nodes"):
             await event_manager.abroadcast_app_event(ConfigChanged(key="k", old_value="a", new_value="b"))
 
-        assert sorted(completed) == ["slow", "sync"]
+        assert sorted(completed) == ["survivor", "sync"]
         assert "failing_listener" in caplog.text
         assert "ConfigChanged" in caplog.text
 
@@ -414,13 +416,15 @@ class TestBroadcastAppEventListenerIsolation:
     async def test_sync_broadcast_runs_siblings_after_a_listener_raises(self) -> None:
         event_manager = EventManager()
         completed: list[str] = []
+        failed = asyncio.Event()
 
         async def failing_listener(_event: ConfigChanged) -> None:
+            failed.set()
             msg = "listener blew up"
             raise PermissionError(msg)
 
         async def surviving_listener(_event: ConfigChanged) -> None:
-            await asyncio.sleep(0)
+            await failed.wait()
             completed.append("survivor")
 
         event_manager.add_listener_to_app_event(ConfigChanged, failing_listener)
