@@ -13,6 +13,8 @@ from griptape_nodes.common.macro_parser import ParsedMacro
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowRegistry
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.context_events import (
+    GetWorkflowContextRequest,
+    GetWorkflowContextSuccess,
     SetWorkflowContextFailure,
     SetWorkflowContextRequest,
     SetWorkflowContextSuccess,
@@ -537,3 +539,73 @@ class TestEnsureWorkflowAndFlowRequest:
         assert result.created_flow is True
 
         self._cleanup(griptape_nodes)
+
+
+class TestGetWorkflowContextIsLoading:
+    """GetWorkflowContext's is_loading answers whether a load is still populating the workflow it returns."""
+
+    def test_reports_not_loading_by_default(self, griptape_nodes: Engine) -> None:
+        context_manager = griptape_nodes.ContextManager()
+        context_manager.push_workflow(workflow_name="my_workflow")
+        try:
+            result = context_manager.on_get_workflow_context_request(GetWorkflowContextRequest())
+        finally:
+            context_manager.pop_workflow()
+
+        assert isinstance(result, GetWorkflowContextSuccess)
+        assert result.workflow_name == "my_workflow"
+        assert result.is_loading is False
+
+    @pytest.mark.asyncio
+    async def test_reports_loading_for_a_workflow_a_load_entered(self, griptape_nodes: Engine) -> None:
+        """Drives is_loading through a real GetWorkflowContextRequest response, not a patched predicate."""
+        context_manager = griptape_nodes.ContextManager()
+        workflow_manager = griptape_nodes.WorkflowManager()
+
+        try:
+            async with workflow_manager._tracking_workflow_load("some/workflow.py"):
+                context_manager.push_workflow(workflow_name="my_workflow")
+                result = context_manager.on_get_workflow_context_request(GetWorkflowContextRequest())
+        finally:
+            context_manager.pop_workflow()
+
+        assert isinstance(result, GetWorkflowContextSuccess)
+        assert result.workflow_name == "my_workflow"
+        assert result.is_loading is True
+
+    @pytest.mark.asyncio
+    async def test_reports_loading_for_a_workflow_that_was_already_open_when_the_load_started(
+        self, griptape_nodes: Engine
+    ) -> None:
+        """RunWorkflowWithCurrentState rebuilds the open workflow in place instead of entering a new one."""
+        context_manager = griptape_nodes.ContextManager()
+        workflow_manager = griptape_nodes.WorkflowManager()
+
+        context_manager.push_workflow(workflow_name="my_workflow")
+        try:
+            async with workflow_manager._tracking_workflow_load("some/workflow.py"):
+                result = context_manager.on_get_workflow_context_request(GetWorkflowContextRequest())
+        finally:
+            context_manager.pop_workflow()
+
+        assert isinstance(result, GetWorkflowContextSuccess)
+        assert result.is_loading is True
+
+    @pytest.mark.asyncio
+    async def test_reports_not_loading_once_the_load_that_entered_the_workflow_finished(
+        self, griptape_nodes: Engine
+    ) -> None:
+        """A workflow left in context by a finished load must settle, not stay reported as loading."""
+        context_manager = griptape_nodes.ContextManager()
+        workflow_manager = griptape_nodes.WorkflowManager()
+
+        try:
+            async with workflow_manager._tracking_workflow_load("some/workflow.py"):
+                context_manager.push_workflow(workflow_name="my_workflow")
+
+            result = context_manager.on_get_workflow_context_request(GetWorkflowContextRequest())
+        finally:
+            context_manager.pop_workflow()
+
+        assert isinstance(result, GetWorkflowContextSuccess)
+        assert result.is_loading is False

@@ -7,6 +7,7 @@ import pickle
 import re
 import sys
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -57,6 +58,7 @@ from griptape_nodes.retained_mode.events.app_events import (
     GetEngineVersionResultSuccess,
     InitializationPhase,
     InitializationStatus,
+    WorkflowLoadComplete,
 )
 
 # Runtime imports for ResultDetails since it's used at runtime
@@ -223,7 +225,7 @@ from griptape_nodes.utils.file_utils import find_files_recursive
 from griptape_nodes.utils.string_utils import normalize_display_name
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import AsyncIterator, Callable, Sequence
     from types import TracebackType
 
     from griptape_nodes.exe_types.core_types import Parameter
@@ -349,6 +351,20 @@ class WorkflowManager(EngineScoped):
             self.manager._squelch_workflow_altered_count -= 1
 
     _squelch_workflow_altered_count: int = 0
+
+    @dataclass
+    class WorkflowLoadRecord:
+        """One load-request handler's in-flight load: what it is loading, how it ended, whether it is done.
+
+        Every workflow context the load enters holds a reference to this record, so `in_progress`
+        going false settles all of them at once. See `_tracking_workflow_load` for how a handler
+        owns and fills one in.
+        """
+
+        relative_file_path: str
+        workflow_name: str | None = None
+        successful: bool = False
+        in_progress: bool = True
 
     # Track referenced workflow import context stack
     class ReferencedWorkflowContext:
@@ -868,7 +884,15 @@ class WorkflowManager(EngineScoped):
                 raise RuntimeError(error_message)
 
     async def run_workflow(self, relative_file_path: str) -> WorkflowExecutionResult:
-        # Resolve path using utility function
+        """Execute a workflow file's build_workflow() (or, for legacy files, its top-level code).
+
+        Shared by every caller that needs to run a workflow file: the three load-request
+        handlers, and importing a workflow as a referenced sub flow. Reports only whether
+        execution succeeded; it has no notion of a load being in progress. A caller that needs
+        to report load progress to a client does so itself (see `_tracking_workflow_load`),
+        because only the caller knows whether this particular execution is a load a client is
+        waiting on or an import into an already-open canvas.
+        """
         workspace_path = self.engine.config_manager.workspace_path
         complete_file_path = resolve_workspace_path(Path(relative_file_path), workspace_path)
         try:
@@ -916,6 +940,86 @@ class WorkflowManager(EngineScoped):
             execution_successful=True,
             execution_details=f"Succeeded in running workflow on path '{complete_file_path}'.",
         )
+
+    @asynccontextmanager
+    async def _tracking_workflow_load(self, relative_file_path: str) -> AsyncIterator[WorkflowLoadRecord]:
+        """Own the in-flight load a load-request handler is executing, for its entire handler body.
+
+        Wraps `on_run_workflow_from_scratch_request`, `on_run_workflow_with_current_state_request`,
+        and `on_run_workflow_from_registry_request`, the three handlers that load a workflow file on
+        a caller's behalf. Each yields a WorkflowLoadRecord it fills in as its load proceeds:
+        `workflow_name` and `successful` are set once the file has finished executing (see
+        `_record_load_outcome`), before any cleanup the handler still has to do, such as clearing all
+        object state after a failed load. Broadcasting WorkflowLoadComplete only once this scope's
+        caller (the handler's own body) has run to completion means a client that reacts to the event
+        by re-querying engine state sees a settled engine, not one about to be cleaned up.
+
+        ContextManager holds the record for the duration and stamps it onto every workflow context
+        the load enters, which is how GetWorkflowContext answers `is_loading`. The record is the one
+        source of truth for whether the load is still running, so clearing `in_progress` here settles
+        every context that references it without any per-context unwinding.
+
+        Importing a workflow as a referenced sub flow calls `run_workflow` directly rather than
+        through one of these three handlers, so it never enters this scope: an already-open canvas
+        importing another workflow into itself never becomes an in-flight load, and the canvas keeps
+        reporting itself as loaded. If a load handler is ever re-entered while a load is still in
+        flight, the inner call gets a scratch record of its own: it does not own the scope, so it
+        neither stamps contexts nor broadcasts, and writing its outcome into a record nobody reads
+        keeps it from corrupting the owner's `workflow_name` and `successful`.
+
+        Concurrent top-level loads on one engine are unsupported independent of anything tracked
+        here: `on_run_workflow_from_scratch_request` clears all object state before loading, so two
+        such loads running at once already corrupt each other's engine state regardless of how their
+        progress is reported.
+        """
+        context_manager = self.engine.context_manager
+        if context_manager.get_in_flight_workflow_load() is not None:
+            yield WorkflowManager.WorkflowLoadRecord(relative_file_path=relative_file_path, in_progress=False)
+            return
+        load_record = WorkflowManager.WorkflowLoadRecord(relative_file_path=relative_file_path)
+        context_manager.begin_workflow_load(load_record)
+        try:
+            yield load_record
+        finally:
+            load_record.in_progress = False
+            context_manager.end_workflow_load()
+            await self._broadcast_workflow_load_complete(load_record)
+
+    def _record_load_outcome(
+        self, load_record: WorkflowManager.WorkflowLoadRecord, execution_result: WorkflowExecutionResult
+    ) -> None:
+        """Fill in a load's outcome right after its file finishes executing, before any cleanup.
+
+        A failed from-registry load still clears all object state afterward, which wipes Context;
+        reading the resolved workflow name here keeps WorkflowLoadComplete naming the workflow
+        that was actually loading rather than whatever Context holds once that cleanup settles.
+        """
+        load_record.successful = execution_result.execution_successful
+        if self.engine.context_manager.has_current_workflow():
+            load_record.workflow_name = self.engine.context_manager.get_current_workflow_name()
+
+    async def _broadcast_workflow_load_complete(self, load_record: WorkflowManager.WorkflowLoadRecord) -> None:
+        """Broadcast that a load has finished, without letting a listener failure affect the load.
+
+        abroadcast_app_event deliberately propagates listener failures, as an ExceptionGroup raised
+        by the asyncio.TaskGroup it runs them in. That failure must not replace the exception or
+        result already unwinding from the load this broadcast is reporting on.
+        """
+        try:
+            await self.engine.abroadcast_app_event(
+                WorkflowLoadComplete(
+                    relative_file_path=load_record.relative_file_path,
+                    workflow_name=load_record.workflow_name,
+                    successful=load_record.successful,
+                )
+            )
+        except ExceptionGroup:
+            details = (
+                f"Attempted to notify listeners that workflow '{load_record.relative_file_path}' finished "
+                "loading. Failed due to an error raised by a WorkflowLoadComplete listener. The workflow "
+                "load itself was unaffected."
+            )
+            logger.exception(details)
 
     async def _ensure_libraries_for_workflow(
         self, *, relative_file_path: str, complete_file_path: Path
@@ -976,44 +1080,48 @@ class WorkflowManager(EngineScoped):
         return None
 
     async def on_run_workflow_from_scratch_request(self, request: RunWorkflowFromScratchRequest) -> ResultPayload:
-        # Squelch any ResultPayloads that indicate the workflow was changed, because we are loading it into a blank slate.
-        with WorkflowManager.WorkflowSquelchContext(self):
-            # Check if file path exists
-            relative_file_path = request.file_path
-            complete_file_path = WorkflowRegistry.get_complete_file_path(relative_file_path=relative_file_path)
-            if not await anyio.Path(complete_file_path).is_file():
-                details = f"Failed to find file. Path '{complete_file_path}' doesn't exist."
-                return RunWorkflowFromScratchResultFailure(result_details=details)
+        relative_file_path = request.file_path
+        async with self._tracking_workflow_load(relative_file_path) as load_record:
+            # Squelch any ResultPayloads that indicate the workflow was changed, because we are loading it into a blank slate.
+            with WorkflowManager.WorkflowSquelchContext(self):
+                # Check if file path exists
+                complete_file_path = WorkflowRegistry.get_complete_file_path(relative_file_path=relative_file_path)
+                if not await anyio.Path(complete_file_path).is_file():
+                    details = f"Failed to find file. Path '{complete_file_path}' doesn't exist."
+                    return RunWorkflowFromScratchResultFailure(result_details=details)
 
-            # Start with a clean slate.
-            clear_all_request = ClearAllObjectStateRequest(i_know_what_im_doing=True)
-            clear_all_result = await self.engine.ahandle_request(clear_all_request)
-            if not clear_all_result.succeeded():
-                details = f"Failed to clear the existing object state when trying to run '{complete_file_path}'."
-                return RunWorkflowFromScratchResultFailure(result_details=details)
+                # Start with a clean slate.
+                clear_all_request = ClearAllObjectStateRequest(i_know_what_im_doing=True)
+                clear_all_result = await self.engine.ahandle_request(clear_all_request)
+                if not clear_all_result.succeeded():
+                    details = f"Failed to clear the existing object state when trying to run '{complete_file_path}'."
+                    return RunWorkflowFromScratchResultFailure(result_details=details)
 
-            # Run the file, goddamn it
-            execution_result = await self.run_workflow(relative_file_path=relative_file_path)
-            if execution_result.execution_successful:
-                return RunWorkflowFromScratchResultSuccess(result_details=execution_result.execution_details)
+                # Run the file, goddamn it
+                execution_result = await self.run_workflow(relative_file_path=relative_file_path)
+                self._record_load_outcome(load_record, execution_result)
+                if execution_result.execution_successful:
+                    return RunWorkflowFromScratchResultSuccess(result_details=execution_result.execution_details)
 
-            logger.error(execution_result.execution_details)
-            return RunWorkflowFromScratchResultFailure(result_details=execution_result.execution_details)
+                logger.error(execution_result.execution_details)
+                return RunWorkflowFromScratchResultFailure(result_details=execution_result.execution_details)
 
     async def on_run_workflow_with_current_state_request(
         self, request: RunWorkflowWithCurrentStateRequest
     ) -> ResultPayload:
         relative_file_path = request.file_path
-        complete_file_path = WorkflowRegistry.get_complete_file_path(relative_file_path=relative_file_path)
-        if not await anyio.Path(complete_file_path).is_file():
-            details = f"Failed to find file. Path '{complete_file_path}' doesn't exist."
-            return RunWorkflowWithCurrentStateResultFailure(result_details=details)
-        execution_result = await self.run_workflow(relative_file_path=relative_file_path)
+        async with self._tracking_workflow_load(relative_file_path) as load_record:
+            complete_file_path = WorkflowRegistry.get_complete_file_path(relative_file_path=relative_file_path)
+            if not await anyio.Path(complete_file_path).is_file():
+                details = f"Failed to find file. Path '{complete_file_path}' doesn't exist."
+                return RunWorkflowWithCurrentStateResultFailure(result_details=details)
+            execution_result = await self.run_workflow(relative_file_path=relative_file_path)
+            self._record_load_outcome(load_record, execution_result)
 
-        if execution_result.execution_successful:
-            return RunWorkflowWithCurrentStateResultSuccess(result_details=execution_result.execution_details)
-        logger.error(execution_result.execution_details)
-        return RunWorkflowWithCurrentStateResultFailure(result_details=execution_result.execution_details)
+            if execution_result.execution_successful:
+                return RunWorkflowWithCurrentStateResultSuccess(result_details=execution_result.execution_details)
+            logger.error(execution_result.execution_details)
+            return RunWorkflowWithCurrentStateResultFailure(result_details=execution_result.execution_details)
 
     async def on_run_workflow_from_registry_request(self, request: RunWorkflowFromRegistryRequest) -> ResultPayload:
         await self._workflows_loading_complete.wait()
@@ -1046,40 +1154,44 @@ class WorkflowManager(EngineScoped):
         if not request.run_with_clean_slate and self.engine.context_manager.has_current_workflow():
             context_warning = f"Started a new workflow '{request.workflow_name}' but a workflow '{self.engine.context_manager.get_current_workflow_name()}' was already in the Current Context. Replacing the old with the new."
 
-        # Squelch any ResultPayloads that indicate the workflow was changed, because we are loading it.
-        with WorkflowManager.WorkflowSquelchContext(self):
-            if request.run_with_clean_slate:
-                # Start with a clean slate.
-                clear_all_request = ClearAllObjectStateRequest(i_know_what_im_doing=True)
-                clear_all_result = await self.engine.ahandle_request(clear_all_request)
-                if not clear_all_result.succeeded():
-                    details = f"Failed to clear the existing object state when preparing to run workflow '{request.workflow_name}'."
-                    return RunWorkflowFromRegistryResultFailure(result_details=details)
+        async with self._tracking_workflow_load(relative_file_path) as load_record:
+            # Squelch any ResultPayloads that indicate the workflow was changed, because we are loading it.
+            with WorkflowManager.WorkflowSquelchContext(self):
+                if request.run_with_clean_slate:
+                    # Start with a clean slate.
+                    clear_all_request = ClearAllObjectStateRequest(i_know_what_im_doing=True)
+                    clear_all_result = await self.engine.ahandle_request(clear_all_request)
+                    if not clear_all_result.succeeded():
+                        details = f"Failed to clear the existing object state when preparing to run workflow '{request.workflow_name}'."
+                        return RunWorkflowFromRegistryResultFailure(result_details=details)
 
-            # Let's run under the assumption that this Workflow will become our Current Context; if we fail, it will revert.
-            self.engine.context_manager.push_workflow(request.workflow_name)
-            # run file
-            execution_result = await self.run_workflow(relative_file_path=relative_file_path)
+                # Let's run under the assumption that this Workflow will become our Current Context; if we fail, it will revert.
+                self.engine.context_manager.push_workflow(request.workflow_name)
+                # run file
+                execution_result = await self.run_workflow(relative_file_path=relative_file_path)
+                self._record_load_outcome(load_record, execution_result)
 
-            if not execution_result.execution_successful:
-                result_messages = []
-                if context_warning:
-                    result_messages.append(ResultDetail(message=context_warning, level=logging.WARNING))
-                result_messages.append(ResultDetail(message=execution_result.execution_details, level=logging.ERROR))
+                if not execution_result.execution_successful:
+                    result_messages = []
+                    if context_warning:
+                        result_messages.append(ResultDetail(message=context_warning, level=logging.WARNING))
+                    result_messages.append(
+                        ResultDetail(message=execution_result.execution_details, level=logging.ERROR)
+                    )
 
-                # Attempt to clear everything out, as we modified the engine state getting here.
-                clear_all_request = ClearAllObjectStateRequest(i_know_what_im_doing=True)
-                clear_all_result = await self.engine.ahandle_request(clear_all_request)
+                    # Attempt to clear everything out, as we modified the engine state getting here.
+                    clear_all_request = ClearAllObjectStateRequest(i_know_what_im_doing=True)
+                    clear_all_result = await self.engine.ahandle_request(clear_all_request)
 
-                # The clear-all above here wipes the ContextManager, so no need to do a pop_workflow().
-                return RunWorkflowFromRegistryResultFailure(result_details=ResultDetails(*result_messages))
+                    # The clear-all above here wipes the ContextManager, so no need to do a pop_workflow().
+                    return RunWorkflowFromRegistryResultFailure(result_details=ResultDetails(*result_messages))
 
-        # Success!
-        result_messages = []
-        if context_warning:
-            result_messages.append(ResultDetail(message=context_warning, level=logging.WARNING))
-        result_messages.append(ResultDetail(message=execution_result.execution_details, level=logging.DEBUG))
-        return RunWorkflowFromRegistryResultSuccess(result_details=ResultDetails(*result_messages))
+            # Success!
+            result_messages = []
+            if context_warning:
+                result_messages.append(ResultDetail(message=context_warning, level=logging.WARNING))
+            result_messages.append(ResultDetail(message=execution_result.execution_details, level=logging.DEBUG))
+            return RunWorkflowFromRegistryResultSuccess(result_details=ResultDetails(*result_messages))
 
     def _persist_external_workflow_registration(self, full_path: str) -> None:
         """Persist an out-of-workspace workflow path to global config so it survives restarts.

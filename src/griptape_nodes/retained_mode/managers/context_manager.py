@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
+    from griptape_nodes.retained_mode.managers.workflow_manager import WorkflowManager
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -41,6 +42,7 @@ class ContextManager(EngineScoped):
     """
 
     _workflow_stack: list[ContextManager.WorkflowContextState]
+    _in_flight_workflow_load: WorkflowManager.WorkflowLoadRecord | None
 
     class WorkflowContextError(Exception):
         """Base exception for workflow context errors."""
@@ -60,9 +62,16 @@ class ContextManager(EngineScoped):
         _name: str
         _file_path: str | None
         _working_directory: str | None
+        _load: WorkflowManager.WorkflowLoadRecord | None
         _flow_stack: list[ContextManager.FlowContextState]
 
-        def __init__(self, name: str, file_path: str | None = None, working_directory: str | None = None):
+        def __init__(
+            self,
+            name: str,
+            file_path: str | None = None,
+            working_directory: str | None = None,
+            load: WorkflowManager.WorkflowLoadRecord | None = None,
+        ):
             self._name = name
             # The path this context was entered WITH, when it was entered by path. Retained
             # because `_name` is a registry key derived against the workspace that was active
@@ -76,7 +85,20 @@ class ContextManager(EngineScoped):
             # a file whose PARENT is the directory. Always loses to `_file_path` -- once the
             # workflow has been saved, the saved file's own location is the better answer.
             self._working_directory = working_directory
+            # The load that is populating this context, if it was entered by one. See
+            # `is_loading`.
+            self._load = load
             self._flow_stack = []
+
+        def is_loading(self) -> bool:
+            """Whether a load is still populating this Workflow context.
+
+            A workflow is entered before its nodes exist, so a name being current is not proof
+            the workflow is usable. This reports the gap. Reading through to the load record
+            rather than caching a bool means the load finishing settles every context it
+            entered at once, with no unwinding to get wrong.
+            """
+            return self._load is not None and self._load.in_progress
 
         def push_flow(self, flow: ControlFlow) -> ControlFlow:
             """Push a flow name onto this workflow's flow stack."""
@@ -266,6 +288,7 @@ class ContextManager(EngineScoped):
         """Initialize the context manager with empty workflow and flow stacks."""
         super().__init__(engine)
         self._workflow_stack = []
+        self._in_flight_workflow_load = None
         event_manager.assign_manager_to_request_type(
             request_type=SetWorkflowContextRequest, callback=self.on_set_workflow_context_request
         )
@@ -327,13 +350,16 @@ class ContextManager(EngineScoped):
     def on_get_workflow_context_request(self, request: GetWorkflowContextRequest) -> ResultPayload:  # noqa: ARG002
         workflow_name = None
         is_saved = None
+        is_loading = False
         if self.has_current_workflow():
             workflow_name = self.get_current_workflow_name()
+            is_loading = self.is_current_workflow_loading()
             if WorkflowRegistry.has_workflow_with_name(workflow_name):
                 is_saved = WorkflowRegistry.get_workflow_by_name(workflow_name).is_saved
         return GetWorkflowContextSuccess(
             workflow_name=workflow_name,
             is_saved=is_saved,
+            is_loading=is_loading,
             result_details=f"Successfully retrieved workflow context: {workflow_name or 'None'}",
         )
 
@@ -575,6 +601,22 @@ class ContextManager(EngineScoped):
 
         return self._workflow_stack[-1]._working_directory
 
+    def is_current_workflow_loading(self) -> bool:
+        """Whether a load is still populating the current Workflow context.
+
+        Answers about the workflow this context IS, not about whatever the engine happens to be
+        executing: importing a referenced sub flow into an already-open workflow reads False,
+        because that workflow is not the thing being loaded.
+
+        Raises:
+            NoActiveWorkflowError: If no Workflow context is active.
+        """
+        if not self.has_current_workflow():
+            msg = "No active Workflow context"
+            raise self.NoActiveWorkflowError(msg)
+
+        return self._workflow_stack[-1].is_loading()
+
     def set_current_workflow_name(self, new_name: str) -> None:
         """Update the name of the current Workflow context.
 
@@ -670,6 +712,34 @@ class ContextManager(EngineScoped):
         current_node = current_flow._node_stack[-1]
         return current_node.get_current_element()
 
+    def get_in_flight_workflow_load(self) -> WorkflowManager.WorkflowLoadRecord | None:
+        """The load currently populating context, if any. See `begin_workflow_load`."""
+        return self._in_flight_workflow_load
+
+    def begin_workflow_load(self, load: WorkflowManager.WorkflowLoadRecord) -> None:
+        """Mark `load` as the load populating context, until the matching `end_workflow_load`.
+
+        Every workflow entered from here on is stamped with `load` by `push_workflow`, which is
+        what `is_current_workflow_loading` reports. The workflow that is ALREADY current is
+        stamped too, because a load into an open canvas (RunWorkflowWithCurrentState) mutates
+        that workflow in place instead of entering a new one, and a client watching it needs to
+        know its graph is mid-build. A load that starts with no workflow current stamps nothing
+        yet; the workflow its file enters gets stamped when it is pushed.
+
+        Called by WorkflowManager, which owns loads. See `WorkflowManager._tracking_workflow_load`.
+        """
+        self._in_flight_workflow_load = load
+        if self.has_current_workflow():
+            self._workflow_stack[-1]._load = load
+
+    def end_workflow_load(self) -> None:
+        """Stop stamping newly entered workflows with the in-flight load.
+
+        Does not settle the workflows already stamped with it. They read the load's own
+        `in_progress`, which its owner clears, so they settle together rather than one at a time.
+        """
+        self._in_flight_workflow_load = None
+
     def push_workflow(
         self,
         workflow_name: str | None = None,
@@ -731,7 +801,10 @@ class ContextManager(EngineScoped):
             raise ValueError(msg)
 
         workflow_context_state = self.WorkflowContextState(
-            resolved_name, file_path=file_path, working_directory=working_directory
+            resolved_name,
+            file_path=file_path,
+            working_directory=working_directory,
+            load=self._in_flight_workflow_load,
         )
         self._workflow_stack.append(workflow_context_state)
         return resolved_name
