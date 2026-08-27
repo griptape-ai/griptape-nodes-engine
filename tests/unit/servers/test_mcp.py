@@ -53,8 +53,6 @@ class TestSummarizeResultDetails:
 class TestTrimResponse:
     def test_drops_envelope_noise_and_flattens_details(self) -> None:
         raw = {
-            "engine_id": "engine-1",
-            "session_id": "session-1",
             "request": {"node_type": "Probe", "library": "demo"},
             "request_id": "abc",
             "response_topic": "response",
