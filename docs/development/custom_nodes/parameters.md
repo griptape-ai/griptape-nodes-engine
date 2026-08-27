@@ -828,10 +828,16 @@ The engine answers that with a **port summary** per node type, served by
 
 There is nothing to declare and nothing to keep in sync — the engine derives all four by
 constructing one throwaway instance of your node and reading the parameters your `__init__`
-added. `input_types` and `output_type` are read straight off each `Parameter` (each falling
-back to `type` when not set), `allowed_modes` decides which side a parameter lands on, and
-`private=True` parameters are skipped. Control ports are reported only as the two booleans and
-never appear in the type lists, because control and data connections never interconnect.
+added. `input_types` and `output_type` are read straight off each `Parameter`, `allowed_modes`
+decides which side a parameter lands on, and `private=True` parameters are skipped. Control ports
+are reported only as the two booleans and never appear in the type lists, because control and
+data connections never interconnect.
+
+Two defaults surprise people here. A parameter with the default `allowed_modes` is both an input
+and an output, so it lands on *both* sides. And the unset direction inherits from the set one:
+`input_types` falls back to `type`, then `output_type`, then `"str"`; `output_type` falls back to
+`type`, then the first entry of `input_types`, then `"str"`. So a parameter declaring only
+`input_types=["ImageArtifact"]` is reported as emitting `ImageArtifact` too.
 
 Because it is a union, a match means "this node type has *some* port that could accept the
 dragged connection", not that a specific port will. The real connection is still resolved

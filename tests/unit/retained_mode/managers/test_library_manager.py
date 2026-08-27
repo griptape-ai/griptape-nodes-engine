@@ -34,6 +34,7 @@ from griptape_nodes.node_library.library_declarations import (
 from griptape_nodes.node_library.library_registry import (
     LibraryMetadata,
     LibraryRegistry,
+    LibraryRegistryError,
     LibrarySchema,
     NodeMetadata,
     get_declared_models,
@@ -2201,11 +2202,27 @@ class TestNodePortSummary:
         assert "list[str]" in summary.output_types
         assert "str" in summary.output_types
 
-    def test_container_element_type_matches_what_a_real_child_declares(self) -> None:
-        """Pin the element type to add_child_parameter, so the two cannot drift apart."""
-        probe = _PortSummaryContainerProbe(name="probe")
-        container = probe.get_parameter_by_name("items")
-        assert isinstance(container, ParameterList)
+    @pytest.mark.parametrize(
+        "declared",
+        [
+            # Fully declared: nothing can drift.
+            {"input_types": ["str"], "output_type": "str"},
+            # Only `type`: both element sides resolve through Parameter's fallback chain.
+            {"type": "int"},
+            # Only one direction declared: the other inherits it.
+            {"input_types": ["ImageArtifact"]},
+            {"output_type": "ImageArtifact"},
+            # Nothing declared: both sides fall through to "str".
+            {},
+        ],
+    )
+    def test_container_element_type_matches_what_a_real_child_declares(self, declared: dict[str, Any]) -> None:
+        """Pin the element type to add_child_parameter across every declaration shape.
+
+        The interesting cases are the ones that resolve through `Parameter`'s fallback chain --
+        those are what a future change to that chain would silently break.
+        """
+        container = ParameterList(name="items", tooltip="Accepts many.", **declared)
 
         child = container.add_child_parameter()
 
@@ -2346,11 +2363,11 @@ class TestGetPortSummariesForAllLibrariesRequest:
         library_manager = engine.library_manager
         self._register_probe_library(_PortSummaryDataOnlyProbe)
 
-        async def invalidate_midway(library_name: str) -> dict[str, NodePortSummary]:
-            summaries = await _LibraryManager._compute_port_summaries_for_library(library_manager, library_name)
+        async def invalidate_midway(library_name: str) -> Any:
+            computation = await _LibraryManager._compute_port_summaries_for_library(library_manager, library_name)
             # Stand in for a reload / sandbox registration landing while the pass was awaiting.
             library_manager._invalidate_port_summaries(library_name)
-            return summaries
+            return computation
 
         with patch.object(
             library_manager, "_compute_port_summaries_for_library", side_effect=invalidate_midway
@@ -2369,6 +2386,99 @@ class TestGetPortSummariesForAllLibrariesRequest:
         assert isinstance(second, GetPortSummariesForAllLibrariesResultSuccess)
         assert compute_spy.call_count == expected_compute_calls
         assert self._LIBRARY_NAME not in library_manager._library_to_port_summaries
+
+    @pytest.mark.asyncio
+    async def test_a_node_type_that_fails_to_resolve_does_not_fail_the_whole_response(
+        self, engine: Engine
+    ) -> None:
+        """Resolution raises more than import errors, and the response covers every library.
+
+        `Library.get_node_class` raises `LibraryRegistryError` for a node type unregistered since
+        the loop read `get_registered_nodes()`, and `NodeTypeEntry.resolve()` raises `RuntimeError`
+        for an entry with neither class nor loader. Neither may take down the other libraries.
+        """
+        library_manager = engine.library_manager
+        self._register_probe_library(_PortSummaryDataOnlyProbe, _PortSummaryProbe)
+        library = LibraryRegistry.get_library(self._LIBRARY_NAME)
+        real_get_node_class = library.get_node_class
+
+        def raise_for_one_node_type(node_type: str) -> Any:
+            if node_type == _PortSummaryProbe.__name__:
+                msg = f"Node type '{node_type}' vanished mid-pass."
+                raise LibraryRegistryError(msg)
+            return real_get_node_class(node_type)
+
+        with patch.object(library, "get_node_class", side_effect=raise_for_one_node_type):
+            result = await library_manager.on_get_port_summaries_for_all_libraries_request(
+                GetPortSummariesForAllLibrariesRequest()
+            )
+
+        assert isinstance(result, GetPortSummariesForAllLibrariesResultSuccess)
+        summaries = result.library_name_to_port_summaries[self._LIBRARY_NAME]
+        assert _PortSummaryProbe.__name__ not in summaries
+        assert _PortSummaryDataOnlyProbe.__name__ in summaries
+
+    @pytest.mark.asyncio
+    async def test_does_not_cache_a_pass_that_hit_a_transient_failure(self, engine: Engine) -> None:
+        """A timeout may not recur, so baking its gap into the cache would make it permanent.
+
+        `asyncio.to_thread` shares the loop's default executor, so a saturated pool can time out a
+        probe that would otherwise have succeeded. Nothing invalidates the library afterwards.
+        """
+        library_manager = engine.library_manager
+        self._register_probe_library(_PortSummaryDataOnlyProbe)
+
+        async def time_out_once(awaitable: Any, *_args: Any, **_kwargs: Any) -> Any:
+            # Standing in for wait_for, so nothing else will await the to_thread coroutine.
+            awaitable.close()
+            raise TimeoutError
+
+        with patch.object(asyncio, "wait_for", side_effect=time_out_once):
+            first = await library_manager.on_get_port_summaries_for_all_libraries_request(
+                GetPortSummariesForAllLibrariesRequest()
+            )
+
+        assert isinstance(first, GetPortSummariesForAllLibrariesResultSuccess)
+        assert first.library_name_to_port_summaries[self._LIBRARY_NAME] == {}
+        assert self._LIBRARY_NAME not in library_manager._library_to_port_summaries
+
+        # With the pool no longer saturated, the next request must actually probe again.
+        second = await library_manager.on_get_port_summaries_for_all_libraries_request(
+            GetPortSummariesForAllLibrariesRequest()
+        )
+
+        assert isinstance(second, GetPortSummariesForAllLibrariesResultSuccess)
+        assert _PortSummaryDataOnlyProbe.__name__ in second.library_name_to_port_summaries[self._LIBRARY_NAME]
+
+    @pytest.mark.asyncio
+    async def test_caches_a_pass_whose_only_gap_is_a_broken_node_type(self, engine: Engine) -> None:
+        """A node whose __init__ raises will keep raising until the library reloads.
+
+        That gap is stable, so the pass is still worth caching -- otherwise one broken node type in
+        a library would mean re-probing every node type in it on every menu open.
+        """
+        library_manager = engine.library_manager
+        self._register_probe_library(_PortSummaryDataOnlyProbe, _RaisingProbe)
+
+        await library_manager.on_get_port_summaries_for_all_libraries_request(GetPortSummariesForAllLibrariesRequest())
+
+        assert self._LIBRARY_NAME in library_manager._library_to_port_summaries
+
+    @pytest.mark.asyncio
+    async def test_result_does_not_alias_the_cache(self, engine: Engine) -> None:
+        """The payload must not hand out the cache's own dict, or a consumer can corrupt it."""
+        library_manager = engine.library_manager
+        self._register_probe_library(_PortSummaryDataOnlyProbe)
+
+        result = await library_manager.on_get_port_summaries_for_all_libraries_request(
+            GetPortSummariesForAllLibrariesRequest()
+        )
+
+        assert isinstance(result, GetPortSummariesForAllLibrariesResultSuccess)
+        served = result.library_name_to_port_summaries[self._LIBRARY_NAME]
+        served.pop(_PortSummaryDataOnlyProbe.__name__)
+
+        assert _PortSummaryDataOnlyProbe.__name__ in library_manager._library_to_port_summaries[self._LIBRARY_NAME]
 
     @pytest.mark.asyncio
     async def test_recomputes_after_library_is_unloaded(self, engine: Engine) -> None:
