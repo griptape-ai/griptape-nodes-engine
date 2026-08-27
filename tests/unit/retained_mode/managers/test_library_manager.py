@@ -1858,6 +1858,32 @@ class _RaisingProbe(BaseNode):
         raise RuntimeError(msg)
 
 
+class _HostileElementTypesList(ParameterList):
+    """Container whose element-type accessor raises, as a library's subclass is free to do.
+
+    `get_element_input_types` is an override point nothing calls during construction -- only the
+    port summary pass does -- so a subclass can raise there on a node that builds perfectly well.
+    """
+
+    def get_element_input_types(self) -> list[str]:
+        msg = "simulated failure computing element types"
+        raise RuntimeError(msg)
+
+
+class _HostileTypesProbe(BaseNode):
+    """Node type that constructs fine but cannot be summarized."""
+
+    def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
+        super().__init__(name=name, metadata=metadata)
+        self.add_parameter(
+            _HostileElementTypesList(
+                name="hostile",
+                input_types=["str"],
+                tooltip="Container whose element types cannot be read.",
+            )
+        )
+
+
 class _CatalogProbe(BaseNode):
     """Probe whose __init__ sources a parameter default from the library model_catalog.
 
@@ -2433,13 +2459,15 @@ class TestGetPortSummariesForAllLibrariesRequest:
         real_construct = _LibraryManager._construct_probe_node
         release_blocked_probe = threading.Event()
 
-        def block_one_node_type(manager: _LibraryManager, *args: Any, **kwargs: Any) -> Any:
-            if args[1] == timed_out_node_type:
+        def block_one_node_type(
+            manager: _LibraryManager, library_name: str, node_type: str, *args: Any, **kwargs: Any
+        ) -> Any:
+            if node_type == timed_out_node_type:
                 # Stand in for an __init__ that makes a blocking call, exercising the real
                 # wait_for/to_thread timeout rather than a patched one. Released below so the
                 # worker thread does not outlive the test.
                 release_blocked_probe.wait(timeout=30)
-            return real_construct(manager, *args, **kwargs)
+            return real_construct(manager, library_name, node_type, *args, **kwargs)
 
         try:
             with (
@@ -2466,18 +2494,123 @@ class TestGetPortSummariesForAllLibrariesRequest:
             second = await library_manager.on_get_port_summaries_for_all_libraries_request(
                 GetPortSummariesForAllLibrariesRequest()
             )
-            probed_node_types = [call.args[2] for call in probe_spy.call_args_list]
 
             # A third request has no retries left to spend, so it probes nothing at all -- this is
-            # what stops a permanently stuck __init__ from leaking a thread per menu open.
+            # what stops a permanently stuck __init__ from leaking a thread per menu open. Both
+            # requests share one spy, so the single recorded call below covers that claim too.
             await library_manager.on_get_port_summaries_for_all_libraries_request(
                 GetPortSummariesForAllLibrariesRequest()
             )
+            # autospec passes self positionally: (manager, library_name, node_type, node_class, ...).
+            probed_node_types = [call.args[2] for call in probe_spy.call_args_list]
 
         assert isinstance(second, GetPortSummariesForAllLibrariesResultSuccess)
         assert probed_node_types == [timed_out_node_type]
         assert timed_out_node_type in second.library_name_to_port_summaries[self._LIBRARY_NAME]
         assert self._LIBRARY_NAME not in library_manager._library_to_port_summary_retries
+
+    @pytest.mark.asyncio
+    async def test_contains_a_node_type_whose_element_types_cannot_be_read(self, engine: Engine) -> None:
+        """Summarizing a container's element types runs library code construction never reached.
+
+        `get_element_input_types` exists for this pass alone, so a subclass that raises there gets
+        past construction and lands in the summarize step. One library's Parameter subclass must not
+        take down the summaries for every library in the response -- the handler answers for all of
+        them at once.
+        """
+        library_manager = engine.library_manager
+        self._register_probe_library(_HostileTypesProbe, _PortSummaryDataOnlyProbe)
+
+        result = await library_manager.on_get_port_summaries_for_all_libraries_request(
+            GetPortSummariesForAllLibrariesRequest()
+        )
+
+        assert isinstance(result, GetPortSummariesForAllLibrariesResultSuccess)
+        summaries = result.library_name_to_port_summaries[self._LIBRARY_NAME]
+        # The unsummarizable node type is left out; the healthy one behind it is not collateral.
+        assert set(summaries) == {_PortSummaryDataOnlyProbe.__name__}
+        # Its getter will raise again next request, so it is a stable gap rather than a retry.
+        assert self._LIBRARY_NAME not in library_manager._library_to_port_summary_retries
+
+    @pytest.mark.asyncio
+    async def test_contains_a_node_type_whose_library_metadata_cannot_be_read(
+        self, engine: Engine
+    ) -> None:
+        """Building the probe's metadata reads and serializes the library author's node metadata.
+
+        A malformed entry raises there, outside the node's own __init__, and must be contained to
+        the one node type for the same reason as an unreadable parameter.
+        """
+        library_manager = engine.library_manager
+        self._register_probe_library(_PortSummaryProbe, _PortSummaryDataOnlyProbe)
+        broken_node_type = _PortSummaryProbe.__name__
+        real_metadata = _LibraryManager._library_node_metadata_for_probe
+
+        def fail_for_one_node_type(manager: _LibraryManager, *, library: Any, node_type: str) -> Any:
+            if node_type == broken_node_type:
+                msg = "simulated malformed library node metadata"
+                raise RuntimeError(msg)
+            return real_metadata(manager, library=library, node_type=node_type)
+
+        with patch.object(
+            _LibraryManager, "_library_node_metadata_for_probe", side_effect=fail_for_one_node_type, autospec=True
+        ):
+            result = await library_manager.on_get_port_summaries_for_all_libraries_request(
+                GetPortSummariesForAllLibrariesRequest()
+            )
+
+        assert isinstance(result, GetPortSummariesForAllLibrariesResultSuccess)
+        assert set(result.library_name_to_port_summaries[self._LIBRARY_NAME]) == {_PortSummaryDataOnlyProbe.__name__}
+        assert self._LIBRARY_NAME not in library_manager._library_to_port_summary_retries
+
+    @pytest.mark.asyncio
+    async def test_stops_probing_a_library_once_its_timeout_budget_is_spent(
+        self, engine: Engine
+    ) -> None:
+        """Each timeout costs a thread that cannot be reclaimed, so one pass cannot keep spending.
+
+        A library of blocking nodes would otherwise drain the loop's default executor in a single
+        request and stall every other threaded operation in the engine. The abandoned node types get
+        no retry either -- a retry would walk straight back into the timeouts that stopped the pass.
+        """
+        library_manager = engine.library_manager
+        # The blocking node type is registered first so the pass aborts while a healthy one is still
+        # unprobed, which is the collateral this bound accepts.
+        self._register_probe_library(_PortSummaryProbe, _PortSummaryDataOnlyProbe)
+        timed_out_node_type = _PortSummaryProbe.__name__
+        abandoned_node_type = _PortSummaryDataOnlyProbe.__name__
+        real_construct = _LibraryManager._construct_probe_node
+        release_blocked_probe = threading.Event()
+
+        def block_one_node_type(
+            manager: _LibraryManager, library_name: str, node_type: str, *args: Any, **kwargs: Any
+        ) -> Any:
+            if node_type == timed_out_node_type:
+                release_blocked_probe.wait(timeout=30)
+            return real_construct(manager, library_name, node_type, *args, **kwargs)
+
+        try:
+            with (
+                patch.object(_LibraryManager, "_SCHEMA_PROBE_TIMEOUT_S", 0.2),
+                patch.object(_LibraryManager, "_PORT_SUMMARY_TIMEOUT_BUDGET", 1),
+                patch.object(
+                    _LibraryManager, "_construct_probe_node", side_effect=block_one_node_type, autospec=True
+                ) as probe_spy,
+            ):
+                result = await library_manager.on_get_port_summaries_for_all_libraries_request(
+                    GetPortSummariesForAllLibrariesRequest()
+                )
+                probed_node_types = [call.args[2] for call in probe_spy.call_args_list]
+        finally:
+            release_blocked_probe.set()
+
+        assert isinstance(result, GetPortSummariesForAllLibrariesResultSuccess)
+        # The healthy node type after the abort is never even attempted...
+        assert probed_node_types == [timed_out_node_type]
+        assert result.library_name_to_port_summaries[self._LIBRARY_NAME] == {}
+        # ...and only the node type that actually timed out is owed a retry.
+        assert library_manager._library_to_port_summary_retries[self._LIBRARY_NAME] == frozenset({timed_out_node_type})
+        assert abandoned_node_type not in library_manager._library_to_port_summaries[self._LIBRARY_NAME]
 
     @pytest.mark.asyncio
     async def test_caches_a_pass_whose_only_gap_is_a_broken_node_type(self, engine: Engine) -> None:
@@ -2534,10 +2667,14 @@ class TestGetPortSummariesForAllLibrariesRequest:
 
         assert event_queue.empty()
 
-        # Control: the same construction without suppression does publish, which is what makes the
-        # assertion above mean something.
-        with LibraryRegistry.constructing_node():
-            _PortSummaryProbe(name="unsuppressed")
+        # Control: the same construction in a worker thread, differing only in that it does not
+        # suppress, does publish. That is what makes the assertion above mean something -- it pins
+        # the silence on the ContextVar rather than on the thread boundary swallowing events.
+        def construct_without_suppression() -> None:
+            with LibraryRegistry.constructing_node():
+                _PortSummaryProbe(name="unsuppressed")
+
+        await asyncio.to_thread(construct_without_suppression)
         await asyncio.sleep(0.05)
 
         assert not event_queue.empty()

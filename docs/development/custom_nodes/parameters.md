@@ -850,10 +850,11 @@ the element type its children take. A `ParameterList(input_types=["str"])` repor
 just dragging a whole list.
 
 The two type lists hold raw declared type names, and the engine's matching rules are not plain
-string equality: matching is case-insensitive, a target of `any` accepts anything (but a source
-of `any` is not accepted by a specific target), and `list[str]` matches a `list` target on the
-base type. `ParameterType.are_types_compatible` implements those three. One more rule lives
-outside it — a source of `all` matches anything, applied by
+string equality: matching is case-insensitive; a target of `any` accepts anything (but a source
+of `any` is not accepted by a specific target); `none` on either side matches nothing, `any`
+target included; and `list[str]` matches a `list` or `list[any]` target on the base type, though a
+bare `list` source does not match `list[str]`. `ParameterType.are_types_compatible` implements
+those. One more rule lives outside it — a source of `all` matches anything, applied by
 `Parameter.is_incoming_type_allowed` before it delegates — so a client that calls
 `are_types_compatible` alone will not rank `all`-typed outputs against anything.
 
@@ -866,8 +867,10 @@ What this asks of your node:
 - **Keep `__init__` cheap and offline.** Summaries are computed for every node type in a
     library in one pass. A node whose `__init__` raises is omitted from the summary — it stays
     creatable, but the editor cannot rank it, so it sinks to the bottom of the menu. One that
-    blocks past a 10-second timeout is omitted the same way. This is the same constraint the
-    worker-mode schema probe imposes — see
+    blocks past a 10-second timeout is omitted the same way, and once a handful of node types in
+    one library have timed out the engine stops probing that library for the rest of the pass, so
+    a few blocking nodes can cost their neighbors their ranking too. This is the same constraint
+    the worker-mode schema probe imposes — see
     [`__init__` runs during library load](node_isolation_with_workers.md#__init__-runs-during-library-load).
 - **Expect dynamic ports to be missing.** Only ports that exist right after construction are
     reported. Ports added later — a

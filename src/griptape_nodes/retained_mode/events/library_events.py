@@ -295,7 +295,11 @@ class NodePortSummary:
     - Matching is case-insensitive (`"Image"` matches `"image"`).
     - It is directional and asymmetric. A target of `"any"` accepts every source type, but a
       source of `"any"` is not accepted by a specific target.
-    - Parameterized types match on their base, so `"list[str]"` matches a `"list"` target.
+    - `"none"` on either side never matches, ahead of every rule below it -- including the
+      `"any"` target, which does not rescue it.
+    - Parameterized types match on their base, but only toward a less specific target:
+      `"list[str]"` matches a `"list"` or `"list[any]"` target, while a bare `"list"` source does
+      not match a `"list[str]"` one.
 
     One rule lives outside that function and a client has to apply it too: a source of `"all"`
     matches every target. `Parameter.is_incoming_type_allowed` short-circuits on it before
@@ -326,9 +330,11 @@ class NodePortSummary:
 
         Only sees parameters that exist right after construction. Ports added dynamically at
         runtime (config-driven ports, transition components) are absent by design -- see
-        GetPortSummariesForAllLibrariesRequest. Container parameters are the exception: their
-        children do not exist yet either, but a container knows the element type its children will
-        have, so both the container type and the element type are reported.
+        GetPortSummariesForAllLibrariesRequest. List containers are the exception: their children do
+        not exist yet either, but the container knows the element type its children will have, so
+        both the container type and the element type are reported. A dictionary container reports
+        only its own type, because its children are key-value pairs rather than scalar ports and
+        there is no single element type to advertise.
         """
         control_type = ParameterTypeBuiltin.CONTROL_TYPE.value
         input_types: list[str] = []

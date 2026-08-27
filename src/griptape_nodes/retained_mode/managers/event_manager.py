@@ -97,6 +97,12 @@ def suppress_event_publication() -> Iterator[None]:
     canvas node's would, so it publishes parameter events naming a node the editor has never
     heard of and never will.
 
+    Blunt on purpose, and worth knowing how blunt: this drops *every* event the block publishes,
+    including the fan-out to registered execution-event listeners, and it covers anything the block
+    transitively causes -- a request the inspected object's `__init__` issues has its result
+    dropped too. It follows the context rather than the call stack, so a thread the block spawns
+    itself starts from a fresh copy and does publish.
+
     Deliberately not `EventSuppressionContext`, which reference-counts event types on the manager
     and is consulted at the send boundary. That is the wrong tool twice over here: probe
     construction runs in a worker thread, where mutating manager state races the loop, and

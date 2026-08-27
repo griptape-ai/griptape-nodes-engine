@@ -397,6 +397,22 @@ class PortSummaryComputation(NamedTuple):
     retry_node_types: frozenset[str]
 
 
+class NodeTypePortProbeOutcome(NamedTuple):
+    """Outcome of probing a single node type for its port summary.
+
+    `summary` is None for every node type the engine could not probe, which keeps it out of the
+    library's map entirely rather than recording it as portless: a caller ranking node types should
+    leave it unranked, not rank it as connecting to nothing.
+
+    `timed_out` separates the one gap worth another attempt from the ones that are stable until the
+    library reloads. It also tells the caller a thread was spent that cannot be reclaimed, which is
+    what the per-pass timeout budget counts.
+    """
+
+    summary: NodePortSummary | None
+    timed_out: bool
+
+
 class LibraryGitOperationContext(NamedTuple):
     """Context information for git operations on a library."""
 
@@ -663,10 +679,10 @@ class LibraryManager(EngineScoped):
         # Per-library node type -> port summary, computed on the first GetPortSummaries request
         # and dropped when the library is unloaded (which a reload goes through).
         self._library_to_port_summaries: dict[str, dict[str, NodePortSummary]] = {}
-        # Node types in a cached library whose probe timed out, owed exactly one more attempt on
-        # the next request. Emptied by that attempt whether or not it succeeds, so a node whose
-        # __init__ blocks forever costs at most two un-reclaimable threads rather than one per
-        # request.
+        # Node types in a cached library whose probe timed out, owed exactly one more attempt on the
+        # next request. Emptied by that attempt whether or not it succeeds, so a node whose __init__
+        # blocks forever costs two un-reclaimable threads per library generation -- one per pass --
+        # rather than one per request. Each reload of the library starts that allowance over.
         self._library_to_port_summary_retries: dict[str, frozenset[str]] = {}
         # Bumped by _invalidate_port_summaries. The compute pass awaits, so a library can be
         # mutated while its summaries are being computed; comparing the counter before and after
@@ -3369,7 +3385,8 @@ class LibraryManager(EngineScoped):
         stays on the event loop because ``NodeTypeEntry.resolve()`` is not thread-safe, and only
         construction goes to a thread, where the same timeout the worker-side schema pass uses
         bounds it: a node's ``__init__`` can block indefinitely, and one such node must not stall
-        the rest.
+        the rest. A pass gives up entirely after `_PORT_SUMMARY_TIMEOUT_BUDGET` timeouts, because
+        every one of those has cost a thread that cannot be handed back.
 
         Only a timeout is reported in `retry_node_types` -- see `PortSummaryComputation` for why
         every other gap is stable.
@@ -3377,9 +3394,11 @@ class LibraryManager(EngineScoped):
         try:
             library = LibraryRegistry.get_library(library_name)
         except KeyError:
-            # Reachable when a library is unloaded between LibraryRegistry.list_libraries() and
-            # this lookup. That path bumps the generation counter, so the caller already declines
-            # to cache what comes back; nothing here is worth retrying.
+            # Reachable when a library is unloaded between LibraryRegistry.list_libraries() and this
+            # lookup. The caller may well cache this empty result, since unloading only bumps the
+            # generation counter when it happens *during* a pass, not before one starts. That is
+            # harmless: the entry is for a library nothing can now ask about, and re-registering the
+            # name invalidates it. Nothing here is worth retrying.
             logger.warning("Cannot compute port summaries: library '%s' not found in registry.", library_name)
             return PortSummaryComputation(summaries={}, retry_node_types=frozenset())
 
@@ -3392,93 +3411,41 @@ class LibraryManager(EngineScoped):
         summaries: dict[str, NodePortSummary] = {}
         skipped_node_types: list[str] = []
         retry_node_types: set[str] = set()
-        for node_type in node_types_to_probe:
+        timed_out_count = 0
+        for probe_index, node_type in enumerate(node_types_to_probe):
             # Yield between node types so a large library's resolve calls, which run on the loop,
             # interleave with other work instead of monopolizing it for the whole pass.
             await asyncio.sleep(0)
 
-            try:
-                resolution = self._resolve_node_class_for_probe(library=library, node_type=node_type)
-            except Exception:
-                # Resolution converts import failures into a result, so reaching here means
-                # something else went wrong -- a LibraryRegistryError for a node type unregistered
-                # since get_registered_nodes() was read (the loop awaits, so that is reachable), or
-                # a NodeTypeEntry with neither class nor loader. Skip the one node type rather than
-                # failing summaries for every library in the response.
-                logger.debug(
-                    "Unexpected failure resolving node type '%s' in library '%s' for its port summary; skipping.",
-                    node_type,
-                    library_name,
-                    exc_info=True,
-                )
+            outcome = await self._probe_node_type_port_summary(
+                library=library, library_name=library_name, node_type=node_type
+            )
+            if outcome.summary is None:
                 skipped_node_types.append(node_type)
-                continue
+                if not outcome.timed_out:
+                    continue
 
-            if resolution.node_class is None:
-                logger.debug(
-                    "Could not probe node type '%s' in library '%s' for its port summary: %s",
-                    node_type,
-                    library_name,
-                    resolution.error_message,
-                )
-                skipped_node_types.append(node_type)
-                continue
-
-            # Built before the try because it reads the library's node-metadata dict, and a failure
-            # doing so is a defect in that data rather than anything a retry would fix.
-            library_node_metadata = self._library_node_metadata_for_probe(library=library, node_type=node_type)
-
-            try:
-                probe_result = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        self._construct_probe_node,
-                        library_name,
-                        node_type,
-                        resolution.node_class,
-                        library_node_metadata,
-                    ),
-                    timeout=self._SCHEMA_PROBE_TIMEOUT_S,
-                )
-            except TimeoutError:
-                # asyncio.to_thread cannot be cancelled, so the thread is not reclaimed: it holds a
-                # worker of the loop's default executor until __init__ returns, which for a truly
-                # stuck node means for the life of the process. That is also why this node type
-                # gets one retry rather than one per request.
-                logger.warning(
-                    "Port summary probe for node type '%s' in library '%s' timed out after %.1fs; "
-                    "skipping it and leaking the probe thread, which cannot be cancelled. The "
-                    "node's __init__ likely makes a blocking call.",
-                    node_type,
-                    library_name,
-                    self._SCHEMA_PROBE_TIMEOUT_S,
-                )
-                skipped_node_types.append(node_type)
                 retry_node_types.add(node_type)
-                continue
-            except Exception:
-                # _construct_probe_node already converts a raising __init__ into a result, so
-                # reaching here means the failure was outside it -- the executor refusing work
-                # during interpreter shutdown, for instance, which a retry cannot help either.
-                logger.debug(
-                    "Unexpected failure probing node type '%s' in library '%s' for its port summary; skipping.",
-                    node_type,
-                    library_name,
-                    exc_info=True,
-                )
-                skipped_node_types.append(node_type)
-                continue
+                timed_out_count += 1
+                if timed_out_count < self._PORT_SUMMARY_TIMEOUT_BUDGET:
+                    continue
 
-            if probe_result.node is None:
-                logger.debug(
-                    "Could not probe node type '%s' in library '%s' for its port summary: %s",
-                    node_type,
+                abandoned_node_types = node_types_to_probe[probe_index + 1 :]
+                logger.warning(
+                    "Abandoning port summaries for the remaining %d node type(s) in library '%s' after %d probe "
+                    "timeout(s): %s. Each timeout costs a thread the engine cannot reclaim, so the rest of this "
+                    "library goes unranked until it is reloaded.",
+                    len(abandoned_node_types),
                     library_name,
-                    probe_result.error_message,
+                    timed_out_count,
+                    ", ".join(abandoned_node_types),
                 )
-                skipped_node_types.append(node_type)
-                continue
+                # Not added to retry_node_types: they were never probed, so a retry would walk
+                # straight back into the same timeouts that stopped this pass.
+                skipped_node_types.extend(abandoned_node_types)
+                break
 
-            summaries[node_type] = NodePortSummary.from_parameters(probe_result.node.parameters)
+            summaries[node_type] = outcome.summary
 
         if skipped_node_types:
             logger.info(
@@ -3489,6 +3456,116 @@ class LibraryManager(EngineScoped):
                 ", ".join(skipped_node_types),
             )
         return PortSummaryComputation(summaries=summaries, retry_node_types=frozenset(retry_node_types))
+
+    async def _probe_node_type_port_summary(  # noqa: PLR0911
+        self, *, library: Library, library_name: str, node_type: str
+    ) -> NodeTypePortProbeOutcome:
+        """Construct one node type's throwaway probe node and summarize the ports it declared.
+
+        Every failure is contained here and reported as a missing summary rather than raised. The
+        caller answers for every library in the engine at once, so a single library's malformed
+        metadata, unimportable module, or raising ``__init__`` must not blank the whole response.
+        """
+        try:
+            resolution = self._resolve_node_class_for_probe(library=library, node_type=node_type)
+        except Exception:
+            # Resolution converts import failures into a result, so reaching here means something
+            # else went wrong -- a LibraryRegistryError for a node type unregistered since
+            # get_registered_nodes() was read (the caller awaits, so that is reachable), or a
+            # NodeTypeEntry with neither class nor loader.
+            logger.debug(
+                "Unexpected failure resolving node type '%s' in library '%s' for its port summary; skipping.",
+                node_type,
+                library_name,
+                exc_info=True,
+            )
+            return NodeTypePortProbeOutcome(summary=None, timed_out=False)
+
+        if resolution.node_class is None:
+            logger.debug(
+                "Could not probe node type '%s' in library '%s' for its port summary: %s",
+                node_type,
+                library_name,
+                resolution.error_message,
+            )
+            return NodeTypePortProbeOutcome(summary=None, timed_out=False)
+
+        try:
+            library_node_metadata = self._library_node_metadata_for_probe(library=library, node_type=node_type)
+        except Exception:
+            # Reads and serializes the library author's node metadata, so a malformed entry raises
+            # here. Not worth retrying -- the metadata is as broken next request as it is now.
+            logger.debug(
+                "Unexpected failure reading metadata for node type '%s' in library '%s' for its port summary; "
+                "skipping.",
+                node_type,
+                library_name,
+                exc_info=True,
+            )
+            return NodeTypePortProbeOutcome(summary=None, timed_out=False)
+
+        try:
+            probe_result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._construct_probe_node,
+                    library_name,
+                    node_type,
+                    resolution.node_class,
+                    library_node_metadata,
+                ),
+                timeout=self._SCHEMA_PROBE_TIMEOUT_S,
+            )
+        except TimeoutError:
+            # asyncio.to_thread cannot be cancelled, so the thread is not reclaimed: it holds a
+            # worker of the loop's default executor until __init__ returns, which for a truly stuck
+            # node means for the life of the process. That is why the caller both bounds how many
+            # timeouts one pass will spend and gives this node type one retry rather than one per
+            # request.
+            logger.warning(
+                "Port summary probe for node type '%s' in library '%s' timed out after %.1fs; skipping it and "
+                "leaking the probe thread, which cannot be cancelled. The node's __init__ likely makes a "
+                "blocking call.",
+                node_type,
+                library_name,
+                self._SCHEMA_PROBE_TIMEOUT_S,
+            )
+            return NodeTypePortProbeOutcome(summary=None, timed_out=True)
+        except Exception:
+            # _construct_probe_node already converts a raising __init__ into a result, so reaching
+            # here means the failure was outside it -- the executor refusing work during interpreter
+            # shutdown, for instance, which a retry cannot help either.
+            logger.debug(
+                "Unexpected failure probing node type '%s' in library '%s' for its port summary; skipping.",
+                node_type,
+                library_name,
+                exc_info=True,
+            )
+            return NodeTypePortProbeOutcome(summary=None, timed_out=False)
+
+        if probe_result.node is None:
+            logger.debug(
+                "Could not probe node type '%s' in library '%s' for its port summary: %s",
+                node_type,
+                library_name,
+                probe_result.error_message,
+            )
+            return NodeTypePortProbeOutcome(summary=None, timed_out=False)
+
+        try:
+            summary = NodePortSummary.from_parameters(probe_result.node.parameters)
+        except Exception:
+            # Reads each parameter's declared types, and a container's element types through
+            # `get_element_input_types` -- an override point construction never calls, so a
+            # library's subclass can raise here on a node that built perfectly well.
+            logger.debug(
+                "Unexpected failure summarizing the ports of node type '%s' in library '%s'; skipping.",
+                node_type,
+                library_name,
+                exc_info=True,
+            )
+            return NodeTypePortProbeOutcome(summary=None, timed_out=False)
+
+        return NodeTypePortProbeOutcome(summary=summary, timed_out=False)
 
     def _invalidate_port_summaries(self, library_name: str) -> None:
         """Drop a library's cached port summaries after its node types change.
@@ -5384,6 +5461,13 @@ class LibraryManager(EngineScoped):
     # await init-time events (e.g. WorkflowManager._workflows_loading_complete),
     # so each probe runs in a worker thread with this ceiling.
     _SCHEMA_PROBE_TIMEOUT_S: float = 10.0
+    # How many probe timeouts one port summary pass tolerates before abandoning
+    # the library's remaining node types. Each timeout permanently costs a worker
+    # of the event loop's default executor -- asyncio.to_thread cannot cancel the
+    # thread it started -- so an unbounded pass over a library of blocking nodes
+    # would starve every other to_thread caller in the engine. Leaving the tail
+    # of one library unranked until it reloads is the cheaper failure.
+    _PORT_SUMMARY_TIMEOUT_BUDGET: int = 4
     # Sentinel name passed to the throwaway node instance built for schema
     # discovery. The instance is discarded after its parameters are read.
     _SCHEMA_PROBE_NODE_NAME: str = "__schema_probe__"
