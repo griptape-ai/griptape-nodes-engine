@@ -981,9 +981,11 @@ class TestTemplatesSurviveAWorkspaceChange:
                 registered_in_second_workspace = list(WorkflowRegistry._workflows)
 
         # Inside the workspace the key is relative to it; once the workspace moves away from the
-        # library the same file registers under its absolute path instead.
+        # library the same file registers under its absolute path instead. `as_posix` rather than
+        # `str` because `derive_registry_key` normalizes separators to forward slashes, so on
+        # Windows the key is "C:/.../test_lib/example" and never the backslashed spelling.
         assert registered_in_first_workspace == ["libraries/test_lib/example"]
-        assert registered_in_second_workspace == [str(library_dir / "example")]
+        assert registered_in_second_workspace == [(library_dir / "example").as_posix()]
         assert library_manager._library_to_workflow_keys[LIBRARY_NAME] == registered_in_second_workspace
 
     @pytest.mark.asyncio
