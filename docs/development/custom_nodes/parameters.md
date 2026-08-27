@@ -867,10 +867,10 @@ What this asks of your node:
 - **Keep `__init__` cheap and offline.** Summaries are computed for every node type in a
     library in one pass. A node whose `__init__` raises is omitted from the summary — it stays
     creatable, but the editor cannot rank it, so it sinks to the bottom of the menu. One that
-    blocks past a 10-second timeout is omitted the same way, and once a handful of node types in
-    one library have timed out the engine stops probing that library for the rest of the pass, so
-    a few blocking nodes can cost their neighbors their ranking too. This is the same constraint
-    the worker-mode schema probe imposes — see
+    blocks past a 10-second timeout is omitted the same way, and it costs more than itself: a
+    blocked probe holds a thread the engine cannot reclaim, so after a handful of them the engine
+    stops probing that library at all and its remaining node types go unranked until it reloads.
+    This is the same constraint the worker-mode schema probe imposes — see
     [`__init__` runs during library load](node_isolation_with_workers.md#__init__-runs-during-library-load).
 - **Expect dynamic ports to be missing.** Only ports that exist right after construction are
     reported. Ports added later — a
@@ -880,9 +880,12 @@ What this asks of your node:
     matters for discoverability, declare a port for it up front.
 
 Summaries are cached per library and recomputed after that library changes — a reload, an unload,
-or a new sandbox node — so the probe pass happens once, not per menu open. A node type whose
-`__init__` blocked past the timeout is the one exception: it gets a second attempt on the next
-request, alone, and is then left out until the library reloads.
+or a new sandbox node — so the probe pass happens once, not per menu open. Blocking nodes are the
+one exception. A node type whose `__init__` blocked past the timeout gets a second attempt on the
+next request, alone, and is then left out until the library reloads. Because each of those timeouts
+costs the engine a thread for good, one request will only wait out a few of them; libraries it did
+not reach are probed on a later request instead, and a library that has spent the whole allowance is
+left as-is until it reloads.
 
 ### Two-Image Processing Node Pattern
 

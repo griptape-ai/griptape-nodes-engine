@@ -68,7 +68,11 @@ from griptape_nodes.retained_mode.events.library_events import (
 )
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager as _LibraryManager
-from griptape_nodes.retained_mode.managers.library_manager import LibraryVenvInitResult
+from griptape_nodes.retained_mode.managers.library_manager import (
+    LibraryVenvInitResult,
+    PortSummaryCacheEntry,
+    ProbeTimeoutAllowance,
+)
 from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
 from griptape_nodes.retained_mode.managers.settings import (
     LIBRARIES_TO_DOWNLOAD_KEY,
@@ -1695,7 +1699,7 @@ class TestRegisterSandboxNodeFromSourceRequest:
         assert isinstance(first, RegisterSandboxNodeFromSourceResultSuccess)
 
         # Pretend a port summary request already ran and cached a result for this library.
-        library_manager._library_to_port_summaries[self._LIBRARY_NAME] = {}
+        library_manager._library_to_port_summary_cache[self._LIBRARY_NAME] = _empty_port_summary_cache_entry()
 
         # A file whose first class is new and whose second is already registered. With
         # replace_if_exists=False the loop registers the first, then bails on the second.
@@ -1718,7 +1722,7 @@ class TestRegisterSandboxNodeFromSourceRequest:
         assert isinstance(second, RegisterSandboxNodeFromSourceResultFailure)
         # The library really was mutated before the bail-out, so the cache must be gone.
         assert LibraryRegistry.get_library(self._LIBRARY_NAME).has_node_type("SandboxBrandNew")
-        assert self._LIBRARY_NAME not in library_manager._library_to_port_summaries
+        assert self._LIBRARY_NAME not in library_manager._library_to_port_summary_cache
 
     def test_fails_when_sandbox_directory_is_not_configured(
         self,
@@ -1847,6 +1851,13 @@ class _DescribeNodeTypeProbe(BaseNode):
             allowed_modes={ParameterMode.PROPERTY},
         )
         self.add_parameter(temperature)
+
+
+def _empty_port_summary_cache_entry() -> PortSummaryCacheEntry:
+    """A complete-but-empty cache entry, standing in for a port summary request that already ran."""
+    return PortSummaryCacheEntry(
+        summaries={}, retry_node_types=frozenset(), unprobed_node_types=frozenset(), timeouts_spent=0
+    )
 
 
 class _RaisingProbe(BaseNode):
@@ -2268,9 +2279,9 @@ class TestGetPortSummariesForAllLibrariesRequest:
         yield
         LibraryRegistry._clear()
 
-    def _register_probe_library(self, *node_classes: type[BaseNode]) -> None:
+    def _register_probe_library(self, *node_classes: type[BaseNode], library_name: str | None = None) -> None:
         schema = LibrarySchema(
-            name=self._LIBRARY_NAME,
+            name=library_name or self._LIBRARY_NAME,
             library_schema_version=LibrarySchema.LATEST_SCHEMA_VERSION,
             metadata=LibraryMetadata(
                 author="test",
@@ -2389,8 +2400,10 @@ class TestGetPortSummariesForAllLibrariesRequest:
         library_manager = engine.library_manager
         self._register_probe_library(_PortSummaryDataOnlyProbe)
 
-        async def invalidate_midway(library_name: str) -> Any:
-            computation = await _LibraryManager._compute_port_summaries_for_library(library_manager, library_name)
+        async def invalidate_midway(library_name: str, allowance: ProbeTimeoutAllowance) -> Any:
+            computation = await _LibraryManager._compute_port_summaries_for_library(
+                library_manager, library_name, allowance
+            )
             # Stand in for a reload / sandbox registration landing while the pass was awaiting.
             library_manager._invalidate_port_summaries(library_name)
             return computation
@@ -2411,7 +2424,7 @@ class TestGetPortSummariesForAllLibrariesRequest:
         assert isinstance(first, GetPortSummariesForAllLibrariesResultSuccess)
         assert isinstance(second, GetPortSummariesForAllLibrariesResultSuccess)
         assert compute_spy.call_count == expected_compute_calls
-        assert self._LIBRARY_NAME not in library_manager._library_to_port_summaries
+        assert self._LIBRARY_NAME not in library_manager._library_to_port_summary_cache
 
     @pytest.mark.asyncio
     async def test_a_node_type_that_fails_to_resolve_does_not_fail_the_whole_response(
@@ -2483,8 +2496,13 @@ class TestGetPortSummariesForAllLibrariesRequest:
         # The node types that did probe are cached, so the retry does not re-pay for them...
         assert isinstance(first, GetPortSummariesForAllLibrariesResultSuccess)
         assert timed_out_node_type not in first.library_name_to_port_summaries[self._LIBRARY_NAME]
-        assert _PortSummaryDataOnlyProbe.__name__ in library_manager._library_to_port_summaries[self._LIBRARY_NAME]
-        assert library_manager._library_to_port_summary_retries[self._LIBRARY_NAME] == frozenset({timed_out_node_type})
+        assert (
+            _PortSummaryDataOnlyProbe.__name__
+            in library_manager._library_to_port_summary_cache[self._LIBRARY_NAME].summaries
+        )
+        assert library_manager._library_to_port_summary_cache[self._LIBRARY_NAME].retry_node_types == frozenset(
+            {timed_out_node_type}
+        )
 
         # ...and the retry probes that node type alone.
         real_construct = _LibraryManager._construct_probe_node
@@ -2507,7 +2525,7 @@ class TestGetPortSummariesForAllLibrariesRequest:
         assert isinstance(second, GetPortSummariesForAllLibrariesResultSuccess)
         assert probed_node_types == [timed_out_node_type]
         assert timed_out_node_type in second.library_name_to_port_summaries[self._LIBRARY_NAME]
-        assert self._LIBRARY_NAME not in library_manager._library_to_port_summary_retries
+        assert not library_manager._library_to_port_summary_cache[self._LIBRARY_NAME].pending_node_types()
 
     @pytest.mark.asyncio
     async def test_contains_a_node_type_whose_element_types_cannot_be_read(self, engine: Engine) -> None:
@@ -2530,7 +2548,7 @@ class TestGetPortSummariesForAllLibrariesRequest:
         # The unsummarizable node type is left out; the healthy one behind it is not collateral.
         assert set(summaries) == {_PortSummaryDataOnlyProbe.__name__}
         # Its getter will raise again next request, so it is a stable gap rather than a retry.
-        assert self._LIBRARY_NAME not in library_manager._library_to_port_summary_retries
+        assert not library_manager._library_to_port_summary_cache[self._LIBRARY_NAME].pending_node_types()
 
     @pytest.mark.asyncio
     async def test_contains_a_node_type_whose_library_metadata_cannot_be_read(
@@ -2561,26 +2579,81 @@ class TestGetPortSummariesForAllLibrariesRequest:
 
         assert isinstance(result, GetPortSummariesForAllLibrariesResultSuccess)
         assert set(result.library_name_to_port_summaries[self._LIBRARY_NAME]) == {_PortSummaryDataOnlyProbe.__name__}
-        assert self._LIBRARY_NAME not in library_manager._library_to_port_summary_retries
+        assert not library_manager._library_to_port_summary_cache[self._LIBRARY_NAME].pending_node_types()
 
     @pytest.mark.asyncio
-    async def test_stops_probing_a_library_once_its_timeout_budget_is_spent(
+    async def test_resumes_node_types_a_request_ran_out_of_allowance_before_reaching(
         self, engine: Engine
     ) -> None:
-        """Each timeout costs a thread that cannot be reclaimed, so one pass cannot keep spending.
+        """One library's blocking node must not cost another library its ranking for good.
 
-        A library of blocking nodes would otherwise drain the loop's default executor in a single
-        request and stall every other threaded operation in the engine. The abandoned node types get
-        no retry either -- a retry would walk straight back into the timeouts that stopped the pass.
+        The timeout allowance is spent per request across every library, so a library reached after
+        it runs out is never attempted at all. Nothing is known about those node types, so they stay
+        pending and the next request -- with a fresh allowance -- probes them.
         """
         library_manager = engine.library_manager
-        # The blocking node type is registered first so the pass aborts while a healthy one is still
-        # unprobed, which is the collateral this bound accepts.
+        blocking_library = "port-summary-blocking-library"
+        # Registration order decides which library the handler walks first.
+        self._register_probe_library(_PortSummaryProbe, library_name=blocking_library)
+        self._register_probe_library(_PortSummaryDataOnlyProbe)
+        release_blocked_probe = threading.Event()
+        real_construct = _LibraryManager._construct_probe_node
+
+        def block_the_first_library(
+            manager: _LibraryManager, library_name: str, node_type: str, *args: Any, **kwargs: Any
+        ) -> Any:
+            if library_name == blocking_library:
+                release_blocked_probe.wait(timeout=30)
+            return real_construct(manager, library_name, node_type, *args, **kwargs)
+
+        try:
+            with (
+                patch.object(_LibraryManager, "_SCHEMA_PROBE_TIMEOUT_S", 0.2),
+                patch.object(_LibraryManager, "_PORT_SUMMARY_TIMEOUT_BUDGET", 1),
+                patch.object(
+                    _LibraryManager, "_construct_probe_node", side_effect=block_the_first_library, autospec=True
+                ),
+            ):
+                first = await library_manager.on_get_port_summaries_for_all_libraries_request(
+                    GetPortSummariesForAllLibrariesRequest()
+                )
+                # The healthy library was never reached, so it is owed a real attempt rather than
+                # being recorded as unrankable.
+                assert isinstance(first, GetPortSummariesForAllLibrariesResultSuccess)
+                assert first.library_name_to_port_summaries[self._LIBRARY_NAME] == {}
+                healthy_entry = library_manager._library_to_port_summary_cache[self._LIBRARY_NAME]
+                assert healthy_entry.unprobed_node_types == frozenset({_PortSummaryDataOnlyProbe.__name__})
+                assert healthy_entry.timeouts_spent == 0
+
+                second = await library_manager.on_get_port_summaries_for_all_libraries_request(
+                    GetPortSummariesForAllLibrariesRequest()
+                )
+        finally:
+            release_blocked_probe.set()
+
+        assert isinstance(second, GetPortSummariesForAllLibrariesResultSuccess)
+        assert set(second.library_name_to_port_summaries[self._LIBRARY_NAME]) == {_PortSummaryDataOnlyProbe.__name__}
+        assert not library_manager._library_to_port_summary_cache[self._LIBRARY_NAME].pending_node_types()
+
+    @pytest.mark.asyncio
+    async def test_gives_up_on_a_library_that_has_spent_its_lifetime_timeout_allowance(
+        self, engine: Engine
+    ) -> None:
+        """Carrying unreached node types forever would let a stuck library leak a thread per request.
+
+        Each timeout permanently holds a worker of the loop's default executor, so once a library has
+        cost its whole allowance, everything still pending is dropped until it reloads -- including
+        node types never attempted, which cannot be told apart from the blocking ones without paying
+        again. That is the trade this bound makes, and it is why the allowance is not per request
+        alone.
+        """
+        library_manager = engine.library_manager
+        # The blocking node type is registered first so a healthy one is still unreached when the
+        # library's allowance runs out.
         self._register_probe_library(_PortSummaryProbe, _PortSummaryDataOnlyProbe)
         timed_out_node_type = _PortSummaryProbe.__name__
-        abandoned_node_type = _PortSummaryDataOnlyProbe.__name__
-        real_construct = _LibraryManager._construct_probe_node
         release_blocked_probe = threading.Event()
+        real_construct = _LibraryManager._construct_probe_node
 
         def block_one_node_type(
             manager: _LibraryManager, library_name: str, node_type: str, *args: Any, **kwargs: Any
@@ -2597,20 +2670,26 @@ class TestGetPortSummariesForAllLibrariesRequest:
                     _LibraryManager, "_construct_probe_node", side_effect=block_one_node_type, autospec=True
                 ) as probe_spy,
             ):
-                result = await library_manager.on_get_port_summaries_for_all_libraries_request(
+                first = await library_manager.on_get_port_summaries_for_all_libraries_request(
                     GetPortSummariesForAllLibrariesRequest()
                 )
+                # A second request must not spend anything more on this library, so the spy below
+                # covers both requests.
+                await library_manager.on_get_port_summaries_for_all_libraries_request(
+                    GetPortSummariesForAllLibrariesRequest()
+                )
+                # autospec passes self positionally: (manager, library_name, node_type, node_class, ...).
                 probed_node_types = [call.args[2] for call in probe_spy.call_args_list]
         finally:
             release_blocked_probe.set()
 
-        assert isinstance(result, GetPortSummariesForAllLibrariesResultSuccess)
-        # The healthy node type after the abort is never even attempted...
+        assert isinstance(first, GetPortSummariesForAllLibrariesResultSuccess)
         assert probed_node_types == [timed_out_node_type]
-        assert result.library_name_to_port_summaries[self._LIBRARY_NAME] == {}
-        # ...and only the node type that actually timed out is owed a retry.
-        assert library_manager._library_to_port_summary_retries[self._LIBRARY_NAME] == frozenset({timed_out_node_type})
-        assert abandoned_node_type not in library_manager._library_to_port_summaries[self._LIBRARY_NAME]
+        entry = library_manager._library_to_port_summary_cache[self._LIBRARY_NAME]
+        # The empty map is cached as complete: nothing pending is what stops the next request from
+        # paying for this library again.
+        assert entry.summaries == {}
+        assert not entry.pending_node_types()
 
     @pytest.mark.asyncio
     async def test_caches_a_pass_whose_only_gap_is_a_broken_node_type(self, engine: Engine) -> None:
@@ -2624,12 +2703,12 @@ class TestGetPortSummariesForAllLibrariesRequest:
 
         await library_manager.on_get_port_summaries_for_all_libraries_request(GetPortSummariesForAllLibrariesRequest())
 
-        cached = library_manager._library_to_port_summaries[self._LIBRARY_NAME]
+        cached = library_manager._library_to_port_summary_cache[self._LIBRARY_NAME].summaries
         # Both halves: the working node type is cached with its ports, and the broken one is cached
         # as absent rather than earning a retry that would never succeed.
         assert set(cached) == {_PortSummaryDataOnlyProbe.__name__}
         assert cached[_PortSummaryDataOnlyProbe.__name__].output_types == ("str",)
-        assert self._LIBRARY_NAME not in library_manager._library_to_port_summary_retries
+        assert not library_manager._library_to_port_summary_cache[self._LIBRARY_NAME].pending_node_types()
 
     @pytest.mark.asyncio
     async def test_result_does_not_alias_the_cache(self, engine: Engine) -> None:
@@ -2645,7 +2724,10 @@ class TestGetPortSummariesForAllLibrariesRequest:
         served = result.library_name_to_port_summaries[self._LIBRARY_NAME]
         served.pop(_PortSummaryDataOnlyProbe.__name__)
 
-        assert _PortSummaryDataOnlyProbe.__name__ in library_manager._library_to_port_summaries[self._LIBRARY_NAME]
+        assert (
+            _PortSummaryDataOnlyProbe.__name__
+            in library_manager._library_to_port_summary_cache[self._LIBRARY_NAME].summaries
+        )
 
     @pytest.mark.asyncio
     async def test_probing_publishes_no_events(self, engine: Engine) -> None:
@@ -2690,7 +2772,7 @@ class TestGetPortSummariesForAllLibrariesRequest:
             UnloadLibraryFromRegistryRequest(library_name=self._LIBRARY_NAME)
         )
 
-        assert self._LIBRARY_NAME not in library_manager._library_to_port_summaries
+        assert self._LIBRARY_NAME not in library_manager._library_to_port_summary_cache
 
         # Re-registering with a different node type must be reflected, not served stale.
         self._register_probe_library(_PortSummaryProbe)
@@ -2747,7 +2829,7 @@ class TestPortSummaryInvalidationOnLibraryLoad:
 
         # Stand in for a port summary request that landed while the library was published but
         # empty, which is exactly the state the invalidation exists to discard.
-        library_manager._library_to_port_summaries[self._LIBRARY_NAME] = {}
+        library_manager._library_to_port_summary_cache[self._LIBRARY_NAME] = _empty_port_summary_cache_entry()
         generation_before = library_manager._library_to_port_summaries_generation.get(self._LIBRARY_NAME, 0)
 
         library_info = _LibraryManager.LibraryInfo(
@@ -2781,7 +2863,7 @@ class TestPortSummaryInvalidationOnLibraryLoad:
             )
 
         assert result is None
-        assert self._LIBRARY_NAME not in library_manager._library_to_port_summaries
+        assert self._LIBRARY_NAME not in library_manager._library_to_port_summary_cache
         # The generation bump is what lets a probe pass already in flight discard its stale result.
         assert library_manager._library_to_port_summaries_generation[self._LIBRARY_NAME] > generation_before
 
