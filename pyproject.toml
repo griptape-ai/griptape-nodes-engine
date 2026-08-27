@@ -172,10 +172,6 @@ ignore = [
 #
 # Group 2 -- not yet migrated. Each of these should eventually receive an Engine instead.
 # Deleting an entry from this list is the definition of done; do not add new entries.
-# scan.py reaches the facade from a module-level free function, so its engine has to be threaded
-# from os_manager.on_scan_sequences_request down through scan_sequences. It moves with the other
-# free-function modules rather than with the class-based execution internals.
-"src/griptape_nodes/common/sequences/scan.py" = ["TID251"]
 # GriptapeCloudStorageDriver is constructed from inside exe_types
 # (param_components/artifact_url/public_artifact_url_parameter.py), which has no Engine of its own
 # yet, so drivers cannot come off this list until exe_types does.

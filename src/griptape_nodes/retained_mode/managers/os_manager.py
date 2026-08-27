@@ -1933,6 +1933,7 @@ class OSManager(EngineScoped):
                 scan_sequences,
                 mapping,
                 mapping.filename_pattern,
+                engine=self.engine,
                 policy=request.policy,
                 no_token_behavior=request.no_token_behavior,
                 start=request.start_number,
