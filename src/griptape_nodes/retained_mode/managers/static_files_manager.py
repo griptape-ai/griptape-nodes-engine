@@ -5,6 +5,7 @@ import threading
 from pathlib import Path
 from typing import NamedTuple
 
+import anyio
 from xdg_base_dirs import xdg_config_home
 
 from griptape_nodes.common.macro_parser import MacroSyntaxError, ParsedMacro
@@ -52,6 +53,7 @@ from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
 from griptape_nodes.servers import bind_free_socket
 from griptape_nodes.servers.static import STATIC_SERVER_HOST, STATIC_SERVER_PORT, STATIC_SERVER_URL, start_static_server
+from griptape_nodes.utils.async_utils import to_thread
 from griptape_nodes.utils.url_utils import uri_to_path
 
 logger = logging.getLogger("griptape_nodes")
@@ -328,16 +330,58 @@ class StaticFilesManager(EngineScoped):
             static_files_directory=static_files_directory,
         )
 
-    async def _resolve_preview_path(self, file_path: Path, *, preview: bool) -> tuple[Path, dict | None]:
+    async def _extract_metadata_only(self, file_path: Path) -> dict | None:
+        """Extract artifact metadata for a file without generating a preview.
+
+        Returns None if no provider supports the format or extraction fails --
+        serving the download URL must not fail because metadata could not be read.
+
+        Args:
+            file_path: Path to the original file.
+
+        Returns:
+            Extracted metadata dict or None.
+        """
+        extension = file_path.suffix.lstrip(".").lower()
+        if not extension:
+            return None
+
+        # Cloud URLs arrive here as Path("https:/...") -- providers can only probe local files.
+        if not await anyio.Path(file_path).is_file():
+            logger.debug("Skipping metadata extraction for non-local file: %s", file_path)
+            return None
+
+        registry = self.engine.artifact_manager._registry
+        provider_classes = registry.get_provider_classes_by_format(extension)
+        if not provider_classes:
+            logger.debug("Skipping metadata extraction for unsupported file format: %s", file_path)
+            return None
+
+        provider_class = provider_classes[0]
+        metadata = await to_thread(provider_class.get_artifact_metadata, str(file_path))
+        return metadata.model_dump() if metadata else None
+
+    async def _resolve_preview_path(
+        self, file_path: Path, *, preview: bool, metadata_only: bool = False
+    ) -> tuple[Path, dict | None]:
         """Return the path to serve and any source metadata, generating a preview when requested.
 
         Args:
             file_path: Path to the original file.
             preview: Whether to generate and serve a preview.
+            metadata_only: When True, extract metadata without generating a preview. The
+                returned path is always the original file. Takes precedence over preview.
 
         Returns:
             Tuple of (path to serve, artifact metadata or None).
         """
+        if metadata_only:
+            try:
+                artifact_metadata = await self._extract_metadata_only(file_path)
+            except Exception as e:
+                logger.warning("Metadata extraction failed for %s: %s", file_path, e)
+                artifact_metadata = None
+            return file_path, artifact_metadata
         if not preview:
             logger.debug("Serving full image for %s", file_path)
             return file_path, None
@@ -363,7 +407,12 @@ class StaticFilesManager(EngineScoped):
             Result with download URL or failure message.
         """
         file_path = request.file_path
-        logger.debug("CreateStaticFileDownloadUrlFromPath: file_path=%s, preview=%s", file_path, request.preview)
+        logger.debug(
+            "CreateStaticFileDownloadUrlFromPath: file_path=%s, preview=%s, metadata_only=%s",
+            file_path,
+            request.preview,
+            request.metadata_only,
+        )
 
         # Resolve macro paths (e.g. "{outputs}/file.png") before further processing
         try:
@@ -398,9 +447,10 @@ class StaticFilesManager(EngineScoped):
             # For local paths, convert URI to path
             file_path_for_driver = Path(uri_to_path(file_path))
 
-        # If preview requested, generate preview and get preview path + artifact metadata
+        # If preview requested, generate preview and get preview path + artifact metadata.
+        # If metadata_only requested, extract metadata without generating a preview.
         file_path_to_use, artifact_metadata = await self._resolve_preview_path(
-            file_path_for_driver, preview=request.preview
+            file_path_for_driver, preview=request.preview, metadata_only=request.metadata_only
         )
 
         try:

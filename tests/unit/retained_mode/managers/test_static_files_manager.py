@@ -626,6 +626,68 @@ class TestStaticFilesManagerCreateDownloadUrlFromPath:
         assert isinstance(result, CreateStaticFileDownloadUrlResultFailure)
         assert "invalid macro syntax" in result.error
 
+    @pytest.mark.asyncio
+    async def test_create_download_url_from_path_metadata_only(
+        self, mock_static_files_manager: StaticFilesManager, tmp_path: Path
+    ) -> None:
+        """Test metadata_only extracts provider metadata, serves the original file, and skips preview generation."""
+        from griptape_nodes.retained_mode.events.static_file_events import (
+            CreateStaticFileDownloadUrlFromPathRequest,
+            CreateStaticFileDownloadUrlFromPathResultSuccess,
+        )
+
+        source_file = tmp_path / "clip.mov"
+        source_file.write_bytes(b"not a real video")
+
+        mock_metadata = Mock()
+        mock_metadata.model_dump.return_value = {"width": 1920, "height": 1080, "codec": "prores"}
+        mock_provider_class = Mock()
+        mock_provider_class.get_artifact_metadata.return_value = mock_metadata
+        registry = mock_static_files_manager.engine.artifact_manager._registry
+        registry.get_provider_classes_by_format.return_value = [mock_provider_class]
+
+        mock_static_files_manager.storage_driver.create_signed_download_url.return_value = "http://signed-url.com"
+        mock_static_files_manager.storage_driver.get_asset_url.return_value = "http://asset-url.com"
+
+        # preview=True alongside metadata_only proves metadata_only takes precedence
+        request = CreateStaticFileDownloadUrlFromPathRequest(
+            file_path=str(source_file), preview=True, metadata_only=True
+        )
+
+        with patch.object(mock_static_files_manager, "_generate_preview_if_needed") as mock_generate_preview:
+            result = await mock_static_files_manager.on_handle_create_static_file_download_url_from_path_request(
+                request
+            )
+
+        assert isinstance(result, CreateStaticFileDownloadUrlFromPathResultSuccess)
+        assert result.artifact_metadata == {"width": 1920, "height": 1080, "codec": "prores"}
+        mock_provider_class.get_artifact_metadata.assert_called_once_with(str(source_file))
+        mock_generate_preview.assert_not_called()
+        # The original file is served, not a preview
+        mock_static_files_manager.storage_driver.create_signed_download_url.assert_called_once_with(source_file)
+
+    @pytest.mark.asyncio
+    async def test_create_download_url_from_path_metadata_only_missing_file(
+        self, mock_static_files_manager: StaticFilesManager
+    ) -> None:
+        """Test metadata_only on a non-local path still succeeds with no metadata and no provider probe."""
+        from griptape_nodes.retained_mode.events.static_file_events import (
+            CreateStaticFileDownloadUrlFromPathRequest,
+            CreateStaticFileDownloadUrlFromPathResultSuccess,
+        )
+
+        registry = mock_static_files_manager.engine.artifact_manager._registry
+        mock_static_files_manager.storage_driver.create_signed_download_url.return_value = "http://signed-url.com"
+        mock_static_files_manager.storage_driver.get_asset_url.return_value = "http://asset-url.com"
+
+        request = CreateStaticFileDownloadUrlFromPathRequest(file_path="/does/not/exist/clip.mov", metadata_only=True)
+
+        result = await mock_static_files_manager.on_handle_create_static_file_download_url_from_path_request(request)
+
+        assert isinstance(result, CreateStaticFileDownloadUrlFromPathResultSuccess)
+        assert result.artifact_metadata is None
+        registry.get_provider_classes_by_format.assert_not_called()
+
 
 class TestStaticFilesManagerResolveStaticFilePath:
     """Test StaticFilesManager._resolve_static_file_path() method."""
