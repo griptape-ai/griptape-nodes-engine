@@ -810,6 +810,56 @@ class ColorMatch(SuccessFailureNode):
 
 **Trade-off**: You lose helper methods from specialized base classes, but gain complete control over the node's UI structure.
 
+### How the editor previews your ports before a node exists
+
+Some editor features need to know what a node type can connect to *before* one is on the
+canvas. Dragging a connection off a port and dropping it on empty canvas is the main one: the
+Add Node menu that opens floats node types with a compatible port to the top.
+
+The engine answers that with a **port summary** per node type, served by
+`GetPortSummariesForAllLibrariesRequest`. Each summary is four fields:
+
+| Field                | Meaning                                                        |
+| -------------------- | -------------------------------------------------------------- |
+| `input_types`        | Every type accepted, unioned across all ports allowing `INPUT` |
+| `output_types`       | Every type emitted, unioned across all ports allowing `OUTPUT` |
+| `has_control_input`  | Whether the node declares an incoming control (execution) port |
+| `has_control_output` | Whether the node declares an outgoing control (execution) port |
+
+There is nothing to declare and nothing to keep in sync — the engine derives all four by
+constructing one throwaway instance of your node and reading the parameters your `__init__`
+added. `input_types` and `output_type` are read straight off each `Parameter` (each falling
+back to `type` when not set), `allowed_modes` decides which side a parameter lands on, and
+`private=True` parameters are skipped. Control ports are reported only as the two booleans and
+never appear in the type lists, because control and data connections never interconnect.
+
+Because it is a union, a match means "this node type has *some* port that could accept the
+dragged connection", not that a specific port will. The real connection is still resolved
+against the created node's actual parameters, which is where `allow_incoming_connection` /
+`allow_outgoing_connection` get their say.
+
+What this asks of your node:
+
+- **Declare `input_types` / `output_type` honestly in `__init__`.** They are what the editor
+    ranks on. A parameter left at the default `type` is fine; a parameter whose declared types
+    are wider than what `process()` really handles will get your node offered for connections
+    it cannot use.
+- **Keep `__init__` cheap and offline.** Summaries are computed for every node type in a
+    library in one pass. A node whose `__init__` raises is omitted from the summary — it stays
+    creatable, but the editor cannot rank it, so it sinks to the bottom of the menu. One that
+    blocks past a 10-second timeout is omitted the same way. This is the same constraint the
+    worker-mode schema probe imposes — see
+    [`__init__` runs during library load](node_isolation_with_workers.md#__init__-runs-during-library-load).
+- **Expect dynamic ports to be missing.** Only ports that exist right after construction are
+    reported. Ports added later — container children, a
+    [`ParameterTransitionComponent`](#dynamic-parameter-schemas-with-parametertransitioncomponent)
+    swapping in a schema after a dropdown changes — are absent, so your node will not be
+    offered for those types until it is on the canvas. If a type matters for discoverability,
+    declare a port for it up front.
+
+Summaries are cached per library for the life of the process and recomputed after that library
+is reloaded, so the probe pass happens once, not per menu open.
+
 ### Two-Image Processing Node Pattern
 
 For nodes that process two images together (blending, color matching, compositing), use this pattern:

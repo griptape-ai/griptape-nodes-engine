@@ -12,7 +12,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
+from griptape_nodes.exe_types.core_types import (
+    ControlParameterInput,
+    ControlParameterOutput,
+    Parameter,
+    ParameterMode,
+)
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.node_library.library_declarations import (
     KeySupport,
@@ -41,6 +46,8 @@ from griptape_nodes.retained_mode.events.library_events import (
     GetAllInfoForAllLibrariesResultFailure,
     GetAllInfoForAllLibrariesResultSuccess,
     GetAllInfoForLibraryRequest,
+    GetPortSummariesForAllLibrariesRequest,
+    GetPortSummariesForAllLibrariesResultSuccess,
     InstallLibraryDependenciesRequest,
     InstallLibraryDependenciesResultFailure,
     InstallLibraryDependenciesResultSuccess,
@@ -49,6 +56,7 @@ from griptape_nodes.retained_mode.events.library_events import (
     LoadLibrariesRequest,
     LoadLibrariesResultSuccess,
     LoadLibraryMetadataFromFileResultSuccess,
+    NodePortSummary,
     RegisterLibraryFromFileRequest,
     RegisterLibraryFromFileResultFailure,
     RegisterLibraryFromFileResultSuccess,
@@ -1940,7 +1948,7 @@ class TestDescribeNodeTypeRequest:
         # Probe node must not leak into the ObjectManager.
         assert (
             engine.object_manager.attempt_get_object_by_name(
-                f"__describe_node_type_probe__{_DescribeNodeTypeProbe.__name__}"
+                f"{_LibraryManager.PROBE_NODE_NAME_PREFIX}{_DescribeNodeTypeProbe.__name__}"
             )
             is None
         )
@@ -2007,6 +2015,207 @@ class TestDescribeNodeTypeRequest:
         assert isinstance(result.result_details, ResultDetails)
         assert any(detail.level == logging.WARNING for detail in result.result_details.result_details)
         assert "simulated I/O failure" in str(result.result_details)
+
+
+class _PortSummaryProbe(BaseNode):
+    """Node whose ports cover every case NodePortSummary has to sort out."""
+
+    def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
+        super().__init__(name=name, metadata=metadata)
+
+        # Control ports belong to the booleans, never to the data type unions.
+        self.add_parameter(ControlParameterInput())
+        self.add_parameter(ControlParameterOutput())
+
+        # Multi-type input; "str" also appears below, so it must not be duplicated.
+        self.add_parameter(
+            Parameter(
+                name="subject",
+                input_types=["str", "ImageArtifact"],
+                output_type="str",
+                tooltip="Input and output.",
+            )
+        )
+
+        # No input_types/output_type declared -- both unions fall back to `type`.
+        self.add_parameter(Parameter(name="count", type="int", tooltip="Falls back to type."))
+
+        # Property-only: connectable in neither direction, so it appears in neither union.
+        self.add_parameter(
+            Parameter(
+                name="seed",
+                type="float",
+                tooltip="Property only.",
+                allowed_modes={ParameterMode.PROPERTY},
+            )
+        )
+
+        # Private parameters are engine bookkeeping, never offered as ports.
+        self.add_parameter(Parameter(name="internal_state", type="dict", tooltip="Private.", private=True))
+
+
+class _PortSummaryDataOnlyProbe(BaseNode):
+    """Node with data ports but no control ports, e.g. a pure value provider."""
+
+    def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
+        super().__init__(name=name, metadata=metadata)
+        self.add_parameter(
+            Parameter(
+                name="value",
+                type="str",
+                tooltip="Emitted value.",
+                allowed_modes={ParameterMode.OUTPUT},
+            )
+        )
+
+
+class TestNodePortSummary:
+    """Exercise NodePortSummary.from_parameters, the derivation the ranking depends on."""
+
+    def test_derives_unions_and_control_flags(self) -> None:
+        probe = _PortSummaryProbe(name="probe")
+
+        summary = NodePortSummary.from_parameters(probe.parameters)
+
+        # "str" appears on two parameters but is unioned once; the control type is excluded.
+        assert summary.input_types == ["str", "ImageArtifact", "int"]
+        assert summary.output_types == ["str", "int"]
+        assert summary.has_control_input is True
+        assert summary.has_control_output is True
+
+        # The property-only and private parameters contribute to neither union.
+        assert "float" not in summary.input_types
+        assert "float" not in summary.output_types
+        assert "dict" not in summary.input_types
+        assert "dict" not in summary.output_types
+
+    def test_reports_no_control_when_node_declares_none(self) -> None:
+        probe = _PortSummaryDataOnlyProbe(name="probe")
+
+        summary = NodePortSummary.from_parameters(probe.parameters)
+
+        assert summary.has_control_input is False
+        assert summary.has_control_output is False
+        # Output-only mode means the parameter is emitted but not accepted.
+        assert summary.input_types == []
+        assert summary.output_types == ["str"]
+
+    def test_returns_empty_summary_for_portless_node(self) -> None:
+        summary = NodePortSummary.from_parameters([])
+
+        assert summary.input_types == []
+        assert summary.output_types == []
+        assert summary.has_control_input is False
+        assert summary.has_control_output is False
+
+
+class TestGetPortSummariesForAllLibrariesRequest:
+    """Exercise LibraryManager.on_get_port_summaries_for_all_libraries_request."""
+
+    _LIBRARY_NAME = "port-summary-test-library"
+
+    @pytest.fixture(autouse=True)
+    def _clean_registry(self) -> Generator[None, None, None]:
+        """LibraryRegistry holds class-level state that survives the singleton reset fixture."""
+        LibraryRegistry._clear()
+        yield
+        LibraryRegistry._clear()
+
+    def _register_probe_library(self, *node_classes: type[BaseNode]) -> None:
+        schema = LibrarySchema(
+            name=self._LIBRARY_NAME,
+            library_schema_version=LibrarySchema.LATEST_SCHEMA_VERSION,
+            metadata=LibraryMetadata(
+                author="test",
+                description="port summary library",
+                library_version="1.0.0",
+                engine_version="1.0.0",
+                tags=[],
+            ),
+            categories=[],
+            nodes=[],
+        )
+        library = LibraryRegistry.generate_new_library(library_data=schema)
+        for node_class in node_classes:
+            library.register_new_node_type(
+                node_class,
+                NodeMetadata(
+                    category="test",
+                    description=f"{node_class.__name__} used by port summary tests",
+                    display_name=node_class.__name__,
+                ),
+            )
+
+    @pytest.mark.asyncio
+    async def test_returns_a_summary_for_every_node_type(self, engine: Engine) -> None:
+        library_manager = engine.library_manager
+        self._register_probe_library(_PortSummaryProbe, _PortSummaryDataOnlyProbe)
+
+        result = await library_manager.on_get_port_summaries_for_all_libraries_request(
+            GetPortSummariesForAllLibrariesRequest()
+        )
+
+        assert isinstance(result, GetPortSummariesForAllLibrariesResultSuccess)
+        summaries = result.library_name_to_port_summaries[self._LIBRARY_NAME]
+        assert set(summaries) == {_PortSummaryProbe.__name__, _PortSummaryDataOnlyProbe.__name__}
+        assert summaries[_PortSummaryProbe.__name__].has_control_input is True
+        assert summaries[_PortSummaryDataOnlyProbe.__name__].output_types == ["str"]
+
+    @pytest.mark.asyncio
+    async def test_omits_node_types_that_cannot_be_probed(self, engine: Engine) -> None:
+        """A node whose __init__ raises is left out rather than reported as having no ports."""
+        library_manager = engine.library_manager
+        self._register_probe_library(_PortSummaryDataOnlyProbe, _RaisingProbe)
+
+        result = await library_manager.on_get_port_summaries_for_all_libraries_request(
+            GetPortSummariesForAllLibrariesRequest()
+        )
+
+        assert isinstance(result, GetPortSummariesForAllLibrariesResultSuccess)
+        summaries = result.library_name_to_port_summaries[self._LIBRARY_NAME]
+        assert _RaisingProbe.__name__ not in summaries
+        assert _PortSummaryDataOnlyProbe.__name__ in summaries
+
+    @pytest.mark.asyncio
+    async def test_probes_each_node_type_once_across_requests(self, engine: Engine) -> None:
+        """Probing is the expensive part, so a second request must be served from the cache."""
+        library_manager = engine.library_manager
+        self._register_probe_library(_PortSummaryDataOnlyProbe)
+
+        with patch.object(
+            _LibraryManager, "_probe_node_type", side_effect=_LibraryManager._probe_node_type, autospec=True
+        ) as probe_spy:
+            await library_manager.on_get_port_summaries_for_all_libraries_request(
+                GetPortSummariesForAllLibrariesRequest()
+            )
+            await library_manager.on_get_port_summaries_for_all_libraries_request(
+                GetPortSummariesForAllLibrariesRequest()
+            )
+
+        assert probe_spy.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_recomputes_after_library_is_unloaded(self, engine: Engine) -> None:
+        """Unloading is the choke point every reload goes through, so it must drop the cache."""
+        library_manager = engine.library_manager
+        self._register_probe_library(_PortSummaryDataOnlyProbe)
+
+        await library_manager.on_get_port_summaries_for_all_libraries_request(GetPortSummariesForAllLibrariesRequest())
+        library_manager.unload_library_from_registry_request(
+            UnloadLibraryFromRegistryRequest(library_name=self._LIBRARY_NAME)
+        )
+
+        assert self._LIBRARY_NAME not in library_manager._library_to_port_summaries
+
+        # Re-registering with a different node type must be reflected, not served stale.
+        self._register_probe_library(_PortSummaryProbe)
+        result = await library_manager.on_get_port_summaries_for_all_libraries_request(
+            GetPortSummariesForAllLibrariesRequest()
+        )
+
+        assert isinstance(result, GetPortSummariesForAllLibrariesResultSuccess)
+        summaries = result.library_name_to_port_summaries[self._LIBRARY_NAME]
+        assert set(summaries) == {_PortSummaryProbe.__name__}
 
 
 class _LifecycleProbe(BaseNode):

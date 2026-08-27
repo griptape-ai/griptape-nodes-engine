@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+from griptape_nodes.exe_types.core_types import ParameterMode, ParameterTypeBuiltin
 from griptape_nodes.node_library.library_registry import (
     LibraryMetadata,
     LibrarySchema,
@@ -270,6 +271,75 @@ class ParameterDescription:
             settable=param_dict["settable"],
             ui_options=param_dict["ui_options"],
             parent_container_name=param_dict["parent_container_name"],
+        )
+
+
+@dataclass
+class NodePortSummary:
+    """Connectivity-only view of a node type's ports, derived from the parameters it declares.
+
+    Purpose-built for ranking node types before any node exists -- e.g. the editor dragging a
+    connection onto empty canvas, where the Add Node menu wants to float compatible node types
+    to the top. The type lists are unions across every port, so a match means "this node type
+    has some port that could accept the dragged connection", not that a specific port will:
+    the actual connection is still resolved against the created node's real parameters, which
+    is also where a node gets to veto via `allow_incoming_connection` / `allow_outgoing_connection`.
+
+    Control flow is carried solely by the two booleans. Control ports are excluded from
+    `input_types` / `output_types` because control and data connections never interconnect.
+
+    Args:
+        input_types: Accepted types unioned over every port allowing the INPUT mode
+        output_types: Emitted types unioned over every port allowing the OUTPUT mode
+        has_control_input: Whether the node declares an incoming control (execution) port
+        has_control_output: Whether the node declares an outgoing control (execution) port
+    """
+
+    input_types: list[str]
+    output_types: list[str]
+    has_control_input: bool
+    has_control_output: bool
+
+    @classmethod
+    def from_parameters(cls, parameters: list[Parameter]) -> NodePortSummary:
+        """Derive the summary from the parameters a probed node declares.
+
+        Only sees parameters that exist right after construction. Ports added dynamically at
+        runtime (container children, config-driven ports) are absent by design -- see
+        GetPortSummariesForAllLibrariesRequest.
+        """
+        control_type = ParameterTypeBuiltin.CONTROL_TYPE.value
+        input_types: list[str] = []
+        output_types: list[str] = []
+        has_control_input = False
+        has_control_output = False
+
+        for parameter in parameters:
+            # Private parameters are engine bookkeeping and are never offered as ports.
+            if parameter.private:
+                continue
+
+            if ParameterMode.INPUT in parameter.allowed_modes:
+                # `Parameter.input_types` already falls back to the parameter's single `type`.
+                for accepted_type in parameter.input_types:
+                    if accepted_type == control_type:
+                        has_control_input = True
+                    elif accepted_type not in input_types:
+                        input_types.append(accepted_type)
+
+            if ParameterMode.OUTPUT in parameter.allowed_modes:
+                # Likewise, `Parameter.output_type` falls back to `type`.
+                emitted_type = parameter.output_type
+                if emitted_type == control_type:
+                    has_control_output = True
+                elif emitted_type not in output_types:
+                    output_types.append(emitted_type)
+
+        return cls(
+            input_types=input_types,
+            output_types=output_types,
+            has_control_input=has_control_input,
+            has_control_output=has_control_output,
         )
 
 
@@ -800,6 +870,51 @@ class GetAllInfoForAllLibrariesResultSuccess(WorkflowNotAlteredMixin, ResultPayl
 @PayloadRegistry.register
 class GetAllInfoForAllLibrariesResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Comprehensive information retrieval for all libraries failed. Common causes: registry not initialized, system error."""
+
+
+@dataclass
+@PayloadRegistry.register
+class GetPortSummariesForAllLibrariesRequest(RequestPayload):
+    """Get a compact port summary for every node type in every registered library.
+
+    Use when: ranking node types by what they can connect to before any node exists -- the
+    editor's drag-a-connection-onto-empty-canvas flow, or any other "which node types accept
+    this type?" question. `GetAllInfoForLibraryRequest` deliberately carries only display
+    metadata, which cannot answer it.
+
+    Deliberately a separate request rather than a field on the library catalog. A node type's
+    ports are only knowable by constructing it, and node modules are imported lazily by default
+    (`library.lazy_node_loading`), so folding this into the catalog would import and instantiate
+    every node type in every library on every editor connect. Here the cost is paid once, on
+    demand, by the callers that need ranking. Results are cached per library for the process
+    lifetime and recomputed after the library is reloaded.
+
+    Known limitation: only ports present right after construction are reported. Ports created
+    dynamically later (container children, config-driven ports) are absent, which is fine for
+    ranking -- the real connection is resolved against the created node's actual parameters.
+
+    Results: GetPortSummariesForAllLibrariesResultSuccess | GetPortSummariesForAllLibrariesResultFailure
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class GetPortSummariesForAllLibrariesResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Port summaries retrieved successfully.
+
+    Args:
+        library_name_to_port_summaries: Per library, a map of node type name to its port summary.
+            Node types the engine could not construct are omitted rather than reported as
+            portless, so callers can leave them unranked instead of ranking them wrongly.
+    """
+
+    library_name_to_port_summaries: dict[str, dict[str, NodePortSummary]]
+
+
+@dataclass
+@PayloadRegistry.register
+class GetPortSummariesForAllLibrariesResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Port summary retrieval failed. Common causes: registry not initialized, system error."""
 
 
 @dataclass

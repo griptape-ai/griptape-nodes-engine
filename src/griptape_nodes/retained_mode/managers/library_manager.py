@@ -125,6 +125,8 @@ from griptape_nodes.retained_mode.events.library_events import (
     GetNodeMetadataFromLibraryRequest,
     GetNodeMetadataFromLibraryResultFailure,
     GetNodeMetadataFromLibraryResultSuccess,
+    GetPortSummariesForAllLibrariesRequest,
+    GetPortSummariesForAllLibrariesResultSuccess,
     InspectLibraryRepoRequest,
     InspectLibraryRepoResultFailure,
     InspectLibraryRepoResultSuccess,
@@ -153,6 +155,7 @@ from griptape_nodes.retained_mode.events.library_events import (
     LoadLibraryMetadataFromFileResultSuccess,
     LoadMetadataForAllLibrariesRequest,
     LoadMetadataForAllLibrariesResultSuccess,
+    NodePortSummary,
     ParameterDescription,
     PreviewProjectProvisioningRequest,
     PreviewProjectProvisioningResultFailure,
@@ -355,6 +358,18 @@ class StableNamespaceImportFinder(importlib.abc.MetaPathFinder, importlib.abc.Lo
         """No-op: the module was fully executed by the memoized loader in create_module."""
 
 
+class NodeProbeResult(NamedTuple):
+    """Outcome of constructing a throwaway node to read the parameters its __init__ declares.
+
+    `node` is None exactly when the probe failed -- either the node's module could not be
+    imported or its __init__ raised -- and `error_message` says why. On success `error_message`
+    is empty.
+    """
+
+    node: BaseNode | None
+    error_message: str
+
+
 class LibraryGitOperationContext(NamedTuple):
     """Context information for git operations on a library."""
 
@@ -428,6 +443,11 @@ class LibraryManager(EngineScoped):
     # Sandbox library constants
     UNRESOLVED_SANDBOX_CLASS_NAME = "<NOT YET RESOLVED>"
     SANDBOX_CATEGORY_NAME = "Griptape Nodes Sandbox"
+
+    # Name given to the throwaway nodes `_probe_node_type` constructs to read a node type's
+    # declared parameters. They are never registered with the ObjectManager, so the prefix only
+    # exists to make one obvious in a log line or traceback.
+    PROBE_NODE_NAME_PREFIX = "__node_type_probe__"
 
     _library_file_path_to_info: dict[str, LibraryInfo]
 
@@ -585,7 +605,7 @@ class LibraryManager(EngineScoped):
     # Callbacks invoked immediately before all libraries are reloaded.
     _pre_reload_callbacks: list[Callable[[], Awaitable[None]]]
 
-    def __init__(
+    def __init__(  # noqa: PLR0915 (mostly a flat list of request-handler registrations)
         self, event_manager: EventManager, *, worker_manager: WorkerManager, engine: Engine | None = None
     ) -> None:
         super().__init__(engine)
@@ -613,6 +633,10 @@ class LibraryManager(EngineScoped):
         self._library_event_handler_mappings: dict[
             type[Payload], dict[str, LibraryManager.RegisteredEventHandler[Any]]
         ] = {}
+        # Per-library node type -> port summary, computed on the first GetPortSummaries request
+        # and dropped when the library is unloaded (which a reload goes through).
+        self._library_to_port_summaries: dict[str, dict[str, NodePortSummary]] = {}
+        self._port_summaries_lock = asyncio.Lock()
         self._libraries_loading_complete = asyncio.Event()
         self._libraries_loading_complete.set()  # Not loading initially; load_all_libraries_from_config will clear/set this
         # True for the duration of the engine's initialization sequence (library + workflow
@@ -666,6 +690,9 @@ class LibraryManager(EngineScoped):
         )
         event_manager.assign_manager_to_request_type(
             GetAllInfoForAllLibrariesRequest, self.on_get_all_info_for_all_libraries_request
+        )
+        event_manager.assign_manager_to_request_type(
+            GetPortSummariesForAllLibrariesRequest, self.on_get_port_summaries_for_all_libraries_request
         )
         event_manager.assign_manager_to_request_type(
             LoadMetadataForAllLibrariesRequest, self.load_metadata_for_all_libraries_request
@@ -1920,6 +1947,10 @@ class LibraryManager(EngineScoped):
             )
             return RegisterSandboxNodeFromSourceResultFailure(result_details=details)
 
+        # These node types were added to (or replaced within) an already-registered library, so
+        # its cached port summaries no longer describe it.
+        self._library_to_port_summaries.pop(LibraryManager.SANDBOX_LIBRARY_NAME, None)
+
         summary = (
             f"Registered {len(registered_class_names)} node type(s) from '{file_path}' "
             f"into the {LibraryManager.SANDBOX_LIBRARY_NAME} "
@@ -1954,20 +1985,13 @@ class LibraryManager(EngineScoped):
             return DescribeNodeTypeResultFailure(result_details=details)
 
         # Instantiate a throwaway node so we can read the parameters its __init__ declares.
-        # The node is never added to a flow or the ObjectManager, so it is garbage-collected
-        # when this method returns.
         #
-        # Nodes whose __init__ performs I/O (network calls, auth checks, disk reads) can raise.
-        # In that case we still return a success payload with the library-level metadata and a
-        # WARNING entry in result_details, so callers can present the node at all instead of
-        # getting an opaque failure for every such node type.
-        # Resolving the class imports the node's module (lazy registration defers this to
-        # first use). A broken module raises here; return the library-level metadata with a
-        # WARNING rather than an opaque failure, matching the probe-failure path below.
-        try:
-            node_class = library.get_node_class(request.node_type)
-        except (ImportError, AttributeError, TypeError) as err:
-            import_error = f"{type(err).__name__}: {err}"
+        # The import or the __init__ can fail (a broken module, or __init__ I/O such as network
+        # calls, auth checks, disk reads). In that case we still return a success payload with
+        # the library-level metadata and a WARNING entry in result_details, so callers can
+        # present the node at all instead of getting an opaque failure for every such node type.
+        probe_result = self._probe_node_type(library=library, node_type=request.node_type)
+        if probe_result.node is None:
             return DescribeNodeTypeResultSuccess(
                 library=library_name,
                 node_type=request.node_type,
@@ -1983,49 +2007,12 @@ class LibraryManager(EngineScoped):
                     ),
                     ResultDetail(
                         level=logging.WARNING,
-                        message=f"Node module failed to import: {import_error}",
-                    ),
-                ),
-            )
-        probe_name = f"__describe_node_type_probe__{request.node_type}"
-        try:
-            # Wrap in ``LibraryRegistry.constructing_node()`` so the
-            # parameter-mutation detector skips this ephemeral probe's
-            # declarative ``add_parameter`` calls (this construction
-            # bypasses ``LibraryRegistry.create_node``).
-            #
-            # Pass the node's library and type so declarative ``__init__`` logic
-            # that resolves against the library -- e.g. ``get_declared_models``
-            # populating a model dropdown from the ``model_catalog`` -- works
-            # during the probe just as it does under ``create_node``.
-            with LibraryRegistry.constructing_node():
-                probe_node = node_class(
-                    name=probe_name,
-                    metadata={"library": library_name, "node_type": request.node_type},
-                )
-        except Exception as err:
-            probe_error = f"{type(err).__name__}: {err}"
-            return DescribeNodeTypeResultSuccess(
-                library=library_name,
-                node_type=request.node_type,
-                metadata=node_metadata,
-                parameters=[],
-                result_details=ResultDetails(
-                    ResultDetail(
-                        level=logging.INFO,
-                        message=(
-                            f"Described node type '{request.node_type}' in Library '{library_name}' "
-                            "with library metadata only."
-                        ),
-                    ),
-                    ResultDetail(
-                        level=logging.WARNING,
-                        message=f"Parameter probe failed because: {probe_error}",
+                        message=probe_result.error_message,
                     ),
                 ),
             )
 
-        parameters = [ParameterDescription.from_parameter(param) for param in probe_node.parameters]
+        parameters = [ParameterDescription.from_parameter(param) for param in probe_result.node.parameters]
 
         details = f"Successfully described node type '{request.node_type}' in Library '{library_name}'."
         return DescribeNodeTypeResultSuccess(
@@ -2035,6 +2022,55 @@ class LibraryManager(EngineScoped):
             parameters=parameters,
             result_details=details,
         )
+
+    def _probe_node_type(self, library: Library, node_type: str) -> NodeProbeResult:
+        """Construct a throwaway node so callers can read the parameters its __init__ declares.
+
+        Parameters are usually added in __init__ rather than declared as class attributes, so
+        constructing the node is the only way to see its ports. The probe is never added to a
+        flow or the ObjectManager, so it is garbage-collected once the caller drops it.
+
+        Two things can fail and neither is exceptional from a caller's point of view, so both
+        come back as `error_message` on the result:
+
+        - Resolving the class imports the node's module, which lazy registration defers to first
+          use. A broken module raises here.
+        - A node's __init__ may perform I/O (network calls, auth checks, disk reads).
+
+        Callers on the event loop should note that both can block; ``__init__`` in particular has
+        no bound on how long it takes.
+        """
+        library_name = library.get_library_data().name
+
+        try:
+            node_class = library.get_node_class(node_type)
+        except (ImportError, AttributeError, TypeError) as err:
+            return NodeProbeResult(
+                node=None,
+                error_message=f"Node module failed to import: {type(err).__name__}: {err}",
+            )
+
+        try:
+            # Wrap in ``LibraryRegistry.constructing_node()`` so the parameter-mutation detector
+            # skips this ephemeral probe's declarative ``add_parameter`` calls (this construction
+            # bypasses ``LibraryRegistry.create_node``).
+            #
+            # Pass the node's library and type so declarative ``__init__`` logic that resolves
+            # against the library -- e.g. ``get_declared_models`` populating a model dropdown
+            # from the ``model_catalog`` -- works during the probe just as it does under
+            # ``create_node``.
+            with LibraryRegistry.constructing_node():
+                probe_node = node_class(
+                    name=f"{self.PROBE_NODE_NAME_PREFIX}{node_type}",
+                    metadata={"library": library_name, "node_type": node_type},
+                )
+        except Exception as err:
+            return NodeProbeResult(
+                node=None,
+                error_message=f"Parameter probe failed because: {type(err).__name__}: {err}",
+            )
+
+        return NodeProbeResult(node=probe_node, error_message="")
 
     def list_categories_in_library_request(self, request: ListCategoriesInLibraryRequest) -> ResultPayload:
         # Does this library exist?
@@ -3042,6 +3078,10 @@ class LibraryManager(EngineScoped):
             details = f"Attempted to unload library '{request.library_name}'. Failed due to {e}"
             return UnloadLibraryFromRegistryResultFailure(result_details=details)
 
+        # Drop cached port summaries: the library's node types are gone, and a subsequent load may
+        # bring back different ones. Every reload path unloads first, so this covers reloads too.
+        self._library_to_port_summaries.pop(request.library_name, None)
+
         # Clean up all stable module aliases for this library. Note first whether any of its node
         # modules had actually been imported: if so, this process is stuck with that code and the
         # library's next load cannot replace it.
@@ -3102,6 +3142,106 @@ class LibraryManager(EngineScoped):
         """Registered entry point: hold the caller until any in-flight reload finishes."""
         await self._libraries_loading_complete.wait()
         return await self.get_all_info_for_all_libraries_request(request)
+
+    async def on_get_port_summaries_for_all_libraries_request(
+        self,
+        request: GetPortSummariesForAllLibrariesRequest,  # noqa: ARG002
+    ) -> ResultPayload:
+        """Async handler for GetPortSummariesForAllLibrariesRequest.
+
+        Waits for library loading to finish, then serves each library's summaries from the cache,
+        computing them on first request.
+        """
+        await self._libraries_loading_complete.wait()
+
+        library_name_to_port_summaries: dict[str, dict[str, NodePortSummary]] = {}
+        for library_name in LibraryRegistry.list_libraries():
+            library_name_to_port_summaries[library_name] = await self._get_port_summaries_for_library(library_name)
+
+        node_type_count = sum(len(summaries) for summaries in library_name_to_port_summaries.values())
+        details = (
+            f"Successfully retrieved port summaries for {node_type_count} node type(s) "
+            f"across {len(library_name_to_port_summaries)} librar(ies)."
+        )
+        return GetPortSummariesForAllLibrariesResultSuccess(
+            library_name_to_port_summaries=library_name_to_port_summaries,
+            result_details=details,
+        )
+
+    async def _get_port_summaries_for_library(self, library_name: str) -> dict[str, NodePortSummary]:
+        """Return the port summary for every node type in a library, computing it on first call.
+
+        Cached for the process lifetime because a node type's declared ports cannot change
+        without the library being reloaded, which clears the entry.
+
+        The lock means concurrent callers do the probe pass once rather than once each; the
+        second caller waits and then reads the cache.
+        """
+        async with self._port_summaries_lock:
+            cached_summaries = self._library_to_port_summaries.get(library_name)
+            if cached_summaries is not None:
+                return cached_summaries
+
+            summaries = await self._compute_port_summaries_for_library(library_name)
+            self._library_to_port_summaries[library_name] = summaries
+            return summaries
+
+    async def _compute_port_summaries_for_library(self, library_name: str) -> dict[str, NodePortSummary]:
+        """Probe every node type in a library and derive its port summary.
+
+        Node types the engine cannot construct are left out of the result entirely rather than
+        recorded as portless, so callers leave them unranked instead of ranking them as
+        connecting to nothing.
+
+        Each probe runs in a thread under the same timeout the worker-side schema pass uses:
+        a node's __init__ can block indefinitely, and one such node must not stall the rest.
+        """
+        try:
+            library = LibraryRegistry.get_library(library_name)
+        except KeyError:
+            logger.warning("Cannot compute port summaries: library '%s' not found in registry.", library_name)
+            return {}
+
+        summaries: dict[str, NodePortSummary] = {}
+        skipped_node_types: list[str] = []
+        for node_type in library.get_registered_nodes():
+            try:
+                probe_result = await asyncio.wait_for(
+                    asyncio.to_thread(self._probe_node_type, library, node_type),
+                    timeout=self._SCHEMA_PROBE_TIMEOUT_S,
+                )
+            except TimeoutError:
+                logger.warning(
+                    "Port summary probe for node type '%s' in library '%s' timed out after %.1fs; skipping. "
+                    "The node's __init__ likely makes a blocking call.",
+                    node_type,
+                    library_name,
+                    self._SCHEMA_PROBE_TIMEOUT_S,
+                )
+                skipped_node_types.append(node_type)
+                continue
+
+            if probe_result.node is None:
+                logger.debug(
+                    "Could not probe node type '%s' in library '%s' for its port summary: %s",
+                    node_type,
+                    library_name,
+                    probe_result.error_message,
+                )
+                skipped_node_types.append(node_type)
+                continue
+
+            summaries[node_type] = NodePortSummary.from_parameters(probe_result.node.parameters)
+
+        if skipped_node_types:
+            logger.info(
+                "Computed port summaries for %d node type(s) in library '%s'; %d could not be probed: %s",
+                len(summaries),
+                library_name,
+                len(skipped_node_types),
+                ", ".join(skipped_node_types),
+            )
+        return summaries
 
     async def on_get_all_info_for_library_request(self, request: GetAllInfoForLibraryRequest) -> ResultPayload:
         """Registered entry point: hold the caller until any in-flight reload finishes.
@@ -4461,6 +4601,10 @@ class LibraryManager(EngineScoped):
         except KeyError:
             logger.warning("Cannot register worker node schemas: library '%s' not found in registry.", library_name)
             return
+
+        # Stub classes are about to replace whatever this library previously advertised, so any
+        # port summaries cached from an earlier load are stale.
+        self._library_to_port_summaries.pop(library_name, None)
 
         # Build a lookup from class_name -> NodeMetadata using the library JSON schema.
         library_data = library.get_library_data()
