@@ -173,13 +173,13 @@ target_node.parameter_output_values[target_param_name] = param_value
 ```python
 # node_executor._apply_parameter_values_to_node — skips the request entirely
 if target_node.should_preserve_stored_template(target_param_name, param_value):
-    self._unresolve_future_nodes_for_skipped_write(target_node, target_param_name, param_value)
+    self._unresolve_future_nodes_for_skipped_write(target_node, target_param_name)
 else:
     self.engine.node_manager.on_set_parameter_value_request(SetParameterValueRequest(..., value=param_value))
 target_node.parameter_output_values[target_param_name] = param_value
 ```
 
-**`is_output=True` is not a shortcut here.** It looks like one — `_set_and_pass_through_values` writes to `parameter_output_values` and returns early, so the template survives — but it sets `modified` only when the key *already* held a different value, and `parallel_resolution` calls `parameter_output_values.silent_clear()` before executing a node. With the key absent, `modified` is `False` and the handler's `unresolve_future_nodes` never fires, so downstream nodes keep results from before the group ran. The non-output path did not have that problem: it compared old and new *stored* values, and the template always differed from the resolved text. So skip the request and do the invalidation explicitly.
+**`is_output=True` is not a shortcut here.** It looks like one — `_set_and_pass_through_values` writes to `parameter_output_values` and returns early, so the template survives — but it sets `modified` only when the key *already* held a different value, and `parallel_resolution` calls `parameter_output_values.silent_clear()` before executing a node. With the key absent, `modified` is `False` and the handler's `unresolve_future_nodes` never fires, so downstream nodes keep results from before the group ran. The non-output path did not have that problem: it compared old and new *stored* values, and the template always differed from the resolved text. So skip the request and do the invalidation explicitly — unconditionally, since that is what the comparison the request would have made always concluded. Gating it on the resolved output matching the previous run's would be a new optimisation, on the side where a wrong guess leaves a node resolved against stale input.
 
 Skipping also means skipping `make_node_unresolved` on the target and the downstream property pass-through. Neither is worth reproducing: the resolution machine marks the target RESOLVED again as soon as the executor returns, and downstream delivery is pull-based (`parallel_resolution.collect_values_from_upstream_nodes` re-reads upstream `parameter_output_values` before each node runs), so a node that resolves this run reads the fresh value rather than a pushed copy.
 

@@ -133,20 +133,6 @@ logger = logging.getLogger("griptape_nodes")
 current_executing_node_name: ContextVar[str | None] = ContextVar("current_executing_node_name", default=None)
 
 
-def _values_are_equal(left: Any, right: Any) -> bool:
-    """Whether two parameter values are equal, treating an unanswerable comparison as unequal.
-
-    ``==`` is not guaranteed to return a bool: numpy arrays and DataFrames compare
-    elementwise and their truthiness raises. Callers use equality to decide whether
-    some bookkeeping can be skipped, so a comparison that cannot be answered should
-    fall through to doing the work rather than silently skipping it.
-    """
-    try:
-        return bool(left == right)
-    except Exception:
-        return False
-
-
 class IterationControlAction(StrEnum):
     """Enum for iterative group control actions."""
 
@@ -3783,7 +3769,7 @@ class NodeExecutor(EngineScoped):
                 # .silent_clear() before executing a node, so the key is routinely absent
                 # and downstream invalidation would quietly stop firing on this path.
                 if target_node.should_preserve_stored_template(target_param_name, param_value):
-                    self._unresolve_future_nodes_for_skipped_write(target_node, target_param_name, param_value)
+                    self._unresolve_future_nodes_for_skipped_write(target_node, target_param_name)
                 else:
                     self.engine.node_manager.on_set_parameter_value_request(
                         SetParameterValueRequest(
@@ -3803,9 +3789,7 @@ class NodeExecutor(EngineScoped):
                 param_value,
             )
 
-    def _unresolve_future_nodes_for_skipped_write(
-        self, target_node: BaseNode, target_param_name: str, param_value: Any
-    ) -> None:
+    def _unresolve_future_nodes_for_skipped_write(self, target_node: BaseNode, target_param_name: str) -> None:
         """Invalidate downstream nodes for a copy-back that bypassed the request handler.
 
         ``SetParameterValueRequest`` unresolves future nodes whenever the value it set
@@ -3813,23 +3797,20 @@ class NodeExecutor(EngineScoped):
         so the same bookkeeping has to happen here or downstream nodes keep stale
         results from before the group ran.
 
-        This is deliberately *not* handler parity. The handler compares stored values,
-        and on this path those always differ (``_differs`` is a precondition of
-        ``should_preserve_stored_template``), so it would unresolve unconditionally.
-        The rule here is narrower and states the thing that actually matters: changed
-        relative to the value downstream already consumed. An absent key counts as
-        changed; an identical resolved output means nothing downstream is stale.
+        Unconditional, because the request this stands in for was too: the handler
+        compares the *stored* value, and on this path that is the template while the
+        value is the resolved text (``_differs`` is a precondition of
+        ``should_preserve_stored_template``), so it always saw a change. Skipping when
+        the resolved output happens to match the previous run's would be a new
+        optimisation, and getting it wrong leaves a node resolved against stale input.
 
-        Two other things the handler's ``modified`` flag drives are also not
-        reproduced. ``make_node_unresolved`` on the target would be overwritten
-        immediately -- the resolution machine marks the node RESOLVED once the
-        executor returns. The downstream property pass-through is redundant because
-        delivery is pull-based: ``collect_values_from_upstream_nodes`` re-reads
-        upstream ``parameter_output_values`` before each node runs.
+        Two other things the handler's ``modified`` flag drives are not reproduced.
+        ``make_node_unresolved`` on the target would be overwritten immediately -- the
+        resolution machine marks the node RESOLVED once the executor returns. The
+        downstream property pass-through is redundant because delivery is pull-based:
+        ``collect_values_from_upstream_nodes`` re-reads upstream
+        ``parameter_output_values`` before each node runs.
         """
-        current_outputs = target_node.parameter_output_values
-        if target_param_name in current_outputs and _values_are_equal(current_outputs[target_param_name], param_value):
-            return
         try:
             self.engine.flow_manager.get_connections().unresolve_future_nodes(target_node)
         except Exception:

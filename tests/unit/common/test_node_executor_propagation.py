@@ -324,11 +324,13 @@ class TestGroupCopyBackPreservesTemplate:
         unresolve = mock_engine.flow_manager.get_connections.return_value.unresolve_future_nodes
         unresolve.assert_called_once_with(node)
 
-    def test_apply_parameter_values_skips_invalidation_when_output_unchanged(self) -> None:
-        """An output that already holds this value did not change, so nothing is stale.
+    def test_apply_parameter_values_invalidates_even_when_output_unchanged(self) -> None:
+        """Invalidation is unconditional, matching the request this path stands in for.
 
-        Mirrors the `modified` gate the request handler applies, so a re-run that
-        produces the same value does not needlessly unresolve the graph.
+        The handler gates on the *stored* value changing, and here that is the template
+        against the resolved text, so it always unresolved. Comparing the previous
+        output instead would be a new optimisation, and it is the kind that leaves a
+        node resolved against stale input when it guesses wrong.
         """
         node = _make_template_node()
         executor = _make_executor()
@@ -344,7 +346,7 @@ class TestGroupCopyBackPreservesTemplate:
             executor._apply_parameter_values_to_node(node, {"PromptNode_prompt": "hyperreal"}, package_result)
 
         unresolve = mock_engine.flow_manager.get_connections.return_value.unresolve_future_nodes
-        unresolve.assert_not_called()
+        unresolve.assert_called_once_with(node)
 
     def test_apply_parameter_values_writes_non_template_values_normally(self) -> None:
         """Without a template the request must still be sent as a stored-value write."""
