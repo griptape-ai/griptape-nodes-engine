@@ -5,7 +5,7 @@ import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
-from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -326,13 +326,6 @@ A = TypeVar("A", bound=AppPayload)
 
 class BaseEvent(BaseModel, ABC):
     """Abstract base class for all events."""
-
-    # Instance fields for engine and session identification
-    _engine_id: ClassVar[str | None] = None
-    _session_id: ClassVar[str | None] = None
-
-    engine_id: str | None = Field(default_factory=lambda: BaseEvent._engine_id)
-    session_id: str | None = Field(default_factory=lambda: BaseEvent._session_id)
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
