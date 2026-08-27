@@ -554,6 +554,77 @@ class TestPermissionDispatch:
         assert manager.check_read_permission("/some/file_without_ext") is None
 
 
+class TestExtractArtifactMetadata:
+    """extract_artifact_metadata resolves the provider by extension and returns its metadata as a dict."""
+
+    _PROBE_FORMAT = "probe"
+
+    def _make_probe_provider_class(self, metadata=None):  # noqa: ANN001, ANN202
+        from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_provider import (
+            BaseArtifactMetadata,
+            BaseArtifactProvider,
+        )
+
+        probe_format = self._PROBE_FORMAT
+
+        class _ProbeProvider(BaseArtifactProvider):
+            @classmethod
+            def get_friendly_name(cls) -> str:
+                return "Probe"
+
+            @classmethod
+            def get_supported_formats(cls) -> set[str]:
+                return {probe_format}
+
+            @classmethod
+            def get_artifact_metadata(cls, source_path: str) -> BaseArtifactMetadata | None:  # noqa: ARG003
+                return metadata
+
+        return _ProbeProvider
+
+    def _register(self, manager: ArtifactManager, provider_class: type) -> None:
+        result = manager.on_handle_register_artifact_provider_request(
+            RegisterArtifactProviderRequest(provider_class=provider_class)
+        )
+        assert isinstance(result, RegisterArtifactProviderResultSuccess)
+
+    @pytest.mark.asyncio
+    async def test_returns_provider_metadata_as_dict(self) -> None:
+        from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_provider import (
+            BaseArtifactMetadata,
+        )
+
+        class _ProbeMetadata(BaseArtifactMetadata):
+            codec: str = "prores"
+            width: int = 1920
+
+        probe_cls = self._make_probe_provider_class(metadata=_ProbeMetadata())
+        manager = ArtifactManager()
+        self._register(manager, probe_cls)
+
+        result = await manager.extract_artifact_metadata(f"/some/clip.{self._PROBE_FORMAT}")
+
+        assert result == {"codec": "prores", "width": 1920}
+
+    @pytest.mark.asyncio
+    async def test_unknown_extension_returns_none(self) -> None:
+        manager = ArtifactManager()
+        assert await manager.extract_artifact_metadata("/some/clip.unregistered") is None
+
+    @pytest.mark.asyncio
+    async def test_no_extension_returns_none(self) -> None:
+        manager = ArtifactManager()
+        assert await manager.extract_artifact_metadata("/some/file_without_ext") is None
+
+    @pytest.mark.asyncio
+    async def test_provider_returning_none_metadata_returns_none(self) -> None:
+        probe_cls = self._make_probe_provider_class(metadata=None)
+        manager = ArtifactManager()
+        self._register(manager, probe_cls)
+
+        assert await manager.extract_artifact_metadata(f"/some/clip.{self._PROBE_FORMAT}") is None
+
+
 class TestCheckArtifactReadPermissionHandler:
     """The request-based read-permission check.
 

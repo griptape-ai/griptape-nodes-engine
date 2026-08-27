@@ -14,7 +14,7 @@ from griptape_nodes.drivers.cloud_credentials import MISSING_CREDENTIAL_MESSAGE,
 from griptape_nodes.drivers.storage import StorageBackend
 from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
 from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
-from griptape_nodes.files.path_utils import FilenameParts
+from griptape_nodes.files.path_utils import FilenameParts, resolve_workspace_path
 from griptape_nodes.retained_mode.engine import Engine, EngineScoped
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.artifact_events import (
@@ -53,7 +53,6 @@ from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
 from griptape_nodes.servers import bind_free_socket
 from griptape_nodes.servers.static import STATIC_SERVER_HOST, STATIC_SERVER_PORT, STATIC_SERVER_URL, start_static_server
-from griptape_nodes.utils.async_utils import to_thread
 from griptape_nodes.utils.url_utils import uri_to_path
 
 logger = logging.getLogger("griptape_nodes")
@@ -333,33 +332,32 @@ class StaticFilesManager(EngineScoped):
     async def _extract_metadata_only(self, file_path: Path) -> dict | None:
         """Extract artifact metadata for a file without generating a preview.
 
-        Returns None if no provider supports the format or extraction fails --
-        serving the download URL must not fail because metadata could not be read.
+        Returns None if the file is not a local file, no provider supports the
+        format, or extraction fails -- serving the download URL must never fail
+        because metadata could not be read.
 
         Args:
-            file_path: Path to the original file.
+            file_path: Path to the original file, as handed to the storage driver.
 
         Returns:
             Extracted metadata dict or None.
         """
-        extension = file_path.suffix.lstrip(".").lower()
-        if not extension:
+        # Probe the same file the local driver will serve: workspace-relative paths are a
+        # documented request shape, and the raw path would resolve against the process
+        # CWD instead. Cloud URLs arrive here as Path("https:/...") and fail the
+        # is_file check -- providers can only probe local files. Under the GTC storage
+        # backend the probe reads the local workspace copy, mirroring how preview
+        # generation already behaves there.
+        probe_path = resolve_workspace_path(file_path, self.config_manager.workspace_path)
+        if not await anyio.Path(probe_path).is_file():
+            logger.debug("Skipping metadata extraction for non-local file: %s", probe_path)
             return None
 
-        # Cloud URLs arrive here as Path("https:/...") -- providers can only probe local files.
-        if not await anyio.Path(file_path).is_file():
-            logger.debug("Skipping metadata extraction for non-local file: %s", file_path)
+        try:
+            return await self.engine.artifact_manager.extract_artifact_metadata(str(probe_path))
+        except Exception as e:
+            logger.warning("Metadata extraction failed for %s: %s", probe_path, e)
             return None
-
-        registry = self.engine.artifact_manager._registry
-        provider_classes = registry.get_provider_classes_by_format(extension)
-        if not provider_classes:
-            logger.debug("Skipping metadata extraction for unsupported file format: %s", file_path)
-            return None
-
-        provider_class = provider_classes[0]
-        metadata = await to_thread(provider_class.get_artifact_metadata, str(file_path))
-        return metadata.model_dump() if metadata else None
 
     async def _resolve_preview_path(
         self, file_path: Path, *, preview: bool, metadata_only: bool = False
@@ -376,11 +374,7 @@ class StaticFilesManager(EngineScoped):
             Tuple of (path to serve, artifact metadata or None).
         """
         if metadata_only:
-            try:
-                artifact_metadata = await self._extract_metadata_only(file_path)
-            except Exception as e:
-                logger.warning("Metadata extraction failed for %s: %s", file_path, e)
-                artifact_metadata = None
+            artifact_metadata = await self._extract_metadata_only(file_path)
             return file_path, artifact_metadata
         if not preview:
             logger.debug("Serving full image for %s", file_path)
