@@ -56,7 +56,7 @@ def _flow_commands(
     )
 
 
-def _generate(griptape_nodes: Engine, serialized_flow_commands: SerializedFlowCommands) -> str:
+def _generate(engine: Engine, serialized_flow_commands: SerializedFlowCommands) -> str:
     metadata = WorkflowMetadata(
         name="nested_codegen_workflow",
         schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
@@ -64,13 +64,13 @@ def _generate(griptape_nodes: Engine, serialized_flow_commands: SerializedFlowCo
         node_libraries_referenced=[],
         workflow_shape=None,
     )
-    return griptape_nodes.WorkflowManager()._generate_workflow_file_content(
+    return engine.workflow_manager._generate_workflow_file_content(
         serialized_flow_commands=serialized_flow_commands, workflow_metadata=metadata
     )
 
 
 class TestNestedFlowCodegen:
-    def test_generates_nodes_from_a_flow_three_levels_deep(self, griptape_nodes: Engine) -> None:
+    def test_generates_nodes_from_a_flow_three_levels_deep(self, engine: Engine) -> None:
         """A node two subflows below the top must still be written into the file."""
         leaf = _node_commands("Leaf")
         commands = _flow_commands(
@@ -78,7 +78,7 @@ class TestNestedFlowCodegen:
             sub_flows=[_flow_commands("middle", sub_flows=[_flow_commands("bottom", nodes=[leaf])])],
         )
 
-        content = _generate(griptape_nodes, commands)
+        content = _generate(engine, commands)
 
         assert "'Leaf'" in content
         # Each Flow gets its own variable, so all three levels are rebuilt.
@@ -86,19 +86,19 @@ class TestNestedFlowCodegen:
         assert "flow1_name" in content
         assert "flow2_name" in content
 
-    def test_parents_each_subflow_to_the_flow_that_encloses_it(self, griptape_nodes: Engine) -> None:
+    def test_parents_each_subflow_to_the_flow_that_encloses_it(self, engine: Engine) -> None:
         """The generated hierarchy has to mirror the nesting, not flatten onto the top-level flow."""
         commands = _flow_commands(
             "top",
             sub_flows=[_flow_commands("middle", sub_flows=[_flow_commands("bottom", nodes=[_node_commands("Leaf")])])],
         )
 
-        content = _generate(griptape_nodes, commands)
+        content = _generate(engine, commands)
 
         assert "parent_flow_name=flow0_name" in content
         assert "parent_flow_name=flow1_name" in content
 
-    def test_gives_every_node_in_the_file_a_distinct_variable(self, griptape_nodes: Engine) -> None:
+    def test_gives_every_node_in_the_file_a_distinct_variable(self, engine: Engine) -> None:
         """Node variables are file-wide, so names must not restart per Flow and collide."""
         commands = _flow_commands(
             "top",
@@ -112,7 +112,7 @@ class TestNestedFlowCodegen:
             ],
         )
 
-        content = _generate(griptape_nodes, commands)
+        content = _generate(engine, commands)
 
         assigned_names = [
             target.id
@@ -123,13 +123,13 @@ class TestNestedFlowCodegen:
         ]
         assert sorted(assigned_names) == ["node0_name", "node1_name", "node2_name"]
 
-    def test_resolves_group_membership_across_a_deeper_subflow(self, griptape_nodes: Engine) -> None:
+    def test_resolves_group_membership_across_a_deeper_subflow(self, engine: Engine) -> None:
         """A group's member can be created in a subflow below it, and must still be named."""
         child = _node_commands("Child")
         group = _node_commands("Group", is_node_group=True, node_names_to_add=[child.node_uuid])
         commands = _flow_commands("top", nodes=[group], sub_flows=[_flow_commands("group_subflow", nodes=[child])])
 
-        content = _generate(griptape_nodes, commands)
+        content = _generate(engine, commands)
 
         # The child is referenced by its generated variable, and it has to be the variable belonging
         # to the child rather than to the group: resolving membership means looking the UUID up
@@ -139,7 +139,7 @@ class TestNestedFlowCodegen:
         child_variable_line = next(line for line in content.splitlines() if "'Child'" in line)
         assert child_variable_line.lstrip().startswith("node0_name")
 
-    def test_writes_a_connection_once_even_though_each_level_reports_it(self, griptape_nodes: Engine) -> None:
+    def test_writes_a_connection_once_even_though_each_level_reports_it(self, engine: Engine) -> None:
         """Every Flow's serialized connections include its subflows', so the same edge repeats.
 
         Re-creating a connection tears down and rebuilds whatever it was routed through, so the
@@ -159,13 +159,11 @@ class TestNestedFlowCodegen:
             sub_flows=[_flow_commands("child", nodes=[source, target], connections=[connection])],
         )
 
-        content = _generate(griptape_nodes, commands)
+        content = _generate(engine, commands)
 
         assert content.count("CreateConnectionRequest(") == 1
 
-    def test_writes_a_nested_group_wall_connection_once_and_after_the_group_exists(
-        self, griptape_nodes: Engine
-    ) -> None:
+    def test_writes_a_nested_group_wall_connection_once_and_after_the_group_exists(self, engine: Engine) -> None:
         """The duplicate that actually happens crosses a nested group's wall, so cover that shape.
 
         An edge into a nested group attaches to a proxy parameter on the group node, so it belongs to
@@ -193,7 +191,7 @@ class TestNestedFlowCodegen:
         # this edge too even though neither endpoint lives there.
         commands = _flow_commands("top", connections=[wall_connection], sub_flows=[outer_subflow])
 
-        content = _generate(griptape_nodes, commands)
+        content = _generate(engine, commands)
 
         assert content.count("CreateConnectionRequest(") == 1
         # The group's variable has to be assigned before the connection referring to it is written,
@@ -206,7 +204,7 @@ class TestNestedFlowCodegen:
         assert len(group_variable_lines) == 1, f"expected one line creating InnerGroup, got {group_variable_lines}"
         assert group_variable_lines[0] < connection_lines[0]
 
-    def test_refuses_to_write_a_group_whose_member_is_not_in_the_file(self, griptape_nodes: Engine) -> None:
+    def test_refuses_to_write_a_group_whose_member_is_not_in_the_file(self, engine: Engine) -> None:
         """Silently dropping the member would save a group the artist has to refill by hand."""
         missing_child = _node_commands("Child")
         group = _node_commands("Group", is_node_group=True, node_names_to_add=[missing_child.node_uuid])
@@ -214,10 +212,10 @@ class TestNestedFlowCodegen:
         commands = _flow_commands("top", nodes=[group])
 
         with pytest.raises(ValueError, match="nodes in the group 'Group'"):
-            _generate(griptape_nodes, commands)
+            _generate(engine, commands)
 
     def test_skips_a_connection_whose_endpoint_is_not_in_the_file_rather_than_failing_the_save(
-        self, griptape_nodes: Engine, caplog: pytest.LogCaptureFixture
+        self, engine: Engine, caplog: pytest.LogCaptureFixture
     ) -> None:
         """Dropping the edge beats refusing to save: the artist keeps everything else.
 
@@ -238,14 +236,14 @@ class TestNestedFlowCodegen:
         commands = _flow_commands("top", nodes=[source], connections=[connection])
 
         with caplog.at_level(logging.ERROR):
-            content = _generate(griptape_nodes, commands)
+            content = _generate(engine, commands)
 
         assert "CreateConnectionRequest(" not in content
         assert "'A'" in content, "the node that could be written still has to be"
         ast.parse(content)
         assert "were never written to the file" in caplog.text
 
-    def test_emits_valid_python(self, griptape_nodes: Engine) -> None:
+    def test_emits_valid_python(self, engine: Engine) -> None:
         """Whatever the nesting depth, the file has to parse."""
         commands = _flow_commands(
             "top",
@@ -259,14 +257,14 @@ class TestNestedFlowCodegen:
             ],
         )
 
-        content = _generate(griptape_nodes, commands)
+        content = _generate(engine, commands)
 
         ast.parse(content)  # raises SyntaxError if the generated file is malformed
 
 
 class TestNestedFlowCodegenStructure:
     @pytest.mark.parametrize("depth", [1, 2, 4])
-    def test_each_level_is_written_inside_the_one_above_it(self, griptape_nodes: Engine, depth: int) -> None:
+    def test_each_level_is_written_inside_the_one_above_it(self, engine: Engine, depth: int) -> None:
         """Nodes must be created inside their own Flow's context block, at any depth."""
         commands = _flow_commands("level0", nodes=[_node_commands("Node0")])
         deepest = commands
@@ -275,7 +273,7 @@ class TestNestedFlowCodegenStructure:
             deepest.sub_flows_commands.append(child)
             deepest = child
 
-        content = _generate(griptape_nodes, commands)
+        content = _generate(engine, commands)
 
         # Deeper Flows are nested further in, so their statements are indented further.
         indents = []

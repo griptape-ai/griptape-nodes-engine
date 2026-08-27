@@ -27,10 +27,11 @@ from griptape_nodes.retained_mode.events.library_events import (
 )
 from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from griptape_nodes.retained_mode.engine import Engine
 
 # Timeout with thread dump.
 pytestmark = pytest.mark.timeout(300, method="thread")
@@ -52,32 +53,32 @@ _DELAY_SECONDS = 0.4
 )
 @pytest.mark.asyncio
 async def test_group_runs_independent_nodes_in_parallel(
-    tmp_path: Path, materialize_library: Callable[..., Path]
+    tmp_path: Path, engine: Engine, materialize_library: Callable[..., Path]
 ) -> None:
     """Every independent child of a group resolves, and they overlap in time under PARALLEL mode."""
     library_json = materialize_library(
         tmp_path / "library", template=FIXTURE_LIBRARY_JSON_TEMPLATE, node_file=FIXTURE_NODE_FILE, name=LIBRARY_NAME
     )
-    register_result = GriptapeNodes.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
+    register_result = engine.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(register_result, RegisterLibraryFromFileResultSuccess), register_result
 
-    config_manager = GriptapeNodes.ConfigManager()
+    config_manager = engine.config_manager
     prior_mode = config_manager.get_config_value("workflow_execution_mode")
     prior_max = config_manager.get_config_value("max_nodes_in_parallel")
     config_manager.set_config_value("workflow_execution_mode", "parallel")
     config_manager.set_config_value("max_nodes_in_parallel", 5)
 
     try:
-        GriptapeNodes.ContextManager().push_workflow(workflow_name="repro_4920_wf")
+        engine.context_manager.push_workflow(workflow_name="repro_4920_wf")
 
-        parent_result = GriptapeNodes.handle_request(
+        parent_result = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name="ParentFlow", set_as_new_context=False)
         )
         assert isinstance(parent_result, CreateFlowResultSuccess), parent_result
         parent_flow = parent_result.flow_name
 
-        with GriptapeNodes.ContextManager().flow(parent_flow):
-            group_result = GriptapeNodes.handle_request(
+        with engine.context_manager.flow(parent_flow):
+            group_result = engine.handle_request(
                 CreateNodeRequest(
                     node_type="SubflowGroupNode",
                     specific_library_name=LIBRARY_NAME,
@@ -88,7 +89,7 @@ async def test_group_runs_independent_nodes_in_parallel(
 
             node_names = []
             for i in range(_NODE_COUNT):
-                node_result = GriptapeNodes.handle_request(
+                node_result = engine.handle_request(
                     CreateNodeRequest(
                         node_type="TimedEchoNode",
                         specific_library_name=LIBRARY_NAME,
@@ -100,14 +101,12 @@ async def test_group_runs_independent_nodes_in_parallel(
                 node_names.append(node_result.node_name)
 
         for i, name in enumerate(node_names):
-            GriptapeNodes.handle_request(
-                SetParameterValueRequest(parameter_name="text", node_name=name, value=f"n-{i}")
-            )
-            GriptapeNodes.handle_request(
+            engine.handle_request(SetParameterValueRequest(parameter_name="text", node_name=name, value=f"n-{i}"))
+            engine.handle_request(
                 SetParameterValueRequest(parameter_name="delay", node_name=name, value=_DELAY_SECONDS)
             )
 
-        run_result = await GriptapeNodes.ahandle_request(
+        run_result = await engine.ahandle_request(
             StartFlowRequest(
                 flow_name=parent_flow,
                 flow_node_name=group_result.node_name,
@@ -120,7 +119,7 @@ async def test_group_runs_independent_nodes_in_parallel(
         config_manager.set_config_value("workflow_execution_mode", prior_mode)
         config_manager.set_config_value("max_nodes_in_parallel", prior_max)
 
-    node_manager = GriptapeNodes.NodeManager()
+    node_manager = engine.node_manager
     intervals = []
     for i, name in enumerate(node_names):
         node = node_manager.get_node_by_name(name)

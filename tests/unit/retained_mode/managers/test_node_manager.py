@@ -18,26 +18,25 @@ from griptape_nodes.retained_mode.events.node_events import (
     UnresolveNodeResultSuccess,
 )
 from griptape_nodes.retained_mode.events.parameter_events import AlterParameterDetailsRequest
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 
 class TestNodeManagerBatchSetNodeMetadata:
     """Test the batch_set_node_metadata functionality in NodeManager."""
 
-    def test_batch_set_node_metadata_empty_request_succeeds(self) -> None:
+    def test_batch_set_node_metadata_empty_request_succeeds(self, engine: Engine) -> None:
         """Test that an empty batch request succeeds without errors."""
         # Create an empty batch request
         request = BatchSetNodeMetadataRequest(node_metadata_updates={})
 
-        # Execute the batch update through GriptapeNodes
-        result = GriptapeNodes.handle_request(request)
+        # Execute the batch update through the engine
+        result = engine.handle_request(request)
 
         # Should succeed even with no updates
         assert isinstance(result, BatchSetNodeMetadataResultSuccess)
         assert result.updated_nodes == []
         assert result.failed_nodes == {}
 
-    def test_batch_set_node_metadata_all_nodes_not_found_fails(self) -> None:
+    def test_batch_set_node_metadata_all_nodes_not_found_fails(self, engine: Engine) -> None:
         """Test that batch update fails when all nodes are not found."""
         # Create request with non-existent nodes
         request = BatchSetNodeMetadataRequest(
@@ -47,8 +46,8 @@ class TestNodeManagerBatchSetNodeMetadata:
             }
         )
 
-        # Execute the batch update through GriptapeNodes
-        result = GriptapeNodes.handle_request(request)
+        # Execute the batch update through the engine
+        result = engine.handle_request(request)
 
         # Should fail because all nodes failed to be found
         assert isinstance(result, BatchSetNodeMetadataResultFailure)
@@ -174,7 +173,7 @@ class TestNodeManagerResolutionStateSerialization:
         mock_tracker.get_tracker_state.return_value = SerializedParameterValueTracker.TrackerState.NOT_IN_TRACKER
 
         caplog.clear()
-        caplog.set_level(logging.WARNING, logger="griptape_nodes")
+        caplog.set_level(logging.WARNING, logger="engine")
 
         NodeManager.handle_parameter_value_saving(
             parameter=mock_parameter,
@@ -216,7 +215,7 @@ class TestNodeManagerResolutionStateSerialization:
         mock_tracker.get_tracker_state.return_value = SerializedParameterValueTracker.TrackerState.NOT_SERIALIZABLE
 
         caplog.clear()
-        caplog.set_level(logging.WARNING, logger="griptape_nodes")
+        caplog.set_level(logging.WARNING, logger="engine")
 
         NodeManager.handle_parameter_value_saving(
             parameter=mock_parameter,
@@ -265,7 +264,7 @@ class TestSerializeNodeWithoutLibraryMetadata:
         assert node.metadata["library"] == "Original Library"
         assert node.metadata["node_type"] == "OriginalType"
 
-    def test_serialize_node_without_library_metadata_does_not_crash(self, griptape_nodes: Engine) -> None:
+    def test_serialize_node_without_library_metadata_does_not_crash(self, engine: Engine) -> None:
         """Regression for griptape-ai/griptape-nodes-app#154: a missing 'library' key must not raise."""
         from griptape_nodes.exe_types.node_types import ErrorProxyNode
         from griptape_nodes.retained_mode.events.context_events import EnsureWorkflowAndFlowRequest
@@ -275,10 +274,8 @@ class TestSerializeNodeWithoutLibraryMetadata:
         )
         from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 
-        griptape_nodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
-        griptape_nodes.handle_request(
-            EnsureWorkflowAndFlowRequest(workflow_name="proxy_workflow", flow_name="proxy_flow")
-        )
+        engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        engine.handle_request(EnsureWorkflowAndFlowRequest(workflow_name="proxy_workflow", flow_name="proxy_flow"))
 
         node = ErrorProxyNode(
             name="Execute Python",
@@ -292,46 +289,44 @@ class TestSerializeNodeWithoutLibraryMetadata:
         node.metadata.pop("library", None)
         assert "library" not in node.metadata
 
-        GriptapeNodes.ObjectManager().add_object_by_name(node.name, node)
+        engine.object_manager.add_object_by_name(node.name, node)
 
-        result = griptape_nodes.NodeManager().on_serialize_node_to_commands(
-            SerializeNodeToCommandsRequest(node_name=node.name)
-        )
+        result = engine.node_manager.on_serialize_node_to_commands(SerializeNodeToCommandsRequest(node_name=node.name))
 
         assert isinstance(result, SerializeNodeToCommandsResultSuccess)
         create_command = result.serialized_node_commands.create_node_command
         assert create_command.node_type == "ExecutePython"
         assert create_command.specific_library_name == "Missing Library"
 
-        griptape_nodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
 
 
 class TestUnresolveNodeRequest:
     """Tests for the on_unresolve_node_request handler."""
 
-    def test_node_not_found_returns_failure(self) -> None:
-        result = GriptapeNodes.handle_request(UnresolveNodeRequest(node_name="nonexistent_node"))
+    def test_node_not_found_returns_failure(self, engine: Engine) -> None:
+        result = engine.handle_request(UnresolveNodeRequest(node_name="nonexistent_node"))
         assert isinstance(result, UnresolveNodeResultFailure)
         assert "nonexistent_node" in str(result.result_details)
 
-    def test_resolving_node_returns_failure_without_side_effects(self) -> None:
+    def test_resolving_node_returns_failure_without_side_effects(self, engine: Engine) -> None:
         mock_node = MagicMock(spec=BaseNode)
         mock_node.name = "test_node"
         mock_node.state = NodeResolutionState.RESOLVING
         mock_node.parameter_output_values = MagicMock()
         with patch.object(
-            GriptapeNodes.ObjectManager(),
+            engine.object_manager,
             "attempt_get_object_by_name_as_type",
             return_value=mock_node,
         ):
-            result = GriptapeNodes.handle_request(UnresolveNodeRequest(node_name="test_node"))
+            result = engine.handle_request(UnresolveNodeRequest(node_name="test_node"))
 
         assert isinstance(result, UnresolveNodeResultFailure)
         assert "test_node" in str(result.result_details)
         mock_node.make_node_unresolved.assert_not_called()
         mock_node.parameter_output_values.clear.assert_not_called()
 
-    def test_resolved_node_unresolves_and_cascades_downstream(self) -> None:
+    def test_resolved_node_unresolves_and_cascades_downstream(self, engine: Engine) -> None:
         mock_node = MagicMock(spec=BaseNode)
         mock_node.name = "test_node"
         mock_node.state = NodeResolutionState.RESOLVED
@@ -339,17 +334,17 @@ class TestUnresolveNodeRequest:
         mock_connections = MagicMock()
         with (
             patch.object(
-                GriptapeNodes.ObjectManager(),
+                engine.object_manager,
                 "attempt_get_object_by_name_as_type",
                 return_value=mock_node,
             ),
             patch.object(
-                GriptapeNodes.FlowManager(),
+                engine.flow_manager,
                 "get_connections",
                 return_value=mock_connections,
             ),
         ):
-            result = GriptapeNodes.handle_request(UnresolveNodeRequest(node_name="test_node"))
+            result = engine.handle_request(UnresolveNodeRequest(node_name="test_node"))
 
         assert isinstance(result, UnresolveNodeResultSuccess)
         mock_node.make_node_unresolved.assert_called_once_with(
@@ -358,7 +353,7 @@ class TestUnresolveNodeRequest:
         mock_node.parameter_output_values.silent_clear.assert_not_called()
         mock_connections.unresolve_future_nodes.assert_called_once_with(mock_node)
 
-    def test_unresolved_node_still_cascades_downstream(self) -> None:
+    def test_unresolved_node_still_cascades_downstream(self, engine: Engine) -> None:
         mock_node = MagicMock(spec=BaseNode)
         mock_node.name = "test_node"
         mock_node.state = NodeResolutionState.UNRESOLVED
@@ -366,17 +361,17 @@ class TestUnresolveNodeRequest:
         mock_connections = MagicMock()
         with (
             patch.object(
-                GriptapeNodes.ObjectManager(),
+                engine.object_manager,
                 "attempt_get_object_by_name_as_type",
                 return_value=mock_node,
             ),
             patch.object(
-                GriptapeNodes.FlowManager(),
+                engine.flow_manager,
                 "get_connections",
                 return_value=mock_connections,
             ),
         ):
-            result = GriptapeNodes.handle_request(UnresolveNodeRequest(node_name="test_node"))
+            result = engine.handle_request(UnresolveNodeRequest(node_name="test_node"))
 
         assert isinstance(result, UnresolveNodeResultSuccess)
         mock_node.parameter_output_values.silent_clear.assert_not_called()
@@ -387,7 +382,7 @@ class TestNodeManagerAlterParameterDetailsClearDefaultValue:
     """Test AlterParameterDetailsRequest behavior when clear_default_value and default_value are both set."""
 
     def test_clear_default_value_with_default_value_logs_warning_and_clears(
-        self, griptape_nodes: Engine, caplog: pytest.LogCaptureFixture
+        self, engine: Engine, caplog: pytest.LogCaptureFixture
     ) -> None:
         """When both clear_default_value and default_value are provided, default is cleared and a warning is logged."""
         parameter = Parameter(name="test_param", default_value="original_value")
@@ -401,7 +396,7 @@ class TestNodeManagerAlterParameterDetailsClearDefaultValue:
         caplog.clear()
         caplog.set_level(logging.WARNING)
 
-        griptape_nodes.NodeManager().modify_key_parameter_fields(request, parameter)
+        engine.node_manager.modify_key_parameter_fields(request, parameter)
 
         assert parameter.default_value is None
         assert len(caplog.records) == 1
@@ -415,7 +410,7 @@ class TestNodeManagerAlterParameterDetailsClearDefaultValue:
 class TestGetParameterValueOutputPriority:
     """Output values must take priority over input/property values in GetParameterValueRequest."""
 
-    def test_output_value_takes_priority_over_parameter_value(self, griptape_nodes: Engine) -> None:
+    def test_output_value_takes_priority_over_parameter_value(self, engine: Engine) -> None:
         """When both parameter_values and parameter_output_values contain a key, the output value wins."""
         from unittest.mock import MagicMock
 
@@ -436,17 +431,17 @@ class TestGetParameterValueOutputPriority:
         mock_node.parameter_output_values = {"result": output_value}
         mock_node.get_parameter_by_name.return_value = param
 
-        obj_mgr = griptape_nodes.ObjectManager()
+        obj_mgr = engine.object_manager
         obj_mgr.add_object_by_name("test_node", mock_node)
 
-        node_manager = griptape_nodes.NodeManager()
+        node_manager = engine.node_manager
         request = GetParameterValueRequest(parameter_name="result", node_name="test_node")
         result = node_manager.on_get_parameter_value_request(request)
 
         assert isinstance(result, GetParameterValueResultSuccess)
         assert result.value == output_value
 
-    def test_falls_back_to_parameter_value_when_no_output(self, griptape_nodes: Engine) -> None:
+    def test_falls_back_to_parameter_value_when_no_output(self, engine: Engine) -> None:
         """When parameter_output_values is empty, parameter_values is used."""
         from unittest.mock import MagicMock
 
@@ -466,17 +461,17 @@ class TestGetParameterValueOutputPriority:
         mock_node.parameter_output_values = {}
         mock_node.get_parameter_by_name.return_value = param
 
-        obj_mgr = griptape_nodes.ObjectManager()
+        obj_mgr = engine.object_manager
         obj_mgr.add_object_by_name("test_node", mock_node)
 
-        node_manager = griptape_nodes.NodeManager()
+        node_manager = engine.node_manager
         request = GetParameterValueRequest(parameter_name="a", node_name="test_node")
         result = node_manager.on_get_parameter_value_request(request)
 
         assert isinstance(result, GetParameterValueResultSuccess)
         assert result.value == input_value
 
-    def test_falls_back_to_default_when_no_values(self, griptape_nodes: Engine) -> None:
+    def test_falls_back_to_default_when_no_values(self, engine: Engine) -> None:
         """When neither dict contains the key, the parameter default is returned."""
         from unittest.mock import MagicMock
 
@@ -496,10 +491,10 @@ class TestGetParameterValueOutputPriority:
         mock_node.parameter_output_values = {}
         mock_node.get_parameter_by_name.return_value = param
 
-        obj_mgr = griptape_nodes.ObjectManager()
+        obj_mgr = engine.object_manager
         obj_mgr.add_object_by_name("test_node", mock_node)
 
-        node_manager = griptape_nodes.NodeManager()
+        node_manager = engine.node_manager
         request = GetParameterValueRequest(parameter_name="x", node_name="test_node")
         result = node_manager.on_get_parameter_value_request(request)
 
@@ -511,14 +506,14 @@ class TestNodeManagerCancelExecuteNode:
     """Tests for the CancelExecuteNodeRequest handler and cancel_worker_execution dispatch."""
 
     @pytest.mark.asyncio
-    async def test_handler_no_inflight_returns_success(self, griptape_nodes: Engine) -> None:
+    async def test_handler_no_inflight_returns_success(self, engine: Engine) -> None:
         """Cancelling a request_id that isn't tracked is idempotent success."""
         from griptape_nodes.retained_mode.events.execution_events import (
             CancelExecuteNodeRequest,
             CancelExecuteNodeResultSuccess,
         )
 
-        node_manager = griptape_nodes.NodeManager()
+        node_manager = engine.node_manager
         request = CancelExecuteNodeRequest(target_request_id="not-tracked")
 
         result = await node_manager.on_cancel_execute_node_request(request)
@@ -526,7 +521,7 @@ class TestNodeManagerCancelExecuteNode:
         assert isinstance(result, CancelExecuteNodeResultSuccess)
 
     @pytest.mark.asyncio
-    async def test_handler_cancels_tracked_task_and_sets_flag(self, griptape_nodes: Engine) -> None:
+    async def test_handler_cancels_tracked_task_and_sets_flag(self, engine: Engine) -> None:
         """With an in-flight task registered, the handler sets the node's cancel flag and cancels the task."""
         import asyncio
 
@@ -536,7 +531,7 @@ class TestNodeManagerCancelExecuteNode:
             CancelExecuteNodeResultSuccess,
         )
 
-        node_manager = griptape_nodes.NodeManager()
+        node_manager = engine.node_manager
 
         cancellation_seen = {"value": False}
 
@@ -572,9 +567,9 @@ class TestNodeManagerCancelExecuteNode:
                 task.cancel()
 
     @pytest.mark.asyncio
-    async def test_cancel_worker_execution_noop_when_not_tracked(self, griptape_nodes: Engine) -> None:
+    async def test_cancel_worker_execution_noop_when_not_tracked(self, engine: Engine) -> None:
         """cancel_worker_execution is a no-op when the node isn't routed to a worker."""
-        node_manager = griptape_nodes.NodeManager()
+        node_manager = engine.node_manager
 
         # Should not raise; there is no entry for "ghost_node" and
         # WorkerManager.forward_event_to_worker should not be invoked.
@@ -756,7 +751,7 @@ class TestNodeInstantiationAuthorizationCheckpoint:
         )
         assert self._attrs(library)["executes_arbitrary_code"] is True
 
-    def test_enforce_raises_on_denial(self, griptape_nodes: Engine) -> None:
+    def test_enforce_raises_on_denial(self, engine: Engine) -> None:
         from griptape_nodes.node_library.library_declarations import LifecycleStage, LifecycleStageNodeProperty
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
         from griptape_nodes.retained_mode.managers.node_manager import NodeManager, _NodeInstantiationDeniedError
@@ -770,16 +765,16 @@ class TestNodeInstantiationAuthorizationCheckpoint:
             seen["stage"] = checkpoint.attributes.get("lifecycle_stage")  # type: ignore[attr-defined]
             return CheckpointDenial(failures=(CheckpointFailure(detail="Ask your admin to enable Labs nodes."),))
 
-        griptape_nodes.event_manager.add_authorization_hook(deny)
+        engine.event_manager.add_authorization_hook(deny)
         with pytest.raises(_NodeInstantiationDeniedError, match="Ask your admin to enable Labs nodes"):
             NodeManager._enforce_instantiation_checkpoint(
                 node_type=_GateProbe.__name__,
                 specific_library_name=self._LIBRARY_NAME,
-                event_manager=griptape_nodes.event_manager,
+                event_manager=engine.event_manager,
             )
         assert seen == {"action": "InstantiateNode", "stage": "LABS"}
 
-    def test_enforce_allows_without_hook(self, griptape_nodes: Engine) -> None:
+    def test_enforce_allows_without_hook(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.managers.node_manager import NodeManager
 
         self._register()
@@ -787,10 +782,10 @@ class TestNodeInstantiationAuthorizationCheckpoint:
         NodeManager._enforce_instantiation_checkpoint(
             node_type=_GateProbe.__name__,
             specific_library_name=self._LIBRARY_NAME,
-            event_manager=griptape_nodes.event_manager,
+            event_manager=engine.event_manager,
         )
 
-    def test_worker_materialize_denied_returns_failure(self, griptape_nodes: Engine) -> None:
+    def test_worker_materialize_denied_returns_failure(self, engine: Engine) -> None:
         """Worker-side construction from caller-supplied metadata is gated by the same checkpoint."""
         from griptape_nodes.node_library.library_declarations import LifecycleStage, LifecycleStageNodeProperty
         from griptape_nodes.retained_mode.events.execution_events import (
@@ -806,16 +801,16 @@ class TestNodeInstantiationAuthorizationCheckpoint:
                 return CheckpointDenial(failures=(CheckpointFailure(detail="Labs nodes are disabled."),))
             return None
 
-        griptape_nodes.event_manager.add_authorization_hook(deny)
+        engine.event_manager.add_authorization_hook(deny)
         request = ExecuteNodeRequest(
             node_name="probe-1",
             node_metadata={"node_type": _GateProbe.__name__, "library": self._LIBRARY_NAME},
         )
-        result = griptape_nodes.NodeManager()._materialize_transient_node_from_metadata(request)
+        result = engine.node_manager._materialize_transient_node_from_metadata(request)
         assert isinstance(result, ExecuteNodeResultFailure)
         assert "Labs nodes are disabled." in str(result.result_details)
 
-    def test_worker_materialize_allows_without_hook(self, griptape_nodes: Engine) -> None:
+    def test_worker_materialize_allows_without_hook(self, engine: Engine) -> None:
         """With no policy hook the worker path builds the node, matching the no-denial contract."""
         from griptape_nodes.exe_types.node_types import BaseNode
         from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeRequest
@@ -825,11 +820,11 @@ class TestNodeInstantiationAuthorizationCheckpoint:
             node_name="probe-1",
             node_metadata={"node_type": _GateProbe.__name__, "library": self._LIBRARY_NAME},
         )
-        result = griptape_nodes.NodeManager()._materialize_transient_node_from_metadata(request)
+        result = engine.node_manager._materialize_transient_node_from_metadata(request)
         assert isinstance(result, BaseNode)
         assert result.name == "probe-1"
 
-    def test_schema_preview_returns_denied_node_types(self, griptape_nodes: Engine) -> None:
+    def test_schema_preview_returns_denied_node_types(self, engine: Engine) -> None:
         from griptape_nodes.node_library.library_declarations import LifecycleStage, LifecycleStageNodeProperty
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
         from griptape_nodes.retained_mode.managers.node_manager import NodeManager
@@ -841,20 +836,18 @@ class TestNodeInstantiationAuthorizationCheckpoint:
                 return CheckpointDenial(failures=(CheckpointFailure(detail="Labs nodes are disabled."),))
             return None
 
-        griptape_nodes.event_manager.add_authorization_hook(deny)
-        denials = NodeManager.evaluate_schema_node_instantiation_denials(
-            schema, event_manager=griptape_nodes.event_manager
-        )
+        engine.event_manager.add_authorization_hook(deny)
+        denials = NodeManager.evaluate_schema_node_instantiation_denials(schema, event_manager=engine.event_manager)
         assert set(denials) == {_GateProbe.__name__}
         assert denials[_GateProbe.__name__].messages() == ["Labs nodes are disabled."]
 
-    def test_schema_preview_empty_without_hook(self, griptape_nodes: Engine) -> None:
+    def test_schema_preview_empty_without_hook(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.managers.node_manager import NodeManager
 
         # No hook -> nothing denied.
         assert (
             NodeManager.evaluate_schema_node_instantiation_denials(
-                self._schema_with_node(), event_manager=griptape_nodes.event_manager
+                self._schema_with_node(), event_manager=engine.event_manager
             )
             == {}
         )
@@ -911,7 +904,7 @@ class TestNodeInstantiationAuthorizationCheckpoint:
         assert "provider_ids" not in attrs
         assert "model_families" not in attrs
 
-    def test_model_facts_reach_the_checkpoint_and_can_be_denied(self, griptape_nodes: Engine) -> None:
+    def test_model_facts_reach_the_checkpoint_and_can_be_denied(self, engine: Engine) -> None:
         from griptape_nodes.node_library.library_declarations import ModelUsageNodeProperty
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
         from griptape_nodes.retained_mode.managers.node_manager import NodeManager
@@ -930,10 +923,8 @@ class TestNodeInstantiationAuthorizationCheckpoint:
                 return CheckpointDenial(failures=(CheckpointFailure(detail="Anthropic is not enabled."),))
             return None
 
-        griptape_nodes.event_manager.add_authorization_hook(deny)
-        denials = NodeManager.evaluate_schema_node_instantiation_denials(
-            schema, event_manager=griptape_nodes.event_manager
-        )
+        engine.event_manager.add_authorization_hook(deny)
+        denials = NodeManager.evaluate_schema_node_instantiation_denials(schema, event_manager=engine.event_manager)
         assert seen == {"provider_ids": ["anthropic"], "model_families": ["Claude 4"]}
         assert set(denials) == {_GateProbe.__name__}
         assert denials[_GateProbe.__name__].messages() == ["Anthropic is not enabled."]
@@ -1009,7 +1000,7 @@ class TestNodeCreationFailureDescription:
         yield
         LibraryRegistry._clear()
 
-    def _record_flawed_library(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
+    def _record_flawed_library(self, engine: Engine, tmp_path: Path) -> None:
         """Track a LOADED-but-FLAWED library whose Agent node module failed to import."""
         from griptape_nodes.retained_mode.managers.fitness_problems.libraries.node_module_import_problem import (
             NodeModuleImportProblem,
@@ -1017,7 +1008,7 @@ class TestNodeCreationFailureDescription:
         from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 
         library_file_path = str(tmp_path / "griptape_nodes_library.json")
-        griptape_nodes.LibraryManager()._library_file_path_to_info[library_file_path] = LibraryManager.LibraryInfo(
+        engine.library_manager._library_file_path_to_info[library_file_path] = LibraryManager.LibraryInfo(
             lifecycle_state=LibraryManager.LibraryLifecycleState.LOADED,
             library_path=library_file_path,
             is_sandbox=False,
@@ -1055,10 +1046,10 @@ class TestNodeCreationFailureDescription:
         library = LibraryRegistry.generate_new_library(library_data=schema)
         library.register_new_node_type(_GateProbe, NodeMetadata(category="t", description="d", display_name="Probe"))
 
-    def test_description_appends_the_library_problems(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
-        self._record_flawed_library(griptape_nodes, tmp_path)
+    def test_description_appends_the_library_problems(self, engine: Engine, tmp_path: Path) -> None:
+        self._record_flawed_library(engine, tmp_path)
 
-        description = griptape_nodes.NodeManager()._describe_node_creation_failure(
+        description = engine.node_manager._describe_node_creation_failure(
             LibraryRegistryError(f"Node type 'Agent' not found in library '{self._LIBRARY_NAME}'"),
             node_type="Agent",
             library_name=self._LIBRARY_NAME,
@@ -1069,15 +1060,13 @@ class TestNodeCreationFailureDescription:
         assert description.startswith(f"Node type 'Agent' not found in library '{self._LIBRARY_NAME}'")
         assert "require_model_invocation_sync" in description
 
-    def test_description_finds_the_library_by_node_type_when_unnamed(
-        self, griptape_nodes: GriptapeNodes, tmp_path: Path
-    ) -> None:
+    def test_description_finds_the_library_by_node_type_when_unnamed(self, engine: Engine, tmp_path: Path) -> None:
         # Creating a node from the node palette names no library, so the failure path has to
         # resolve the owning library itself to report its problems.
         self._register_library_providing_probe()
-        self._record_flawed_library(griptape_nodes, tmp_path)
+        self._record_flawed_library(engine, tmp_path)
 
-        description = griptape_nodes.NodeManager()._describe_node_creation_failure(
+        description = engine.node_manager._describe_node_creation_failure(
             ImportError("cannot import name 'require_model_invocation_sync'"),
             node_type=_GateProbe.__name__,
             library_name=None,
@@ -1086,14 +1075,12 @@ class TestNodeCreationFailureDescription:
         assert "require_model_invocation_sync" in description
         assert self._LIBRARY_NAME in description
 
-    def test_description_finds_the_library_by_recorded_import_failure(
-        self, griptape_nodes: GriptapeNodes, tmp_path: Path
-    ) -> None:
+    def test_description_finds_the_library_by_recorded_import_failure(self, engine: Engine, tmp_path: Path) -> None:
         # An eagerly-loaded node whose module failed to import registers nothing, so no library
         # provides the type; the recorded failure is what names the library.
-        self._record_flawed_library(griptape_nodes, tmp_path)
+        self._record_flawed_library(engine, tmp_path)
 
-        description = griptape_nodes.NodeManager()._describe_node_creation_failure(
+        description = engine.node_manager._describe_node_creation_failure(
             LibraryRegistryError("No node type 'Agent' could be found in any of the libraries registered."),
             node_type="Agent",
             library_name=None,
@@ -1102,18 +1089,18 @@ class TestNodeCreationFailureDescription:
         assert "require_model_invocation_sync" in description
         assert self._LIBRARY_NAME in description
 
-    def test_description_is_just_the_message_when_the_library_is_healthy(self, griptape_nodes: GriptapeNodes) -> None:
-        description = griptape_nodes.NodeManager()._describe_node_creation_failure(
+    def test_description_is_just_the_message_when_the_library_is_healthy(self, engine: Engine) -> None:
+        description = engine.node_manager._describe_node_creation_failure(
             ValueError("node __init__ blew up"), node_type="Whatever", library_name="library-with-no-problems"
         )
 
         assert description == "node __init__ blew up"
 
-    def test_description_unquotes_a_sentence_raised_as_a_key_error(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_description_unquotes_a_sentence_raised_as_a_key_error(self, engine: Engine) -> None:
         # A node's __init__ lives in a separately versioned library and can raise a sentence as a
         # bare KeyError (`BaseNode.set_parameter_value` does). str() would repr that sentence, so
         # the artist would read their error wrapped in quotes.
-        description = griptape_nodes.NodeManager()._describe_node_creation_failure(
+        description = engine.node_manager._describe_node_creation_failure(
             KeyError("Attempted to set value for Parameter 'prompt' but no such Parameter could be found."),
             node_type="Whatever",
             library_name="library-with-no-problems",
@@ -1122,14 +1109,14 @@ class TestNodeCreationFailureDescription:
         assert description == "Attempted to set value for Parameter 'prompt' but no such Parameter could be found."
 
     def test_description_tells_the_artist_to_restart_after_a_mid_session_reload(
-        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+        self, engine: Engine, tmp_path: Path
     ) -> None:
-        self._record_flawed_library(griptape_nodes, tmp_path)
+        self._record_flawed_library(engine, tmp_path)
         # The library was reloaded after its node modules had already imported, so this engine is
         # stuck with the old code no matter how the library is re-registered.
-        griptape_nodes.LibraryManager()._libraries_reloaded_after_import.add(self._LIBRARY_NAME)
+        engine.library_manager._libraries_reloaded_after_import.add(self._LIBRARY_NAME)
 
-        description = griptape_nodes.NodeManager()._describe_node_creation_failure(
+        description = engine.node_manager._describe_node_creation_failure(
             ImportError("cannot import name 'require_model_invocation_sync'"),
             node_type="Agent",
             library_name=self._LIBRARY_NAME,
@@ -1139,12 +1126,10 @@ class TestNodeCreationFailureDescription:
         assert "cannot import name 'require_model_invocation_sync'" in description
         assert "Restart the engine" in description
 
-    def test_description_omits_the_restart_hint_for_a_library_loaded_once(
-        self, griptape_nodes: GriptapeNodes, tmp_path: Path
-    ) -> None:
-        self._record_flawed_library(griptape_nodes, tmp_path)
+    def test_description_omits_the_restart_hint_for_a_library_loaded_once(self, engine: Engine, tmp_path: Path) -> None:
+        self._record_flawed_library(engine, tmp_path)
 
-        description = griptape_nodes.NodeManager()._describe_node_creation_failure(
+        description = engine.node_manager._describe_node_creation_failure(
             ImportError("no module named 'torch'"),
             node_type="Agent",
             library_name=self._LIBRARY_NAME,
@@ -1154,10 +1139,8 @@ class TestNodeCreationFailureDescription:
         # would not help. Saying otherwise would send the artist on a goose chase.
         assert "Restart the engine" not in description
 
-    def test_description_is_just_the_message_when_the_node_type_has_no_library(
-        self, griptape_nodes: GriptapeNodes
-    ) -> None:
-        description = griptape_nodes.NodeManager()._describe_node_creation_failure(
+    def test_description_is_just_the_message_when_the_node_type_has_no_library(self, engine: Engine) -> None:
+        description = engine.node_manager._describe_node_creation_failure(
             ValueError("boom"), node_type="UnknownEverywhere", library_name=None
         )
 

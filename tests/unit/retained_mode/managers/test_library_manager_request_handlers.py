@@ -17,7 +17,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 
 if TYPE_CHECKING:
-    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+    from griptape_nodes.retained_mode.engine import Engine
 
 
 @dataclass
@@ -58,7 +58,7 @@ def _make_library(advanced_library: AdvancedNodeLibrary | None = None) -> Librar
 
 
 class TestRequestHandlerRegistration:
-    def test_handlers_registered_via_event_manager(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_handlers_registered_via_event_manager(self, engine: Engine) -> None:
         """get_request_handlers() pairs should be registered with EventManager."""
 
         class MyLib(AdvancedNodeLibrary):
@@ -68,9 +68,9 @@ class TestRequestHandlerRegistration:
         library = _make_library(advanced_library=MyLib())
         library_info = _make_library_info()
 
-        lm = griptape_nodes.LibraryManager()
+        lm = engine.library_manager
         event_manager = MagicMock()
-        with patch.object(griptape_nodes, "_event_manager", event_manager):
+        with patch.object(engine, "_event_manager", event_manager):
             lm._attempt_load_nodes_from_library(
                 library_data=library._library_data,
                 library=library,
@@ -80,7 +80,7 @@ class TestRequestHandlerRegistration:
 
         event_manager.assign_manager_to_request_type.assert_called_once_with(_TestRequest, _handler)
 
-    def test_handler_types_recorded_on_library(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_handler_types_recorded_on_library(self, engine: Engine) -> None:
         """Registered handler types must be stored in library._registered_request_handler_types."""
 
         class MyLib(AdvancedNodeLibrary):
@@ -90,9 +90,9 @@ class TestRequestHandlerRegistration:
         library = _make_library(advanced_library=MyLib())
         library_info = _make_library_info()
 
-        lm = griptape_nodes.LibraryManager()
+        lm = engine.library_manager
         event_manager = MagicMock()
-        with patch.object(griptape_nodes, "_event_manager", event_manager):
+        with patch.object(engine, "_event_manager", event_manager):
             lm._attempt_load_nodes_from_library(
                 library_data=library._library_data,
                 library=library,
@@ -102,7 +102,7 @@ class TestRequestHandlerRegistration:
 
         assert _TestRequest in library._registered_request_handler_types
 
-    def test_exception_in_get_request_handlers_appends_problem(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_exception_in_get_request_handlers_appends_problem(self, engine: Engine) -> None:
         """An exception from get_request_handlers() should append RequestHandlerRegistrationProblem."""
 
         class BoomLib(AdvancedNodeLibrary):
@@ -115,9 +115,9 @@ class TestRequestHandlerRegistration:
         # Add a dummy node so the library isn't marked UNUSABLE (any_nodes_loaded_successfully=False)
         library_info.problems = []
 
-        lm = griptape_nodes.LibraryManager()
+        lm = engine.library_manager
         event_manager = MagicMock()
-        with patch.object(griptape_nodes, "_event_manager", event_manager):
+        with patch.object(engine, "_event_manager", event_manager):
             lm._attempt_load_nodes_from_library(
                 library_data=library._library_data,
                 library=library,
@@ -128,14 +128,14 @@ class TestRequestHandlerRegistration:
         problem_types = [type(p) for p in library_info.problems]
         assert RequestHandlerRegistrationProblem in problem_types
 
-    def test_no_advanced_library_does_nothing(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_no_advanced_library_does_nothing(self, engine: Engine) -> None:
         """A library with no advanced library should not touch EventManager at all."""
         library = _make_library(advanced_library=None)
         library_info = _make_library_info()
 
-        lm = griptape_nodes.LibraryManager()
+        lm = engine.library_manager
         event_manager = MagicMock()
-        with patch.object(griptape_nodes, "_event_manager", event_manager):
+        with patch.object(engine, "_event_manager", event_manager):
             lm._attempt_load_nodes_from_library(
                 library_data=library._library_data,
                 library=library,
@@ -145,7 +145,7 @@ class TestRequestHandlerRegistration:
 
         event_manager.assign_manager_to_request_type.assert_not_called()
 
-    def test_empty_get_request_handlers_does_nothing(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_empty_get_request_handlers_does_nothing(self, engine: Engine) -> None:
         """A library returning [] from get_request_handlers() should not register any handlers."""
 
         class EmptyLib(AdvancedNodeLibrary):
@@ -154,9 +154,9 @@ class TestRequestHandlerRegistration:
         library = _make_library(advanced_library=EmptyLib())
         library_info = _make_library_info()
 
-        lm = griptape_nodes.LibraryManager()
+        lm = engine.library_manager
         event_manager = MagicMock()
-        with patch.object(griptape_nodes, "_event_manager", event_manager):
+        with patch.object(engine, "_event_manager", event_manager):
             lm._attempt_load_nodes_from_library(
                 library_data=library._library_data,
                 library=library,
@@ -166,9 +166,7 @@ class TestRequestHandlerRegistration:
 
         event_manager.assign_manager_to_request_type.assert_not_called()
 
-    def test_worker_mode_library_with_handlers_appends_incompatible_problem(
-        self, griptape_nodes: GriptapeNodes
-    ) -> None:
+    def test_worker_mode_library_with_handlers_appends_incompatible_problem(self, engine: Engine) -> None:
         """A library requiring worker mode that declares handlers should surface RequestHandlersWorkerIncompatibleProblem."""
 
         class WorkerLib(AdvancedNodeLibrary):
@@ -179,9 +177,9 @@ class TestRequestHandlerRegistration:
         library_info = _make_library_info()
         library_info.requires_worker = True
 
-        lm = griptape_nodes.LibraryManager()
+        lm = engine.library_manager
         event_manager = MagicMock()
-        with patch.object(griptape_nodes, "_event_manager", event_manager):
+        with patch.object(engine, "_event_manager", event_manager):
             lm._attempt_load_nodes_from_library(
                 library_data=library._library_data,
                 library=library,
@@ -192,7 +190,7 @@ class TestRequestHandlerRegistration:
         problem_types = [type(p) for p in library_info.problems]
         assert RequestHandlersWorkerIncompatibleProblem in problem_types
 
-    def test_non_worker_library_with_handlers_no_incompatible_problem(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_non_worker_library_with_handlers_no_incompatible_problem(self, engine: Engine) -> None:
         """A non-worker library with handlers should NOT get RequestHandlersWorkerIncompatibleProblem."""
 
         class OrchestratorLib(AdvancedNodeLibrary):
@@ -203,9 +201,9 @@ class TestRequestHandlerRegistration:
         library_info = _make_library_info()
         library_info.requires_worker = False
 
-        lm = griptape_nodes.LibraryManager()
+        lm = engine.library_manager
         event_manager = MagicMock()
-        with patch.object(griptape_nodes, "_event_manager", event_manager):
+        with patch.object(engine, "_event_manager", event_manager):
             lm._attempt_load_nodes_from_library(
                 library_data=library._library_data,
                 library=library,

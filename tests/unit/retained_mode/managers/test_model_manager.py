@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from griptape_nodes.exe_types.node_types import BaseNode
+from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.base_events import RequestPayload
 from griptape_nodes.retained_mode.events.model_events import (
@@ -28,7 +29,6 @@ from griptape_nodes.retained_mode.events.model_events import (
     SearchModelsResultFailure,
     SearchModelsResultSuccess,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.model_manager import DownloadParams, ModelManager
 
@@ -233,12 +233,11 @@ class TestOnHandleDeclareModelInvocationRequest:
         assert isinstance(allowed.result, DeclareModelInvocationResultSuccess)
         assert allowed.result.model_id == "gtc_gpt_5"
 
-    def test_authorization_checkpoint_denial_blocks_invocation(self) -> None:
+    def test_authorization_checkpoint_denial_blocks_invocation(self, engine: Engine) -> None:
         # The InvokeModel checkpoint gates the declared invocation: a denial from
         # a registered authorization hook turns into a failure so the node does
         # not invoke the model. The handler passes the stable catalog key; the app
         # resolves the provider and family from it.
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
             AuthorizationCheckpoint,
             CheckpointDenial,
@@ -255,7 +254,7 @@ class TestOnHandleDeclareModelInvocationRequest:
                 return CheckpointDenial(failures=(CheckpointFailure(detail="Anthropic models are not enabled."),))
             return None
 
-        GriptapeNodes.EventManager().add_authorization_hook(deny)
+        engine.event_manager.add_authorization_hook(deny)
         manager = ModelManager()
 
         denied = manager.on_handle_declare_model_invocation_request(
@@ -270,10 +269,9 @@ class TestOnHandleDeclareModelInvocationRequest:
         )
         assert isinstance(allowed, DeclareModelInvocationResultSuccess)
 
-    def test_empty_failure_denial_still_yields_a_reason(self) -> None:
+    def test_empty_failure_denial_still_yields_a_reason(self, engine: Engine) -> None:
         # A hook that misuses the contract by returning a denial with no failures
         # (it should return None to allow) must not produce a reason-less message.
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
             AuthorizationCheckpoint,
             CheckpointDenial,
@@ -282,7 +280,7 @@ class TestOnHandleDeclareModelInvocationRequest:
         def deny(_checkpoint: AuthorizationCheckpoint) -> CheckpointDenial:
             return CheckpointDenial(failures=())
 
-        GriptapeNodes.EventManager().add_authorization_hook(deny)
+        engine.event_manager.add_authorization_hook(deny)
         manager = ModelManager()
 
         denied = manager.on_handle_declare_model_invocation_request(
@@ -344,7 +342,7 @@ class TestDeclareModelInvocationCatalogEnrichment:
             }
         )
 
-    def _register_node(self, node_name: str) -> None:
+    def _register_node(self, node_name: str, engine: Engine) -> None:
         """Register a library + probe node type, then a node instance the handler can resolve."""
         from griptape_nodes.node_library.library_declarations import ModelUsageNodeProperty
         from griptape_nodes.node_library.library_registry import (
@@ -382,25 +380,25 @@ class TestDeclareModelInvocationCatalogEnrichment:
             name=node_name,
             metadata={"library": _CATALOG_LIBRARY_NAME, "node_type": _ProbeModelNode.__name__},
         )
-        GriptapeNodes.ObjectManager().add_object_by_name(node_name, node)
+        engine.object_manager.add_object_by_name(node_name, node)
 
     def test_checkpoint_carries_family_and_provider_for_declared_model(
         self,
-        griptape_nodes: GriptapeNodes,
+        engine: Engine,
     ) -> None:
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
             AuthorizationCheckpoint,
             CheckpointDenial,
         )
 
-        self._register_node("Probe_1")
+        self._register_node("Probe_1", engine)
         seen: dict[str, object] = {}
 
         def capture(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
             seen["attributes"] = dict(checkpoint.attributes)
             return None
 
-        griptape_nodes.EventManager().add_authorization_hook(capture)
+        engine.event_manager.add_authorization_hook(capture)
         manager = ModelManager()
 
         result = manager.on_handle_declare_model_invocation_request(
@@ -416,7 +414,7 @@ class TestDeclareModelInvocationCatalogEnrichment:
             "model_families": ["GPT Image"],
         }
 
-    def test_family_scoped_hook_blocks_the_invocation(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_family_scoped_hook_blocks_the_invocation(self, engine: Engine) -> None:
         # Mirrors a license policy that forbids a family via the attribute form
         # `resource.model_families.contains(...)`: with the family now on the
         # InvokeModel checkpoint, that forbid fires at invocation time, not only
@@ -427,14 +425,14 @@ class TestDeclareModelInvocationCatalogEnrichment:
             CheckpointFailure,
         )
 
-        self._register_node("Probe_1")
+        self._register_node("Probe_1", engine)
 
         def deny(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
             if "GPT Image" in (checkpoint.attributes.get("model_families") or []):
                 return CheckpointDenial(failures=(CheckpointFailure(detail="GPT Image family is not in your plan."),))
             return None
 
-        griptape_nodes.EventManager().add_authorization_hook(deny)
+        engine.event_manager.add_authorization_hook(deny)
         manager = ModelManager()
 
         result = manager.on_handle_declare_model_invocation_request(
@@ -444,7 +442,7 @@ class TestDeclareModelInvocationCatalogEnrichment:
         assert isinstance(result, DeclareModelInvocationResultFailure)
         assert "GPT Image family is not in your plan." in str(result.result_details)
 
-    def test_key_absent_from_node_models_falls_back_to_bare_id(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_key_absent_from_node_models_falls_back_to_bare_id(self, engine: Engine) -> None:
         # A key the node does not declare cannot be enriched; the checkpoint
         # carries only the bare id, so a family/provider rule cannot match but a
         # bare-id rule still can.
@@ -453,14 +451,14 @@ class TestDeclareModelInvocationCatalogEnrichment:
             CheckpointDenial,
         )
 
-        self._register_node("Probe_1")
+        self._register_node("Probe_1", engine)
         seen: dict[str, object] = {}
 
         def capture(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
             seen["attributes"] = dict(checkpoint.attributes)
             return None
 
-        griptape_nodes.EventManager().add_authorization_hook(capture)
+        engine.event_manager.add_authorization_hook(capture)
         manager = ModelManager()
 
         manager.on_handle_declare_model_invocation_request(
@@ -469,7 +467,7 @@ class TestDeclareModelInvocationCatalogEnrichment:
 
         assert seen["attributes"] == {"id": "gtc_not_declared"}
 
-    def test_missing_node_name_falls_back_to_bare_id(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_missing_node_name_falls_back_to_bare_id(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
             AuthorizationCheckpoint,
             CheckpointDenial,
@@ -481,7 +479,7 @@ class TestDeclareModelInvocationCatalogEnrichment:
             seen["attributes"] = dict(checkpoint.attributes)
             return None
 
-        griptape_nodes.EventManager().add_authorization_hook(capture)
+        engine.event_manager.add_authorization_hook(capture)
         manager = ModelManager()
 
         manager.on_handle_declare_model_invocation_request(

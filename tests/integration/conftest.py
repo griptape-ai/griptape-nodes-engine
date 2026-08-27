@@ -6,10 +6,9 @@ from pathlib import Path
 import pytest  # type: ignore[reportMissingImports]
 
 from griptape_nodes.node_library.library_registry import LibraryRegistry
-from griptape_nodes.retained_mode.engine import reset_root_engine
+from griptape_nodes.retained_mode.engine import Engine, current_engine, reset_root_engine
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
 from griptape_nodes.retained_mode.events.library_events import RegisterLibraryFromFileRequest
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers import config_manager as config_manager_module
 from griptape_nodes.retained_mode.managers import secrets_manager as secrets_manager_module
 from griptape_nodes.utils import install_file_url_support
@@ -47,16 +46,22 @@ def _isolated_engine_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Ite
 
 
 @pytest.fixture
-def flow() -> CreateFlowResultSuccess:
+def engine() -> Engine:
+    """Provide the engine for this test, building it on first use."""
+    return current_engine()
+
+
+@pytest.fixture
+def flow(engine: Engine) -> CreateFlowResultSuccess:
     """Fixture to create a flow for testing."""
     request = RegisterLibraryFromFileRequest(
         file_path="../griptape-nodes/libraries/griptape_nodes_library/griptape_nodes_library.json"
     )
-    result = GriptapeNodes.handle_request(request)
+    result = engine.handle_request(request)
 
     # Create a canvas (flow with no parents)
     request = CreateFlowRequest(parent_flow_name=None, flow_name="canvas")
-    result = GriptapeNodes.handle_request(request)
+    result = engine.handle_request(request)
 
     assert isinstance(result, CreateFlowResultSuccess)
 

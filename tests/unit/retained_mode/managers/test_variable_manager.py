@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
+from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.variable_events import (
@@ -46,7 +47,6 @@ from griptape_nodes.retained_mode.events.variable_events import (
     SetVariableValueRequest,
     SetVariableValueResultFailure,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.variable_types import (
     FlowVariable,
     VariableLayer,
@@ -99,58 +99,58 @@ def project_macros(macros: dict[str, Any]) -> Iterator[None]:
 
 
 @pytest.fixture
-def flow_name(griptape_nodes: GriptapeNodes) -> str:
+def flow_name(engine: Engine) -> str:
     """Bootstrap a clean workflow + flow and return the flow name."""
-    griptape_nodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
-    griptape_nodes.ContextManager().push_workflow("test_wf")
-    result = griptape_nodes.handle_request(
+    engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+    engine.context_manager.push_workflow("test_wf")
+    result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="test_flow", set_as_new_context=True)
     )
     assert isinstance(result, CreateFlowResultSuccess)
     return "test_flow"
 
 
-def _add_variable(griptape_nodes: GriptapeNodes, name: str, value: object, type_: str = "str") -> None:
-    result = griptape_nodes.handle_request(CreateVariableRequest(name=name, type=type_, value=value))
+def _add_variable(engine: Engine, name: str, value: object, type_: str = "str") -> None:
+    result = engine.handle_request(CreateVariableRequest(name=name, type=type_, value=value))
     assert isinstance(result, CreateVariableResultSuccess)
 
 
 class TestListSubstitutablesRequest:
-    def test_returns_user_vars_and_macros(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
-        _add_variable(griptape_nodes, "SHOT", "sc001")
+    def test_returns_user_vars_and_macros(self, engine: Engine, flow_name: str) -> None:
+        _add_variable(engine, "SHOT", "sc001")
         with project_macros({"workspace_dir": "/workspace"}):
-            result = griptape_nodes.handle_request(ListSubstitutablesRequest(starting_flow=flow_name))
+            result = engine.handle_request(ListSubstitutablesRequest(starting_flow=flow_name))
         assert isinstance(result, ListSubstitutablesResultSuccess)
         assert {s.name for s in result.substitutables} == {"SHOT", "workspace_dir"}
 
-    def test_macro_has_correct_metadata(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+    def test_macro_has_correct_metadata(self, engine: Engine, flow_name: str) -> None:
         with project_macros({"workspace_dir": "/workspace"}):
-            result = griptape_nodes.handle_request(ListSubstitutablesRequest(starting_flow=flow_name))
+            result = engine.handle_request(ListSubstitutablesRequest(starting_flow=flow_name))
         assert isinstance(result, ListSubstitutablesResultSuccess)
         macro = next(s for s in result.substitutables if s.name == "workspace_dir")
         assert macro.source == "macro"
         assert macro.read_only is True
         assert macro.value == "/workspace"
 
-    def test_user_var_has_correct_metadata(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
-        _add_variable(griptape_nodes, "SHOT", "sc001")
+    def test_user_var_has_correct_metadata(self, engine: Engine, flow_name: str) -> None:
+        _add_variable(engine, "SHOT", "sc001")
         with project_macros({}):
-            result = griptape_nodes.handle_request(ListSubstitutablesRequest(starting_flow=flow_name))
+            result = engine.handle_request(ListSubstitutablesRequest(starting_flow=flow_name))
         assert isinstance(result, ListSubstitutablesResultSuccess)
         var = next(s for s in result.substitutables if s.name == "SHOT")
         assert var.source == "variable"
         assert var.read_only is False
         assert var.value == "sc001"
 
-    def test_flow_var_shadows_macro_on_name_collision(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+    def test_flow_var_shadows_macro_on_name_collision(self, engine: Engine, flow_name: str) -> None:
         """Precedence FLOW > PROJECT: a flow-scoped user var shadows a project macro of the same name.
 
         Uses a non-reserved project name (a builtin/directory name can't be taken by a
         flow var — see TestReservedNames), so the shadow is one the API actually permits.
         """
-        _add_variable(griptape_nodes, "custom_var", "/my/override")
+        _add_variable(engine, "custom_var", "/my/override")
         with project_macros({"custom_var": "/project"}):
-            result = griptape_nodes.handle_request(ListSubstitutablesRequest(starting_flow=flow_name))
+            result = engine.handle_request(ListSubstitutablesRequest(starting_flow=flow_name))
         assert isinstance(result, ListSubstitutablesResultSuccess)
         entries = [s for s in result.substitutables if s.name == "custom_var"]
         assert len(entries) == 1
@@ -158,18 +158,18 @@ class TestListSubstitutablesRequest:
         assert entries[0].read_only is False
         assert entries[0].value == "/my/override"
 
-    def test_macro_shadows_global_on_name_collision(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+    def test_macro_shadows_global_on_name_collision(self, engine: Engine, flow_name: str) -> None:
         """Precedence PROJECT > GLOBAL: a project macro shadows a global user var of the same name.
 
         Uses a non-reserved name — reserved names (real builtins like workspace_dir) can't be
         taken by a global at all (see TestReservedNames), so the collision must be staged with
         a name only the patched project layer claims.
         """
-        griptape_nodes.handle_request(
+        engine.handle_request(
             CreateVariableRequest(name="custom_var", type="str", value="/my/override", is_global=True)
         )
         with project_macros({"custom_var": "/workspace"}):
-            result = griptape_nodes.handle_request(ListSubstitutablesRequest(starting_flow=flow_name))
+            result = engine.handle_request(ListSubstitutablesRequest(starting_flow=flow_name))
         assert isinstance(result, ListSubstitutablesResultSuccess)
         entries = [s for s in result.substitutables if s.name == "custom_var"]
         assert len(entries) == 1
@@ -177,66 +177,62 @@ class TestListSubstitutablesRequest:
         assert entries[0].read_only is True
         assert entries[0].value == "/workspace"
 
-    def test_filters_out_non_substitutable_user_vars(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+    def test_filters_out_non_substitutable_user_vars(self, engine: Engine, flow_name: str) -> None:
         """User vars with non-str/int values are excluded, matching ResolveSubstitutionRequest behavior."""
-        _add_variable(griptape_nodes, "SHOT", "sc001")
-        _add_variable(griptape_nodes, "META", None)
-        _add_variable(griptape_nodes, "TAGS", ["a", "b"])
+        _add_variable(engine, "SHOT", "sc001")
+        _add_variable(engine, "META", None)
+        _add_variable(engine, "TAGS", ["a", "b"])
         with project_macros({}):
-            result = griptape_nodes.handle_request(ListSubstitutablesRequest(starting_flow=flow_name))
+            result = engine.handle_request(ListSubstitutablesRequest(starting_flow=flow_name))
         assert isinstance(result, ListSubstitutablesResultSuccess)
         names = {s.name for s in result.substitutables}
         assert "SHOT" in names
         assert "META" not in names
         assert "TAGS" not in names
 
-    def test_returns_empty_when_no_vars_and_no_macros(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+    def test_returns_empty_when_no_vars_and_no_macros(self, engine: Engine, flow_name: str) -> None:
         with project_macros({}):
-            result = griptape_nodes.handle_request(ListSubstitutablesRequest(starting_flow=flow_name))
+            result = engine.handle_request(ListSubstitutablesRequest(starting_flow=flow_name))
         assert isinstance(result, ListSubstitutablesResultSuccess)
         assert result.substitutables == []
 
-    def test_returns_failure_for_unknown_flow(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_returns_failure_for_unknown_flow(self, engine: Engine) -> None:
         with project_macros({}):
-            result = griptape_nodes.handle_request(ListSubstitutablesRequest(starting_flow="does_not_exist"))
+            result = engine.handle_request(ListSubstitutablesRequest(starting_flow="does_not_exist"))
         assert isinstance(result, ListSubstitutablesResultFailure)
 
 
 class TestGetVariablesRequest:
     """GetVariablesRequest probes specific names in scope; misses are data, not failures."""
 
-    def test_probe_resolves_requested_names(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
-        _add_variable(griptape_nodes, "SHOT", "sc001")
-        _add_variable(griptape_nodes, "SHOW", "myshow")
-        result = griptape_nodes.handle_request(GetVariablesRequest(starting_flow=flow_name, names=["SHOT"]))
+    def test_probe_resolves_requested_names(self, engine: Engine, flow_name: str) -> None:
+        _add_variable(engine, "SHOT", "sc001")
+        _add_variable(engine, "SHOW", "myshow")
+        result = engine.handle_request(GetVariablesRequest(starting_flow=flow_name, names=["SHOT"]))
         assert isinstance(result, GetVariablesResultSuccess)
         assert result.variables == {"SHOT": "sc001"}
         assert result.unresolved == []
 
-    def test_probe_reports_misses_as_unresolved_not_failure(
-        self, griptape_nodes: GriptapeNodes, flow_name: str
-    ) -> None:
+    def test_probe_reports_misses_as_unresolved_not_failure(self, engine: Engine, flow_name: str) -> None:
         """The ParsedMacro use case: probe required+optional names, decide from unresolved."""
-        _add_variable(griptape_nodes, "SHOT", "sc001")
-        result = griptape_nodes.handle_request(GetVariablesRequest(starting_flow=flow_name, names=["SHOT", "MISSING"]))
+        _add_variable(engine, "SHOT", "sc001")
+        result = engine.handle_request(GetVariablesRequest(starting_flow=flow_name, names=["SHOT", "MISSING"]))
         assert isinstance(result, GetVariablesResultSuccess)
         assert result.variables == {"SHOT": "sc001"}
         assert result.unresolved == ["MISSING"]
 
-    def test_probe_walks_project_layer(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+    def test_probe_walks_project_layer(self, engine: Engine, flow_name: str) -> None:
         """The probe uses the full layered walk — project entries resolve (unlike the old user-only view)."""
         with project_macros({"workspace_dir": "/workspace"}):
-            result = griptape_nodes.handle_request(
-                GetVariablesRequest(starting_flow=flow_name, names=["workspace_dir"])
-            )
+            result = engine.handle_request(GetVariablesRequest(starting_flow=flow_name, names=["workspace_dir"]))
         assert isinstance(result, GetVariablesResultSuccess)
         assert result.variables == {"workspace_dir": "/workspace"}
 
-    def test_probe_honors_lookup_scope(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+    def test_probe_honors_lookup_scope(self, engine: Engine, flow_name: str) -> None:
         """GLOBAL_ONLY probe skips flow layers: the flow var is a miss, not a hit."""
-        _add_variable(griptape_nodes, "flow_only", "from_flow")
+        _add_variable(engine, "flow_only", "from_flow")
         with project_macros({}):
-            result = griptape_nodes.handle_request(
+            result = engine.handle_request(
                 GetVariablesRequest(
                     starting_flow=flow_name, names=["flow_only"], lookup_scope=VariableScope.GLOBAL_ONLY
                 )
@@ -245,83 +241,81 @@ class TestGetVariablesRequest:
         assert result.variables == {}
         assert result.unresolved == ["flow_only"]
 
-    def test_empty_names_fails(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
-        result = griptape_nodes.handle_request(GetVariablesRequest(starting_flow=flow_name))
+    def test_empty_names_fails(self, engine: Engine, flow_name: str) -> None:
+        result = engine.handle_request(GetVariablesRequest(starting_flow=flow_name))
         assert isinstance(result, GetVariablesResultFailure)
         assert "ListVariablesRequest" in str(result.result_details)
 
-    def test_returns_failure_for_unknown_flow(self, griptape_nodes: GriptapeNodes) -> None:
-        result = griptape_nodes.handle_request(GetVariablesRequest(starting_flow="does_not_exist", names=["x"]))
+    def test_returns_failure_for_unknown_flow(self, engine: Engine) -> None:
+        result = engine.handle_request(GetVariablesRequest(starting_flow="does_not_exist", names=["x"]))
         assert isinstance(result, GetVariablesResultFailure)
 
 
 class TestResolveSubstitutionRequest:
     """ResolveSubstitutionRequest layers project vars with user vars; precedence FLOW > PROJECT > GLOBAL."""
 
-    def test_returns_user_vars_and_macros(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
-        _add_variable(griptape_nodes, "SHOT", "sc001")
+    def test_returns_user_vars_and_macros(self, engine: Engine, flow_name: str) -> None:
+        _add_variable(engine, "SHOT", "sc001")
         with project_macros({"workspace_dir": "/workspace"}):
-            result = griptape_nodes.handle_request(ResolveSubstitutionRequest(starting_flow=flow_name))
+            result = engine.handle_request(ResolveSubstitutionRequest(starting_flow=flow_name))
         assert isinstance(result, ResolveSubstitutionResultSuccess)
         assert result.variables["SHOT"] == "sc001"
         assert result.variables["workspace_dir"] == "/workspace"
 
-    def test_flow_var_wins_over_macro(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+    def test_flow_var_wins_over_macro(self, engine: Engine, flow_name: str) -> None:
         """A flow-scoped user var shadows the project macro (new precedence: FLOW > PROJECT).
 
         Uses a non-reserved project name — a builtin/directory name can't be taken by a
         flow var (see TestReservedNames).
         """
-        _add_variable(griptape_nodes, "custom_var", "/my/override")
+        _add_variable(engine, "custom_var", "/my/override")
         with project_macros({"custom_var": "/project"}):
-            result = griptape_nodes.handle_request(ResolveSubstitutionRequest(starting_flow=flow_name))
+            result = engine.handle_request(ResolveSubstitutionRequest(starting_flow=flow_name))
         assert isinstance(result, ResolveSubstitutionResultSuccess)
         assert result.variables["custom_var"] == "/my/override"
 
-    def test_macro_wins_over_global(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+    def test_macro_wins_over_global(self, engine: Engine, flow_name: str) -> None:
         """A project macro shadows a global user var (precedence: PROJECT > GLOBAL).
 
         Non-reserved name: reserved names can't be taken by a global at all, so the
         collision is staged with a name only the patched project layer claims.
         """
-        griptape_nodes.handle_request(
+        engine.handle_request(
             CreateVariableRequest(name="custom_var", type="str", value="/my/override", is_global=True)
         )
         with project_macros({"custom_var": "/workspace"}):
-            result = griptape_nodes.handle_request(ResolveSubstitutionRequest(starting_flow=flow_name))
+            result = engine.handle_request(ResolveSubstitutionRequest(starting_flow=flow_name))
         assert isinstance(result, ResolveSubstitutionResultSuccess)
         assert result.variables["custom_var"] == "/workspace"
 
-    def test_named_lookup_finds_macro(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+    def test_named_lookup_finds_macro(self, engine: Engine, flow_name: str) -> None:
         with project_macros({"workspace_dir": "/workspace"}):
-            result = griptape_nodes.handle_request(
-                ResolveSubstitutionRequest(starting_flow=flow_name, names=["workspace_dir"])
-            )
+            result = engine.handle_request(ResolveSubstitutionRequest(starting_flow=flow_name, names=["workspace_dir"]))
         assert isinstance(result, ResolveSubstitutionResultSuccess)
         assert result.variables == {"workspace_dir": "/workspace"}
 
-    def test_named_lookup_fails_if_not_in_vars_or_macros(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
-        _add_variable(griptape_nodes, "SHOT", "sc001")
+    def test_named_lookup_fails_if_not_in_vars_or_macros(self, engine: Engine, flow_name: str) -> None:
+        _add_variable(engine, "SHOT", "sc001")
         with project_macros({"workspace_dir": "/workspace"}):
-            result = griptape_nodes.handle_request(
+            result = engine.handle_request(
                 ResolveSubstitutionRequest(starting_flow=flow_name, names=["SHOT", "workspace_dir", "MISSING"])
             )
         assert isinstance(result, ResolveSubstitutionResultFailure)
         assert result.unresolved == ["MISSING"]
         assert result.resolved == {"SHOT": "sc001", "workspace_dir": "/workspace"}
 
-    def test_returns_failure_for_unknown_flow(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_returns_failure_for_unknown_flow(self, engine: Engine) -> None:
         with project_macros({}):
-            result = griptape_nodes.handle_request(ResolveSubstitutionRequest(starting_flow="does_not_exist"))
+            result = engine.handle_request(ResolveSubstitutionRequest(starting_flow="does_not_exist"))
         assert isinstance(result, ResolveSubstitutionResultFailure)
 
 
 class TestProjectLayerScopes:
     """PROJECT_ONLY and HIERARCHICAL_FROM_PROJECT — new opt-in scopes."""
 
-    def test_project_only_returns_project_entry(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+    def test_project_only_returns_project_entry(self, engine: Engine, flow_name: str) -> None:
         with project_macros({"workspace_dir": "/proj"}):
-            result = griptape_nodes.handle_request(
+            result = engine.handle_request(
                 GetVariableRequest(
                     name="workspace_dir", starting_flow=flow_name, lookup_scope=VariableScope.PROJECT_ONLY
                 )
@@ -329,30 +323,30 @@ class TestProjectLayerScopes:
         assert isinstance(result, GetVariableResultSuccess)
         assert result.variable.value == "/proj"
 
-    def test_project_only_ignores_flow_var(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+    def test_project_only_ignores_flow_var(self, engine: Engine, flow_name: str) -> None:
         # Non-reserved name so the flow var can be created; PROJECT_ONLY still ignores it.
-        _add_variable(griptape_nodes, "custom_var", "/from_flow")
+        _add_variable(engine, "custom_var", "/from_flow")
         with project_macros({"custom_var": "/from_project"}):
-            result = griptape_nodes.handle_request(
+            result = engine.handle_request(
                 GetVariableRequest(name="custom_var", starting_flow=flow_name, lookup_scope=VariableScope.PROJECT_ONLY)
             )
         assert isinstance(result, GetVariableResultSuccess)
         assert result.variable.value == "/from_project"
 
-    def test_project_only_missing_returns_failure(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+    def test_project_only_missing_returns_failure(self, engine: Engine, flow_name: str) -> None:
         with project_macros({}):
-            result = griptape_nodes.handle_request(
+            result = engine.handle_request(
                 GetVariableRequest(
                     name="workspace_dir", starting_flow=flow_name, lookup_scope=VariableScope.PROJECT_ONLY
                 )
             )
         assert isinstance(result, GetVariableResultFailure)
 
-    def test_hierarchical_from_project_finds_project(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+    def test_hierarchical_from_project_finds_project(self, engine: Engine, flow_name: str) -> None:
         # Non-reserved name so the flow var can be created; the FROM_PROJECT walk skips it.
-        _add_variable(griptape_nodes, "custom_var", "/from_flow")
+        _add_variable(engine, "custom_var", "/from_flow")
         with project_macros({"custom_var": "/from_project"}):
-            result = griptape_nodes.handle_request(
+            result = engine.handle_request(
                 GetVariableRequest(
                     name="custom_var",
                     starting_flow=flow_name,
@@ -363,14 +357,12 @@ class TestProjectLayerScopes:
         # Flow var must not shadow — the walk skips flows entirely.
         assert result.variable.value == "/from_project"
 
-    def test_hierarchical_from_project_falls_through_to_global(
-        self, griptape_nodes: GriptapeNodes, flow_name: str
-    ) -> None:
-        griptape_nodes.handle_request(
+    def test_hierarchical_from_project_falls_through_to_global(self, engine: Engine, flow_name: str) -> None:
+        engine.handle_request(
             CreateVariableRequest(name="only_global", type="str", value="from_global", is_global=True)
         )
         with project_macros({}):
-            result = griptape_nodes.handle_request(
+            result = engine.handle_request(
                 GetVariableRequest(
                     name="only_global",
                     starting_flow=flow_name,
@@ -380,10 +372,10 @@ class TestProjectLayerScopes:
         assert isinstance(result, GetVariableResultSuccess)
         assert result.variable.value == "from_global"
 
-    def test_hierarchical_from_project_ignores_flow_vars(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
-        _add_variable(griptape_nodes, "only_flow", "from_flow")
+    def test_hierarchical_from_project_ignores_flow_vars(self, engine: Engine, flow_name: str) -> None:
+        _add_variable(engine, "only_flow", "from_flow")
         with project_macros({}):
-            result = griptape_nodes.handle_request(
+            result = engine.handle_request(
                 GetVariableRequest(
                     name="only_flow",
                     starting_flow=flow_name,
@@ -392,17 +384,17 @@ class TestProjectLayerScopes:
             )
         assert isinstance(result, GetVariableResultFailure)
 
-    def test_hierarchical_walks_flow_project_global(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+    def test_hierarchical_walks_flow_project_global(self, engine: Engine, flow_name: str) -> None:
         """HIERARCHICAL: flow first, then project, then global."""
         # Only in project layer:
         with project_macros({"workspace_dir": "/from_project"}):
-            result = griptape_nodes.handle_request(GetVariableRequest(name="workspace_dir", starting_flow=flow_name))
+            result = engine.handle_request(GetVariableRequest(name="workspace_dir", starting_flow=flow_name))
         assert isinstance(result, GetVariableResultSuccess)
         assert result.variable.value == "/from_project"
 
-    def test_has_variable_reports_found_scope_project(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+    def test_has_variable_reports_found_scope_project(self, engine: Engine, flow_name: str) -> None:
         with project_macros({"workspace_dir": "/from_project"}):
-            result = griptape_nodes.handle_request(HasVariableRequest(name="workspace_dir", starting_flow=flow_name))
+            result = engine.handle_request(HasVariableRequest(name="workspace_dir", starting_flow=flow_name))
         assert isinstance(result, HasVariableResultSuccess)
         assert result.exists is True
         assert result.found_scope is VariableScope.PROJECT_ONLY
@@ -411,11 +403,11 @@ class TestProjectLayerScopes:
 class TestListVariablesLayerProvenance:
     """ListVariablesResultSuccess.layers is parallel to variables and names each entry's layer."""
 
-    def test_hierarchical_tags_each_layer(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
-        _add_variable(griptape_nodes, "flow_var", "f")
-        griptape_nodes.handle_request(CreateVariableRequest(name="global_var", type="str", value="g", is_global=True))
+    def test_hierarchical_tags_each_layer(self, engine: Engine, flow_name: str) -> None:
+        _add_variable(engine, "flow_var", "f")
+        engine.handle_request(CreateVariableRequest(name="global_var", type="str", value="g", is_global=True))
         with project_macros({"workspace_dir": "/proj"}):
-            result = griptape_nodes.handle_request(
+            result = engine.handle_request(
                 ListVariablesRequest(starting_flow=flow_name, lookup_scope=VariableScope.HIERARCHICAL)
             )
         assert isinstance(result, ListVariablesResultSuccess)
@@ -425,15 +417,13 @@ class TestListVariablesLayerProvenance:
         assert layer_by_name["workspace_dir"] is VariableLayerKind.PROJECT
         assert layer_by_name["global_var"] is VariableLayerKind.GLOBAL
 
-    def test_shadowing_reports_winning_layer(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+    def test_shadowing_reports_winning_layer(self, engine: Engine, flow_name: str) -> None:
         # Same name in flow and global — hierarchical resolution keeps the flow one,
         # and the layers field must say FLOW for it.
-        _add_variable(griptape_nodes, "shadowed", "from_flow")
-        griptape_nodes.handle_request(
-            CreateVariableRequest(name="shadowed", type="str", value="from_global", is_global=True)
-        )
+        _add_variable(engine, "shadowed", "from_flow")
+        engine.handle_request(CreateVariableRequest(name="shadowed", type="str", value="from_global", is_global=True))
         with project_macros({}):
-            result = griptape_nodes.handle_request(
+            result = engine.handle_request(
                 ListVariablesRequest(starting_flow=flow_name, lookup_scope=VariableScope.HIERARCHICAL)
             )
         assert isinstance(result, ListVariablesResultSuccess)
@@ -443,15 +433,13 @@ class TestListVariablesLayerProvenance:
         assert variable.value == "from_flow"
         assert layer is VariableLayerKind.FLOW
 
-    def test_all_scope_keeps_alignment_across_duplicates(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+    def test_all_scope_keeps_alignment_across_duplicates(self, engine: Engine, flow_name: str) -> None:
         # ALL returns every layer's entry without shadowing; the parallel lists must
         # stay aligned even when the same name appears twice.
-        _add_variable(griptape_nodes, "dup", "from_flow")
-        griptape_nodes.handle_request(
-            CreateVariableRequest(name="dup", type="str", value="from_global", is_global=True)
-        )
+        _add_variable(engine, "dup", "from_flow")
+        engine.handle_request(CreateVariableRequest(name="dup", type="str", value="from_global", is_global=True))
         with project_macros({}):
-            result = griptape_nodes.handle_request(
+            result = engine.handle_request(
                 ListVariablesRequest(starting_flow=flow_name, lookup_scope=VariableScope.ALL)
             )
         assert isinstance(result, ListVariablesResultSuccess)
@@ -506,18 +494,18 @@ class TestVariableLayerPrimitive:
 class TestAllScopePointLookup:
     """ALL is an enumeration scope; a single-name lookup under it degrades to CURRENT_FLOW_ONLY."""
 
-    def test_get_variable_with_all_scope_finds_flow_var(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
-        _add_variable(griptape_nodes, "flow_var", "v")
-        result = griptape_nodes.handle_request(
+    def test_get_variable_with_all_scope_finds_flow_var(self, engine: Engine, flow_name: str) -> None:
+        _add_variable(engine, "flow_var", "v")
+        result = engine.handle_request(
             GetVariableRequest(name="flow_var", starting_flow=flow_name, lookup_scope=VariableScope.ALL)
         )
         assert isinstance(result, GetVariableResultSuccess)
         assert result.variable.value == "v"
 
-    def test_get_variable_with_all_scope_misses_global(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+    def test_get_variable_with_all_scope_misses_global(self, engine: Engine, flow_name: str) -> None:
         """ALL point-lookup only consults the starting flow — a global is not found."""
-        griptape_nodes.handle_request(CreateVariableRequest(name="only_global", type="str", value="g", is_global=True))
-        result = griptape_nodes.handle_request(
+        engine.handle_request(CreateVariableRequest(name="only_global", type="str", value="g", is_global=True))
+        result = engine.handle_request(
             GetVariableRequest(name="only_global", starting_flow=flow_name, lookup_scope=VariableScope.ALL)
         )
         assert isinstance(result, GetVariableResultFailure)
@@ -526,9 +514,9 @@ class TestAllScopePointLookup:
 class TestVariablePermission:
     """READ_ONLY variables refuse writes uniformly."""
 
-    def test_set_value_on_project_variable_fails(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+    def test_set_value_on_project_variable_fails(self, engine: Engine, flow_name: str) -> None:
         with project_macros({"workspace_dir": "/proj"}):
-            result = griptape_nodes.handle_request(
+            result = engine.handle_request(
                 SetVariableValueRequest(name="workspace_dir", value="/new", starting_flow=flow_name)
             )
         assert isinstance(result, SetVariableValueResultFailure)
@@ -536,35 +524,35 @@ class TestVariablePermission:
         # 'project', recorded at discovery, not inferred from the search scope.
         assert "project layer" in str(result.result_details)
 
-    def test_delete_project_variable_fails(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+    def test_delete_project_variable_fails(self, engine: Engine, flow_name: str) -> None:
         with project_macros({"workspace_dir": "/proj"}):
-            result = griptape_nodes.handle_request(DeleteVariableRequest(name="workspace_dir", starting_flow=flow_name))
+            result = engine.handle_request(DeleteVariableRequest(name="workspace_dir", starting_flow=flow_name))
         assert isinstance(result, DeleteVariableResultFailure)
 
-    def test_rename_project_variable_fails(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+    def test_rename_project_variable_fails(self, engine: Engine, flow_name: str) -> None:
         with project_macros({"workspace_dir": "/proj"}):
-            result = griptape_nodes.handle_request(
+            result = engine.handle_request(
                 RenameVariableRequest(name="workspace_dir", new_name="new", starting_flow=flow_name)
             )
         assert isinstance(result, RenameVariableResultFailure)
 
-    def test_rename_flow_var_to_reserved_name_fails(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+    def test_rename_flow_var_to_reserved_name_fails(self, engine: Engine, flow_name: str) -> None:
         """Renaming a flow var to a reserved project name (workspace_dir) is refused.
 
         Matches create's rule — a flow var may not take a reserved project builtin/directory
         name — so the two agree. workspace_dir is reserved by the loaded system-defaults project.
         """
-        _add_variable(griptape_nodes, "temp_name", "sc001")
-        result = griptape_nodes.handle_request(
+        _add_variable(engine, "temp_name", "sc001")
+        result = engine.handle_request(
             RenameVariableRequest(name="temp_name", new_name="workspace_dir", starting_flow=flow_name)
         )
         assert isinstance(result, RenameVariableResultFailure)
         assert "reserved" in str(result.result_details)
 
-    def test_set_variables_batch_with_project_hit_fails(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
-        _add_variable(griptape_nodes, "SHOT", "sc001")
+    def test_set_variables_batch_with_project_hit_fails(self, engine: Engine, flow_name: str) -> None:
+        _add_variable(engine, "SHOT", "sc001")
         with project_macros({"workspace_dir": "/proj"}):
-            result = griptape_nodes.handle_request(
+            result = engine.handle_request(
                 SetVariablesRequest(
                     starting_flow=flow_name,
                     variables={"SHOT": "sc002", "workspace_dir": "/hacked"},
@@ -572,7 +560,7 @@ class TestVariablePermission:
             )
         assert isinstance(result, SetVariablesResultFailure)
         # SHOT must NOT have been written (all-or-nothing).
-        after = griptape_nodes.handle_request(GetVariablesRequest(starting_flow=flow_name, names=["SHOT"]))
+        after = engine.handle_request(GetVariablesRequest(starting_flow=flow_name, names=["SHOT"]))
         assert isinstance(after, GetVariablesResultSuccess)
         assert after.variables == {"SHOT": "sc001"}
 
@@ -584,20 +572,20 @@ class TestReservedNames:
     so these exercise the real ProjectManager.project_computed_names path — no patching.
     """
 
-    def test_create_flow_var_with_reserved_name_fails(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
-        result = griptape_nodes.handle_request(
+    def test_create_flow_var_with_reserved_name_fails(self, engine: Engine, flow_name: str) -> None:
+        result = engine.handle_request(
             CreateVariableRequest(name="workspace_dir", type="str", value="/hijack", owning_flow=flow_name)
         )
         assert isinstance(result, CreateVariableResultFailure)
         assert "reserved" in str(result.result_details)
 
-    def test_create_flow_var_with_unreserved_name_succeeds(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
-        result = griptape_nodes.handle_request(
+    def test_create_flow_var_with_unreserved_name_succeeds(self, engine: Engine, flow_name: str) -> None:
+        result = engine.handle_request(
             CreateVariableRequest(name="not_a_builtin", type="str", value="ok", owning_flow=flow_name)
         )
         assert isinstance(result, CreateVariableResultSuccess)
 
-    def test_initial_setup_replay_bypasses_reserved_gate(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+    def test_initial_setup_replay_bypasses_reserved_gate(self, engine: Engine, flow_name: str) -> None:
         """Workflow load-replay (initial_setup=True) recreates a reserved-named variable.
 
         Load re-executes captured CreateVariableRequests and DISCARDS the results, so a
@@ -605,7 +593,7 @@ class TestReservedNames:
         (saved before the name was reserved). The recreated flow variable is shadowed by
         the project's computed value in resolution — exactly the pre-reservation behavior.
         """
-        result = griptape_nodes.handle_request(
+        result = engine.handle_request(
             CreateVariableRequest(
                 name="workspace_dir",
                 type="str",
@@ -616,7 +604,7 @@ class TestReservedNames:
         )
         assert isinstance(result, CreateVariableResultSuccess)
         # Stored in the flow layer (CURRENT_FLOW_ONLY sees it)...
-        stored = griptape_nodes.handle_request(
+        stored = engine.handle_request(
             GetVariableRequest(
                 name="workspace_dir", starting_flow=flow_name, lookup_scope=VariableScope.CURRENT_FLOW_ONLY
             )
@@ -625,36 +613,34 @@ class TestReservedNames:
         assert stored.variable.value == "/from_saved_workflow"
 
     @pytest.mark.usefixtures("flow_name")
-    def test_initial_setup_replay_of_global_bypasses_reserved_gate(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_initial_setup_replay_of_global_bypasses_reserved_gate(self, engine: Engine) -> None:
         """Same replay exemption for globals — is_global=True round-trips through save/load too."""
-        result = griptape_nodes.handle_request(
+        result = engine.handle_request(
             CreateVariableRequest(
                 name="workspace_dir", type="str", value="/global_from_save", is_global=True, initial_setup=True
             )
         )
         assert isinstance(result, CreateVariableResultSuccess)
 
-    def test_live_create_still_refused_after_replay_exemption(
-        self, griptape_nodes: GriptapeNodes, flow_name: str
-    ) -> None:
+    def test_live_create_still_refused_after_replay_exemption(self, engine: Engine, flow_name: str) -> None:
         """The exemption is replay-only: the same request WITHOUT initial_setup stays refused."""
-        result = griptape_nodes.handle_request(
+        result = engine.handle_request(
             CreateVariableRequest(name="workspace_dir", type="str", value="/hijack", owning_flow=flow_name)
         )
         assert isinstance(result, CreateVariableResultFailure)
         assert "reserved" in str(result.result_details)
 
     def test_replay_failure_is_logged_not_silent(
-        self, griptape_nodes: GriptapeNodes, flow_name: str, caplog: pytest.LogCaptureFixture
+        self, engine: Engine, flow_name: str, caplog: pytest.LogCaptureFixture
     ) -> None:
         """A replayed create that fails for a NON-reserved reason logs a warning.
 
         Load discards results, so the log is the only signal a saved variable didn't
         come back (e.g. duplicate name in the same flow).
         """
-        _add_variable(griptape_nodes, "dup_var", "first")
-        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
-            result = griptape_nodes.handle_request(
+        _add_variable(engine, "dup_var", "first")
+        with caplog.at_level(logging.WARNING, logger="engine"):
+            result = engine.handle_request(
                 CreateVariableRequest(
                     name="dup_var", type="str", value="second", owning_flow=flow_name, initial_setup=True
                 )
@@ -662,60 +648,56 @@ class TestReservedNames:
         assert isinstance(result, CreateVariableResultFailure)
         assert any("could not recreate variable 'dup_var'" in r.message for r in caplog.records)
 
-    def test_create_with_blank_name_fails(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+    def test_create_with_blank_name_fails(self, engine: Engine, flow_name: str) -> None:
         for blank in ("", "   "):
-            result = griptape_nodes.handle_request(
+            result = engine.handle_request(
                 CreateVariableRequest(name=blank, type="str", value="x", owning_flow=flow_name)
             )
             assert isinstance(result, CreateVariableResultFailure)
             assert "empty name" in str(result.result_details)
 
     @pytest.mark.usefixtures("flow_name")
-    def test_create_global_with_reserved_name_fails(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_create_global_with_reserved_name_fails(self, engine: Engine) -> None:
         """Reserved means reserved in EVERY scope: a global may not take a reserved name either.
 
         Depends on the flow_name fixture for clean engine state + a current project, but
         doesn't need the flow value itself (globals aren't flow-scoped).
         """
-        result = griptape_nodes.handle_request(
+        result = engine.handle_request(
             CreateVariableRequest(name="workspace_dir", type="str", value="/global", is_global=True)
         )
         assert isinstance(result, CreateVariableResultFailure)
         assert "reserved" in str(result.result_details)
 
-    def test_create_flow_var_shadowing_a_global_is_allowed(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+    def test_create_flow_var_shadowing_a_global_is_allowed(self, engine: Engine, flow_name: str) -> None:
         """A flow var may share a name with a global (only reserved names are refused)."""
-        griptape_nodes.handle_request(
-            CreateVariableRequest(name="shared", type="str", value="from_global", is_global=True)
-        )
-        result = griptape_nodes.handle_request(
+        engine.handle_request(CreateVariableRequest(name="shared", type="str", value="from_global", is_global=True))
+        result = engine.handle_request(
             CreateVariableRequest(name="shared", type="str", value="from_flow", owning_flow=flow_name)
         )
         assert isinstance(result, CreateVariableResultSuccess)
 
-    def test_rename_to_same_name_is_noop_success(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+    def test_rename_to_same_name_is_noop_success(self, engine: Engine, flow_name: str) -> None:
         """Renaming a variable to its current name is an idempotent success, not a self-collision crash."""
-        _add_variable(griptape_nodes, "keeper", "v1")
-        result = griptape_nodes.handle_request(
-            RenameVariableRequest(name="keeper", new_name="keeper", starting_flow=flow_name)
-        )
+        _add_variable(engine, "keeper", "v1")
+        result = engine.handle_request(RenameVariableRequest(name="keeper", new_name="keeper", starting_flow=flow_name))
         assert isinstance(result, RenameVariableResultSuccess)
         # Value preserved.
-        after = griptape_nodes.handle_request(GetVariablesRequest(starting_flow=flow_name, names=["keeper"]))
+        after = engine.handle_request(GetVariablesRequest(starting_flow=flow_name, names=["keeper"]))
         assert isinstance(after, GetVariablesResultSuccess)
         assert after.variables == {"keeper": "v1"}
 
-    def test_rename_to_blank_name_fails(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
-        _add_variable(griptape_nodes, "keeper", "v1")
+    def test_rename_to_blank_name_fails(self, engine: Engine, flow_name: str) -> None:
+        _add_variable(engine, "keeper", "v1")
         for blank in ("", "   "):
-            result = griptape_nodes.handle_request(
+            result = engine.handle_request(
                 RenameVariableRequest(name="keeper", new_name=blank, starting_flow=flow_name)
             )
             assert isinstance(result, RenameVariableResultFailure)
             assert "empty name" in str(result.result_details)
 
     @pytest.mark.usefixtures("flow_name")
-    def test_rename_reserved_named_global_to_itself_is_noop_success(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_rename_reserved_named_global_to_itself_is_noop_success(self, engine: Engine) -> None:
         """A pre-existing global whose name is reserved can still be renamed to itself.
 
         Creating a reserved-named global is refused now, but variables from workflows saved
@@ -725,26 +707,24 @@ class TestReservedNames:
         it, a no-op rename of a reserved-named variable would surface a spurious 'that name is
         reserved' failure.
         """
-        griptape_nodes.VariablesManager()._global_layer.set(
+        engine.variables_manager._global_layer.set(
             FlowVariable(name="workspace_dir", owning_flow_name=None, type="str", value="/g")
         )
-        result = griptape_nodes.handle_request(
+        result = engine.handle_request(
             RenameVariableRequest(
                 name="workspace_dir", new_name="workspace_dir", lookup_scope=VariableScope.GLOBAL_ONLY
             )
         )
         assert isinstance(result, RenameVariableResultSuccess)
 
-    def test_rename_read_only_variable_to_itself_is_noop_success(
-        self, griptape_nodes: GriptapeNodes, flow_name: str
-    ) -> None:
+    def test_rename_read_only_variable_to_itself_is_noop_success(self, engine: Engine, flow_name: str) -> None:
         """Rename-to-self succeeds even on a READ_ONLY variable — nothing is mutated.
 
         The no-op short-circuit runs before the read-only refusal (and every other gate):
         a resolved project builtin like workspace_dir is READ_ONLY, and renaming it to its
         own name must be an idempotent success, not a 'read-only' Failure.
         """
-        result = griptape_nodes.handle_request(
+        result = engine.handle_request(
             RenameVariableRequest(
                 name="workspace_dir",
                 new_name="workspace_dir",
@@ -754,11 +734,9 @@ class TestReservedNames:
         )
         assert isinstance(result, RenameVariableResultSuccess)
 
-    def test_rename_read_only_variable_to_new_name_still_refused(
-        self, griptape_nodes: GriptapeNodes, flow_name: str
-    ) -> None:
+    def test_rename_read_only_variable_to_new_name_still_refused(self, engine: Engine, flow_name: str) -> None:
         """The no-op reorder must not weaken the real gate: an ACTUAL rename of READ_ONLY still fails."""
-        result = griptape_nodes.handle_request(
+        result = engine.handle_request(
             RenameVariableRequest(
                 name="workspace_dir",
                 new_name="my_workspace",
@@ -769,48 +747,40 @@ class TestReservedNames:
         assert isinstance(result, RenameVariableResultFailure)
         assert "read-only" in str(result.result_details)
 
-    def test_variable_details_reports_reserved_for_builtin(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+    def test_variable_details_reports_reserved_for_builtin(self, engine: Engine, flow_name: str) -> None:
         """GetVariableDetails populates reserved: True for a resolved computed name, False for a user variable."""
-        builtin_details = griptape_nodes.handle_request(
+        builtin_details = engine.handle_request(
             GetVariableDetailsRequest(name="workspace_dir", starting_flow=flow_name)
         )
         assert isinstance(builtin_details, GetVariableDetailsResultSuccess)
         assert builtin_details.details.reserved is True
 
-        _add_variable(griptape_nodes, "my_var", "v")
-        user_details = griptape_nodes.handle_request(GetVariableDetailsRequest(name="my_var", starting_flow=flow_name))
+        _add_variable(engine, "my_var", "v")
+        user_details = engine.handle_request(GetVariableDetailsRequest(name="my_var", starting_flow=flow_name))
         assert isinstance(user_details, GetVariableDetailsResultSuccess)
         assert user_details.details.reserved is False
 
     @pytest.mark.usefixtures("flow_name")
-    def test_delete_global_variable_routes_to_global_layer(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_delete_global_variable_routes_to_global_layer(self, engine: Engine) -> None:
         """Delete routes by layer provenance — a global (owning_flow_name=None) leaves the global layer."""
-        griptape_nodes.handle_request(CreateVariableRequest(name="g_del", type="str", value="v", is_global=True))
-        result = griptape_nodes.handle_request(
-            DeleteVariableRequest(name="g_del", lookup_scope=VariableScope.GLOBAL_ONLY)
-        )
+        engine.handle_request(CreateVariableRequest(name="g_del", type="str", value="v", is_global=True))
+        result = engine.handle_request(DeleteVariableRequest(name="g_del", lookup_scope=VariableScope.GLOBAL_ONLY))
         assert isinstance(result, DeleteVariableResultSuccess)
-        after = griptape_nodes.handle_request(
-            GetVariableValueRequest(name="g_del", lookup_scope=VariableScope.GLOBAL_ONLY)
-        )
+        after = engine.handle_request(GetVariableValueRequest(name="g_del", lookup_scope=VariableScope.GLOBAL_ONLY))
         assert isinstance(after, GetVariableValueResultFailure)
 
     @pytest.mark.usefixtures("flow_name")
-    def test_rename_global_variable_routes_to_global_layer(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_rename_global_variable_routes_to_global_layer(self, engine: Engine) -> None:
         """Rename routes by layer provenance — a global renames within the global layer."""
-        griptape_nodes.handle_request(CreateVariableRequest(name="g_old", type="str", value="v", is_global=True))
-        result = griptape_nodes.handle_request(
+        engine.handle_request(CreateVariableRequest(name="g_old", type="str", value="v", is_global=True))
+        result = engine.handle_request(
             RenameVariableRequest(name="g_old", new_name="g_new", lookup_scope=VariableScope.GLOBAL_ONLY)
         )
         assert isinstance(result, RenameVariableResultSuccess)
-        new_val = griptape_nodes.handle_request(
-            GetVariableValueRequest(name="g_new", lookup_scope=VariableScope.GLOBAL_ONLY)
-        )
+        new_val = engine.handle_request(GetVariableValueRequest(name="g_new", lookup_scope=VariableScope.GLOBAL_ONLY))
         assert isinstance(new_val, GetVariableValueResultSuccess)
         assert new_val.value == "v"
-        old_val = griptape_nodes.handle_request(
-            GetVariableValueRequest(name="g_old", lookup_scope=VariableScope.GLOBAL_ONLY)
-        )
+        old_val = engine.handle_request(GetVariableValueRequest(name="g_old", lookup_scope=VariableScope.GLOBAL_ONLY))
         assert isinstance(old_val, GetVariableValueResultFailure)
 
 
@@ -823,21 +793,19 @@ class TestGetProjectVariableRealBody:
     (they go live for real when #5142 wires set_project_variables at load).
     """
 
-    def test_computed_name_resolves_via_real_dispatch(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+    def test_computed_name_resolves_via_real_dispatch(self, engine: Engine, flow_name: str) -> None:
         """A real builtin resolves through membership check → resolve_project_variable."""
-        result = griptape_nodes.handle_request(
+        result = engine.handle_request(
             GetVariableRequest(name="workspace_dir", starting_flow=flow_name, lookup_scope=VariableScope.PROJECT_ONLY)
         )
         assert isinstance(result, GetVariableResultSuccess)
         assert result.variable.permission is VariablePermission.READ_ONLY
         assert result.variable.value  # resolved from live config; exact value is environment-specific
 
-    def test_computed_name_with_unready_context_silent_skips(
-        self, griptape_nodes: GriptapeNodes, flow_name: str
-    ) -> None:
+    def test_computed_name_with_unready_context_silent_skips(self, engine: Engine, flow_name: str) -> None:
         """A computed name whose resolver raises context-not-ready yields not-found — no crash, no stored fallback."""
-        variables_manager = griptape_nodes.VariablesManager()
-        project_id = griptape_nodes.ProjectManager().resolve_project_id(None)
+        variables_manager = engine.variables_manager
+        project_id = engine.project_manager.resolve_project_id(None)
         assert project_id is not None
         # Stage a same-named stored entry to prove the silent-skip does NOT fall through to it.
         stored_layer = VariableLayer()
@@ -845,11 +813,11 @@ class TestGetProjectVariableRealBody:
         variables_manager.set_project_variables(project_id, stored_layer)
         try:
             with patch.object(
-                type(griptape_nodes.ProjectManager()),
+                type(engine.project_manager),
                 "resolve_project_variable",
                 side_effect=RuntimeError("context not ready"),
             ):
-                result = griptape_nodes.handle_request(
+                result = engine.handle_request(
                     GetVariableRequest(
                         name="workspace_dir", starting_flow=flow_name, lookup_scope=VariableScope.PROJECT_ONLY
                     )
@@ -858,19 +826,17 @@ class TestGetProjectVariableRealBody:
         finally:
             variables_manager.remove_project_variables(project_id)
 
-    def test_non_computed_name_falls_through_to_stored_snapshot(
-        self, griptape_nodes: GriptapeNodes, flow_name: str
-    ) -> None:
+    def test_non_computed_name_falls_through_to_stored_snapshot(self, engine: Engine, flow_name: str) -> None:
         """A stored-only name skips resolve entirely and returns a snapshot copy, not the stored object."""
-        variables_manager = griptape_nodes.VariablesManager()
-        project_id = griptape_nodes.ProjectManager().resolve_project_id(None)
+        variables_manager = engine.variables_manager
+        project_id = engine.project_manager.resolve_project_id(None)
         assert project_id is not None
         stored = FlowVariable(name="team_prefix", owning_flow_name=None, type="str", value="vfx")
         stored_layer = VariableLayer()
         stored_layer.set(stored)
         variables_manager.set_project_variables(project_id, stored_layer)
         try:
-            result = griptape_nodes.handle_request(
+            result = engine.handle_request(
                 GetVariableRequest(name="team_prefix", starting_flow=flow_name, lookup_scope=VariableScope.PROJECT_ONLY)
             )
             assert isinstance(result, GetVariableResultSuccess)
@@ -884,23 +850,21 @@ class TestGetProjectVariableRealBody:
 class TestProjectVariableSerialization:
     """Regression: project-layer variables must cross the request boundary as plain, serializable FlowVariables."""
 
-    def test_get_variable_from_project_returns_plain_flow_variable(
-        self, griptape_nodes: GriptapeNodes, flow_name: str
-    ) -> None:
+    def test_get_variable_from_project_returns_plain_flow_variable(self, engine: Engine, flow_name: str) -> None:
         """A HIERARCHICAL Get that resolves to the project layer returns a plain, serializable FlowVariable."""
         with project_macros({"workspace_dir": "/proj"}):
-            result = griptape_nodes.handle_request(GetVariableRequest(name="workspace_dir", starting_flow=flow_name))
+            result = engine.handle_request(GetVariableRequest(name="workspace_dir", starting_flow=flow_name))
         assert isinstance(result, GetVariableResultSuccess)
         # Must be a plain FlowVariable carrying a stored value — no live resolver.
         assert type(result.variable) is FlowVariable
         assert result.variable.value == "/proj"
 
-    def test_get_variable_from_project_serializes(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+    def test_get_variable_from_project_serializes(self, engine: Engine, flow_name: str) -> None:
         """The Success payload must survive cattrs unstructure (the broadcast path)."""
         from griptape_nodes.retained_mode.events.event_converter import safe_unstructure
 
         with project_macros({"workspace_dir": "/proj"}):
-            result = griptape_nodes.handle_request(GetVariableRequest(name="workspace_dir", starting_flow=flow_name))
+            result = engine.handle_request(GetVariableRequest(name="workspace_dir", starting_flow=flow_name))
         assert isinstance(result, GetVariableResultSuccess)
         serialized = safe_unstructure(result)
         assert serialized["variable"]["name"] == "workspace_dir"

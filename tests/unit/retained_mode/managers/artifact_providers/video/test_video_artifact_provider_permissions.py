@@ -17,7 +17,7 @@ from typing import Any
 
 import pytest
 
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_provider import WriteVettingPolicy
 from griptape_nodes.retained_mode.managers.artifact_providers.video.video_artifact_provider import (
     VideoArtifactProvider,
@@ -45,7 +45,7 @@ class TestVideoCheckWriteFormatFromPath:
 
     def test_denies_when_hook_denies_codec(
         self,
-        griptape_nodes: GriptapeNodes,
+        engine: Engine,
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
     ) -> None:
@@ -69,11 +69,11 @@ class TestVideoCheckWriteFormatFromPath:
         staged.write_bytes(b"stand-in; ffprobe is mocked")
 
         provider = VideoArtifactProvider(registry=None)  # type: ignore[arg-type]
-        griptape_nodes.EventManager().add_authorization_hook(deny_hevc)
+        engine.event_manager.add_authorization_hook(deny_hevc)
         try:
             denial = provider.check_write_format_from_path(str(staged), "mp4")
         finally:
-            griptape_nodes.EventManager().remove_authorization_hook(deny_hevc)
+            engine.event_manager.remove_authorization_hook(deny_hevc)
 
         assert denial is not None
         # The checkpoint must carry both id (codec) and container_format so a
@@ -82,7 +82,7 @@ class TestVideoCheckWriteFormatFromPath:
 
     def test_allows_when_hook_allows_codec(
         self,
-        griptape_nodes: GriptapeNodes,
+        engine: Engine,
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
     ) -> None:
@@ -101,17 +101,17 @@ class TestVideoCheckWriteFormatFromPath:
         staged.write_bytes(b"stand-in; ffprobe is mocked")
 
         provider = VideoArtifactProvider(registry=None)  # type: ignore[arg-type]
-        griptape_nodes.EventManager().add_authorization_hook(deny_hevc)
+        engine.event_manager.add_authorization_hook(deny_hevc)
         try:
             denial = provider.check_write_format_from_path(str(staged), "mp4")
         finally:
-            griptape_nodes.EventManager().remove_authorization_hook(deny_hevc)
+            engine.event_manager.remove_authorization_hook(deny_hevc)
 
         assert denial is None
 
     def test_fails_closed_when_ffprobe_returns_none(
         self,
-        griptape_nodes: GriptapeNodes,
+        engine: Engine,
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
     ) -> None:
@@ -131,11 +131,11 @@ class TestVideoCheckWriteFormatFromPath:
         staged.write_bytes(b"unclassifiable")
 
         provider = VideoArtifactProvider(registry=None)  # type: ignore[arg-type]
-        griptape_nodes.EventManager().add_authorization_hook(sentinel_hook)
+        engine.event_manager.add_authorization_hook(sentinel_hook)
         try:
             denial = provider.check_write_format_from_path(str(staged), "mp4")
         finally:
-            griptape_nodes.EventManager().remove_authorization_hook(sentinel_hook)
+            engine.event_manager.remove_authorization_hook(sentinel_hook)
 
         assert denial is not None
         # The denial detail is generic -- OSManager wraps it with the caller's
@@ -151,7 +151,7 @@ class TestVideoCheckWriteFormatFromPath:
 
     def test_fails_closed_when_probe_has_no_video_stream(
         self,
-        griptape_nodes: GriptapeNodes,
+        engine: Engine,
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
     ) -> None:
@@ -173,11 +173,11 @@ class TestVideoCheckWriteFormatFromPath:
         staged.write_bytes(b"audio-only")
 
         provider = VideoArtifactProvider(registry=None)  # type: ignore[arg-type]
-        griptape_nodes.EventManager().add_authorization_hook(sentinel_hook)
+        engine.event_manager.add_authorization_hook(sentinel_hook)
         try:
             denial = provider.check_write_format_from_path(str(staged), "mp4")
         finally:
-            griptape_nodes.EventManager().remove_authorization_hook(sentinel_hook)
+            engine.event_manager.remove_authorization_hook(sentinel_hook)
 
         assert denial is not None
         # Denial detail carries the "probe unavailable or failed -- see server logs"
@@ -189,7 +189,7 @@ class TestVideoCheckWriteFormatFromPath:
 
     def test_denies_when_disallowed_codec_is_on_a_non_first_video_stream(
         self,
-        griptape_nodes: GriptapeNodes,
+        engine: Engine,
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
     ) -> None:
@@ -227,11 +227,11 @@ class TestVideoCheckWriteFormatFromPath:
         staged.write_bytes(b"stand-in; ffprobe is mocked")
 
         provider = VideoArtifactProvider(registry=None)  # type: ignore[arg-type]
-        griptape_nodes.EventManager().add_authorization_hook(deny_hevc)
+        engine.event_manager.add_authorization_hook(deny_hevc)
         try:
             denial = provider.check_write_format_from_path(str(staged), "mp4")
         finally:
-            griptape_nodes.EventManager().remove_authorization_hook(deny_hevc)
+            engine.event_manager.remove_authorization_hook(deny_hevc)
 
         assert denial is not None
         # Both codecs must have been offered to the hook, in stream order.
@@ -244,7 +244,7 @@ class TestVideoReadPermission:
     """``check_read_permission`` mirrors the from-path write path (both funnel through _check_codec)."""
 
     def test_denies_when_hook_denies_codec(
-        self, griptape_nodes: GriptapeNodes, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         monkeypatch.setattr(
             VideoArtifactProvider,
@@ -266,17 +266,17 @@ class TestVideoReadPermission:
         source_path.write_bytes(b"stand-in; ffprobe is mocked")
 
         provider = VideoArtifactProvider(registry=None)  # type: ignore[arg-type]
-        griptape_nodes.EventManager().add_authorization_hook(deny_hevc)
+        engine.event_manager.add_authorization_hook(deny_hevc)
         try:
             denial = provider.check_read_permission(str(source_path))
         finally:
-            griptape_nodes.EventManager().remove_authorization_hook(deny_hevc)
+            engine.event_manager.remove_authorization_hook(deny_hevc)
 
         assert denial is not None
         assert seen[-1] == {"id": "hevc", "container_format": "mp4"}
 
     def test_container_format_unknown_when_path_has_no_extension(
-        self, griptape_nodes: GriptapeNodes, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         # A caller can pass a path with no extension (e.g. a temp file). The
         # provider still probes the bytes for codec but tags the checkpoint
@@ -297,16 +297,16 @@ class TestVideoReadPermission:
         source_path.write_bytes(b"stand-in")
 
         provider = VideoArtifactProvider(registry=None)  # type: ignore[arg-type]
-        griptape_nodes.EventManager().add_authorization_hook(record)
+        engine.event_manager.add_authorization_hook(record)
         try:
             provider.check_read_permission(str(source_path))
         finally:
-            griptape_nodes.EventManager().remove_authorization_hook(record)
+            engine.event_manager.remove_authorization_hook(record)
 
         assert seen[-1]["container_format"] == "unknown"
 
     def test_fails_closed_when_ffprobe_returns_none(
-        self, griptape_nodes: GriptapeNodes, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         # ffprobe unavailable: read cannot be verified as compliant. Fail
         # closed with a synthetic denial. The provider's denial detail is
@@ -324,11 +324,11 @@ class TestVideoReadPermission:
         source_path.write_bytes(b"stand-in")
 
         provider = VideoArtifactProvider(registry=None)  # type: ignore[arg-type]
-        griptape_nodes.EventManager().add_authorization_hook(sentinel_hook)
+        engine.event_manager.add_authorization_hook(sentinel_hook)
         try:
             denial = provider.check_read_permission(str(source_path))
         finally:
-            griptape_nodes.EventManager().remove_authorization_hook(sentinel_hook)
+            engine.event_manager.remove_authorization_hook(sentinel_hook)
 
         assert denial is not None
         # Denial detail carries the "probe unavailable or failed -- see server logs"

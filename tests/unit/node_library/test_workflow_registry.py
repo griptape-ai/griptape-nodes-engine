@@ -1,15 +1,20 @@
 """Tests for WorkflowRegistry functionality."""
 
+from __future__ import annotations
+
 import os
 import platform
 from pathlib import Path
+from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from griptape_nodes.files.path_utils import derive_registry_key
 from griptape_nodes.node_library.workflow_registry import Workflow, WorkflowRegistry
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.engine import Engine
 
 
 class TestDeriveRegistryKey:
@@ -112,12 +117,12 @@ class TestWorkflowRegistry:
             # On Unix, Windows paths are treated as relative
             assert result.endswith("C:\\Users\\test\\workflow.py")
 
-    def test_get_complete_file_path_with_relative_path(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_get_complete_file_path_with_relative_path(self, engine: Engine) -> None:
         """Test that get_complete_file_path resolves relative paths to workspace."""
         relative_path = "workflows/my_workflow.py"
 
         # Get the actual workspace path from the config manager
-        workspace_path = griptape_nodes.ConfigManager().workspace_path
+        workspace_path = engine.config_manager.workspace_path
 
         result = WorkflowRegistry.get_complete_file_path(relative_path)
 
@@ -140,24 +145,24 @@ class TestWorkflowRegistry:
             # On Unix, ~ is also treated as relative (not expanded)
             assert result.endswith("~/workflows/my_workflow.py")
 
-    def test_get_complete_file_path_with_current_dir_relative(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_get_complete_file_path_with_current_dir_relative(self, engine: Engine) -> None:
         """Test that get_complete_file_path handles current directory relative paths."""
         current_dir_path = "./my_workflow.py"
 
         # Get the actual workspace path from the config manager
-        workspace_path = griptape_nodes.ConfigManager().workspace_path
+        workspace_path = engine.config_manager.workspace_path
 
         result = WorkflowRegistry.get_complete_file_path(current_dir_path)
 
         expected = str(workspace_path / current_dir_path)
         assert result == expected
 
-    def test_get_complete_file_path_with_parent_dir_relative(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_get_complete_file_path_with_parent_dir_relative(self, engine: Engine) -> None:
         """Test that get_complete_file_path handles parent directory relative paths."""
         parent_dir_path = "../external/my_workflow.py"
 
         # Get the actual workspace path from the config manager
-        workspace_path = griptape_nodes.ConfigManager().workspace_path
+        workspace_path = engine.config_manager.workspace_path
 
         result = WorkflowRegistry.get_complete_file_path(parent_dir_path)
 

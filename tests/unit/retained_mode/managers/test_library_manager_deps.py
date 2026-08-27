@@ -14,6 +14,7 @@ from griptape_nodes.node_library.library_registry import (
     LibraryNameAndVersion,
     LibrarySchema,
 )
+from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.library_events import (
     DownloadLibraryRequest,
@@ -24,7 +25,6 @@ from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileRequest,
     RegisterLibraryFromFileResultFailure,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries import LibraryDependencyProblem
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.managers.settings import LibraryDependencyInstallBehavior
@@ -146,9 +146,9 @@ class TestLibraryDependencyResolution:
     """
 
     @pytest.mark.asyncio
-    async def test_no_library_dependencies_skips_download(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_no_library_dependencies_skips_download(self, engine: Engine) -> None:
         """A library with no library_dependencies does not call download_library_request."""
-        mgr = griptape_nodes.LibraryManager()
+        mgr = engine.library_manager
         lib_info = _make_lib_info()
 
         with (
@@ -168,9 +168,9 @@ class TestLibraryDependencyResolution:
         mock_download.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_empty_library_dependencies_skips_download(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_empty_library_dependencies_skips_download(self, engine: Engine) -> None:
         """A library with library_dependencies=[] does not call download_library_request."""
-        mgr = griptape_nodes.LibraryManager()
+        mgr = engine.library_manager
         lib_info = _make_lib_info()
 
         with (
@@ -190,9 +190,9 @@ class TestLibraryDependencyResolution:
         mock_download.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_already_tracked_dependency_skips_download(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_already_tracked_dependency_skips_download(self, engine: Engine) -> None:
         """If the dep repo name appears in an existing tracked path with healthy state, download is skipped."""
-        mgr = griptape_nodes.LibraryManager()
+        mgr = engine.library_manager
         lib_info = _make_lib_info()
         schema = _make_schema_mock(["griptape-ai/griptape-nodes-library-opencolorio@v1.2.0"])
 
@@ -225,9 +225,9 @@ class TestLibraryDependencyResolution:
         mock_download.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_missing_dependency_triggers_download(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_missing_dependency_triggers_download(self, engine: Engine) -> None:
         """A dep not yet tracked causes download_library_request to be called with correct args."""
-        mgr = griptape_nodes.LibraryManager()
+        mgr = engine.library_manager
         lib_info = _make_lib_info()
         schema = _make_schema_mock(["griptape-ai/nodes-dep@v1.0.0"])
 
@@ -260,9 +260,9 @@ class TestLibraryDependencyResolution:
         assert req.auto_register is True
 
     @pytest.mark.asyncio
-    async def test_dependency_failure_marks_library_unusable(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_dependency_failure_marks_library_unusable(self, engine: Engine) -> None:
         """When a dependency download fails, the library gets LibraryDependencyProblem and UNUSABLE fitness."""
-        mgr = griptape_nodes.LibraryManager()
+        mgr = engine.library_manager
         lib_info = _make_lib_info()
         schema = _make_schema_mock(["griptape-ai/nodes-bad@v1.0.0"])
 
@@ -291,9 +291,9 @@ class TestLibraryDependencyResolution:
         assert "griptape-ai/nodes-bad@v1.0.0" in dep_problems[0].dependency_name
 
     @pytest.mark.asyncio
-    async def test_dependency_resolved_before_pip_install(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_dependency_resolved_before_pip_install(self, engine: Engine) -> None:
         """Library dependency download happens before pip package installation."""
-        mgr = griptape_nodes.LibraryManager()
+        mgr = engine.library_manager
         lib_info = _make_lib_info()
         schema = _make_schema_mock(["griptape-ai/nodes-dep@v1.0.0"])
 
@@ -328,9 +328,9 @@ class TestLibraryDependencyResolution:
         assert call_order.index("download") < call_order.index("install")
 
     @pytest.mark.asyncio
-    async def test_never_behavior_skips_required_dep_and_marks_flawed(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_never_behavior_skips_required_dep_and_marks_flawed(self, engine: Engine) -> None:
         """When install behavior is 'never', required deps are skipped and library is FLAWED."""
-        mgr = griptape_nodes.LibraryManager()
+        mgr = engine.library_manager
         lib_info = _make_lib_info()
         schema = _make_schema_mock(["griptape-ai/nodes-dep@v1.0.0"])
 
@@ -342,7 +342,7 @@ class TestLibraryDependencyResolution:
             patch.object(mgr, "install_library_dependencies_request", return_value=_INSTALL_STOP),
             patch.object(mgr, "download_library_request") as mock_download,
             patch.object(mgr, "_library_file_path_to_info", {"/mock.json": lib_info}),
-            patch.object(griptape_nodes, "_config_manager", config_mock),
+            patch.object(engine, "_config_manager", config_mock),
         ):
             await mgr._progress_library_through_lifecycle(
                 library_info=lib_info,
@@ -357,9 +357,9 @@ class TestLibraryDependencyResolution:
         assert "nodes-dep" in dep_problems[0].dependency_name
 
     @pytest.mark.asyncio
-    async def test_never_behavior_skips_optional_dep_without_problem(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_never_behavior_skips_optional_dep_without_problem(self, engine: Engine) -> None:
         """When install behavior is 'never', optional deps are silently skipped."""
-        mgr = griptape_nodes.LibraryManager()
+        mgr = engine.library_manager
         lib_info = _make_lib_info()
         schema = _make_schema_mock(["griptape-ai/nodes-dep@v1.0.0"], optional=True)
 
@@ -371,7 +371,7 @@ class TestLibraryDependencyResolution:
             patch.object(mgr, "install_library_dependencies_request", return_value=_INSTALL_STOP),
             patch.object(mgr, "download_library_request") as mock_download,
             patch.object(mgr, "_library_file_path_to_info", {"/mock.json": lib_info}),
-            patch.object(griptape_nodes, "_config_manager", config_mock),
+            patch.object(engine, "_config_manager", config_mock),
         ):
             await mgr._progress_library_through_lifecycle(
                 library_info=lib_info,
@@ -385,14 +385,14 @@ class TestLibraryDependencyResolution:
         assert len(dep_problems) == 0
 
     @pytest.mark.asyncio
-    async def test_optional_dep_failure_does_not_fail_registration(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_optional_dep_failure_does_not_fail_registration(self, engine: Engine) -> None:
         """When an optional dep download fails, the lifecycle continues past the dep block.
 
         Unlike a required dep failure (which returns early before pip install), an optional
         dep failure only logs a warning. The lifecycle proceeds to install_library_dependencies,
         so mock_install must be called and no LibraryDependencyProblem must be recorded.
         """
-        mgr = griptape_nodes.LibraryManager()
+        mgr = engine.library_manager
         lib_info = _make_lib_info()
         schema = _make_schema_mock(["griptape-ai/nodes-optional@v1.0.0"], optional=True)
 
@@ -420,11 +420,9 @@ class TestLibraryDependencyResolution:
         assert len(dep_problems) == 0
 
     @pytest.mark.asyncio
-    async def test_registration_failure_after_download_marks_library_unusable(
-        self, griptape_nodes: GriptapeNodes
-    ) -> None:
+    async def test_registration_failure_after_download_marks_library_unusable(self, engine: Engine) -> None:
         """When download_library_request returns failure, the dependent library is marked UNUSABLE and install is not reached."""
-        mgr = griptape_nodes.LibraryManager()
+        mgr = engine.library_manager
         lib_info = _make_lib_info()
         schema = _make_schema_mock(["griptape-ai/nodes-dep@v1.0.0"])
 
@@ -454,9 +452,9 @@ class TestLibraryDependencyResolution:
         assert len(dep_problems) == 1
 
     @pytest.mark.asyncio
-    async def test_failed_dep_already_in_tracker_triggers_download(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_failed_dep_already_in_tracker_triggers_download(self, engine: Engine) -> None:
         """A dep in _library_file_path_to_info but in FAILURE state is not treated as satisfied — download must still be attempted."""
-        mgr = griptape_nodes.LibraryManager()
+        mgr = engine.library_manager
         lib_info = _make_lib_info()
         schema = _make_schema_mock(["griptape-ai/griptape-nodes-library-opencolorio@v1.2.0"])
 
@@ -498,9 +496,9 @@ class TestLibraryDependencyResolution:
         mock_download.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_dep_recognized_by_library_name_skips_download(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_dep_recognized_by_library_name_skips_download(self, engine: Engine) -> None:
         """A dep whose library_name matches repo name skips download even when its path has no matching component."""
-        mgr = griptape_nodes.LibraryManager()
+        mgr = engine.library_manager
         lib_info = _make_lib_info()
         schema = _make_schema_mock(["griptape-ai/griptape-nodes-library-opencolorio@v1.2.0"])
 
@@ -558,9 +556,9 @@ def _make_lib_registry_mock(
 class TestResolveTransitiveLibraryDeps:
     """Tests for LibraryManager.resolve_transitive_library_deps()."""
 
-    def test_no_deps_returns_initial(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_no_deps_returns_initial(self, engine: Engine) -> None:
         """A library with no library_dependencies returns just the initial set."""
-        mgr = griptape_nodes.LibraryManager()
+        mgr = engine.library_manager
         lib_a = _make_lib_registry_mock(library_dependencies=None)
 
         with patch(
@@ -571,9 +569,9 @@ class TestResolveTransitiveLibraryDeps:
 
         assert [r.library_name for r in result] == ["lib-a"]
 
-    def test_direct_dep_added(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_direct_dep_added(self, engine: Engine) -> None:
         """Library A declaring a library_dependency on Library B includes B in the result."""
-        mgr = griptape_nodes.LibraryManager()
+        mgr = engine.library_manager
         dep_b = LibraryDependencyDeclaration(url="griptape-ai/lib-b@v1.0.0", required=True)
         lib_a = _make_lib_registry_mock(library_dependencies=[dep_b])
         lib_b = _make_lib_registry_mock(library_dependencies=None)
@@ -594,9 +592,9 @@ class TestResolveTransitiveLibraryDeps:
         assert "lib-a" in names
         assert "lib-b" in names
 
-    def test_transitive_dep_added(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_transitive_dep_added(self, engine: Engine) -> None:
         """A→B→C chain results in all three libraries being included."""
-        mgr = griptape_nodes.LibraryManager()
+        mgr = engine.library_manager
         dep_b = LibraryDependencyDeclaration(url="griptape-ai/lib-b@v1.0.0", required=True)
         dep_c = LibraryDependencyDeclaration(url="griptape-ai/lib-c@v1.0.0", required=True)
         lib_a = _make_lib_registry_mock(library_dependencies=[dep_b])
@@ -616,9 +614,9 @@ class TestResolveTransitiveLibraryDeps:
 
         assert {r.library_name for r in result} == {"lib-a", "lib-b", "lib-c"}
 
-    def test_cycle_does_not_loop(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_cycle_does_not_loop(self, engine: Engine) -> None:
         """A→B→A cycle terminates and includes both libraries exactly once."""
-        mgr = griptape_nodes.LibraryManager()
+        mgr = engine.library_manager
         dep_b = LibraryDependencyDeclaration(url="griptape-ai/lib-b@v1.0.0", required=True)
         dep_a = LibraryDependencyDeclaration(url="griptape-ai/lib-a@v1.0.0", required=True)
         lib_a = _make_lib_registry_mock(library_dependencies=[dep_b])
@@ -637,9 +635,9 @@ class TestResolveTransitiveLibraryDeps:
 
         assert {r.library_name for r in result} == {"lib-a", "lib-b"}
 
-    def test_unregistered_dep_skipped(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_unregistered_dep_skipped(self, engine: Engine) -> None:
         """A dep that has no LibraryInfo is skipped without raising."""
-        mgr = griptape_nodes.LibraryManager()
+        mgr = engine.library_manager
         dep_missing = LibraryDependencyDeclaration(url="griptape-ai/lib-missing@v1.0.0", required=True)
         lib_a = _make_lib_registry_mock(library_dependencies=[dep_missing])
 
@@ -664,7 +662,7 @@ class TestDownloadLibraryRequestAutoRegister:
     """
 
     @pytest.mark.asyncio
-    async def test_auto_register_failure_returns_download_failure(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_auto_register_failure_returns_download_failure(self, engine: Engine) -> None:
         """When RegisterLibraryFromFileRequest fails, download_library_request must return DownloadLibraryResultFailure.
 
         Regression guard: old code only logged a warning on registration failure and fell through to
@@ -673,7 +671,7 @@ class TestDownloadLibraryRequestAutoRegister:
         import json as _json
         import tempfile
 
-        mgr = griptape_nodes.LibraryManager()
+        mgr = engine.library_manager
         tracked: dict = {}
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -696,7 +694,7 @@ class TestDownloadLibraryRequestAutoRegister:
                     return_value=fake_json_path,
                 ),
                 patch.object(
-                    griptape_nodes,
+                    engine,
                     "ahandle_request",
                     new_callable=AsyncMock,
                     return_value=RegisterLibraryFromFileResultFailure(result_details="schema validation error"),
@@ -750,10 +748,8 @@ class TestWorkerDelegatedAdvancedLibrarySkip:
         )
 
     @pytest.mark.asyncio
-    async def test_orchestrator_skips_advanced_module_for_worker_delegated_library(
-        self, griptape_nodes: GriptapeNodes
-    ) -> None:
-        mgr = griptape_nodes.LibraryManager()
+    async def test_orchestrator_skips_advanced_module_for_worker_delegated_library(self, engine: Engine) -> None:
+        mgr = engine.library_manager
         lib_info = self._make_lib_info(
             state=LibraryManager.LibraryLifecycleState.WORKER_DELEGATED, requires_worker=True
         )
@@ -783,9 +779,9 @@ class TestWorkerDelegatedAdvancedLibrarySkip:
         assert lib_info.lifecycle_state is LibraryManager.LibraryLifecycleState.WORKER_PENDING
 
     @pytest.mark.asyncio
-    async def test_in_process_library_still_loads_the_advanced_module(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_in_process_library_still_loads_the_advanced_module(self, engine: Engine) -> None:
         """Pins the non-worker path: the skip must key on worker delegation, not fire always."""
-        mgr = griptape_nodes.LibraryManager()
+        mgr = engine.library_manager
         lib_info = self._make_lib_info(
             state=LibraryManager.LibraryLifecycleState.DEPENDENCIES_INSTALLED, requires_worker=False
         )
@@ -835,14 +831,14 @@ class TestRequiresWorkerResolvedOnFilePathRegistration:
         return RegisterLibraryFromFileRequest(file_path="/mock.json", perform_discovery_if_not_found=False)
 
     @pytest.mark.asyncio
-    async def test_an_existing_library_info_is_updated_in_place(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_an_existing_library_info_is_updated_in_place(self, engine: Engine) -> None:
         """Discovered-but-unnamed LibraryInfo: the stale requires_worker must be overwritten.
 
         `_library_file_path_to_info` can already hold an entry from discovery that never got a
         library_name (so it defaulted requires_worker to False). Updating every other field
         while leaving that one stale is how a worker library ends up loading in-process.
         """
-        mgr = griptape_nodes.LibraryManager()
+        mgr = engine.library_manager
         lib_info = LibraryManager.LibraryInfo(
             lifecycle_state=LibraryManager.LibraryLifecycleState.DISCOVERED,
             library_path="/mock.json",
@@ -869,9 +865,9 @@ class TestRequiresWorkerResolvedOnFilePathRegistration:
         assert lib_info.lifecycle_state is LibraryManager.LibraryLifecycleState.METADATA_LOADED
 
     @pytest.mark.asyncio
-    async def test_a_new_library_info_is_created_with_it(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_a_new_library_info_is_created_with_it(self, engine: Engine) -> None:
         """Nothing discovered yet -- the freshly built LibraryInfo carries the resolved value."""
-        mgr = griptape_nodes.LibraryManager()
+        mgr = engine.library_manager
 
         with (
             patch.object(
@@ -888,9 +884,9 @@ class TestRequiresWorkerResolvedOnFilePathRegistration:
         assert result.library_info.lifecycle_state is LibraryManager.LibraryLifecycleState.METADATA_LOADED
 
     @pytest.mark.asyncio
-    async def test_a_library_with_no_worker_declaration_stays_in_process(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_a_library_with_no_worker_declaration_stays_in_process(self, engine: Engine) -> None:
         """The resolution must read the manifest, not default to worker mode for everyone."""
-        mgr = griptape_nodes.LibraryManager()
+        mgr = engine.library_manager
         schema = self._worker_mode_schema()
         schema.metadata.declarations = []
 
