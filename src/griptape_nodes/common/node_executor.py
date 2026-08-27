@@ -3756,15 +3756,30 @@ class NodeExecutor(EngineScoped):
             # Provide source node/parameter to bypass connection conflict validation
             # These values are coming from execution results, treat as upstream values
             if target_param.type != ParameterTypeBuiltin.CONTROL_TYPE:
-                self.engine.node_manager.on_set_parameter_value_request(
-                    SetParameterValueRequest(
-                        node_name=target_node_name,
-                        parameter_name=target_param_name,
-                        value=param_value,
-                        incoming_connection_source_node_name=node.name,
-                        incoming_connection_source_parameter_name=target_param_name,
+                # Skip the request entirely when the parameter holds a {VAR} template:
+                # param_value is the resolved text, and the handler would route it into
+                # parameter_values, destroying the template the user typed rather than
+                # merely hiding it. The output write below still hands downstream nodes
+                # the resolved value.
+                #
+                # is_output=True is not a substitute for skipping. The handler gates
+                # unresolve_future_nodes on `modified`, and for an output write that is
+                # only true when the key *already* held a different value; an absent key
+                # yields False. parallel_resolution calls parameter_output_values
+                # .silent_clear() before executing a node, so the key is routinely absent
+                # and downstream invalidation would quietly stop firing on this path.
+                if target_node.should_preserve_stored_template(target_param_name, param_value):
+                    self._unresolve_future_nodes_for_skipped_write(target_node, target_param_name)
+                else:
+                    self.engine.node_manager.on_set_parameter_value_request(
+                        SetParameterValueRequest(
+                            node_name=target_node_name,
+                            parameter_name=target_param_name,
+                            value=param_value,
+                            incoming_connection_source_node_name=node.name,
+                            incoming_connection_source_parameter_name=target_param_name,
+                        )
                     )
-                )
             target_node.parameter_output_values[target_param_name] = param_value
 
             logger.debug(
@@ -3772,6 +3787,38 @@ class NodeExecutor(EngineScoped):
                 target_param_name,
                 target_node_name,
                 param_value,
+            )
+
+    def _unresolve_future_nodes_for_skipped_write(self, target_node: BaseNode, target_param_name: str) -> None:
+        """Invalidate downstream nodes for a copy-back that bypassed the request handler.
+
+        ``SetParameterValueRequest`` unresolves future nodes whenever the value it set
+        actually changed. Preserving a {VAR} template means not sending that request,
+        so the same bookkeeping has to happen here or downstream nodes keep stale
+        results from before the group ran.
+
+        Unconditional, because the request this stands in for was too: the handler
+        compares the *stored* value, and on this path that is the template while the
+        value is the resolved text (``_differs`` is a precondition of
+        ``should_preserve_stored_template``), so it always saw a change. Skipping when
+        the resolved output happens to match the previous run's would be a new
+        optimisation, and getting it wrong leaves a node resolved against stale input.
+
+        Two other things the handler's ``modified`` flag drives are not reproduced.
+        ``make_node_unresolved`` on the target would be overwritten immediately -- the
+        resolution machine marks the node RESOLVED once the executor returns. The
+        downstream property pass-through is redundant because delivery is pull-based:
+        ``collect_values_from_upstream_nodes`` re-reads upstream
+        ``parameter_output_values`` before each node runs.
+        """
+        try:
+            self.engine.flow_manager.get_connections().unresolve_future_nodes(target_node)
+        except Exception:
+            logger.warning(
+                "Could not unresolve nodes downstream of '%s' after preserving the variable template on '%s'",
+                target_node.name,
+                target_param_name,
+                exc_info=True,
             )
 
     def _apply_last_iteration_to_packaged_nodes(
@@ -3831,8 +3878,15 @@ class NodeExecutor(EngineScoped):
                 logger.debug("Skipping control parameter '%s' on node '%s'", target_param_name, target_node_name)
                 continue
 
-            # Set the value on the target node
-            target_node.set_parameter_value(target_param_name, param_value)
+            # Set the value on the target node.
+            #
+            # Skip the stored-value write when the parameter holds a {VAR} template:
+            # param_value is the last iteration's resolved text, and writing it into
+            # parameter_values would destroy the template the user typed rather than
+            # merely hiding it. The output value below still reflects the last
+            # iteration for downstream consumers and artifacts.
+            if not target_node.should_preserve_stored_template(target_param_name, param_value):
+                target_node.set_parameter_value(target_param_name, param_value)
             target_node.parameter_output_values[target_param_name] = param_value
 
             logger.debug(
