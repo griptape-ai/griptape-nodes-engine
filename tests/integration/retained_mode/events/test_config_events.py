@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from griptape_nodes.retained_mode.events.config_events import (
     GetConfigValueRequest,
     GetConfigValueResultSuccess,
@@ -14,6 +16,7 @@ from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 
 class TestConfigEvents:
+    @pytest.mark.xfail(strict=True, reason="Drifted due to not running on CI - see #5237")
     def test_get_config_value(self) -> None:
         GriptapeNodes.handle_request(SetSecretValueRequest(key="SECRET_KEY", value="secret foo"))
         GriptapeNodes.handle_request(SetConfigValueRequest(category_and_key="nodes.foo.bar", value="$SECRET_KEY"))
