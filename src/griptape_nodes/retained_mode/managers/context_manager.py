@@ -302,9 +302,22 @@ class ContextManager(EngineScoped):
         workflow_name = None
         is_saved = None
         if self.has_current_workflow():
-            workflow_name = self.get_current_workflow_name()
-            if WorkflowRegistry.has_workflow_with_name(workflow_name):
-                is_saved = WorkflowRegistry.get_workflow_by_name(workflow_name).is_saved
+            candidate = self.get_current_workflow_name()
+            # Only report a context key the registry can still back. Editors treat any
+            # non-empty workflow_name here as "the engine has this open" and adopt it
+            # wholesale, so handing back an orphaned key makes them display -- and then
+            # re-open -- a workflow that cannot be loaded or saved. A key goes orphaned
+            # when the registry is rebuilt underneath a live context (workspace switch,
+            # registry refresh) or when a stack entry outlives its workflow.
+            if WorkflowRegistry.has_workflow_with_name(candidate):
+                workflow_name = candidate
+                is_saved = WorkflowRegistry.get_workflow_by_name(candidate).is_saved
+            else:
+                logger.warning(
+                    "Current workflow context '%s' has no entry in the Workflow Registry; reporting no active "
+                    "workflow rather than a name that cannot be resolved.",
+                    candidate,
+                )
         return GetWorkflowContextSuccess(
             workflow_name=workflow_name,
             is_saved=is_saved,
@@ -658,13 +671,7 @@ class ContextManager(EngineScoped):
                     if workflow.file_path is not None:
                         file_path = WorkflowRegistry.get_complete_file_path(workflow.file_path)
         elif file_path is not None:
-            resolved = canonicalize_for_identity(file_path)
-            workspace_path = canonicalize_for_identity(self.engine.config_manager.workspace_path)
-            if resolved.is_relative_to(workspace_path):
-                path_for_key = str(resolved.relative_to(workspace_path))
-            else:
-                path_for_key = str(resolved)
-            resolved_name = derive_registry_key(path_for_key)
+            resolved_name = self.registry_key_for_file(file_path)
         else:
             msg = "Either workflow_name or file_path must be provided."
             raise ValueError(msg)
@@ -672,6 +679,49 @@ class ContextManager(EngineScoped):
         workflow_context_state = self.WorkflowContextState(resolved_name, file_path=file_path)
         self._workflow_stack.append(workflow_context_state)
         return resolved_name
+
+    def registry_key_for_file(self, file_path: str) -> str:
+        """Derive the Workflow Registry key a workflow file would be pushed under.
+
+        The key is workspace-relative when the file lives under the active workspace, which
+        is what makes it stable across machines -- and what makes it go stale the moment the
+        workspace changes.
+        """
+        resolved = canonicalize_for_identity(file_path)
+        workspace_path = canonicalize_for_identity(self.engine.config_manager.workspace_path)
+        if resolved.is_relative_to(workspace_path):
+            path_for_key = str(resolved.relative_to(workspace_path))
+        else:
+            path_for_key = str(resolved)
+        return derive_registry_key(path_for_key)
+
+    def warn_if_foreign_workflow_context(self, file_path: str) -> str | None:
+        """Report when a workflow file is being executed under somebody else's context.
+
+        Generated workflow files only push their own context when the stack is empty, so a
+        context left behind by an earlier run silently becomes the name under which this
+        file's nodes load. Nothing downstream can tell the difference afterwards -- the
+        engine reports the stale name as the open workflow while the canvas shows this
+        file's graph. Surface it here rather than letting it pass unremarked.
+
+        Returns:
+            The current context name when it does not match this file, otherwise None.
+        """
+        if not self.has_current_workflow():
+            return None
+        current = self.get_current_workflow_name()
+        expected = self.registry_key_for_file(file_path)
+        if current == expected:
+            return None
+        logger.error(
+            "Workflow file '%s' is loading under the unrelated workflow context '%s' (expected '%s'). Its nodes "
+            "will be attributed to '%s'; the context should have been retired before this file ran.",
+            file_path,
+            current,
+            expected,
+            current,
+        )
+        return current
 
     def pop_workflow(self) -> str:
         """Pop the top Workflow from the stack.
@@ -688,6 +738,46 @@ class ContextManager(EngineScoped):
 
         workflow_context = self._workflow_stack.pop()
         return workflow_context._name
+
+    def clear_workflow_stack(self) -> list[str]:
+        """Drop every Workflow context, returning the names that were discarded.
+
+        Only for teardown paths that have already released the underlying objects
+        (see ClearAllObjectState). Callers that still hold flows or nodes should
+        retire them through `Engine.clear_current_workflow_data` instead.
+        """
+        discarded = [entry._name for entry in self._workflow_stack]
+        self._workflow_stack.clear()
+        return discarded
+
+    def reconcile_with_registry(self) -> list[str]:
+        """Drop context entries the Workflow Registry can no longer resolve.
+
+        A registry key is derived against whatever workspace was active at push time, so
+        rebuilding the registry underneath a live context (switching workspace, refreshing
+        the registry) strands the entries that were pushed before it. Those keys resolve to
+        nothing, but still answer `GetWorkflowContextRequest` and the heartbeat, which is how
+        an editor ends up opening a workflow nobody chose.
+
+        Returns:
+            The names that were discarded, outermost first.
+        """
+        surviving = []
+        discarded = []
+        for entry in self._workflow_stack:
+            if WorkflowRegistry.has_workflow_with_name(entry._name):
+                surviving.append(entry)
+            else:
+                discarded.append(entry._name)
+
+        if discarded:
+            logger.warning(
+                "Dropping %d workflow context(s) with no Workflow Registry entry: %s.",
+                len(discarded),
+                ", ".join(repr(name) for name in discarded),
+            )
+            self._workflow_stack = surviving
+        return discarded
 
     def push_flow(self, flow: ControlFlow) -> ControlFlow:
         """Push a new Flow context onto the stack for the current Workflow.

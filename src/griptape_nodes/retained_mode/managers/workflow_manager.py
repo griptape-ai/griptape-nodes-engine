@@ -871,6 +871,11 @@ class WorkflowManager(EngineScoped):
         # Resolve path using utility function
         workspace_path = self.engine.config_manager.workspace_path
         complete_file_path = resolve_workspace_path(Path(relative_file_path), workspace_path)
+        # A workflow file pushes its own context while it executes, and anything it raises
+        # skips the matching pop. Remember how deep we started so a failed run cannot leave
+        # half-entered contexts behind for the next caller to read as "the open workflow".
+        context_manager = self.engine.context_manager
+        entry_depth = len(context_manager._workflow_stack)
         try:
             async with await anyio.open_file(Path(complete_file_path), encoding="utf-8") as file:
                 workflow_content = await file.read()
@@ -908,9 +913,15 @@ class WorkflowManager(EngineScoped):
             await self._ensure_workflow_context_established()
 
         except Exception as e:
+            leaked = len(context_manager._workflow_stack) - entry_depth
+            for _ in range(max(leaked, 0)):
+                context_manager.pop_workflow()
+            details = f"Failed to run workflow on path '{complete_file_path}'. Exception: {e}"
+            if leaked > 0:
+                details += f" Discarded {leaked} workflow context(s) the failed run left behind."
             return WorkflowManager.WorkflowExecutionResult(
                 execution_successful=False,
-                execution_details=f"Failed to run workflow on path '{complete_file_path}'. Exception: {e}",
+                execution_details=details,
             )
         return WorkflowManager.WorkflowExecutionResult(
             execution_successful=True,
@@ -1056,6 +1067,16 @@ class WorkflowManager(EngineScoped):
                     details = f"Failed to clear the existing object state when preparing to run workflow '{request.workflow_name}'."
                     return RunWorkflowFromRegistryResultFailure(result_details=details)
 
+            # Retire the outgoing workflow before entering the new one. Only one Workflow may
+            # be in the Current Context (SetWorkflowContext enforces the same rule), so
+            # pushing without retiring buries the previous entry rather than replacing it --
+            # contradicting the warning above, and leaving a workflow the user already closed
+            # to resurface on the next pop and be reported as the open one. A clean slate has
+            # already emptied the stack, so this is a no-op on that path.
+            retired = self.engine.context_manager.clear_workflow_stack()
+            if retired:
+                logger.debug("Retired workflow context(s) %s before opening '%s'.", retired, request.workflow_name)
+
             # Let's run under the assumption that this Workflow will become our Current Context; if we fail, it will revert.
             self.engine.context_manager.push_workflow(request.workflow_name)
             # run file
@@ -1067,11 +1088,7 @@ class WorkflowManager(EngineScoped):
                     result_messages.append(ResultDetail(message=context_warning, level=logging.WARNING))
                 result_messages.append(ResultDetail(message=execution_result.execution_details, level=logging.ERROR))
 
-                # Attempt to clear everything out, as we modified the engine state getting here.
-                clear_all_request = ClearAllObjectStateRequest(i_know_what_im_doing=True)
-                clear_all_result = await self.engine.ahandle_request(clear_all_request)
-
-                # The clear-all above here wipes the ContextManager, so no need to do a pop_workflow().
+                await self._abandon_failed_registry_run(request.workflow_name, result_messages)
                 return RunWorkflowFromRegistryResultFailure(result_details=ResultDetails(*result_messages))
 
         # Success!
@@ -1080,6 +1097,31 @@ class WorkflowManager(EngineScoped):
             result_messages.append(ResultDetail(message=context_warning, level=logging.WARNING))
         result_messages.append(ResultDetail(message=execution_result.execution_details, level=logging.DEBUG))
         return RunWorkflowFromRegistryResultSuccess(result_details=ResultDetails(*result_messages))
+
+    async def _abandon_failed_registry_run(self, workflow_name: str, result_messages: list[ResultDetail]) -> None:
+        """Tear down the engine state a failed run from the registry left behind.
+
+        Appends to `result_messages` if the teardown itself could not complete.
+        """
+        # Attempt to clear everything out, as we modified the engine state getting here.
+        clear_all_request = ClearAllObjectStateRequest(i_know_what_im_doing=True)
+        clear_all_result = await self.engine.ahandle_request(clear_all_request)
+
+        # A successful clear-all wipes the ContextManager for us. A failed one does not, and
+        # leaves the workflow we just pushed sitting in the Current Context as though it had
+        # opened cleanly -- which is exactly the state that gets reported to the editor and
+        # re-opened later. Unwind it ourselves.
+        if not clear_all_result.succeeded():
+            stranded = self.engine.context_manager.clear_workflow_stack()
+            result_messages.append(
+                ResultDetail(
+                    message=(
+                        f"Failed to clear object state after workflow '{workflow_name}' failed to run; "
+                        f"discarded stranded workflow context(s) {stranded}."
+                    ),
+                    level=logging.ERROR,
+                )
+            )
 
     def _persist_external_workflow_registration(self, full_path: str) -> None:
         """Persist an out-of-workspace workflow path to global config so it survives restarts.
@@ -4289,10 +4331,28 @@ class WorkflowManager(EngineScoped):
         )
         ast.fix_missing_locations(push_call)
 
+        # A context already on the stack means this file is about to load its nodes under a
+        # name that is not its own -- the engine would then report that foreign name as the
+        # open workflow while this file's graph is what the user sees. The push stays guarded
+        # (a caller such as RunWorkflowFromRegistry legitimately enters the context first),
+        # but the mismatched case is no longer silent.
+        warn_call = ast.Expr(
+            value=ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id="context_manager", ctx=ast.Load()),
+                    attr="warn_if_foreign_workflow_context",
+                    ctx=ast.Load(),
+                ),
+                args=[],
+                keywords=[ast.keyword(arg="file_path", value=ast.Name(id="__file__", ctx=ast.Load()))],
+            )
+        )
+        ast.fix_missing_locations(warn_call)
+
         if_stmt = ast.If(
             test=test,
             body=[push_call],
-            orelse=[],
+            orelse=[warn_call],
         )
         ast.fix_missing_locations(if_stmt)
         code_blocks.append(if_stmt)
