@@ -358,6 +358,17 @@ class StableNamespaceImportFinder(importlib.abc.MetaPathFinder, importlib.abc.Lo
         """No-op: the module was fully executed by the memoized loader in create_module."""
 
 
+class NodeClassResolution(NamedTuple):
+    """Outcome of resolving a node type to its class, importing the module if needed.
+
+    `node_class` is None exactly when the import failed, and `error_message` says why. On success
+    `error_message` is empty.
+    """
+
+    node_class: type[BaseNode] | None
+    error_message: str
+
+
 class NodeProbeResult(NamedTuple):
     """Outcome of constructing a throwaway node to read the parameters its __init__ declares.
 
@@ -636,6 +647,10 @@ class LibraryManager(EngineScoped):
         # Per-library node type -> port summary, computed on the first GetPortSummaries request
         # and dropped when the library is unloaded (which a reload goes through).
         self._library_to_port_summaries: dict[str, dict[str, NodePortSummary]] = {}
+        # Bumped by _invalidate_port_summaries. The compute pass awaits, so a library can be
+        # mutated while its summaries are being computed; comparing the counter before and after
+        # tells the pass whether its now-stale result is still safe to cache.
+        self._library_to_port_summaries_generation: dict[str, int] = {}
         self._port_summaries_lock = asyncio.Lock()
         self._libraries_loading_complete = asyncio.Event()
         self._libraries_loading_complete.set()  # Not loading initially; load_all_libraries_from_config will clear/set this
@@ -1906,6 +1921,11 @@ class LibraryManager(EngineScoped):
             )
             return RegisterSandboxNodeFromSourceResultFailure(result_details=details)
 
+        # Invalidate before the loop below, not after it. The loop mutates the library as it goes
+        # and can bail out partway through (replace_if_exists=False), which would otherwise leave
+        # a mutated library described by cached summaries for the rest of the process's life.
+        self._invalidate_port_summaries(LibraryManager.SANDBOX_LIBRARY_NAME)
+
         # Discover BaseNode subclasses defined in this module. The filter matches the one in
         # `_attempt_load_nodes_from_sandbox_library_using_existing_schema` so that files
         # registered via MCP and files scanned at startup surface identically.
@@ -1946,10 +1966,6 @@ class LibraryManager(EngineScoped):
                 "re-exported from another module). Nothing was registered."
             )
             return RegisterSandboxNodeFromSourceResultFailure(result_details=details)
-
-        # These node types were added to (or replaced within) an already-registered library, so
-        # its cached port summaries no longer describe it.
-        self._library_to_port_summaries.pop(LibraryManager.SANDBOX_LIBRARY_NAME, None)
 
         summary = (
             f"Registered {len(registered_class_names)} node type(s) from '{file_path}' "
@@ -2039,16 +2055,61 @@ class LibraryManager(EngineScoped):
 
         Callers on the event loop should note that both can block; ``__init__`` in particular has
         no bound on how long it takes.
-        """
-        library_name = library.get_library_data().name
 
+        MUST run on the event loop, because resolving the class is not thread-safe (see
+        ``_resolve_node_class_for_probe``). A caller that wants to bound a blocking ``__init__``
+        with a timeout should call the two halves separately rather than threading this: resolve
+        here on the loop, then hand ``_construct_probe_node`` to ``asyncio.to_thread``.
+        """
+        resolution = self._resolve_node_class_for_probe(library=library, node_type=node_type)
+        if resolution.node_class is None:
+            return NodeProbeResult(node=None, error_message=resolution.error_message)
+
+        return self._construct_probe_node(library=library, node_type=node_type, node_class=resolution.node_class)
+
+    def _resolve_node_class_for_probe(self, library: Library, node_type: str) -> NodeClassResolution:
+        """Resolve a node type to its class, importing the module now if registration was lazy.
+
+        MUST run on the event loop. ``NodeTypeEntry.resolve()`` documents itself as not
+        thread-safe: it assumes single-threaded resolution, so concurrent callers could each run
+        the loader and hand out two different class objects for one node type. The loader also
+        mutates process- and manager-wide state as a side effect (``sys.modules``, the stable
+        namespace alias maps), which would then race the loop.
+
+        The import can be slow -- a node module pulling in torch or diffusers costs seconds -- and
+        that cost lands on the loop. That is the same trade the (synchronous) DescribeNodeType and
+        CreateNode handlers already make; a caller resolving many node types in a row should yield
+        between them so it does not monopolize the loop.
+        """
         try:
             node_class = library.get_node_class(node_type)
         except (ImportError, AttributeError, TypeError) as err:
-            return NodeProbeResult(
-                node=None,
+            return NodeClassResolution(
+                node_class=None,
                 error_message=f"Node module failed to import: {type(err).__name__}: {err}",
             )
+
+        return NodeClassResolution(node_class=node_class, error_message="")
+
+    def _construct_probe_node(self, library: Library, node_type: str, node_class: type[BaseNode]) -> NodeProbeResult:
+        """Construct a probe instance of an already-resolved node class.
+
+        Safe to hand to ``asyncio.to_thread``: it touches no shared registry state, and
+        ``constructing_node()`` is a ContextVar, which ``to_thread`` propagates via
+        ``copy_context()``. Threading this is how a caller bounds a blocking ``__init__`` with a
+        timeout without also moving class resolution off the loop.
+        """
+        library_name = library.get_library_data().name
+        # Mirror the metadata blob ``Library.create_node`` builds, so declarative ``__init__``
+        # logic reading ``library_node_metadata`` sees under probe what it sees when the artist
+        # really creates the node. Diverging here would let a node declare different parameters
+        # during the probe than on the canvas -- i.e. report ports it does not have.
+        try:
+            node_metadata_model = library.get_node_metadata(node_type)
+        except LibraryRegistryError:
+            library_node_metadata = {}
+        else:
+            library_node_metadata = node_metadata_model.model_dump(mode="json")
 
         try:
             # Wrap in ``LibraryRegistry.constructing_node()`` so the parameter-mutation detector
@@ -2062,7 +2123,11 @@ class LibraryManager(EngineScoped):
             with LibraryRegistry.constructing_node():
                 probe_node = node_class(
                     name=f"{self.PROBE_NODE_NAME_PREFIX}{node_type}",
-                    metadata={"library": library_name, "node_type": node_type},
+                    metadata={
+                        "library": library_name,
+                        "node_type": node_type,
+                        "library_node_metadata": library_node_metadata,
+                    },
                 )
         except Exception as err:
             return NodeProbeResult(
@@ -3080,7 +3145,7 @@ class LibraryManager(EngineScoped):
 
         # Drop cached port summaries: the library's node types are gone, and a subsequent load may
         # bring back different ones. Every reload path unloads first, so this covers reloads too.
-        self._library_to_port_summaries.pop(request.library_name, None)
+        self._invalidate_port_summaries(request.library_name)
 
         # Clean up all stable module aliases for this library. Note first whether any of its node
         # modules had actually been imported: if so, this process is stuck with that code and the
@@ -3171,18 +3236,41 @@ class LibraryManager(EngineScoped):
     async def _get_port_summaries_for_library(self, library_name: str) -> dict[str, NodePortSummary]:
         """Return the port summary for every node type in a library, computing it on first call.
 
-        Cached for the process lifetime because a node type's declared ports cannot change
-        without the library being reloaded, which clears the entry.
+        Cached until the library is mutated or unloaded, because a node type's declared ports
+        cannot change without one of those happening.
 
-        The lock means concurrent callers do the probe pass once rather than once each; the
-        second caller waits and then reads the cache.
+        The lock means concurrent callers do the probe pass once rather than once each; the second
+        caller waits and then reads the cache. It is deliberately not held for the cache-hit path:
+        the probe pass can take seconds, and a request that only needs already-computed summaries
+        should not queue behind an unrelated library being probed for the first time.
         """
+        cached_summaries = self._library_to_port_summaries.get(library_name)
+        if cached_summaries is not None:
+            return cached_summaries
+
         async with self._port_summaries_lock:
+            # Re-check: another caller may have computed these while we waited for the lock.
             cached_summaries = self._library_to_port_summaries.get(library_name)
             if cached_summaries is not None:
                 return cached_summaries
 
+            generation_before = self._library_to_port_summaries_generation.get(library_name, 0)
             summaries = await self._compute_port_summaries_for_library(library_name)
+
+            # The pass above awaited, so the library may have been reloaded, unloaded, or had node
+            # types registered into it in the meantime. Caching what we just measured would pin
+            # pre-mutation ports for the rest of the process's life, so return them to this caller
+            # (they are the best answer we have) without writing them back. The next request
+            # recomputes.
+            generation_after = self._library_to_port_summaries_generation.get(library_name, 0)
+            if generation_after != generation_before:
+                logger.debug(
+                    "Library '%s' changed while its port summaries were being computed; "
+                    "serving this result without caching it.",
+                    library_name,
+                )
+                return summaries
+
             self._library_to_port_summaries[library_name] = summaries
             return summaries
 
@@ -3193,8 +3281,11 @@ class LibraryManager(EngineScoped):
         recorded as portless, so callers leave them unranked instead of ranking them as
         connecting to nothing.
 
-        Each probe runs in a thread under the same timeout the worker-side schema pass uses:
-        a node's __init__ can block indefinitely, and one such node must not stall the rest.
+        The two halves of the probe run in different places on purpose. Resolving the node class
+        stays on the event loop because ``NodeTypeEntry.resolve()`` is not thread-safe, and only
+        construction goes to a thread, where the same timeout the worker-side schema pass uses
+        bounds it: a node's ``__init__`` can block indefinitely, and one such node must not stall
+        the rest.
         """
         try:
             library = LibraryRegistry.get_library(library_name)
@@ -3205,9 +3296,24 @@ class LibraryManager(EngineScoped):
         summaries: dict[str, NodePortSummary] = {}
         skipped_node_types: list[str] = []
         for node_type in library.get_registered_nodes():
+            # Yield between node types so a large library's resolve calls, which run on the loop,
+            # interleave with other work instead of monopolizing it for the whole pass.
+            await asyncio.sleep(0)
+
+            resolution = self._resolve_node_class_for_probe(library=library, node_type=node_type)
+            if resolution.node_class is None:
+                logger.debug(
+                    "Could not probe node type '%s' in library '%s' for its port summary: %s",
+                    node_type,
+                    library_name,
+                    resolution.error_message,
+                )
+                skipped_node_types.append(node_type)
+                continue
+
             try:
                 probe_result = await asyncio.wait_for(
-                    asyncio.to_thread(self._probe_node_type, library, node_type),
+                    asyncio.to_thread(self._construct_probe_node, library, node_type, resolution.node_class),
                     timeout=self._SCHEMA_PROBE_TIMEOUT_S,
                 )
             except TimeoutError:
@@ -3217,6 +3323,18 @@ class LibraryManager(EngineScoped):
                     node_type,
                     library_name,
                     self._SCHEMA_PROBE_TIMEOUT_S,
+                )
+                skipped_node_types.append(node_type)
+                continue
+            except Exception:
+                # _construct_probe_node already converts a raising __init__ into a result, so
+                # reaching here means the failure was outside it. Skip the one node type rather
+                # than failing summaries for every library in the response.
+                logger.debug(
+                    "Unexpected failure probing node type '%s' in library '%s' for its port summary; skipping.",
+                    node_type,
+                    library_name,
+                    exc_info=True,
                 )
                 skipped_node_types.append(node_type)
                 continue
@@ -3242,6 +3360,19 @@ class LibraryManager(EngineScoped):
                 ", ".join(skipped_node_types),
             )
         return summaries
+
+    def _invalidate_port_summaries(self, library_name: str) -> None:
+        """Drop a library's cached port summaries after its node types change.
+
+        Bumps a per-library generation counter as well as clearing the entry, so a probe pass
+        already in flight for this library can tell that its result is stale and decline to cache
+        it. Call this *before* mutating the library, so a mutation that bails out partway through
+        still leaves the cache cleared.
+        """
+        self._library_to_port_summaries.pop(library_name, None)
+        self._library_to_port_summaries_generation[library_name] = (
+            self._library_to_port_summaries_generation.get(library_name, 0) + 1
+        )
 
     async def on_get_all_info_for_library_request(self, request: GetAllInfoForLibraryRequest) -> ResultPayload:
         """Registered entry point: hold the caller until any in-flight reload finishes.
@@ -4604,7 +4735,7 @@ class LibraryManager(EngineScoped):
 
         # Stub classes are about to replace whatever this library previously advertised, so any
         # port summaries cached from an earlier load are stale.
-        self._library_to_port_summaries.pop(library_name, None)
+        self._invalidate_port_summaries(library_name)
 
         # Build a lookup from class_name -> NodeMetadata using the library JSON schema.
         library_data = library.get_library_data()

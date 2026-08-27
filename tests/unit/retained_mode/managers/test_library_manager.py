@@ -4,6 +4,7 @@ import json
 import logging
 import subprocess
 import sys
+import threading
 from collections.abc import Callable, Generator
 from functools import partial
 from pathlib import Path
@@ -16,6 +17,7 @@ from griptape_nodes.exe_types.core_types import (
     ControlParameterInput,
     ControlParameterOutput,
     Parameter,
+    ParameterList,
     ParameterMode,
 )
 from griptape_nodes.exe_types.node_types import BaseNode
@@ -1658,6 +1660,65 @@ class TestRegisterSandboxNodeFromSourceRequest:
         assert isinstance(second, RegisterSandboxNodeFromSourceResultSuccess)
         assert second.replaced_class_names == ["ProbeSandboxNode"]
 
+    def test_drops_cached_port_summaries_even_when_registration_bails_partway(
+        self,
+        engine: Engine,
+        _isolate_registry_and_config: Path,  # noqa: PT019 - value is used to locate the source file
+    ) -> None:
+        """The registration loop mutates as it goes and can bail out midway.
+
+        If the cache were only dropped on the success path, the library would be left mutated with
+        stale summaries describing it -- for the rest of the process's life, since nothing
+        invalidates again.
+        """
+        from griptape_nodes.retained_mode.events.library_events import (
+            RegisterSandboxNodeFromSourceRequest,
+            RegisterSandboxNodeFromSourceResultFailure,
+            RegisterSandboxNodeFromSourceResultSuccess,
+        )
+
+        library_manager = engine.library_manager
+        sandbox_dir = _isolate_registry_and_config
+
+        existing_source = sandbox_dir / "existing_node.py"
+        existing_source.write_text(
+            "from griptape_nodes.exe_types.node_types import BaseNode\n"
+            "\n"
+            "class SandboxExisting(BaseNode):\n"
+            "    def process(self) -> None:\n"
+            "        return None\n"
+        )
+        first = library_manager.register_sandbox_node_from_source_request(
+            RegisterSandboxNodeFromSourceRequest(file_path=str(existing_source))
+        )
+        assert isinstance(first, RegisterSandboxNodeFromSourceResultSuccess)
+
+        # Pretend a port summary request already ran and cached a result for this library.
+        library_manager._library_to_port_summaries[self._LIBRARY_NAME] = {}
+
+        # A file whose first class is new and whose second is already registered. With
+        # replace_if_exists=False the loop registers the first, then bails on the second.
+        conflicting_source = sandbox_dir / "conflicting_node.py"
+        conflicting_source.write_text(
+            "from griptape_nodes.exe_types.node_types import BaseNode\n"
+            "\n"
+            "class SandboxBrandNew(BaseNode):\n"
+            "    def process(self) -> None:\n"
+            "        return None\n"
+            "\n"
+            "class SandboxExisting(BaseNode):\n"
+            "    def process(self) -> None:\n"
+            "        return None\n"
+        )
+        second = library_manager.register_sandbox_node_from_source_request(
+            RegisterSandboxNodeFromSourceRequest(file_path=str(conflicting_source), replace_if_exists=False)
+        )
+
+        assert isinstance(second, RegisterSandboxNodeFromSourceResultFailure)
+        # The library really was mutated before the bail-out, so the cache must be gone.
+        assert LibraryRegistry.get_library(self._LIBRARY_NAME).has_node_type("SandboxBrandNew")
+        assert self._LIBRARY_NAME not in library_manager._library_to_port_summaries
+
     def test_fails_when_sandbox_directory_is_not_configured(
         self,
         engine: Engine,
@@ -2069,6 +2130,21 @@ class _PortSummaryDataOnlyProbe(BaseNode):
         )
 
 
+class _PortSummaryContainerProbe(BaseNode):
+    """Node whose only data port is a list container, i.e. the expander shape."""
+
+    def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
+        super().__init__(name=name, metadata=metadata)
+        self.add_parameter(
+            ParameterList(
+                name="items",
+                input_types=["str"],
+                output_type="str",
+                tooltip="Accepts many strings.",
+            )
+        )
+
+
 class TestNodePortSummary:
     """Exercise NodePortSummary.from_parameters, the derivation the ranking depends on."""
 
@@ -2107,6 +2183,34 @@ class TestNodePortSummary:
         assert summary.output_types == []
         assert summary.has_control_input is False
         assert summary.has_control_output is False
+
+    def test_container_reports_element_type_alongside_container_type(self) -> None:
+        """A list container is how a node says "I take many of these", so both types must appear.
+
+        Without the element type, dragging a single `str` would not surface expander nodes at all
+        -- exactly the case the ranking exists to serve.
+        """
+        probe = _PortSummaryContainerProbe(name="probe")
+
+        summary = NodePortSummary.from_parameters(probe.parameters)
+
+        # The container's own port accepts a whole collection; its children accept one element.
+        assert "list[str]" in summary.input_types
+        assert "list" in summary.input_types
+        assert "str" in summary.input_types
+        assert "list[str]" in summary.output_types
+        assert "str" in summary.output_types
+
+    def test_container_element_type_matches_what_a_real_child_declares(self) -> None:
+        """Pin the element type to add_child_parameter, so the two cannot drift apart."""
+        probe = _PortSummaryContainerProbe(name="probe")
+        container = probe.get_parameter_by_name("items")
+        assert isinstance(container, ParameterList)
+
+        child = container.add_child_parameter()
+
+        assert container.get_element_input_types() == child.input_types
+        assert container.get_element_output_type() == child.output_type
 
 
 class TestGetPortSummariesForAllLibrariesRequest:
@@ -2183,7 +2287,10 @@ class TestGetPortSummariesForAllLibrariesRequest:
         self._register_probe_library(_PortSummaryDataOnlyProbe)
 
         with patch.object(
-            _LibraryManager, "_probe_node_type", side_effect=_LibraryManager._probe_node_type, autospec=True
+            _LibraryManager,
+            "_construct_probe_node",
+            side_effect=_LibraryManager._construct_probe_node,
+            autospec=True,
         ) as probe_spy:
             await library_manager.on_get_port_summaries_for_all_libraries_request(
                 GetPortSummariesForAllLibrariesRequest()
@@ -2193,6 +2300,75 @@ class TestGetPortSummariesForAllLibrariesRequest:
             )
 
         assert probe_spy.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_resolves_node_classes_on_the_event_loop(self, engine: Engine) -> None:
+        """Resolution must stay on the loop: NodeTypeEntry.resolve() is not thread-safe.
+
+        Only construction is allowed off-thread, because a node's __init__ can block.
+        """
+        library_manager = engine.library_manager
+        self._register_probe_library(_PortSummaryDataOnlyProbe)
+        loop_thread_id = threading.get_ident()
+        resolve_thread_ids: list[int] = []
+        construct_thread_ids: list[int] = []
+        # Bind the real implementations before patching, or the side effects recurse into the mocks.
+        real_resolve = _LibraryManager._resolve_node_class_for_probe
+        real_construct = _LibraryManager._construct_probe_node
+
+        def record_resolve(manager: _LibraryManager, *args: Any, **kwargs: Any) -> Any:
+            resolve_thread_ids.append(threading.get_ident())
+            return real_resolve(manager, *args, **kwargs)
+
+        def record_construct(manager: _LibraryManager, *args: Any, **kwargs: Any) -> Any:
+            construct_thread_ids.append(threading.get_ident())
+            return real_construct(manager, *args, **kwargs)
+
+        with (
+            patch.object(_LibraryManager, "_resolve_node_class_for_probe", side_effect=record_resolve, autospec=True),
+            patch.object(_LibraryManager, "_construct_probe_node", side_effect=record_construct, autospec=True),
+        ):
+            await library_manager.on_get_port_summaries_for_all_libraries_request(
+                GetPortSummariesForAllLibrariesRequest()
+            )
+
+        assert resolve_thread_ids == [loop_thread_id]
+        assert construct_thread_ids != []
+        assert loop_thread_id not in construct_thread_ids
+
+    @pytest.mark.asyncio
+    async def test_does_not_cache_summaries_measured_before_an_invalidation(self, engine: Engine) -> None:
+        """The probe pass awaits, so the library can change underneath it.
+
+        Caching a result measured before that change would pin the pre-change ports for the rest
+        of the process's life, because nothing invalidates again.
+        """
+        library_manager = engine.library_manager
+        self._register_probe_library(_PortSummaryDataOnlyProbe)
+
+        async def invalidate_midway(library_name: str) -> dict[str, NodePortSummary]:
+            summaries = await _LibraryManager._compute_port_summaries_for_library(library_manager, library_name)
+            # Stand in for a reload / sandbox registration landing while the pass was awaiting.
+            library_manager._invalidate_port_summaries(library_name)
+            return summaries
+
+        with patch.object(
+            library_manager, "_compute_port_summaries_for_library", side_effect=invalidate_midway
+        ) as compute_spy:
+            first = await library_manager.on_get_port_summaries_for_all_libraries_request(
+                GetPortSummariesForAllLibrariesRequest()
+            )
+            # The stale result is still served to the caller -- it is the best answer available --
+            # but it must not have been written back, so this request recomputes.
+            second = await library_manager.on_get_port_summaries_for_all_libraries_request(
+                GetPortSummariesForAllLibrariesRequest()
+            )
+
+        expected_compute_calls = 2  # Once per request: the first result was never cached.
+        assert isinstance(first, GetPortSummariesForAllLibrariesResultSuccess)
+        assert isinstance(second, GetPortSummariesForAllLibrariesResultSuccess)
+        assert compute_spy.call_count == expected_compute_calls
+        assert self._LIBRARY_NAME not in library_manager._library_to_port_summaries
 
     @pytest.mark.asyncio
     async def test_recomputes_after_library_is_unloaded(self, engine: Engine) -> None:

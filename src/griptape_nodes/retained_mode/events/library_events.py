@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, NamedTuple
 
-from griptape_nodes.exe_types.core_types import ParameterMode, ParameterTypeBuiltin
+from griptape_nodes.exe_types.core_types import ParameterContainer, ParameterMode, ParameterTypeBuiltin
 from griptape_nodes.node_library.library_registry import (
     LibraryMetadata,
     LibrarySchema,
@@ -288,6 +288,19 @@ class NodePortSummary:
     Control flow is carried solely by the two booleans. Control ports are excluded from
     `input_types` / `output_types` because control and data connections never interconnect.
 
+    The type strings are raw declared type names, so matching them is NOT set membership. Use the
+    engine's own rules, which `ParameterType.are_types_compatible(source, target)` implements:
+
+    - Matching is case-insensitive (`"Image"` matches `"image"`).
+    - It is directional and asymmetric. A target of `"any"` accepts every source type, but a
+      source of `"any"` is not accepted by a specific target.
+    - A source of `"all"` matches every target (`Parameter.is_incoming_type_allowed`
+      short-circuits on it).
+    - Parameterized types match on their base, so `"list[str]"` matches a `"list"` target.
+
+    A client that treats these as opaque strings and intersects two sets will get the wrong
+    answer for every one of those cases.
+
     Args:
         input_types: Accepted types unioned over every port allowing the INPUT mode
         output_types: Emitted types unioned over every port allowing the OUTPUT mode
@@ -305,8 +318,10 @@ class NodePortSummary:
         """Derive the summary from the parameters a probed node declares.
 
         Only sees parameters that exist right after construction. Ports added dynamically at
-        runtime (container children, config-driven ports) are absent by design -- see
-        GetPortSummariesForAllLibrariesRequest.
+        runtime (config-driven ports, transition components) are absent by design -- see
+        GetPortSummariesForAllLibrariesRequest. Container parameters are the exception: their
+        children do not exist yet either, but a container knows the element type its children will
+        have, so both the container type and the element type are reported.
         """
         control_type = ParameterTypeBuiltin.CONTROL_TYPE.value
         input_types: list[str] = []
@@ -319,17 +334,13 @@ class NodePortSummary:
             if parameter.private:
                 continue
 
-            if ParameterMode.INPUT in parameter.allowed_modes:
-                # `Parameter.input_types` already falls back to the parameter's single `type`.
-                for accepted_type in parameter.input_types:
-                    if accepted_type == control_type:
-                        has_control_input = True
-                    elif accepted_type not in input_types:
-                        input_types.append(accepted_type)
+            for accepted_type in cls._accepted_types_for(parameter):
+                if accepted_type == control_type:
+                    has_control_input = True
+                elif accepted_type not in input_types:
+                    input_types.append(accepted_type)
 
-            if ParameterMode.OUTPUT in parameter.allowed_modes:
-                # Likewise, `Parameter.output_type` falls back to `type`.
-                emitted_type = parameter.output_type
+            for emitted_type in cls._emitted_types_for(parameter):
                 if emitted_type == control_type:
                     has_control_output = True
                 elif emitted_type not in output_types:
@@ -341,6 +352,42 @@ class NodePortSummary:
             has_control_input=has_control_input,
             has_control_output=has_control_output,
         )
+
+    @staticmethod
+    def _accepted_types_for(parameter: Parameter) -> list[str]:
+        """Every type a single parameter can accept, before deduplication.
+
+        A container advertises the collection type on itself (`list[str]`, `list`) while its
+        children take the element type (`str`). Both are reported: an expander node is precisely
+        how a node type says "I accept many of these", so omitting the element type would hide the
+        nodes a single-value drag most wants to find. Children inherit the container's
+        `allowed_modes`, so the same INPUT gating covers them.
+        """
+        if ParameterMode.INPUT not in parameter.allowed_modes:
+            return []
+
+        # `Parameter.input_types` already falls back to the parameter's single `type`.
+        accepted_types = list(parameter.input_types)
+        if isinstance(parameter, ParameterContainer):
+            accepted_types.extend(parameter.get_element_input_types())
+        return accepted_types
+
+    @staticmethod
+    def _emitted_types_for(parameter: Parameter) -> list[str]:
+        """Every type a single parameter can emit, before deduplication.
+
+        The output-side counterpart to `_accepted_types_for`, with the same container reasoning.
+        """
+        if ParameterMode.OUTPUT not in parameter.allowed_modes:
+            return []
+
+        # Likewise, `Parameter.output_type` falls back to `type`.
+        emitted_types = [parameter.output_type]
+        if isinstance(parameter, ParameterContainer):
+            element_output_type = parameter.get_element_output_type()
+            if element_output_type is not None:
+                emitted_types.append(element_output_type)
+        return emitted_types
 
 
 @dataclass
@@ -890,8 +937,10 @@ class GetPortSummariesForAllLibrariesRequest(RequestPayload):
     lifetime and recomputed after the library is reloaded.
 
     Known limitation: only ports present right after construction are reported. Ports created
-    dynamically later (container children, config-driven ports) are absent, which is fine for
-    ranking -- the real connection is resolved against the created node's actual parameters.
+    dynamically later (config-driven ports, transition components swapping in a schema) are
+    absent, which is fine for ranking -- the real connection is resolved against the created
+    node's actual parameters. Container parameters are covered despite their children not
+    existing yet, because a container knows its element type up front.
 
     Results: GetPortSummariesForAllLibrariesResultSuccess | GetPortSummariesForAllLibrariesResultFailure
     """

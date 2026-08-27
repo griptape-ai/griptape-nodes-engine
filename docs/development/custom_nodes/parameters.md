@@ -838,6 +838,17 @@ dragged connection", not that a specific port will. The real connection is still
 against the created node's actual parameters, which is where `allow_incoming_connection` /
 `allow_outgoing_connection` get their say.
 
+A `ParameterList` or `ParameterDictionary` contributes both the container type and, for lists,
+the element type its children take. A `ParameterList(input_types=["str"])` reports
+`list[str]`, `list`, *and* `str`, so dragging a single string finds your expander node — not
+just dragging a whole list.
+
+The two type lists hold raw declared type names, and the engine's matching rules are not plain
+string equality: matching is case-insensitive, a target of `any` accepts anything (but a source
+of `any` is not accepted by a specific target), a source of `all` matches anything, and
+`list[str]` matches a `list` target on the base type. `ParameterType.are_types_compatible` is
+the authority.
+
 What this asks of your node:
 
 - **Declare `input_types` / `output_type` honestly in `__init__`.** They are what the editor
@@ -851,14 +862,14 @@ What this asks of your node:
     worker-mode schema probe imposes — see
     [`__init__` runs during library load](node_isolation_with_workers.md#__init__-runs-during-library-load).
 - **Expect dynamic ports to be missing.** Only ports that exist right after construction are
-    reported. Ports added later — container children, a
+    reported. Ports added later — a
     [`ParameterTransitionComponent`](#dynamic-parameter-schemas-with-parametertransitioncomponent)
-    swapping in a schema after a dropdown changes — are absent, so your node will not be
-    offered for those types until it is on the canvas. If a type matters for discoverability,
-    declare a port for it up front.
+    swapping in a schema after a dropdown changes, or ports you add from `after_value_set` — are
+    absent, so your node will not be offered for those types until it is on the canvas. If a type
+    matters for discoverability, declare a port for it up front.
 
-Summaries are cached per library for the life of the process and recomputed after that library
-is reloaded, so the probe pass happens once, not per menu open.
+Summaries are cached per library and recomputed after that library changes — a reload, an unload,
+or a new sandbox node — so the probe pass happens once, not per menu open.
 
 ### Two-Image Processing Node Pattern
 

@@ -2469,6 +2469,28 @@ class ParameterContainer(Parameter, ABC):
         """
         return True
 
+    def get_element_input_types(self) -> list[str]:
+        """Types a single child port of this container accepts, without the container wrapper.
+
+        A container's own `input_types` describe connecting a whole collection to it
+        (`list[str]`, `list`), which is not what one of its child ports accepts (`str`). Callers
+        reasoning about connectivity before any child exists -- ranking node types for the Add
+        Node menu, for instance -- need both, because a list container is exactly how a node
+        advertises "I take many of these".
+
+        Empty by default: a container whose children are not plain scalar ports (a dictionary's
+        key-value pairs) has no element type worth connecting to.
+        """
+        return []
+
+    def get_element_output_type(self) -> str | None:
+        """Type a single child port of this container emits, without the container wrapper.
+
+        The output-side counterpart to `get_element_input_types`. None when the container has no
+        scalar element type.
+        """
+        return None
+
     @abstractmethod
     def add_child_parameter(self) -> Parameter:
         pass
@@ -2690,6 +2712,17 @@ class ParameterList(ParameterContainer):
         base_type = super()._custom_getter_for_property_output_type()
         result = f"list[{base_type}]"
         return result
+
+    def get_element_input_types(self) -> list[str]:
+        # Bypassing this class's wrapping getter lands on Parameter's, which applies the same
+        # declared-else-`type` fallback the children get: add_child_parameter hands a new child the
+        # raw `_input_types` / `_type` / `_output_type`, so the child's resolved `input_types` are
+        # exactly these.
+        return super()._custom_getter_for_property_input_types()
+
+    def get_element_output_type(self) -> str | None:
+        # Same reasoning as get_element_input_types, for the output side.
+        return super()._custom_getter_for_property_output_type()
 
     def __len__(self) -> int:
         # Returns the number of child Parameters. Just do the top level.
