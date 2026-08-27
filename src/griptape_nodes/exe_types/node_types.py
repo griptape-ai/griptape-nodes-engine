@@ -370,6 +370,26 @@ class BaseNode(ABC):
     def parent_group(self, parent_group: BaseNode | None) -> None:
         self._parent_group = parent_group
 
+    def prepare_to_run_again(self) -> None:
+        """Clear this node's resolution so it executes again, and tell the editor it did.
+
+        Locked nodes keep the values they were locked with, so they are left alone.
+
+        Unlike a bare ``make_node_unresolved``, the change event fires from every state
+        rather than only from the ones that made visible progress: a node that is about to
+        run needs its status cleared in the editor even if it already looked unresolved.
+        """
+        if self.lock:
+            return
+
+        self.make_node_unresolved(
+            current_states_to_trigger_change_event={
+                NodeResolutionState.UNRESOLVED,
+                NodeResolutionState.RESOLVED,
+                NodeResolutionState.RESOLVING,
+            }
+        )
+
     # This is gross and we need to have a universal pass on resolution state changes and emission of events. That's what this ticket does!
     # https://github.com/griptape-ai/griptape-nodes/issues/994
     def make_node_unresolved(self, current_states_to_trigger_change_event: set[NodeResolutionState] | None) -> None:

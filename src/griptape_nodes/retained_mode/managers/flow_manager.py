@@ -4797,7 +4797,18 @@ class FlowManager(EngineScoped):
         # We are now going to have different behavior depending on how the node is behaving.
         if self.check_for_existing_running_flow():
             # Now we know something is running, it's ParallelResolutionMachine, and that we are in single_node_resolution.
-            self._global_dag_builder.add_node_with_dependencies(node, node.name)
+            # Nothing below awaits before inject_node: that is what lets the running driver
+            # see this as one atomic change, rather than catching it half-applied or tearing
+            # the DAG down between the check above and the mutation.
+            machine = self._global_control_flow_machine
+            if machine is None:
+                msg = f"Attempted to run '{node.name}' as part of the workflow already in progress, but that workflow could not be found. Wait for it to finish and try again."
+                raise RuntimeError(msg)
+            # The cold path below unresolves the node before queueing it, and so must this
+            # one: otherwise an already-resolved node is treated as a duplicate completion
+            # and never re-runs, and the editor keeps showing it as resolved.
+            node.prepare_to_run_again()
+            machine.resolution_machine.inject_node(node)
             # Emit involved nodes update after adding node to DAG
             involved_nodes = list(self._global_dag_builder.node_to_reference.keys())
             self.engine.event_manager.put_event(
