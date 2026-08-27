@@ -91,9 +91,10 @@ class GetWorkflowContextSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
         is_saved: Whether the current workflow is backed by a file on disk. None when
                   no context is set or the context key is not in the registry.
         is_loading: Whether a load is still populating workflow_name. Can be True while its
-                    nodes are absent or only partially built. False when workflow_name is None.
-                    Defaulted for backward compatibility with older engines, which always read
-                    as False.
+                    nodes are absent or only partially built. False when workflow_name is None,
+                    and False while workflow_name imports a referenced sub flow, which loads
+                    another workflow rather than this one. Defaulted for backward compatibility
+                    with older engines, which always read as False.
     """
 
     workflow_name: str | None
