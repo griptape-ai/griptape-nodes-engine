@@ -209,6 +209,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointAttribute,
     CheckpointSubjectType,
 )
+from griptape_nodes.retained_mode.managers.event_manager import suppress_event_publication
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     AdvancedLibraryLoadFailureProblem,
     AfterLibraryCallbackProblem,
@@ -382,16 +383,18 @@ class NodeProbeResult(NamedTuple):
 
 
 class PortSummaryComputation(NamedTuple):
-    """Outcome of probing a whole library for its per-node-type port summaries.
+    """Outcome of probing a library's node types for their port summaries.
 
-    `is_complete` is False when a node type was skipped for a reason that may not recur -- a probe
-    timeout, an unexpected error, or the library not being in the registry yet. Callers use it to
-    decide whether the result is worth caching; a node type whose module is simply broken does not
-    make the pass incomplete, because that gap is stable until the library reloads.
+    `retry_node_types` holds the node types whose gap might close on its own, which in practice
+    means only the ones whose probe timed out: `asyncio.to_thread` shares the loop's default
+    executor, so a saturated pool can time out a probe that would otherwise have succeeded. Every
+    other gap is stable until the library reloads -- a module that fails to import keeps failing,
+    an `__init__` that raises keeps raising -- so those node types are simply absent from
+    `summaries` and are not worth another pass.
     """
 
     summaries: dict[str, NodePortSummary]
-    is_complete: bool
+    retry_node_types: frozenset[str]
 
 
 class LibraryGitOperationContext(NamedTuple):
@@ -660,11 +663,18 @@ class LibraryManager(EngineScoped):
         # Per-library node type -> port summary, computed on the first GetPortSummaries request
         # and dropped when the library is unloaded (which a reload goes through).
         self._library_to_port_summaries: dict[str, dict[str, NodePortSummary]] = {}
+        # Node types in a cached library whose probe timed out, owed exactly one more attempt on
+        # the next request. Emptied by that attempt whether or not it succeeds, so a node whose
+        # __init__ blocks forever costs at most two un-reclaimable threads rather than one per
+        # request.
+        self._library_to_port_summary_retries: dict[str, frozenset[str]] = {}
         # Bumped by _invalidate_port_summaries. The compute pass awaits, so a library can be
         # mutated while its summaries are being computed; comparing the counter before and after
         # tells the pass whether its now-stale result is still safe to cache.
         self._library_to_port_summaries_generation: dict[str, int] = {}
-        self._port_summaries_lock = asyncio.Lock()
+        # One lock per library, so a request that only needs an already-computed library's
+        # summaries does not queue behind a different library's first probe pass.
+        self._library_to_port_summaries_lock: dict[str, asyncio.Lock] = {}
         self._libraries_loading_complete = asyncio.Event()
         self._libraries_loading_complete.set()  # Not loading initially; load_all_libraries_from_config will clear/set this
         # True for the duration of the engine's initialization sequence (library + workflow
@@ -2137,24 +2147,29 @@ class LibraryManager(EngineScoped):
         """Construct a probe instance of an already-resolved node class.
 
         Safe to hand to ``asyncio.to_thread``. Everything it reads from the library is passed in as
-        a plain value, so it touches no state the event loop mutates, and
-        ``LibraryRegistry.constructing_node()`` is a ContextVar, which ``to_thread`` propagates via
-        ``copy_context()``. Threading this is how a caller bounds a blocking ``__init__`` with a
-        timeout without also moving class resolution off the loop.
+        a plain value, so it touches no state the event loop mutates, and both context managers it
+        enters are ContextVar-based, which ``to_thread`` propagates via ``copy_context()``.
+        Threading this is how a caller bounds a blocking ``__init__`` with a timeout without also
+        moving class resolution off the loop.
 
         What the node's own ``__init__`` touches is of course not controlled here -- that is the
         same exposure ``DescribeNodeType`` and the worker schema pass already accept.
         """
         try:
-            # Wrap in ``LibraryRegistry.constructing_node()`` so the parameter-mutation detector
-            # skips this ephemeral probe's declarative ``add_parameter`` calls (this construction
+            # ``LibraryRegistry.constructing_node()`` makes the parameter-mutation detector skip
+            # this ephemeral probe's declarative ``add_parameter`` calls (this construction
             # bypasses ``LibraryRegistry.create_node``).
+            #
+            # ``suppress_event_publication()`` keeps the probe off the event bus. ``add_parameter``
+            # publishes an ``AlterElementEvent`` per parameter, so without this the editor receives
+            # element events for a node named ``__node_type_probe__*`` that does not exist and
+            # never will -- once per parameter per node type per library on a port summary pass.
             #
             # Pass the node's library and type so declarative ``__init__`` logic that resolves
             # against the library -- e.g. ``get_declared_models`` populating a model dropdown
             # from the ``model_catalog`` -- works during the probe just as it does under
             # ``create_node``.
-            with LibraryRegistry.constructing_node():
+            with LibraryRegistry.constructing_node(), suppress_event_publication():
                 probe_node = node_class(
                     name=f"{self.PROBE_NODE_NAME_PREFIX}{node_type}",
                     metadata={
@@ -3176,6 +3191,12 @@ class LibraryManager(EngineScoped):
             return False
 
     def unload_library_from_registry_request(self, request: UnloadLibraryFromRegistryRequest) -> ResultPayload:
+        # Drop cached port summaries first: the library's node types are about to go, and a
+        # subsequent load may bring back different ones. Every reload path unloads first, so this
+        # covers reloads too. Before the unload rather than after so an unload that fails partway
+        # cannot leave summaries cached for a half-dismantled library.
+        self._invalidate_port_summaries(request.library_name)
+
         try:
             LibraryRegistry.unregister_library(
                 library_name=request.library_name, event_manager=self.engine.event_manager
@@ -3183,10 +3204,6 @@ class LibraryManager(EngineScoped):
         except Exception as e:
             details = f"Attempted to unload library '{request.library_name}'. Failed due to {e}"
             return UnloadLibraryFromRegistryResultFailure(result_details=details)
-
-        # Drop cached port summaries: the library's node types are gone, and a subsequent load may
-        # bring back different ones. Every reload path unloads first, so this covers reloads too.
-        self._invalidate_port_summaries(request.library_name)
 
         # Clean up all stable module aliases for this library. Note first whether any of its node
         # modules had actually been imported: if so, this process is stuck with that code and the
@@ -3280,23 +3297,37 @@ class LibraryManager(EngineScoped):
         Cached until the library changes -- a reload, an unload, or node types being registered
         into it -- because a node type's declared ports cannot change without one of those.
 
-        The lock means concurrent callers do the probe pass once rather than once each; the second
-        caller waits and then reads the cache. It is deliberately not held for the cache-hit path:
-        the probe pass can take seconds, and a request that only needs already-computed summaries
-        should not queue behind an unrelated library being probed for the first time.
+        A cached library with node types owed a retry (their probe timed out) is topped up rather
+        than recomputed: only those node types are probed again, and the retry is spent whether or
+        not it succeeds. That bounds the damage a node whose ``__init__`` blocks can do. Probing it
+        burns a thread ``asyncio.to_thread`` cannot cancel, so re-probing on every request would
+        drain the loop's shared executor and eventually stall every other threaded operation in the
+        engine -- a far worse outcome than one node type going unranked in the Add Node menu.
+
+        The per-library lock means concurrent callers do the probe pass once rather than once each;
+        the second caller waits and then reads the cache. It is deliberately not held for the
+        cache-hit path: the probe pass can take seconds, and a request that only needs
+        already-computed summaries should not queue behind another library's first pass.
         """
         cached_summaries = self._library_to_port_summaries.get(library_name)
-        if cached_summaries is not None:
+        retry_node_types = self._library_to_port_summary_retries.get(library_name, frozenset())
+        if cached_summaries is not None and not retry_node_types:
             return dict(cached_summaries)
 
-        async with self._port_summaries_lock:
-            # Re-check: another caller may have computed these while we waited for the lock.
+        async with self._library_to_port_summaries_lock.setdefault(library_name, asyncio.Lock()):
+            # Re-check: another caller may have computed or topped these up while we waited.
             cached_summaries = self._library_to_port_summaries.get(library_name)
-            if cached_summaries is not None:
+            retry_node_types = self._library_to_port_summary_retries.get(library_name, frozenset())
+            if cached_summaries is not None and not retry_node_types:
                 return dict(cached_summaries)
 
             generation_before = self._library_to_port_summaries_generation.get(library_name, 0)
-            computation = await self._compute_port_summaries_for_library(library_name)
+            if cached_summaries is None:
+                computation = await self._compute_port_summaries_for_library(library_name)
+                summaries = computation.summaries
+            else:
+                computation = await self._compute_port_summaries_for_library(library_name, retry_node_types)
+                summaries = {**cached_summaries, **computation.summaries}
 
             # The pass above awaited, so the library may have been reloaded, unloaded, or had node
             # types registered into it in the meantime. Caching what we just measured would pin
@@ -3310,24 +3341,25 @@ class LibraryManager(EngineScoped):
                     "serving this result without caching it.",
                     library_name,
                 )
-                return computation.summaries
+                return summaries
 
-            # Likewise for a pass that hit a transient failure. Nothing invalidates this library
-            # again on its own, so caching an incomplete result would make a one-off timeout or a
-            # saturated thread pool permanent.
-            if not computation.is_complete:
-                logger.debug(
-                    "Port summaries for library '%s' are incomplete for a reason that may not "
-                    "recur; serving this result without caching it.",
-                    library_name,
-                )
-                return computation.summaries
+            self._library_to_port_summaries[library_name] = summaries
+            # Only a first pass earns retries. A top-up pass has spent them, so clearing the entry
+            # here is what stops a permanently stuck node type from being re-probed forever.
+            if cached_summaries is None and computation.retry_node_types:
+                self._library_to_port_summary_retries[library_name] = computation.retry_node_types
+            else:
+                self._library_to_port_summary_retries.pop(library_name, None)
 
-            self._library_to_port_summaries[library_name] = computation.summaries
-            return dict(computation.summaries)
+            return dict(summaries)
 
-    async def _compute_port_summaries_for_library(self, library_name: str) -> PortSummaryComputation:
-        """Probe every node type in a library and derive its port summary.
+    async def _compute_port_summaries_for_library(
+        self, library_name: str, node_types: frozenset[str] | None = None
+    ) -> PortSummaryComputation:
+        """Probe a library's node types and derive each one's port summary.
+
+        Covers every registered node type unless `node_types` narrows it, which is how a cached
+        library's timed-out node types get their one retry without re-probing the rest.
 
         Node types the engine cannot construct are left out of the result entirely rather than
         recorded as portless, so callers leave them unranked instead of ranking them as
@@ -3339,25 +3371,28 @@ class LibraryManager(EngineScoped):
         bounds it: a node's ``__init__`` can block indefinitely, and one such node must not stall
         the rest.
 
-        `is_complete` on the result separates the two kinds of gap. A node type whose module fails
-        to import or whose ``__init__`` raises will keep failing until the library is reloaded, so
-        that gap is stable and the result is worth caching. A timeout or an unexpected error might
-        not recur -- ``asyncio.to_thread`` shares the loop's default executor, so a saturated pool
-        can time out probes that would otherwise have succeeded -- so a pass that hits one reports
-        itself incomplete and is not cached.
+        Only a timeout is reported in `retry_node_types` -- see `PortSummaryComputation` for why
+        every other gap is stable.
         """
         try:
             library = LibraryRegistry.get_library(library_name)
         except KeyError:
-            # Registration publishes a library before its node types are populated, so this can
-            # mean "not yet" rather than "never". Reported incomplete so it is not cached.
+            # Reachable when a library is unloaded between LibraryRegistry.list_libraries() and
+            # this lookup. That path bumps the generation counter, so the caller already declines
+            # to cache what comes back; nothing here is worth retrying.
             logger.warning("Cannot compute port summaries: library '%s' not found in registry.", library_name)
-            return PortSummaryComputation(summaries={}, is_complete=False)
+            return PortSummaryComputation(summaries={}, retry_node_types=frozenset())
+
+        node_types_to_probe = library.get_registered_nodes()
+        if node_types is not None:
+            # Intersect rather than trust the caller's set: a node type can have been unregistered
+            # since it earned its retry.
+            node_types_to_probe = [node_type for node_type in node_types_to_probe if node_type in node_types]
 
         summaries: dict[str, NodePortSummary] = {}
         skipped_node_types: list[str] = []
-        is_complete = True
-        for node_type in library.get_registered_nodes():
+        retry_node_types: set[str] = set()
+        for node_type in node_types_to_probe:
             # Yield between node types so a large library's resolve calls, which run on the loop,
             # interleave with other work instead of monopolizing it for the whole pass.
             await asyncio.sleep(0)
@@ -3377,7 +3412,6 @@ class LibraryManager(EngineScoped):
                     exc_info=True,
                 )
                 skipped_node_types.append(node_type)
-                is_complete = False
                 continue
 
             if resolution.node_class is None:
@@ -3390,6 +3424,10 @@ class LibraryManager(EngineScoped):
                 skipped_node_types.append(node_type)
                 continue
 
+            # Built before the try because it reads the library's node-metadata dict, and a failure
+            # doing so is a defect in that data rather than anything a retry would fix.
+            library_node_metadata = self._library_node_metadata_for_probe(library=library, node_type=node_type)
+
             try:
                 probe_result = await asyncio.wait_for(
                     asyncio.to_thread(
@@ -3397,14 +3435,15 @@ class LibraryManager(EngineScoped):
                         library_name,
                         node_type,
                         resolution.node_class,
-                        self._library_node_metadata_for_probe(library=library, node_type=node_type),
+                        library_node_metadata,
                     ),
                     timeout=self._SCHEMA_PROBE_TIMEOUT_S,
                 )
             except TimeoutError:
                 # asyncio.to_thread cannot be cancelled, so the thread is not reclaimed: it holds a
                 # worker of the loop's default executor until __init__ returns, which for a truly
-                # stuck node means for the life of the process.
+                # stuck node means for the life of the process. That is also why this node type
+                # gets one retry rather than one per request.
                 logger.warning(
                     "Port summary probe for node type '%s' in library '%s' timed out after %.1fs; "
                     "skipping it and leaking the probe thread, which cannot be cancelled. The "
@@ -3414,11 +3453,12 @@ class LibraryManager(EngineScoped):
                     self._SCHEMA_PROBE_TIMEOUT_S,
                 )
                 skipped_node_types.append(node_type)
-                is_complete = False
+                retry_node_types.add(node_type)
                 continue
             except Exception:
                 # _construct_probe_node already converts a raising __init__ into a result, so
-                # reaching here means the failure was outside it.
+                # reaching here means the failure was outside it -- the executor refusing work
+                # during interpreter shutdown, for instance, which a retry cannot help either.
                 logger.debug(
                     "Unexpected failure probing node type '%s' in library '%s' for its port summary; skipping.",
                     node_type,
@@ -3426,7 +3466,6 @@ class LibraryManager(EngineScoped):
                     exc_info=True,
                 )
                 skipped_node_types.append(node_type)
-                is_complete = False
                 continue
 
             if probe_result.node is None:
@@ -3449,7 +3488,7 @@ class LibraryManager(EngineScoped):
                 len(skipped_node_types),
                 ", ".join(skipped_node_types),
             )
-        return PortSummaryComputation(summaries=summaries, is_complete=is_complete)
+        return PortSummaryComputation(summaries=summaries, retry_node_types=frozenset(retry_node_types))
 
     def _invalidate_port_summaries(self, library_name: str) -> None:
         """Drop a library's cached port summaries after its node types change.
@@ -3458,8 +3497,12 @@ class LibraryManager(EngineScoped):
         already in flight for this library can tell that its result is stale and decline to cache
         it. Call this *before* mutating the library, so a mutation that bails out partway through
         still leaves the cache cleared.
+
+        Outstanding retries go too: a reload replaces the node's code, so a probe that timed out
+        against the old code has earned a fresh full attempt rather than a top-up.
         """
         self._library_to_port_summaries.pop(library_name, None)
+        self._library_to_port_summary_retries.pop(library_name, None)
         self._library_to_port_summaries_generation[library_name] = (
             self._library_to_port_summaries_generation.get(library_name, 0) + 1
         )

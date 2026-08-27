@@ -851,9 +851,11 @@ just dragging a whole list.
 
 The two type lists hold raw declared type names, and the engine's matching rules are not plain
 string equality: matching is case-insensitive, a target of `any` accepts anything (but a source
-of `any` is not accepted by a specific target), a source of `all` matches anything, and
-`list[str]` matches a `list` target on the base type. `ParameterType.are_types_compatible` is
-the authority.
+of `any` is not accepted by a specific target), and `list[str]` matches a `list` target on the
+base type. `ParameterType.are_types_compatible` implements those three. One more rule lives
+outside it — a source of `all` matches anything, applied by
+`Parameter.is_incoming_type_allowed` before it delegates — so a client that calls
+`are_types_compatible` alone will not rank `all`-typed outputs against anything.
 
 What this asks of your node:
 
@@ -875,7 +877,9 @@ What this asks of your node:
     matters for discoverability, declare a port for it up front.
 
 Summaries are cached per library and recomputed after that library changes — a reload, an unload,
-or a new sandbox node — so the probe pass happens once, not per menu open.
+or a new sandbox node — so the probe pass happens once, not per menu open. A node type whose
+`__init__` blocked past the timeout is the one exception: it gets a second attempt on the next
+request, alone, and is then left out until the library reloads.
 
 ### Two-Image Processing Node Pattern
 

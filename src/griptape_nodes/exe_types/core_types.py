@@ -2717,8 +2717,9 @@ class ParameterList(ParameterContainer):
         # Bypassing this class's wrapping getter lands on Parameter's, which applies the same
         # declared-else-`type` fallback the children get: add_child_parameter hands a new child the
         # raw `_input_types` / `_type` / `_output_type`, so the child's resolved `input_types` are
-        # exactly these.
-        return super()._custom_getter_for_property_input_types()
+        # exactly these. Copied because Parameter's getter can return `self._input_types` itself,
+        # and a caller mutating what it got back would rewrite this container's declared types.
+        return list(super()._custom_getter_for_property_input_types())
 
     def get_element_output_type(self) -> str | None:
         # Same reasoning as get_element_input_types, for the output side.

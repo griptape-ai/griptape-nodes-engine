@@ -83,6 +83,33 @@ _active_post_dispatch_hooks: ContextVar[tuple[tuple[type[RequestPayload], Any], 
 # for a hook that runs slower than requests arrive.
 POST_DISPATCH_HOOK_INFLIGHT_WARNING_THRESHOLD = 100
 
+_event_publication_suppressed: ContextVar[bool] = ContextVar(
+    "_event_manager_event_publication_suppressed", default=False
+)
+
+
+@contextmanager
+def suppress_event_publication() -> Iterator[None]:
+    """Drop every event published from the calling task or thread for the duration of the block.
+
+    For work that constructs a real object purely to inspect it. `LibraryManager`'s throwaway
+    probe node is the case this exists for: its `__init__` runs the same `add_parameter` calls a
+    canvas node's would, so it publishes parameter events naming a node the editor has never
+    heard of and never will.
+
+    Deliberately not `EventSuppressionContext`, which reference-counts event types on the manager
+    and is consulted at the send boundary. That is the wrong tool twice over here: probe
+    construction runs in a worker thread, where mutating manager state races the loop, and
+    suppressing a type outright would also silence that event for real nodes changing at the same
+    moment. A ContextVar is scoped to the block that set it, and `asyncio.to_thread` carries it
+    into the worker via `copy_context()`.
+    """
+    token = _event_publication_suppressed.set(True)
+    try:
+        yield
+    finally:
+        _event_publication_suppressed.reset(token)
+
 
 def _is_async_callable(callback: Any) -> bool:
     """Whether calling `callback` returns a coroutine.
@@ -322,6 +349,8 @@ class EventManager(EngineScoped):
         Args:
             event: The event to publish to the queue
         """
+        if _event_publication_suppressed.get():
+            return
         if self._event_queue is None:
             return
 
@@ -346,6 +375,8 @@ class EventManager(EngineScoped):
         Args:
             event: The event to publish to the queue
         """
+        if _event_publication_suppressed.get():
+            return
         if self._event_queue is None:
             return
 

@@ -274,7 +274,7 @@ class ParameterDescription:
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class NodePortSummary:
     """Connectivity-only view of a node type's ports, derived from the parameters it declares.
 
@@ -289,17 +289,24 @@ class NodePortSummary:
     `input_types` / `output_types` because control and data connections never interconnect.
 
     The type strings are raw declared type names, so matching them is NOT set membership. Use the
-    engine's own rules, which `ParameterType.are_types_compatible(source, target)` implements:
+    engine's own rules. `ParameterType.are_types_compatible(source, target)` implements most of
+    them:
 
     - Matching is case-insensitive (`"Image"` matches `"image"`).
     - It is directional and asymmetric. A target of `"any"` accepts every source type, but a
       source of `"any"` is not accepted by a specific target.
-    - A source of `"all"` matches every target (`Parameter.is_incoming_type_allowed`
-      short-circuits on it).
     - Parameterized types match on their base, so `"list[str]"` matches a `"list"` target.
+
+    One rule lives outside that function and a client has to apply it too: a source of `"all"`
+    matches every target. `Parameter.is_incoming_type_allowed` short-circuits on it before
+    delegating, so calling `are_types_compatible` alone leaves every `"all"`-typed output ranked
+    against nothing -- the wildcard case ranking most needs to get right.
 
     A client that treats these as opaque strings and intersects two sets will get the wrong
     answer for every one of those cases.
+
+    Immutable, and the type fields are tuples, so a cached summary can be handed to a caller
+    without copying it.
 
     Args:
         input_types: Accepted types unioned over every port allowing the INPUT mode
@@ -308,8 +315,8 @@ class NodePortSummary:
         has_control_output: Whether the node declares an outgoing control (execution) port
     """
 
-    input_types: list[str]
-    output_types: list[str]
+    input_types: tuple[str, ...]
+    output_types: tuple[str, ...]
     has_control_input: bool
     has_control_output: bool
 
@@ -347,8 +354,8 @@ class NodePortSummary:
                     output_types.append(emitted_type)
 
         return cls(
-            input_types=input_types,
-            output_types=output_types,
+            input_types=tuple(input_types),
+            output_types=tuple(output_types),
             has_control_input=has_control_input,
             has_control_output=has_control_output,
         )
@@ -934,7 +941,10 @@ class GetPortSummariesForAllLibrariesRequest(RequestPayload):
     (`library.lazy_node_loading`), so folding this into the catalog would import and instantiate
     every node type in every library on every editor connect. Here the cost is paid once, on
     demand, by the callers that need ranking. Results are cached per library for the process
-    lifetime and recomputed after the library is reloaded.
+    lifetime and recomputed after the library is reloaded. A node type whose probe timed out is
+    the one thing retried, and only on the next request; after that its gap is treated as
+    permanent until the library reloads, because re-probing a node whose `__init__` blocks costs
+    a thread that cannot be reclaimed.
 
     Known limitation: only ports present right after construction are reported. Ports created
     dynamically later (config-driven ports, transition components swapping in a schema) are
