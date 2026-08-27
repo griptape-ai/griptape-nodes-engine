@@ -18,11 +18,20 @@ if TYPE_CHECKING:
 
 from griptape_nodes.exe_types.core_types import Parameter
 from griptape_nodes.exe_types.node_types import NodeDependencies
-from griptape_nodes.node_library.workflow_registry import Workflow, WorkflowMetadata, WorkflowRegistry, WorkflowShape
+from griptape_nodes.node_library.workflow_registry import (
+    Workflow,
+    WorkflowMetadata,
+    WorkflowRegistry,
+    WorkflowShape,
+    read_workflow_metadata,
+)
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.flow_events import SerializedFlowCommands
 from griptape_nodes.retained_mode.events.workflow_events import (
+    BranchWorkflowRequest,
+    BranchWorkflowResultFailure,
+    BranchWorkflowResultSuccess,
     CreateWorkflowFromTemplateRequest,
     CreateWorkflowFromTemplateResultFailure,
     CreateWorkflowFromTemplateResultSuccess,
@@ -45,11 +54,16 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     LoadWorkflowMetadata,
     LoadWorkflowMetadataResultFailure,
     LoadWorkflowMetadataResultSuccess,
+    MergeWorkflowBranchRequest,
+    MergeWorkflowBranchResultSuccess,
     MoveWorkflowRequest,
     MoveWorkflowResultFailure,
     MoveWorkflowResultSuccess,
+    RegisterWorkflowRequest,
     RegisterWorkflowResultFailure,
     RegisterWorkflowResultSuccess,
+    ResetWorkflowBranchRequest,
+    ResetWorkflowBranchResultSuccess,
     SetWorkflowMetadataRequest,
     SetWorkflowMetadataResultSuccess,
     WorkflowDependencyInfo,
@@ -4508,3 +4522,348 @@ class TestSaveWorkflowOverwriteProtection:
 
             assert isinstance(result, SaveWorkflowResultSuccess)
             assert victim_path.read_text() != "# theirs"
+
+
+class TestWorkflowBranchDisplayNames:
+    """Regression coverage: a branch's ``metadata.name`` must be a title, not a registry key.
+
+    A registry key is a file path (``shots/sh010/comp``); ``metadata.name`` is the human-readable
+    label the editor shows. Three sites used to write the key into the label, so any branch of a
+    workflow living in a subdirectory read as a file path in the UI. Two of them overwrote a
+    previously-correct label and persisted it to disk, so each test asserts the registry entry *and*
+    the on-disk header.
+
+    Driven through ``GriptapeNodes.handle_request`` with real files in a real temp workspace, since
+    the persisted header is half the bug.
+    """
+
+    SOURCE_KEY = "shots/sh010/comp"
+    SOURCE_DISPLAY_NAME = "Shot 010 Comp"
+
+    @pytest.fixture
+    def temp_dir(self, tmp_path: Path) -> Path:
+        return tmp_path.resolve()
+
+    @pytest.fixture(autouse=True)
+    def workspace(self, temp_dir: Path, griptape_nodes: Engine) -> "Generator[None, None, None]":
+        """Point the workspace at a temp dir so registry keys resolve to real files."""
+        original_workspace = griptape_nodes.ConfigManager().workspace_path
+        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            yield
+        griptape_nodes.ConfigManager().workspace_path = original_workspace
+
+    @staticmethod
+    def _register_workflow(griptape_nodes: Engine, temp_dir: Path, *, registry_key: str, display_name: str) -> Path:
+        """Write a workflow file carrying a real metadata header and register it."""
+        metadata = WorkflowMetadata(
+            name=display_name,
+            schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
+            engine_version_created_with="test",
+            node_libraries_referenced=[],
+            creation_date=datetime.now(UTC),
+        )
+        header = griptape_nodes.WorkflowManager()._generate_workflow_metadata_header(metadata)
+        assert header is not None
+
+        relative_file_path = f"{registry_key}.py"
+        file_path = temp_dir / relative_file_path
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(f"{header}\n\nprint('body')\n", encoding="utf-8")
+
+        WorkflowRegistry.generate_new_workflow(
+            registry_key=registry_key, metadata=metadata, file_path=relative_file_path
+        )
+        return file_path
+
+    @staticmethod
+    def _persisted_display_name(temp_dir: Path, registry_key: str) -> str:
+        """Read ``metadata.name`` back out of the workflow file on disk."""
+        return read_workflow_metadata(temp_dir / f"{registry_key}.py").name
+
+    def _register_source(self, griptape_nodes: Engine, temp_dir: Path) -> Path:
+        return self._register_workflow(
+            griptape_nodes, temp_dir, registry_key=self.SOURCE_KEY, display_name=self.SOURCE_DISPLAY_NAME
+        )
+
+    def test_branch_of_nested_workflow_gets_readable_display_name(self, griptape_nodes: Engine, temp_dir: Path) -> None:
+        """The reported bug: the branch's label was the full registry key path.
+
+        The key still carries the directories (it is a file path), but the label is derived from the
+        source's display name.
+        """
+        self._register_source(griptape_nodes, temp_dir)
+
+        result = GriptapeNodes.handle_request(BranchWorkflowRequest(workflow_name=self.SOURCE_KEY))
+
+        assert isinstance(result, BranchWorkflowResultSuccess)
+        branch_key = result.branched_workflow_name
+        assert branch_key == "shots/sh010/comp_branch_1"
+
+        branch = WorkflowRegistry.get_workflow_by_name(branch_key)
+        assert branch.metadata.name == "Shot 010 Comp (branch 1)"
+        assert self._persisted_display_name(temp_dir, branch_key) == "Shot 010 Comp (branch 1)"
+        # The branch relationship is keyed on the registry key, not the label.
+        assert branch.metadata.branched_from == self.SOURCE_KEY
+
+    def test_branch_leaves_source_display_name_alone(self, griptape_nodes: Engine, temp_dir: Path) -> None:
+        """Branching must not touch the source's label."""
+        self._register_source(griptape_nodes, temp_dir)
+
+        result = GriptapeNodes.handle_request(BranchWorkflowRequest(workflow_name=self.SOURCE_KEY))
+
+        assert isinstance(result, BranchWorkflowResultSuccess)
+        source = WorkflowRegistry.get_workflow_by_name(self.SOURCE_KEY)
+        assert source.metadata.name == self.SOURCE_DISPLAY_NAME
+        assert self._persisted_display_name(temp_dir, self.SOURCE_KEY) == self.SOURCE_DISPLAY_NAME
+
+    def test_branch_counter_stays_in_step_with_registry_key(self, griptape_nodes: Engine, temp_dir: Path) -> None:
+        """The label's counter tracks the key's counter, so branches stay distinguishable."""
+        self._register_source(griptape_nodes, temp_dir)
+
+        first = GriptapeNodes.handle_request(BranchWorkflowRequest(workflow_name=self.SOURCE_KEY))
+        second = GriptapeNodes.handle_request(BranchWorkflowRequest(workflow_name=self.SOURCE_KEY))
+
+        assert isinstance(first, BranchWorkflowResultSuccess)
+        assert isinstance(second, BranchWorkflowResultSuccess)
+        assert first.branched_workflow_name == "shots/sh010/comp_branch_1"
+        assert second.branched_workflow_name == "shots/sh010/comp_branch_2"
+        assert WorkflowRegistry.get_workflow_by_name(first.branched_workflow_name).metadata.name == (
+            "Shot 010 Comp (branch 1)"
+        )
+        assert WorkflowRegistry.get_workflow_by_name(second.branched_workflow_name).metadata.name == (
+            "Shot 010 Comp (branch 2)"
+        )
+
+    def test_branch_uses_explicit_display_name_when_provided(self, griptape_nodes: Engine, temp_dir: Path) -> None:
+        """A caller-supplied label wins over the derivation, and is stripped."""
+        self._register_source(griptape_nodes, temp_dir)
+
+        result = GriptapeNodes.handle_request(
+            BranchWorkflowRequest(workflow_name=self.SOURCE_KEY, branched_workflow_display_name="  Lighting Test  ")
+        )
+
+        assert isinstance(result, BranchWorkflowResultSuccess)
+        branch_key = result.branched_workflow_name
+        assert WorkflowRegistry.get_workflow_by_name(branch_key).metadata.name == "Lighting Test"
+        assert self._persisted_display_name(temp_dir, branch_key) == "Lighting Test"
+
+    def test_branch_rejects_blank_display_name(self, griptape_nodes: Engine, temp_dir: Path) -> None:
+        """A whitespace-only label would leave the branch looking nameless, so refuse it."""
+        self._register_source(griptape_nodes, temp_dir)
+
+        result = GriptapeNodes.handle_request(
+            BranchWorkflowRequest(workflow_name=self.SOURCE_KEY, branched_workflow_display_name="   ")
+        )
+
+        assert isinstance(result, BranchWorkflowResultFailure)
+        assert "empty display name" in str(result.result_details)
+        # Nothing was created.
+        assert WorkflowRegistry.get_branches_of_workflow(self.SOURCE_KEY) == []
+
+    def test_branch_with_caller_supplied_key_labels_from_final_segment(
+        self, griptape_nodes: Engine, temp_dir: Path
+    ) -> None:
+        """When the caller picks the key, its last segment is the label -- never the whole path."""
+        self._register_source(griptape_nodes, temp_dir)
+
+        result = GriptapeNodes.handle_request(
+            BranchWorkflowRequest(workflow_name=self.SOURCE_KEY, branched_workflow_name="shots/sh010/my_experiment")
+        )
+
+        assert isinstance(result, BranchWorkflowResultSuccess)
+        branch_key = result.branched_workflow_name
+        assert branch_key == "shots/sh010/my_experiment"
+        assert WorkflowRegistry.get_workflow_by_name(branch_key).metadata.name == "my_experiment"
+        assert self._persisted_display_name(temp_dir, branch_key) == "my_experiment"
+
+    def test_branch_of_path_shaped_label_does_not_propagate_the_path(
+        self, griptape_nodes: Engine, temp_dir: Path
+    ) -> None:
+        """Branches created before this fix carry their key as their label; don't carry it forward."""
+        self._register_workflow(
+            griptape_nodes,
+            temp_dir,
+            registry_key="shots/sh010/comp_branch_1",
+            display_name="shots/sh010/comp_branch_1",
+        )
+
+        result = GriptapeNodes.handle_request(BranchWorkflowRequest(workflow_name="shots/sh010/comp_branch_1"))
+
+        assert isinstance(result, BranchWorkflowResultSuccess)
+        branch_key = result.branched_workflow_name
+        assert WorkflowRegistry.get_workflow_by_name(branch_key).metadata.name == "comp_branch_1 (branch 1)"
+
+    def test_branch_falls_back_to_key_segment_when_source_label_blank(
+        self, griptape_nodes: Engine, temp_dir: Path
+    ) -> None:
+        """A corrupt (blank) source label falls back to the file name, not to emptiness."""
+        self._register_workflow(griptape_nodes, temp_dir, registry_key=self.SOURCE_KEY, display_name="   ")
+
+        result = GriptapeNodes.handle_request(BranchWorkflowRequest(workflow_name=self.SOURCE_KEY))
+
+        assert isinstance(result, BranchWorkflowResultSuccess)
+        branch_key = result.branched_workflow_name
+        assert WorkflowRegistry.get_workflow_by_name(branch_key).metadata.name == "comp (branch 1)"
+
+    def test_merge_preserves_source_display_name(self, griptape_nodes: Engine, temp_dir: Path) -> None:
+        """Merging changes the source's contents, never its title.
+
+        This site read the branch's ``branched_from`` (a registry key) into the source's
+        ``metadata.name``, overwriting a correct label with a path and writing it to disk.
+        """
+        self._register_source(griptape_nodes, temp_dir)
+        branch_result = GriptapeNodes.handle_request(BranchWorkflowRequest(workflow_name=self.SOURCE_KEY))
+        assert isinstance(branch_result, BranchWorkflowResultSuccess)
+
+        merge_result = GriptapeNodes.handle_request(
+            MergeWorkflowBranchRequest(workflow_name=branch_result.branched_workflow_name)
+        )
+
+        assert isinstance(merge_result, MergeWorkflowBranchResultSuccess)
+        source = WorkflowRegistry.get_workflow_by_name(self.SOURCE_KEY)
+        assert source.metadata.name == self.SOURCE_DISPLAY_NAME
+        assert self._persisted_display_name(temp_dir, self.SOURCE_KEY) == self.SOURCE_DISPLAY_NAME
+
+    def test_reset_preserves_branch_display_name(self, griptape_nodes: Engine, temp_dir: Path) -> None:
+        """Resetting discards the branch's content changes, not its title.
+
+        This site wrote the branch's own registry key into its ``metadata.name`` and persisted it,
+        so a reset silently renamed the branch to its file path.
+        """
+        self._register_source(griptape_nodes, temp_dir)
+        branch_result = GriptapeNodes.handle_request(
+            BranchWorkflowRequest(workflow_name=self.SOURCE_KEY, branched_workflow_display_name="Lighting Test")
+        )
+        assert isinstance(branch_result, BranchWorkflowResultSuccess)
+        branch_key = branch_result.branched_workflow_name
+
+        reset_result = GriptapeNodes.handle_request(ResetWorkflowBranchRequest(workflow_name=branch_key))
+
+        assert isinstance(reset_result, ResetWorkflowBranchResultSuccess)
+        assert WorkflowRegistry.get_workflow_by_name(branch_key).metadata.name == "Lighting Test"
+        assert self._persisted_display_name(temp_dir, branch_key) == "Lighting Test"
+
+
+class TestRepairPathShapedDisplayName:
+    """Workflows already on disk carry a registry key as their ``metadata.name``.
+
+    The pre-fix branch/merge/reset sites wrote the path-derived key into the display name and
+    persisted it, so those files are still out there. They carry the *current* schema version -- the
+    bug was never a schema change -- so registration keys on the damage itself: a display name that
+    exactly equals its own registry key.
+
+    Repair is in-memory. The file keeps the old header until its next save, so each test asserts the
+    registry entry shows the readable name while the file on disk is untouched.
+    """
+
+    @pytest.fixture
+    def temp_dir(self, tmp_path: Path) -> Path:
+        return tmp_path.resolve()
+
+    @pytest.fixture(autouse=True)
+    def workspace(self, temp_dir: Path, griptape_nodes: Engine) -> "Generator[None, None, None]":
+        original_workspace = griptape_nodes.ConfigManager().workspace_path
+        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            yield
+        griptape_nodes.ConfigManager().workspace_path = original_workspace
+
+    @staticmethod
+    def _write_and_register(
+        griptape_nodes: Engine, temp_dir: Path, *, relative_file_path: str, display_name: str
+    ) -> Path:
+        """Write a real workflow file with `display_name` in its header, then register it from disk."""
+        metadata = WorkflowMetadata(
+            name=display_name,
+            schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
+            engine_version_created_with="test",
+            node_libraries_referenced=[],
+            creation_date=datetime.now(UTC),
+        )
+        header = griptape_nodes.WorkflowManager()._generate_workflow_metadata_header(metadata)
+        assert header is not None
+
+        file_path = temp_dir / relative_file_path
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(f"{header}\n\nprint('body')\n", encoding="utf-8")
+
+        result = GriptapeNodes.handle_request(RegisterWorkflowRequest(metadata=metadata, file_name=relative_file_path))
+        assert isinstance(result, RegisterWorkflowResultSuccess)
+        return file_path
+
+    def test_legacy_branch_name_is_repaired_on_load(self, griptape_nodes: Engine, temp_dir: Path) -> None:
+        """The reported symptom, loaded from a file a pre-fix build wrote."""
+        file_path = self._write_and_register(
+            griptape_nodes,
+            temp_dir,
+            relative_file_path="shots/sh010/comp_branch_1.py",
+            display_name="shots/sh010/comp_branch_1",
+        )
+
+        workflow = WorkflowRegistry.get_workflow_by_name("shots/sh010/comp_branch_1")
+        assert workflow.metadata.name == "comp_branch_1"
+        # In-memory only: the header on disk is deliberately left for the next save to rewrite.
+        assert read_workflow_metadata(file_path).name == "shots/sh010/comp_branch_1"
+
+    def test_legacy_merged_source_name_is_repaired_on_load(self, griptape_nodes: Engine, temp_dir: Path) -> None:
+        """The merge site overwrote a *source* workflow's title with its key; same fingerprint."""
+        self._write_and_register(
+            griptape_nodes, temp_dir, relative_file_path="shots/sh010/comp.py", display_name="shots/sh010/comp"
+        )
+
+        assert WorkflowRegistry.get_workflow_by_name("shots/sh010/comp").metadata.name == "comp"
+
+    def test_deeper_nesting_keeps_only_the_final_segment(self, griptape_nodes: Engine, temp_dir: Path) -> None:
+        """The deeper the folder structure the worse the old label read; only the file name survives."""
+        self._write_and_register(
+            griptape_nodes,
+            temp_dir,
+            relative_file_path="show/seq/shots/sh010/comp_branch_2.py",
+            display_name="show/seq/shots/sh010/comp_branch_2",
+        )
+
+        workflow = WorkflowRegistry.get_workflow_by_name("show/seq/shots/sh010/comp_branch_2")
+        assert workflow.metadata.name == "comp_branch_2"
+
+    def test_real_display_name_is_left_alone(self, griptape_nodes: Engine, temp_dir: Path) -> None:
+        """A proper title never equals its own registry key, so it is never touched."""
+        self._write_and_register(
+            griptape_nodes,
+            temp_dir,
+            relative_file_path="shots/sh010/comp.py",
+            display_name="Shot 010 Comp",
+        )
+
+        assert WorkflowRegistry.get_workflow_by_name("shots/sh010/comp").metadata.name == "Shot 010 Comp"
+
+    def test_deliberate_separator_in_a_title_is_left_alone(self, griptape_nodes: Engine, temp_dir: Path) -> None:
+        """Only exact key equality triggers repair -- a slash someone typed on purpose survives."""
+        self._write_and_register(
+            griptape_nodes,
+            temp_dir,
+            relative_file_path="shots/sh010/comp.py",
+            display_name="Lighting / Comp",
+        )
+
+        assert WorkflowRegistry.get_workflow_by_name("shots/sh010/comp").metadata.name == "Lighting / Comp"
+
+    def test_workspace_root_workflow_matching_its_stem_is_left_alone(
+        self, griptape_nodes: Engine, temp_dir: Path
+    ) -> None:
+        """Name == key with no directories is the normal unnamed-workflow case, not the bug."""
+        self._write_and_register(griptape_nodes, temp_dir, relative_file_path="my_flow.py", display_name="my_flow")
+
+        assert WorkflowRegistry.get_workflow_by_name("my_flow").metadata.name == "my_flow"
+
+    def test_repaired_workflow_branches_with_a_readable_label(self, griptape_nodes: Engine, temp_dir: Path) -> None:
+        """The payoff: branching a legacy workflow no longer carries the path forward."""
+        self._write_and_register(
+            griptape_nodes, temp_dir, relative_file_path="shots/sh010/comp.py", display_name="shots/sh010/comp"
+        )
+
+        result = GriptapeNodes.handle_request(BranchWorkflowRequest(workflow_name="shots/sh010/comp"))
+
+        assert isinstance(result, BranchWorkflowResultSuccess)
+        branch = WorkflowRegistry.get_workflow_by_name(result.branched_workflow_name)
+        assert branch.metadata.name == "comp (branch 1)"

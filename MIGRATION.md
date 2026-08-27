@@ -1,5 +1,35 @@
 # Unreleased
 
+## Branched workflows show a title instead of a file path
+
+Branching a workflow used to set the new workflow's `metadata.name` — the human-readable display
+name — to its registry key, which is derived from the file path. A branch of "Shot 010 Comp" saved
+under `shots/sh010/` came back named `shots/sh010/comp_branch_1`, so anywhere the editor shows a
+workflow title, a branch read as a path while its own source next to it read as a title.
+
+A branch is now named after the workflow it came from:
+
+|                 | before                      | after                                   |
+| --------------- | --------------------------- | --------------------------------------- |
+| registry key    | `shots/sh010/comp_branch_1` | `shots/sh010/comp_branch_1` (unchanged) |
+| `metadata.name` | `shots/sh010/comp_branch_1` | `Shot 010 Comp (branch 1)`              |
+
+Registry keys are unchanged, so anything that looks workflows up by name keeps working. Merging a
+branch no longer overwrites its source's title, and resetting a branch no longer overwrites its own.
+
+`BranchWorkflowRequest` takes an optional `branched_workflow_display_name` if you want to set the
+label yourself:
+
+```python
+BranchWorkflowRequest(workflow_name="shots/sh010/comp", branched_workflow_display_name="Lighting Test")
+```
+
+**Workflows already on disk.** Files written by earlier versions still carry the path in their
+header. The engine shows the readable name (just the file name, e.g. `comp_branch_1`) when it loads
+one, and the header is rewritten the next time that workflow is saved. Nothing is rewritten during
+load, so no files change until you save them. Only a display name that exactly equals its own
+registry key is repaired — a title you deliberately wrote with a `/` in it is left alone.
+
 ## Agent streaming payloads carry `thread_id`
 
 `AgentStreamEvent`, `AgentThinkingEvent`, `AgentToolCallEvent`, and `AgentToolResultEvent`
