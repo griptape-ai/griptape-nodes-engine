@@ -3,7 +3,7 @@
 import json
 import logging
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import pytest
 
@@ -19,8 +19,6 @@ from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import (
     SituationPolicy,
     write_sidecar,
 )
-
-HANDLE_REQUEST_PATH = "griptape_nodes.retained_mode.file_metadata.sidecar_metadata.GriptapeNodes.handle_request"
 
 
 class TestSidecarContentModel:
@@ -59,15 +57,11 @@ class TestWriteSidecarFailurePaths:
         """write_sidecar logs a warning and swallows the exception when no project is loaded."""
         file_path = Path("/workspace/output.txt")
         metadata = SidecarContent()
+        mock_engine = Mock()
+        mock_engine.handle_request.return_value = GetCurrentProjectResultFailure(result_details="no project")
 
-        with (
-            patch(
-                HANDLE_REQUEST_PATH,
-                return_value=GetCurrentProjectResultFailure(result_details="no project"),
-            ),
-            caplog.at_level(logging.WARNING, logger="griptape_nodes"),
-        ):
-            write_sidecar(file_path, metadata)
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            write_sidecar(file_path, metadata, mock_engine)
 
         assert "Failed to write sidecar metadata" in caplog.text
         assert "output.txt" in caplog.text
@@ -96,11 +90,11 @@ class TestWriteSidecarFailurePaths:
             msg = f"Unexpected request: {request}"
             raise AssertionError(msg)
 
-        with (
-            patch(HANDLE_REQUEST_PATH, side_effect=handle_request),
-            caplog.at_level(logging.WARNING, logger="griptape_nodes"),
-        ):
-            write_sidecar(file_path, metadata)
+        mock_engine = Mock()
+        mock_engine.handle_request.side_effect = handle_request
+
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            write_sidecar(file_path, metadata, mock_engine)
 
         assert "Failed to write sidecar metadata" in caplog.text
 
@@ -148,11 +142,11 @@ class TestWriteSidecarFailurePaths:
             msg = f"Unexpected request: {request}"
             raise AssertionError(msg)
 
-        with (
-            patch(HANDLE_REQUEST_PATH, side_effect=handle_request),
-            caplog.at_level(logging.WARNING, logger="griptape_nodes"),
-        ):
-            write_sidecar(file_path, metadata)
+        mock_engine = Mock()
+        mock_engine.handle_request.side_effect = handle_request
+
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            write_sidecar(file_path, metadata, mock_engine)
 
         assert "Failed to write sidecar metadata" in caplog.text
 
@@ -201,8 +195,10 @@ class TestWriteSidecarFailurePaths:
             msg = f"Unexpected request: {request}"
             raise AssertionError(msg)
 
-        with patch(HANDLE_REQUEST_PATH, side_effect=handle_request):
-            write_sidecar(file_path, None)
+        mock_engine = Mock()
+        mock_engine.handle_request.side_effect = handle_request
+
+        write_sidecar(file_path, None, mock_engine)
 
         assert sidecar_path.exists()
         data = json.loads(sidecar_path.read_text())

@@ -9,9 +9,15 @@ from dataclasses import dataclass
 from fnmatch import fnmatch
 from functools import partial
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import anyio
 import anyio.to_thread
+
+from griptape_nodes.retained_mode.managers.settings import DISCOVERY_MAX_DEPTH_KEY
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.engine import Engine
 
 logger = logging.getLogger(__name__)
 
@@ -21,21 +27,17 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_SEARCH_DEPTH = 5
 
 
-def _resolve_discovery_max_depth() -> int:
+def _resolve_discovery_max_depth(engine: Engine) -> int:
     """Read the operator-configured ``discovery_max_depth`` ceiling for recursive discovery.
 
     Returns the live `discovery_max_depth` engine setting (overridable via the
     `GTN_CONFIG_DISCOVERY_MAX_DEPTH` env var), falling back to
     DEFAULT_MAX_SEARCH_DEPTH only when the setting is absent.
-    """
-    # Lazy import: file_utils is a leaf util imported by the managers, so reaching
-    # GriptapeNodes/ConfigManager at module top-level would create a cycle
-    # (file_utils <- managers <- griptape_nodes). config_manager.py breaks the
-    # same cycle the same way.
-    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-    from griptape_nodes.retained_mode.managers.settings import DISCOVERY_MAX_DEPTH_KEY
 
-    return GriptapeNodes.ConfigManager().get_config_value(
+    Args:
+        engine: The engine whose ConfigManager holds the setting.
+    """
+    return engine.config_manager.get_config_value(
         DISCOVERY_MAX_DEPTH_KEY, default=DEFAULT_MAX_SEARCH_DEPTH, cast_type=int
     )
 
@@ -253,6 +255,7 @@ async def find_files_recursive(
     directory: Path,
     pattern: str,
     *,
+    engine: Engine,
     skip_hidden: bool = True,
     max_files: int | None = None,
 ) -> list[Path]:
@@ -266,6 +269,7 @@ async def find_files_recursive(
     Args:
         directory: Directory to search in
         pattern: Glob pattern to match file names against (e.g., '*.json')
+        engine: The engine whose ConfigManager supplies the `discovery_max_depth` ceiling.
         skip_hidden: If True, skip hidden directories (those starting with .).
             This avoids descending into large hidden trees like .git or .venv.
         max_files: If set, stop and return as soon as this many matches are found.
@@ -285,7 +289,7 @@ async def find_files_recursive(
     params = _AsyncWalkParams(
         pattern=pattern,
         skip_hidden=skip_hidden,
-        max_depth=_resolve_discovery_max_depth(),
+        max_depth=_resolve_discovery_max_depth(engine),
         max_files=max_files,
         matches=matches,
     )

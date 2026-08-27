@@ -6040,14 +6040,17 @@ situations:
         nested_project.write_text(self.VALID_PROJECT_YAML)
         yaml_content = self.VALID_PROJECT_YAML
 
-        def get_config_value_side_effect(key: str, **_: object) -> object:
+        def get_config_value_side_effect(key: str, default: object = None, **_: object) -> object:
             if key == PROJECTS_TO_REGISTER_KEY:
                 return [str(tmp_path)]
-            return []
+            return default
 
         cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
 
         mock_engine = MagicMock()
+        # find_files_recursive reads discovery_max_depth via self.engine.config_manager, so this
+        # mock config manager needs the same fallback-to-default behavior as pm._config_manager.
+        mock_engine.config_manager.get_config_value.side_effect = get_config_value_side_effect
         with (
             patch.object(pm, "_engine", mock_engine),
             patch.object(pm, "_register_project_path") as mock_register,

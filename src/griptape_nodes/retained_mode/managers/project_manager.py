@@ -2047,7 +2047,7 @@ class ProjectManager(EngineScoped):
         # Canonicalize directory-discovered files the same way _load_projects_from_directory does, so
         # their paths collide with registry paths under the path-identity comparisons used downstream.
         for directory in directory_paths:
-            discovered = await find_files_recursive(directory, WORKSPACE_PROJECT_FILE)
+            discovered = await find_files_recursive(directory, WORKSPACE_PROJECT_FILE, engine=self.engine)
             file_paths.extend(canonicalize_for_identity(path) for path in discovered)
 
         for canonical_path in file_paths:
@@ -5161,7 +5161,7 @@ class ProjectManager(EngineScoped):
         `discovery_max_depth` setting and hidden directories (e.g. .venv, .git)
         are skipped by find_files_recursive.
         """
-        discovered = await find_files_recursive(directory, WORKSPACE_PROJECT_FILE)
+        discovered = await find_files_recursive(directory, WORKSPACE_PROJECT_FILE, engine=self.engine)
         if not discovered:
             logger.warning(
                 "projects_to_register directory '%s' contains no '%s' files; skipping",

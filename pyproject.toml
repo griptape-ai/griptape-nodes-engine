@@ -185,8 +185,10 @@ ignore = [
 # WorkflowRegistry is still a process-global fake singleton reaching the facade for config.
 # Making it engine-owned is its own change, since it alters what node libraries import.
 "src/griptape_nodes/node_library/workflow_registry.py" = ["TID251"]
-"src/griptape_nodes/utils/**" = ["TID251"]
-"src/griptape_nodes/retained_mode/file_metadata/**" = ["TID251"]
+# artifact_normalization.py is called from Parameter converter closures in
+# exe_types/param_types/parameter_{image,audio,video,three_d}.py, which have no Engine of
+# their own yet, so it cannot come off this list until exe_types does.
+"src/griptape_nodes/utils/artifact_normalization.py" = ["TID251"]
 # project_packager.py reaches the facade from a module-level free function. Its engine has to be
 # threaded from project_manager.on_export_project_request through package_project_to_zip.
 "src/griptape_nodes/retained_mode/publishing/project_packager.py" = ["TID251"]
