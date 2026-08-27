@@ -307,3 +307,54 @@ class TestForeignContextIsNotSilent:
         finally:
             config_manager.workspace_path = original_workspace
             _drain(context_manager)
+
+
+class TestProjectSwitchReconcilesContext:
+    """A project switch is a real, user-reachable way to strand a context key.
+
+    Registry keys are derived against the active workspace, so switching to a project
+    with a different workspace rebuilds the registry out from under whatever the user
+    had open. Only a *library* change clears object state (and with it the context);
+    a workspace-only switch does not, which leaves the outgoing project's key on the
+    stack -- still answering GetWorkflowContext, backed by nothing.
+    """
+
+    @pytest.mark.asyncio
+    async def test_workspace_only_switch_leaves_no_orphaned_context(
+        self, griptape_nodes: Engine, tmp_path: Path
+    ) -> None:
+        """The workspace-changed branch must retire keys the rebuilt registry cannot back."""
+        context_manager = griptape_nodes.ContextManager()
+        config_manager = griptape_nodes.ConfigManager()
+        project_manager = griptape_nodes.ProjectManager()
+        _drain(context_manager)
+
+        outgoing = tmp_path / "project_a"
+        incoming = tmp_path / "project_b"
+        outgoing.mkdir()
+        incoming.mkdir()
+
+        original_workspace = config_manager.workspace_path
+        config_manager.workspace_path = outgoing
+        try:
+            with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+                _register_workflow(outgoing, "Workflow_2")
+                context_manager.push_workflow(workflow_name="Workflow_2")
+
+                # The switch itself: new workspace, library config untouched.
+                config_manager.workspace_path = incoming
+                failure = await project_manager._reload_after_project_switch(
+                    "project-b",
+                    workspace_changed=True,
+                    library_config_changed=False,
+                )
+
+                assert failure is None
+                assert not WorkflowRegistry.has_workflow_with_name("Workflow_2")
+                assert not context_manager.has_current_workflow(), (
+                    "the outgoing project's workflow key survived the switch and would be "
+                    "reported as the open workflow in the incoming project"
+                )
+        finally:
+            config_manager.workspace_path = original_workspace
+            _drain(context_manager)
