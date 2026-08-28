@@ -27,6 +27,10 @@ STATIC_SERVER_ENABLED = os.getenv("STATIC_SERVER_ENABLED", "true").lower() == "t
 STATIC_SERVER_HOST = os.getenv("STATIC_SERVER_HOST", "localhost")
 # Port of the static server (where uvicorn binds). Falls back to an OS-assigned free port if unavailable.
 STATIC_SERVER_PORT = int(os.getenv("STATIC_SERVER_PORT", "8124"))
+# Set by the orchestrator on a worker subprocess's environment: the URL of the static server
+# the orchestrator already serves this workspace on. A worker adopts it instead of starting a
+# server of its own, so asset URLs a worker produces outlive that worker.
+ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV = "GTN_ORCHESTRATOR_STATIC_SERVER_BASE_URL"
 # URL path for the static server
 STATIC_SERVER_URL = os.getenv("STATIC_SERVER_URL", "/workspace")
 # Log level for the static server

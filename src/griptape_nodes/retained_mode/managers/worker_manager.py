@@ -21,6 +21,7 @@ from griptape_nodes.retained_mode.managers.settings import (
     WORKER_HEARTBEAT_STARTUP_GRACE_KEY,
     WORKER_HEARTBEAT_TIMEOUT_KEY,
 )
+from griptape_nodes.servers.static import ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV
 from griptape_nodes.utils.version_utils import engine_version
 
 if TYPE_CHECKING:
@@ -340,6 +341,16 @@ class WorkerManager(EngineScoped):
         # desktop app); unbuffered output keeps worker log lines from stalling in Python's
         # block buffer and from being lost on a crash.
         worker_environ["PYTHONUNBUFFERED"] = "1"
+
+        # Hand the worker the URL of the static server the orchestrator is ALREADY serving
+        # this workspace on. Without it the worker starts its own server, wins an arbitrary
+        # OS-assigned port, and hands back asset URLs on that port -- which die when the
+        # worker is evicted and are already dead by the time a saved workflow is reopened.
+        # Both processes share the workspace on disk, so the orchestrator's long-lived
+        # server is the right place to serve anything a worker writes.
+        static_base_url = self._orchestrator_static_server_base_url()
+        if static_base_url is not None:
+            worker_environ[ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV] = static_base_url
         # Hand the orchestrator's own stdout/stderr to the worker explicitly so worker log
         # lines land in the same stream as orchestrator logs. Implicit inheritance is
         # POSIX-only: on Windows, redirected std handles (e.g. the desktop app's pipes) are
@@ -424,6 +435,19 @@ class WorkerManager(EngineScoped):
         # RequestClient.cancel_requests_by_tag, so a dead worker still surfaces
         # to the caller without a per-request ceiling.
         return await future
+
+    def _orchestrator_static_server_base_url(self) -> str | None:
+        """The base URL this engine serves the workspace on, when it has resolved one.
+
+        Returns None before app initialization settles it (nothing to hand a worker yet) or
+        when this engine serves nothing itself, in which case the worker falls back to its
+        own server exactly as before.
+        """
+        try:
+            return self.engine.static_files_manager.static_server_base_url
+        except RuntimeError:
+            # Raised when accessed before on_app_initialization_complete resolved it.
+            return None
 
     async def evict_worker(self, worker_engine_id: str) -> None:
         """Remove a worker from the registry and unsubscribe from its response topic."""

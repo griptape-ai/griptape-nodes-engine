@@ -42,6 +42,7 @@ from griptape_nodes.retained_mode.events.base_events import (
     WorkflowNotAlteredMixin,
 )
 from griptape_nodes.retained_mode.events.config_events import (
+    GetConfigValueRequest,
     ResetConfigRequest,
     SetConfigCategoryRequest,
     SetConfigValueRequest,
@@ -79,6 +80,7 @@ from griptape_nodes.retained_mode.events.project_events import (
 )
 from griptape_nodes.retained_mode.events.secrets_events import (
     DeleteSecretValueRequest,
+    GetSecretValueRequest,
     SetSecretValueRequest,
 )
 from griptape_nodes.retained_mode.events.variable_events import (
@@ -128,10 +130,15 @@ FORWARDED_REQUEST_TYPES: frozenset[type[RequestPayload]] = frozenset(
         ListFlowsInCurrentContextRequest,
         ListFlowsInFlowRequest,
         # config_events
+        # Getters forward too: a worker's own ConfigManager is populated from the same shared
+        # files, but it is a non-authoritative copy that can lag the orchestrator's in-memory
+        # state. Reads during node execution should see what the orchestrator sees.
+        GetConfigValueRequest,
         SetConfigValueRequest,
         SetConfigCategoryRequest,
         ResetConfigRequest,
         # secrets_events
+        GetSecretValueRequest,
         SetSecretValueRequest,
         DeleteSecretValueRequest,
         # variable_events

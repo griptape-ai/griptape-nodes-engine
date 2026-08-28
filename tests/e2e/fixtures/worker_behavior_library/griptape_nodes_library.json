@@ -1,0 +1,92 @@
+{
+  "name": "Worker Behavior Library",
+  "library_schema_version": "0.12.0",
+  "metadata": {
+    "author": "Test Fixture",
+    "description": "Behaviors a heavy library depends on when executing in a worker",
+    "library_version": "0.1.0",
+    "engine_version": "0.0.0",
+    "tags": [
+      "test"
+    ],
+    "dependencies": {
+      "pip_dependencies": [],
+      "pip_dependencies_exec": []
+    }
+  },
+  "categories": [
+    {
+      "test": {
+        "title": "test",
+        "description": "Test nodes",
+        "color": "border-gray-500",
+        "icon": "Folder"
+      }
+    }
+  ],
+  "nodes": [
+    {
+      "class_name": "SaveMediaNode",
+      "file_path": "worker_behavior_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Writes bytes and returns a URL",
+        "display_name": "SaveMediaNode"
+      }
+    },
+    {
+      "class_name": "ReadConfigNode",
+      "file_path": "worker_behavior_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Reads engine config via a request",
+        "display_name": "ReadConfigNode"
+      }
+    },
+    {
+      "class_name": "StreamingNode",
+      "file_path": "worker_behavior_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Streams progress and yields work",
+        "display_name": "StreamingNode"
+      }
+    },
+    {
+      "class_name": "ChainStartNode",
+      "file_path": "worker_behavior_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "First hop of a three-node chain",
+        "display_name": "ChainStartNode"
+      }
+    },
+    {
+      "class_name": "ChainMiddleNode",
+      "file_path": "worker_behavior_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Second hop of a three-node chain",
+        "display_name": "ChainMiddleNode"
+      }
+    },
+    {
+      "class_name": "ChainEndNode",
+      "file_path": "worker_behavior_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Third hop of a three-node chain",
+        "display_name": "ChainEndNode"
+      }
+    },
+    {
+      "class_name": "EditorBehaviorNode",
+      "file_path": "worker_behavior_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Converters, validators, dynamic parameters",
+        "display_name": "EditorBehaviorNode"
+      }
+    }
+  ]
+}
