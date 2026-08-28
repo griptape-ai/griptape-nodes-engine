@@ -21,13 +21,19 @@ This is the mechanism behind the stale-library report. Three facts combine:
    loaded template outright, but **system defaults still takes this path**, so the exposure
    is narrowed rather than removed.
 
-What writes those entries into the user layer is NOT established. `gtn init` is the
-remaining live candidate (it writes the user config and the desktop app invokes it), but
-that is unconfirmed. Two other suspects were ruled out: the desktop app's
-`registerLibraries()` filesystem sweep has had no callers since Nov 2025, and
-`_write_user_config_delta` merges only the delta into the on-disk file rather than
-round-tripping the merged config. Until the writer is known, these tests pin the exposure
-mechanism only -- they do not prove how a given user's config came to hold stale paths.
+Editing library settings in the editor is what puts those entries in the user layer. The
+editor renders the MERGED config (`on_handle_get_config_category_request` returns
+`merged_config`) and every write to a list-valued key sends the whole rendered array. So
+`set_config_value` builds a delta holding the merged list, and because
+`_write_user_config_delta` merges that delta with `merge_lists=False`, the array in the
+user config file is replaced by the merged one. Toggling a library's enabled switch,
+changing its execution mode, or removing a row therefore copies the active project's entire
+library list into the user config, where it persists after the project is gone.
+
+(The write path is delta-only at the file level, which is why it looked clean at first
+glance. The leak is in the delta's own contents for list keys, not in the file merge. The
+desktop app's `registerLibraries()` filesystem sweep, blamed earlier, has had no callers
+since Nov 2025 and is not involved.)
 """
 
 from __future__ import annotations
