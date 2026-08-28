@@ -256,6 +256,12 @@ class _ProjectVariableResolver:
     none of the known sources and are absent from shell env are left unresolved so
     the underlying ParsedMacro.resolve raises MISSING_REQUIRED_VARIABLES.
 
+    Builtin lookup failures are cached alongside successes, so a builtin that is
+    unavailable in the current context (e.g. `workflow_dir` with no current workflow)
+    is attempted once per resolver instance no matter how many directories or
+    environment values reference it, and its degradation warning logs once rather
+    than once per referencing directory.
+
     Construct via `ProjectManager._build_variable_resolver`. Cycle detection and caches
     are instance-scoped so resolvers are single-use per call site.
     """
@@ -264,6 +270,8 @@ class _ProjectVariableResolver:
     get_builtin: Callable[[str], str]
     secrets_manager: SecretsManager
     builtins_cache: dict[str, str] = field(default_factory=dict)
+    builtins_unavailable: dict[str, RuntimeError | NotImplementedError] = field(default_factory=dict)
+    warned_unavailable_builtins: set[str] = field(default_factory=set)
     env_resolved: dict[str, str] = field(default_factory=dict)
     directories_resolved: dict[str, str] = field(default_factory=dict)
     in_progress: set[str] = field(default_factory=set)
@@ -307,10 +315,22 @@ class _ProjectVariableResolver:
         self.env_resolved[name] = resolved
         return resolved
 
+    def resolve_builtin(self, name: str) -> str:
+        """Resolve a builtin variable, sharing this resolver's success and failure caches."""
+        return self._get_builtin(name)
+
     def _get_builtin(self, name: str) -> str:
-        if name not in self.builtins_cache:
-            self.builtins_cache[name] = self.get_builtin(name)
-        return self.builtins_cache[name]
+        if name in self.builtins_unavailable:
+            raise self.builtins_unavailable[name]
+        if name in self.builtins_cache:
+            return self.builtins_cache[name]
+        try:
+            value = self.get_builtin(name)
+        except (RuntimeError, NotImplementedError) as e:
+            self.builtins_unavailable[name] = e
+            raise
+        self.builtins_cache[name] = value
+        return value
 
     def _resolve_macro_string(self, owner_kind: str, owner_name: str, raw_value: str) -> str:
         token = f"{owner_kind}:{owner_name}"
@@ -337,20 +357,7 @@ class _ProjectVariableResolver:
                         # situation-macro path in on_get_path_for_macro_request. A required
                         # builtin that can't resolve is a genuine error.
                         if not var_info.is_required:
-                            # Logged because the degraded result is a PLAUSIBLE path, not an
-                            # obviously broken one: dropping `{workflow_dir}` from
-                            # `{workflow_dir?:/}outputs` silently relocates writes and reads
-                            # from the workflow's folder to the workspace root. Without this
-                            # line the only symptom is media that resolves to a file which was
-                            # never written there.
-                            logger.warning(
-                                "Optional builtin '%s' could not be resolved while resolving %s '%s'; "
-                                "dropping it from the path (%s)",
-                                ref,
-                                owner_kind,
-                                owner_name,
-                                e,
-                            )
+                            self._warn_unavailable_builtin_once(ref, owner_kind, owner_name, e)
                             continue
                         msg = (
                             f"Cannot resolve {owner_kind} '{owner_name}': "
@@ -392,6 +399,35 @@ class _ProjectVariableResolver:
         finally:
             self.in_progress.discard(token)
         return resolved
+
+    def _warn_unavailable_builtin_once(
+        self,
+        ref: str,
+        owner_kind: str,
+        owner_name: str,
+        error: RuntimeError | NotImplementedError,
+    ) -> None:
+        """Log the optional-builtin degradation warning for the first failure of `ref` only.
+
+        Logged because the degraded result is a PLAUSIBLE path, not an obviously broken one:
+        dropping `{workflow_dir}` from `{workflow_dir?:/}outputs` silently relocates writes and
+        reads from the workflow's folder to the workspace root. Without this line the only
+        symptom is media that resolves to a file which was never written there.
+
+        Every directory and environment value referencing the same unavailable builtin reaches
+        this call, so the warning is emitted once per builtin per resolver instance and the
+        references after the first degrade silently.
+        """
+        if ref in self.warned_unavailable_builtins:
+            return
+        self.warned_unavailable_builtins.add(ref)
+        logger.warning(
+            "Optional builtin '%s' could not be resolved while resolving %s '%s'; dropping it from the path (%s)",
+            ref,
+            owner_kind,
+            owner_name,
+            error,
+        )
 
 
 @dataclass
@@ -459,6 +495,20 @@ class _BuiltinResolutionResult(NamedTuple):
     """
 
     conflicts: set[str]
+    unavailable: dict[str, Exception]
+
+
+class _ProjectVariableResolution(NamedTuple):
+    """Outcome of resolving a batch of computed project variables through one resolver.
+
+    `resolved` holds a READ_ONLY snapshot per name that produced a value. `unavailable`
+    maps each remaining name to the exception explaining why its context isn't ready
+    (e.g. "No current workflow"). Callers enumerating the whole computed namespace skip
+    the unavailable names; the split lets them report which name failed and why without
+    resolving twice.
+    """
+
+    resolved: dict[str, FlowVariable]
     unavailable: dict[str, Exception]
 
 
@@ -4527,32 +4577,69 @@ class ProjectManager(EngineScoped):
         Stored (user-defined) project variables are NOT resolved here; those live in
         VariablesManager's project bags. This method covers only the computed namespace.
 
+        Use `resolve_project_variables` to resolve several names at once; it shares one
+        resolver across the whole call instead of building one per name.
+
         Raises ValueError when the project isn't loaded or the name isn't a computed name;
         RuntimeError / NotImplementedError when the value's context isn't ready (e.g.
         {workflow_dir} before the workflow is saved).
         """
+        project_info = self._loaded_project_info(project_id)
+        resolver = self._build_variable_resolver(project_info.template, project_info)
+        return self._computed_variable_snapshot(name, project_info, resolver)
+
+    def resolve_project_variables(self, names: Iterable[str], *, project_id: str | None) -> _ProjectVariableResolution:
+        """Resolve many computed project variables through a single shared resolver.
+
+        One resolver serves every name, so a builtin or directory that several names
+        reference is resolved once for the whole call rather than once per name. That
+        matters for the default template, where seven directories anchor to
+        `{workflow_dir?:/}`: a per-name resolver re-resolved the builtin seven times and
+        emitted seven identical degradation warnings.
+
+        Names whose context isn't ready are reported in `unavailable` instead of raising,
+        so a caller enumerating the whole namespace can skip them. A name that isn't a
+        computed name at all still raises ValueError, since that is a caller bug rather
+        than a not-ready value.
+        """
+        project_info = self._loaded_project_info(project_id)
+        resolver = self._build_variable_resolver(project_info.template, project_info)
+
+        resolved: dict[str, FlowVariable] = {}
+        unavailable: dict[str, Exception] = {}
+        for name in names:
+            try:
+                resolved[name] = self._computed_variable_snapshot(name, project_info, resolver)
+            except (RuntimeError, NotImplementedError, MacroResolutionError) as e:
+                unavailable[name] = e
+        return _ProjectVariableResolution(resolved=resolved, unavailable=unavailable)
+
+    def _loaded_project_info(self, project_id: str | None) -> ProjectInfo:
+        """Return the loaded template info for `project_id`, or raise if it isn't loaded."""
         effective = self.resolve_project_id(project_id)
         if effective is None:
             msg = f"Project '{project_id}' is not loaded"
             raise ValueError(msg)
-        project_info = self._successfully_loaded_project_templates[effective]
+        return self._successfully_loaded_project_templates[effective]
 
+    def _computed_variable_snapshot(
+        self, name: str, project_info: ProjectInfo, resolver: _ProjectVariableResolver
+    ) -> FlowVariable:
+        """Resolve one computed name to a READ_ONLY snapshot through `resolver`.
+
+        Builtins go through the resolver rather than `_get_builtin_variable_value` directly so
+        they share its caches with any directory macro that references them.
+        """
         if name in BUILTIN_VARIABLES:
-            value = self._get_builtin_variable_value(name, project_info)
-            return FlowVariable(
-                name=name, owning_flow_name=None, type="str", value=value, permission=VariablePermission.READ_ONLY
-            )
-        if name in project_info.template.directories:
-            resolver = self._build_variable_resolver(project_info.template, project_info)
-            return FlowVariable(
-                name=name,
-                owning_flow_name=None,
-                type="str",
-                value=resolver.resolve_directory(name),
-                permission=VariablePermission.READ_ONLY,
-            )
-        msg = f"Unknown computed project variable '{name}'"
-        raise ValueError(msg)
+            value = resolver.resolve_builtin(name)
+        elif name in project_info.template.directories:
+            value = resolver.resolve_directory(name)
+        else:
+            msg = f"Unknown computed project variable '{name}'"
+            raise ValueError(msg)
+        return FlowVariable(
+            name=name, owning_flow_name=None, type="str", value=value, permission=VariablePermission.READ_ONLY
+        )
 
     # Helper methods (private)
 

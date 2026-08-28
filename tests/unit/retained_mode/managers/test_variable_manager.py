@@ -56,6 +56,7 @@ from griptape_nodes.retained_mode.variable_types import (
 )
 
 _GET_PROJECT_VAR_PATCH = "griptape_nodes.retained_mode.managers.variable_manager.VariablesManager._get_project_variable"
+_COMPUTED_NAMES_PATCH = "griptape_nodes.retained_mode.managers.project_manager.ProjectManager.project_computed_names"
 _LIST_PROJECT_VAR_NAMES_PATCH = (
     "griptape_nodes.retained_mode.managers.variable_manager.VariablesManager._list_project_variable_names"
 )
@@ -80,6 +81,10 @@ def _macro(name: str, value: Any) -> FlowVariable:
 def project_macros(macros: dict[str, Any]) -> Iterator[None]:
     """Patch VariablesManager's project-layer seams to return the given macros.
 
+    Every macro is served through `_get_project_variable`, so the computed namespace is
+    emptied for the duration: the bulk computed-resolution path would otherwise resolve
+    real builtins and directories from the live project template and shadow these values.
+
     Usage: `with project_macros({"workspace_dir": "/x"}): ...`.
     """
 
@@ -91,9 +96,13 @@ def project_macros(macros: dict[str, Any]) -> Iterator[None]:
             return None
         return _macro(name, macros[name])
 
+    def no_computed_names(_self: object, *, project_id: str | None = None) -> frozenset[str]:  # noqa: ARG001
+        return frozenset()
+
     with (
         patch(_LIST_PROJECT_VAR_NAMES_PATCH, autospec=True, side_effect=list_names),
         patch(_GET_PROJECT_VAR_PATCH, autospec=True, side_effect=get_var),
+        patch(_COMPUTED_NAMES_PATCH, autospec=True, side_effect=no_computed_names),
     ):
         yield
 

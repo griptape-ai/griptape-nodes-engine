@@ -404,12 +404,34 @@ class VariablesManager(EngineScoped):
         Silent-skip for bulk enumeration: computed values whose context isn't ready (e.g.
         workflow_dir before the workflow is saved) are omitted rather than raising. Each entry
         carries VariableLayerKind.PROJECT so callers can distinguish it from a same-named global.
+
+        Every computed name resolves through one shared resolver, so a builtin that many
+        template directories reference is resolved once for the whole enumeration.
         """
+        effective = self._effective_project_id(project_id)
+        if effective is None:
+            return []
+
+        project_manager = self.engine.project_manager
+        computed_names = project_manager.project_computed_names(project_id=effective)
+        if not computed_names:
+            resolved_computed: dict[str, FlowVariable] = {}
+        else:
+            resolution = project_manager.resolve_project_variables(computed_names, project_id=effective)
+            for name, error in resolution.unavailable.items():
+                logger.debug("Computed project variable %r unavailable: %s", name, error)
+            resolved_computed = resolution.resolved
+
         collected: list[ResolvedVariable] = []
         for name in self._list_project_variable_names(project_id=project_id):
             if name in seen:
                 continue
-            variable = self._get_project_variable(name, project_id=project_id)
+            # A computed name that failed to resolve gets no stored-layer fallback: the name is
+            # defined, just unavailable right now.
+            if name in computed_names:
+                variable = resolved_computed.get(name)
+            else:
+                variable = self._get_project_variable(name, project_id=project_id)
             if variable is None:
                 continue
             collected.append(ResolvedVariable(variable=variable, layer=VariableLayerKind.PROJECT))

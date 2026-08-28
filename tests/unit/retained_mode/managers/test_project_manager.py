@@ -875,6 +875,65 @@ class TestProjectManagerBuiltinVariables:
             f"Expected a warning about the dropped optional builtin, got: {warning_messages}"
         )
 
+    def test_get_builtin_caches_unavailable_builtin_across_directories(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """One resolver instance warns once per unavailable builtin, not once per referencing directory.
+
+        Regression guard for a warning storm observed against a live engine: a single 3-node flow
+        run on an unsaved workflow emitted one identical WARNING per default project directory that
+        anchors to `{workflow_dir?:/}` (backups, inputs, outputs, temp, workflow_run_failures, and
+        the two dotted metadata/preview directories) -- 21 lines from 3 resolution passes over 7
+        directories. Callers that resolve every directory through one shared resolver (e.g.
+        `_absolute_path_to_macro_path`, `on_get_path_for_macro_request`) hit the same unavailable
+        builtin once per directory. `_get_builtin` caches the failure alongside successes, so the
+        underlying builtin callable runs once per resolver instance regardless of how many
+        directories reference it, and `_resolve_macro_string` warns only on that first failure.
+        """
+        from griptape_nodes.retained_mode.managers.project_manager import (
+            DEFAULT_PROJECT_TEMPLATE as DEFAULT_TEMPLATE_FROM_MODULE,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import _ProjectVariableResolver
+
+        directories_anchored_to_workflow_dir = [
+            name
+            for name, directory in DEFAULT_TEMPLATE_FROM_MODULE.directories.items()
+            if isinstance(directory.path_macro, str) and "workflow_dir" in directory.path_macro
+        ]
+        # Sanity: this is the exact multi-directory fan-out that produced the storm, not one directory.
+        min_expected_directories_anchored_to_workflow_dir = 5
+        assert len(directories_anchored_to_workflow_dir) >= min_expected_directories_anchored_to_workflow_dir
+
+        call_count = 0
+
+        def unavailable_get_builtin(name: str) -> str:  # noqa: ARG001
+            nonlocal call_count
+            call_count += 1
+            msg = "No current workflow"
+            raise RuntimeError(msg)
+
+        resolver = _ProjectVariableResolver(
+            template=DEFAULT_TEMPLATE_FROM_MODULE,
+            get_builtin=unavailable_get_builtin,
+            secrets_manager=Mock(),
+        )
+
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            resolved = {name: resolver.resolve_directory(name) for name in directories_anchored_to_workflow_dir}
+
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warning_records) == 1, f"Expected exactly one warning, got: {[r.message for r in warning_records]}"
+        assert "workflow_dir" in warning_records[0].message
+        assert "dropping it from the path" in warning_records[0].message
+        # The unavailable builtin still degrades every directory to its workspace-relative
+        # suffix rather than erroring -- it just loses its workflow-relative anchor.
+        for name in directories_anchored_to_workflow_dir:
+            path_macro = cast("str", DEFAULT_TEMPLATE_FROM_MODULE.directories[name].path_macro)
+            assert resolved[name] == path_macro.removeprefix("{workflow_dir?:/}")
+        # The actual mechanism: the builtin callable itself ran once, not once per directory.
+        assert call_count == 1
+
     @patch("griptape_nodes.retained_mode.managers.project_manager.WorkflowRegistry")
     def test_builtin_workflow_dir_survives_stale_registry_key(
         self,
