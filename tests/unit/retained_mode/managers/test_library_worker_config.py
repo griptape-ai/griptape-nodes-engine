@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from griptape_nodes.node_library.library_registry import LibraryMetadata
+from griptape_nodes.node_library.library_registry import Dependencies, LibraryMetadata
 from griptape_nodes.retained_mode.events.app_events import LibraryLoadedNotification
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 
@@ -69,6 +69,7 @@ class TestGetWorkerForLibrary:
             is_sandbox=False,
             library_name="my_lib",
             requires_worker=True,
+            executes_in_worker=True,
         )
 
         cast("MagicMock", mgr._worker_manager).get_worker_for_key.return_value = (
@@ -106,6 +107,7 @@ class TestGetWorkerForLibrary:
             is_sandbox=False,
             library_name="my_lib",
             requires_worker=True,
+            executes_in_worker=True,
         )
 
         cast("MagicMock", mgr._worker_manager).get_worker_for_key.return_value = None
@@ -174,3 +176,45 @@ class TestRegisterPreReloadCallback:
         mgr.register_pre_reload_callback(second)
 
         assert mgr._pre_reload_callbacks == [*baseline, first, second]
+
+
+class TestResolveExecutesInWorker:
+    """Execution placement is a fact about dependencies, derived not declared."""
+
+    def _metadata(self, *, exec_deps: list[str] | None) -> LibraryMetadata:
+        dependencies = None
+        if exec_deps is not None:
+            dependencies = Dependencies(pip_dependencies=["pillow"], pip_dependencies_exec=exec_deps)
+        return LibraryMetadata(
+            author="t",
+            description="d",
+            library_version="1.0.0",
+            engine_version="0.0.0",
+            tags=[],
+            dependencies=dependencies,
+        )
+
+    def test_exec_dependencies_require_a_worker(self) -> None:
+        result = LibraryManager._resolve_executes_in_worker(
+            requires_worker=False, metadata=self._metadata(exec_deps=["torch"])
+        )
+        assert result is True
+
+    def test_no_dependencies_section_means_no_worker(self) -> None:
+        result = LibraryManager._resolve_executes_in_worker(
+            requires_worker=False, metadata=self._metadata(exec_deps=None)
+        )
+        assert result is False
+
+    def test_empty_exec_dependencies_mean_no_worker(self) -> None:
+        result = LibraryManager._resolve_executes_in_worker(
+            requires_worker=False, metadata=self._metadata(exec_deps=[])
+        )
+        assert result is False
+
+    def test_legacy_worker_mode_still_executes_in_a_worker(self) -> None:
+        """The two reasons are independent: declaring worker mode is sufficient alone."""
+        result = LibraryManager._resolve_executes_in_worker(
+            requires_worker=True, metadata=self._metadata(exec_deps=None)
+        )
+        assert result is True

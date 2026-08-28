@@ -510,6 +510,13 @@ class LibraryManager(EngineScoped):
         # parsed (discovery or lifecycle progression). Absence of the relevant
         # declarations falls through to False.
         requires_worker: bool = False
+        # True when this library's nodes EXECUTE in a dedicated worker process, for either
+        # reason: legacy worker-mode declarations (requires_worker above, which also skips
+        # orchestrator-side loading in favor of stubs) or execution dependencies
+        # (pip_dependencies_exec -- the library loads REAL nodes on the orchestrator and
+        # only its process() runs in the worker, where .venv-exec is on sys.path).
+        # Consumed by execution routing; never by load-time skips.
+        executes_in_worker: bool = False
         # Set when the library enters WORKER_PENDING state. The orchestrator waits on this
         # event before returning RegisterLibraryFromFileResultSuccess so callers see the real
         # fitness once the worker has loaded and reported back.
@@ -750,7 +757,10 @@ class LibraryManager(EngineScoped):
         # Register stub node classes from the worker-reported schemas so the orchestrator
         # can display nodes in the sidebar and recreate them during workflow loading.
         # Skip on the worker itself -- it already has the real node classes registered.
-        if notification.node_schemas and not self._is_worker:
+        # Exec-deps libraries registered REAL node classes locally at load; overwriting
+        # them with schema stubs would throw away converters/validators/traits/hooks.
+        # Only legacy worker-mode libraries (requires_worker) use stub registration.
+        if notification.node_schemas and not self._is_worker and library_info.requires_worker:
             self._register_nodes_from_worker_schemas(notification.library_name, notification.node_schemas)
         # Unblock any code awaiting this library's worker_ready event.
         if library_info.worker_ready is not None:
@@ -776,7 +786,7 @@ class LibraryManager(EngineScoped):
         """
         if library_name:
             library_info = self.get_library_info_by_library_name(library_name)
-            if library_info and library_info.requires_worker:
+            if library_info and library_info.executes_in_worker:
                 wm = self._worker_manager
                 if wm:
                     worker = wm.get_worker_for_key(library_name)
@@ -802,10 +812,15 @@ class LibraryManager(EngineScoped):
         that worker creation is always tied to an active session.
         """
         for library_info in self._library_file_path_to_info.values():
-            if library_info.requires_worker and library_info.library_name and not self._is_worker:
-                library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.WORKER_PENDING
-                # Create (or reset) the worker_ready event for this spawn.
-                library_info.worker_ready = asyncio.Event()
+            if library_info.executes_in_worker and library_info.library_name and not self._is_worker:
+                # Legacy worker-mode libraries load AS the worker confirms (stubs meanwhile),
+                # so their lifecycle gates on the spawn. Exec-deps libraries loaded real
+                # nodes locally already: the worker gates execution availability only, and
+                # registration must not block on it.
+                if library_info.requires_worker:
+                    library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.WORKER_PENDING
+                    # Create (or reset) the worker_ready event for this spawn.
+                    library_info.worker_ready = asyncio.Event()
                 await self.engine.ahandle_request(StartWorkerRequest(library_name=library_info.library_name))
 
     def on_worker_evicted(self, worker_engine_id: str, library_name: str | None) -> None:
@@ -2183,11 +2198,15 @@ class LibraryManager(EngineScoped):
                 )
 
                 # Update or create LibraryInfo
+                executes_in_worker = self._resolve_executes_in_worker(
+                    requires_worker=requires_worker, metadata=metadata_result.library_schema.metadata
+                )
                 if lib_info:
                     lib_info.library_name = library_name
                     lib_info.library_version = metadata_result.library_schema.metadata.library_version
                     lib_info.lifecycle_state = LibraryManager.LibraryLifecycleState.METADATA_LOADED
                     lib_info.requires_worker = requires_worker
+                    lib_info.executes_in_worker = executes_in_worker
                 else:
                     # Create new LibraryInfo since it doesn't exist yet
                     lib_info = LibraryManager.LibraryInfo(
@@ -2199,6 +2218,7 @@ class LibraryManager(EngineScoped):
                         fitness=LibraryManager.LibraryFitness.NOT_EVALUATED,
                         problems=[],
                         requires_worker=requires_worker,
+                        executes_in_worker=executes_in_worker,
                     )
                     self._library_file_path_to_info[file_path] = lib_info
             else:
@@ -2316,6 +2336,10 @@ class LibraryManager(EngineScoped):
                     library_info.requires_worker = self._resolve_requires_worker(
                         library_info.registered_path,
                         metadata_result.library_schema.metadata.declarations,
+                    )
+                    library_info.executes_in_worker = self._resolve_executes_in_worker(
+                        requires_worker=library_info.requires_worker,
+                        metadata=metadata_result.library_schema.metadata,
                     )
                     library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.METADATA_LOADED
 
@@ -5115,6 +5139,14 @@ class LibraryManager(EngineScoped):
         registered node type to extract its parameter layout, so the orchestrator
         can create stub classes without importing the library's Python modules.
         """
+        # Only a legacy worker-mode library is stubbed on the orchestrator: an
+        # execution-dependency library is loaded there for real (its node modules are
+        # base-clean by contract), and stub registration is gated on `requires_worker`.
+        # The two stub-loss detectors below are gated on the same fact, or they warn that
+        # converters, traits and hooks "will not execute on the orchestrator stub" for a
+        # library that has no stub -- sending an author to fix code that is already correct.
+        library_info = self.get_library_info_by_library_name(library_name)
+        will_be_stubbed = library_info is None or library_info.requires_worker
         try:
             library = LibraryRegistry.get_library(library_name)
         except KeyError:
@@ -5158,8 +5190,9 @@ class LibraryManager(EngineScoped):
                 # Run the parameter-behavior-drop and inert-hook detectors
                 # inside the scope so warnings attach to the same LOAD_PROBE
                 # scope that owns the probe attempt.
-                self._report_parameter_behavior_losses(probe)
-                self._report_inert_worker_hooks(probe)
+                if will_be_stubbed:
+                    self._report_parameter_behavior_losses(probe)
+                    self._report_inert_worker_hooks(probe)
 
             # Drop the class only when a rule flagged drops_class_from_schema
             # fired. Severity is a logging concern; drops_class_from_schema is
@@ -5437,6 +5470,18 @@ class LibraryManager(EngineScoped):
 
         return manifest_default
 
+    @staticmethod
+    def _resolve_executes_in_worker(*, requires_worker: bool, metadata: LibraryMetadata) -> bool:
+        """Whether this library's nodes execute in a dedicated worker process.
+
+        True for legacy worker-mode libraries (requires_worker) and for libraries that
+        declare execution dependencies: their heavy packages live in .venv-exec, which is
+        only on sys.path in a worker, so process() can only run there.
+        """
+        dependencies = metadata.dependencies
+        has_exec_dependencies = bool(dependencies and dependencies.pip_dependencies_exec)
+        return requires_worker or has_exec_dependencies
+
     def _remove_missing_libraries_from_config(self, config_category: str) -> None:
         # Now remove all libraries that were missing from the user's config.
         config_mgr = self.engine.config_manager
@@ -5691,6 +5736,7 @@ class LibraryManager(EngineScoped):
         library_name = None
         library_version = None
         requires_worker = False
+        executes_in_worker = False
         lifecycle_state = LibraryManager.LibraryLifecycleState.DISCOVERED
 
         if isinstance(metadata_result, LoadLibraryMetadataFromFileResultSuccess):
@@ -5699,6 +5745,9 @@ class LibraryManager(EngineScoped):
             requires_worker = self._resolve_requires_worker(
                 registered_path,
                 metadata_result.library_schema.metadata.declarations,
+            )
+            executes_in_worker = self._resolve_executes_in_worker(
+                requires_worker=requires_worker, metadata=metadata_result.library_schema.metadata
             )
             lifecycle_state = LibraryManager.LibraryLifecycleState.METADATA_LOADED
 
@@ -5715,6 +5764,7 @@ class LibraryManager(EngineScoped):
             library_version=library_version,
             registered_path=registered_path,
             requires_worker=requires_worker,
+            executes_in_worker=executes_in_worker,
         )
 
     async def discover_libraries_request(

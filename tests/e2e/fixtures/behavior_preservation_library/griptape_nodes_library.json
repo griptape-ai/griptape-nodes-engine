@@ -1,0 +1,38 @@
+{
+  "name": "Behavior Preservation Library",
+  "library_schema_version": "0.12.0",
+  "metadata": {
+    "author": "Test Fixture",
+    "description": "Library whose nodes carry traits, converters and validators",
+    "library_version": "0.1.0",
+    "engine_version": "0.0.0",
+    "tags": [
+      "test"
+    ],
+    "dependencies": {
+      "pip_dependencies": [],
+      "pip_dependencies_exec": []
+    }
+  },
+  "categories": [
+    {
+      "test": {
+        "title": "test",
+        "description": "Test nodes",
+        "color": "border-gray-500",
+        "icon": "Folder"
+      }
+    }
+  ],
+  "nodes": [
+    {
+      "class_name": "BehaviorPreservationNode",
+      "file_path": "behavior_preservation_node.py",
+      "metadata": {
+        "category": "test",
+        "description": "Node carrying a Button trait, a converter and a validator",
+        "display_name": "Behavior Preservation Node"
+      }
+    }
+  ]
+}
