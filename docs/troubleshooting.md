@@ -39,6 +39,24 @@ Media in the editor is served by a local **static file server** that the engine 
 
     If your engine runs on a different machine than the editor (or behind a tunnel or reverse proxy), missing media is expected until you point the editor at the right address. Set `static_server_base_url` as described in [Static File Server Configuration](guides/configuration.md#static-file-server-configuration).
 
+## Imported images or videos are 0 bytes
+
+**Symptoms**
+
+- Imported images and videos land in `{inputs}/images/` or `{inputs}/videos/` as **0 bytes** (File Explorer shows `0 KB`).
+- The media doesn't display in the editor, and reopening the workflow shows no media.
+- Quitting and reopening Griptape Nodes doesn't help.
+
+**Cause**
+
+Bringing a file into a project happens in two steps. The engine first reserves the destination filename by creating an empty file, then the editor sends the file's contents to the local static file server the engine runs on port `8124`. When that second step doesn't complete, the reserved empty file is all that's left.
+
+This has been traced to a browser-level fault on the machine, and has only been seen on Windows 10. Restarting the application doesn't clear it.
+
+**Fix**
+
+- Restart your computer. Restarting Griptape Nodes on its own is not enough.
+
 ## "Address already in use" / the engine won't start
 
 **Symptoms**

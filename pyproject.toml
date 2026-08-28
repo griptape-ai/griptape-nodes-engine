@@ -134,7 +134,13 @@ ignore = [
 "griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes".msg = "Engine-internal code should take an injected Engine (see griptape_nodes.retained_mode.engine) and reach peers via self.engine, not the process-wide GriptapeNodes facade. The facade exists for saved workflow files, node libraries, and process entry points; those are allowlisted in per-file-ignores."
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["S101", "D104", "TID251"]
+"tests/*" = ["S101", "D104"]
+# Fixture node libraries and saved workflow files under the e2e suite. Node libraries and
+# generated workflows are the intended facade audience, exactly as the ban message says.
+"tests/e2e/fixtures/**" = ["TID251"]
+# These two assert the facade's own behavior, so they have to name it.
+"tests/unit/retained_mode/test_engine.py" = ["TID251"]
+"tests/unit/retained_mode/managers/test_griptape_nodes.py" = ["TID251"]
 "libraries/**/tests/**" = ["S101", "D104", "INP001"]
 "src/griptape_nodes/retained_mode/events/*" = ["TC001"]
 # Example libraries shipped with the Advanced Libraries doc. Authors copy these files
@@ -166,10 +172,6 @@ ignore = [
 #
 # Group 2 -- not yet migrated. Each of these should eventually receive an Engine instead.
 # Deleting an entry from this list is the definition of done; do not add new entries.
-# scan.py reaches the facade from a module-level free function, so its engine has to be threaded
-# from os_manager.on_scan_sequences_request down through scan_sequences. It moves with the other
-# free-function modules rather than with the class-based execution internals.
-"src/griptape_nodes/common/sequences/scan.py" = ["TID251"]
 # GriptapeCloudStorageDriver is constructed from inside exe_types
 # (param_components/artifact_url/public_artifact_url_parameter.py), which has no Engine of its own
 # yet, so drivers cannot come off this list until exe_types does.
@@ -179,8 +181,10 @@ ignore = [
 # WorkflowRegistry is still a process-global fake singleton reaching the facade for config.
 # Making it engine-owned is its own change, since it alters what node libraries import.
 "src/griptape_nodes/node_library/workflow_registry.py" = ["TID251"]
-"src/griptape_nodes/utils/**" = ["TID251"]
-"src/griptape_nodes/retained_mode/file_metadata/**" = ["TID251"]
+# artifact_normalization.py is called from Parameter converter closures in
+# exe_types/param_types/parameter_{image,audio,video,three_d}.py, which have no Engine of
+# their own yet, so it cannot come off this list until exe_types does.
+"src/griptape_nodes/utils/artifact_normalization.py" = ["TID251"]
 # project_packager.py reaches the facade from a module-level free function. Its engine has to be
 # threaded from project_manager.on_export_project_request through package_project_to_zip.
 "src/griptape_nodes/retained_mode/publishing/project_packager.py" = ["TID251"]

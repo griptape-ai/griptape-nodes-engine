@@ -37,10 +37,11 @@ from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileResultSuccess,
 )
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from griptape_nodes.retained_mode.engine import Engine
 
 # Timeout with thread dump.
 pytestmark = pytest.mark.timeout(300, method="thread")
@@ -58,6 +59,7 @@ LIBRARY_NAME = "NonSerializable Library"
 @pytest.mark.asyncio
 async def test_serializable_false_output_reresolved_on_load(
     tmp_path: Path,
+    engine: Engine,
     materialize_library: Callable[..., Path],
     create_node: Callable[..., str],
     connect: Callable[..., None],
@@ -74,12 +76,12 @@ async def test_serializable_false_output_reresolved_on_load(
     library_json = materialize_library(
         tmp_path / "library", template=FIXTURE_LIBRARY_JSON_TEMPLATE, node_file=FIXTURE_NODE_FILE
     )
-    register_result = GriptapeNodes.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
+    register_result = engine.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(register_result, RegisterLibraryFromFileResultSuccess), register_result
 
-    GriptapeNodes.ContextManager().push_workflow(workflow_name="nonserializable_test_wf")
+    engine.context_manager.push_workflow(workflow_name="nonserializable_test_wf")
 
-    flow_result = GriptapeNodes.handle_request(
+    flow_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="TestFlow", set_as_new_context=False)
     )
     assert isinstance(flow_result, CreateFlowResultSuccess), flow_result
@@ -90,7 +92,7 @@ async def test_serializable_false_output_reresolved_on_load(
     connect("Producer", "session", "Consumer", "session")
 
     # --- Step 2: Run the flow so both nodes become RESOLVED ---
-    run_result = await GriptapeNodes.ahandle_request(
+    run_result = await engine.ahandle_request(
         StartFlowRequest(
             flow_name=flow_name,
             flow_node_name="Consumer",
@@ -100,7 +102,7 @@ async def test_serializable_false_output_reresolved_on_load(
     )
     assert isinstance(run_result, StartFlowResultSuccess), run_result
 
-    node_manager = GriptapeNodes.NodeManager()
+    node_manager = engine.node_manager
     producer = node_manager.get_node_by_name("Producer")
     consumer = node_manager.get_node_by_name("Consumer")
 
@@ -113,15 +115,15 @@ async def test_serializable_false_output_reresolved_on_load(
     assert consumer.parameter_output_values.get("marker") == "live-session-marker"
 
     # --- Step 3: Serialize (save) ---
-    serialize_result = GriptapeNodes.handle_request(SerializeFlowToCommandsRequest(flow_name=flow_name))
+    serialize_result = engine.handle_request(SerializeFlowToCommandsRequest(flow_name=flow_name))
     assert isinstance(serialize_result, SerializeFlowToCommandsResultSuccess), serialize_result
     saved_commands = serialize_result.serialized_flow_commands
 
     # --- Step 4: Clear state and deserialize (load) ---
-    GriptapeNodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
-    GriptapeNodes.ContextManager().push_workflow(workflow_name="nonserializable_test_wf_reloaded")
+    engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+    engine.context_manager.push_workflow(workflow_name="nonserializable_test_wf_reloaded")
 
-    deserialize_result = GriptapeNodes.handle_request(
+    deserialize_result = engine.handle_request(
         DeserializeFlowFromCommandsRequest(serialized_flow_commands=saved_commands)
     )
     assert isinstance(deserialize_result, DeserializeFlowFromCommandsResultSuccess), deserialize_result
@@ -129,7 +131,7 @@ async def test_serializable_false_output_reresolved_on_load(
 
     # --- Step 5: Run the loaded flow — consumer must get a recomputed Session, not None ---
     restored_consumer_name = deserialize_result.node_name_mappings.get("Consumer", "Consumer")
-    run_result_2 = await GriptapeNodes.ahandle_request(
+    run_result_2 = await engine.ahandle_request(
         StartFlowRequest(
             flow_name=loaded_flow,
             flow_node_name=restored_consumer_name,

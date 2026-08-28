@@ -660,13 +660,17 @@ class BranchWorkflowRequest(RequestPayload):
 
     Args:
         workflow_name: Name of the workflow to branch
-        branched_workflow_name: Name for the branched workflow (None for auto-generated)
+        branched_workflow_name: Registry key for the branched workflow (None for auto-generated)
+        branched_workflow_display_name: Human-readable label (``metadata.name``) for the branch.
+            None derives one from the source workflow's display name, e.g. branching
+            "Shot 010 Comp" yields "Shot 010 Comp (branch 1)". Must not be blank when provided.
 
     Results: BranchWorkflowResultSuccess (with branch name) | BranchWorkflowResultFailure (branch error)
     """
 
     workflow_name: str
     branched_workflow_name: str | None = None
+    branched_workflow_display_name: str | None = None
 
 
 @dataclass

@@ -345,6 +345,31 @@ class ArtifactManager(EngineScoped):
             return None
         return provider.check_read_permission(source_path)
 
+    async def extract_artifact_metadata(self, source_path: str) -> dict | None:
+        """Extract source-file metadata via the format's provider, off the event loop.
+
+        Resolves the provider through ``_provider_for_format`` so the
+        multi-provider-per-format policy stays centralized. Returns None when no
+        provider claims the extension or the provider cannot extract metadata
+        (built-in providers return None rather than raise on unreadable files).
+        Exceptions from third-party providers propagate; callers own their
+        failure policy.
+
+        Args:
+            source_path: Absolute path to the source file.
+
+        Returns:
+            The provider's metadata as a dict, or None.
+        """
+        extension = Path(source_path).suffix.lstrip(".").lower()
+        if not extension:
+            return None
+        provider = self._provider_for_format(extension)
+        if provider is None:
+            return None
+        metadata = await to_thread(provider.get_artifact_metadata, source_path)
+        return metadata.model_dump() if metadata else None
+
     def _provider_for_format(self, fmt: str) -> BaseArtifactProvider | None:
         """Resolve the registered provider that handles ``fmt`` (empty → None).
 

@@ -54,11 +54,13 @@ from griptape_nodes.retained_mode.events.os_events import (
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.settings import (
     DEFAULT_LIBRARIES_DIRECTORY,
+    DISCOVERY_MAX_DEPTH_KEY,
     LIBRARIES_DIRECTORY_KEY,
     WORKFLOWS_TO_REGISTER_KEY,
     Settings,
 )
 from griptape_nodes.utils.dict_utils import get_dot_value, merge_dicts, set_dot_value
+from griptape_nodes.utils.file_utils import DEFAULT_MAX_SEARCH_DEPTH
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -352,6 +354,18 @@ class ConfigManager(EngineScoped):
             possible_config_files.append(self._workspace_config_path)
 
         return [config_file for config_file in possible_config_files if config_file.exists()]
+
+    @property
+    def discovery_max_depth(self) -> int:
+        """Get the operator-configured recursion depth ceiling for recursive file discovery.
+
+        Overridable via the `GTN_CONFIG_DISCOVERY_MAX_DEPTH` env var; falls back to
+        DEFAULT_MAX_SEARCH_DEPTH when unset.
+
+        Returns:
+            The `discovery_max_depth` setting.
+        """
+        return self.get_config_value(DISCOVERY_MAX_DEPTH_KEY, default=DEFAULT_MAX_SEARCH_DEPTH, cast_type=int)
 
     def _load_config_from_env_vars(self) -> dict[str, Any]:
         """Load configuration values from GTN_CONFIG_ environment variables.

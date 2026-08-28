@@ -406,6 +406,12 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
     def delete_file(self, path: Path) -> None:
         """Delete a file from the bucket.
 
+        Deleting an asset that is already absent is a successful no-op: a 404 means the
+        requested end state -- the asset not being in the bucket -- already holds. Cleanup
+        paths that delete transient uploads run after the asset may have been removed
+        elsewhere, and must not fail an otherwise-successful operation over it. A 403, a
+        5xx, or a timeout still raises.
+
         Args:
             path: The path of the file to delete.
         """
@@ -415,6 +421,13 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
         try:
             self._request("DELETE", url)
         except httpx.HTTPStatusError as e:
+            if e.response.status_code == HTTPStatus.NOT_FOUND:
+                logger.debug(
+                    "Asset %s is already absent from bucket %s; nothing to delete",
+                    normalized_path,
+                    self.bucket_id,
+                )
+                return
             msg = f"Failed to delete file {normalized_path}: {e}"
             logger.error(msg)
             raise RuntimeError(msg) from e

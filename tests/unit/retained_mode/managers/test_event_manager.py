@@ -106,8 +106,8 @@ class TestEventManagerBroadcasting:
         event_manager.broadcast_app_event(event)
 
     @pytest.mark.asyncio
-    async def test_abroadcast_app_event_handles_listener_exceptions(self) -> None:
-        """Test that abroadcast_app_event raises ExceptionGroup when a listener raises an exception."""
+    async def test_abroadcast_app_event_contains_listener_exceptions(self) -> None:
+        """Test that abroadcast_app_event contains a listener failure instead of propagating it."""
         event_manager = EventManager()
 
         # Create listeners where one raises an exception
@@ -119,9 +119,12 @@ class TestEventManagerBroadcasting:
 
         event = ConfigChanged(key="test_key", old_value="old", new_value="new")
 
-        # TaskGroup raises ExceptionGroup when a task fails
-        with pytest.raises(ExceptionGroup):
-            await event_manager.abroadcast_app_event(event)
+        # The failure is logged per listener, so the broadcast completes and the
+        # surviving listener still sees the event.
+        await event_manager.abroadcast_app_event(event)
+
+        listener1.assert_awaited_once_with(event)
+        listener2.assert_awaited_once_with(event)
 
     @pytest.mark.asyncio
     async def test_abroadcast_app_event_with_mixed_listener_types(self) -> None:
@@ -364,6 +367,72 @@ class TestBroadcastAppEventLoopSafety:
 
         assert "listener_loop" in captured
         assert captured["listener_loop"] is not caller_loop
+
+
+class TestBroadcastAppEventListenerIsolation:
+    """One failing listener must not cancel the siblings sharing its TaskGroup."""
+
+    @pytest.mark.asyncio
+    async def test_async_broadcast_runs_siblings_after_a_listener_raises(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A failing listener must not abort the broadcast.
+
+        Regression guard: a PermissionError in ModelManager's AppInitializationComplete
+        listener aborted the whole broadcast, so every other subsystem silently skipped
+        its startup work.
+        """
+        event_manager = EventManager()
+        completed: list[str] = []
+        failed = asyncio.Event()
+
+        async def failing_listener(_event: ConfigChanged) -> None:
+            failed.set()
+            msg = "listener blew up"
+            raise PermissionError(msg)
+
+        async def surviving_listener(_event: ConfigChanged) -> None:
+            # Resumes only after the sibling raised, so it completes only if that failure
+            # did not cancel the TaskGroup. Listeners are stored in a set, so this cannot
+            # rely on creation order.
+            await failed.wait()
+            completed.append("survivor")
+
+        def sync_listener(_event: ConfigChanged) -> None:
+            completed.append("sync")
+
+        event_manager.add_listener_to_app_event(ConfigChanged, failing_listener)
+        event_manager.add_listener_to_app_event(ConfigChanged, surviving_listener)
+        event_manager.add_listener_to_app_event(ConfigChanged, sync_listener)
+
+        with caplog.at_level(logging.ERROR, logger="griptape_nodes"):
+            await event_manager.abroadcast_app_event(ConfigChanged(key="k", old_value="a", new_value="b"))
+
+        assert sorted(completed) == ["survivor", "sync"]
+        assert "failing_listener" in caplog.text
+        assert "ConfigChanged" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_sync_broadcast_runs_siblings_after_a_listener_raises(self) -> None:
+        event_manager = EventManager()
+        completed: list[str] = []
+        failed = asyncio.Event()
+
+        async def failing_listener(_event: ConfigChanged) -> None:
+            failed.set()
+            msg = "listener blew up"
+            raise PermissionError(msg)
+
+        async def surviving_listener(_event: ConfigChanged) -> None:
+            await failed.wait()
+            completed.append("survivor")
+
+        event_manager.add_listener_to_app_event(ConfigChanged, failing_listener)
+        event_manager.add_listener_to_app_event(ConfigChanged, surviving_listener)
+
+        event_manager.broadcast_app_event(ConfigChanged(key="k", old_value="a", new_value="b"))
+
+        assert completed == ["survivor"]
 
 
 class TestLogResultDetailsSkipsStrictModeViolations:

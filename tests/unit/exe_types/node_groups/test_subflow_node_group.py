@@ -7,10 +7,11 @@ from unittest.mock import create_autospec
 
 from griptape_nodes.exe_types.node_groups.subflow_node_group import SubflowNodeGroup
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 if TYPE_CHECKING:
     import pytest
+
+    from griptape_nodes.retained_mode.engine import Engine
 
 
 class TestSubflowNodeGroupCreateSubflow:
@@ -18,7 +19,7 @@ class TestSubflowNodeGroupCreateSubflow:
 
     def test_records_deduplicated_flow_name_on_collision(
         self,
-        griptape_nodes: GriptapeNodes,  # noqa: ARG002 - initialises the engine singleton for construction
+        engine: Engine,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """The group records the flow name it got back, not the (colliding) name it requested."""
@@ -26,11 +27,11 @@ class TestSubflowNodeGroupCreateSubflow:
 
         # Simulate the engine deduplicating the requested "G_subflow" (already taken) to "G_subflow_1".
         deduped_result = CreateFlowResultSuccess(flow_name="G_subflow_1", result_details="created")
-        mock_handle = create_autospec(GriptapeNodes.handle_request, return_value=deduped_result)
-        monkeypatch.setattr(GriptapeNodes, "handle_request", mock_handle)
+        mock_handle = create_autospec(engine.handle_request, return_value=deduped_result)
+        monkeypatch.setattr(engine, "handle_request", mock_handle)
 
         # _create_subflow reads the current flow only to parent the request; keep it off engine state.
-        context_manager = GriptapeNodes.ContextManager()
+        context_manager = engine.context_manager
         monkeypatch.setattr(
             context_manager,
             "get_current_flow",
@@ -61,7 +62,7 @@ class TestGetAllNodes:
 
     def test_collects_members_nested_more_than_one_level_deep(
         self,
-        griptape_nodes: GriptapeNodes,  # noqa: ARG002 - initialises the engine singleton for construction
+        engine: Engine,  # noqa: ARG002 - initialises the engine singleton for construction
     ) -> None:
         outer = _MiniSubflowGroup(name="outer")
         middle = _MiniSubflowGroup(name="middle")
@@ -78,7 +79,7 @@ class TestGetAllNodes:
 
     def test_returns_direct_members_when_nothing_is_nested(
         self,
-        griptape_nodes: GriptapeNodes,  # noqa: ARG002 - initialises the engine singleton for construction
+        engine: Engine,  # noqa: ARG002 - initialises the engine singleton for construction
     ) -> None:
         group = _MiniSubflowGroup(name="group")
         group.nodes = {"only": _MiniSubflowGroup(name="only")}

@@ -88,12 +88,12 @@ def _write_workflow(tmp_path: Path, *, shape: dict[str, Any] | None) -> Path:
 
 
 class TestRegisterWorkflowNode:
-    def test_registers_generated_node_type(self, griptape_nodes: Engine, tmp_path: Path) -> None:
+    def test_registers_generated_node_type(self, engine: Engine, tmp_path: Path) -> None:
         workflow_path = _write_workflow(tmp_path, shape=_SHAPE)
         library = _library([_definition(workflow_path.name)])
         library_info = _library_info()
 
-        registered = griptape_nodes.library_manager._register_workflow_node(
+        registered = engine.library_manager._register_workflow_node(
             library.get_library_data().workflow_nodes[0],  # type: ignore[index]
             tmp_path,
             library,
@@ -107,11 +107,11 @@ class TestRegisterWorkflowNode:
         assert issubclass(node_class, WorkflowNode)
         assert node_class.workflow_file_path == workflow_path
 
-    def test_metadata_from_the_json_wins(self, griptape_nodes: Engine, tmp_path: Path) -> None:
+    def test_metadata_from_the_json_wins(self, engine: Engine, tmp_path: Path) -> None:
         workflow_path = _write_workflow(tmp_path, shape=_SHAPE)
         library = _library([_definition(workflow_path.name)])
 
-        griptape_nodes.library_manager._register_workflow_node(
+        engine.library_manager._register_workflow_node(
             library.get_library_data().workflow_nodes[0],  # type: ignore[index]
             tmp_path,
             library,
@@ -120,11 +120,11 @@ class TestRegisterWorkflowNode:
 
         assert library.get_node_metadata(NODE_TYPE).display_name == "Shout Workflow"
 
-    def test_missing_workflow_file_records_problem(self, griptape_nodes: Engine, tmp_path: Path) -> None:
+    def test_missing_workflow_file_records_problem(self, engine: Engine, tmp_path: Path) -> None:
         library = _library([_definition("absent_workflow.py")])
         library_info = _library_info()
 
-        registered = griptape_nodes.library_manager._register_workflow_node(
+        registered = engine.library_manager._register_workflow_node(
             library.get_library_data().workflow_nodes[0],  # type: ignore[index]
             tmp_path,
             library,
@@ -135,12 +135,12 @@ class TestRegisterWorkflowNode:
         assert not library.has_node_type(NODE_TYPE)
         assert [type(problem) for problem in library_info.problems] == [WorkflowNodeLoadProblem]
 
-    def test_workflow_without_shape_records_problem(self, griptape_nodes: Engine, tmp_path: Path) -> None:
+    def test_workflow_without_shape_records_problem(self, engine: Engine, tmp_path: Path) -> None:
         workflow_path = _write_workflow(tmp_path, shape=None)
         library = _library([_definition(workflow_path.name)])
         library_info = _library_info()
 
-        registered = griptape_nodes.library_manager._register_workflow_node(
+        registered = engine.library_manager._register_workflow_node(
             library.get_library_data().workflow_nodes[0],  # type: ignore[index]
             tmp_path,
             library,
@@ -178,7 +178,7 @@ class TestWorkflowNodeLoadProblemDisplay:
         assert "Encountered 2 workflow-backed node failures" in message
 
 
-@pytest.mark.usefixtures("griptape_nodes")
+@pytest.mark.usefixtures("engine")
 class TestSchemaDefaults:
     def test_workflow_nodes_defaults_to_none(self) -> None:
         schema = LibrarySchema(

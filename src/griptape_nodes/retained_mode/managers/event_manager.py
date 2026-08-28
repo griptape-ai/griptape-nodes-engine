@@ -1362,7 +1362,7 @@ class EventManager(EngineScoped):
             async def _broadcast_async() -> None:
                 async with asyncio.TaskGroup() as tg:
                     for listener_callback in listener_set:
-                        tg.create_task(call_function(listener_callback, app_event))
+                        tg.create_task(self._call_app_event_listener(listener_callback, app_event))
 
             if _running_loop() is not None:
                 with ThreadRunner() as runner:
@@ -1382,7 +1382,31 @@ class EventManager(EngineScoped):
 
             async with asyncio.TaskGroup() as tg:
                 for listener_callback in listener_set:
-                    tg.create_task(call_function(listener_callback, app_event))
+                    tg.create_task(self._call_app_event_listener(listener_callback, app_event))
+
+    async def _call_app_event_listener(
+        self, listener_callback: Callable[[AP], None] | Callable[[AP], Awaitable[None]], app_event: AP
+    ) -> None:
+        """Run one app event listener, keeping its failure to itself.
+
+        Listeners are independent subsystems reacting to the same event, and they run as
+        siblings in a TaskGroup. A listener that raises would cancel every sibling that
+        had not finished yet, so one broken subsystem would silently skip the rest of the
+        app's reaction to the event. Broad by design: a listener is an arbitrary callback,
+        so there is no narrower type to catch here.
+
+        Args:
+            listener_callback: The listener to invoke.
+            app_event: The app event to pass to the listener.
+        """
+        try:
+            await call_function(listener_callback, app_event)
+        except Exception:
+            logging.getLogger("griptape_nodes").exception(
+                "App event listener '%s' failed handling '%s'. The remaining listeners still ran.",
+                getattr(listener_callback, "__qualname__", listener_callback),
+                type(app_event).__name__,
+            )
 
     def _flush_tracked_parameter_changes(self) -> None:
         obj_manager = self.engine.object_manager

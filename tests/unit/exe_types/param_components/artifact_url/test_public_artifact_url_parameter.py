@@ -7,6 +7,7 @@ paths. See griptape-ai/griptape-nodes-engine#4688.
 """
 
 import re
+from pathlib import Path
 from typing import Any, NamedTuple
 from unittest.mock import Mock
 
@@ -201,3 +202,58 @@ class TestGetBucketId:
 
         with pytest.raises(RuntimeError, match="No Griptape Cloud storage buckets found"):
             PublicArtifactUrlParameter._get_bucket_id("https://base", "key")
+
+
+class TestUploadPathLifecycle:
+    """Covers gtc_file_path across runs -- see griptape-ai/griptape-nodes-engine#4872.
+
+    A helper instance lives as long as the node, so the path recorded by an upload used to
+    outlive the run that made it. A later run whose input was already public took the
+    pass-through path and then deleted that stale path, 404ing on an asset it had already
+    deleted itself and failing a successful generation in cleanup.
+    """
+
+    STALE_PATH = Path("artifact_url_storage/deadbeef/reference.mp4")
+
+    def test_pass_through_clears_a_path_from_an_earlier_run(self) -> None:
+        component, driver = _make_component("https://example.com/img.png")
+        component.gtc_file_path = self.STALE_PATH
+
+        component.get_public_url_for_parameter()
+
+        assert component.gtc_file_path is None
+        driver.upload_file.assert_not_called()
+
+    def test_cleanup_after_a_pass_through_run_deletes_nothing(self) -> None:
+        component, driver = _make_component("https://example.com/img.png")
+        component.gtc_file_path = self.STALE_PATH
+
+        component.get_public_url_for_parameter()
+        component.delete_uploaded_artifact()
+
+        driver.delete_file.assert_not_called()
+
+    def test_delete_forgets_the_path(self) -> None:
+        component, driver = _make_component("https://example.com/img.png")
+        component.gtc_file_path = self.STALE_PATH
+
+        component.delete_uploaded_artifact()
+
+        driver.delete_file.assert_called_once_with(self.STALE_PATH)
+        assert component.gtc_file_path is None
+
+    def test_second_cleanup_pass_deletes_nothing(self) -> None:
+        component, driver = _make_component("https://example.com/img.png")
+        component.gtc_file_path = self.STALE_PATH
+
+        component.delete_uploaded_artifact()
+        component.delete_uploaded_artifact()
+
+        assert driver.delete_file.call_count == 1
+
+    def test_delete_is_skipped_when_nothing_was_uploaded(self) -> None:
+        component, driver = _make_component("https://example.com/img.png")
+
+        component.delete_uploaded_artifact()
+
+        driver.delete_file.assert_not_called()

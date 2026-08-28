@@ -85,6 +85,10 @@ class BaseStorageDriver(ABC):
     def delete_file(self, path: Path) -> None:
         """Delete a file from storage.
 
+        Deleting a path that is already absent is a successful no-op: the requested end
+        state already holds, so implementations must return normally rather than raising.
+        Real failures (permission denied, server errors, timeouts) still raise.
+
         Args:
             path: Workspace-relative path of the file (e.g., ``outputs/image.png``).
         """

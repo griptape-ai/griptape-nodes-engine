@@ -38,7 +38,7 @@ from griptape_nodes.utils.git_utils import GitError
 from griptape_nodes.utils.library_utils import LibraryVersionInfo
 
 if TYPE_CHECKING:
-    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+    from griptape_nodes.retained_mode.engine import Engine
 
 LIBRARY_MANAGER_MODULE = "griptape_nodes.retained_mode.managers.library_manager"
 MIN_AGE_HOURS = 24.0
@@ -60,21 +60,21 @@ def _config_manager(*, minimum_release_age_hours: float) -> MagicMock:
 class TestEvaluateUpdateAgeGate:
     """Test the pure age-gate decision helper."""
 
-    def test_disabled_never_gates(self, griptape_nodes: GriptapeNodes) -> None:
-        library_manager = griptape_nodes.LibraryManager()
+    def test_disabled_never_gates(self, engine: Engine) -> None:
+        library_manager = engine.library_manager
         young_commit = datetime.now(tz=UTC) - timedelta(hours=1)
 
-        with patch.object(griptape_nodes, "_config_manager", _config_manager(minimum_release_age_hours=0.0)):
+        with patch.object(engine, "_config_manager", _config_manager(minimum_release_age_hours=0.0)):
             decision = library_manager._evaluate_update_age_gate(young_commit)
 
         assert decision.enabled is False
         assert decision.gated is False
 
-    def test_enabled_gates_commit_younger_than_threshold(self, griptape_nodes: GriptapeNodes) -> None:
-        library_manager = griptape_nodes.LibraryManager()
+    def test_enabled_gates_commit_younger_than_threshold(self, engine: Engine) -> None:
+        library_manager = engine.library_manager
         young_commit = datetime.now(tz=UTC) - timedelta(hours=1)
 
-        with patch.object(griptape_nodes, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)):
+        with patch.object(engine, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)):
             decision = library_manager._evaluate_update_age_gate(young_commit)
 
         assert decision.enabled is True
@@ -83,11 +83,11 @@ class TestEvaluateUpdateAgeGate:
         assert decision.age_hours == pytest.approx(1.0, abs=0.1)
         assert decision.minimum_release_age_hours == MIN_AGE_HOURS
 
-    def test_enabled_allows_commit_older_than_threshold(self, griptape_nodes: GriptapeNodes) -> None:
-        library_manager = griptape_nodes.LibraryManager()
+    def test_enabled_allows_commit_older_than_threshold(self, engine: Engine) -> None:
+        library_manager = engine.library_manager
         old_commit = datetime.now(tz=UTC) - timedelta(hours=48)
 
-        with patch.object(griptape_nodes, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)):
+        with patch.object(engine, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)):
             decision = library_manager._evaluate_update_age_gate(old_commit)
 
         assert decision.enabled is True
@@ -95,33 +95,33 @@ class TestEvaluateUpdateAgeGate:
         assert decision.age_hours is not None
         assert decision.age_hours == pytest.approx(48.0, abs=0.1)
 
-    def test_enabled_allows_when_commit_datetime_unknown(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_enabled_allows_when_commit_datetime_unknown(self, engine: Engine) -> None:
         """A missing commit timestamp cannot be verified, so the update is allowed (not wedged)."""
-        library_manager = griptape_nodes.LibraryManager()
+        library_manager = engine.library_manager
 
-        with patch.object(griptape_nodes, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)):
+        with patch.object(engine, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)):
             decision = library_manager._evaluate_update_age_gate(None)
 
         assert decision.enabled is True
         assert decision.gated is False
         assert decision.age_hours is None
 
-    def test_naive_commit_datetime_is_treated_as_utc(self, griptape_nodes: GriptapeNodes) -> None:
-        library_manager = griptape_nodes.LibraryManager()
+    def test_naive_commit_datetime_is_treated_as_utc(self, engine: Engine) -> None:
+        library_manager = engine.library_manager
         naive_young_commit = datetime.now(tz=UTC).replace(tzinfo=None) - timedelta(hours=1)
 
-        with patch.object(griptape_nodes, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)):
+        with patch.object(engine, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)):
             decision = library_manager._evaluate_update_age_gate(naive_young_commit)
 
         assert decision.gated is True
 
     def test_enabled_unknown_timestamp_logs_fail_open_warning(
-        self, griptape_nodes: GriptapeNodes, caplog: pytest.LogCaptureFixture
+        self, engine: Engine, caplog: pytest.LogCaptureFixture
     ) -> None:
-        library_manager = griptape_nodes.LibraryManager()
+        library_manager = engine.library_manager
 
         with (
-            patch.object(griptape_nodes, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)),
+            patch.object(engine, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)),
             caplog.at_level("WARNING"),
         ):
             decision = library_manager._evaluate_update_age_gate(None)
@@ -129,13 +129,11 @@ class TestEvaluateUpdateAgeGate:
         assert decision.gated is False
         assert any("could not be determined" in message for message in caplog.messages)
 
-    def test_disabled_unknown_timestamp_does_not_warn(
-        self, griptape_nodes: GriptapeNodes, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        library_manager = griptape_nodes.LibraryManager()
+    def test_disabled_unknown_timestamp_does_not_warn(self, engine: Engine, caplog: pytest.LogCaptureFixture) -> None:
+        library_manager = engine.library_manager
 
         with (
-            patch.object(griptape_nodes, "_config_manager", _config_manager(minimum_release_age_hours=0.0)),
+            patch.object(engine, "_config_manager", _config_manager(minimum_release_age_hours=0.0)),
             caplog.at_level("WARNING"),
         ):
             decision = library_manager._evaluate_update_age_gate(None)
@@ -143,13 +141,13 @@ class TestEvaluateUpdateAgeGate:
         assert decision.enabled is False
         assert not any("could not be determined" in message for message in caplog.messages)
 
-    def test_explicit_config_is_not_re_read_from_config_manager(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_explicit_config_is_not_re_read_from_config_manager(self, engine: Engine) -> None:
         """Passing a pre-read config skips the ConfigManager lookup entirely."""
-        library_manager = griptape_nodes.LibraryManager()
+        library_manager = engine.library_manager
         config_mgr = _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)
         old_commit = datetime.now(tz=UTC) - timedelta(hours=48)
 
-        with patch.object(griptape_nodes, "_config_manager", config_mgr):
+        with patch.object(engine, "_config_manager", config_mgr):
             decision = library_manager._evaluate_update_age_gate(
                 old_commit, config=MinimumReleaseAgeConfig(hours=MIN_AGE_HOURS)
             )
@@ -162,35 +160,35 @@ class TestEvaluateUpdateAgeGate:
 class TestReadMinimumReleaseAgeConfig:
     """Test the config-reading helper that both the check and update paths share."""
 
-    def test_reads_configured_hours(self, griptape_nodes: GriptapeNodes) -> None:
-        library_manager = griptape_nodes.LibraryManager()
+    def test_reads_configured_hours(self, engine: Engine) -> None:
+        library_manager = engine.library_manager
 
-        with patch.object(griptape_nodes, "_config_manager", _config_manager(minimum_release_age_hours=12.0)):
+        with patch.object(engine, "_config_manager", _config_manager(minimum_release_age_hours=12.0)):
             config = library_manager._read_minimum_release_age_config()
 
         assert config == MinimumReleaseAgeConfig(hours=12.0)
         assert config.enabled is True
 
-    def test_zero_hours_disables_the_gate(self, griptape_nodes: GriptapeNodes) -> None:
-        library_manager = griptape_nodes.LibraryManager()
+    def test_zero_hours_disables_the_gate(self, engine: Engine) -> None:
+        library_manager = engine.library_manager
 
-        with patch.object(griptape_nodes, "_config_manager", _config_manager(minimum_release_age_hours=0.0)):
+        with patch.object(engine, "_config_manager", _config_manager(minimum_release_age_hours=0.0)):
             config = library_manager._read_minimum_release_age_config()
 
         assert config == MinimumReleaseAgeConfig(hours=0.0)
         assert config.enabled is False
 
-    def test_explicit_null_override_falls_back_to_default(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_explicit_null_override_falls_back_to_default(self, engine: Engine) -> None:
         """An explicit ``null`` in config resolves to None (bypassing cast_type); coalesce to the default.
 
         Reading the config must never raise (e.g. ``float(None)``), otherwise a malformed config
         would wedge every update instead of failing open.
         """
-        library_manager = griptape_nodes.LibraryManager()
+        library_manager = engine.library_manager
         null_config_mgr = MagicMock()
         null_config_mgr.get_config_value.return_value = None
 
-        with patch.object(griptape_nodes, "_config_manager", null_config_mgr):
+        with patch.object(engine, "_config_manager", null_config_mgr):
             config = library_manager._read_minimum_release_age_config()
 
         assert config == MinimumReleaseAgeConfig(hours=0.0)
@@ -209,9 +207,9 @@ class TestUpdateLibraryRequestAgeGate:
         )
 
     @pytest.mark.asyncio
-    async def test_young_target_commit_blocks_update(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_young_target_commit_blocks_update(self, engine: Engine) -> None:
         """A target commit younger than the minimum age blocks the update without touching git."""
-        library_manager = griptape_nodes.LibraryManager()
+        library_manager = engine.library_manager
         library_dir = Path("/var/lib/test_lib")
         young_commit = datetime.now(tz=UTC) - timedelta(hours=2)
 
@@ -222,7 +220,7 @@ class TestUpdateLibraryRequestAgeGate:
                 new=AsyncMock(return_value=self._validation_context(library_dir)),
             ),
             patch(f"{LIBRARY_MANAGER_MODULE}.is_monorepo", return_value=False),
-            patch.object(griptape_nodes, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)),
+            patch.object(engine, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)),
             patch.object(
                 library_manager,
                 "_get_remote_target_commit_datetime",
@@ -239,9 +237,9 @@ class TestUpdateLibraryRequestAgeGate:
         mock_update_git.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_old_target_commit_allows_update(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_old_target_commit_allows_update(self, engine: Engine) -> None:
         """A target commit older than the minimum age is allowed through to the git update."""
-        library_manager = griptape_nodes.LibraryManager()
+        library_manager = engine.library_manager
         library_dir = Path("/var/lib/test_lib")
         old_commit = datetime.now(tz=UTC) - timedelta(hours=48)
 
@@ -252,7 +250,7 @@ class TestUpdateLibraryRequestAgeGate:
                 new=AsyncMock(return_value=self._validation_context(library_dir)),
             ),
             patch(f"{LIBRARY_MANAGER_MODULE}.is_monorepo", return_value=False),
-            patch.object(griptape_nodes, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)),
+            patch.object(engine, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)),
             patch.object(
                 library_manager,
                 "_get_remote_target_commit_datetime",
@@ -275,9 +273,9 @@ class TestUpdateLibraryRequestAgeGate:
         mock_update_git.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_disabled_skips_remote_age_lookup(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_disabled_skips_remote_age_lookup(self, engine: Engine) -> None:
         """When gating is disabled, the update path never pays for the remote age round-trip."""
-        library_manager = griptape_nodes.LibraryManager()
+        library_manager = engine.library_manager
         library_dir = Path("/var/lib/test_lib")
 
         with (
@@ -287,7 +285,7 @@ class TestUpdateLibraryRequestAgeGate:
                 new=AsyncMock(return_value=self._validation_context(library_dir)),
             ),
             patch(f"{LIBRARY_MANAGER_MODULE}.is_monorepo", return_value=False),
-            patch.object(griptape_nodes, "_config_manager", _config_manager(minimum_release_age_hours=0.0)),
+            patch.object(engine, "_config_manager", _config_manager(minimum_release_age_hours=0.0)),
             patch.object(
                 library_manager,
                 "_get_remote_target_commit_datetime",
@@ -309,9 +307,9 @@ class TestUpdateLibraryRequestAgeGate:
         mock_remote_age.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_unknown_target_commit_allows_update(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_unknown_target_commit_allows_update(self, engine: Engine) -> None:
         """Fail-open: when the target commit timestamp cannot be read, the update still proceeds."""
-        library_manager = griptape_nodes.LibraryManager()
+        library_manager = engine.library_manager
         library_dir = Path("/var/lib/test_lib")
 
         with (
@@ -321,7 +319,7 @@ class TestUpdateLibraryRequestAgeGate:
                 new=AsyncMock(return_value=self._validation_context(library_dir)),
             ),
             patch(f"{LIBRARY_MANAGER_MODULE}.is_monorepo", return_value=False),
-            patch.object(griptape_nodes, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)),
+            patch.object(engine, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)),
             patch.object(
                 library_manager,
                 "_get_remote_target_commit_datetime",
@@ -347,9 +345,9 @@ class TestGetRemoteTargetCommitDatetime:
     """Test the remote target-commit timestamp helper that feeds the update-path age gate."""
 
     @pytest.mark.asyncio
-    async def test_returns_none_when_no_remote(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_returns_none_when_no_remote(self, engine: Engine) -> None:
         """A library with no git remote cannot be age-checked, so the helper returns None."""
-        library_manager = griptape_nodes.LibraryManager()
+        library_manager = engine.library_manager
 
         with (
             patch(f"{LIBRARY_MANAGER_MODULE}.get_git_remote", return_value=None),
@@ -361,9 +359,9 @@ class TestGetRemoteTargetCommitDatetime:
         mock_clone.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_returns_none_on_git_error(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_returns_none_on_git_error(self, engine: Engine) -> None:
         """A git failure while reading the remote commit degrades to None (fail-open)."""
-        library_manager = griptape_nodes.LibraryManager()
+        library_manager = engine.library_manager
 
         with (
             patch(f"{LIBRARY_MANAGER_MODULE}.get_git_remote", return_value="https://example.com/repo.git"),
@@ -384,7 +382,7 @@ class TestCheckLibraryUpdateRequestAgeGate:
     async def _run_check(
         self,
         library_manager: LibraryManager,
-        griptape_nodes: GriptapeNodes,
+        engine: Engine,
         *,
         commit_datetime: datetime | None,
         enabled: bool,
@@ -423,7 +421,7 @@ class TestCheckLibraryUpdateRequestAgeGate:
             patch(f"{LIBRARY_MANAGER_MODULE}.clone_and_get_library_version", return_value=version_info),
             patch.object(library_manager, "_check_engine_version_compatibility", return_value=(True, "1.0.0")),
             patch.object(
-                griptape_nodes,
+                engine,
                 "_config_manager",
                 _config_manager(minimum_release_age_hours=minimum_release_age_hours),
             ),
@@ -436,12 +434,12 @@ class TestCheckLibraryUpdateRequestAgeGate:
         return result
 
     @pytest.mark.asyncio
-    async def test_gated_update_reports_age_fields(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_gated_update_reports_age_fields(self, engine: Engine) -> None:
         """A young target commit yields has_update=True with update_gated_by_age=True and the age/min fields."""
-        library_manager = griptape_nodes.LibraryManager()
+        library_manager = engine.library_manager
         young_commit = datetime.now(tz=UTC) - timedelta(hours=2)
 
-        result = await self._run_check(library_manager, griptape_nodes, commit_datetime=young_commit, enabled=True)
+        result = await self._run_check(library_manager, engine, commit_datetime=young_commit, enabled=True)
 
         assert result.has_update is True
         assert result.update_gated_by_age is True
@@ -450,12 +448,12 @@ class TestCheckLibraryUpdateRequestAgeGate:
         assert result.minimum_release_age_hours == MIN_AGE_HOURS
 
     @pytest.mark.asyncio
-    async def test_ungated_update_reports_age_fields(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_ungated_update_reports_age_fields(self, engine: Engine) -> None:
         """An old target commit is not gated, but the age and min fields are still populated when enabled."""
-        library_manager = griptape_nodes.LibraryManager()
+        library_manager = engine.library_manager
         old_commit = datetime.now(tz=UTC) - timedelta(hours=48)
 
-        result = await self._run_check(library_manager, griptape_nodes, commit_datetime=old_commit, enabled=True)
+        result = await self._run_check(library_manager, engine, commit_datetime=old_commit, enabled=True)
 
         assert result.has_update is True
         assert result.update_gated_by_age is False
@@ -464,26 +462,26 @@ class TestCheckLibraryUpdateRequestAgeGate:
         assert result.minimum_release_age_hours == MIN_AGE_HOURS
 
     @pytest.mark.asyncio
-    async def test_disabled_leaves_min_age_none(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_disabled_leaves_min_age_none(self, engine: Engine) -> None:
         """With gating disabled, an available update is never gated and reports no configured minimum."""
-        library_manager = griptape_nodes.LibraryManager()
+        library_manager = engine.library_manager
         young_commit = datetime.now(tz=UTC) - timedelta(hours=2)
 
-        result = await self._run_check(library_manager, griptape_nodes, commit_datetime=young_commit, enabled=False)
+        result = await self._run_check(library_manager, engine, commit_datetime=young_commit, enabled=False)
 
         assert result.has_update is True
         assert result.update_gated_by_age is False
         assert result.minimum_release_age_hours is None
 
     @pytest.mark.asyncio
-    async def test_no_update_leaves_age_fields_default(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_no_update_leaves_age_fields_default(self, engine: Engine) -> None:
         """When there is no update, the age gate is not evaluated and its fields stay at defaults."""
-        library_manager = griptape_nodes.LibraryManager()
+        library_manager = engine.library_manager
         young_commit = datetime.now(tz=UTC) - timedelta(hours=2)
 
         result = await self._run_check(
             library_manager,
-            griptape_nodes,
+            engine,
             commit_datetime=young_commit,
             enabled=True,
             has_update=False,
@@ -517,9 +515,9 @@ class TestSyncLibrariesRequestAgeGate:
         )
 
     @pytest.mark.asyncio
-    async def test_deferred_library_counted_and_not_updated(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_deferred_library_counted_and_not_updated(self, engine: Engine) -> None:
         """A gated library is counted in libraries_deferred, summarized, and skipped by the update pass."""
-        library_manager = griptape_nodes.LibraryManager()
+        library_manager = engine.library_manager
         check_results = {
             "up_to_date": self._check_result(has_update=False),
             "gated": self._check_result(has_update=True, gated=True, latest_version="2.0.0"),
@@ -541,8 +539,8 @@ class TestSyncLibrariesRequestAgeGate:
             raise AssertionError(error)
 
         with (
-            patch.object(griptape_nodes, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)),
-            patch.object(griptape_nodes, "ahandle_request", AsyncMock(side_effect=dispatch)),
+            patch.object(engine, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)),
+            patch.object(engine, "ahandle_request", AsyncMock(side_effect=dispatch)),
         ):
             result = await library_manager.sync_libraries_request(SyncLibrariesRequest())
 
@@ -562,13 +560,13 @@ class TestSyncLibrariesRequestAgeGate:
         assert "up_to_date" not in result.update_summary
 
     @pytest.mark.asyncio
-    async def test_update_pass_age_gate_refusal_counts_as_deferred(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_update_pass_age_gate_refusal_counts_as_deferred(self, engine: Engine) -> None:
         """A library that passes the check but is refused by the update pass age gate is deferred, not failed.
 
         This models a newer commit landing on the remote between the check and update passes: the
         update request comes back as UpdateLibraryResultFailure(age_gated=True) rather than success.
         """
-        library_manager = griptape_nodes.LibraryManager()
+        library_manager = engine.library_manager
         check_results = {
             "raced": self._check_result(has_update=True, gated=False),
         }
@@ -586,8 +584,8 @@ class TestSyncLibrariesRequestAgeGate:
             raise AssertionError(error)
 
         with (
-            patch.object(griptape_nodes, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)),
-            patch.object(griptape_nodes, "ahandle_request", AsyncMock(side_effect=dispatch)),
+            patch.object(engine, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)),
+            patch.object(engine, "ahandle_request", AsyncMock(side_effect=dispatch)),
         ):
             result = await library_manager.sync_libraries_request(SyncLibrariesRequest())
 

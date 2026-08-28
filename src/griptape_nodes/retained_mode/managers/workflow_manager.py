@@ -1105,6 +1105,10 @@ class WorkflowManager(EngineScoped):
             if isinstance(request.metadata, dict):
                 request.metadata = WorkflowMetadata(**request.metadata)
 
+            request.metadata.name = self._repair_path_shaped_display_name(
+                display_name=request.metadata.name, registry_key=registry_key
+            )
+
             WorkflowRegistry.generate_new_workflow(
                 registry_key=registry_key, metadata=request.metadata, file_path=request.file_name
             )
@@ -1118,6 +1122,39 @@ class WorkflowManager(EngineScoped):
                 level=logging.DEBUG,
             ),
         )
+
+    def _repair_path_shaped_display_name(self, *, display_name: str, registry_key: str) -> str:
+        """Repair a display name that an older branch/merge/reset wrote as a registry key.
+
+        Those three sites used to write the path-derived registry key straight into ``metadata.name``,
+        so a branch of "Shot 010 Comp" living under ``shots/sh010/`` loaded as
+        "shots/sh010/comp_branch_1" everywhere the editor shows a workflow title. Files written by
+        those versions are still on disk, and they carry the *current* schema version -- the bug was
+        never a schema change -- so there is no version to gate on. We key on the damage itself.
+
+        Exact equality with the registry key is the fingerprint: a title someone actually typed does
+        not coincide with its own file path. Everything else is left alone, including a name that
+        merely happens to contain a separator, which may well be deliberate.
+
+        In-memory only. Rewriting headers during load would touch a pile of user files, churning
+        mtimes and git diffs for a cosmetic label; the repaired name persists on its own the next
+        time the workflow is saved for any other reason.
+        """
+        if display_name != registry_key:
+            return display_name
+        if "/" not in registry_key:
+            # A workspace-root workflow whose title matches its file stem. Nothing path-shaped here,
+            # and nothing the three sites broke -- they only read badly with directories in the key.
+            return display_name
+
+        repaired_name = PurePosixPath(registry_key).name
+        logger.debug(
+            "Workflow '%s' carries its registry key as its display name (written by a pre-fix branch, "
+            "merge, or reset). Showing it as '%s'; the file keeps the old name until its next save.",
+            registry_key,
+            repaired_name,
+        )
+        return repaired_name
 
     async def on_import_workflow_request(self, request: ImportWorkflowRequest) -> ResultPayload:
         # First, attempt to load metadata from the file
@@ -6094,15 +6131,20 @@ class WorkflowManager(EngineScoped):
             )
             return BranchWorkflowResultFailure(result_details=details)
 
-        # Generate branch name if not provided
-        branch_name = request.branched_workflow_name
-        if branch_name is None:
-            base_name = request.workflow_name
-            counter = 1
-            branch_name = f"{base_name}_branch_{counter}"
-            while WorkflowRegistry.has_workflow_with_name(branch_name):
-                counter += 1
-                branch_name = f"{base_name}_branch_{counter}"
+        # A caller-supplied display name has to actually say something; a blank label would leave the
+        # branch looking nameless everywhere the editor shows a workflow title.
+        requested_display_name = request.branched_workflow_display_name
+        if requested_display_name is not None and not requested_display_name.strip():
+            details = (
+                f"Attempted to branch workflow '{request.workflow_name}' with an empty display name. "
+                "Provide a display name with at least one non-whitespace character, or leave it unset "
+                "to name the branch after the workflow it came from."
+            )
+            return BranchWorkflowResultFailure(result_details=details)
+
+        branch_naming = self._resolve_branch_naming(request=request, source_workflow=source_workflow)
+        branch_name = branch_naming.registry_key
+        branch_display_name = branch_naming.display_name
 
         # Check if branch name already exists
         if WorkflowRegistry.has_workflow_with_name(branch_name):
@@ -6112,7 +6154,8 @@ class WorkflowManager(EngineScoped):
         try:
             # Create branch metadata by copying source metadata
             branch_metadata = WorkflowMetadata(
-                name=branch_name,
+                # The display name, not the registry key: `branch_name` is a file path.
+                name=branch_display_name,
                 schema_version=source_workflow.metadata.schema_version,
                 engine_version_created_with=source_workflow.metadata.engine_version_created_with,
                 node_libraries_referenced=source_workflow.metadata.node_libraries_referenced.copy(),
@@ -6170,6 +6213,81 @@ class WorkflowManager(EngineScoped):
 
             traceback.print_exc()
             return BranchWorkflowResultFailure(result_details=details)
+
+    class _BranchNaming(NamedTuple):
+        """The two distinct names a new branch needs.
+
+        `registry_key` is the workspace-relative file path minus its extension, used to key the
+        registry. `display_name` is the human-readable title stored as `metadata.name`. Conflating
+        them is what made branches show up in the editor as file paths.
+        """
+
+        registry_key: str
+        display_name: str
+
+    def _resolve_branch_naming(self, *, request: BranchWorkflowRequest, source_workflow: Workflow) -> _BranchNaming:
+        """Pick the registry key and display name for a new branch of ``source_workflow``.
+
+        The two are resolved together because the label depends on how the key was chosen: an
+        auto-generated key contributes its ``_branch_<n>`` counter to the label, while a
+        caller-supplied key does not. ``request.branched_workflow_display_name``, when given, wins
+        over either derivation; ``on_branch_workflow_request`` has already rejected a blank one.
+        """
+        branch_counter = None
+        branch_registry_key = request.branched_workflow_name
+        if branch_registry_key is None:
+            branch_counter = 1
+            branch_registry_key = f"{request.workflow_name}_branch_{branch_counter}"
+            while WorkflowRegistry.has_workflow_with_name(branch_registry_key):
+                branch_counter += 1
+                branch_registry_key = f"{request.workflow_name}_branch_{branch_counter}"
+
+        requested_display_name = request.branched_workflow_display_name
+        if requested_display_name is not None:
+            return self._BranchNaming(registry_key=branch_registry_key, display_name=requested_display_name.strip())
+
+        derived_display_name = self._derive_branch_display_name(
+            source_display_name=source_workflow.metadata.name,
+            source_registry_key=request.workflow_name,
+            branch_registry_key=branch_registry_key,
+            branch_counter=branch_counter,
+        )
+        return self._BranchNaming(registry_key=branch_registry_key, display_name=derived_display_name)
+
+    def _derive_branch_display_name(
+        self,
+        *,
+        source_display_name: str | None,
+        source_registry_key: str,
+        branch_registry_key: str,
+        branch_counter: int | None,
+    ) -> str:
+        """Compute the human-readable label (``metadata.name``) for a new branch.
+
+        A registry key is a file path; ``metadata.name`` is a title. Using the key as the label makes
+        a branch of "Shot 010 Comp" read as "shots/sh010/comp_branch_1" everywhere the editor shows a
+        workflow name, and the deeper the folder structure the worse it reads.
+
+        * ``branch_counter`` is set when the caller auto-generated the branch key as
+          ``<source key>_branch_<counter>``. The label mirrors that counter so it stays in step with
+          the key: "Shot 010 Comp (branch 1)".
+        * ``branch_counter`` is None when the caller supplied ``branched_workflow_name`` themselves.
+          They chose the key, so its final path segment is the most faithful label available.
+        """
+        if branch_counter is None:
+            return PurePosixPath(branch_registry_key).name
+
+        source_label = (source_display_name or "").strip()
+        if source_label:
+            # Keep only the final segment. A path-shaped source label is exactly the bug this
+            # derivation exists to fix -- branches created before it carry their full registry key as
+            # their name -- so deriving from one verbatim would carry the path forward.
+            source_label = PurePosixPath(source_label).name.strip()
+        if not source_label:
+            # A blank (or purely separator) display name means the source's own metadata is corrupt.
+            # A label off the file path beats propagating emptiness onto the branch.
+            source_label = PurePosixPath(source_registry_key).name
+        return f"{source_label} (branch {branch_counter})"
 
     def on_create_workflow_from_template_request(self, request: CreateWorkflowFromTemplateRequest) -> ResultPayload:
         """Create a new workflow file from a template (Griptape-provided or user-provided)."""
@@ -6287,7 +6405,11 @@ class WorkflowManager(EngineScoped):
         try:
             # Create updated metadata for source workflow - update timestamp
             merged_metadata = WorkflowMetadata(
-                name=source_workflow_name,
+                # Carry the source's existing display name across. `source_workflow_name` came from
+                # the branch's `branched_from`, which holds a registry key (a file path), so using it
+                # here would overwrite the source's correct title with a path and persist that to disk.
+                # A merge changes the source's contents, never what it is called.
+                name=source_workflow.metadata.name,
                 schema_version=source_workflow.metadata.schema_version,
                 engine_version_created_with=source_workflow.metadata.engine_version_created_with,
                 node_libraries_referenced=source_workflow.metadata.node_libraries_referenced.copy(),
@@ -6388,7 +6510,11 @@ class WorkflowManager(EngineScoped):
 
             # Create updated metadata for branch workflow - preserve branch relationship and source timestamp
             reset_metadata = WorkflowMetadata(
-                name=request.workflow_name,
+                # Keep the branch's own display name. A reset discards the branch's *content* changes;
+                # its identity fields below (creation_date, branched_from, is_template) are likewise
+                # kept from the branch, and its title belongs with them. `request.workflow_name` is a
+                # registry key, so using it would overwrite the branch's title with a path on disk.
+                name=branch_workflow.metadata.name,
                 schema_version=source_workflow.metadata.schema_version,
                 engine_version_created_with=source_workflow.metadata.engine_version_created_with,
                 node_libraries_referenced=source_workflow.metadata.node_libraries_referenced.copy(),
@@ -6733,7 +6859,9 @@ class WorkflowManager(EngineScoped):
                 # find_files_recursive skips hidden directories (.venv, .git) and
                 # bounds recursion depth, so a deep or symlink-looped tree can't stall
                 # the boot scan.
-                for workflow_file in await find_files_recursive(path, "*.py"):
+                for workflow_file in await find_files_recursive(
+                    path, "*.py", max_depth=self.engine.config_manager.discovery_max_depth
+                ):
                     # Unsaved workflows are ephemeral; any file with this prefix is a
                     # leak from a pre-fix save and cannot be registered (the registry
                     # rejects unsaved keys paired with a file path).

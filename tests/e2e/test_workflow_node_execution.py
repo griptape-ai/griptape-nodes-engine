@@ -33,10 +33,11 @@ from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileResultSuccess,
 )
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from griptape_nodes.retained_mode.engine import Engine
 
 # Timeout with thread dump.
 pytestmark = pytest.mark.timeout(300, method="thread")
@@ -50,7 +51,7 @@ WORKFLOW_NODE_TYPE = "ShoutWorkflow"
 
 
 @pytest.fixture
-def registered_library(tmp_path: Path, materialize_library: Callable[..., Path]) -> Path:
+def registered_library(tmp_path: Path, engine: Engine, materialize_library: Callable[..., Path]) -> Path:
     """Materialize and register the fixture library, returning its JSON path."""
     library_json = materialize_library(
         tmp_path / "library",
@@ -58,7 +59,7 @@ def registered_library(tmp_path: Path, materialize_library: Callable[..., Path])
         node_file=FIXTURE_NODE_FILE,
         extra_files=[FIXTURE_WORKFLOW_FILE],
     )
-    register_result = GriptapeNodes.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
+    register_result = engine.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(register_result, RegisterLibraryFromFileResultSuccess), register_result
     return library_json
 
@@ -69,22 +70,23 @@ def registered_library(tmp_path: Path, materialize_library: Callable[..., Path])
 )
 def test_workflow_node_registers_with_shape_derived_parameters(
     registered_library: Path,  # noqa: ARG001
+    engine: Engine,
     create_node: Callable[..., str],
 ) -> None:
     """A `workflow_nodes` entry becomes a real node type whose parameters mirror the shape."""
-    list_result = GriptapeNodes.handle_request(ListNodeTypesInLibraryRequest(library=LIBRARY_NAME))
+    list_result = engine.handle_request(ListNodeTypesInLibraryRequest(library=LIBRARY_NAME))
     assert isinstance(list_result, ListNodeTypesInLibraryResultSuccess), list_result
     assert WORKFLOW_NODE_TYPE in list_result.node_types
 
-    GriptapeNodes.ContextManager().push_workflow(workflow_name="workflow_node_e2e_shape")
+    engine.context_manager.push_workflow(workflow_name="workflow_node_e2e_shape")
 
-    flow_result = GriptapeNodes.handle_request(
+    flow_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="ParentFlow", set_as_new_context=False)
     )
     assert isinstance(flow_result, CreateFlowResultSuccess), flow_result
 
     create_node(WORKFLOW_NODE_TYPE, "Shout It", flow_result.flow_name, library_name=LIBRARY_NAME)
-    node = GriptapeNodes.NodeManager().get_node_by_name("Shout It")
+    node = engine.node_manager.get_node_by_name("Shout It")
 
     assert isinstance(node, WorkflowNode), f"Expected a workflow-backed node, got {type(node).__name__}"
     # `text` comes from the workflow's Start Flow node, `result` from its End Flow node. Control
@@ -101,24 +103,25 @@ def test_workflow_node_registers_with_shape_derived_parameters(
 @pytest.mark.asyncio
 async def test_workflow_node_runs_its_workflow_and_returns_outputs(
     registered_library: Path,  # noqa: ARG001
+    engine: Engine,
     create_node: Callable[..., str],
 ) -> None:
     """Running the generated node executes the workflow and surfaces its End Flow values."""
-    GriptapeNodes.ContextManager().push_workflow(workflow_name="workflow_node_e2e")
+    engine.context_manager.push_workflow(workflow_name="workflow_node_e2e")
 
-    flow_result = GriptapeNodes.handle_request(
+    flow_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="ParentFlow", set_as_new_context=False)
     )
     assert isinstance(flow_result, CreateFlowResultSuccess), flow_result
     parent_flow = flow_result.flow_name
 
     create_node(WORKFLOW_NODE_TYPE, "Shout It", parent_flow, library_name=LIBRARY_NAME)
-    set_result = GriptapeNodes.handle_request(
+    set_result = engine.handle_request(
         SetParameterValueRequest(parameter_name="text", node_name="Shout It", value="hello there")
     )
     assert set_result.succeeded(), set_result
 
-    run_result = await GriptapeNodes.ahandle_request(
+    run_result = await engine.ahandle_request(
         StartFlowRequest(
             flow_name=parent_flow,
             flow_node_name="Shout It",
@@ -128,13 +131,13 @@ async def test_workflow_node_runs_its_workflow_and_returns_outputs(
     )
     assert isinstance(run_result, StartFlowResultSuccess), run_result
 
-    node = GriptapeNodes.NodeManager().get_node_by_name("Shout It")
+    node = engine.node_manager.get_node_by_name("Shout It")
     assert node.state == NodeResolutionState.RESOLVED
     assert node.parameter_output_values.get("result") == "HELLO THERE!"
 
     # The workflow was imported as a child flow of the node's own flow so it can be inspected
     # during the session, and it is tagged transient so a save never bakes it in.
-    subflows_result = GriptapeNodes.handle_request(ListFlowsInFlowRequest(parent_flow_name=parent_flow))
+    subflows_result = engine.handle_request(ListFlowsInFlowRequest(parent_flow_name=parent_flow))
     assert isinstance(subflows_result, ListFlowsInFlowResultSuccess), subflows_result
     assert node.metadata["subflow_name"] in subflows_result.flow_names
 
@@ -146,6 +149,7 @@ async def test_workflow_node_runs_its_workflow_and_returns_outputs(
 @pytest.mark.asyncio
 async def test_two_workflow_nodes_run_independently(
     registered_library: Path,  # noqa: ARG001
+    engine: Engine,
     create_node: Callable[..., str],
     connect: Callable[..., None],
 ) -> None:
@@ -154,9 +158,9 @@ async def test_two_workflow_nodes_run_independently(
     The second import renames the workflow's Start/End nodes (their names are already taken), so
     this covers the path where the saved shape's node names no longer match the live subflow.
     """
-    GriptapeNodes.ContextManager().push_workflow(workflow_name="workflow_node_e2e_pair")
+    engine.context_manager.push_workflow(workflow_name="workflow_node_e2e_pair")
 
-    flow_result = GriptapeNodes.handle_request(
+    flow_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="ParentFlow", set_as_new_context=False)
     )
     assert isinstance(flow_result, CreateFlowResultSuccess), flow_result
@@ -167,12 +171,10 @@ async def test_two_workflow_nodes_run_independently(
     connect("First", "exec_out", "Second", "exec_in")
     connect("First", "result", "Second", "text")
 
-    set_result = GriptapeNodes.handle_request(
-        SetParameterValueRequest(parameter_name="text", node_name="First", value="hey")
-    )
+    set_result = engine.handle_request(SetParameterValueRequest(parameter_name="text", node_name="First", value="hey"))
     assert set_result.succeeded(), set_result
 
-    run_result = await GriptapeNodes.ahandle_request(
+    run_result = await engine.ahandle_request(
         StartFlowRequest(
             flow_name=parent_flow,
             flow_node_name="First",
@@ -182,7 +184,7 @@ async def test_two_workflow_nodes_run_independently(
     )
     assert isinstance(run_result, StartFlowResultSuccess), run_result
 
-    node_manager = GriptapeNodes.NodeManager()
+    node_manager = engine.node_manager
     first = node_manager.get_node_by_name("First")
     second = node_manager.get_node_by_name("Second")
 

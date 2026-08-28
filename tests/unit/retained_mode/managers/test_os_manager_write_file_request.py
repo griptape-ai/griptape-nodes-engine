@@ -28,6 +28,7 @@ from griptape_nodes.common.macro_parser import ParsedMacro
 from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
 from griptape_nodes.common.project_templates.situation import SituationFilePolicy
 from griptape_nodes.files.file import File, FileDestination, FileLoadError, FileWriteError
+from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.artifact_events import RegisterArtifactProviderRequest
 from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.os_events import (
@@ -48,7 +49,6 @@ from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import (
     SituationMetadata,
     SituationPolicy,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_provider import WriteVettingPolicy
 from griptape_nodes.retained_mode.managers.artifact_providers.image.image_artifact_provider import (
     ImageArtifactProvider,
@@ -70,16 +70,16 @@ class TestCreateNewWarningLevelResultDetails:
             yield Path(tmpdir)
 
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
         """Automatically set workspace to temp_dir for all tests."""
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        original_workspace = engine.config_manager.workspace_path
+        engine.config_manager.workspace_path = temp_dir
         yield
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.config_manager.workspace_path = original_workspace
 
-    def test_create_new_fallback_warning_level(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_create_new_fallback_warning_level(self, engine: Engine, temp_dir: Path) -> None:
         """Test CREATE_NEW returns WARNING-level ResultDetails when falling back to indexed path."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "test.txt"
 
         # Create the originally requested file so CREATE_NEW must fall back
@@ -107,9 +107,9 @@ class TestCreateNewWarningLevelResultDetails:
         assert "already existed" in detail.message.lower()
         assert str(file_path) in detail.message or "test.txt" in detail.message
 
-    def test_create_new_first_try_no_warning(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_create_new_first_try_no_warning(self, engine: Engine, temp_dir: Path) -> None:
         """Test CREATE_NEW returns normal success (not WARNING) when first-try succeeds."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "newfile.txt"
 
         # Don't create the file - let CREATE_NEW succeed on first try
@@ -132,9 +132,9 @@ class TestCreateNewWarningLevelResultDetails:
         assert detail.level == logging.DEBUG  # Normal success is DEBUG, not WARNING
         assert "successfully" in detail.message.lower()
 
-    def test_create_new_fallback_multiple_times(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_create_new_fallback_multiple_times(self, engine: Engine, temp_dir: Path) -> None:
         """Test CREATE_NEW generates multiple DEBUG messages for multiple fallbacks."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "output.txt"
 
         # Create original file
@@ -173,16 +173,16 @@ class TestBlanketExceptionHandling:
             yield Path(tmpdir)
 
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
         """Automatically set workspace to temp_dir for all tests."""
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        original_workspace = engine.config_manager.workspace_path
+        engine.config_manager.workspace_path = temp_dir
         yield
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.config_manager.workspace_path = original_workspace
 
-    def test_blanket_exception_on_path_resolution(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_blanket_exception_on_path_resolution(self, engine: Engine, temp_dir: Path) -> None:
         """Test blanket exception handler for unexpected error during path resolution."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "test.txt"
 
         request = WriteFileRequest(file_path=str(file_path), content="Content")
@@ -196,9 +196,9 @@ class TestBlanketExceptionHandling:
         assert isinstance(result.result_details, ResultDetails)
         assert "unexpected error" in result.result_details.result_details[0].message.lower()
 
-    def test_blanket_exception_on_write_operation(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_blanket_exception_on_write_operation(self, engine: Engine, temp_dir: Path) -> None:
         """Test blanket exception handler for unexpected error during write."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "test.txt"
 
         request = WriteFileRequest(file_path=str(file_path), content="Content")
@@ -212,11 +212,9 @@ class TestBlanketExceptionHandling:
         assert isinstance(result.result_details, ResultDetails)
         assert "unexpected error" in result.result_details.result_details[0].message.lower()
 
-    def test_blanket_exception_on_macro_resolution_in_candidate_loop(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path
-    ) -> None:
+    def test_blanket_exception_on_macro_resolution_in_candidate_loop(self, engine: Engine, temp_dir: Path) -> None:
         """Test blanket exception handler for unexpected error during CREATE_NEW macro resolution."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "output.txt"
 
         # Create original file to trigger CREATE_NEW fallback
@@ -254,16 +252,16 @@ class TestParentDirectoryMatchCase:
             yield Path(tmpdir)
 
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
         """Automatically set workspace to temp_dir for all tests."""
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        original_workspace = engine.config_manager.workspace_path
+        engine.config_manager.workspace_path = temp_dir
         yield
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.config_manager.workspace_path = original_workspace
 
-    def test_parent_directory_permission_denied_message(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_parent_directory_permission_denied_message(self, engine: Engine, temp_dir: Path) -> None:
         """Test match/case generates correct message for PERMISSION_DENIED."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "subdir" / "test.txt"
 
         request = WriteFileRequest(file_path=str(file_path), content="Content", create_parents=True)
@@ -281,9 +279,9 @@ class TestParentDirectoryMatchCase:
         assert "permission denied" in message.lower()
         assert "parent directory" in message.lower()
 
-    def test_parent_directory_no_create_message(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_parent_directory_no_create_message(self, engine: Engine, temp_dir: Path) -> None:
         """Test match/case generates correct message for POLICY_NO_CREATE_PARENT_DIRS."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "nonexistent" / "test.txt"
 
         request = WriteFileRequest(file_path=str(file_path), content="Content", create_parents=False)
@@ -298,9 +296,9 @@ class TestParentDirectoryMatchCase:
         assert "parent directory" in message.lower()
         assert "not exist" in message.lower() or "does not exist" in message.lower()
 
-    def test_parent_directory_generic_io_error_message(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_parent_directory_generic_io_error_message(self, engine: Engine, temp_dir: Path) -> None:
         """Test match/case default case generates generic error message."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "subdir" / "test.txt"
 
         request = WriteFileRequest(file_path=str(file_path), content="Content", create_parents=True)
@@ -326,16 +324,16 @@ class TestOnDemandCandidateGeneration:
             yield Path(tmpdir)
 
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
         """Automatically set workspace to temp_dir for all tests."""
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        original_workspace = engine.config_manager.workspace_path
+        engine.config_manager.workspace_path = temp_dir
         yield
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.config_manager.workspace_path = original_workspace
 
-    def test_on_demand_generation_early_success(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_on_demand_generation_early_success(self, engine: Engine, temp_dir: Path) -> None:
         """Test CREATE_NEW only resolves macros until it finds available filename."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "output.txt"
 
         # CREATE_NEW always tries the first-try path first (without index)
@@ -377,9 +375,9 @@ class TestOnDemandCandidateGeneration:
             f"Expected >= {min_expected_resolutions} macro resolution, got {resolve_call_count}"
         )
 
-    def test_on_demand_generation_stops_on_success(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_on_demand_generation_stops_on_success(self, engine: Engine, temp_dir: Path) -> None:
         """Test CREATE_NEW stops generating candidates immediately after successful write."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "test.txt"
 
         # Create original file to trigger fallback
@@ -423,16 +421,16 @@ class TestMetadataInjection:
             yield Path(tmpdir)
 
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
         """Automatically set workspace to temp_dir for all tests."""
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        original_workspace = engine.config_manager.workspace_path
+        engine.config_manager.workspace_path = temp_dir
         yield
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.config_manager.workspace_path = original_workspace
 
-    def test_metadata_injected_for_bytes_content(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_metadata_injected_for_bytes_content(self, engine: Engine, temp_dir: Path) -> None:
         """Test that prepare_content_for_write is called for bytes content."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "image.png"
         original_bytes = b"fake png bytes"
         injected_bytes = b"fake png bytes with metadata"
@@ -440,16 +438,16 @@ class TestMetadataInjection:
         request = WriteFileRequest(file_path=str(file_path), content=original_bytes)
 
         with patch.object(
-            griptape_nodes.ArtifactManager(), "prepare_content_for_write", return_value=injected_bytes
+            engine.artifact_manager, "prepare_content_for_write", return_value=injected_bytes
         ) as mock_prepare:
             result = os_manager.on_write_file_request(request)
 
         assert isinstance(result, WriteFileResultSuccess)
         mock_prepare.assert_called_once_with(original_bytes, "image.png")
 
-    def test_metadata_not_injected_when_skip_flag_set(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_metadata_not_injected_when_skip_flag_set(self, engine: Engine, temp_dir: Path) -> None:
         """Test that injection is skipped when skip_metadata_injection=True."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "image.png"
 
         request = WriteFileRequest(
@@ -458,55 +456,55 @@ class TestMetadataInjection:
             skip_metadata_injection=True,
         )
 
-        with patch.object(griptape_nodes.ArtifactManager(), "prepare_content_for_write") as mock_prepare:
+        with patch.object(engine.artifact_manager, "prepare_content_for_write") as mock_prepare:
             result = os_manager.on_write_file_request(request)
 
         assert isinstance(result, WriteFileResultSuccess)
         mock_prepare.assert_not_called()
 
-    def test_metadata_not_injected_when_config_disabled(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_metadata_not_injected_when_config_disabled(self, engine: Engine, temp_dir: Path) -> None:
         """Test that injection is skipped when auto_inject_workflow_metadata config is False."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "image.png"
 
         request = WriteFileRequest(file_path=str(file_path), content=b"fake png bytes")
 
         with (
             patch.object(
-                griptape_nodes.ConfigManager(),
+                engine.config_manager,
                 "get_config_value",
                 side_effect=lambda key, **kwargs: (
                     False if key == "auto_inject_workflow_metadata" else kwargs.get("default")
                 ),
             ),
-            patch.object(griptape_nodes.ArtifactManager(), "prepare_content_for_write") as mock_prepare,
+            patch.object(engine.artifact_manager, "prepare_content_for_write") as mock_prepare,
         ):
             result = os_manager.on_write_file_request(request)
 
         assert isinstance(result, WriteFileResultSuccess)
         mock_prepare.assert_not_called()
 
-    def test_metadata_not_injected_for_str_content(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_metadata_not_injected_for_str_content(self, engine: Engine, temp_dir: Path) -> None:
         """Test that injection is skipped for str content (only bytes are images)."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "text.txt"
 
         request = WriteFileRequest(file_path=str(file_path), content="text content")
 
-        with patch.object(griptape_nodes.ArtifactManager(), "prepare_content_for_write") as mock_prepare:
+        with patch.object(engine.artifact_manager, "prepare_content_for_write") as mock_prepare:
             result = os_manager.on_write_file_request(request)
 
         assert isinstance(result, WriteFileResultSuccess)
         mock_prepare.assert_not_called()
 
     def test_injection_failure_logs_warning_and_write_succeeds(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path, caplog: pytest.LogCaptureFixture
+        self, engine: Engine, temp_dir: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         """Test that injection failure logs a warning and the write succeeds with original content."""
-        griptape_nodes.ArtifactManager().on_handle_register_artifact_provider_request(
+        engine.artifact_manager.on_handle_register_artifact_provider_request(
             RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider)
         )
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "image.png"
         original_bytes = b"fake png bytes"
 
@@ -519,16 +517,16 @@ class TestMetadataInjection:
         assert file_path.read_bytes() == original_bytes
         assert any("Attempted to collect workflow metadata" in record.message for record in caplog.records)
 
-    def test_injected_content_is_written_to_disk(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_injected_content_is_written_to_disk(self, engine: Engine, temp_dir: Path) -> None:
         """Test that the injected (modified) content is what gets written to disk."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "image.png"
         original_bytes = b"fake png bytes"
         injected_bytes = b"fake png bytes with metadata injected"
 
         request = WriteFileRequest(file_path=str(file_path), content=original_bytes)
 
-        with patch.object(griptape_nodes.ArtifactManager(), "prepare_content_for_write", return_value=injected_bytes):
+        with patch.object(engine.artifact_manager, "prepare_content_for_write", return_value=injected_bytes):
             result = os_manager.on_write_file_request(request)
 
         assert isinstance(result, WriteFileResultSuccess)
@@ -549,9 +547,9 @@ class TestSidecarMetadata:
             yield Path(tmpdir).resolve()
 
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
         """Set workspace to temp_dir and load a project template for sidecar path resolution."""
-        config_manager = griptape_nodes.ConfigManager()
+        config_manager = engine.config_manager
         original_workspace = config_manager.workspace_path
         # Set the *configured* workspace_directory, not just the workspace_path property.
         # The project loaded below is parentless, so activation resolves its workspace via
@@ -563,18 +561,18 @@ class TestSidecarMetadata:
         # Create a project template file so sidecar path resolution has a project to use
         project_yml = temp_dir / "project_template.yml"
         project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
-        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        load_result = engine.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
         if isinstance(load_result, LoadProjectTemplateResultSuccess):
-            GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+            engine.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
 
         yield
 
-        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=None))
+        engine.handle_request(SetCurrentProjectRequest(project_id=None))
         config_manager.set_config_value("workspace_directory", str(original_workspace))
 
-    def test_sidecar_not_written_without_file_metadata(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_sidecar_not_written_without_file_metadata(self, engine: Engine, temp_dir: Path) -> None:
         """Test that no sidecar is written when file_metadata is not provided."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "output.txt"
 
         request = WriteFileRequest(file_path=str(file_path), content="hello")
@@ -584,11 +582,11 @@ class TestSidecarMetadata:
         sidecar_path = temp_dir / ".griptape-nodes-metadata" / "output.txt.json"
         assert not sidecar_path.exists(), "Sidecar should not be written when file_metadata is not provided"
 
-    def test_sidecar_written_when_file_metadata_provided(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_sidecar_written_when_file_metadata_provided(self, engine: Engine, temp_dir: Path) -> None:
         """Test that a sidecar is written when file_metadata is explicitly provided."""
         import json as _json
 
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "output.txt"
         file_metadata = SidecarContent(
             situation=SituationMetadata(name="save_node_output", macro="{outputs}/output.txt"),
@@ -604,11 +602,11 @@ class TestSidecarMetadata:
         assert data["schema_version"] == "0.1.0"
         assert "saved_at" in data
 
-    def test_sidecar_contains_situation_info_when_provided(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_sidecar_contains_situation_info_when_provided(self, engine: Engine, temp_dir: Path) -> None:
         """Test sidecar includes situation block when file_metadata has situation info."""
         import json as _json
 
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "image.png"
         file_metadata = SidecarContent(
             situation=SituationMetadata(
@@ -629,11 +627,11 @@ class TestSidecarMetadata:
         assert data["situation"]["policy"]["on_collision"] == "create_new"
         assert data["situation"]["policy"]["create_dirs"] is True
 
-    def test_sidecar_written_for_indexed_fallback_path(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_sidecar_written_for_indexed_fallback_path(self, engine: Engine, temp_dir: Path) -> None:
         """Test sidecar is written at the actual indexed fallback path, not the requested path."""
         import json as _json
 
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "output.txt"
         file_path.write_text("Original")
         file_metadata = SidecarContent(
@@ -655,9 +653,7 @@ class TestSidecarMetadata:
         data = _json.loads(sidecar_path.read_text())
         assert data["schema_version"] == "0.1.0"
 
-    def test_sidecar_file_extension_unchanged_for_alias_extensions(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path
-    ) -> None:
+    def test_sidecar_file_extension_unchanged_for_alias_extensions(self, engine: Engine, temp_dir: Path) -> None:
         """Sidecar's ``file_extension`` variable must reflect the on-disk name, not the raw sniff.
 
         Regression for the alias-extension case (jpg/jpeg, tif/tiff, m4v/mp4):
@@ -670,7 +666,7 @@ class TestSidecarMetadata:
         """
         import json as _json
 
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         file_path = temp_dir / "photo.jpeg"
         # Bind file_extension in the sidecar's situation variables so the
         # sidecar update path has something to (potentially) overwrite.
@@ -724,24 +720,24 @@ class TestExtensionCoercion:
             yield Path(tmpdir).resolve()
 
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
         """Set workspace and register the image artifact provider so sniff_extension works."""
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        original_workspace = engine.config_manager.workspace_path
+        engine.config_manager.workspace_path = temp_dir
 
-        griptape_nodes.ArtifactManager().on_handle_register_artifact_provider_request(
+        engine.artifact_manager.on_handle_register_artifact_provider_request(
             RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider)
         )
 
         yield
 
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.config_manager.workspace_path = original_workspace
 
     def test_default_coerce_renames_jpeg_when_destination_is_png(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path, caplog: pytest.LogCaptureFixture
+        self, engine: Engine, temp_dir: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         """JPEG bytes saved to a .png path should be renamed to .jpeg by default."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         requested_path = temp_dir / "image.png"
 
         request = WriteFileRequest(file_path=str(requested_path), content=_jpeg_bytes())
@@ -755,11 +751,9 @@ class TestExtensionCoercion:
         assert not requested_path.exists()
         assert any("destination has been adjusted" in r.message for r in caplog.records)
 
-    def test_strict_mode_returns_extension_mismatch_failure(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path
-    ) -> None:
+    def test_strict_mode_returns_extension_mismatch_failure(self, engine: Engine, temp_dir: Path) -> None:
         """With coerce_extension_to_match_bytes=False, mismatched bytes should fail and leave no file."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         requested_path = temp_dir / "image.png"
 
         request = WriteFileRequest(
@@ -774,9 +768,9 @@ class TestExtensionCoercion:
         assert not requested_path.exists()
         assert not (temp_dir / "image.jpg").exists()
 
-    def test_coerce_no_op_when_bytes_match_suffix(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_coerce_no_op_when_bytes_match_suffix(self, engine: Engine, temp_dir: Path) -> None:
         """No rename, no warning when bytes already match the destination suffix."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         requested_path = temp_dir / "image.png"
 
         request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
@@ -787,10 +781,10 @@ class TestExtensionCoercion:
         assert requested_path.exists()
 
     def test_coerce_no_op_when_sniff_returns_none(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path, caplog: pytest.LogCaptureFixture
+        self, engine: Engine, temp_dir: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         """Unrecognized bytes log a 'Could not identify' warning and write through unchanged."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         requested_path = temp_dir / "blob.png"
 
         request = WriteFileRequest(file_path=str(requested_path), content=b"\x00\x01\x02\x03 not a known format")
@@ -801,11 +795,9 @@ class TestExtensionCoercion:
         assert Path(result.final_file_path) == requested_path
         assert any("Could not recognize the bytes as a known file format" in r.message for r in caplog.records)
 
-    def test_coerce_updates_sidecar_file_extension_variable(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path
-    ) -> None:
+    def test_coerce_updates_sidecar_file_extension_variable(self, engine: Engine, temp_dir: Path) -> None:
         """When coercion fires, the sidecar's situation.variables.file_extension is rewritten to match."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         requested_path = temp_dir / "image.png"
 
         file_metadata = SidecarContent(
@@ -831,9 +823,9 @@ class TestExtensionCoercion:
         assert request.file_metadata.situation.variables is not None
         assert request.file_metadata.situation.variables["file_extension"] == "jpg"
 
-    def test_coerce_skipped_for_text_content(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_coerce_skipped_for_text_content(self, engine: Engine, temp_dir: Path) -> None:
         """Text writes should never trigger sniffing/rename."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         requested_path = temp_dir / "notes.png"
 
         request = WriteFileRequest(file_path=str(requested_path), content="just some text")
@@ -859,23 +851,23 @@ class TestOSWritePermissionVet:
             yield Path(tmpdir).resolve()
 
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
         # Register the image provider so PNG/JPEG bytes are recognized; the
         # vet under test is provider.check_write_permission on the returned
         # provider instance.
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        original_workspace = engine.config_manager.workspace_path
+        engine.config_manager.workspace_path = temp_dir
 
-        griptape_nodes.ArtifactManager().on_handle_register_artifact_provider_request(
+        engine.artifact_manager.on_handle_register_artifact_provider_request(
             RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider)
         )
 
         yield
 
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.config_manager.workspace_path = original_workspace
 
     def test_deny_returns_codec_not_permitted_and_no_file(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+        self, engine: Engine, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A provider that denies must abort the write before any bytes hit disk."""
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
@@ -885,9 +877,9 @@ class TestOSWritePermissionVet:
         # Image provider defaults to ``None`` policy (no vet). Override its
         # policy to ``FROM_BYTES`` and its from-bytes hook to deny -- keeps the
         # test focused on the vet dispatch without dragging in disk staging.
-        provider_classes = griptape_nodes.ArtifactManager()._registry.get_provider_classes_by_format("png")
+        provider_classes = engine.artifact_manager._registry.get_provider_classes_by_format("png")
         assert provider_classes, "PNG must resolve to the registered image provider"
-        provider = griptape_nodes.ArtifactManager()._registry.get_or_create_provider_instance(provider_classes[0])
+        provider = engine.artifact_manager._registry.get_or_create_provider_instance(provider_classes[0])
         monkeypatch.setattr(
             provider.__class__, "get_write_vetting_policy", staticmethod(lambda: WriteVettingPolicy.FROM_BYTES)
         )
@@ -897,7 +889,7 @@ class TestOSWritePermissionVet:
             lambda data, detected_format: expected_denial,  # noqa: ARG005
         )
 
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         requested_path = temp_dir / "image.png"
         request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
         result = os_manager.on_write_file_request(request)
@@ -913,9 +905,9 @@ class TestOSWritePermissionVet:
         assert "sniffed" not in str(result.result_details).lower()
         assert not requested_path.exists()
 
-    def test_allow_writes_normally(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_allow_writes_normally(self, engine: Engine, temp_dir: Path) -> None:
         """The default ``None`` policy skips the vet entirely -> allow."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         requested_path = temp_dir / "image.png"
 
         request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
@@ -926,7 +918,7 @@ class TestOSWritePermissionVet:
         assert requested_path.exists()
 
     def test_unrecognized_bytes_skip_vet_entirely(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+        self, engine: Engine, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """If sniff returns None (no provider claims the bytes), the vet is never invoked."""
         called: list[bool] = []
@@ -937,9 +929,9 @@ class TestOSWritePermissionVet:
         # Spy on ArtifactManager.get_write_vetting_policy: if OSManager ever
         # asks about an unrecognized format, we'd see it here. sniff on the
         # blob returns None, so the vet block never even reads the policy.
-        monkeypatch.setattr(griptape_nodes.ArtifactManager(), "get_write_vetting_policy", spy_policy)
+        monkeypatch.setattr(engine.artifact_manager, "get_write_vetting_policy", spy_policy)
 
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         requested_path = temp_dir / "blob.dat"
 
         request = WriteFileRequest(file_path=str(requested_path), content=b"\x00\x01 not a known format")
@@ -950,7 +942,7 @@ class TestOSWritePermissionVet:
         assert requested_path.exists()
 
     def test_deny_returns_codec_not_permitted_and_no_file_for_extensionless_destination(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+        self, engine: Engine, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Regression: extension-less destinations must not bypass the codec vet.
 
@@ -964,9 +956,9 @@ class TestOSWritePermissionVet:
 
         expected_denial = CheckpointDenial(failures=(CheckpointFailure(detail="This codec is not licensed."),))
 
-        provider_classes = griptape_nodes.ArtifactManager()._registry.get_provider_classes_by_format("png")
+        provider_classes = engine.artifact_manager._registry.get_provider_classes_by_format("png")
         assert provider_classes, "PNG must resolve to the registered image provider"
-        provider = griptape_nodes.ArtifactManager()._registry.get_or_create_provider_instance(provider_classes[0])
+        provider = engine.artifact_manager._registry.get_or_create_provider_instance(provider_classes[0])
         monkeypatch.setattr(
             provider.__class__, "get_write_vetting_policy", staticmethod(lambda: WriteVettingPolicy.FROM_BYTES)
         )
@@ -976,7 +968,7 @@ class TestOSWritePermissionVet:
             lambda data, detected_format: expected_denial,  # noqa: ARG005
         )
 
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         # Destination has NO extension. Sniff on bytes classifies as PNG,
         # provider denies, OSManager must refuse the write. Before the fix
         # this would return Success and leave the file on disk.
@@ -990,7 +982,7 @@ class TestOSWritePermissionVet:
         assert not requested_path.exists()
 
     def test_append_writes_are_not_vetted(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+        self, engine: Engine, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Appends skip the codec vet: the tail alone has no container header to classify."""
         called: list[bool] = []
@@ -998,9 +990,9 @@ class TestOSWritePermissionVet:
         def spy_policy(fmt: str) -> None:  # noqa: ARG001
             called.append(True)
 
-        monkeypatch.setattr(griptape_nodes.ArtifactManager(), "get_write_vetting_policy", spy_policy)
+        monkeypatch.setattr(engine.artifact_manager, "get_write_vetting_policy", spy_policy)
 
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         requested_path = temp_dir / "image.png"
         # Seed the file so append has something to append to.
         requested_path.write_bytes(_png_bytes())
@@ -1011,7 +1003,7 @@ class TestOSWritePermissionVet:
         assert called == []
 
     def test_unrecognized_policy_variant_raises_loudly(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+        self, engine: Engine, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A future ``WriteVettingPolicy`` variant OSManager doesn't know how to dispatch must fail loud.
 
@@ -1020,12 +1012,12 @@ class TestOSWritePermissionVet:
         sentinel string the switch doesn't recognize.
         """
         monkeypatch.setattr(
-            griptape_nodes.ArtifactManager(),
+            engine.artifact_manager,
             "get_write_vetting_policy",
             lambda fmt: "future_variant",  # noqa: ARG005
         )
 
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         requested_path = temp_dir / "image.png"
         request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
         with pytest.raises(RuntimeError, match="Unrecognized WriteVettingPolicy"):
@@ -1034,7 +1026,7 @@ class TestOSWritePermissionVet:
         assert not requested_path.exists()
 
     def test_from_path_policy_stages_bytes_and_provides_path_to_provider(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+        self, engine: Engine, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """When a provider declares ``FROM_PATH`` OSManager stages bytes, hands the provider a path, and truncates + deletes after.
 
@@ -1050,15 +1042,15 @@ class TestOSWritePermissionVet:
             assert Path(source_path).read_bytes() == _png_bytes()
             seen_paths.append(source_path)
 
-        provider_classes = griptape_nodes.ArtifactManager()._registry.get_provider_classes_by_format("png")
+        provider_classes = engine.artifact_manager._registry.get_provider_classes_by_format("png")
         assert provider_classes
-        provider = griptape_nodes.ArtifactManager()._registry.get_or_create_provider_instance(provider_classes[0])
+        provider = engine.artifact_manager._registry.get_or_create_provider_instance(provider_classes[0])
         monkeypatch.setattr(
             provider.__class__, "get_write_vetting_policy", staticmethod(lambda: WriteVettingPolicy.FROM_PATH)
         )
         monkeypatch.setattr(provider, "check_write_format_from_path", from_path_hook)
 
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         requested_path = temp_dir / "image.png"
         request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
         result = os_manager.on_write_file_request(request)
@@ -1071,16 +1063,16 @@ class TestOSWritePermissionVet:
         assert not Path(seen_paths[0]).exists(), "staged codec-vet temp must be cleaned up"
 
     def test_from_path_policy_staging_failure_fails_closed(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+        self, engine: Engine, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """If staging the vet's temp file blows up, the write must be refused, not permitted.
 
         An unstageable vet cannot verify the write is compliant -- fail closed
         rather than silently blessing bytes because we couldn't run the check.
         """
-        provider_classes = griptape_nodes.ArtifactManager()._registry.get_provider_classes_by_format("png")
+        provider_classes = engine.artifact_manager._registry.get_provider_classes_by_format("png")
         assert provider_classes
-        provider = griptape_nodes.ArtifactManager()._registry.get_or_create_provider_instance(provider_classes[0])
+        provider = engine.artifact_manager._registry.get_or_create_provider_instance(provider_classes[0])
         monkeypatch.setattr(
             provider.__class__, "get_write_vetting_policy", staticmethod(lambda: WriteVettingPolicy.FROM_PATH)
         )
@@ -1094,7 +1086,7 @@ class TestOSWritePermissionVet:
 
         # Break the staging step by making the SAVE_TEMP_FILE macro resolve fail.
         # Easiest: monkeypatch _stage_bytes_at_temp on the manager to raise.
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
 
         def raise_staging(*_args, **_kwargs):  # type: ignore[no-untyped-def]  # noqa: ANN202
             msg = "simulated staging outage"
@@ -1114,7 +1106,7 @@ class TestOSWritePermissionVet:
         assert provider_hook_calls == []
 
     def test_from_path_policy_cleanup_dispatches_delete_file_request(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+        self, engine: Engine, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Cleanup must go through ``DeleteFileRequest``, not raw ``Path.unlink``.
 
@@ -1131,9 +1123,9 @@ class TestOSWritePermissionVet:
             DeletionOutcome,
         )
 
-        provider_classes = griptape_nodes.ArtifactManager()._registry.get_provider_classes_by_format("png")
+        provider_classes = engine.artifact_manager._registry.get_provider_classes_by_format("png")
         assert provider_classes
-        provider = griptape_nodes.ArtifactManager()._registry.get_or_create_provider_instance(provider_classes[0])
+        provider = engine.artifact_manager._registry.get_or_create_provider_instance(provider_classes[0])
         monkeypatch.setattr(
             provider.__class__, "get_write_vetting_policy", staticmethod(lambda: WriteVettingPolicy.FROM_PATH)
         )
@@ -1163,13 +1155,13 @@ class TestOSWritePermissionVet:
                 result_details="delete recorded by spy",
             )
 
-        event_manager = griptape_nodes.EventManager()
+        event_manager = engine.event_manager
         registry = event_manager._request_type_to_manager
         monkeypatch.setitem(registry, DeleteFileRequest, spy_delete_handler)
 
         requested_path = temp_dir / "image.png"
         request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
-        result = griptape_nodes.OSManager().on_write_file_request(request)
+        result = engine.os_manager.on_write_file_request(request)
 
         assert isinstance(result, WriteFileResultSuccess)
         # Exactly one DeleteFileRequest for the staged temp; not more (would
@@ -1199,25 +1191,25 @@ class TestExtensionCoercionDoesNotClobberPriorSave:
             yield Path(tmpdir).resolve()
 
     @pytest.fixture(autouse=True)
-    def setup_project(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
+    def setup_project(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
+        original_workspace = engine.config_manager.workspace_path
 
         project_yml = temp_dir / "project_template.yml"
         project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
-        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        load_result = engine.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
         if isinstance(load_result, LoadProjectTemplateResultSuccess):
-            GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+            engine.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
 
-        griptape_nodes.ArtifactManager().on_handle_register_artifact_provider_request(
+        engine.artifact_manager.on_handle_register_artifact_provider_request(
             RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider)
         )
 
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        engine.config_manager.workspace_path = temp_dir
 
         yield
 
-        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=None))
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.handle_request(SetCurrentProjectRequest(project_id=None))
+        engine.config_manager.workspace_path = original_workspace
 
     @pytest.fixture
     def outputs_dir(self, temp_dir: Path, setup_project: None) -> Path:  # noqa: ARG002
@@ -1250,10 +1242,10 @@ class TestExtensionCoercionDoesNotClobberPriorSave:
         assert not (outputs_dir / "render_v002.png").exists()
 
     def test_plain_path_create_new_with_mismatched_bytes_does_not_clobber(
-        self, griptape_nodes: GriptapeNodes, outputs_dir: Path
+        self, engine: Engine, outputs_dir: Path
     ) -> None:
         """Plain string path variant: two JPEG saves to ``output.png`` produce two .jpg files."""
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         requested_path = outputs_dir / "output.png"
 
         first_result = os_manager.on_write_file_request(
@@ -1304,7 +1296,7 @@ class TestCreateNewMacroIndexSeed:
             yield Path(tmpdir).resolve()
 
     @pytest.fixture(autouse=True)
-    def setup_project(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+    def setup_project(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
         # Production macro resolution requires a loaded project so `{outputs}` from the
         # default template can resolve to <workspace>/outputs.
         #
@@ -1313,20 +1305,20 @@ class TestCreateNewMacroIndexSeed:
         # from the project/workspace config layers (see ProjectManager._activate_project),
         # which would clobber any earlier workspace_path assignment. Setting it AFTER
         # activation makes our temp_dir stick for the duration of the test.
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
+        original_workspace = engine.config_manager.workspace_path
 
         project_yml = temp_dir / "project_template.yml"
         project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
-        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        load_result = engine.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
         if isinstance(load_result, LoadProjectTemplateResultSuccess):
-            GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+            engine.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
 
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        engine.config_manager.workspace_path = temp_dir
 
         yield
 
-        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=None))
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.handle_request(SetCurrentProjectRequest(project_id=None))
+        engine.config_manager.workspace_path = original_workspace
 
     @pytest.fixture
     def outputs_dir(self, temp_dir: Path, setup_project: None) -> Path:  # noqa: ARG002
@@ -1570,19 +1562,19 @@ class TestOptionalPaddedIndexCollision:
             yield Path(tmpdir).resolve()
 
     @pytest.fixture(autouse=True)
-    def setup_project(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+    def setup_project(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
         # Same load-then-force ordering as TestCreateNewMacroIndexSeed: SetCurrentProject
         # remerges workspace_path from project config layers, so we set it AFTER.
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
+        original_workspace = engine.config_manager.workspace_path
         project_yml = temp_dir / "project_template.yml"
         project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
-        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        load_result = engine.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
         if isinstance(load_result, LoadProjectTemplateResultSuccess):
-            GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+            engine.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+        engine.config_manager.workspace_path = temp_dir
         yield
-        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=None))
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.handle_request(SetCurrentProjectRequest(project_id=None))
+        engine.config_manager.workspace_path = original_workspace
 
     @pytest.fixture
     def outputs_dir(self, temp_dir: Path, setup_project: None) -> Path:  # noqa: ARG002
@@ -1739,20 +1731,20 @@ class TestCreateNewMacroIndexSeedDefensiveFallthrough:
             yield Path(tmpdir).resolve()
 
     @pytest.fixture(autouse=True)
-    def setup_project(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+    def setup_project(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
         # Same ordering as TestCreateNewMacroIndexSeed.setup_project — load + activate
         # FIRST, then force workspace_path. SetCurrentProjectRequest re-derives the
         # workspace from project config layers and would otherwise clobber temp_dir.
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
+        original_workspace = engine.config_manager.workspace_path
         project_yml = temp_dir / "project_template.yml"
         project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
-        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        load_result = engine.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
         if isinstance(load_result, LoadProjectTemplateResultSuccess):
-            GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+            engine.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+        engine.config_manager.workspace_path = temp_dir
         yield
-        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=None))
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.handle_request(SetCurrentProjectRequest(project_id=None))
+        engine.config_manager.workspace_path = original_workspace
 
     @pytest.fixture
     def outputs_dir(self, temp_dir: Path, setup_project: None) -> Path:  # noqa: ARG002
@@ -1868,20 +1860,20 @@ class TestCreateNewMacroIndexSeedWindowsPaths:
             yield Path(tmpdir).resolve()
 
     @pytest.fixture(autouse=True)
-    def setup_project(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+    def setup_project(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
         # Same ordering as TestCreateNewMacroIndexSeed.setup_project — load + activate
         # FIRST, then force workspace_path so SetCurrentProject's project-config remerge
         # doesn't clobber temp_dir.
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
+        original_workspace = engine.config_manager.workspace_path
         project_yml = temp_dir / "project_template.yml"
         project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
-        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        load_result = engine.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
         if isinstance(load_result, LoadProjectTemplateResultSuccess):
-            GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+            engine.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+        engine.config_manager.workspace_path = temp_dir
         yield
-        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=None))
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.handle_request(SetCurrentProjectRequest(project_id=None))
+        engine.config_manager.workspace_path = original_workspace
 
     def test_long_windows_path_gap_fill(self, temp_dir: Path) -> None:
         r"""Workspace + nested dirs + filename combine to >260 chars; gap-fill must still work.
@@ -1958,30 +1950,30 @@ class TestWriteTempFileRequest:
             yield Path(tmpdir).resolve()
 
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
         """Load the default project template so SAVE_TEMP_FILE resolves."""
-        config_manager = griptape_nodes.ConfigManager()
+        config_manager = engine.config_manager
         original_workspace = config_manager.workspace_path
         config_manager.set_config_value("workspace_directory", str(temp_dir))
 
         project_yml = temp_dir / "project_template.yml"
         project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
-        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        load_result = engine.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
         if isinstance(load_result, LoadProjectTemplateResultSuccess):
-            GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+            engine.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
 
         yield
 
-        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=None))
+        engine.handle_request(SetCurrentProjectRequest(project_id=None))
         config_manager.set_config_value("workspace_directory", str(original_workspace))
 
-    def test_stages_bytes_at_project_temp_path(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_stages_bytes_at_project_temp_path(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.events.os_events import (
             WriteTempFileRequest,
             WriteTempFileResultSuccess,
         )
 
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         payload = b"probe target bytes"
 
         result = os_manager.on_write_temp_file_request(
@@ -2002,7 +1994,7 @@ class TestWriteTempFileRequest:
         assert staged.suffix == ".mp4"
         assert "probe" in staged.stem
 
-    def test_caller_controls_uniqueness_via_variables(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_caller_controls_uniqueness_via_variables(self, engine: Engine) -> None:
         """The handler does not inject uuids -- callers who want uniqueness supply their own.
 
         SAVE_TEMP_FILE's on-collision policy is OVERWRITE, so two callers passing
@@ -2015,7 +2007,7 @@ class TestWriteTempFileRequest:
             WriteTempFileResultSuccess,
         )
 
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
 
         result_a = os_manager.on_write_temp_file_request(
             WriteTempFileRequest(content=b"a", variables={"file_name_base": "unique-a", "file_extension": "mp4"})
@@ -2030,7 +2022,7 @@ class TestWriteTempFileRequest:
         assert Path(result_a.staged_path).read_bytes() == b"a"
         assert Path(result_b.staged_path).read_bytes() == b"b"
 
-    def test_lands_under_project_temp_directory(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_lands_under_project_temp_directory(self, engine: Engine, temp_dir: Path) -> None:
         """The staged path is under the project's ``{temp}`` directory, not the OS temp dir.
 
         Confirms we're using the SAVE_TEMP_FILE situation's project-scoped
@@ -2043,7 +2035,7 @@ class TestWriteTempFileRequest:
             WriteTempFileResultSuccess,
         )
 
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
 
         result = os_manager.on_write_temp_file_request(
             WriteTempFileRequest(content=b"payload", variables={"file_name_base": "probe", "file_extension": "mp4"})
@@ -2056,7 +2048,7 @@ class TestWriteTempFileRequest:
         # differences (e.g. macOS ``/var`` vs ``/private/var``).
         assert temp_dir.resolve() in staged.parents
 
-    def test_returns_failure_when_variables_do_not_resolve_macro(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_returns_failure_when_variables_do_not_resolve_macro(self, engine: Engine) -> None:
         """Caller omitting a required macro variable surfaces as a Failure.
 
         The SAVE_TEMP_FILE macro references ``{file_name_base}`` and
@@ -2070,14 +2062,14 @@ class TestWriteTempFileRequest:
             WriteTempFileResultFailure,
         )
 
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         result = os_manager.on_write_temp_file_request(WriteTempFileRequest(content=b"payload", variables={}))
 
         assert isinstance(result, WriteTempFileResultFailure)
         assert result.failure_reason == FileIOFailureReason.INVALID_PATH
 
     def test_returns_failure_when_situation_registry_missing_save_temp_file(
-        self, griptape_nodes: GriptapeNodes, monkeypatch: pytest.MonkeyPatch
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """SAVE_TEMP_FILE absent from the situation registry -> Failure result.
 
@@ -2099,11 +2091,11 @@ class TestWriteTempFileRequest:
         def situation_missing_handler(request: GetSituationRequest) -> GetSituationResultFailure:  # noqa: ARG001
             return GetSituationResultFailure(result_details="situation missing (test)")
 
-        event_manager = griptape_nodes.EventManager()
+        event_manager = engine.event_manager
         registry = event_manager._request_type_to_manager
         monkeypatch.setitem(registry, GetSituationRequest, situation_missing_handler)
 
-        os_manager = griptape_nodes.OSManager()
+        os_manager = engine.os_manager
         result = os_manager.on_write_temp_file_request(
             WriteTempFileRequest(content=b"payload", variables={"file_name_base": "probe", "file_extension": "mp4"})
         )
@@ -2135,23 +2127,23 @@ class TestFailedWriteLeavesNoLitter:
             yield Path(tmpdir).resolve()
 
     @pytest.fixture(autouse=True)
-    def setup_project(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+    def setup_project(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
         # Mirrors TestPaddedIndexMacroSaves: load + activate the project first, then pin
         # workspace_path, since activation re-derives it.
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
+        original_workspace = engine.config_manager.workspace_path
 
         project_yml = temp_dir / "project_template.yml"
         project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
-        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        load_result = engine.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
         if isinstance(load_result, LoadProjectTemplateResultSuccess):
-            GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+            engine.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
 
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        engine.config_manager.workspace_path = temp_dir
 
         yield
 
-        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=None))
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.handle_request(SetCurrentProjectRequest(project_id=None))
+        engine.config_manager.workspace_path = original_workspace
 
     @pytest.fixture
     def outputs_dir(self, temp_dir: Path, setup_project: None) -> Path:  # noqa: ARG002
@@ -2213,13 +2205,13 @@ class TestFailedWriteLeavesNoLitter:
         assert list(outputs_dir.iterdir()) == []
 
     def test_fail_policy_lock_failure_leaves_no_file(
-        self, outputs_dir: Path, monkeypatch: pytest.MonkeyPatch, griptape_nodes: GriptapeNodes
+        self, outputs_dir: Path, monkeypatch: pytest.MonkeyPatch, engine: Engine
     ) -> None:
         """The FAIL policy also writes with mode="x", so it leaked debris too."""
         self._fail_lock_times(monkeypatch, count=None)
         target = outputs_dir / "single.png"
 
-        result = griptape_nodes.OSManager().on_write_file_request(
+        result = engine.os_manager.on_write_file_request(
             WriteFileRequest(
                 file_path=str(target),
                 content=b"payload",
@@ -2232,7 +2224,7 @@ class TestFailedWriteLeavesNoLitter:
         assert not target.exists()
 
     def test_write_error_leaves_no_partial_file(
-        self, outputs_dir: Path, monkeypatch: pytest.MonkeyPatch, griptape_nodes: GriptapeNodes
+        self, outputs_dir: Path, monkeypatch: pytest.MonkeyPatch, engine: Engine
     ) -> None:
         """A mid-write failure is worse than zero-byte: the debris has a plausible size."""
 
@@ -2243,7 +2235,7 @@ class TestFailedWriteLeavesNoLitter:
         monkeypatch.setattr("griptape_nodes.retained_mode.managers.os_manager.os.fsync", exploding_fsync)
         target = outputs_dir / "partial.png"
 
-        result = griptape_nodes.OSManager().on_write_file_request(
+        result = engine.os_manager.on_write_file_request(
             WriteFileRequest(
                 file_path=str(target),
                 content=b"A" * 4096,
@@ -2255,7 +2247,7 @@ class TestFailedWriteLeavesNoLitter:
         assert not target.exists()
 
     def test_cleanup_cannot_be_armed_against_a_non_exclusive_open(
-        self, outputs_dir: Path, monkeypatch: pytest.MonkeyPatch, griptape_nodes: GriptapeNodes
+        self, outputs_dir: Path, monkeypatch: pytest.MonkeyPatch, engine: Engine
     ) -> None:
         """The exclusive-create flag is derived from ``mode``, so the two cannot disagree.
 
@@ -2271,19 +2263,19 @@ class TestFailedWriteLeavesNoLitter:
         # Even with every lock attempt rigged to fail, mode="x" over an existing file
         # raises from open() first, so the cleanup is never reachable.
         with pytest.raises(FileExistsError):
-            griptape_nodes.OSManager()._write_locked_discarding_debris(str(target), b"replacement", "utf-8", mode="x")
+            engine.os_manager._write_locked_discarding_debris(str(target), b"replacement", "utf-8", mode="x")
 
         assert target.read_bytes() == b"REAL USER DATA"
 
     def test_overwrite_never_deletes_pre_existing_file(
-        self, outputs_dir: Path, monkeypatch: pytest.MonkeyPatch, griptape_nodes: GriptapeNodes
+        self, outputs_dir: Path, monkeypatch: pytest.MonkeyPatch, engine: Engine
     ) -> None:
         """Guards the mode="x" gate: under "w" the file may predate us and hold real data."""
         target = outputs_dir / "precious.png"
         target.write_bytes(b"REAL USER DATA")
         self._fail_lock_times(monkeypatch, count=None)
 
-        result = griptape_nodes.OSManager().on_write_file_request(
+        result = engine.os_manager.on_write_file_request(
             WriteFileRequest(
                 file_path=str(target),
                 content=b"replacement",
@@ -2298,10 +2290,10 @@ class TestFailedWriteLeavesNoLitter:
 class TestMacroFailureMessageIsReadable:
     """Error messages must name the macro template, not dump the ParsedMacro repr."""
 
-    def test_failure_details_show_template_not_dataclass_repr(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_failure_details_show_template_not_dataclass_repr(self, engine: Engine) -> None:
         template = "{outputs}/{file_name_base}_v{###}.{file_extension}"
 
-        result = griptape_nodes.OSManager().on_write_file_request(
+        result = engine.os_manager.on_write_file_request(
             WriteFileRequest(
                 file_path=MacroPath(ParsedMacro(template), {}),
                 content=b"payload",

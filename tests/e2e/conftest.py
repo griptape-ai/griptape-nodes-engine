@@ -4,31 +4,30 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
-from pathlib import Path
 from typing import TYPE_CHECKING
-from unittest.mock import patch
 
 import pytest
 
 import griptape_nodes.retained_mode.managers.config_manager as config_manager_module
 import griptape_nodes.retained_mode.managers.secrets_manager as secrets_manager_module
 from griptape_nodes.node_library.library_registry import LibraryRegistry
-from griptape_nodes.retained_mode.engine import reset_root_engine
+from griptape_nodes.retained_mode.engine import current_engine, reset_root_engine
 from griptape_nodes.retained_mode.events.connection_events import (
     CreateConnectionRequest,
     CreateConnectionResultSuccess,
 )
 from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.utils.version_utils import engine_version
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
+    from pathlib import Path
+
+    from griptape_nodes.retained_mode.engine import Engine
 
 
 @pytest.fixture(autouse=True)
-def _isolated_engine_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+def _isolated_engine_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]:
     """Boot each test against empty temp config/secrets and a clean registry.
 
     ``SecretsManager`` installs ``ENV_VAR_PATH``'s contents into ``os.environ`` at init;
@@ -47,19 +46,23 @@ def _isolated_engine_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
         if key.startswith(("GT_CLOUD_", "GTN_CONFIG_")):
             monkeypatch.delenv(key, raising=False)
     try:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_config_path = Path(temp_dir) / "griptape_nodes_config.json"
-            temp_config_path.write_text(json.dumps({}, indent=2))
-            temp_env_path = Path(temp_dir) / ".env"
-            temp_env_path.write_text("")
-            with (
-                patch.object(config_manager_module, "USER_CONFIG_PATH", temp_config_path),
-                patch.object(secrets_manager_module, "ENV_VAR_PATH", temp_env_path),
-            ):
-                yield
+        temp_workspace_path = tmp_path / "workspace"
+        temp_config_path = tmp_path / "griptape_nodes_config.json"
+        temp_config_path.write_text(json.dumps({"workspace_directory": str(temp_workspace_path)}, indent=2))
+        temp_env_path = tmp_path / ".env"
+        temp_env_path.write_text("")
+        monkeypatch.setattr(config_manager_module, "USER_CONFIG_PATH", temp_config_path)
+        monkeypatch.setattr(secrets_manager_module, "ENV_VAR_PATH", temp_env_path)
+        yield
     finally:
         reset_root_engine()
         LibraryRegistry._clear()
+
+
+@pytest.fixture
+def engine() -> Engine:
+    """Provide the engine for this test, building it on first use."""
+    return current_engine()
 
 
 @pytest.fixture
@@ -147,11 +150,11 @@ def write_isolated_config() -> Callable[..., None]:
 
 
 @pytest.fixture
-def create_node() -> Callable[..., str]:
+def create_node(engine: Engine) -> Callable[..., str]:
     """Return a helper that creates a node from the given library and asserts success."""
 
     def _create(node_type: str, node_name: str, flow_name: str, *, library_name: str) -> str:
-        result = GriptapeNodes.handle_request(
+        result = engine.handle_request(
             CreateNodeRequest(
                 node_type=node_type,
                 specific_library_name=library_name,
@@ -166,11 +169,11 @@ def create_node() -> Callable[..., str]:
 
 
 @pytest.fixture
-def connect() -> Callable[..., None]:
+def connect(engine: Engine) -> Callable[..., None]:
     """Return a helper that connects two node parameters and asserts success."""
 
     def _connect(source_node: str, source_param: str, target_node: str, target_param: str) -> None:
-        result = GriptapeNodes.handle_request(
+        result = engine.handle_request(
             CreateConnectionRequest(
                 source_node_name=source_node,
                 source_parameter_name=source_param,

@@ -1,5 +1,6 @@
 import logging
 import time
+from http import HTTPStatus
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -183,6 +184,10 @@ class LocalStorageDriver(BaseStorageDriver):
     def delete_file(self, path: Path) -> None:
         """Delete a file from local storage.
 
+        Deleting a file that is already absent is a successful no-op: the static server
+        answers 404 for a missing file, which means the requested end state already holds.
+        Any other HTTP error still raises.
+
         Args:
             path: The path of the file to delete.
         """
@@ -193,6 +198,9 @@ class LocalStorageDriver(BaseStorageDriver):
             response = httpx.delete(delete_url)
             response.raise_for_status()
         except httpx.HTTPStatusError as e:
+            if e.response.status_code == HTTPStatus.NOT_FOUND:
+                logger.debug("File %s is already absent from local storage; nothing to delete", path)
+                return
             msg = f"Failed to delete file {path}: {e}"
             logger.error(msg)
             raise RuntimeError(msg) from e
