@@ -5563,13 +5563,17 @@ class TestProjectManagerProjectWorkspaces:
         mock_engine.ahandle_request.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_unknown_project_id_remerges_after_clearing_layers(self, tmp_path: Path) -> None:
-        """An unknown project id remerges config instead of leaving layers cleared.
+    async def test_unknown_project_id_is_refused_without_touching_config_layers(self, tmp_path: Path) -> None:
+        """An unknown project id is refused before any config layer is disturbed.
 
-        Activation unconditionally calls clear_project_layers() up front. For a
-        known project (load_project_config) or system defaults (load_configs) a
-        remerge follows; an id with no loaded template must still remerge via
-        load_configs(), otherwise config is left in the cleared, unmerged state.
+        Config must never be left in the cleared, unmerged state. Previously activation
+        cleared the layers up front and then remerged via load_configs() to satisfy that.
+        But remerging without a project layer promotes the user layer's
+        `libraries_to_register` (merge_dicts replaces lists), silently swapping the
+        engine's library set for whatever a previous install left behind.
+
+        Refusing before clear_project_layers() runs satisfies the same invariant more
+        strongly: nothing is cleared, so nothing needs remerging.
         """
         from unittest.mock import AsyncMock, patch
 
@@ -5592,11 +5596,55 @@ class TestProjectManagerProjectWorkspaces:
         with patch.object(pm, "_engine", mock_engine):
             cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = AsyncMock()
-            await pm.on_set_current_project_request(SetCurrentProjectRequest(project_id=str(unknown_file)))
+            result = await pm.on_set_current_project_request(SetCurrentProjectRequest(project_id=str(unknown_file)))
 
-        mock_config.clear_project_layers.assert_called_once()
-        mock_config.load_configs.assert_called_once()
+        assert result.failed()
+        assert "no loaded project template has that id" in str(result.result_details)
+
+        # The refused id never got a project config layer of its own. (clear_project_layers
+        # and load_configs do run, but from the rollback to the previously active project --
+        # system defaults here -- which is what leaves the engine in a coherent state.)
         mock_config.load_project_config.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_refused_switch_rolls_back_to_the_previous_project_layer(self, tmp_path: Path) -> None:
+        """Refusing an unknown id restores the project the user was already working in.
+
+        This is the user-visible fix: a switch to an id this engine never loaded used to
+        remerge without a project layer, silently swapping the library set for the user
+        layer's. Now the failure rolls back, re-establishing the previous project's
+        config layer, so its libraries stay in effect.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        from griptape_nodes.retained_mode.events.project_events import SetCurrentProjectRequest
+
+        project_file = tmp_path / "current" / "project.yml"
+        project_file.parent.mkdir()
+        project_file.touch()
+
+        mock_config = Mock()
+        mock_config.project_config = {}
+        mock_config.env_config = {}
+        mock_config.merged_config = {}
+        self._config_for_workspace_lookup(mock_config, {}, tmp_path)
+
+        pm = self._make_project_manager_with_project(project_file, mock_config)
+        pm._initialization_complete = True
+        pm._current_project_id = str(project_file)
+
+        unknown_file = tmp_path / "from-a-previous-install.yml"
+
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            mock_engine.ahandle_request = AsyncMock()
+            result = await pm.on_set_current_project_request(SetCurrentProjectRequest(project_id=str(unknown_file)))
+
+        assert result.failed()
+
+        # Rollback re-established the project the user was in, not a bare defaults remerge.
+        mock_config.load_project_config.assert_called_once_with(project_file.parent)
+        assert pm._current_project_id == str(project_file)
 
     @pytest.mark.asyncio
     async def test_initialization_incomplete_skips_reload(self, tmp_path: Path) -> None:
