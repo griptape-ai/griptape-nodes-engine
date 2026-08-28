@@ -1985,7 +1985,8 @@ class TestConfigProvenance:
         assert result.shadowed_by.layer == "project"
         assert result.shadowed_by.path == str(project_config)
         # The user is told WHY, not just that the write "succeeded".
-        assert "no visible effect" in str(result.result_details)
+        assert "libraries_directory" in str(result.result_details)
+        assert "does not change" in str(result.result_details)
 
         # The write is not rejected -- it lands in the user layer, silently ignored.
         on_disk = json.loads(isolate_user_config.read_text())
@@ -2026,7 +2027,7 @@ class TestConfigProvenance:
         assert result.applied is True
         assert result.effective_value == "DEBUG"
         assert result.shadowed_by is None
-        assert "no visible effect" not in str(result.result_details)
+        assert "does not change" not in str(result.result_details)
 
     def test_get_config_value_request_reports_source_and_editable(
         self, tmp_path: Path, isolate_user_config: Path
@@ -2085,6 +2086,50 @@ class TestConfigProvenance:
         assert result.applied is False
         assert result.shadowed_by is not None
         assert result.shadowed_by.layer == "project"
+        # The message names the shadowed leaf, not just the category.
+        assert "nuke.executable" in str(result.result_details)
+
+    def test_set_config_category_request_applied_when_a_sibling_key_is_shadowed(self, tmp_path: Path) -> None:
+        """Shadowing is judged per written leaf, not on the category as a whole.
+
+        A project layer that pins `nuke.executable` says nothing about `nuke.port`, so a write
+        of only `port` did take effect and must not be reported as shadowed.
+        """
+        self._write_layer_config(tmp_path, {"nuke": {"executable": "/from/project"}})
+
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.load_project_config(tmp_path)
+            result = manager.on_handle_set_config_category_request(
+                SetConfigCategoryRequest(category="nuke", contents={"port": 8080})
+            )
+
+        assert isinstance(result, SetConfigCategoryResultSuccess)
+        assert result.applied is True
+        assert result.shadowed_by is None
+        assert result.effective_value == {"executable": "/from/project", "port": 8080}
+
+    def test_set_config_category_request_partial_shadow_names_the_shadowed_leaf(self, tmp_path: Path) -> None:
+        """A write where only some leaves are shadowed reports the one that is.
+
+        `applied` False covers the whole write, so the message has to say WHICH key did not
+        change; the rest of the category did.
+        """
+        self._write_layer_config(tmp_path, {"nuke": {"executable": "/from/project"}})
+
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.load_project_config(tmp_path)
+            result = manager.on_handle_set_config_category_request(
+                SetConfigCategoryRequest(category="nuke", contents={"port": 8080, "executable": "/typed/by/user"})
+            )
+
+        assert isinstance(result, SetConfigCategoryResultSuccess)
+        assert result.applied is False
+        assert result.shadowed_by is not None
+        assert "nuke.executable" in str(result.result_details)
+        # The unshadowed sibling still landed.
+        assert result.effective_value == {"executable": "/from/project", "port": 8080}
 
     def test_set_config_category_request_full_replacement_leaves_new_fields_at_defaults(self) -> None:
         """A full-config replacement (category=None) has no single key to check for shadowing.

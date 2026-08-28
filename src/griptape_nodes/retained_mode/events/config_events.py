@@ -150,14 +150,20 @@ class SetConfigValueResultSuccess(ResultPayloadSuccess):
     workspace config layer (or a GTN_CONFIG_ environment variable) can outrank the
     write, in which case it is stored but has no visible effect until that layer changes.
 
+    One key is exempt from that guarantee: `workspace_directory` can also be pinned by a
+    runtime per-project override, which is not one of the layers shadowing is computed
+    from. A write to it while a project pins the workspace can report `applied` True with
+    an `effective_value` that still differs from what was written.
+
     Args:
         applied: Whether the requested value is now the effective (merged) value. False
             means some higher-priority layer still supplies a different value; see
-            `shadowed_by`.
+            `shadowed_by`. A dict value is judged leaf by leaf, so False means at least
+            one leaf it wrote is shadowed, not necessarily all of them.
         effective_value: What `GetConfigValueRequest` for this same key would return right
             now, after this write. Equal to the requested value when `applied` is True.
         shadowed_by: The layer that won instead, when `applied` is False. None when
-            `applied` is True.
+            `applied` is True. `result_details` names which key that layer supplies.
     """
 
     applied: bool = True
@@ -245,11 +251,16 @@ class SetConfigCategoryResultSuccess(ResultPayloadSuccess):
     user layer at once, has no single key to check, and leaves these three at their
     defaults.
 
+    Shadowing is judged per leaf of `contents`, so a higher-priority layer that defines a
+    DIFFERENT key under the same category does not make this write shadowed. `applied`
+    False therefore means at least one of the written leaves is shadowed; the rest may
+    well have taken effect. `result_details` names the first shadowed leaf.
+
     Args:
         applied: See `SetConfigValueResultSuccess.applied`. Always True (default) for a
             full-config replacement.
-        effective_value: See `SetConfigValueResultSuccess.effective_value`. Always None
-            (default) for a full-config replacement.
+        effective_value: See `SetConfigValueResultSuccess.effective_value`, for the whole
+            category. Always None (default) for a full-config replacement.
         shadowed_by: See `SetConfigValueResultSuccess.shadowed_by`. Always None (default)
             for a full-config replacement.
     """
