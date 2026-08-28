@@ -433,6 +433,25 @@ class LoadLibraryMetadataFromFileResultSuccess(WorkflowNotAlteredMixin, ResultPa
         git_remote: The git remote URL if the library is in a git repository, None otherwise.
         git_ref: The current git reference (branch, tag, or commit) if the library is in a git repository, None otherwise.
         enabled: If the current library is enabled or disabled by the user at the time of the request.
+        is_registered: Whether a library of this name is in the LibraryRegistry right now.
+
+                       Metadata is read from whatever `libraries_to_register` currently
+                       resolves to, while the registry holds what was actually loaded. Those
+                       two can disagree: config changes after boot (a settings write, a
+                       project switch) are not applied to the registry until libraries
+                       reload, so metadata can describe a library the engine cannot answer
+                       any other question about. Without this flag that difference is
+                       invisible, and a client reasonably follows a metadata entry with a
+                       name-keyed call (CheckLibraryUpdate, GetAllInfoForLibrary) that then
+                       fails with "no Library with that name was registered".
+
+                       False means "declared but not loaded": show it as pending a library
+                       refresh rather than querying it. Keyed on name, not path, because the
+                       follow-up requests are name-keyed too, so a second copy of an
+                       already-loaded name reports True.
+
+                       Distinct from `enabled` (the user's config flag) and from
+                       `registered_path` (the verbatim config path, not a membership answer).
     """
 
     library_schema: LibrarySchema
@@ -440,6 +459,7 @@ class LoadLibraryMetadataFromFileResultSuccess(WorkflowNotAlteredMixin, ResultPa
     git_remote: str | None
     git_ref: str | None
     enabled: bool
+    is_registered: bool
     registered_path: str | None = None
 
 

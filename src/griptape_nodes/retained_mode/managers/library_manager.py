@@ -1367,8 +1367,20 @@ class LibraryManager(EngineScoped):
             git_remote=git_remote,
             git_ref=git_ref,
             enabled=enabled,
+            is_registered=self._is_library_name_registered(library_data.name),
             result_details=details,
         )
+
+    @staticmethod
+    def _is_library_name_registered(library_name: str) -> bool:
+        """Whether a library of this name is in the registry right now.
+
+        Metadata is derived from config while the registry holds what actually loaded, so the
+        two can disagree until libraries reload. Keyed on name because the requests a client
+        makes off the back of metadata (CheckLibraryUpdate, GetAllInfoForLibrary) are
+        name-keyed: if the name resolves, those calls succeed regardless of which copy loaded.
+        """
+        return library_name in LibraryRegistry.list_libraries()
 
     async def load_metadata_for_all_libraries_request(
         self,
@@ -1422,6 +1434,7 @@ class LibraryManager(EngineScoped):
                         git_remote=None,
                         git_ref=None,
                         enabled=True,
+                        is_registered=self._is_library_name_registered(scan_result.library_schema.name),
                         result_details=scan_result.result_details,
                     )
                 # else: Keep the load failure result
@@ -1583,6 +1596,7 @@ class LibraryManager(EngineScoped):
             git_remote=git_remote,
             git_ref=git_ref,
             enabled=True,
+            is_registered=self._is_library_name_registered(library_schema.name),
             result_details=details,
         )
 
