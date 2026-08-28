@@ -4232,7 +4232,7 @@ class TestSelectTopLevelImportedFlow:
         workflow_manager = engine.workflow_manager
         mock_engine = self._flow_manager_with_parents({"Zeta_flow": "Other", "Alpha_flow": "Other"})
 
-        with caplog.at_level(logging.WARNING, logger="engine"):
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
             selected = workflow_manager._select_top_level_imported_flow(
                 {"Zeta_flow", "Alpha_flow"}, "ParentFlow", "wf", mock_engine
             )
@@ -4250,7 +4250,7 @@ class TestSelectTopLevelImportedFlow:
         workflow_manager = engine.workflow_manager
         mock_engine = self._flow_manager_with_parents({"Zeta_flow": "ParentFlow", "Alpha_flow": "ParentFlow"})
 
-        with caplog.at_level(logging.WARNING, logger="engine"):
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
             selected = workflow_manager._select_top_level_imported_flow(
                 {"Zeta_flow", "Alpha_flow"}, "ParentFlow", "wf", mock_engine
             )

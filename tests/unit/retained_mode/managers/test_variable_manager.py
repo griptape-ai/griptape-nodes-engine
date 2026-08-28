@@ -639,7 +639,7 @@ class TestReservedNames:
         come back (e.g. duplicate name in the same flow).
         """
         _add_variable(engine, "dup_var", "first")
-        with caplog.at_level(logging.WARNING, logger="engine"):
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
             result = engine.handle_request(
                 CreateVariableRequest(
                     name="dup_var", type="str", value="second", owning_flow=flow_name, initial_setup=True

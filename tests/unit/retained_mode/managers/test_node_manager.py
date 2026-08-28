@@ -173,7 +173,7 @@ class TestNodeManagerResolutionStateSerialization:
         mock_tracker.get_tracker_state.return_value = SerializedParameterValueTracker.TrackerState.NOT_IN_TRACKER
 
         caplog.clear()
-        caplog.set_level(logging.WARNING, logger="engine")
+        caplog.set_level(logging.WARNING, logger="griptape_nodes")
 
         NodeManager.handle_parameter_value_saving(
             parameter=mock_parameter,
@@ -215,7 +215,7 @@ class TestNodeManagerResolutionStateSerialization:
         mock_tracker.get_tracker_state.return_value = SerializedParameterValueTracker.TrackerState.NOT_SERIALIZABLE
 
         caplog.clear()
-        caplog.set_level(logging.WARNING, logger="engine")
+        caplog.set_level(logging.WARNING, logger="griptape_nodes")
 
         NodeManager.handle_parameter_value_saving(
             parameter=mock_parameter,

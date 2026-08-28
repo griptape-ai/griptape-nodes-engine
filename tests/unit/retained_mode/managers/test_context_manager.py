@@ -415,7 +415,7 @@ class TestWorkflowWorkingDirectory:
                 )
                 assert isinstance(result, SetWorkflowContextSuccess)
 
-                with caplog.at_level(logging.WARNING, logger="engine"):
+                with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
                     self._resolve_outputs(engine)
 
                 warnings = [r for r in caplog.records if r.levelno == logging.WARNING]

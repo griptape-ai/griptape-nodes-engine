@@ -864,7 +864,7 @@ class TestProjectManagerBuiltinVariables:
         parsed_macro = ParsedMacro("{workflow_dir?:/}outputs/image.png")
         request = GetPathForMacroRequest(parsed_macro=parsed_macro, variables={})
 
-        with caplog.at_level(logging.WARNING, logger="engine"):
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
             result = project_manager_with_template.on_get_path_for_macro_request(request)
 
         assert isinstance(result, GetPathForMacroResultSuccess)
@@ -2472,7 +2472,7 @@ situations:
 
         with (
             patch("griptape_nodes.retained_mode.managers.project_manager.File") as mock_file_cls,
-            caplog.at_level(logging.ERROR, logger="engine"),
+            caplog.at_level(logging.ERROR, logger="griptape_nodes"),
         ):
             mock_file_instance = Mock()
             mock_file_instance.aread_text = AsyncMock(return_value="not: valid: yaml: : :\n  - broken")
@@ -6087,7 +6087,7 @@ situations:
 
         with (
             patch.object(pm, "_load_and_cache_project_template", new=AsyncMock()) as mock_load,
-            caplog.at_level(logging.WARNING, logger="engine"),
+            caplog.at_level(logging.WARNING, logger="griptape_nodes"),
         ):
             await pm._load_registered_projects()
             mock_load.assert_not_called()
@@ -6113,7 +6113,7 @@ situations:
 
         with (
             patch.object(pm, "on_load_project_template_request", new=AsyncMock(return_value=failure)),
-            caplog.at_level(logging.WARNING, logger="engine"),
+            caplog.at_level(logging.WARNING, logger="griptape_nodes"),
         ):
             await pm._load_registered_projects()
 
@@ -8458,7 +8458,7 @@ class TestValidateProjectTemplateParentChain:
             "directories": {},
         }
 
-        with caplog.at_level(logging.WARNING, logger="engine"):
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
             result = pm.on_validate_project_template_request(
                 ValidateProjectTemplateRequest(template_data=template_data)
             )
@@ -8610,7 +8610,7 @@ situations:
 
         with (
             patch.object(pm, "on_load_project_template_request", new=AsyncMock()) as mock_load,
-            caplog.at_level(logging.WARNING, logger="engine"),
+            caplog.at_level(logging.WARNING, logger="griptape_nodes"),
         ):
             await pm._load_registered_projects()
             mock_load.assert_not_called()
@@ -8636,7 +8636,7 @@ situations:
 
         with (
             patch.object(pm, "on_load_project_template_request", new=AsyncMock()) as mock_load,
-            caplog.at_level(logging.WARNING, logger="engine"),
+            caplog.at_level(logging.WARNING, logger="griptape_nodes"),
         ):
             await pm._load_registered_projects()
             mock_load.assert_not_called()
@@ -12579,7 +12579,7 @@ variables:
                     "griptape_nodes.retained_mode.managers.project_manager.File.write_text",
                     side_effect=FileWriteError(FileIOFailureReason.DISK_FULL, "disk full"),
                 ),
-                caplog.at_level(logging.WARNING, logger="engine"),
+                caplog.at_level(logging.WARNING, logger="griptape_nodes"),
             ):
                 result = engine.handle_request(
                     SetVariableValueRequest(

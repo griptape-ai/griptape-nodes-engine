@@ -460,7 +460,7 @@ class TestEngineFailureIsFailClosedAtRuntime:
 
         self._register_library_without_probe_node()
 
-        with caplog.at_level(logging.WARNING, logger="engine"):
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
             self._build_component_against_unresolved_node()
 
         matches = [r for r in caplog.records if "Could not resolve model access" in r.message]
@@ -473,7 +473,7 @@ class TestEngineFailureIsFailClosedAtRuntime:
 
         self._register_library_without_probe_node()
 
-        with caplog.at_level(logging.WARNING, logger="engine"):
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
             helper = self._build_component_against_unresolved_node()
 
         denial = helper.query_for_denial("alpha")
@@ -489,7 +489,7 @@ class TestEngineFailureIsFailClosedAtRuntime:
 
         self._register_library_without_probe_node()
 
-        with caplog.at_level(logging.WARNING, logger="engine"):
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
             helper = self._build_component_against_unresolved_node()
 
         with pytest.raises(RuntimeError, match="could not be checked against your license"):
@@ -501,7 +501,7 @@ class TestEngineFailureIsFailClosedAtRuntime:
 
         self._register_library_without_probe_node()
 
-        with caplog.at_level(logging.WARNING, logger="engine"):
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
             helper = self._build_component_against_unresolved_node()
 
         # A connected Prompt Model Config driver / Agent replaces the string
