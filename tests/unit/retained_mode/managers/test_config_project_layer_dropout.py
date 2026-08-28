@@ -6,34 +6,26 @@ This is the mechanism behind the stale-library report. Three facts combine:
    `app_events.on_app_initialization_complete.libraries_to_register` -- a *nested* key.
    `_load_config_from_env_vars` only ever produces flat top-level keys
    (`config_key = key[11:].lower()`, no dot-splitting), so no `GTN_CONFIG_*` variable can
-   set or shadow it. A user who pins `GTN_CONFIG_PROJECT_FILE`,
-   `GTN_CONFIG_WORKSPACE_DIRECTORY` and `GTN_CONFIG_LIBRARIES_DIRECTORY` is still fully
-   exposed on the register list.
+   set or shadow it.
 
 2. `merge_dicts` is called with the default `merge_lists=False`, so a project layer that
-   declares `libraries_to_register` *replaces* the user layer's list. While the project
-   layer is loaded, a polluted user layer is invisible -- which is why boot looked clean.
+   declares `libraries_to_register` *replaces* the user layer's list, hiding a polluted
+   user layer for as long as the project layer is loaded.
 
 3. `_activate_project` calls `clear_project_layers()` and then, for a project with no
    project-adjacent config to layer on, falls through to a bare `load_configs()`. With
    `_project_config_path` now None there is no project layer to do the replacing, so the
-   user layer's list becomes the effective config. Activation now refuses an id with no
-   loaded template outright, but **system defaults still takes this path**, so the exposure
-   is narrowed rather than removed.
+   user layer's list becomes the effective config. Activation refuses an id with no loaded
+   template outright, but **system defaults still takes this path**, so the exposure is
+   narrowed rather than removed.
 
 Editing library settings in the editor is what puts those entries in the user layer. The
-editor renders the MERGED config (`on_handle_get_config_category_request` returns
-`merged_config`) and every write to a list-valued key sends the whole rendered array. So
-`set_config_value` builds a delta holding the merged list, and because
-`_write_user_config_delta` merges that delta with `merge_lists=False`, the array in the
-user config file is replaced by the merged one. Toggling a library's enabled switch,
-changing its execution mode, or removing a row therefore copies the active project's entire
-library list into the user config, where it persists after the project is gone.
-
-(The write path is delta-only at the file level, which is why it looked clean at first
-glance. The leak is in the delta's own contents for list keys, not in the file merge. The
-desktop app's `registerLibraries()` filesystem sweep, blamed earlier, has had no callers
-since Nov 2025 and is not involved.)
+editor renders the MERGED config and every write to a list-valued key sends the whole
+rendered array, so `set_config_value` builds a delta holding the merged list, which
+`_write_user_config_delta` then merges with `merge_lists=False` -- replacing the array in
+the user config file. Toggling a library's enabled switch, changing its execution mode, or
+removing a row therefore copies the active project's entire library list into the user
+config, where it persists after the project is gone.
 """
 
 from __future__ import annotations

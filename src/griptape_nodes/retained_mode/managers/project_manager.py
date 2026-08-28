@@ -3112,14 +3112,10 @@ class ProjectManager(EngineScoped):
         """
         # An id with no loaded template has no project config layer to establish. Refuse
         # rather than letting activation fall through to its system-defaults branch: that
-        # remerges with no project layer, and because merge_dicts replaces lists rather
-        # than merging them, whatever `libraries_to_register` the user layer happens to
-        # hold silently becomes the engine's library set -- including libraries a previous
-        # install left behind. Nested keys like that one cannot be pinned by a GTN_CONFIG_
-        # env var (those only ever produce flat top-level keys), so the user has no way to
-        # defend against the swap. The worker adoption path already refuses unknown ids for
-        # the same reason: landing on a stale project while reporting success is the exact
-        # divergence to avoid.
+        # remerges with no project layer, and because merge_dicts replaces lists rather than
+        # merging them, whatever `libraries_to_register` the user layer holds becomes the
+        # engine's library set. The worker adoption path refuses unknown ids for the same
+        # reason.
         if project_info is None:
             details = (
                 f"Attempted to activate project '{resolved_project_id}'. Failed because no loaded "

@@ -15,13 +15,11 @@ hard failure per library that had not yet been re-registered:
 Every one of those libraries registered successfully seconds later, so the failures were
 purely an artifact of being asked mid-reload.
 
-Two things had to change. `_libraries_loading_complete` -- the asyncio.Event that
-`on_list_registered_libraries_request`, `on_get_library_source_info_request` and
-`on_get_all_info_for_all_libraries_request` already awaited -- is now also awaited by the
-two GUI-facing handlers that produced the errors above. And the gate now closes before the
-unload loop rather than inside `load_all_libraries_from_config`, so it actually covers the
-window where the registry is empty; closing it any earlier would deadlock the reload
-against its own `ListRegisteredLibrariesRequest`, which waits on the same gate.
+These tests pin two properties. Every GUI-facing query awaits
+`_libraries_loading_complete` rather than answering from a half-empty registry. And the
+gate closes before the unload loop, so it covers the window where the registry is empty --
+but no earlier than the enumeration that precedes it, which waits on the same gate and
+would otherwise deadlock the reload against itself.
 """
 
 from __future__ import annotations
@@ -149,9 +147,10 @@ class TestQueriesDuringLibraryReload:
         LibraryRegistry.generate_new_library(library_data=_schema(LIBRARY_NAME))
         library_manager._libraries_loading_complete.set()
         singular_result = await singular
-        await plural
+        plural_result = await plural
 
         assert not isinstance(singular_result, GetAllInfoForLibraryResultFailure)
+        assert plural_result.succeeded()
 
     @pytest.mark.asyncio
     async def test_reload_closes_the_gate_before_emptying_the_registry(self, engine: Engine) -> None:
@@ -240,10 +239,10 @@ class TestQueriesDuringLibraryReload:
 
     @pytest.mark.asyncio
     async def test_gated_handler_would_have_returned_the_right_answer(self, engine: Engine) -> None:
-        """Waiting is the correct behavior: the library is present once the reload ends.
+        """Waiting is the correct behavior: the awaited query is answerable once the reload ends.
 
-        This is what makes the failures above spurious rather than informative -- nothing
-        was actually wrong with the library.
+        This is the payoff the gate rests on. A handler that waits and then returns a failure
+        would satisfy the waiting assertions above but defeat the point, so assert the answer.
         """
         library_manager = engine.library_manager
         self._enter_reload_window(engine)
@@ -258,5 +257,6 @@ class TestQueriesDuringLibraryReload:
         LibraryRegistry.generate_new_library(library_data=_schema(LIBRARY_NAME))
         library_manager._libraries_loading_complete.set()
 
-        await pending
+        result = await pending
+        assert result.succeeded()
         assert LIBRARY_NAME in set(LibraryRegistry.list_libraries())

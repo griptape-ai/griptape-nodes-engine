@@ -3109,10 +3109,8 @@ class LibraryManager(EngineScoped):
         Without the wait, a request arriving mid-reload reports the library as
         unregistered even though the reload re-registers it moments later.
 
-        The gate lives on the entry points rather than in the handlers themselves so an
-        internal caller cannot wait on a reload it is already running inside. That is not
-        a hypothetical: `_run_reload_libraries` enumerates registered libraries through a
-        gated request, which is why the gate cannot close any earlier than it does.
+        The gate is held here rather than inside the handler so an internal caller cannot
+        wait on a reload it is running inside.
         """
         await self._libraries_loading_complete.wait()
         return await self.get_all_info_for_library_request(request)
@@ -5548,18 +5546,12 @@ class LibraryManager(EngineScoped):
             logger.error(details)
             return ReloadAllLibrariesResultFailure(result_details=details)
 
-        # Close the loading gate before the registry is actually emptied, and not any
-        # earlier: the enumeration above goes through on_list_registered_libraries_request,
-        # which waits on this same gate, so closing it first would deadlock the reload
-        # against itself. Everything from here on mutates the registry, so a query that
-        # waits now sees the rebuilt registry rather than an empty one. Closing it only in
-        # load_all_libraries_from_config would leave this whole unload window uncovered,
-        # which is what produced the "no Library with that name was registered" spam.
+        # Close the gate before the registry is emptied, and not any earlier: the
+        # enumeration above goes through on_list_registered_libraries_request, which waits on
+        # this same gate, so closing it first deadlocks the reload against itself.
         #
         # A single flag cannot describe two rebuilds at once, so overlapping reloads are not
-        # supported: the second shares this Event and the first to finish reopens it. The
-        # reopen below is deliberately conditional for the same reason -- it must not force
-        # open a gate that another rebuild is relying on.
+        # supported: the second shares this Event and the first to finish reopens it.
         self._close_libraries_loading_gate()
 
         try:
@@ -5579,8 +5571,8 @@ class LibraryManager(EngineScoped):
                 except Exception as e:
                     logger.warning("Pre-reload callback raised an exception: %s", e)
 
-            # Load (or reload, which should trigger a hot reload) all libraries. This reopens
-            # the gate itself on every exit path.
+            # Load (or reload, which should trigger a hot reload) all libraries.
+            # Pass _target_library_names so workers reload only their designated libraries.
             reconcile_failures = await self.load_all_libraries_from_config(
                 target_library_names=self._target_library_names
             )
