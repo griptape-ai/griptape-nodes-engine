@@ -126,12 +126,22 @@ class ConfigWriteOutcome(NamedTuple):
     """Whether a completed user-layer write is the value now in effect.
 
     A write always lands in the user config file; whether it WINS depends on whether a
-    higher-priority layer also defines the key. See `ConfigManager._write_outcome`.
+    higher-priority layer also defines any of the keys it wrote. `shadowed_key` names the
+    first such key, which for a category write is a leaf under it rather than the category
+    itself. See `ConfigManager._write_outcome`.
     """
 
     applied: bool
     effective_value: Any
+    shadowed_key: str | None
     shadowed_by: ConfigValueSource | None
+
+
+class _ShadowedLeaf(NamedTuple):
+    """One written key that a higher-priority layer keeps supplying, and the layer doing it."""
+
+    key: str
+    source: ConfigValueSource
 
 
 class _LayerProbe(NamedTuple):
@@ -573,11 +583,7 @@ class ConfigManager(EngineScoped):
         see which file it would have been) but reports `present=False` with empty `values`,
         matching the skip rather than implying the file is applied twice.
         """
-        workspace_contributes = (
-            self._workspace_config_path is not None
-            and self._workspace_config_path != self._project_config_path
-            and self._workspace_config_path.exists()
-        )
+        workspace_config_path = self._workspace_layer_path()
         return [
             ConfigLayer(
                 layer="default",
@@ -603,7 +609,7 @@ class ConfigManager(EngineScoped):
             ConfigLayer(
                 layer="workspace",
                 path=str(self._workspace_config_path) if self._workspace_config_path is not None else None,
-                present=workspace_contributes,
+                present=workspace_config_path is not None and workspace_config_path.exists(),
                 parse_error=self._layer_parse_errors.get("workspace"),
                 values=self.workspace_config,
             ),
@@ -615,6 +621,18 @@ class ConfigManager(EngineScoped):
                 values=self.env_config,
             ),
         ]
+
+    def _workspace_layer_path(self) -> Path | None:
+        """Return the file the workspace layer loads, or None when it contributes nothing.
+
+        None means either no workspace is resolved, or the workspace dir IS the project dir,
+        so both layers name the same file. `load_configs` loads that file once, as `project`,
+        and this is the single place that decides so, keeping the load and `config_layers`'
+        `present` report from disagreeing about whether the workspace layer applies.
+        """
+        if self._workspace_config_path == self._project_config_path:
+            return None
+        return self._workspace_config_path
 
     def _load_config_from_env_vars(self) -> dict[str, Any]:
         """Load configuration values from GTN_CONFIG_ environment variables.
@@ -815,12 +833,9 @@ class ConfigManager(EngineScoped):
         self.project_config = self._load_file_layer("project", self._project_config_path, "project-adjacent")
         merged_config = merge_dicts(merged_config, self.project_config)
 
-        # Skip workspace config when it points to the same file as project config
-        # (this happens when workspace dir == project dir for self-contained projects).
-        workspace_config_path = self._workspace_config_path
-        if workspace_config_path == self._project_config_path:
-            workspace_config_path = None
-        self.workspace_config = self._load_file_layer("workspace", workspace_config_path, "workspace")
+        # The workspace layer loads nothing when it resolves to the project's own file; see
+        # _workspace_layer_path.
+        self.workspace_config = self._load_file_layer("workspace", self._workspace_layer_path(), "workspace")
         merged_config = merge_dicts(merged_config, self.workspace_config)
 
         # Apply runtime workspace override (from ProjectManager's project_workspaces lookup
@@ -1237,12 +1252,12 @@ class ConfigManager(EngineScoped):
             )
             return SetConfigCategoryResultFailure(result_details=result_details)
 
-        outcome = self._write_outcome(request.category)
+        outcome = self._write_outcome(request.category, request.contents)
 
         result_details = f"Successfully assigned the config dictionary for section '{request.category}'."
 
         return SetConfigCategoryResultSuccess(
-            result_details=self._append_shadow_note(result_details, outcome.shadowed_by),
+            result_details=self._append_shadow_note(result_details, outcome),
             applied=outcome.applied,
             effective_value=outcome.effective_value,
             shadowed_by=outcome.shadowed_by,
@@ -1378,46 +1393,85 @@ class ConfigManager(EngineScoped):
                 formatted_lines.append(f"[{key}]:\n\tFROM: '{old}'\n\t  TO: '{new}'")
         return "\n".join(formatted_lines)
 
-    def _write_outcome(self, key: str) -> ConfigWriteOutcome:
-        """Report whether a just-completed user-layer write to `key` is the value now in effect.
+    def _write_outcome(self, key: str, value: Any) -> ConfigWriteOutcome:
+        """Report whether a just-completed user-layer write is the value now in effect.
 
         Called by the `Set*` handlers once the write is known to have reached disk. The write
         always lands in the user layer, but a higher-priority layer (project, workspace, env)
-        that also defines `key` keeps winning the merge, which is what let those handlers
-        report a bare success for a write with no visible effect.
+        that also defines what was written keeps winning the merge, which is what let those
+        handlers report a bare success for a write with no visible effect.
+
+        Judged on the keys the caller actually WROTE, which for a dict `value` means its
+        leaves rather than `key` itself -- writing `{"port": 8080}` to category "nuke" is
+        unaffected by a project layer that defines only "nuke.executable".
 
         Reads the value back without env-var `$`-expansion, matching how the handlers read
         `old_value`, so the reported value is the raw stored one rather than a resolved secret.
 
         Args:
             key: Dot-notation key that was written.
+            value: The value written to `key`, descended into when it is a dict.
         """
-        shadowed = self.shadowed_by(key)
+        effective_value = self.get_config_value(key, should_load_env_var_if_detected=False)
+        shadowed_leaf = self._first_shadowed_leaf(key, value)
+        if shadowed_leaf is None:
+            return ConfigWriteOutcome(
+                applied=True, effective_value=effective_value, shadowed_key=None, shadowed_by=None
+            )
         return ConfigWriteOutcome(
-            applied=shadowed is None,
-            effective_value=self.get_config_value(key, should_load_env_var_if_detected=False),
-            shadowed_by=shadowed,
+            applied=False,
+            effective_value=effective_value,
+            shadowed_key=shadowed_leaf.key,
+            shadowed_by=shadowed_leaf.source,
         )
 
-    def _append_shadow_note(self, result_details: str, shadowed: ConfigValueSource | None) -> str:
+    def _first_shadowed_leaf(self, key: str, value: Any) -> _ShadowedLeaf | None:
+        """Return the first written key a higher-priority layer shadows, or None if none is.
+
+        A dict `value` is descended into so each leaf is judged on its own dot path, matching
+        the leaf-level granularity `category_sources` reports on the read side. A non-dict
+        value -- and an empty dict, which names no leaves -- is one leaf: `key` itself.
+
+        "First" is in the caller's own key order, so the reported key is the one nearest the
+        top of what they wrote. One shadowed leaf is enough to make the write's outcome
+        partial, so this stops at the first rather than collecting all of them.
+
+        Args:
+            key: Dot-notation key `value` was written to.
+            value: The written value.
+        """
+        if not isinstance(value, dict) or not value:
+            shadowed = self.shadowed_by(key)
+            if shadowed is None:
+                return None
+            return _ShadowedLeaf(key=key, source=shadowed)
+
+        for leaf_name, leaf_value in value.items():
+            shadowed_leaf = self._first_shadowed_leaf(f"{key}.{leaf_name}", leaf_value)
+            if shadowed_leaf is not None:
+                return shadowed_leaf
+        return None
+
+    def _append_shadow_note(self, result_details: str, outcome: ConfigWriteOutcome) -> str:
         """Return `result_details` with an explanation appended when a higher layer shadows the write.
 
-        Returned unchanged when `shadowed` is None. Otherwise the message a user sees (in a
-        toast, a log, a CLI response) says WHY the write had no visible effect instead of
-        reporting a bare success.
+        Returned unchanged when nothing was shadowed. Otherwise the message a user sees (in a
+        toast, a log, a CLI response) names the shadowed key and says WHY it did not change,
+        instead of reporting a bare success. Naming the key matters for a category write,
+        where the rest of the category may well have taken effect.
 
         Args:
             result_details: The success message describing the write.
-            shadowed: The shadowing layer from `ConfigWriteOutcome.shadowed_by`.
+            outcome: The outcome from `_write_outcome`.
         """
-        if shadowed is None:
+        if outcome.shadowed_by is None:
             return result_details
 
-        location = shadowed.path or shadowed.env_var or "an unknown source"
+        location = outcome.shadowed_by.path or outcome.shadowed_by.env_var or "an unknown source"
         return (
-            f"{result_details} NOTE: a higher-priority '{shadowed.layer}' layer ({location}) "
-            "currently supplies the effective value, so this write has no visible effect "
-            "until that layer changes."
+            f"{result_details} NOTE: '{outcome.shadowed_key}' is supplied by a higher-priority "
+            f"'{outcome.shadowed_by.layer}' layer ({location}), so that value does not change "
+            "until that layer does."
         )
 
     def on_handle_set_config_value_request(self, request: SetConfigValueRequest) -> ResultPayload:
@@ -1445,8 +1499,8 @@ class ConfigManager(EngineScoped):
 
         # The write landed in the user layer; whether it's actually the value now in
         # effect depends on whether a higher-priority layer (project/workspace/env) also
-        # defines this key.
-        outcome = self._write_outcome(request.category_and_key)
+        # defines what was written.
+        outcome = self._write_outcome(request.category_and_key, request.value)
 
         # For container types, indicate the change with a diff
         if isinstance(request.value, (dict, list)):
@@ -1463,7 +1517,7 @@ class ConfigManager(EngineScoped):
             result_details = f"Successfully assigned the config value for '{request.category_and_key}':\n\tFROM '{old_value_copy}'\n\tTO: '{request.value}'"
 
         return SetConfigValueResultSuccess(
-            result_details=self._append_shadow_note(result_details, outcome.shadowed_by),
+            result_details=self._append_shadow_note(result_details, outcome),
             applied=outcome.applied,
             effective_value=outcome.effective_value,
             shadowed_by=outcome.shadowed_by,
