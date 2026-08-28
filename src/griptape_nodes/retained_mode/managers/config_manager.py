@@ -688,7 +688,12 @@ class ConfigManager(EngineScoped):
         *,
         should_load_env_var_if_detected: bool = True,
         config_source: Literal[
-            "user_config", "project_config", "workspace_config", "default_config", "merged_config"
+            "user_config",
+            "project_config",
+            "workspace_config",
+            "default_config",
+            "merged_config",
+            "merged_without_user_config",
         ] = "merged_config",
         default: Any | None = None,
         cast_type: type[bool] | type[int] | type[float] | type[str] | None = None,
@@ -701,7 +706,12 @@ class ConfigManager(EngineScoped):
             key: The configuration key to get. Can use dot notation for nested keys (e.g., 'category.subcategory.key').
                  If the key refers to a category (dictionary), returns the entire category.
             should_load_env_var_if_detected: If True, and the value starts with a $, it will be pulled from the environment variables.
-            config_source: The source of the configuration to use. Can be 'user_config', 'project_config', 'default_config', or 'merged_config'.
+            config_source: Which configuration to read. The layer names read that layer alone.
+                'merged_config' is the effective value the engine resolves.
+                'merged_without_user_config' is the effective value the engine WOULD resolve if
+                the user layer did not exist, which answers "is this value the user's own, or
+                something a project handed them?". Computed on demand rather than cached, so
+                unlike the others it reflects any layer mutation since the last load.
             default: The default value to return if the key is not found in the configuration.
             cast_type: Optional type to coerce the value to (bool, int, float, or str). Useful for environment
                        variables which are always strings (e.g., "false" -> False when cast_type=bool).
@@ -709,14 +719,19 @@ class ConfigManager(EngineScoped):
         Returns:
             The value associated with the key, or the entire category if key points to a dict.
         """
-        config_source_map = {
-            "user_config": self.user_config,
-            "project_config": self.project_config,
-            "workspace_config": self.workspace_config,
-            "merged_config": self.merged_config,
-            "default_config": self.default_config,
-        }
-        config = config_source_map.get(config_source, self.merged_config)
+        if config_source == "merged_without_user_config":
+            # Computed rather than looked up, and deliberately not part of the map below so
+            # the merge only runs for callers that ask for it. get_config_value is hot.
+            config = self._merge_config_layers(include_user_layer=False)
+        else:
+            config_source_map = {
+                "user_config": self.user_config,
+                "project_config": self.project_config,
+                "workspace_config": self.workspace_config,
+                "merged_config": self.merged_config,
+                "default_config": self.default_config,
+            }
+            config = config_source_map.get(config_source, self.merged_config)
         value = get_dot_value(config, key, default)
 
         if value is None:
