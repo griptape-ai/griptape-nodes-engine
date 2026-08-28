@@ -54,6 +54,7 @@ from griptape_nodes.files.path_utils import (
 from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete, CurrentProjectChanged
+from griptape_nodes.retained_mode.events.base_events import AppEvent
 from griptape_nodes.retained_mode.events.library_events import (
     ReloadAllLibrariesRequest,
     ReloadAllLibrariesResultFailure,
@@ -3066,8 +3067,13 @@ class ProjectManager(EngineScoped):
         # re-derives the same project), so emit only post-init and only when the
         # project actually changed. A worker that boots like the orchestrator has the
         # same registry, so the id resolves there too.
+        # Published rather than broadcast in-process: broadcast_app_event only reaches
+        # listeners inside this process, so an editor never saw the switch and kept
+        # rendering the previous project's config. Publishing wraps it in an AppEvent,
+        # which the app layer fans out to both the in-process listeners (the worker
+        # adoption above) and every IPC transport.
         if self._initialization_complete and previous_project_id != resolved_project_id:
-            self._event_manager.broadcast_app_event(CurrentProjectChanged(project_id=resolved_project_id))
+            self._event_manager.put_event(AppEvent(payload=CurrentProjectChanged(project_id=resolved_project_id)))
         return result
 
     def _refuse_unresolvable_declared_paths(
