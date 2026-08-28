@@ -128,7 +128,7 @@ def compute_execution_clusters(
     for members in members_by_root.values():
         exec_dependencies: frozenset[str] = frozenset().union(*(deps_by_name[name] for name in members))
         clusters.append(ExecutionCluster(node_names=frozenset(members), exec_dependencies=exec_dependencies))
-    return clusters
+    return _closure_over_paths(clusters, nodes, edges)
 
 
 def exec_dependencies_for_library(library_name: str) -> frozenset[str]:
@@ -201,3 +201,85 @@ def clusters_for_nodes(
         )
 
     return compute_execution_clusters(cluster_nodes, cluster_edges)
+
+
+def _closure_over_paths(
+    clusters: list[ExecutionCluster],
+    nodes: list[ClusterNode],
+    edges: list[ClusterEdge],
+) -> list[ExecutionCluster]:
+    """Absorb any node lying on a path between two members of the same cluster.
+
+    A cluster executes atomically, so it must be convex in the DAG: if member U feeds
+    external node X and X feeds member D, then X's value is needed mid-cluster and X's
+    input only exists once the cluster runs. Leaving X outside would deadlock the
+    dispatch, so X is absorbed and the cluster's dependency union grows accordingly.
+    """
+    deps_by_name = {node.name: node.exec_dependencies for node in nodes}
+    forward: dict[str, list[str]] = {node.name: [] for node in nodes}
+    backward: dict[str, list[str]] = {node.name: [] for node in nodes}
+    for edge in edges:
+        forward[edge.source].append(edge.target)
+        backward[edge.target].append(edge.source)
+
+    def descendants(seeds: frozenset[str]) -> set[str]:
+        return _reachable(seeds, forward)
+
+    def ancestors(seeds: frozenset[str]) -> set[str]:
+        return _reachable(seeds, backward)
+
+    current = clusters
+    changed = True
+    while changed:
+        changed = False
+        absorbed_by_cluster: dict[int, set[str]] = {}
+        for index, cluster in enumerate(current):
+            if cluster.runs_in_orchestrator or len(cluster.node_names) == 1:
+                continue
+            # Nodes both downstream of some member and upstream of another lie on a
+            # member -> member path.
+            on_paths = (descendants(cluster.node_names) & ancestors(cluster.node_names)) - cluster.node_names
+            if on_paths:
+                absorbed_by_cluster[index] = on_paths
+        if not absorbed_by_cluster:
+            return current
+
+        changed = True
+        grown = [cluster.node_names | absorbed_by_cluster.get(index, set()) for index, cluster in enumerate(current)]
+        current = [
+            ExecutionCluster(
+                node_names=members,
+                exec_dependencies=frozenset().union(*(deps_by_name[name] for name in members)),
+            )
+            for members in _merge_overlapping(grown)
+        ]
+    return current
+
+
+def _merge_overlapping(member_sets: list[frozenset[str]]) -> list[frozenset[str]]:
+    """Merge any member sets that share a node, keeping every node in exactly one set.
+
+    Absorption can pull the same node into two clusters (it sits between members of both)
+    or steal a node that was another cluster's member. Either way the affected clusters
+    cannot execute separately.
+    """
+    merged: list[frozenset[str]] = []
+    for members in member_sets:
+        combined = members
+        for existing in [candidate for candidate in merged if candidate & combined]:
+            merged.remove(existing)
+            combined = combined | existing
+        merged.append(combined)
+    return merged
+
+
+def _reachable(seeds: frozenset[str], adjacency: dict[str, list[str]]) -> set[str]:
+    """Every node reachable from ``seeds`` (inclusive) over ``adjacency``."""
+    seen = set(seeds)
+    stack = list(seeds)
+    while stack:
+        for neighbor in adjacency[stack.pop()]:
+            if neighbor not in seen:
+                seen.add(neighbor)
+                stack.append(neighbor)
+    return seen

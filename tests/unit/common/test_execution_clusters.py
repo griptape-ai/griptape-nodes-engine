@@ -164,3 +164,106 @@ class TestValidation:
     def test_edge_referencing_unknown_node_raises(self) -> None:
         with pytest.raises(ValueError, match="references a node not in the graph"):
             compute_execution_clusters([ClusterNode("a")], [ClusterEdge("a", "ghost")])
+
+
+class TestConvexity:
+    """A dispatched cluster must be convex in the DAG.
+
+    Nodes on member->member paths are absorbed, or the dispatch would need a value that
+    only exists mid-cluster.
+    """
+
+    def test_external_node_on_a_member_to_member_path_is_absorbed(self) -> None:
+        """U -> X -> D with U,D pinned by a live edge: X joins the cluster."""
+        nodes = [ClusterNode("u", TORCH), ClusterNode("x"), ClusterNode("d", TORCH)]
+        edges = [
+            ClusterEdge("u", "d", serializable=False),
+            ClusterEdge("u", "x", serializable=True),
+            ClusterEdge("x", "d", serializable=True),
+        ]
+        clusters = compute_execution_clusters(nodes, edges)
+        assert {c.node_names for c in clusters} == {frozenset({"u", "x", "d"})}
+
+    def test_pure_upstream_and_downstream_nodes_are_not_absorbed(self) -> None:
+        """Nodes before or after the cluster stay outside; only in-between nodes join."""
+        nodes = [
+            ClusterNode("before"),
+            ClusterNode("u", TORCH),
+            ClusterNode("d", TORCH),
+            ClusterNode("after"),
+        ]
+        edges = [
+            ClusterEdge("before", "u", serializable=True),
+            ClusterEdge("u", "d", serializable=False),
+            ClusterEdge("d", "after", serializable=True),
+        ]
+        clusters = compute_execution_clusters(nodes, edges)
+        assert {c.node_names for c in clusters} == {
+            frozenset({"before"}),
+            frozenset({"u", "d"}),
+            frozenset({"after"}),
+        }
+
+    def test_absorbed_heavy_node_unions_its_dependencies(self) -> None:
+        """An in-between node from another heavy library grows the cluster's dep union."""
+        nodes = [ClusterNode("u", TORCH), ClusterNode("x", OTHER), ClusterNode("d", TORCH)]
+        edges = [
+            ClusterEdge("u", "d", serializable=False),
+            ClusterEdge("u", "x", serializable=True),
+            ClusterEdge("x", "d", serializable=True),
+        ]
+        clusters = compute_execution_clusters(nodes, edges)
+        assert len(clusters) == 1
+        assert clusters[0].exec_dependencies == TORCH | OTHER
+
+    def test_chained_absorption_reaches_a_fixed_point(self) -> None:
+        """U -> x1 -> x2 -> D: the whole in-between chain is absorbed."""
+        nodes = [ClusterNode("u", TORCH), ClusterNode("x1"), ClusterNode("x2"), ClusterNode("d", TORCH)]
+        edges = [
+            ClusterEdge("u", "d", serializable=False),
+            ClusterEdge("u", "x1", serializable=True),
+            ClusterEdge("x1", "x2", serializable=True),
+            ClusterEdge("x2", "d", serializable=True),
+        ]
+        clusters = compute_execution_clusters(nodes, edges)
+        assert {c.node_names for c in clusters} == {frozenset({"u", "x1", "x2", "d"})}
+
+    def test_light_clusters_are_never_closed(self) -> None:
+        """Convexity only matters for dispatched clusters; orchestrator nodes run per-node."""
+        nodes = [ClusterNode("a"), ClusterNode("x"), ClusterNode("b")]
+        edges = [
+            ClusterEdge("a", "b", serializable=False),
+            ClusterEdge("a", "x", serializable=True),
+            ClusterEdge("x", "b", serializable=True),
+        ]
+        clusters = compute_execution_clusters(nodes, edges)
+        # a-b cluster is light (runs in orchestrator), so x stays outside it.
+        assert frozenset({"x"}) in {c.node_names for c in clusters}
+
+    def test_two_clusters_sharing_an_intermediate_node_merge(self) -> None:
+        """One node between members of TWO clusters merges everything into one.
+
+        The node cannot execute in two places, and every node must land in exactly one
+        cluster.
+        """
+        nodes = [
+            ClusterNode("u1", TORCH),
+            ClusterNode("d1", TORCH),
+            ClusterNode("u2", OTHER),
+            ClusterNode("d2", OTHER),
+            ClusterNode("x"),
+        ]
+        edges = [
+            ClusterEdge("u1", "d1", serializable=False),
+            ClusterEdge("u2", "d2", serializable=False),
+            ClusterEdge("u1", "x", serializable=True),
+            ClusterEdge("x", "d1", serializable=True),
+            ClusterEdge("u2", "x", serializable=True),
+            ClusterEdge("x", "d2", serializable=True),
+        ]
+        clusters = compute_execution_clusters(nodes, edges)
+        seen: set[str] = set()
+        for cluster in clusters:
+            assert not (cluster.node_names & seen), "a node appeared in two clusters"
+            seen |= cluster.node_names
+        assert {c.node_names for c in clusters} == {frozenset({"u1", "d1", "u2", "d2", "x"})}
