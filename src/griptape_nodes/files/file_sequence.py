@@ -15,9 +15,11 @@ import pathlib
 import typing
 
 from fileseq import constants as fileseq_constants
+from fileseq import exceptions as fileseq_exceptions
 from fileseq import filesequence as fileseq_filesequence
 
 from griptape_nodes.common import macro_parser, sequences
+from griptape_nodes.common.sequences import scan as sequences_scan
 from griptape_nodes.files import directory as directory_mod
 from griptape_nodes.files import file as file_mod
 from griptape_nodes.files import project_file
@@ -34,6 +36,35 @@ class FileSequenceError(Exception):
     def __init__(self, result_details: str) -> None:
         self.result_details = result_details
         super().__init__(result_details)
+
+
+def strip_sequence_token(stem: str) -> str:
+    """Return stem with its embedded fileseq token removed, if any.
+
+    Used so a situation's own frame-number token isn't duplicated when the
+    artist's filename already carries one (e.g. ``"render_####"``) -- fileseq
+    and ``ScanSequencesRequest`` reject templates with more than one token.
+
+    Args:
+        stem: Filename stem (no extension) to inspect.
+
+    Returns:
+        stem unchanged if it has no sequence token; otherwise the token-free
+        basename fileseq parsed out of it.
+
+    Raises:
+        FileSequenceError: If stem contains more than one sequence token.
+    """
+    token_count = sequences_scan.count_sequence_tokens(stem)
+    if token_count == 0:
+        return stem
+    if token_count > 1:
+        msg = (
+            f"Attempted to build a file sequence name from '{stem}'. "
+            f"Failed because it contains {token_count} sequence tokens; only one is supported."
+        )
+        raise FileSequenceError(msg)
+    return fileseq_filesequence.FileSequence(stem, pad_style=fileseq_constants.PAD_STYLE_HASH1).basename()
 
 
 def _resolve_entry_path(macro_path: project_events.MacroPath, entry_number: int) -> str:
@@ -295,10 +326,17 @@ class FileSequenceDestination:
             if not isinstance(resolve_result, project_events.GetPathForMacroResultSuccess):
                 msg = f"Attempted to prepare sequence for writing. Failed to resolve macro path: {resolve_result.result_details}"
                 raise FileSequenceError(msg)
-            self._fseq = fileseq_filesequence.FileSequence(
-                str(resolve_result.absolute_path),
-                pad_style=fileseq_constants.PAD_STYLE_HASH1,
-            )
+            try:
+                self._fseq = fileseq_filesequence.FileSequence(
+                    str(resolve_result.absolute_path),
+                    pad_style=fileseq_constants.PAD_STYLE_HASH1,
+                )
+            except fileseq_exceptions.ParseException as exc:
+                msg = (
+                    f"Attempted to prepare sequence for writing. "
+                    f"Failed because '{resolve_result.absolute_path}' is not a valid sequence pattern: {exc}"
+                )
+                raise FileSequenceError(msg) from exc
         return self._fseq
 
     def _on_entry_written(self, written_file: file_mod.File) -> None:  # noqa: ARG002

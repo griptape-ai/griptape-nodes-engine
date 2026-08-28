@@ -164,6 +164,26 @@ DEFAULT_PROJECT_TEMPLATE_V0 = ProjectTemplate(
             ),
             fallback=BuiltInSituation.SAVE_FILE,
         ),
+        "save_output_directory": SituationTemplate(
+            name="save_output_directory",
+            description="Node creates and outputs a directory (versioned with _v001, _v002, …)",
+            macro="{outputs}/{sub_dirs?:/}{node_name?:_}{dir_name}_v{_index:03}",
+            policy=SituationPolicy(
+                on_collision=SituationFilePolicy.CREATE_NEW,
+                create_dirs=True,
+            ),
+            fallback=None,
+        ),
+        "save_file_sequence": SituationTemplate(
+            name="save_file_sequence",
+            description="Node writes a file sequence; version in directory and entry filenames",
+            macro="{outputs}/{sub_dirs?:/}{node_name?:_}{file_name_base}_v{_index:03}/{file_name_base}_v{_index:03}_{entry:04}.{file_extension}",
+            policy=SituationPolicy(
+                on_collision=SituationFilePolicy.CREATE_NEW,
+                create_dirs=True,
+            ),
+            fallback=None,
+        ),
         # Workflows save into the workspace root today for backward compatibility.
         # Migrating to a dedicated subdirectory is tracked in
         # https://github.com/griptape-ai/griptape-nodes/issues/2047.
