@@ -96,9 +96,10 @@ def _forbid_manager_during_worker_execution(manager_name: str, request_hint: str
     if not engine.event_manager.in_node_execution():
         return
     msg = (
-        f"Attempted to use {manager_name} while running in an isolated library process, where "
-        f"it holds no authoritative state. Use GriptapeNodes.handle_request({request_hint}) "
-        f"instead, which asks the main engine and returns the real value."
+        f"Attempted to use {manager_name} while running in an isolated library process, whose "
+        f"copy of that state is not the source of truth. Use "
+        f"GriptapeNodes.handle_request({request_hint}) instead: requests made while a node is "
+        f"executing are answered by the main engine, so the value is always the real one."
     )
     raise RuntimeError(msg)
 

@@ -163,12 +163,16 @@ class TestStateAccessFromAWorker:
         The guardrail tells authors to use this request instead of the manager; that advice is
         only true if the request actually reaches the orchestrator.
         """
-        from griptape_nodes.app.worker_routing import FORWARDED_REQUEST_TYPES
+        from griptape_nodes.app.worker_routing import LOCAL_ONLY_REQUEST_TYPES
         from griptape_nodes.retained_mode.events.config_events import GetConfigValueRequest
+        from griptape_nodes.retained_mode.events.os_events import ReadFileRequest, WriteFileRequest
         from griptape_nodes.retained_mode.events.secrets_events import GetSecretValueRequest
 
-        assert GetConfigValueRequest in FORWARDED_REQUEST_TYPES
-        assert GetSecretValueRequest in FORWARDED_REQUEST_TYPES
+        # Forwarding is the default now, so the assertion is that these are NOT excluded.
+        # Every request the guardrails name has to reach the orchestrator, or the advice
+        # they give authors is false.
+        for request_type in (GetConfigValueRequest, GetSecretValueRequest, ReadFileRequest, WriteFileRequest):
+            assert request_type not in LOCAL_ONLY_REQUEST_TYPES, request_type.__name__
 
 
 class TestStreamingAndAsyncResult:

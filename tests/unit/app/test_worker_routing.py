@@ -9,7 +9,7 @@ These tests pin down the two invariants that replaced the old
    library-load behaviour (e.g. nodes calling ``self.add_parameter(...)``
    during LOAD_PROBE).
 2. ``register_remote_handlers`` swaps the dispatch table entry for every
-   entry in ``FORWARDED_REQUEST_TYPES``, preserving the "one handler per
+   registered type outside ``LOCAL_ONLY_REQUEST_TYPES``, preserving the "one handler per
    request type" invariant enforced by ``assign_manager_to_request_type``.
    Missing an original handler raises with a bootstrap-order diagnostic.
 """
@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from griptape_nodes.app.worker_routing import (
-    FORWARDED_REQUEST_TYPES,
+    LOCAL_ONLY_REQUEST_TYPES,
     RemoteHandler,
     register_remote_handlers,
 )
@@ -32,7 +32,10 @@ from griptape_nodes.retained_mode.events.base_events import (
     ResultPayloadSuccess,
 )
 from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest
-from griptape_nodes.retained_mode.events.parameter_events import AddParameterToNodeRequest
+from griptape_nodes.retained_mode.events.parameter_events import (
+    AddParameterToNodeRequest,
+    SetParameterValueRequest,
+)
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 
 if TYPE_CHECKING:
@@ -129,14 +132,13 @@ class _StubResult(ResultPayloadSuccess):
 
 
 class TestInstallRemoteHandlersSwap:
-    """register_remote_handlers must displace each FORWARDED type's handler."""
+    """register_remote_handlers forwards everything except the local-only exclusions."""
 
-    def test_swap_replaces_each_forwarded_handler(self) -> None:
+    def test_swap_replaces_every_registered_handler(self) -> None:
         event_manager = EventManager()
 
-        # Give every forwarded type a uniquely-identifiable async original.
         originals: dict[type[RequestPayload], Any] = {}
-        for request_type in FORWARDED_REQUEST_TYPES:
+        for request_type in (CreateNodeRequest, AddParameterToNodeRequest, SetParameterValueRequest):
 
             async def original(_request: RequestPayload) -> _StubResult:
                 return _StubResult(result_details="ok")
@@ -154,22 +156,46 @@ class TestInstallRemoteHandlersSwap:
             assert swapped.original is original
             assert swapped.event_manager is event_manager
 
-    def test_missing_original_raises_bootstrap_error(self) -> None:
-        event_manager = EventManager()
+    def test_local_only_types_are_left_alone(self) -> None:
+        """Excluded types must keep their own handler.
 
-        # Register everything except CreateNodeRequest so register_remote_handlers
-        # trips on the first missing original it encounters.
-        for request_type in FORWARDED_REQUEST_TYPES:
-            if request_type is CreateNodeRequest:
-                continue
+        ExecuteNodeRequest is the sharpest case: forwarding a worker's own execution request
+        would send it back to the orchestrator, which would route it straight here again.
+        """
+        event_manager = EventManager()
+        locals_registered: dict[type[RequestPayload], Any] = {}
+        for request_type in LOCAL_ONLY_REQUEST_TYPES:
 
             async def original(_request: RequestPayload) -> _StubResult:
-                return _StubResult(result_details="ok")
+                return _StubResult(result_details="local")
 
+            locals_registered[request_type] = original
             event_manager.assign_manager_to_request_type(request_type, original)
 
-        with pytest.raises(RuntimeError, match="CreateNodeRequest"):
-            register_remote_handlers(event_manager)
+        register_remote_handlers(event_manager)
+
+        for request_type, original in locals_registered.items():
+            assert event_manager.get_manager_for_request_type(request_type) is original, (
+                f"{request_type.__name__} must not be forwarded"
+            )
+
+    def test_unregistered_types_are_skipped_without_error(self) -> None:
+        """Nothing to swap is not a bootstrap failure: only registered types are touched.
+
+        The allowlist version raised when a listed type had no owner, because the list could
+        name types nobody had registered. Iterating what IS registered removes that failure
+        mode entirely.
+        """
+        event_manager = EventManager()
+
+        async def original(_request: RequestPayload) -> _StubResult:
+            return _StubResult(result_details="ok")
+
+        event_manager.assign_manager_to_request_type(CreateNodeRequest, original)
+
+        register_remote_handlers(event_manager)
+
+        assert isinstance(event_manager.get_manager_for_request_type(CreateNodeRequest), RemoteHandler)
 
     def test_post_install_out_of_scope_still_runs_original(self) -> None:
         """Bootstrap-path regression guard: LOAD_PROBE-style calls must stay local.
@@ -187,17 +213,7 @@ class TestInstallRemoteHandlersSwap:
             local_calls.append(request)
             return _StubResult(result_details="local")
 
-        # Register the single type we assert on; register_remote_handlers needs
-        # every forwarded type registered, so fill in trivial stubs for the rest.
         event_manager.assign_manager_to_request_type(AddParameterToNodeRequest, local_add_parameter)
-        for request_type in FORWARDED_REQUEST_TYPES:
-            if request_type is AddParameterToNodeRequest:
-                continue
-
-            async def stub(_request: RequestPayload) -> _StubResult:
-                return _StubResult(result_details="ok")
-
-            event_manager.assign_manager_to_request_type(request_type, stub)
 
         register_remote_handlers(event_manager)
 
