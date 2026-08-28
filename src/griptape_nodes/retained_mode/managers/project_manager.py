@@ -3067,19 +3067,8 @@ class ProjectManager(EngineScoped):
         # re-derives the same project), so emit only post-init and only when the
         # project actually changed. A worker that boots like the orchestrator has the
         # same registry, so the id resolves there too.
-        # Published, not broadcast. broadcast_app_event only walks this process's
-        # _app_event_listeners, so a connected editor never heard the switch and kept
-        # rendering the previous project's config. Publishing is what reaches a client:
-        # the app layer's queue drain re-broadcasts in-process AND forwards to every
-        # transport, so the worker adoption listener registered above still fires
-        # exactly once.
-        #
-        # broadcast_app_event cannot simply be taught to publish, because it is the
-        # terminal in-process step of that same drain: publishing from it would enqueue
-        # the event it was called to deliver, and recurse. A broadcast does reach a
-        # client only where something registers a relay listener that publishes by hand,
-        # as app.py does for LibraryLoadedNotification on a worker. Nothing relays this
-        # event, and a per-event relay is the thing worth avoiding.
+        # Published, not broadcast: publishing reaches in-process listeners and every IPC
+        # transport, so connected clients see the switch too.
         if self._initialization_complete and previous_project_id != resolved_project_id:
             self._event_manager.put_event(AppEvent(payload=CurrentProjectChanged(project_id=resolved_project_id)))
         return result
