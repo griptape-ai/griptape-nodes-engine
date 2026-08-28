@@ -5511,11 +5511,6 @@ class LibraryManager(EngineScoped):
             return await self._run_reload_libraries(request)
         finally:
             self._is_initializing = False
-            # load_all_libraries_from_config reopens the gate on its own way out, but a
-            # reload that bails between closing it and getting there (a failed unload, say)
-            # would otherwise leave every gated query waiting for the life of the process.
-            # Once the reload request is done, loading is definitively not in progress.
-            self._libraries_loading_complete.set()
 
     async def _run_reload_libraries(self, request: ReloadAllLibrariesRequest) -> ResultPayload:  # noqa: ARG002
         # Start with a clean slate.
@@ -5540,27 +5535,43 @@ class LibraryManager(EngineScoped):
         # waits now sees the rebuilt registry rather than an empty one. Closing it only in
         # load_all_libraries_from_config would leave this whole unload window uncovered,
         # which is what produced the "no Library with that name was registered" spam.
+        #
+        # A single flag cannot describe two rebuilds at once, so overlapping reloads are not
+        # supported: the second shares this Event and the first to finish reopens it. The
+        # reopen below is deliberately conditional for the same reason -- it must not force
+        # open a gate that another rebuild is relying on.
         self._close_libraries_loading_gate()
 
-        for library_name in all_libraries_result.libraries:
-            unload_library_request = UnloadLibraryFromRegistryRequest(library_name=library_name)
-            unload_library_result = self.engine.handle_request(unload_library_request)
-            if not unload_library_result.succeeded():
-                details = f"When preparing to reload all libraries, failed to unload library '{library_name}'."
-                logger.error(details)
-                return ReloadAllLibrariesResultFailure(result_details=details)
+        try:
+            for library_name in all_libraries_result.libraries:
+                unload_library_request = UnloadLibraryFromRegistryRequest(library_name=library_name)
+                unload_library_result = self.engine.handle_request(unload_library_request)
+                if not unload_library_result.succeeded():
+                    details = f"When preparing to reload all libraries, failed to unload library '{library_name}'."
+                    logger.error(details)
+                    return ReloadAllLibrariesResultFailure(result_details=details)
 
-        # Notify pre-reload callbacks (e.g. to terminate worker processes) before
-        # load_all_libraries_from_config runs so that workers can be cleanly restarted.
-        for callback in self._pre_reload_callbacks:
-            try:
-                await callback()
-            except Exception as e:
-                logger.warning("Pre-reload callback raised an exception: %s", e)
+            # Notify pre-reload callbacks (e.g. to terminate worker processes) before
+            # load_all_libraries_from_config runs so that workers can be cleanly restarted.
+            for callback in self._pre_reload_callbacks:
+                try:
+                    await callback()
+                except Exception as e:
+                    logger.warning("Pre-reload callback raised an exception: %s", e)
 
-        # Load (or reload, which should trigger a hot reload) all libraries.
-        # Pass _target_library_names so workers reload only their designated libraries.
-        reconcile_failures = await self.load_all_libraries_from_config(target_library_names=self._target_library_names)
+            # Load (or reload, which should trigger a hot reload) all libraries. This reopens
+            # the gate itself on every exit path.
+            reconcile_failures = await self.load_all_libraries_from_config(
+                target_library_names=self._target_library_names
+            )
+        finally:
+            # Bailing out above (a failed unload, or a raise) would otherwise leave the gate
+            # closed and every gated query waiting for the life of the process. Only reopen a
+            # gate still closed at this point: once load_all_libraries_from_config has run,
+            # it has already reopened this one, and re-setting it could open a gate a
+            # concurrent rebuild closed after that.
+            if not self._libraries_loading_complete.is_set():
+                self._libraries_loading_complete.set()
 
         # Re-spawn workers for libraries that require them; reset_workers terminated them above.
         await self._maybe_start_workers_for_existing_session()

@@ -43,6 +43,8 @@ from griptape_nodes.retained_mode.events.library_events import (
     GetAllInfoForLibraryRequest,
     GetAllInfoForLibraryResultFailure,
     ReloadAllLibrariesRequest,
+    ReloadAllLibrariesResultFailure,
+    UnloadLibraryFromRegistryRequest,
 )
 
 if TYPE_CHECKING:
@@ -205,6 +207,35 @@ class TestQueriesDuringLibraryReload:
             await library_manager.load_all_libraries_from_config()
 
         assert library_manager._libraries_loading_complete.is_set()
+
+    @pytest.mark.asyncio
+    async def test_reload_reopens_the_gate_when_it_bails_before_loading(self, griptape_nodes: GriptapeNodes) -> None:
+        """A reload that fails between closing the gate and loading must not wedge queries.
+
+        The gate closes just before the unload loop, so an early return from that loop would
+        otherwise leave every gated query waiting for the life of the process.
+        """
+        library_manager = griptape_nodes.LibraryManager()
+        LibraryRegistry.generate_new_library(library_data=_schema(LIBRARY_NAME))
+
+        failed_unload = ReloadAllLibrariesResultFailure(result_details="unload failed")
+
+        def refuse_unload(request: object) -> object:
+            if isinstance(request, UnloadLibraryFromRegistryRequest):
+                return failed_unload
+            return griptape_nodes.handle_request(request)
+
+        with (
+            patch.object(library_manager, "load_all_libraries_from_config", AsyncMock(return_value=[])) as load_all,
+            patch.object(library_manager.engine, "handle_request", side_effect=refuse_unload),
+        ):
+            result = await library_manager._run_reload_libraries(ReloadAllLibrariesRequest())
+
+        assert isinstance(result, ReloadAllLibrariesResultFailure)
+        load_all.assert_not_called()
+        assert library_manager._libraries_loading_complete.is_set(), (
+            "a reload that bailed before loading must reopen the gate it closed"
+        )
 
     @pytest.mark.asyncio
     async def test_gated_handler_would_have_returned_the_right_answer(self, griptape_nodes: GriptapeNodes) -> None:
