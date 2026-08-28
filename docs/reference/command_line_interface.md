@@ -76,7 +76,7 @@ Subcommands:
 
 - `uninstall` - Uninstall the CLI, removing its configuration and data directories and the installed executable
 - `version` - Display the current version of the CLI
-- `info` - Print a system information report for debugging: engine version and install source, platform and Python details, configuration paths, the full merged configuration, and every registered library with its version. Useful to paste into a bug report
+- `info` - Print a system information report for debugging: engine version and install source, platform and Python details, configuration paths, the config layer stack with each layer's file and any parse error, the full merged configuration, and every registered library with its version. Useful to paste into a bug report
 
 ### `libraries`
 

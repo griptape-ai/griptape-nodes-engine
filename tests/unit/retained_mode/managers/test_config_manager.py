@@ -10,12 +10,26 @@ import pytest
 
 from griptape_nodes.common.project_templates.project_path import resolve_project_path_field
 from griptape_nodes.retained_mode.events.app_events import ConfigChanged
+from griptape_nodes.retained_mode.events.config_events import (
+    GetConfigCategoryRequest,
+    GetConfigCategoryResultSuccess,
+    GetConfigLayersRequest,
+    GetConfigLayersResultSuccess,
+    GetConfigValueRequest,
+    GetConfigValueResultSuccess,
+    SetConfigCategoryRequest,
+    SetConfigCategoryResultSuccess,
+    SetConfigValueRequest,
+    SetConfigValueResultSuccess,
+)
 from griptape_nodes.retained_mode.managers.config_manager import (
     DEFAULT_LIBRARIES_ROOT_ENV_VAR,
     ConfigManager,
 )
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.project_manager import ProjectManager
+from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY, REQUIRES_ENGINE_KEY
+from griptape_nodes.utils.dict_utils import get_dot_value, set_dot_value
 
 
 @pytest.mark.skipif(
@@ -1273,20 +1287,20 @@ class TestConfigManagerUtf8:
         manager = ConfigManager.__new__(ConfigManager)
 
         with patch("locale.getpreferredencoding", return_value="cp949"):
-            result, parse_error = manager._load_config_from_file(config_file, "test")
+            loaded = manager._load_config_from_file(config_file, "test")
 
-        assert result == config_data
-        assert parse_error is None
+        assert loaded.contents == config_data
+        assert loaded.parse_error is None
 
     def test_returns_empty_dict_on_unicode_decode_error(self, tmp_path: Path) -> None:
         config_file = tmp_path / "griptape_nodes_config.json"
         config_file.write_bytes(b'{"key": "\xb9\xd9"}')  # cp949-encoded bytes, not valid UTF-8
 
         manager = ConfigManager.__new__(ConfigManager)
-        result, parse_error = manager._load_config_from_file(config_file, "test")
+        loaded = manager._load_config_from_file(config_file, "test")
 
-        assert result == {}
-        assert parse_error is not None
+        assert loaded.contents == {}
+        assert loaded.parse_error is not None
 
 
 class TestComputeProjectProvisioningConfig:
@@ -1299,7 +1313,6 @@ class TestComputeProjectProvisioningConfig:
 
     @staticmethod
     def _write_config(path: Path, dot_key: str, value: object) -> None:
-        from griptape_nodes.utils.dict_utils import set_dot_value
 
         path.write_text(json.dumps(set_dot_value({}, dot_key, value)), encoding="utf-8")
 
@@ -1309,9 +1322,6 @@ class TestComputeProjectProvisioningConfig:
         Mirrors load_configs's last-writer-wins replacement (merge_lists=False), so the
         preview must read the merged value, not the project-adjacent one.
         """
-        from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY
-        from griptape_nodes.utils.dict_utils import get_dot_value
-
         project_dir = tmp_path / "project"
         workspace_dir = tmp_path / "workspace"
         project_dir.mkdir()
@@ -1331,8 +1341,6 @@ class TestComputeProjectProvisioningConfig:
         storage_backend is Literal["local", "gtc"], so both layers must use valid values;
         the point under test is precedence, not the literal strings.
         """
-        from griptape_nodes.utils.dict_utils import get_dot_value
-
         project_dir = tmp_path / "project"
         project_dir.mkdir()
         self._write_config(project_dir / "griptape_nodes_config.json", "storage_backend", "local")
@@ -1349,9 +1357,6 @@ class TestComputeProjectProvisioningConfig:
         Matches load_configs's guard that skips loading the same file twice; the single
         file's value still lands in the merged config.
         """
-        from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY
-        from griptape_nodes.utils.dict_utils import get_dot_value
-
         project_dir = tmp_path / "project"
         project_dir.mkdir()
         self._write_config(project_dir / "griptape_nodes_config.json", LIBRARIES_TO_REGISTER_KEY, ["only-lib"])
@@ -1395,9 +1400,6 @@ class TestComputeProjectProvisioningConfig:
         griptape_nodes_config.json, so neither may leak into this preview, or the plan
         would diverge from what the switch actually reconciles.
         """
-        from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY
-        from griptape_nodes.utils.dict_utils import get_dot_value
-
         # A stray config file sitting in cwd-adjacent dirs must not be consulted.
         self._write_config(tmp_path / "griptape_nodes_config.json", LIBRARIES_TO_REGISTER_KEY, ["stray-file-lib"])
         self._write_config(isolate_user_config, LIBRARIES_TO_REGISTER_KEY, ["user-pin-lib"])
@@ -1431,7 +1433,6 @@ class TestProvisioningPreviewMatchesActivation:
 
     @staticmethod
     def _write_config_file(path: Path, values: dict[str, object]) -> None:
-        from griptape_nodes.utils.dict_utils import set_dot_value
 
         config: dict = {}
         for dot_key, value in values.items():
@@ -1459,9 +1460,6 @@ class TestProvisioningPreviewMatchesActivation:
         `pm` lets a caller pass a ProjectManager whose registry already models a parent chain (the
         branch-4 walk needs registered ancestors); when None a fresh, registry-less manager is built.
         """
-        from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY, REQUIRES_ENGINE_KEY
-        from griptape_nodes.utils.dict_utils import get_dot_value
-
         if pm is None:
             pm = ProjectManager(Mock(), cm, Mock())
 
@@ -1503,8 +1501,6 @@ class TestProvisioningPreviewMatchesActivation:
 
     def test_project_workspaces_override_branch(self, tmp_path: Path, isolate_user_config: Path) -> None:
         """project_workspaces maps the project to a separate workspace dir (apply_override=True)."""
-        from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY, REQUIRES_ENGINE_KEY
-
         project_dir = tmp_path / "project"
         project_dir.mkdir()
         project_file = project_dir / "project.yml"
@@ -1536,8 +1532,6 @@ class TestProvisioningPreviewMatchesActivation:
 
     def test_env_workspace_branch(self, tmp_path: Path) -> None:
         """GTN_CONFIG_WORKSPACE_DIRECTORY points at a separate workspace dir (apply_override=False)."""
-        from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY, REQUIRES_ENGINE_KEY
-
         project_dir = tmp_path / "project"
         project_dir.mkdir()
         project_file = project_dir / "project.yml"
@@ -1566,8 +1560,6 @@ class TestProvisioningPreviewMatchesActivation:
 
     def test_project_adjacent_workspace_branch(self, tmp_path: Path) -> None:
         """The project-adjacent config sets workspace_directory to a separate dir (apply_override=False)."""
-        from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY, REQUIRES_ENGINE_KEY
-
         project_dir = tmp_path / "project"
         project_dir.mkdir()
         project_file = project_dir / "project.yml"
@@ -1608,7 +1600,6 @@ class TestProvisioningPreviewMatchesActivation:
         from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
         from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
         from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
-        from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY, REQUIRES_ENGINE_KEY
 
         workspace_root = tmp_path / "workspace"
         workspace_root.mkdir()
@@ -1668,8 +1659,6 @@ class TestProvisioningPreviewMatchesActivation:
         so decide_workspace's global-default branch (no containment guard) fires and both paths must
         resolve the workspace layer to that root rather than the project's own dir.
         """
-        from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY, REQUIRES_ENGINE_KEY
-
         workspace_root = tmp_path / "global_ws"
         workspace_root.mkdir()
         project_dir = tmp_path / "project"
@@ -1706,9 +1695,6 @@ class TestProvisioningPreviewMatchesActivation:
         pass would not), which is exactly the pin that can force a destructive reconcile on the
         switch to Default Project.
         """
-        from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY, REQUIRES_ENGINE_KEY
-        from griptape_nodes.utils.dict_utils import get_dot_value, set_dot_value
-
         user_config: dict = {}
         set_dot_value(user_config, LIBRARIES_TO_REGISTER_KEY, ["user-pin-lib"])
         set_dot_value(user_config, REQUIRES_ENGINE_KEY, ">=9.0")
@@ -1746,71 +1732,83 @@ class TestConfigProvenance:
     `parse_error` instead of only a log line.
     """
 
+    @staticmethod
+    def _write_layer_config(directory: Path, contents: dict | str) -> Path:
+        """Write a griptape_nodes_config.json into `directory` and return its path.
+
+        A str `contents` is written verbatim, for the malformed-JSON case; a dict is
+        serialized. Returns the path so a test can assert provenance points at this file
+        without rebuilding the filename.
+        """
+        path = directory / "griptape_nodes_config.json"
+        if isinstance(contents, str):
+            path.write_text(contents, encoding="utf-8")
+        else:
+            path.write_text(json.dumps(contents), encoding="utf-8")
+        return path
+
+    @staticmethod
+    def _managed_dirs(tmp_path: Path) -> tuple[Path, Path]:
+        """Create and return separate project and workspace directories under `tmp_path`."""
+        project_dir = tmp_path / "project"
+        workspace_dir = tmp_path / "workspace"
+        project_dir.mkdir()
+        workspace_dir.mkdir()
+        return project_dir, workspace_dir
+
     # -- value_source: one layer per test, each winning over everything below it --
 
     def test_value_source_default_when_unset_anywhere(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
-            manager = ConfigManager()
-            source = manager.value_source("log_level")
+            source = ConfigManager().value_source("log_level")
 
         assert source.layer == "default"
         assert source.path is None
         assert source.env_var is None
 
     def test_value_source_user_layer(self, isolate_user_config: Path) -> None:
-        isolate_user_config.write_text(json.dumps({"log_level": "ERROR"}))
+        isolate_user_config.write_text(json.dumps({"log_level": "ERROR"}), encoding="utf-8")
 
         with patch.dict(os.environ, {}, clear=True):
-            manager = ConfigManager()
-            source = manager.value_source("log_level")
+            source = ConfigManager().value_source("log_level")
 
         assert source.layer == "user"
         assert source.path == str(isolate_user_config)
 
-    def test_value_source_project_layer_wins_over_user(self, isolate_user_config: Path) -> None:
-        isolate_user_config.write_text(json.dumps({"log_level": "WARNING"}))
+    def test_value_source_project_layer_wins_over_user(self, tmp_path: Path, isolate_user_config: Path) -> None:
+        isolate_user_config.write_text(json.dumps({"log_level": "WARNING"}), encoding="utf-8")
+        project_config = self._write_layer_config(tmp_path, {"log_level": "ERROR"})
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            project_dir = Path(temp_dir)
-            (project_dir / "griptape_nodes_config.json").write_text(json.dumps({"log_level": "ERROR"}))
-
-            with patch.dict(os.environ, {}, clear=True):
-                manager = ConfigManager()
-                manager.load_project_config(project_dir)
-                source = manager.value_source("log_level")
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.load_project_config(tmp_path)
+            source = manager.value_source("log_level")
 
         assert source.layer == "project"
-        assert source.path == str(project_dir / "griptape_nodes_config.json")
+        assert source.path == str(project_config)
 
-    def test_value_source_workspace_layer_wins_over_project(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            project_dir = Path(temp_dir) / "project"
-            project_dir.mkdir()
-            workspace_dir = Path(temp_dir) / "workspace"
-            workspace_dir.mkdir()
-            (project_dir / "griptape_nodes_config.json").write_text(json.dumps({"log_level": "ERROR"}))
-            (workspace_dir / "griptape_nodes_config.json").write_text(json.dumps({"log_level": "DEBUG"}))
+    def test_value_source_workspace_layer_wins_over_project(self, tmp_path: Path) -> None:
+        project_dir, workspace_dir = self._managed_dirs(tmp_path)
+        self._write_layer_config(project_dir, {"log_level": "ERROR"})
+        workspace_config = self._write_layer_config(workspace_dir, {"log_level": "DEBUG"})
 
-            with patch.dict(os.environ, {}, clear=True):
-                manager = ConfigManager()
-                manager.load_project_config(project_dir)
-                manager.load_workspace_config(workspace_dir)
-                source = manager.value_source("log_level")
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.load_project_config(project_dir)
+            manager.load_workspace_config(workspace_dir)
+            source = manager.value_source("log_level")
 
         assert source.layer == "workspace"
-        assert source.path == str(workspace_dir / "griptape_nodes_config.json")
+        assert source.path == str(workspace_config)
 
-    def test_value_source_env_layer_wins_over_everything(self, isolate_user_config: Path) -> None:
-        isolate_user_config.write_text(json.dumps({"log_level": "WARNING"}))
+    def test_value_source_env_layer_wins_over_everything(self, tmp_path: Path, isolate_user_config: Path) -> None:
+        isolate_user_config.write_text(json.dumps({"log_level": "WARNING"}), encoding="utf-8")
+        self._write_layer_config(tmp_path, {"log_level": "ERROR"})
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            project_dir = Path(temp_dir)
-            (project_dir / "griptape_nodes_config.json").write_text(json.dumps({"log_level": "ERROR"}))
-
-            with patch.dict(os.environ, {"GTN_CONFIG_LOG_LEVEL": "DEBUG"}, clear=True):
-                manager = ConfigManager()
-                manager.load_project_config(project_dir)
-                source = manager.value_source("log_level")
+        with patch.dict(os.environ, {"GTN_CONFIG_LOG_LEVEL": "DEBUG"}, clear=True):
+            manager = ConfigManager()
+            manager.load_project_config(tmp_path)
+            source = manager.value_source("log_level")
 
         assert source.layer == "env"
         assert source.env_var == "GTN_CONFIG_LOG_LEVEL"
@@ -1820,25 +1818,21 @@ class TestConfigProvenance:
 
     def test_shadowed_by_none_for_default(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
-            manager = ConfigManager()
-            assert manager.shadowed_by("log_level") is None
+            assert ConfigManager().shadowed_by("log_level") is None
 
     def test_shadowed_by_none_for_user(self, isolate_user_config: Path) -> None:
-        isolate_user_config.write_text(json.dumps({"log_level": "ERROR"}))
+        isolate_user_config.write_text(json.dumps({"log_level": "ERROR"}), encoding="utf-8")
+
+        with patch.dict(os.environ, {}, clear=True):
+            assert ConfigManager().shadowed_by("log_level") is None
+
+    def test_shadowed_by_returns_project_source(self, tmp_path: Path) -> None:
+        self._write_layer_config(tmp_path, {"log_level": "ERROR"})
 
         with patch.dict(os.environ, {}, clear=True):
             manager = ConfigManager()
-            assert manager.shadowed_by("log_level") is None
-
-    def test_shadowed_by_returns_project_source(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            project_dir = Path(temp_dir)
-            (project_dir / "griptape_nodes_config.json").write_text(json.dumps({"log_level": "ERROR"}))
-
-            with patch.dict(os.environ, {}, clear=True):
-                manager = ConfigManager()
-                manager.load_project_config(project_dir)
-                shadowed = manager.shadowed_by("log_level")
+            manager.load_project_config(tmp_path)
+            shadowed = manager.shadowed_by("log_level")
 
         assert shadowed is not None
         assert shadowed.layer == "project"
@@ -1851,37 +1845,29 @@ class TestConfigProvenance:
         This is the contract's own example: not relative to the requested category, so a
         caller can look a key up the same way no matter which category it came through.
         """
-        from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY
-
         with patch.dict(os.environ, {}, clear=True):
-            manager = ConfigManager()
-            sources = manager.category_sources("app_events.on_app_initialization_complete")
+            sources = ConfigManager().category_sources("app_events.on_app_initialization_complete")
 
         assert LIBRARIES_TO_REGISTER_KEY in sources
         assert sources[LIBRARIES_TO_REGISTER_KEY].layer == "default"
 
     def test_category_sources_none_category_is_whole_config_root_relative(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
-            manager = ConfigManager()
-            sources = manager.category_sources(None)
+            sources = ConfigManager().category_sources(None)
 
         assert "libraries_directory" in sources
         assert "workspace_directory" in sources
 
-    def test_category_sources_list_value_is_single_leaf_not_descended(self) -> None:
+    def test_category_sources_list_value_is_single_leaf_not_descended(self, tmp_path: Path) -> None:
         """A list is one leaf entry: the source of the WHOLE list, never split per item."""
-        from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY
+        self._write_layer_config(
+            tmp_path, {"app_events": {"on_app_initialization_complete": {"libraries_to_register": ["a", "b"]}}}
+        )
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            project_dir = Path(temp_dir)
-            (project_dir / "griptape_nodes_config.json").write_text(
-                json.dumps({"app_events": {"on_app_initialization_complete": {"libraries_to_register": ["a", "b"]}}})
-            )
-
-            with patch.dict(os.environ, {}, clear=True):
-                manager = ConfigManager()
-                manager.load_project_config(project_dir)
-                sources = manager.category_sources(None)
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.load_project_config(tmp_path)
+            sources = manager.category_sources(None)
 
         assert LIBRARIES_TO_REGISTER_KEY in sources
         assert sources[LIBRARIES_TO_REGISTER_KEY].layer == "project"
@@ -1891,117 +1877,139 @@ class TestConfigProvenance:
 
     def test_config_layers_returns_five_entries_in_fixed_order(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
-            manager = ConfigManager()
-            layers = manager.config_layers()
+            layers = ConfigManager().config_layers()
 
         assert [layer.layer for layer in layers] == ["default", "user", "project", "workspace", "env"]
 
     def test_config_layers_project_absent_when_no_project_active(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
-            manager = ConfigManager()
-            layers = {layer.layer: layer for layer in manager.config_layers()}
+            layers = {layer.layer: layer for layer in ConfigManager().config_layers()}
 
         assert layers["project"].path is None
         assert layers["project"].present is False
         assert layers["project"].parse_error is None
 
-    def test_config_layers_surfaces_parse_error_for_malformed_project_config(self) -> None:
+    def test_config_layers_surfaces_parse_error_for_malformed_project_config(self, tmp_path: Path) -> None:
         """A file that exists but fails to parse must be visible as `parse_error`, not just a log line.
 
         This is a project-adjacent file holding project-template content under a config
         filename, which silently fails to parse on every load.
         """
-        with tempfile.TemporaryDirectory() as temp_dir:
-            project_dir = Path(temp_dir)
-            (project_dir / "griptape_nodes_config.json").write_text(
-                '"project_template_schema_version": "1.0.0"\n"name": "not valid json"\n'
-            )
+        self._write_layer_config(tmp_path, '"project_template_schema_version": "1.0.0"\n"name": "not valid json"\n')
 
-            with patch.dict(os.environ, {}, clear=True):
-                manager = ConfigManager()
-                manager.load_project_config(project_dir)
-                layers = {layer.layer: layer for layer in manager.config_layers()}
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.load_project_config(tmp_path)
+            layers = {layer.layer: layer for layer in manager.config_layers()}
 
         assert layers["project"].present is True
         assert layers["project"].parse_error is not None
         assert layers["project"].values == {}
 
-    def test_config_layers_env_present_reflects_gtn_config_vars(self) -> None:
+    def test_config_layers_clears_stale_parse_error_when_project_switches(self, tmp_path: Path) -> None:
+        """A layer's parse error must not outlive the project it came from.
+
+        Switching to a project whose config parses (or to none at all) has to clear the
+        previous project's error, or `gtn self info` keeps blaming a file that is no longer
+        part of the merge.
+        """
+        broken_dir, good_dir = self._managed_dirs(tmp_path)
+        self._write_layer_config(broken_dir, "not valid json")
+        self._write_layer_config(good_dir, {"log_level": "ERROR"})
+
         with patch.dict(os.environ, {}, clear=True):
             manager = ConfigManager()
+            manager.load_project_config(broken_dir)
+            assert {layer.layer: layer for layer in manager.config_layers()}["project"].parse_error is not None
+
+            manager.load_project_config(good_dir)
             layers = {layer.layer: layer for layer in manager.config_layers()}
+
+        assert layers["project"].parse_error is None
+        assert layers["project"].values == {"log_level": "ERROR"}
+
+    def test_config_layers_env_present_reflects_gtn_config_vars(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            layers = {layer.layer: layer for layer in ConfigManager().config_layers()}
         assert layers["env"].present is False
 
         with patch.dict(os.environ, {"GTN_CONFIG_LOG_LEVEL": "DEBUG"}, clear=True):
-            manager = ConfigManager()
-            layers = {layer.layer: layer for layer in manager.config_layers()}
+            layers = {layer.layer: layer for layer in ConfigManager().config_layers()}
         assert layers["env"].present is True
         assert layers["env"].values == {"log_level": "DEBUG"}
 
+    def test_config_layers_workspace_not_present_when_it_is_the_project_file(self, tmp_path: Path) -> None:
+        """A workspace dir that IS the project dir names one file, loaded once as `project`.
+
+        load_configs skips the duplicate, so the workspace layer must not claim to be
+        contributing. It keeps its path (so a caller can see which file it would have
+        been) but reports present=False with empty values.
+        """
+        shared_config = self._write_layer_config(tmp_path, {"log_level": "ERROR"})
+
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.load_project_config(tmp_path)
+            manager.load_workspace_config(tmp_path)
+            layers = {layer.layer: layer for layer in manager.config_layers()}
+
+        assert layers["project"].present is True
+        assert layers["project"].values == {"log_level": "ERROR"}
+        assert layers["workspace"].present is False
+        assert layers["workspace"].values == {}
+        assert layers["workspace"].path == str(shared_config)
+
     # -- handler-level: the wire shape a settings UI actually receives --
 
-    def test_set_config_value_request_reports_shadowed_write_as_not_applied(self, isolate_user_config: Path) -> None:
+    def test_set_config_value_request_reports_shadowed_write_as_not_applied(
+        self, tmp_path: Path, isolate_user_config: Path
+    ) -> None:
         """A shadowed write must not report unqualified success.
 
         The write still reaches disk (see the assertion at the end) -- only the REPORTING
         becomes honest; this change does not refuse the write or change where it lands.
         """
-        from griptape_nodes.retained_mode.events.config_events import (
-            SetConfigValueRequest,
-            SetConfigValueResultSuccess,
-        )
+        project_config = self._write_layer_config(tmp_path, {"libraries_directory": "/from/project"})
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            project_dir = Path(temp_dir)
-            (project_dir / "griptape_nodes_config.json").write_text(
-                json.dumps({"libraries_directory": "/from/project"})
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.load_project_config(tmp_path)
+            result = manager.on_handle_set_config_value_request(
+                SetConfigValueRequest(category_and_key="libraries_directory", value="/typed/by/user")
             )
-
-            with patch.dict(os.environ, {}, clear=True):
-                manager = ConfigManager()
-                manager.load_project_config(project_dir)
-
-                request = SetConfigValueRequest(category_and_key="libraries_directory", value="/typed/by/user")
-                result = manager.on_handle_set_config_value_request(request)
 
         assert isinstance(result, SetConfigValueResultSuccess)
         assert result.applied is False
         assert result.effective_value == "/from/project"
         assert result.shadowed_by is not None
         assert result.shadowed_by.layer == "project"
-        assert result.shadowed_by.path == str(project_dir / "griptape_nodes_config.json")
+        assert result.shadowed_by.path == str(project_config)
+        # The user is told WHY, not just that the write "succeeded".
+        assert "no visible effect" in str(result.result_details)
 
         # The write is not rejected -- it lands in the user layer, silently ignored.
         on_disk = json.loads(isolate_user_config.read_text())
         assert on_disk["libraries_directory"] == "/typed/by/user"
 
-    def test_set_config_value_request_write_back_of_shadowed_value_stays_unapplied(self) -> None:
+    def test_set_config_value_request_write_back_of_shadowed_value_stays_unapplied(self, tmp_path: Path) -> None:
         """Writing back exactly the value the merged config is showing does not make it 'yours'.
 
         Shadowing is about which LAYER wins, not whether the values agree. This is the
         settings-panel write-back from the bug thread, where re-saving the displayed value
         looked like a no-op but the key remained just as unowned as before.
         """
-        from griptape_nodes.retained_mode.events.config_events import (
-            SetConfigValueRequest,
-            SetConfigValueResultSuccess,
-        )
+        self._write_layer_config(tmp_path, {"libraries_directory": "/from/project"})
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            project_dir = Path(temp_dir)
-            (project_dir / "griptape_nodes_config.json").write_text(
-                json.dumps({"libraries_directory": "/from/project"})
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.load_project_config(tmp_path)
+
+            shown_value = manager.get_config_value("libraries_directory")
+            assert shown_value == "/from/project"
+
+            result = manager.on_handle_set_config_value_request(
+                SetConfigValueRequest(category_and_key="libraries_directory", value=shown_value)
             )
-
-            with patch.dict(os.environ, {}, clear=True):
-                manager = ConfigManager()
-                manager.load_project_config(project_dir)
-
-                shown_value = manager.get_config_value("libraries_directory")
-                assert shown_value == "/from/project"
-
-                request = SetConfigValueRequest(category_and_key="libraries_directory", value=shown_value)
-                result = manager.on_handle_set_config_value_request(request)
 
         assert isinstance(result, SetConfigValueResultSuccess)
         assert result.applied is False
@@ -2009,44 +2017,34 @@ class TestConfigProvenance:
         assert result.shadowed_by.layer == "project"
 
     def test_set_config_value_request_applied_true_when_not_shadowed(self) -> None:
-        from griptape_nodes.retained_mode.events.config_events import (
-            SetConfigValueRequest,
-            SetConfigValueResultSuccess,
-        )
-
         with patch.dict(os.environ, {}, clear=True):
-            manager = ConfigManager()
-            request = SetConfigValueRequest(category_and_key="log_level", value="DEBUG")
-            result = manager.on_handle_set_config_value_request(request)
+            result = ConfigManager().on_handle_set_config_value_request(
+                SetConfigValueRequest(category_and_key="log_level", value="DEBUG")
+            )
 
         assert isinstance(result, SetConfigValueResultSuccess)
         assert result.applied is True
         assert result.effective_value == "DEBUG"
         assert result.shadowed_by is None
+        assert "no visible effect" not in str(result.result_details)
 
-    def test_get_config_value_request_reports_source_and_editable(self, isolate_user_config: Path) -> None:
-        from griptape_nodes.retained_mode.events.config_events import (
-            GetConfigValueRequest,
-            GetConfigValueResultSuccess,
-        )
+    def test_get_config_value_request_reports_source_and_editable(
+        self, tmp_path: Path, isolate_user_config: Path
+    ) -> None:
+        self._write_layer_config(tmp_path, {"log_level": "ERROR"})
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            project_dir = Path(temp_dir)
-            (project_dir / "griptape_nodes_config.json").write_text(json.dumps({"log_level": "ERROR"}))
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.load_project_config(tmp_path)
+            shadowed_result = manager.on_handle_get_config_value_request(
+                GetConfigValueRequest(category_and_key="log_level")
+            )
 
-            with patch.dict(os.environ, {}, clear=True):
-                manager = ConfigManager()
-                manager.load_project_config(project_dir)
-
-                shadowed_result = manager.on_handle_get_config_value_request(
-                    GetConfigValueRequest(category_and_key="log_level")
-                )
-
-                isolate_user_config.write_text(json.dumps({"some_editable_key": "value"}))
-                manager.load_configs()
-                editable_result = manager.on_handle_get_config_value_request(
-                    GetConfigValueRequest(category_and_key="some_editable_key")
-                )
+            isolate_user_config.write_text(json.dumps({"some_editable_key": "value"}), encoding="utf-8")
+            manager.load_configs()
+            editable_result = manager.on_handle_get_config_value_request(
+                GetConfigValueRequest(category_and_key="some_editable_key")
+            )
 
         assert isinstance(shadowed_result, GetConfigValueResultSuccess)
         assert isinstance(editable_result, GetConfigValueResultSuccess)
@@ -2057,15 +2055,8 @@ class TestConfigProvenance:
         assert editable_result.editable is True
 
     def test_get_config_category_request_sources_keyed_by_full_root_relative_path(self) -> None:
-        from griptape_nodes.retained_mode.events.config_events import (
-            GetConfigCategoryRequest,
-            GetConfigCategoryResultSuccess,
-        )
-        from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY
-
         with patch.dict(os.environ, {}, clear=True):
-            manager = ConfigManager()
-            result = manager.on_handle_get_config_category_request(
+            result = ConfigManager().on_handle_get_config_category_request(
                 GetConfigCategoryRequest(category="app_events.on_app_initialization_complete")
             )
 
@@ -2074,59 +2065,21 @@ class TestConfigProvenance:
         assert result.sources[LIBRARIES_TO_REGISTER_KEY].layer == "default"
 
     def test_get_config_layers_request_handler_returns_five_layers(self) -> None:
-        from griptape_nodes.retained_mode.events.config_events import (
-            GetConfigLayersRequest,
-            GetConfigLayersResultSuccess,
-        )
-
         with patch.dict(os.environ, {}, clear=True):
-            manager = ConfigManager()
-            result = manager.on_handle_get_config_layers_request(GetConfigLayersRequest())
+            result = ConfigManager().on_handle_get_config_layers_request(GetConfigLayersRequest())
 
         assert isinstance(result, GetConfigLayersResultSuccess)
         assert [layer.layer for layer in result.layers] == ["default", "user", "project", "workspace", "env"]
 
-    def test_config_layers_workspace_not_present_when_it_is_the_project_file(self) -> None:
-        """A workspace dir that IS the project dir names one file, loaded once as `project`.
+    def test_set_config_category_request_non_empty_category_reports_shadowed(self, tmp_path: Path) -> None:
+        self._write_layer_config(tmp_path, {"nuke": {"executable": "/from/project"}})
 
-        load_configs skips the duplicate, so the workspace layer must not claim to be
-        contributing. It keeps its path (so a caller can see which file it would have
-        been) but reports present=False with empty values.
-        """
-        with tempfile.TemporaryDirectory() as temp_dir:
-            shared_dir = Path(temp_dir)
-            (shared_dir / "griptape_nodes_config.json").write_text(json.dumps({"log_level": "ERROR"}))
-
-            with patch.dict(os.environ, {}, clear=True):
-                manager = ConfigManager()
-                manager.load_project_config(shared_dir)
-                manager.load_workspace_config(shared_dir)
-                layers = {layer.layer: layer for layer in manager.config_layers()}
-
-        assert layers["project"].present is True
-        assert layers["project"].values == {"log_level": "ERROR"}
-        assert layers["workspace"].present is False
-        assert layers["workspace"].values == {}
-        assert layers["workspace"].path == str(shared_dir / "griptape_nodes_config.json")
-
-    def test_set_config_category_request_non_empty_category_reports_shadowed(self) -> None:
-        from griptape_nodes.retained_mode.events.config_events import (
-            SetConfigCategoryRequest,
-            SetConfigCategoryResultSuccess,
-        )
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            project_dir = Path(temp_dir)
-            (project_dir / "griptape_nodes_config.json").write_text(
-                json.dumps({"nuke": {"executable": "/from/project"}})
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.load_project_config(tmp_path)
+            result = manager.on_handle_set_config_category_request(
+                SetConfigCategoryRequest(category="nuke", contents={"executable": "/typed/by/user"})
             )
-
-            with patch.dict(os.environ, {}, clear=True):
-                manager = ConfigManager()
-                manager.load_project_config(project_dir)
-
-                request = SetConfigCategoryRequest(category="nuke", contents={"executable": "/typed/by/user"})
-                result = manager.on_handle_set_config_category_request(request)
 
         assert isinstance(result, SetConfigCategoryResultSuccess)
         assert result.applied is False
@@ -2139,15 +2092,10 @@ class TestConfigProvenance:
         applied/effective_value/shadowed_by stay at their neutral defaults rather than
         reporting something misleading for a case the contract doesn't cover.
         """
-        from griptape_nodes.retained_mode.events.config_events import (
-            SetConfigCategoryRequest,
-            SetConfigCategoryResultSuccess,
-        )
-
         with patch.dict(os.environ, {}, clear=True):
-            manager = ConfigManager()
-            request = SetConfigCategoryRequest(category=None, contents={"log_level": "DEBUG"})
-            result = manager.on_handle_set_config_category_request(request)
+            result = ConfigManager().on_handle_set_config_category_request(
+                SetConfigCategoryRequest(category=None, contents={"log_level": "DEBUG"})
+            )
 
         assert isinstance(result, SetConfigCategoryResultSuccess)
         assert result.applied is True
