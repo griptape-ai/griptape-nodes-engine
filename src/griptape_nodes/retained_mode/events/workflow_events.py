@@ -123,12 +123,17 @@ class RegisterWorkflowRequest(RequestPayload):
     Args:
         metadata: Workflow metadata containing name, description, and other properties
         file_name: Name of the workflow file to register
+        library_name: Name of the library contributing this workflow, if any. Set it when
+            registering a workflow listed in a library's `workflows`; the registry ties
+            such a workflow to that library's lifetime. Leave it None for workflows found
+            by the workspace scan and for workflows the user creates.
 
     Results: RegisterWorkflowResultSuccess (with workflow name) | RegisterWorkflowResultFailure (registration error)
     """
 
     metadata: WorkflowMetadata
     file_name: str
+    library_name: str | None = None
 
 
 @dataclass

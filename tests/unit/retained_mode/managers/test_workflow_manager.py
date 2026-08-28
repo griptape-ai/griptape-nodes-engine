@@ -4838,3 +4838,161 @@ class TestRepairPathShapedDisplayName:
         assert isinstance(result, BranchWorkflowResultSuccess)
         branch = WorkflowRegistry.get_workflow_by_name(result.branched_workflow_name)
         assert branch.metadata.name == "comp (branch 1)"
+
+
+class TestProtectedTemplateOwnership:
+    """Which templates saving copies instead of overwriting.
+
+    A template that belongs to someone other than the user: one a library contributed, or one
+    Griptape ships. Ownership is what lets a library ship a template with nothing but
+    ``is_template`` in its header -- before this, an author who did not also know to set
+    ``is_griptape_provided`` got the user's edits written into their library directory.
+    """
+
+    @staticmethod
+    def _workflow(
+        *,
+        is_template: bool = False,
+        is_griptape_provided: bool = False,
+        library_name: str | None = None,
+    ) -> Workflow:
+        metadata = WorkflowMetadata(
+            name="example",
+            schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
+            engine_version_created_with="test",
+            node_libraries_referenced=[],
+            is_template=is_template,
+            is_griptape_provided=is_griptape_provided,
+        )
+        return Workflow(
+            registry_key=WorkflowRegistry._RegistryKey(),
+            metadata=metadata,
+            file_path="example.py",
+            library_name=library_name,
+        )
+
+    def test_a_library_template_is_protected(self, engine: Engine) -> None:
+        workflow = self._workflow(is_template=True, library_name="MyLib")
+
+        assert engine.workflow_manager._is_protected_template(workflow) is True
+
+    def test_a_griptape_provided_template_is_protected(self, engine: Engine) -> None:
+        """The pre-existing rule still holds: engine-shipped templates carry the flag, not an owner."""
+        workflow = self._workflow(is_template=True, is_griptape_provided=True)
+
+        assert engine.workflow_manager._is_protected_template(workflow) is True
+
+    def test_the_users_own_template_is_not_protected(self, engine: Engine) -> None:
+        """A workflow the user marked ``is_template`` in their own workspace is theirs to overwrite.
+
+        Which is also what the copy a save produces looks like: the workspace scan registers it
+        with no owner, so saving it again overwrites it rather than making a third copy.
+        """
+        workflow = self._workflow(is_template=True)
+
+        assert engine.workflow_manager._is_protected_template(workflow) is False
+
+    def test_a_library_workflow_that_is_not_a_template_is_not_protected(self, engine: Engine) -> None:
+        """Ownership alone does not protect anything -- the header still has to say template.
+
+        A library can declare a workflow that is not a template, and saving that keeps the
+        overwrite-in-place behaviour it had before ownership was recorded at all.
+        """
+        workflow = self._workflow(library_name="MyLib")
+
+        assert engine.workflow_manager._is_protected_template(workflow) is False
+
+    def test_no_workflow_is_not_protected(self, engine: Engine) -> None:
+        """``_determine_save_target`` asks about both the target and the current workflow.
+
+        Either can be absent -- a first save has no target, a save driven by name alone has no
+        current workflow -- so the missing one must not be mistaken for a protected template.
+        """
+        assert engine.workflow_manager._is_protected_template(None) is False
+
+
+class TestSaveFromTemplateRoutesOnOwnership:
+    """The ownership rule wired up, through the real ``_determine_save_target``.
+
+    ``TestProtectedTemplateOwnership`` covers the predicate; this covers the dispatch reading it,
+    so the two cannot drift apart.
+    """
+
+    @pytest.fixture
+    def temp_dir(self, tmp_path: Path) -> Path:
+        return tmp_path.resolve()
+
+    @pytest.fixture(autouse=True)
+    def setup_default_project(self, temp_dir: Path, engine: Engine) -> "Generator[None, None, None]":
+        """Load + activate the default project template, then force the workspace.
+
+        Same ordering as TestCreateVersionedWorkflow: activate first so
+        SetCurrentProjectRequest's internal re-derivation doesn't clobber the test workspace.
+        """
+        from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
+        from griptape_nodes.retained_mode.events.project_events import (
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+            SetCurrentProjectRequest,
+        )
+
+        original_workspace = engine.config_manager.workspace_path
+
+        project_yml = temp_dir / "project_template.yml"
+        project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
+        load_result = engine.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+        engine.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+
+        engine.config_manager.workspace_path = temp_dir
+
+        yield
+
+        WorkflowRegistry._workflows.clear()
+        engine.handle_request(SetCurrentProjectRequest(project_id=None))
+        engine.config_manager.workspace_path = original_workspace
+
+    @staticmethod
+    def _register_template(temp_dir: Path, *, registry_key: str, library_name: str | None) -> None:
+        """Materialize a template on disk + in the registry, owned by `library_name` or nobody."""
+        file_name = f"{registry_key}.py"
+        (temp_dir / file_name).write_text("# stub")
+        metadata = WorkflowMetadata(
+            name=registry_key,
+            schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
+            engine_version_created_with="test",
+            node_libraries_referenced=[],
+            creation_date=datetime.now(UTC),
+            is_template=True,
+        )
+        WorkflowRegistry.generate_new_workflow(
+            registry_key=registry_key, metadata=metadata, file_path=file_name, library_name=library_name
+        )
+
+    def _determine(self, engine: Engine, registry_key: str) -> WorkflowManager.SaveWorkflowTargetInfo:
+        return engine.workflow_manager._determine_save_target(
+            requested_file_name=registry_key,
+            current_workflow_name=registry_key,
+            create_versioned=False,
+        )
+
+    def test_saving_a_library_template_copies_it(self, engine: Engine, temp_dir: Path) -> None:
+        """No `is_griptape_provided` anywhere -- the library owning it is the whole reason."""
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            self._register_template(temp_dir, registry_key="lib_template", library_name="MyLib")
+
+            target = self._determine(engine, "lib_template")
+
+            assert target.scenario == WorkflowManager.SaveWorkflowScenario.SAVE_FROM_TEMPLATE
+            # A copy under a fresh name, not a write back over the library's own file.
+            assert target.file_path is None
+            assert target.file_name != "lib_template"
+
+    def test_saving_the_users_own_template_overwrites_it(self, engine: Engine, temp_dir: Path) -> None:
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            self._register_template(temp_dir, registry_key="my_template", library_name=None)
+
+            target = self._determine(engine, "my_template")
+
+            assert target.scenario == WorkflowManager.SaveWorkflowScenario.OVERWRITE_EXISTING
+            assert target.file_path == temp_dir / "my_template.py"

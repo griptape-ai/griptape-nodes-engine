@@ -192,8 +192,9 @@ library that provides them:
 - Updating or reloading the library re-registers them, so an edited template file is picked up.
 - Uninstalling the library removes its templates from the picker.
 
-Set two flags in each template's metadata header. The header is the `# /// script` block at the top
-of the saved `.py`; edit the `[tool.griptape-nodes]` table in it, the same way as `is_internal` above:
+Set `is_template = true` in each template's metadata header. The header is the `# /// script` block at
+the top of the saved `.py`; edit the `[tool.griptape-nodes]` table in it, the same way as
+`is_internal` above:
 
 ```python
 # /// script
@@ -202,22 +203,17 @@ of the saved `.py`; edit the `[tool.griptape-nodes]` table in it, the same way a
 # [tool.griptape-nodes]
 # name = "example_workflow"
 # is_template = true
-# is_griptape_provided = true
 # ///
 ```
 
-- **`is_template`** makes the editor offer the workflow as a starting point rather than listing it as
-    an ordinary workflow.
-- **`is_griptape_provided`** makes saving produce a new copy in the user's workspace. Set it on
-    anything you ship.
-
-Both are needed for the copy-on-save behavior. With `is_template` alone, the editor still offers the
-workflow as a starting point, but saving writes back over the template file inside your library — so
-the original is gone and the user's work is overwritten the next time they update the library.
+That does two things: the editor offers the workflow as a starting point rather than listing it as an
+ordinary workflow, and saving it produces a new copy in the user's workspace instead of writing back
+over the file inside your library. The user can save their changes as often as they like and your
+template stays as you shipped it.
 
 Templates survive a workspace rescan — which happens at engine start and whenever the workspace
-directory changes — because the engine re-registers them from your library afterwards. That holds
-whether or not you set `is_griptape_provided`.
+directory changes — because the engine knows they came from your library rather than from the
+workspace.
 
 Templates are registered by reading the metadata header only; the engine does not run them or import
 any node class to do it. A template that names a library version you do not have installed still
