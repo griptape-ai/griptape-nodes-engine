@@ -709,6 +709,7 @@ class TestLibraryManagerRegisterLibraryFromFile:
                 git_remote=None,
                 git_ref=None,
                 enabled=True,
+                is_registered=False,
                 result_details=ResultDetails(message="Success", level=20),
             )
             mock_venv.return_value.exists.return_value = True
@@ -748,6 +749,7 @@ class TestLibraryManagerRegisterLibraryFromFile:
                     git_remote=None,
                     git_ref=None,
                     enabled=True,
+                    is_registered=False,
                     result_details=ResultDetails(message="OK", level=20),
                 ),
             ),
@@ -776,6 +778,7 @@ class TestLibraryManagerInstallLibraryDependencies:
             git_remote=None,
             git_ref=None,
             enabled=True,
+            is_registered=False,
             result_details=ResultDetails(message="OK", level=20),
         )
 

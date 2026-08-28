@@ -128,6 +128,7 @@ def _metadata_success(schema: MagicMock) -> LoadLibraryMetadataFromFileResultSuc
         git_remote=None,
         git_ref=None,
         enabled=True,
+        is_registered=False,
         result_details=ResultDetails(message="OK", level=20),
     )
 
