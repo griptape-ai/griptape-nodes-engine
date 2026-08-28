@@ -77,6 +77,7 @@ from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULT
 from griptape_nodes.retained_mode.managers.settings import (
     LIBRARIES_TO_DOWNLOAD_KEY,
     LIBRARIES_TO_REGISTER_KEY,
+    LIBRARY_WARM_PORT_SUMMARIES_KEY,
     LibraryDownload,
     LibraryRegistration,
 )
@@ -2400,9 +2401,11 @@ class TestGetPortSummariesForAllLibrariesRequest:
         library_manager = engine.library_manager
         self._register_probe_library(_PortSummaryDataOnlyProbe)
 
-        async def invalidate_midway(library_name: str, allowance: ProbeTimeoutAllowance) -> Any:
+        async def invalidate_midway(
+            library_name: str, allowance: ProbeTimeoutAllowance, *, throttle_s: float, **kwargs: Any
+        ) -> Any:
             computation = await _LibraryManager._compute_port_summaries_for_library(
-                library_manager, library_name, allowance
+                library_manager, library_name, allowance, throttle_s=throttle_s, **kwargs
             )
             # Stand in for a reload / sandbox registration landing while the pass was awaiting.
             library_manager._invalidate_port_summaries(library_name)
@@ -2427,9 +2430,7 @@ class TestGetPortSummariesForAllLibrariesRequest:
         assert self._LIBRARY_NAME not in library_manager._library_to_port_summary_cache
 
     @pytest.mark.asyncio
-    async def test_a_node_type_that_fails_to_resolve_does_not_fail_the_whole_response(
-        self, engine: Engine
-    ) -> None:
+    async def test_a_node_type_that_fails_to_resolve_does_not_fail_the_whole_response(self, engine: Engine) -> None:
         """Resolution raises more than import errors, and the response covers every library.
 
         `Library.get_node_class` raises `LibraryRegistryError` for a node type unregistered since
@@ -2551,9 +2552,7 @@ class TestGetPortSummariesForAllLibrariesRequest:
         assert not library_manager._library_to_port_summary_cache[self._LIBRARY_NAME].pending_node_types()
 
     @pytest.mark.asyncio
-    async def test_contains_a_node_type_whose_library_metadata_cannot_be_read(
-        self, engine: Engine
-    ) -> None:
+    async def test_contains_a_node_type_whose_library_metadata_cannot_be_read(self, engine: Engine) -> None:
         """Building the probe's metadata reads and serializes the library author's node metadata.
 
         A malformed entry raises there, outside the node's own __init__, and must be contained to
@@ -2582,9 +2581,7 @@ class TestGetPortSummariesForAllLibrariesRequest:
         assert not library_manager._library_to_port_summary_cache[self._LIBRARY_NAME].pending_node_types()
 
     @pytest.mark.asyncio
-    async def test_resumes_node_types_a_request_ran_out_of_allowance_before_reaching(
-        self, engine: Engine
-    ) -> None:
+    async def test_resumes_node_types_a_request_ran_out_of_allowance_before_reaching(self, engine: Engine) -> None:
         """One library's blocking node must not cost another library its ranking for good.
 
         The timeout allowance is spent per request across every library, so a library reached after
@@ -2636,9 +2633,7 @@ class TestGetPortSummariesForAllLibrariesRequest:
         assert not library_manager._library_to_port_summary_cache[self._LIBRARY_NAME].pending_node_types()
 
     @pytest.mark.asyncio
-    async def test_gives_up_on_a_library_that_has_spent_its_lifetime_timeout_allowance(
-        self, engine: Engine
-    ) -> None:
+    async def test_gives_up_on_a_library_that_has_spent_its_lifetime_timeout_allowance(self, engine: Engine) -> None:
         """Carrying unreached node types forever would let a stuck library leak a thread per request.
 
         Each timeout permanently holds a worker of the loop's default executor, so once a library has
@@ -2783,6 +2778,194 @@ class TestGetPortSummariesForAllLibrariesRequest:
         assert isinstance(result, GetPortSummariesForAllLibrariesResultSuccess)
         summaries = result.library_name_to_port_summaries[self._LIBRARY_NAME]
         assert set(summaries) == {_PortSummaryProbe.__name__}
+
+
+class TestPortSummaryWarming:
+    """Exercise the background pass that fills the port summary cache before anything asks.
+
+    Warming exists to move the probe cost off the moment an artist drags a connection. These tests
+    pin the two properties that make it worth having -- a warmed request probes nothing, and a
+    reload cannot leave a pass running against libraries it is tearing down -- plus the two ways it
+    declines to run at all.
+    """
+
+    _LIBRARY_NAME = "port-summary-warm-test-library"
+
+    @pytest.fixture(autouse=True)
+    def _clean_registry(self) -> Generator[None, None, None]:
+        """LibraryRegistry holds class-level state that survives the singleton reset fixture."""
+        LibraryRegistry._clear()
+        yield
+        LibraryRegistry._clear()
+
+    def _register_probe_library(self, *node_classes: type[BaseNode]) -> None:
+        schema = LibrarySchema(
+            name=self._LIBRARY_NAME,
+            library_schema_version=LibrarySchema.LATEST_SCHEMA_VERSION,
+            metadata=LibraryMetadata(
+                author="test",
+                description="port summary warming library",
+                library_version="1.0.0",
+                engine_version="1.0.0",
+                tags=[],
+            ),
+            categories=[],
+            nodes=[],
+        )
+        library = LibraryRegistry.generate_new_library(library_data=schema)
+        for node_class in node_classes:
+            library.register_new_node_type(
+                node_class,
+                NodeMetadata(
+                    category="test",
+                    description=f"{node_class.__name__} used by port summary warming tests",
+                    display_name=node_class.__name__,
+                ),
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_warmed_request_probes_nothing(self, engine: Engine) -> None:
+        """The whole point: after warming, the request an artist waits on constructs no nodes."""
+        library_manager = engine.library_manager
+        self._register_probe_library(_PortSummaryDataOnlyProbe, _PortSummaryProbe)
+
+        await library_manager._warm_port_summaries()
+
+        with patch.object(
+            _LibraryManager,
+            "_construct_probe_node",
+            side_effect=_LibraryManager._construct_probe_node,
+            autospec=True,
+        ) as probe_spy:
+            result = await library_manager.on_get_port_summaries_for_all_libraries_request(
+                GetPortSummariesForAllLibrariesRequest()
+            )
+
+        assert probe_spy.call_count == 0
+        assert isinstance(result, GetPortSummariesForAllLibrariesResultSuccess)
+        summaries = result.library_name_to_port_summaries[self._LIBRARY_NAME]
+        assert set(summaries) == {_PortSummaryDataOnlyProbe.__name__, _PortSummaryProbe.__name__}
+
+    @pytest.mark.asyncio
+    async def test_a_request_landing_mid_warm_does_not_duplicate_the_probing(self, engine: Engine) -> None:
+        """Warming adds a second concurrent caller, so the per-library lock has to hold.
+
+        Without it the two passes would each probe every node type, making warming a pessimization
+        for exactly the request it is supposed to speed up.
+        """
+        library_manager = engine.library_manager
+        self._register_probe_library(_PortSummaryDataOnlyProbe, _PortSummaryProbe)
+
+        with patch.object(
+            _LibraryManager,
+            "_construct_probe_node",
+            side_effect=_LibraryManager._construct_probe_node,
+            autospec=True,
+        ) as probe_spy:
+            warm = asyncio.create_task(library_manager._warm_port_summaries())
+            request = asyncio.create_task(
+                library_manager.on_get_port_summaries_for_all_libraries_request(
+                    GetPortSummariesForAllLibrariesRequest()
+                )
+            )
+            await asyncio.gather(warm, request)
+
+        expected_probe_calls = 2  # One per node type, total, across both callers.
+        assert probe_spy.call_count == expected_probe_calls
+
+    @pytest.mark.asyncio
+    async def test_cancelling_stops_an_in_flight_pass_before_it_caches(self, engine: Engine) -> None:
+        """A reload calls this before unloading, so the pass must really be off the loop after it.
+
+        The pass resolves node classes, which imports their modules; one still running would pull
+        a library being dismantled back into sys.modules.
+        """
+        library_manager = engine.library_manager
+        self._register_probe_library(_PortSummaryDataOnlyProbe, _PortSummaryProbe)
+        pass_reached_first_probe = asyncio.Event()
+        release_first_probe = asyncio.Event()
+        real_construct = _LibraryManager._construct_probe_node
+
+        async def block_on_first_probe(*args: Any, **kwargs: Any) -> Any:
+            pass_reached_first_probe.set()
+            await release_first_probe.wait()
+            return real_construct(*args, **kwargs)
+
+        # Patch the awaited probe rather than the threaded construction: this test is about the
+        # coroutine being cancellable at an await point, which is what cancellation acts on.
+        with patch.object(library_manager, "_probe_node_type_port_summary", side_effect=block_on_first_probe):
+            library_manager._start_port_summary_warm()
+            warm_task = library_manager._port_summary_warm_task
+            assert warm_task is not None
+            await pass_reached_first_probe.wait()
+
+            await library_manager._cancel_port_summary_warm()
+
+        assert warm_task.cancelled()
+        assert library_manager._port_summary_warm_task is None
+        # Cancelled mid-library, so nothing was written back -- the next request recomputes rather
+        # than serving a half-probed library as complete.
+        assert self._LIBRARY_NAME not in library_manager._library_to_port_summary_cache
+
+    @pytest.mark.asyncio
+    async def test_cancelling_is_a_no_op_when_nothing_is_warming(self, engine: Engine) -> None:
+        """Reload always calls this, including on a boot where warming never started."""
+        library_manager = engine.library_manager
+
+        await library_manager._cancel_port_summary_warm()
+
+        assert library_manager._port_summary_warm_task is None
+
+    @pytest.mark.asyncio
+    async def test_reload_cancels_warming_before_it_unloads_anything(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Ordering is the whole protection, so pin it rather than trusting the call's placement."""
+        library_manager = engine.library_manager
+        call_order: list[str] = []
+
+        async def record_cancel() -> None:
+            call_order.append("cancel")
+
+        async def fail_after_clearing(_request: object) -> Any:
+            # Stands in for the first thing _run_reload_libraries does after cancelling. Failing it
+            # short-circuits the rest of the reload, which this test does not exercise.
+            call_order.append("clear_state")
+            failure = MagicMock()
+            failure.succeeded.return_value = False
+            return failure
+
+        monkeypatch.setattr(library_manager, "_cancel_port_summary_warm", record_cancel)
+        monkeypatch.setattr(library_manager.engine, "ahandle_request", fail_after_clearing)
+
+        from griptape_nodes.retained_mode.events.library_events import ReloadAllLibrariesRequest
+
+        await library_manager._run_reload_libraries(ReloadAllLibrariesRequest())
+
+        assert call_order == ["cancel", "clear_state"]
+
+    def test_does_not_warm_on_a_worker(self, engine: Engine) -> None:
+        """A worker already constructs every node type to serialize its schemas."""
+        library_manager = engine.library_manager
+        library_manager._is_worker = True
+
+        library_manager._start_port_summary_warm()
+
+        assert library_manager._port_summary_warm_task is None
+
+    def test_does_not_warm_when_the_setting_is_off(self, engine: Engine) -> None:
+        """Opting out has to leave the on-demand path as the only one that probes."""
+        library_manager = engine.library_manager
+
+        def config_value(key: str, **_: object) -> object:
+            if key == LIBRARY_WARM_PORT_SUMMARIES_KEY:
+                return False
+            return None
+
+        with patch.object(library_manager.engine.config_manager, "get_config_value", side_effect=config_value):
+            library_manager._start_port_summary_warm()
+
+        assert library_manager._port_summary_warm_task is None
 
 
 class TestPortSummaryInvalidationOnLibraryLoad:

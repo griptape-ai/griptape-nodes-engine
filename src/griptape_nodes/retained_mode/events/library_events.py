@@ -945,9 +945,13 @@ class GetPortSummariesForAllLibrariesRequest(RequestPayload):
     Deliberately a separate request rather than a field on the library catalog. A node type's
     ports are only knowable by constructing it, and node modules are imported lazily by default
     (`library.lazy_node_loading`), so folding this into the catalog would import and instantiate
-    every node type in every library on every editor connect. Here the cost is paid once, on
-    demand, by the callers that need ranking. Results are cached per library for the process
-    lifetime and recomputed after the library is reloaded. A node type whose probe timed out is
+    every node type in every library on every editor connect. Here the cost is paid once per
+    library per load, and by default off the critical path: the engine warms the cache in the
+    background once libraries finish loading, and again after a reload, so a caller normally hits
+    a warm cache (`library.warm_port_summaries` disables that, which only changes *when* the cost
+    is paid -- the first request then computes it, as it did before warming existed). Results are
+    cached per library for the process lifetime and recomputed after the library is reloaded. A
+    node type whose probe timed out is
     the one thing retried, and only on the next request; after that its gap is treated as
     permanent until the library reloads, because re-probing a node whose `__init__` blocks costs
     a thread that cannot be reclaimed.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import importlib.abc
 import importlib.machinery
@@ -249,6 +250,7 @@ from griptape_nodes.retained_mode.managers.settings import (
     LIBRARY_DEPENDENCY_INSTALL_BEHAVIOR_KEY,
     LIBRARY_LAZY_NODE_LOADING_KEY,
     LIBRARY_MINIMUM_RELEASE_AGE_KEY,
+    LIBRARY_WARM_PORT_SUMMARIES_KEY,
     REQUIRES_ENGINE_KEY,
     WORKER_HEARTBEAT_STARTUP_GRACE_KEY,
     LibraryDependencyInstallBehavior,
@@ -730,6 +732,11 @@ class LibraryManager(EngineScoped):
         # One lock per library, so a request that only needs an already-computed library's
         # summaries does not queue behind a different library's first probe pass.
         self._library_to_port_summaries_lock: dict[str, asyncio.Lock] = {}
+        # The in-flight background pass filling the cache above, if any. Retained rather than
+        # fire-and-forget because a reload has to cancel it: the pass resolves node classes, so
+        # one still running while a library is torn down would import that library's modules
+        # back in. See _start_port_summary_warm.
+        self._port_summary_warm_task: asyncio.Task[None] | None = None
         self._libraries_loading_complete = asyncio.Event()
         self._libraries_loading_complete.set()  # Not loading initially; load_all_libraries_from_config will clear/set this
         # True for the duration of the engine's initialization sequence (library + workflow
@@ -3328,12 +3335,18 @@ class LibraryManager(EngineScoped):
         """Async handler for GetPortSummariesForAllLibrariesRequest.
 
         Waits for library loading to finish, then serves each library's summaries from the cache,
-        computing them on first request.
+        computing them on first request. Usually that cache is already warm, because
+        `_start_port_summary_warm` fills it in the background once libraries are loaded; this path
+        still computes so the request is correct when warming is disabled, was cancelled by a
+        reload, or has not reached this library yet.
 
         One timeout allowance covers the whole request rather than each library separately, because
         the cost a timeout imposes -- a worker of the loop's default executor, held for good -- is
         paid by the engine as a whole. A library whose node types go unreached because the allowance
         ran out here keeps them pending, so the next request resumes them.
+
+        No throttle between node types: a caller is waiting on this, so it takes the loop for as
+        long as it needs. The warm pass is the one that spaces its probes out.
         """
         await self._libraries_loading_complete.wait()
 
@@ -3341,7 +3354,7 @@ class LibraryManager(EngineScoped):
         library_name_to_port_summaries: dict[str, dict[str, NodePortSummary]] = {}
         for library_name in LibraryRegistry.list_libraries():
             library_name_to_port_summaries[library_name] = await self._get_port_summaries_for_library(
-                library_name, allowance
+                library_name, allowance, throttle_s=0.0
             )
 
         node_type_count = sum(len(summaries) for summaries in library_name_to_port_summaries.values())
@@ -3354,8 +3367,89 @@ class LibraryManager(EngineScoped):
             result_details=details,
         )
 
+    def _start_port_summary_warm(self) -> None:
+        """Launch the background pass that fills the port summary cache before anything asks for it.
+
+        Called after the engine has announced readiness rather than awaited inside the
+        initialization sequence, because that sequence is bracketed by `_is_initializing`, which
+        the heartbeat reports: awaiting a probe pass in there would have the engine advertise
+        "initializing" to clients for the pass's whole duration, and delay `EngineReadyEvent`
+        behind work no client is waiting on.
+
+        Warming only moves this cost, it does not remove it. What it buys is paying it while
+        nobody is blocked instead of mid-drag in the Add Node menu, which is the only moment the
+        summaries are ever needed.
+        """
+        if self._is_worker:
+            # Nothing to warm on a worker: it loads eagerly and already constructs every node type
+            # to serialize its schemas. The orchestrator answers port summary requests for a
+            # worker-hosted library from the stub classes those schemas produce, which are cheap to
+            # probe precisely because they carry no library code.
+            return
+
+        if not self.engine.config_manager.get_config_value(LIBRARY_WARM_PORT_SUMMARIES_KEY, default=True):
+            logger.debug(
+                "Port summary warming is disabled by configuration ('%s'); summaries will be computed on demand.",
+                LIBRARY_WARM_PORT_SUMMARIES_KEY,
+            )
+            return
+
+        self._port_summary_warm_task = asyncio.create_task(self._warm_port_summaries())
+
+    async def _cancel_port_summary_warm(self) -> None:
+        """Stop any in-flight warm pass and wait for it to actually be off the loop.
+
+        Awaited rather than just cancelled because the caller is about to unload libraries, and a
+        pass between awaits could still resolve a node class -- importing a module belonging to a
+        library being dismantled. Returns promptly even when the pass is inside a probe: the
+        construction thread cannot be cancelled, but the coroutine awaiting it can, which is the
+        same leaked-thread trade the probe path already documents.
+
+        Clearing the handle before awaiting keeps a second caller from awaiting the same task.
+        """
+        task = self._port_summary_warm_task
+        if task is None:
+            return
+
+        self._port_summary_warm_task = None
+        if task.done():
+            return
+
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    async def _warm_port_summaries(self) -> None:
+        """Probe every registered library's node types so the first real request is a cache hit.
+
+        Deliberately just another caller of `_get_port_summaries_for_library`: the per-library lock
+        there means a request arriving mid-pass never duplicates the work -- it either reads what
+        this pass has already cached or waits on the one library it needs -- and the generation
+        counter already decides whether a result computed across a library mutation is safe to
+        keep. Warming needed no new cache machinery for that reason.
+
+        Runs on its own timeout allowance, and throttled, both because it covers every library at
+        once and because nothing is waiting on it.
+        """
+        await self._libraries_loading_complete.wait()
+
+        allowance = ProbeTimeoutAllowance(remaining=self._PORT_SUMMARY_WARM_TIMEOUT_BUDGET)
+        library_names = LibraryRegistry.list_libraries()
+        node_type_count = 0
+        for library_name in library_names:
+            summaries = await self._get_port_summaries_for_library(
+                library_name, allowance, throttle_s=self._PORT_SUMMARY_WARM_THROTTLE_S
+            )
+            node_type_count += len(summaries)
+
+        logger.info(
+            "Warmed port summaries for %d node type(s) across %d librar(ies); connection ranking is ready.",
+            node_type_count,
+            len(library_names),
+        )
+
     async def _get_port_summaries_for_library(
-        self, library_name: str, allowance: ProbeTimeoutAllowance
+        self, library_name: str, allowance: ProbeTimeoutAllowance, *, throttle_s: float
     ) -> dict[str, NodePortSummary]:
         """Return the port summary for every node type in a library, computing it on first call.
 
@@ -3381,6 +3475,10 @@ class LibraryManager(EngineScoped):
         the second caller waits and then reads the cache. It is deliberately not held for the
         cache-hit path: the probe pass can take seconds, and a request that only needs
         already-computed summaries should not queue behind another library's first pass.
+
+        `throttle_s` is how long to pause between node types, and is the only thing separating the
+        background warm pass from an interactive request. Both share this function so the cache,
+        lock, and generation handling above have exactly one implementation.
         """
         entry = self._library_to_port_summary_cache.get(library_name)
         if entry is not None and not entry.pending_node_types():
@@ -3397,12 +3495,14 @@ class LibraryManager(EngineScoped):
 
             generation_before = self._library_to_port_summaries_generation.get(library_name, 0)
             if entry is None:
-                computation = await self._compute_port_summaries_for_library(library_name, allowance)
+                computation = await self._compute_port_summaries_for_library(
+                    library_name, allowance, throttle_s=throttle_s
+                )
                 summaries = computation.summaries
                 timeouts_spent = len(computation.timed_out_node_types)
             else:
                 computation = await self._compute_port_summaries_for_library(
-                    library_name, allowance, entry.pending_node_types()
+                    library_name, allowance, node_types=entry.pending_node_types(), throttle_s=throttle_s
                 )
                 summaries = {**entry.summaries, **computation.summaries}
                 timeouts_spent = entry.timeouts_spent + len(computation.timed_out_node_types)
@@ -3481,7 +3581,12 @@ class LibraryManager(EngineScoped):
         )
 
     async def _compute_port_summaries_for_library(
-        self, library_name: str, allowance: ProbeTimeoutAllowance, node_types: frozenset[str] | None = None
+        self,
+        library_name: str,
+        allowance: ProbeTimeoutAllowance,
+        *,
+        throttle_s: float,
+        node_types: frozenset[str] | None = None,
     ) -> PortSummaryComputation:
         """Probe a library's node types and derive each one's port summary.
 
@@ -3539,8 +3644,10 @@ class LibraryManager(EngineScoped):
                 break
 
             # Yield between node types so a large library's resolve calls, which run on the loop,
-            # interleave with other work instead of monopolizing it for the whole pass.
-            await asyncio.sleep(0)
+            # interleave with other work instead of monopolizing it for the whole pass. A zero
+            # sleep only lets already-ready callbacks run; the warm pass passes a real interval,
+            # which is what actually leaves the loop usable while it works.
+            await asyncio.sleep(throttle_s)
 
             outcome = await self._probe_node_type_port_summary(
                 library=library, library_name=library_name, node_type=node_type
@@ -4935,6 +5042,10 @@ class LibraryManager(EngineScoped):
                 )
             )
 
+        # Strictly after readiness is announced: warming is for the editor's benefit, so it must
+        # not sit between the engine being usable and the app being told so.
+        self._start_port_summary_warm()
+
     async def _collect_library_workflow_files(self) -> list[str]:
         """Collect workflow file paths declared by all registered libraries.
 
@@ -5581,6 +5692,18 @@ class LibraryManager(EngineScoped):
     # blocking nodes would starve every other to_thread caller in the engine.
     # Leaving part of one library unranked until it reloads is the cheaper failure.
     _PORT_SUMMARY_TIMEOUT_BUDGET: int = 4
+    # The same allowance for the background warm pass, which needs its own number because it
+    # covers every library rather than the one a caller asked about: given the interactive
+    # budget, a single library of blocking nodes would spend the whole thing and leave every
+    # other library cold, which is the one outcome that makes warming pointless. Still far
+    # below the default executor's worker count, since every timeout counted here is a thread
+    # the engine never gets back.
+    _PORT_SUMMARY_WARM_TIMEOUT_BUDGET: int = 8
+    # Gap left between node types during the warm pass. Resolving a node class imports its
+    # module on the event loop, which nothing can interrupt, so the pass cannot avoid blocking
+    # the loop in bursts -- it can only space them out. A warm pass has no deadline, so it
+    # buys editor responsiveness with wall-clock time an interactive request cannot spend.
+    _PORT_SUMMARY_WARM_THROTTLE_S: float = 0.05
     # Sentinel name passed to the throwaway node instance built for schema
     # discovery. The instance is discarded after its parameters are read.
     _SCHEMA_PROBE_NODE_NAME: str = "__schema_probe__"
@@ -6138,6 +6261,11 @@ class LibraryManager(EngineScoped):
             self._is_initializing = False
 
     async def _run_reload_libraries(self, request: ReloadAllLibrariesRequest) -> ResultPayload:  # noqa: ARG002
+        # Stop any background port summary warming before anything is torn down. The pass resolves
+        # node classes, so one left running would import modules belonging to libraries this is
+        # about to unload -- reviving exactly what the reload exists to replace.
+        await self._cancel_port_summary_warm()
+
         # Start with a clean slate.
         clear_all_request = ClearAllObjectStateRequest(i_know_what_im_doing=True)
         clear_all_result = await self.engine.ahandle_request(clear_all_request)
@@ -6212,6 +6340,12 @@ class LibraryManager(EngineScoped):
                     )
                 )
             )
+
+        # Re-warm against the reloaded libraries. Their cached summaries were dropped when they
+        # unloaded, so without this a reload silently hands the cost back to the next artist to
+        # drag a connection. Started even when reconcile reported problems below: the libraries
+        # that did load still have node types worth ranking.
+        self._start_port_summary_warm()
 
         # Hard activation: a reload is interactive (project switch / explicit reload), so a
         # reconcile failure (bad engine_version gate or a sourced library that could not be

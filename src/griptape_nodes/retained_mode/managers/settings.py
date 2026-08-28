@@ -29,6 +29,7 @@ DEFAULT_LIBRARIES_DIRECTORY = "libraries"
 LIBRARY_DEPENDENCY_INSTALL_BEHAVIOR_KEY = "library.dependency_install_behavior"
 LIBRARY_MINIMUM_RELEASE_AGE_KEY = "library.minimum_release_age"
 LIBRARY_LAZY_NODE_LOADING_KEY = "library.lazy_node_loading"
+LIBRARY_WARM_PORT_SUMMARIES_KEY = "library.warm_port_summaries"
 
 
 class Category(BaseModel):
@@ -315,6 +316,19 @@ class LibrarySettings(BaseModel):
             "import error surfaces immediately as a library problem, before the node is placed on a "
             "canvas; set this while authoring nodes if you want that check. Nodes in the sandbox library "
             "are always loaded eagerly regardless of this setting."
+        ),
+    )
+    warm_port_summaries: bool = Field(
+        default=True,
+        description=(
+            "When True (the default), the engine computes each node type's port summary in the background "
+            "once libraries have finished loading, so the editor's 'which node types accept this connection?' "
+            "ranking is instant the first time it is needed. Computing a summary means constructing the node "
+            "type, which imports its Python module, so this trades background work after startup for not "
+            "making the artist wait mid-drag. Set to False on a constrained machine, or while authoring, to "
+            "leave the cost where it was: paid on demand by the first request that needs ranking. Either way "
+            "the summaries are computed at most once per library per load. Has no effect on a dedicated "
+            "library worker, which already imports every node module to report its schemas."
         ),
     )
     minimum_release_age: float = Field(
