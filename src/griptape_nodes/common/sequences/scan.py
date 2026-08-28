@@ -27,7 +27,7 @@ import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NamedTuple, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, NamedTuple, Protocol, runtime_checkable
 
 from fileseq.constants import PAD_STYLE_HASH1
 from fileseq.filesequence import FileSequence
@@ -46,7 +46,9 @@ from griptape_nodes.retained_mode.events.os_events import (
     ListDirectoryRequest,
     ListDirectoryResultSuccess,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.engine import Engine
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -143,6 +145,7 @@ def scan_sequences(  # noqa: PLR0913
     mapping: PathMapping,
     pattern: str | FileSequence,
     *,
+    engine: Engine,
     policy: MissingItemPolicy = MissingItemPolicy.SPLIT,
     no_token_behavior: NoTokenBehavior = NoTokenBehavior.SINGLE_FILE,
     start: int | None = None,
@@ -164,6 +167,7 @@ def scan_sequences(  # noqa: PLR0913
             a pre-constructed `FileSequence` whose basename + padding +
             extension act as the filter. Sequence tokens are interpreted in
             HASH1 mode regardless of pattern syntax.
+        engine: The engine used to dispatch the inner `ListDirectoryRequest`.
         policy: How to handle gaps within the matched range. SPLIT yields one
             Sequence per contiguous run; the others yield exactly one
             Sequence with policy-driven gap fills (or omissions for SKIP, or
@@ -206,7 +210,7 @@ def scan_sequences(  # noqa: PLR0913
     _validate_subset_bounds(start, end)
     target = _coerce_target_pattern(pattern, no_token_behavior=no_token_behavior)
 
-    relevant = _list_pattern_matching_filenames(mapping.resolved_directory, target)
+    relevant = _list_pattern_matching_filenames(mapping.resolved_directory, target, engine=engine)
     directory_had_matching_files = bool(relevant)
     if not relevant:
         return ScanOutcome(
@@ -388,7 +392,7 @@ def _count_sequence_tokens(pattern: str) -> int:
     return len(_TOKEN_PATTERN.findall(pattern))
 
 
-def _list_pattern_matching_filenames(directory: str, target: TargetPattern) -> list[str]:
+def _list_pattern_matching_filenames(directory: str, target: TargetPattern, *, engine: Engine) -> list[str]:
     """List `directory` and keep only files whose name matches the target shape.
 
     Filters by basename prefix and extension suffix before fileseq sees the
@@ -397,7 +401,7 @@ def _list_pattern_matching_filenames(directory: str, target: TargetPattern) -> l
     full filename and extension is empty, so this collapses to an exact-name
     match — same behavior `_collect_literal_single_file` then applies.
     """
-    filenames = _list_directory_filenames(directory)
+    filenames = _list_directory_filenames(directory, engine=engine)
     if not filenames:
         return []
     target_basename = target.basename()
@@ -606,7 +610,7 @@ def _collect_present_numbers_from_fseq(
     return _PresentNumbers(by_number=by_number, dropped_negatives=dropped_negatives)
 
 
-def _list_directory_filenames(directory: str) -> list[str]:
+def _list_directory_filenames(directory: str, *, engine: Engine) -> list[str]:
     """List `directory` via ListDirectoryRequest, returning bare filenames.
 
     Raises `DirectoryListingError` on any listing failure, carrying the
@@ -617,7 +621,7 @@ def _list_directory_filenames(directory: str) -> list[str]:
     Suppresses client toasts via `broadcast_result=False` since "directory
     not found" is a normal outcome of a user-supplied template.
     """
-    result = GriptapeNodes.handle_request(
+    result = engine.handle_request(
         ListDirectoryRequest(
             directory_path=directory,
             workspace_only=False,
