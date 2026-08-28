@@ -54,6 +54,7 @@ from griptape_nodes.files.path_utils import (
 from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete, CurrentProjectChanged
+from griptape_nodes.retained_mode.events.base_events import AppEvent
 from griptape_nodes.retained_mode.events.library_events import (
     ReloadAllLibrariesRequest,
     ReloadAllLibrariesResultFailure,
@@ -3067,7 +3068,7 @@ class ProjectManager(EngineScoped):
         # project actually changed. A worker that boots like the orchestrator has the
         # same registry, so the id resolves there too.
         if self._initialization_complete and previous_project_id != resolved_project_id:
-            self._event_manager.broadcast_app_event(CurrentProjectChanged(project_id=resolved_project_id))
+            self._event_manager.put_event(AppEvent(payload=CurrentProjectChanged(project_id=resolved_project_id)))
         return result
 
     def _refuse_unresolvable_declared_paths(

@@ -12669,3 +12669,81 @@ variables:
             assert result.variable.value == "sc042"
         finally:
             self._unload(engine, project_id)
+
+
+class TestCurrentProjectChangedReachesClients:
+    """A project switch has to tell out-of-process listeners, not just in-process ones.
+
+    ``broadcast_app_event`` only walks ``EventManager._app_event_listeners``, which live
+    in this process. An editor learns about a switch from an ``AppEvent`` on the wire, so
+    a switch announced only by broadcast leaves every connected client rendering the
+    previous project's config until it remounts and refetches.
+    """
+
+    @staticmethod
+    def _load(engine: Engine, tmp_path: Path) -> str:
+        from griptape_nodes.retained_mode.events.project_events import (
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+        )
+
+        project_yml = tmp_path / "project_template.yml"
+        project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
+        load_result = engine.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+        return load_result.project_id
+
+    @staticmethod
+    def _published_project_changes(published: list[Any]) -> list[Any]:
+        """The CurrentProjectChanged payloads among published events."""
+        from griptape_nodes.retained_mode.events.app_events import CurrentProjectChanged
+        from griptape_nodes.retained_mode.events.base_events import AppEvent
+
+        return [
+            event.payload
+            for event in published
+            if isinstance(event, AppEvent) and isinstance(event.payload, CurrentProjectChanged)
+        ]
+
+    def test_switch_publishes_the_change_so_clients_receive_it(self, engine: Engine, tmp_path: Path) -> None:
+        """The switch is handed to the publish path, which is what feeds the IPC transports."""
+        from griptape_nodes.retained_mode.events.project_events import SetCurrentProjectRequest
+
+        project_id = self._load(engine, tmp_path)
+        original_workspace = engine.config_manager.workspace_path
+        # The broadcast is gated on initialization being complete; a real engine has
+        # finished booting long before a user switches projects.
+        engine.project_manager._initialization_complete = True
+
+        published: list[Any] = []
+        try:
+            with patch.object(engine.event_manager, "put_event", side_effect=published.append):
+                engine.handle_request(SetCurrentProjectRequest(project_id=project_id))
+
+            changes = self._published_project_changes(published)
+            assert len(changes) == 1, "a project switch must publish exactly one CurrentProjectChanged"
+            assert changes[0].project_id == project_id
+        finally:
+            engine.project_manager._initialization_complete = False
+            engine.handle_request(SetCurrentProjectRequest(project_id=None))
+            engine.config_manager.workspace_path = original_workspace
+
+    def test_switch_to_the_same_project_publishes_nothing(self, engine: Engine, tmp_path: Path) -> None:
+        """Re-activating the current project is not a change, so clients are left alone."""
+        from griptape_nodes.retained_mode.events.project_events import SetCurrentProjectRequest
+
+        project_id = self._load(engine, tmp_path)
+        original_workspace = engine.config_manager.workspace_path
+        engine.project_manager._initialization_complete = True
+
+        published: list[Any] = []
+        try:
+            engine.handle_request(SetCurrentProjectRequest(project_id=project_id))
+            with patch.object(engine.event_manager, "put_event", side_effect=published.append):
+                engine.handle_request(SetCurrentProjectRequest(project_id=project_id))
+
+            assert self._published_project_changes(published) == []
+        finally:
+            engine.project_manager._initialization_complete = False
+            engine.handle_request(SetCurrentProjectRequest(project_id=None))
+            engine.config_manager.workspace_path = original_workspace
