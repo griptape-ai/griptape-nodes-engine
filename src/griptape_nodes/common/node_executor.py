@@ -50,10 +50,14 @@ from griptape_nodes.retained_mode.events.connection_events import (
     ListConnectionsForNodeResultSuccess,
 )
 from griptape_nodes.retained_mode.events.execution_events import (
+    ClusterEdgeSpec,
+    ClusterNodeSpec,
     ControlFlowCancelledEvent,
     ControlFlowResolvedEvent,
     CurrentControlNodeEvent,
     CurrentDataNodeEvent,
+    ExecuteClusterRequest,
+    ExecuteClusterResultSuccess,
     ExecuteNodeRequest,
     ExecuteNodeResultSuccess,
     GriptapeEvent,
@@ -122,6 +126,7 @@ from griptape_nodes.retained_mode.variable_types import VariableScope
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from griptape_nodes.common.execution_clusters import ExecutionCluster
     from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
@@ -226,15 +231,31 @@ class NodeExecutor(EngineScoped):
         msg = f"Could not find PublishWorkflowRequest handler for library {library_name}"
         raise ValueError(msg)
 
-    async def execute(self, node: BaseNode) -> None:
+    async def execute(  # noqa: C901, PLR0911 (a dispatch ladder: each node kind exits on its own branch)
+        self,
+        node: BaseNode,
+        cluster: ExecutionCluster | None = None,
+        cluster_executed: set[str] | None = None,
+    ) -> None:
         """Execute the given node.
 
         Args:
             node: The BaseNode to execute
-            library_name: The library that the execute method should come from.
+            cluster: The heavy execution cluster this node belongs to, if any. The first
+                member to execute dispatches the whole cluster in one request; the rest
+                are no-ops whose outputs were already applied.
+            cluster_executed: Run-scoped set of node names already executed via a cluster
+                dispatch. Owned by the resolution context; mutated here.
         """
+        if cluster_executed is not None and node.name in cluster_executed:
+            # This member already ran inside its cluster's dispatch; its outputs are
+            # already on the node. Completing without re-executing is the contract.
+            return
         token = current_executing_node_name.set(node.name)
         try:
+            if cluster is not None and not cluster.runs_in_orchestrator:
+                await self._execute_cluster(node, cluster, cluster_executed if cluster_executed is not None else set())
+                return
             # Handle while-loop node groups (RetryGroup, etc.)
             # Check this BEFORE SubflowNodeGroup since BaseWhileNodeGroup extends SubflowNodeGroup
             if isinstance(node, BaseWhileNodeGroup):
@@ -297,6 +318,84 @@ class NodeExecutor(EngineScoped):
                 node.parameter_output_values[name] = value
         finally:
             current_executing_node_name.reset(token)
+
+    async def _execute_cluster(self, node: BaseNode, cluster: ExecutionCluster, cluster_executed: set[str]) -> None:
+        """Dispatch a heavy cluster as one ExecuteClusterRequest and apply all outputs.
+
+        Nodes joined by unserializable values must run in one process, so the whole
+        cluster goes as one request; intra-cluster values are handed off inside the
+        executing process as live references. Restricted to single-library clusters until
+        venues are keyed on dependency sets: a multi-library live-value chain fails here,
+        loudly, naming the libraries.
+        """
+        object_manager = self.engine.object_manager
+        members: list[BaseNode] = []
+        for member_name in sorted(cluster.node_names):
+            member = object_manager.attempt_get_object_by_name_as_type(member_name, BaseNode)
+            if member is None:
+                msg = f"Attempted to execute a node cluster, but member '{member_name}' no longer exists."
+                raise RuntimeError(msg)
+            members.append(member)
+
+        libraries = {str(member.metadata.get("library", "")) for member in members}
+        if len(libraries) > 1:
+            msg = (
+                f"Attempted to execute nodes {sorted(cluster.node_names)} together because a value "
+                f"that cannot leave its process connects them, but they come from different "
+                f"libraries ({sorted(libraries)}). Running two libraries' nodes in one isolated "
+                f"process is not supported yet: split the chain so the value stays within one library."
+            )
+            raise RuntimeError(msg)
+
+        result = await self.engine.ahandle_request(
+            ExecuteClusterRequest(
+                nodes=[
+                    ClusterNodeSpec(
+                        node_name=member.name,
+                        node_type=str(member.metadata.get("node_type", type(member).__name__)),
+                        library_name=str(member.metadata.get("library", "")),
+                        parameter_values=dict(member.parameter_values),
+                        node_metadata=dict(member.metadata),
+                    )
+                    for member in members
+                ],
+                edges=self._intra_cluster_edges(cluster, members),
+                output_nodes=[member.name for member in members],
+                variables=self._resolve_variables_for_node(node.name),
+            )
+        )
+        if not isinstance(result, ExecuteClusterResultSuccess):
+            failed = getattr(result, "failed_node", None) or node.name
+            msg = self._format_node_failure_message(failed, result, getattr(result, "exception", None))
+            raise RuntimeError(msg)  # noqa: TRY004 (failure result, not a type error; matches the single-node path)
+
+        # Apply every member's outputs with the same idempotent copy-back discipline as
+        # the single-node path (see the comment in execute()).
+        for member in members:
+            for name, value in result.parameter_output_values.get(member.name, {}).items():
+                member.parameter_output_values[name] = value
+            cluster_executed.add(member.name)
+
+    def _intra_cluster_edges(self, cluster: ExecutionCluster, members: list[BaseNode]) -> list[ClusterEdgeSpec]:
+        """Dataflow edges between cluster members, from the live connection indices."""
+        connections = self.engine.flow_manager.get_connections()
+        edges = []
+        for member in members:
+            outgoing = connections.outgoing_index.get(member.name, {})
+            for parameter_name, connection_ids in outgoing.items():
+                for connection_id in connection_ids:
+                    connection = connections.connections.get(connection_id)
+                    if connection is None or connection.target_node.name not in cluster.node_names:
+                        continue
+                    edges.append(
+                        ClusterEdgeSpec(
+                            source_node=member.name,
+                            source_parameter=parameter_name,
+                            target_node=connection.target_node.name,
+                            target_parameter=connection.target_parameter.name,
+                        )
+                    )
+        return edges
 
     def _resolve_variables_for_node(self, node_name: str) -> dict[str, str | int]:
         """Resolve the variable dict for a node's flow on the orchestrator.

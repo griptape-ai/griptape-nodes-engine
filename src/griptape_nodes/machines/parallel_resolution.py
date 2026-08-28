@@ -5,6 +5,7 @@ import contextlib
 import logging
 from typing import TYPE_CHECKING, NamedTuple
 
+from griptape_nodes.common.execution_clusters import ExecutionCluster, heavy_clusters_by_node
 from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeEndNode, BaseIterativeStartNode
 from griptape_nodes.exe_types.connections import Direction
 from griptape_nodes.exe_types.core_types import Parameter, ParameterTypeBuiltin
@@ -97,6 +98,13 @@ class ParallelResolutionContext(EngineScoped):
         self.task_to_node = {}
         self.generation = 0
         self.new_work_event = asyncio.Event()
+        # Heavy execution clusters (nodes pinned together by unserializable values whose
+        # libraries declare execution dependencies). Computed once when DAG execution
+        # starts; nodes absent from the map run exactly as they always have.
+        self.heavy_cluster_by_node: dict[str, ExecutionCluster] = {}
+        # Members already executed via a cluster dispatch this run: their outputs are
+        # applied, so their own execution is a no-op completion.
+        self.cluster_executed_nodes: set[str] = set()
 
     @property
     def node_to_reference(self) -> dict[str, DagNode]:
@@ -544,12 +552,49 @@ class ExecuteDagState(State):
                 ExecuteDagState._try_queue_waiting_node(context, leaf_node)
 
     @staticmethod
-    async def execute_node(engine: Engine, current_node: DagNode) -> None:
+    async def execute_node(engine: Engine, current_node: DagNode, context: ParallelResolutionContext) -> None:
         executor = engine.flow_manager.node_executor
-        await executor.execute(current_node.node_reference)
+        await executor.execute(
+            current_node.node_reference,
+            cluster=context.heavy_cluster_by_node.get(current_node.node_reference.name),
+            cluster_executed=context.cluster_executed_nodes,
+        )
+
+    @staticmethod
+    def _compute_heavy_clusters(context: ParallelResolutionContext) -> None:
+        """Compute the run's heavy clusters from the completed DAG."""
+        nodes = [dag_node.node_reference for dag_node in context.node_to_reference.values()]
+        connections = context.engine.flow_manager.get_connections()
+        context.heavy_cluster_by_node = heavy_clusters_by_node(nodes, connections)
+        context.cluster_executed_nodes = set()
+
+    @staticmethod
+    def _cluster_is_dispatchable(context: ParallelResolutionContext, cluster: ExecutionCluster) -> bool:
+        """True when every member's EXTERNAL dataflow inputs are resolved.
+
+        A cluster executes atomically, so it cannot start until every value entering it
+        from outside exists. Intra-cluster sources are exempt: those values are produced
+        by the dispatch itself.
+        """
+        connections = context.engine.flow_manager.get_connections()
+        for member_name in cluster.node_names:
+            incoming = connections.incoming_index.get(member_name, {})
+            for connection_ids in incoming.values():
+                for connection_id in connection_ids:
+                    connection = connections.connections.get(connection_id)
+                    if connection is None:
+                        continue
+                    source_name = connection.source_node.name
+                    if source_name in cluster.node_names:
+                        continue
+                    source_dag_node = context.node_to_reference.get(source_name)
+                    if source_dag_node is not None and source_dag_node.node_state != NodeState.DONE:
+                        return False
+        return True
 
     @staticmethod
     async def on_enter(context: ParallelResolutionContext) -> type[State] | None:
+        ExecuteDagState._compute_heavy_clusters(context)
         # Start DAG execution after resolution is complete
         for node in context.node_to_reference.values():
             # Only queue nodes that are waiting - preserve state of already processed nodes.
@@ -614,6 +659,23 @@ class ExecuteDagState(State):
                 context.running_tasks_count -= 1  # Decrement since we're skipping
                 continue
 
+            # A member of a heavy cluster cannot start until the WHOLE cluster can: it
+            # executes atomically with its co-members, so every value entering the
+            # cluster from outside must exist first. Requeue and stop this drain pass;
+            # the completion that resolves the missing input signals new work and the
+            # drain runs again. (Never parks a task: with max_nodes_in_parallel slots,
+            # parking cluster sources could starve the very externals they wait for.)
+            gating_cluster = context.heavy_cluster_by_node.get(node)
+            if (
+                gating_cluster is not None
+                and node not in context.cluster_executed_nodes
+                and not ExecuteDagState._cluster_is_dispatchable(context, gating_cluster)
+            ):
+                context.running_tasks_count -= 1
+                node_reference.node_state = NodeState.QUEUED
+                context.node_priority_queue.add_node(node_reference)
+                break
+
             # Collect parameter values from upstream nodes before executing
             try:
                 await ExecuteDagState.collect_values_from_upstream_nodes(context.engine, node_reference)
@@ -643,9 +705,16 @@ class ExecuteDagState(State):
                 return None
 
             # Clear all of the current output values but don't broadcast the clearing.
-            # to avoid any flickering in subscribers (UI).
-            node_reference.node_reference.parameter_output_values.silent_clear()
-            exceptions = node_reference.node_reference.validate_before_node_run()
+            # to avoid any flickering in subscribers (UI). Members already executed by a
+            # cluster dispatch keep their applied outputs: their task below is a no-op
+            # completion, and clearing here would wipe the dispatch's results.
+            if node not in context.cluster_executed_nodes:
+                node_reference.node_reference.parameter_output_values.silent_clear()
+            exceptions = (
+                []
+                if node in context.cluster_executed_nodes
+                else node_reference.node_reference.validate_before_node_run()
+            )
             if exceptions:
                 context.running_tasks_count -= 1  # Decrement on error
                 validation_node_name = node_reference.node_reference.name
@@ -710,7 +779,7 @@ class ExecuteDagState(State):
             node_reference.node_state = NodeState.PROCESSING
             node_reference.node_reference.state = NodeResolutionState.RESOLVING
 
-            node_task = asyncio.create_task(ExecuteDagState.execute_node(context.engine, node_reference))
+            node_task = asyncio.create_task(ExecuteDagState.execute_node(context.engine, node_reference, context))
             context.task_to_node[node_task] = node_reference
             node_reference.task_reference = node_task
 

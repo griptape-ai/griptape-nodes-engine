@@ -283,3 +283,48 @@ def _reachable(seeds: frozenset[str], adjacency: dict[str, list[str]]) -> set[st
                 seen.add(neighbor)
                 stack.append(neighbor)
     return seen
+
+
+def heavy_clusters_by_node(
+    nodes: list[Any],
+    connections: Any,
+) -> dict[str, ExecutionCluster]:
+    """Map node name -> the heavy cluster it belongs to, for a set of live nodes.
+
+    Derives dataflow edges from the engine's Connections indices (control edges are not
+    dataflow and are skipped), computes clusters, and returns only the ones that need a
+    dispatch: clusters with execution dependencies and more than zero members. Nodes in
+    light clusters are absent from the map, which is the executor's signal to run them
+    exactly as today.
+    """
+    # Deferred import: keeps the module importable without the exe_types tree.
+    from griptape_nodes.exe_types.core_types import ParameterTypeBuiltin
+
+    names = {node.name for node in nodes}
+    edges = []
+    for node in nodes:
+        outgoing = connections.outgoing_index.get(node.name, {})
+        for parameter_name, connection_ids in outgoing.items():
+            parameter = node.get_parameter_by_name(parameter_name)
+            if parameter is None or parameter.output_type == ParameterTypeBuiltin.CONTROL_TYPE.value:
+                continue
+            for connection_id in connection_ids:
+                connection = connections.connections.get(connection_id)
+                if connection is None or connection.target_node.name not in names:
+                    continue
+                edges.append(
+                    NodeGraphEdge(
+                        source_node_name=node.name,
+                        source_parameter=parameter_name,
+                        target_node_name=connection.target_node.name,
+                        target_parameter=connection.target_parameter.name,
+                    )
+                )
+
+    by_node: dict[str, ExecutionCluster] = {}
+    for cluster in clusters_for_nodes(list(nodes), edges):
+        if cluster.runs_in_orchestrator:
+            continue
+        for member in cluster.node_names:
+            by_node[member] = cluster
+    return by_node

@@ -64,6 +64,7 @@ def _stub_handle_done_nodes(monkeypatch: pytest.MonkeyPatch) -> None:
     Stub it so these stay focused scheduler tests; they only care about who is
     allowed to drive the machine, not what happens after a node finishes.
     """
+    monkeypatch.setattr(ExecuteDagState, "_compute_heavy_clusters", MagicMock())
     monkeypatch.setattr(ExecuteDagState, "handle_done_nodes", AsyncMock())
 
 
