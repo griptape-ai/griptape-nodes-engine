@@ -50,8 +50,8 @@ from griptape_nodes.retained_mode.events.library_events import (
 if TYPE_CHECKING:
     from collections.abc import Generator
 
+    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload
-    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 # A library the engine had registered before the reload and re-registers after it.
 # Mirrors 'Sendgrid Library' / 'Topaz Labs' from the log: fine before, fine after,
@@ -85,26 +85,26 @@ class TestQueriesDuringLibraryReload:
         LibraryRegistry._clear()
 
     @staticmethod
-    def _enter_reload_window(griptape_nodes: GriptapeNodes) -> None:
+    def _enter_reload_window(engine: Engine) -> None:
         """Put the manager in the state `_run_reload_libraries` creates mid-flight.
 
         The registry has been emptied by the unload loop and `load_all_libraries_from_config`
         has not finished re-registering, so the loading gate is closed.
         """
-        library_manager = griptape_nodes.LibraryManager()
+        library_manager = engine.library_manager
         LibraryRegistry._clear()
         library_manager._libraries_loading_complete = asyncio.Event()
 
     @pytest.mark.asyncio
-    async def test_check_library_update_waits_for_the_reload(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_check_library_update_waits_for_the_reload(self, engine: Engine) -> None:
         """An update check mid-reload waits instead of reporting the library missing."""
-        library_manager = griptape_nodes.LibraryManager()
+        library_manager = engine.library_manager
         LibraryRegistry.generate_new_library(library_data=_schema(LIBRARY_NAME))
 
         # Before the reload the library answers normally: it is in the registry.
         assert LIBRARY_NAME in set(LibraryRegistry.list_libraries())
 
-        self._enter_reload_window(griptape_nodes)
+        self._enter_reload_window(engine)
 
         pending = asyncio.create_task(
             library_manager.check_library_update_request(CheckLibraryUpdateRequest(library_name=LIBRARY_NAME))
@@ -123,17 +123,17 @@ class TestQueriesDuringLibraryReload:
         assert "no Library with that name was registered" not in str(result.result_details)
 
     @pytest.mark.asyncio
-    async def test_both_get_all_info_entry_points_wait_on_the_gate(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_both_get_all_info_entry_points_wait_on_the_gate(self, engine: Engine) -> None:
         """The per-library and all-libraries entry points now agree about the reload window.
 
         `get_all_info_for_library_request` stays synchronous and ungated because
         `get_all_info_for_all_libraries_request` calls it directly once it has already
         waited. The registered entry point is the async wrapper, which waits.
         """
-        library_manager = griptape_nodes.LibraryManager()
+        library_manager = engine.library_manager
         LibraryRegistry.generate_new_library(library_data=_schema(LIBRARY_NAME))
 
-        self._enter_reload_window(griptape_nodes)
+        self._enter_reload_window(engine)
 
         singular = asyncio.create_task(
             library_manager.on_get_all_info_for_library_request(GetAllInfoForLibraryRequest(library=LIBRARY_NAME))
@@ -155,7 +155,7 @@ class TestQueriesDuringLibraryReload:
         assert not isinstance(singular_result, GetAllInfoForLibraryResultFailure)
 
     @pytest.mark.asyncio
-    async def test_reload_closes_the_gate_before_emptying_the_registry(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_reload_closes_the_gate_before_emptying_the_registry(self, engine: Engine) -> None:
         """The gate must cover the whole reload, including the unload loop.
 
         `_run_reload_libraries` empties the registry (ClearAllObjectState + the unload loop)
@@ -163,7 +163,7 @@ class TestQueriesDuringLibraryReload:
         registry would already be empty while the gate still read "loaded", and a handler
         awaiting it would sail through onto an empty registry. So the gate closes first.
         """
-        library_manager = griptape_nodes.LibraryManager()
+        library_manager = engine.library_manager
         LibraryRegistry.generate_new_library(library_data=_schema(LIBRARY_NAME))
 
         observed: dict[str, object] = {}
@@ -190,12 +190,12 @@ class TestQueriesDuringLibraryReload:
         )
 
     @pytest.mark.asyncio
-    async def test_reload_reopens_the_gate_even_when_loading_raises(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_reload_reopens_the_gate_even_when_loading_raises(self, engine: Engine) -> None:
         """A failed rebuild must not leave the gate closed forever.
 
         Otherwise every gated query would hang for the life of the process.
         """
-        library_manager = griptape_nodes.LibraryManager()
+        library_manager = engine.library_manager
         failure = RuntimeError("discovery blew up")
 
         async def boom(*_args: object, **_kwargs: object) -> list[str]:
@@ -210,17 +210,17 @@ class TestQueriesDuringLibraryReload:
         assert library_manager._libraries_loading_complete.is_set()
 
     @pytest.mark.asyncio
-    async def test_reload_reopens_the_gate_when_it_bails_before_loading(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_reload_reopens_the_gate_when_it_bails_before_loading(self, engine: Engine) -> None:
         """A reload that fails between closing the gate and loading must not wedge queries.
 
         The gate closes just before the unload loop, so an early return from that loop would
         otherwise leave every gated query waiting for the life of the process.
         """
-        library_manager = griptape_nodes.LibraryManager()
+        library_manager = engine.library_manager
         LibraryRegistry.generate_new_library(library_data=_schema(LIBRARY_NAME))
 
         failed_unload = ReloadAllLibrariesResultFailure(result_details="unload failed")
-        real_handle_request = griptape_nodes.handle_request
+        real_handle_request = engine.handle_request
 
         def refuse_unload(request: RequestPayload) -> ResultPayload:
             if isinstance(request, UnloadLibraryFromRegistryRequest):
@@ -240,14 +240,14 @@ class TestQueriesDuringLibraryReload:
         )
 
     @pytest.mark.asyncio
-    async def test_gated_handler_would_have_returned_the_right_answer(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_gated_handler_would_have_returned_the_right_answer(self, engine: Engine) -> None:
         """Waiting is the correct behavior: the library is present once the reload ends.
 
         This is what makes the failures above spurious rather than informative -- nothing
         was actually wrong with the library.
         """
-        library_manager = griptape_nodes.LibraryManager()
-        self._enter_reload_window(griptape_nodes)
+        library_manager = engine.library_manager
+        self._enter_reload_window(engine)
 
         pending = asyncio.create_task(
             library_manager.on_get_all_info_for_all_libraries_request(GetAllInfoForAllLibrariesRequest())
