@@ -1,5 +1,7 @@
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field
 
 from griptape_nodes.retained_mode.events.base_events import (
     RequestPayload,
@@ -8,6 +10,74 @@ from griptape_nodes.retained_mode.events.base_events import (
     WorkflowNotAlteredMixin,
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
+
+# Fixed vocabulary for which config layer supplies a value's effective content, lowest to
+# highest priority. Matches ConfigManager.load_configs' merge order exactly: "default" is
+# the Settings model's own defaults, "env" is GTN_CONFIG_ environment variables. Shared
+# between ConfigValueSource and ConfigLayer so a caller matching one against the other
+# (e.g. is this key's source among GetConfigLayersResultSuccess.layers) compares equal
+# strings.
+ConfigLayerName = Literal["default", "user", "project", "workspace", "env"]
+
+
+class ConfigValueSource(BaseModel):
+    """Identifies which config layer currently supplies a value's effective content.
+
+    Only "default" and "user" are writable by `SetConfigValueRequest` /
+    `SetConfigCategoryRequest` today: a value sourced from "project", "workspace", or
+    "env" is a value a settings-editor write cannot change, because a higher-priority
+    layer keeps re-supplying its own value on every `load_configs()` remerge. See
+    `ConfigManager.shadowed_by`.
+    """
+
+    layer: ConfigLayerName
+    path: str | None = Field(
+        default=None,
+        description=(
+            "Absolute path to the config file backing this layer. None for 'default' "
+            "(no file backs the Settings model's own defaults) and for 'env' (see env_var "
+            "instead). May be None for 'project'/'workspace' too when no project is active."
+        ),
+    )
+    env_var: str | None = Field(
+        default=None,
+        description=(
+            "The GTN_CONFIG_ environment variable name supplying this value, e.g. "
+            "'GTN_CONFIG_LIBRARIES_DIRECTORY'. Set only when layer == 'env'."
+        ),
+    )
+
+
+class ConfigLayer(BaseModel):
+    """One layer of the config stack, in isolation: this layer's own contents, unmerged.
+
+    Used by `GetConfigLayersRequest` to answer "which layer set this key" and "did this
+    layer's file even parse" without requiring the caller to already know the answer --
+    unlike `ConfigManager.merged_config`, which only ever shows the WINNING value.
+    """
+
+    layer: ConfigLayerName
+    path: str | None = Field(
+        default=None,
+        description="Absolute path to this layer's config file. None for 'default' and 'env'.",
+    )
+    present: bool = Field(
+        description=(
+            "Whether this layer currently has any effect: the file exists for a file layer, "
+            "or at least one GTN_CONFIG_ variable is set for 'env'. 'default' is always True."
+        )
+    )
+    parse_error: str | None = Field(
+        default=None,
+        description=(
+            "Set only when this layer's file EXISTS but failed to parse as JSON. A missing "
+            "file is not an error and leaves this None with present=False."
+        ),
+    )
+    values: dict[str, Any] = Field(
+        default_factory=dict,
+        description="This layer's own parsed contents, unmerged with any other layer.",
+    )
 
 
 @dataclass
@@ -34,9 +104,15 @@ class GetConfigValueResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess)
 
     Args:
         value: The configuration value (can be any type)
+        source: Which config layer currently supplies this value.
+        editable: Whether a `SetConfigValueRequest` for this same key can actually change
+            the effective value (True when `source.layer` is "default" or "user"; False
+            when a higher-priority project/workspace/env layer would keep overriding it).
     """
 
     value: Any
+    source: ConfigValueSource = field(default_factory=lambda: ConfigValueSource(layer="default"))
+    editable: bool = True
 
 
 @dataclass
@@ -67,7 +143,26 @@ class SetConfigValueRequest(RequestPayload):
 @dataclass
 @PayloadRegistry.register
 class SetConfigValueResultSuccess(ResultPayloadSuccess):
-    """Configuration value set successfully."""
+    """Configuration value set successfully.
+
+    A success here means the write reached disk; it does NOT mean the value took
+    effect. Check `applied` and `shadowed_by` before assuming so -- a project or
+    workspace config layer (or a GTN_CONFIG_ environment variable) can outrank the
+    write, in which case it is stored but has no visible effect until that layer changes.
+
+    Args:
+        applied: Whether the requested value is now the effective (merged) value. False
+            means some higher-priority layer still supplies a different value; see
+            `shadowed_by`.
+        effective_value: What `GetConfigValueRequest` for this same key would return right
+            now, after this write. Equal to the requested value when `applied` is True.
+        shadowed_by: The layer that won instead, when `applied` is False. None when
+            `applied` is True.
+    """
+
+    applied: bool = True
+    effective_value: Any = None
+    shadowed_by: ConfigValueSource | None = None
 
 
 @dataclass
@@ -100,9 +195,17 @@ class GetConfigCategoryResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucce
 
     Args:
         contents: Dictionary of key-value pairs within the category
+        sources: `ConfigValueSource` for every leaf key under this category, keyed by full
+            dot path FROM THE CONFIG ROOT (not relative to `category`), e.g.
+            "app_events.on_app_initialization_complete.libraries_to_register" even when
+            `category` was "app_events.on_app_initialization_complete". Root-relative keys
+            let a caller look a key up the same way no matter which category it was
+            fetched through. A dict value is a sub-category and is recursed into; a list (or
+            any other non-dict) value is one leaf entry, never split per item.
     """
 
     contents: dict[str, Any]
+    sources: dict[str, ConfigValueSource] = field(default_factory=dict)
 
 
 @dataclass
@@ -133,7 +236,27 @@ class SetConfigCategoryRequest(RequestPayload):
 @dataclass
 @PayloadRegistry.register
 class SetConfigCategoryResultSuccess(ResultPayloadSuccess):
-    """Configuration category updated successfully."""
+    """Configuration category updated successfully.
+
+    See `SetConfigValueResultSuccess` for what `applied`/`effective_value`/`shadowed_by`
+    mean; the same shadowing risk applies here. They are only computed when `category` is
+    a single named key (the request routes through `ConfigManager.set_config_value` for
+    that key): a full-config replacement (`category` is None or "") rewrites the whole
+    user layer at once, has no single key to check, and leaves these three at their
+    defaults.
+
+    Args:
+        applied: See `SetConfigValueResultSuccess.applied`. Always True (default) for a
+            full-config replacement.
+        effective_value: See `SetConfigValueResultSuccess.effective_value`. Always None
+            (default) for a full-config replacement.
+        shadowed_by: See `SetConfigValueResultSuccess.shadowed_by`. Always None (default)
+            for a full-config replacement.
+    """
+
+    applied: bool = True
+    effective_value: Any = None
+    shadowed_by: ConfigValueSource | None = None
 
 
 @dataclass
@@ -198,6 +321,37 @@ class GetConfigPathResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
 @PayloadRegistry.register
 class GetConfigPathResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Configuration path retrieval failed. Common causes: configuration not initialized, access denied."""
+
+
+@dataclass
+@PayloadRegistry.register
+class GetConfigLayersRequest(RequestPayload):
+    """Get the full config layer stack, in isolation, lowest to highest priority.
+
+    Use when: diagnosing why a setting doesn't take effect, building a settings UI that
+    shows provenance (which file, or which GTN_CONFIG_ variable, currently owns a value),
+    or writing an environment/support report. Unlike `GetConfigCategoryRequest`, which
+    only ever returns the MERGED (winning) values, this returns each layer's own contents
+    separately -- including a layer whose file exists but failed to parse, which today
+    only ever reaches a log line.
+
+    Results: GetConfigLayersResultSuccess (with layers, lowest to highest priority)
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class GetConfigLayersResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Config layer stack retrieved successfully.
+
+    Args:
+        layers: Every config layer, ordered lowest to highest priority. Always exactly
+            five entries, in this fixed order: default, user, project, workspace, env.
+            `project`/`workspace` report `path=None`, `present=False` when no project is
+            currently active.
+    """
+
+    layers: list[ConfigLayer]
 
 
 @dataclass

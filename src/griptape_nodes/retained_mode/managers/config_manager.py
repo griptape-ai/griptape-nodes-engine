@@ -18,9 +18,13 @@ from griptape_nodes.retained_mode.events.artifact_events import (
 )
 from griptape_nodes.retained_mode.events.base_events import ResultPayload
 from griptape_nodes.retained_mode.events.config_events import (
+    ConfigLayer,
+    ConfigValueSource,
     GetConfigCategoryRequest,
     GetConfigCategoryResultFailure,
     GetConfigCategoryResultSuccess,
+    GetConfigLayersRequest,
+    GetConfigLayersResultSuccess,
     GetConfigPathRequest,
     GetConfigPathResultSuccess,
     GetConfigSchemaRequest,
@@ -65,6 +69,11 @@ from griptape_nodes.utils.file_utils import DEFAULT_MAX_SEARCH_DEPTH
 logger = logging.getLogger("griptape_nodes")
 
 USER_CONFIG_PATH = xdg_config_home() / "griptape_nodes" / "griptape_nodes_config.json"
+
+# Sentinel distinguishing "this layer's dict has no entry for this key" from "this layer's
+# dict has an entry whose value happens to be None" (e.g. `project_file: str | None`).
+# get_dot_value's own `default` parameter can't do this job: `None` is also its default.
+_KEY_NOT_IN_LAYER = object()
 
 # Environment variable the engine PUBLISHES (it is never read as config input) carrying the absolute
 # directory libraries install under when no project declares a libraries_dir. Deliberately outside
@@ -143,6 +152,15 @@ class ConfigManager(EngineScoped):
         # variable warns repeatedly for the life of this manager. Other ConfigManagers built
         # elsewhere in the process keep their own accounting.
         self._reported_invalid_env_vars: set[tuple[str, str]] = set()
+        # Parse error for the most recent load of each file layer, set by load_configs()
+        # via _load_config_from_file. None means either the file doesn't exist or it parsed
+        # fine; config_layers() distinguishes those two cases with `present`. Deliberately
+        # NOT touched by compute_project_provisioning_config / compute_system_defaults_provisioning_config's
+        # own _load_config_from_file calls, which preview a DIFFERENT project's config and
+        # would otherwise clobber the live layer's error with a preview's.
+        self._user_config_parse_error: str | None = None
+        self._project_config_parse_error: str | None = None
+        self._workspace_config_parse_error: str | None = None
         self.load_configs()
 
         # Once per engine process, before any project YAML is read. See the method docstring for why
@@ -165,6 +183,9 @@ class ConfigManager(EngineScoped):
             event_manager.assign_manager_to_request_type(GetConfigValueRequest, self.on_handle_get_config_value_request)
             event_manager.assign_manager_to_request_type(SetConfigValueRequest, self.on_handle_set_config_value_request)
             event_manager.assign_manager_to_request_type(GetConfigPathRequest, self.on_handle_get_config_path_request)
+            event_manager.assign_manager_to_request_type(
+                GetConfigLayersRequest, self.on_handle_get_config_layers_request
+            )
             event_manager.assign_manager_to_request_type(GetWorkspaceRequest, self.on_handle_get_workspace_request)
             event_manager.assign_manager_to_request_type(
                 GetConfigSchemaRequest, self.on_handle_get_config_schema_request
@@ -395,6 +416,157 @@ class ConfigManager(EngineScoped):
         """
         return self.get_config_value(DISCOVERY_MAX_DEPTH_KEY, default=DEFAULT_MAX_SEARCH_DEPTH, cast_type=int)
 
+    def value_source(self, key: str) -> ConfigValueSource:
+        """Return which config layer currently supplies `key`'s effective value.
+
+        Walks the same five layers `load_configs` merges, in the same priority order
+        (env highest, then workspace, project, user, default lowest), and returns the
+        first (highest-priority) layer whose own dict contains `key` at all. That layer
+        WINS the merge for `key` regardless of what any lower layer's value is, so it is
+        reported as the source even if, say, the project layer's value happens to equal
+        the user layer's. Every key resolves to at least "default", since
+        `Settings().model_dump()` always populates `default_config`.
+
+        Blind to the runtime `_workspace_dir_override` set by `set_workspace_override` (a
+        project's own `workspace_dir` pin, applied directly onto `merged_config` in
+        `load_configs`, not one of the five layers this method inspects): for
+        `workspace_directory` specifically, while an override is active and no env var
+        overrides it, this reports whichever file/default layer would otherwise apply,
+        which can differ from the override actually in effect. `shadowed_by` inherits the
+        same gap. Every other key is unaffected.
+
+        Args:
+            key: Dot-notation key, e.g. "libraries_directory" or
+                "app_events.on_app_initialization_complete.libraries_to_register".
+        """
+        if get_dot_value(self.env_config, key, _KEY_NOT_IN_LAYER) is not _KEY_NOT_IN_LAYER:
+            return ConfigValueSource(layer="env", env_var=f"GTN_CONFIG_{key.upper()}")
+        if get_dot_value(self.workspace_config, key, _KEY_NOT_IN_LAYER) is not _KEY_NOT_IN_LAYER:
+            path = str(self._workspace_config_path) if self._workspace_config_path is not None else None
+            return ConfigValueSource(layer="workspace", path=path)
+        if get_dot_value(self.project_config, key, _KEY_NOT_IN_LAYER) is not _KEY_NOT_IN_LAYER:
+            path = str(self._project_config_path) if self._project_config_path is not None else None
+            return ConfigValueSource(layer="project", path=path)
+        if get_dot_value(self.user_config, key, _KEY_NOT_IN_LAYER) is not _KEY_NOT_IN_LAYER:
+            return ConfigValueSource(layer="user", path=str(USER_CONFIG_PATH))
+        return ConfigValueSource(layer="default")
+
+    def shadowed_by(self, key: str) -> ConfigValueSource | None:
+        """Return the layer shadowing `key` from the user's own edits, or None if not shadowed.
+
+        "Not shadowed" means `value_source(key)` is "default" or "user" -- the two layers a
+        `set_config_value` write can actually control. Any other winning layer (project,
+        workspace, env) means a user-layer write to `key` is currently invisible: it lands
+        on disk (see `set_config_value`) but the merged config still reports the higher
+        layer's value on every subsequent `load_configs()`. This is what makes
+        `SetConfigValueRequest` report success for a write that has no visible effect.
+
+        Args:
+            key: Dot-notation key, same as `value_source`.
+        """
+        source = self.value_source(key)
+        if source.layer in ("default", "user"):
+            return None
+        return source
+
+    def category_sources(self, category: str | None) -> dict[str, ConfigValueSource]:
+        """Return `value_source` for every leaf key under `category`, keyed by full dot path.
+
+        Keys are relative to the CONFIG ROOT, not to `category`: requesting
+        "app_events.on_app_initialization_complete" returns keys like
+        "app_events.on_app_initialization_complete.libraries_to_register", not just
+        "libraries_to_register", so a caller can look a key up the same way regardless of
+        which category it was fetched through.
+
+        A dict value is treated as a sub-category and is recursed into. A list (or any
+        other non-dict) value is one leaf entry -- a list is never split into per-item
+        entries, since whichever layer set the WHOLE list is the source for all of it.
+
+        Args:
+            category: Dot-notation category, or None/"" for the whole merged config.
+        """
+        if category is None or category == "":
+            contents: Any = self.merged_config
+            prefix = ""
+        else:
+            contents = self.get_config_value(category, should_load_env_var_if_detected=False)
+            prefix = category
+
+        sources: dict[str, ConfigValueSource] = {}
+        if isinstance(contents, dict):
+            self._collect_leaf_sources(contents, prefix, sources)
+        return sources
+
+    def _collect_leaf_sources(self, node: dict, prefix: str, out: dict[str, ConfigValueSource]) -> None:
+        """Recursion helper for `category_sources`. Mutates `out` in place."""
+        for key, value in node.items():
+            full_key = f"{prefix}.{key}" if prefix else key
+            if isinstance(value, dict):
+                self._collect_leaf_sources(value, full_key, out)
+            else:
+                out[full_key] = self.value_source(full_key)
+
+    def config_layers(self) -> list[ConfigLayer]:
+        """Return every config layer in isolation, lowest to highest priority.
+
+        Unlike `merged_config`, each returned layer's `values` is that layer's OWN parsed
+        contents, not merged with any other layer -- this is what lets a caller see which
+        layer a key came from, and whether a layer's file exists but failed to parse
+        (`parse_error`), e.g. for `gtn self info` or a support/environment report. Always
+        exactly five entries, in this fixed order: default, user, project, workspace, env.
+        `project`/`workspace` report `path=None`, `present=False` when no project is
+        currently active (`_project_config_path`/`_workspace_config_path` unset).
+
+        `present` means "this layer contributes to the merge", not merely "its file
+        exists". That distinction matters for one real case: when the workspace dir IS the
+        project dir, both layers name the same file and `load_configs` deliberately loads
+        it once, as `project`. The `workspace` entry then keeps its `path` (so a caller can
+        see which file it would have been) but reports `present=False` with empty `values`,
+        matching the skip rather than implying the file is applied twice.
+        """
+        workspace_contributes = (
+            self._workspace_config_path is not None
+            and self._workspace_config_path != self._project_config_path
+            and self._workspace_config_path.exists()
+        )
+        return [
+            ConfigLayer(
+                layer="default",
+                path=None,
+                present=True,
+                parse_error=None,
+                values=self.default_config,
+            ),
+            ConfigLayer(
+                layer="user",
+                path=str(USER_CONFIG_PATH),
+                present=USER_CONFIG_PATH.exists(),
+                parse_error=self._user_config_parse_error,
+                values=self.user_config,
+            ),
+            ConfigLayer(
+                layer="project",
+                path=str(self._project_config_path) if self._project_config_path is not None else None,
+                present=self._project_config_path is not None and self._project_config_path.exists(),
+                parse_error=self._project_config_parse_error,
+                values=self.project_config,
+            ),
+            ConfigLayer(
+                layer="workspace",
+                path=str(self._workspace_config_path) if self._workspace_config_path is not None else None,
+                present=workspace_contributes,
+                parse_error=self._workspace_config_parse_error,
+                values=self.workspace_config,
+            ),
+            ConfigLayer(
+                layer="env",
+                path=None,
+                present=bool(self.env_config),
+                parse_error=None,
+                values=self.env_config,
+            ),
+        ]
+
     def _load_config_from_env_vars(self) -> dict[str, Any]:
         """Load configuration values from GTN_CONFIG_ environment variables.
 
@@ -535,16 +707,27 @@ class ConfigManager(EngineScoped):
         self._reported_invalid_env_vars.add(report_key)
         logger.warning("Ignoring environment variable %s: %s.", env_var_name, reason)
 
-    def _load_config_from_file(self, path: Path, label: str) -> dict:
-        """Read and parse a JSON config file. Returns empty dict if missing or unparsable."""
+    def _load_config_from_file(self, path: Path, label: str) -> tuple[dict, str | None]:
+        """Read and parse a JSON config file.
+
+        Returns:
+            A tuple of (parsed contents, parse error). Contents is `{}` when the file is
+            missing or fails to parse. The error is `None` unless the file EXISTS and
+            failed to parse -- a missing file is not an error. A parse failure is still
+            logged at ERROR here, unchanged; the returned string additionally lets a
+            caller (currently only `load_configs`, for the three live layers) attribute
+            the failure to a specific layer for `config_layers()`, instead of it only ever
+            reaching a log line as before.
+        """
         if not path.exists():
             logger.debug("No %s config file loaded", label)
-            return {}
+            return {}, None
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            return json.loads(path.read_text(encoding="utf-8")), None
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            error = f"{type(e).__name__}: {e}"
             logger.error("Error parsing %s config file: %s", label, e)
-            return {}
+            return {}, error
 
     def load_configs(self) -> None:
         """Load and merge configs from all sources in priority order.
@@ -557,25 +740,32 @@ class ConfigManager(EngineScoped):
         merged_config = self.default_config
 
         if USER_CONFIG_PATH.exists():
-            self.user_config = self._load_config_from_file(USER_CONFIG_PATH, "user")
+            self.user_config, self._user_config_parse_error = self._load_config_from_file(USER_CONFIG_PATH, "user")
             merged_config = merge_dicts(merged_config, self.user_config)
         else:
             self.user_config = {}
+            self._user_config_parse_error = None
             logger.debug("User config file not found")
 
         if self._project_config_path is not None:
-            self.project_config = self._load_config_from_file(self._project_config_path, "project-adjacent")
+            self.project_config, self._project_config_parse_error = self._load_config_from_file(
+                self._project_config_path, "project-adjacent"
+            )
             merged_config = merge_dicts(merged_config, self.project_config)
         else:
             self.project_config = {}
+            self._project_config_parse_error = None
 
         # Skip workspace config when it points to the same file as project config
         # (this happens when workspace dir == project dir for self-contained projects).
         if self._workspace_config_path is not None and self._workspace_config_path != self._project_config_path:
-            self.workspace_config = self._load_config_from_file(self._workspace_config_path, "workspace")
+            self.workspace_config, self._workspace_config_parse_error = self._load_config_from_file(
+                self._workspace_config_path, "workspace"
+            )
             merged_config = merge_dicts(merged_config, self.workspace_config)
         else:
             self.workspace_config = {}
+            self._workspace_config_parse_error = None
 
         # Apply runtime workspace override (from ProjectManager's project_workspaces lookup
         # or auto-default-to-project-dir). Sits above config files but below env vars.
@@ -663,16 +853,19 @@ class ConfigManager(EngineScoped):
         merged = Settings().model_dump()
 
         if USER_CONFIG_PATH.exists():
-            merged = merge_dicts(merged, self._load_config_from_file(USER_CONFIG_PATH, "user"))
+            user_config, _ = self._load_config_from_file(USER_CONFIG_PATH, "user")
+            merged = merge_dicts(merged, user_config)
 
         project_config_path = project_dir / "griptape_nodes_config.json"
-        merged = merge_dicts(merged, self._load_config_from_file(project_config_path, "project-adjacent"))
+        project_config, _ = self._load_config_from_file(project_config_path, "project-adjacent")
+        merged = merge_dicts(merged, project_config)
 
         # Skip the workspace layer when it resolves to the project-adjacent file
         # (workspace dir == project dir for self-contained projects), matching load_configs.
         workspace_config_path = workspace_dir / "griptape_nodes_config.json"
         if workspace_config_path != project_config_path:
-            merged = merge_dicts(merged, self._load_config_from_file(workspace_config_path, "workspace"))
+            workspace_config, _ = self._load_config_from_file(workspace_config_path, "workspace")
+            merged = merge_dicts(merged, workspace_config)
 
         # Apply the runtime workspace override conditionally, mirroring _activate_project:
         # only the project_workspaces, parent-chain inheritance, and global-default branches
@@ -703,7 +896,8 @@ class ConfigManager(EngineScoped):
         merged = Settings().model_dump()
 
         if USER_CONFIG_PATH.exists():
-            merged = merge_dicts(merged, self._load_config_from_file(USER_CONFIG_PATH, "user"))
+            user_config, _ = self._load_config_from_file(USER_CONFIG_PATH, "user")
+            merged = merge_dicts(merged, user_config)
 
         env_config = self._load_config_from_env_vars()
         if env_config:
@@ -842,7 +1036,8 @@ class ConfigManager(EngineScoped):
         Args:
             path: The config file to read.
         """
-        return self._load_config_from_file(path, label=str(path))
+        contents, _ = self._load_config_from_file(path, label=str(path))
+        return contents
 
     def read_env_config(self) -> dict[str, Any]:
         """Return the config layer derived from GTN_CONFIG_ environment variables, mutating nothing.
@@ -919,7 +1114,9 @@ class ConfigManager(EngineScoped):
             # Return the whole shebang. Start with the defaults and then layer on the user config.
             contents = self.merged_config
             result_details = "Successfully returned the entire config dictionary."
-            return GetConfigCategoryResultSuccess(contents=contents, result_details=result_details)
+            return GetConfigCategoryResultSuccess(
+                contents=contents, sources=self.category_sources(None), result_details=result_details
+            )
 
         # See if we got something valid.
         find_results = self.get_config_value(request.category)
@@ -932,7 +1129,11 @@ class ConfigManager(EngineScoped):
             return GetConfigCategoryResultFailure(result_details=result_details)
 
         result_details = f"Successfully returned the config dictionary for section '{request.category}'."
-        return GetConfigCategoryResultSuccess(contents=find_results, result_details=result_details)
+        return GetConfigCategoryResultSuccess(
+            contents=find_results,
+            sources=self.category_sources(request.category),
+            result_details=result_details,
+        )
 
     def on_handle_set_config_category_request(self, request: SetConfigCategoryRequest) -> ResultPayload:
         # Validate the value is a dict
@@ -967,6 +1168,10 @@ class ConfigManager(EngineScoped):
                 )
                 self._event_manager.broadcast_app_event(event)
 
+            # A full-config replacement has no single dot-key to check for shadowing: it
+            # rewrites the whole user layer at once. applied/effective_value/shadowed_by
+            # are only meaningful for a single key (see the non-empty-category branch
+            # below), so they are left at their neutral defaults here.
             return SetConfigCategoryResultSuccess(result_details=result_details)
 
         write_succeeded = self.set_config_value(key=request.category, value=request.contents)
@@ -977,8 +1182,20 @@ class ConfigManager(EngineScoped):
             )
             return SetConfigCategoryResultFailure(result_details=result_details)
 
+        effective_value = self.get_config_value(request.category, should_load_env_var_if_detected=False)
+        shadowed = self.shadowed_by(request.category)
+        applied = shadowed is None
+
         result_details = f"Successfully assigned the config dictionary for section '{request.category}'."
-        return SetConfigCategoryResultSuccess(result_details=result_details)
+        if not applied and shadowed is not None:
+            result_details += self._shadow_note(shadowed)
+
+        return SetConfigCategoryResultSuccess(
+            result_details=result_details,
+            applied=applied,
+            effective_value=effective_value,
+            shadowed_by=shadowed,
+        )
 
     def on_handle_get_config_value_request(self, request: GetConfigValueRequest) -> ResultPayload:
         if request.category_and_key == "":
@@ -991,12 +1208,22 @@ class ConfigManager(EngineScoped):
             result_details = f"Attempted to get config value for category.key '{request.category_and_key}'. Failed because no such category.key could be found."
             return GetConfigValueResultFailure(result_details=result_details)
 
+        source = self.value_source(request.category_and_key)
         result_details = f"Successfully returned the config value for section '{request.category_and_key}'."
-        return GetConfigValueResultSuccess(value=find_results, result_details=result_details)
+        return GetConfigValueResultSuccess(
+            value=find_results,
+            source=source,
+            editable=source.layer in ("default", "user"),
+            result_details=result_details,
+        )
 
     def on_handle_get_config_path_request(self, request: GetConfigPathRequest) -> ResultPayload:  # noqa: ARG002
         result_details = "Successfully returned the config path."
         return GetConfigPathResultSuccess(config_path=str(USER_CONFIG_PATH), result_details=result_details)
+
+    def on_handle_get_config_layers_request(self, request: GetConfigLayersRequest) -> ResultPayload:  # noqa: ARG002
+        result_details = "Successfully returned the config layer stack."
+        return GetConfigLayersResultSuccess(layers=self.config_layers(), result_details=result_details)
 
     def on_handle_get_workspace_request(self, request: GetWorkspaceRequest) -> ResultPayload:  # noqa: ARG002
         result_details = "Successfully returned the absolute workspace path."
@@ -1100,6 +1327,20 @@ class ConfigManager(EngineScoped):
                 formatted_lines.append(f"[{key}]:\n\tFROM: '{old}'\n\t  TO: '{new}'")
         return "\n".join(formatted_lines)
 
+    def _shadow_note(self, shadowed: ConfigValueSource) -> str:
+        """Format a human-readable suffix explaining which layer is shadowing a write.
+
+        Appended to a Set*ResultSuccess's `result_details` when `applied` is False, so the
+        message a user sees (in a toast, a log, a CLI response) says WHY the write had no
+        visible effect instead of just reporting a bare success.
+        """
+        location = shadowed.path or shadowed.env_var or "an unknown source"
+        return (
+            f" NOTE: a higher-priority '{shadowed.layer}' layer ({location}) currently "
+            "supplies the effective value, so this write has no visible effect until that "
+            "layer changes."
+        )
+
     def on_handle_set_config_value_request(self, request: SetConfigValueRequest) -> ResultPayload:
         if request.category_and_key == "":
             result_details = "Attempted to set config value but no category or key was specified."
@@ -1123,6 +1364,14 @@ class ConfigManager(EngineScoped):
             )
             return SetConfigValueResultFailure(result_details=result_details)
 
+        # The write landed in the user layer; whether it's actually the value now in
+        # effect depends on whether a higher-priority layer (project/workspace/env) also
+        # defines this key. Read back without env-var $-expansion, matching old_value
+        # above, so this reflects the raw stored value rather than a resolved secret.
+        effective_value = self.get_config_value(request.category_and_key, should_load_env_var_if_detected=False)
+        shadowed = self.shadowed_by(request.category_and_key)
+        applied = shadowed is None
+
         # For container types, indicate the change with a diff
         if isinstance(request.value, (dict, list)):
             if old_value_copy is not None:
@@ -1137,7 +1386,15 @@ class ConfigManager(EngineScoped):
         else:
             result_details = f"Successfully assigned the config value for '{request.category_and_key}':\n\tFROM '{old_value_copy}'\n\tTO: '{request.value}'"
 
-        return SetConfigValueResultSuccess(result_details=result_details)
+        if not applied and shadowed is not None:
+            result_details += self._shadow_note(shadowed)
+
+        return SetConfigValueResultSuccess(
+            result_details=result_details,
+            applied=applied,
+            effective_value=effective_value,
+            shadowed_by=shadowed,
+        )
 
     def _write_user_config_delta(self, user_config_delta: dict) -> bool:  # noqa: C901, PLR0911, PLR0912, PLR0915
         """Write user configuration delta to config file with atomic read-modify-write.

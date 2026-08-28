@@ -114,6 +114,7 @@ def _print_system_info() -> None:
     _print_engine_info()
     _print_platform_info()
     _print_paths_info()
+    _print_config_layers()
     _print_configuration()
     _print_registered_libraries()
 
@@ -154,6 +155,34 @@ def _print_paths_info() -> None:
     workspace_dir = config_manager.get_config_value("file_system.directories.workspace_directory")
     if workspace_dir:
         console.print(f"  Workspace Directory: {workspace_dir}")
+    console.print()
+
+
+def _print_config_layers() -> None:
+    """Print the config layer stack: each layer's file/path, presence, and any parse error.
+
+    Complements `_print_configuration` below, which only ever shows the merged (winning)
+    blob. This shows WHICH layer set what -- the merged view alone cannot answer that, and
+    a layer whose file exists but failed to parse otherwise only ever reaches a log line.
+    The `env` layer has no file to point at, so its own GTN_CONFIG_ key/value pairs are
+    printed inline instead.
+    """
+    console.print("[bold]Config Layers (lowest to highest priority):[/bold]")
+    try:
+        for layer in config_manager.config_layers():
+            path_display = layer.path or "-"
+            presence = "present" if layer.present else "absent"
+            presence_style = "green" if layer.present else "dim"
+            console.print(
+                f"  [cyan]{layer.layer:<10}[/cyan] {path_display}  [{presence_style}]{presence}[/{presence_style}]"
+            )
+            if layer.parse_error:
+                console.print(f"    [red]parse error: {layer.parse_error}[/red]")
+            if layer.layer == "env" and layer.values:
+                for key, value in layer.values.items():
+                    console.print(f"    GTN_CONFIG_{key.upper()} = {value}")
+    except Exception as e:
+        console.print(f"  [red]Error retrieving config layers: {e}[/red]")
     console.print()
 
 
