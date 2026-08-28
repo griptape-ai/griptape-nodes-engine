@@ -6859,7 +6859,9 @@ class WorkflowManager(EngineScoped):
                 # find_files_recursive skips hidden directories (.venv, .git) and
                 # bounds recursion depth, so a deep or symlink-looped tree can't stall
                 # the boot scan.
-                for workflow_file in await find_files_recursive(path, "*.py"):
+                for workflow_file in await find_files_recursive(
+                    path, "*.py", max_depth=self.engine.config_manager.discovery_max_depth
+                ):
                     # Unsaved workflows are ephemeral; any file with this prefix is a
                     # leak from a pre-fix save and cannot be registered (the registry
                     # rejects unsaved keys paired with a file path).

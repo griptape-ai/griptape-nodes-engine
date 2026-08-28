@@ -6,7 +6,6 @@ import pickle
 import tempfile
 from collections.abc import Generator
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
 
 import pytest
 from PIL import Image
@@ -16,6 +15,7 @@ from griptape_nodes.exe_types.connections import Connections
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import BaseNode, ControlNode, DataNode, StartNode
 from griptape_nodes.machines.dag_builder import DagNodeCategories
+from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.flow_events import (
     TRANSIENT_KEY,
     CreateFlowRequest,
@@ -29,10 +29,6 @@ from griptape_nodes.retained_mode.events.flow_events import (
 )
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-if TYPE_CHECKING:
-    from griptape_nodes.retained_mode.engine import Engine
 
 
 def _data_parameter(name: str = "value") -> Parameter:
@@ -128,9 +124,9 @@ class TestExtractFlowCommandsFromImageMetadata:
     """Covers the non-error success paths for images that carry no workflow payload."""
 
     def test_returns_success_with_none_when_image_has_no_metadata(
-        self, griptape_nodes: GriptapeNodes, image_without_metadata: str
+        self, engine: Engine, image_without_metadata: str
     ) -> None:
-        flow_manager = griptape_nodes.FlowManager()
+        flow_manager = engine.flow_manager
         request = ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=image_without_metadata)
 
         result = flow_manager.on_extract_flow_commands_from_image_metadata(request)
@@ -140,9 +136,9 @@ class TestExtractFlowCommandsFromImageMetadata:
         assert result.altered_workflow_state is False
 
     def test_returns_success_with_none_when_flow_commands_key_missing(
-        self, griptape_nodes: GriptapeNodes, image_with_unrelated_metadata: str
+        self, engine: Engine, image_with_unrelated_metadata: str
     ) -> None:
-        flow_manager = griptape_nodes.FlowManager()
+        flow_manager = engine.flow_manager
         request = ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=image_with_unrelated_metadata)
 
         result = flow_manager.on_extract_flow_commands_from_image_metadata(request)
@@ -151,8 +147,8 @@ class TestExtractFlowCommandsFromImageMetadata:
         assert result.serialized_flow_commands is None
         assert result.altered_workflow_state is False
 
-    def test_returns_failure_when_file_missing(self, griptape_nodes: GriptapeNodes) -> None:
-        flow_manager = griptape_nodes.FlowManager()
+    def test_returns_failure_when_file_missing(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
         request = ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path="/does/not/exist.png")
 
         result = flow_manager.on_extract_flow_commands_from_image_metadata(request)
@@ -160,9 +156,9 @@ class TestExtractFlowCommandsFromImageMetadata:
         assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultFailure)
 
     def test_returns_commands_when_flow_commands_key_present(
-        self, griptape_nodes: GriptapeNodes, image_with_flow_commands: str
+        self, engine: Engine, image_with_flow_commands: str
     ) -> None:
-        flow_manager = griptape_nodes.FlowManager()
+        flow_manager = engine.flow_manager
         request = ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=image_with_flow_commands)
 
         result = flow_manager.on_extract_flow_commands_from_image_metadata(request)
@@ -176,10 +172,10 @@ class TestAwaitFlowCompletion:
     """Tests for FlowManager._await_flow_completion (the wait_for_completion helper)."""
 
     @pytest.mark.asyncio
-    async def test_returns_none_when_flow_finishes_cleanly(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_returns_none_when_flow_finishes_cleanly(self, engine: Engine) -> None:
         from unittest.mock import patch
 
-        flow_manager = griptape_nodes.FlowManager()
+        flow_manager = engine.flow_manager
 
         # No control flow machine -> no error to report; simulate "flow finished" with a single False.
         with patch.object(flow_manager, "check_for_existing_running_flow", return_value=False):
@@ -188,10 +184,10 @@ class TestAwaitFlowCompletion:
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_returns_timeout_string_when_timeout_exceeded(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_returns_timeout_string_when_timeout_exceeded(self, engine: Engine) -> None:
         from unittest.mock import patch
 
-        flow_manager = griptape_nodes.FlowManager()
+        flow_manager = engine.flow_manager
 
         # Keep reporting "still running" so the timeout path fires quickly.
         with patch.object(flow_manager, "check_for_existing_running_flow", return_value=True):
@@ -201,10 +197,10 @@ class TestAwaitFlowCompletion:
         assert "Timed out" in result
 
     @pytest.mark.asyncio
-    async def test_returns_error_message_when_resolution_machine_errored(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_returns_error_message_when_resolution_machine_errored(self, engine: Engine) -> None:
         from unittest.mock import MagicMock, patch
 
-        flow_manager = griptape_nodes.FlowManager()
+        flow_manager = engine.flow_manager
 
         fake_resolution_machine = MagicMock()
         fake_resolution_machine.is_errored.return_value = True
@@ -225,21 +221,21 @@ class TestStartFlowRequestDefaultsToCurrentContext:
     """Tests for StartFlowRequest / StartFlowFromNodeRequest current-context fallback."""
 
     @pytest.mark.asyncio
-    async def test_start_flow_fails_cleanly_when_no_flow_and_no_context(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_start_flow_fails_cleanly_when_no_flow_and_no_context(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.events.execution_events import (
             StartFlowRequest,
             StartFlowResultFailure,
         )
 
-        flow_manager = griptape_nodes.FlowManager()
-        griptape_nodes.handle_request(
+        flow_manager = engine.flow_manager
+        engine.handle_request(
             __import__(
                 "griptape_nodes.retained_mode.events.object_events",
                 fromlist=["ClearAllObjectStateRequest"],
             ).ClearAllObjectStateRequest(i_know_what_im_doing=True)
         )
 
-        assert not griptape_nodes.ContextManager().has_current_flow()
+        assert not engine.context_manager.has_current_flow()
 
         result = await flow_manager.on_start_flow_request(StartFlowRequest())
 
@@ -248,7 +244,7 @@ class TestStartFlowRequestDefaultsToCurrentContext:
         assert "Current Context" in str(result.result_details)
 
     @pytest.mark.asyncio
-    async def test_start_flow_uses_current_context_flow_when_name_omitted(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_start_flow_uses_current_context_flow_when_name_omitted(self, engine: Engine) -> None:
         from unittest.mock import patch
 
         from griptape_nodes.retained_mode.events.execution_events import (
@@ -258,12 +254,12 @@ class TestStartFlowRequestDefaultsToCurrentContext:
         from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
         from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 
-        flow_manager = griptape_nodes.FlowManager()
-        griptape_nodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        flow_manager = engine.flow_manager
+        engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
         # Bootstrap manually via push_workflow + CreateFlowRequest so this test does not
         # depend on any sibling MCP-bootstrap PR landing first.
-        griptape_nodes.ContextManager().push_workflow("wf")
-        create_flow_result = griptape_nodes.handle_request(
+        engine.context_manager.push_workflow("wf")
+        create_flow_result = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name="flow_in_ctx", set_as_new_context=True)
         )
         assert isinstance(create_flow_result, CreateFlowResultSuccess)
@@ -278,22 +274,20 @@ class TestStartFlowRequestDefaultsToCurrentContext:
         assert isinstance(result, StartFlowResultFailure)
         get_flow.assert_called_once_with("flow_in_ctx")
 
-        griptape_nodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
 
     @pytest.mark.asyncio
-    async def test_start_flow_from_node_fails_cleanly_when_no_node_and_no_context(
-        self, griptape_nodes: GriptapeNodes
-    ) -> None:
+    async def test_start_flow_from_node_fails_cleanly_when_no_node_and_no_context(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.events.execution_events import (
             StartFlowFromNodeRequest,
             StartFlowFromNodeResultFailure,
         )
         from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 
-        flow_manager = griptape_nodes.FlowManager()
-        griptape_nodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        flow_manager = engine.flow_manager
+        engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
 
-        assert not griptape_nodes.ContextManager().has_current_node()
+        assert not engine.context_manager.has_current_node()
 
         result = await flow_manager.on_start_flow_from_node_request(StartFlowFromNodeRequest())
 
@@ -301,9 +295,7 @@ class TestStartFlowRequestDefaultsToCurrentContext:
         assert "Current Context" in str(result.result_details)
 
     @pytest.mark.asyncio
-    async def test_start_flow_from_node_uses_current_context_node_and_derives_parent_flow(
-        self, griptape_nodes: GriptapeNodes
-    ) -> None:
+    async def test_start_flow_from_node_uses_current_context_node_and_derives_parent_flow(self, engine: Engine) -> None:
         from unittest.mock import MagicMock, patch
 
         from griptape_nodes.exe_types.node_types import BaseNode
@@ -313,24 +305,24 @@ class TestStartFlowRequestDefaultsToCurrentContext:
         )
         from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 
-        flow_manager = griptape_nodes.FlowManager()
-        griptape_nodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        flow_manager = engine.flow_manager
+        engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
 
         # Stand in a current node so the handler can fall back to it. The node itself only
         # needs to expose `.name`; we short-circuit object lookup below.
         fake_node = MagicMock(spec=BaseNode)
         fake_node.name = "node_in_ctx"
-        ctx = griptape_nodes.ContextManager()
+        ctx = engine.context_manager
         with (
             patch.object(ctx, "has_current_node", return_value=True),
             patch.object(ctx, "get_current_node", return_value=fake_node),
             patch.object(
-                griptape_nodes.ObjectManager(),
+                engine.object_manager,
                 "attempt_get_object_by_name_as_type",
                 return_value=fake_node,
             ),
             patch.object(
-                griptape_nodes.NodeManager(),
+                engine.node_manager,
                 "get_node_parent_flow_by_name",
                 return_value="derived_parent_flow",
             ) as get_parent_flow,
@@ -344,14 +336,14 @@ class TestStartFlowRequestDefaultsToCurrentContext:
         get_parent_flow.assert_called_once_with("node_in_ctx")
         get_flow.assert_called_once_with("derived_parent_flow")
 
-        griptape_nodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
 
 
 class TestStartFlowCancelsOnWaitTimeout:
     """Tests for the wait_for_completion cancel-on-timeout cleanup in on_start_flow_request."""
 
     @pytest.mark.asyncio
-    async def test_cancels_running_flow_when_wait_for_completion_times_out(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_cancels_running_flow_when_wait_for_completion_times_out(self, engine: Engine) -> None:
         from unittest.mock import AsyncMock, MagicMock, patch
 
         from griptape_nodes.retained_mode.events.execution_events import (
@@ -362,7 +354,7 @@ class TestStartFlowCancelsOnWaitTimeout:
             ValidateFlowDependenciesResultSuccess,
         )
 
-        flow_manager = griptape_nodes.FlowManager()
+        flow_manager = engine.flow_manager
 
         fake_flow = MagicMock()
         fake_flow.name = "timeout_flow"
@@ -406,7 +398,7 @@ class TestStartFlowCancelsOnWaitTimeout:
         cancel_mock.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_does_not_cancel_when_flow_already_finished_with_error(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_does_not_cancel_when_flow_already_finished_with_error(self, engine: Engine) -> None:
         from unittest.mock import AsyncMock, MagicMock, patch
 
         from griptape_nodes.retained_mode.events.execution_events import (
@@ -417,7 +409,7 @@ class TestStartFlowCancelsOnWaitTimeout:
             ValidateFlowDependenciesResultSuccess,
         )
 
-        flow_manager = griptape_nodes.FlowManager()
+        flow_manager = engine.flow_manager
 
         fake_flow = MagicMock()
         fake_flow.name = "errored_flow"
@@ -464,32 +456,32 @@ class TestListNodesInFlowRequest:
         fake_flow.nodes = nodes
         return fake_flow
 
-    def _run_request(self, griptape_nodes: GriptapeNodes, flow: object, request: object) -> object:
+    def _run_request(self, engine: Engine, flow: object, request: object) -> object:
         from unittest.mock import patch
 
         from griptape_nodes.retained_mode.managers.flow_manager import ControlFlow
 
-        flow_manager = griptape_nodes.FlowManager()
+        flow_manager = engine.flow_manager
         with patch.object(
-            griptape_nodes.ObjectManager(),
+            engine.object_manager,
             "attempt_get_object_by_name_as_type",
             side_effect=lambda _name, typ: flow if typ is ControlFlow else None,
         ):
             return flow_manager.on_list_nodes_in_flow_request(request)  # type: ignore[arg-type]
 
-    def test_no_filter_returns_all_nodes(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_no_filter_returns_all_nodes(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.events.flow_events import ListNodesInFlowRequest, ListNodesInFlowResultSuccess
 
         class NoteNode:
             pass
 
         flow = self._make_flow({"Note_1": NoteNode(), "Note_2": NoteNode()})
-        result = self._run_request(griptape_nodes, flow, ListNodesInFlowRequest(flow_name="test_flow"))
+        result = self._run_request(engine, flow, ListNodesInFlowRequest(flow_name="test_flow"))
 
         assert isinstance(result, ListNodesInFlowResultSuccess)
         assert set(result.node_names) == {"Note_1", "Note_2"}
 
-    def test_filter_by_matching_class_name_returns_subset(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_filter_by_matching_class_name_returns_subset(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.events.flow_events import ListNodesInFlowRequest, ListNodesInFlowResultSuccess
 
         class NoteNode:
@@ -499,14 +491,12 @@ class TestListNodesInFlowRequest:
             pass
 
         flow = self._make_flow({"note_1": NoteNode(), "agent_1": AgentNode(), "note_2": NoteNode()})
-        result = self._run_request(
-            griptape_nodes, flow, ListNodesInFlowRequest(flow_name="test_flow", node_types=["NoteNode"])
-        )
+        result = self._run_request(engine, flow, ListNodesInFlowRequest(flow_name="test_flow", node_types=["NoteNode"]))
 
         assert isinstance(result, ListNodesInFlowResultSuccess)
         assert set(result.node_names) == {"note_1", "note_2"}
 
-    def test_filter_by_nonexistent_class_name_returns_empty(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_filter_by_nonexistent_class_name_returns_empty(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.events.flow_events import ListNodesInFlowRequest, ListNodesInFlowResultSuccess
 
         class NoteNode:
@@ -514,25 +504,25 @@ class TestListNodesInFlowRequest:
 
         flow = self._make_flow({"note_1": NoteNode()})
         result = self._run_request(
-            griptape_nodes, flow, ListNodesInFlowRequest(flow_name="test_flow", node_types=["NonExistentClass"])
+            engine, flow, ListNodesInFlowRequest(flow_name="test_flow", node_types=["NonExistentClass"])
         )
 
         assert isinstance(result, ListNodesInFlowResultSuccess)
         assert result.node_names == []
 
-    def test_filter_with_empty_list_returns_empty(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_filter_with_empty_list_returns_empty(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.events.flow_events import ListNodesInFlowRequest, ListNodesInFlowResultSuccess
 
         class NoteNode:
             pass
 
         flow = self._make_flow({"note_1": NoteNode()})
-        result = self._run_request(griptape_nodes, flow, ListNodesInFlowRequest(flow_name="test_flow", node_types=[]))
+        result = self._run_request(engine, flow, ListNodesInFlowRequest(flow_name="test_flow", node_types=[]))
 
         assert isinstance(result, ListNodesInFlowResultSuccess)
         assert result.node_names == []
 
-    def test_filter_with_multiple_types_returns_union(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_filter_with_multiple_types_returns_union(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.events.flow_events import ListNodesInFlowRequest, ListNodesInFlowResultSuccess
 
         class NoteNode:
@@ -546,7 +536,7 @@ class TestListNodesInFlowRequest:
 
         flow = self._make_flow({"note_1": NoteNode(), "agent_1": AgentNode(), "other_1": OtherNode()})
         result = self._run_request(
-            griptape_nodes,
+            engine,
             flow,
             ListNodesInFlowRequest(flow_name="test_flow", node_types=["NoteNode", "AgentNode"]),
         )
@@ -558,23 +548,23 @@ class TestListNodesInFlowRequest:
 class TestAutoLayoutFlowRequest:
     """Tests for FlowManager.on_auto_layout_flow_request."""
 
-    def _cleanup(self, griptape_nodes: GriptapeNodes) -> None:
+    def _cleanup(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 
-        griptape_nodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
 
-    def _bootstrap_workflow_and_flow(self, griptape_nodes: GriptapeNodes, workflow: str, flow: str) -> None:
+    def _bootstrap_workflow_and_flow(self, engine: Engine, workflow: str, flow: str) -> None:
         """Push a workflow + create a flow without depending on any sibling bootstrap PR."""
         from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
 
-        self._cleanup(griptape_nodes)
-        griptape_nodes.ContextManager().push_workflow(workflow)
-        result = griptape_nodes.handle_request(
+        self._cleanup(engine)
+        engine.context_manager.push_workflow(workflow)
+        result = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name=flow, set_as_new_context=True)
         )
         assert isinstance(result, CreateFlowResultSuccess)
 
-    def _bootstrap_graph(self, griptape_nodes: GriptapeNodes) -> str:
+    def _bootstrap_graph(self, engine: Engine) -> str:
         """Create a small Workflow + Flow + 3 chained Note nodes (A -> B -> C) for layout tests.
 
         Uses `Note` from the registered Griptape Nodes Library because it has data params that
@@ -583,17 +573,17 @@ class TestAutoLayoutFlowRequest:
         from griptape_nodes.retained_mode.events.connection_events import CreateConnectionRequest
         from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
 
-        self._bootstrap_workflow_and_flow(griptape_nodes, workflow="layout_wf", flow="layout_flow")
+        self._bootstrap_workflow_and_flow(engine, workflow="layout_wf", flow="layout_flow")
 
         names = []
         for desired in ("A", "B", "C"):
-            result = griptape_nodes.handle_request(CreateNodeRequest(node_type="Note", node_name=desired))
+            result = engine.handle_request(CreateNodeRequest(node_type="Note", node_name=desired))
             assert isinstance(result, CreateNodeResultSuccess)
             names.append(result.node_name)
 
         # Wire A -> B -> C on the Note node's text parameter.
         for source, target in itertools.pairwise(names):
-            conn_result = griptape_nodes.handle_request(
+            conn_result = engine.handle_request(
                 CreateConnectionRequest(
                     source_node_name=source,
                     source_parameter_name="note",
@@ -608,28 +598,28 @@ class TestAutoLayoutFlowRequest:
         return "layout_flow"
 
     @pytest.mark.asyncio
-    async def test_fails_cleanly_when_no_flow_in_context_and_no_name(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_fails_cleanly_when_no_flow_in_context_and_no_name(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.events.flow_events import (
             AutoLayoutFlowRequest,
             AutoLayoutFlowResultFailure,
         )
 
-        self._cleanup(griptape_nodes)
-        flow_manager = griptape_nodes.FlowManager()
+        self._cleanup(engine)
+        flow_manager = engine.flow_manager
 
         result = await flow_manager.on_auto_layout_flow_request(AutoLayoutFlowRequest())
 
         assert isinstance(result, AutoLayoutFlowResultFailure)
 
     @pytest.mark.asyncio
-    async def test_lays_out_linear_chain_into_columns(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_lays_out_linear_chain_into_columns(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.events.flow_events import (
             AutoLayoutFlowRequest,
             AutoLayoutFlowResultSuccess,
         )
 
-        flow_name = self._bootstrap_graph(griptape_nodes)
-        flow_manager = griptape_nodes.FlowManager()
+        flow_name = self._bootstrap_graph(engine)
+        flow_manager = engine.flow_manager
 
         result = await flow_manager.on_auto_layout_flow_request(
             AutoLayoutFlowRequest(
@@ -654,24 +644,24 @@ class TestAutoLayoutFlowRequest:
         assert flow.nodes["A"].metadata["position"] == {"x": 10.0, "y": 20.0}
         assert flow.nodes["C"].metadata["position"] == {"x": 210.0, "y": 20.0}
 
-        self._cleanup(griptape_nodes)
+        self._cleanup(engine)
 
     @pytest.mark.asyncio
-    async def test_empty_flow_is_handled_gracefully(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_empty_flow_is_handled_gracefully(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.events.flow_events import (
             AutoLayoutFlowRequest,
             AutoLayoutFlowResultSuccess,
         )
 
-        self._bootstrap_workflow_and_flow(griptape_nodes, workflow="empty_wf", flow="empty_flow")
+        self._bootstrap_workflow_and_flow(engine, workflow="empty_wf", flow="empty_flow")
 
-        flow_manager = griptape_nodes.FlowManager()
+        flow_manager = engine.flow_manager
         result = await flow_manager.on_auto_layout_flow_request(AutoLayoutFlowRequest(flow_name="empty_flow"))
 
         assert isinstance(result, AutoLayoutFlowResultSuccess)
         assert result.positioned_nodes == []
 
-        self._cleanup(griptape_nodes)
+        self._cleanup(engine)
 
 
 class TestExcludeSubflowGroupChildren:
@@ -683,13 +673,13 @@ class TestExcludeSubflowGroupChildren:
     does NOT, because within a group's own subflow those members are exactly what must resolve.
     """
 
-    def test_drops_only_subflow_group_children(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_drops_only_subflow_group_children(self, engine: Engine) -> None:
         from unittest.mock import MagicMock
 
         from griptape_nodes.exe_types.node_groups.subflow_node_group import SubflowNodeGroup
         from griptape_nodes.exe_types.node_types import BaseNode
 
-        flow_manager = griptape_nodes.FlowManager()
+        flow_manager = engine.flow_manager
 
         child = MagicMock(spec=BaseNode)
         child.name = "child"
@@ -708,8 +698,8 @@ class TestExcludeSubflowGroupChildren:
 
         assert [node.name for node in kept] == ["free", "other_group_child"]
 
-    def test_empty_input_returns_empty(self, griptape_nodes: GriptapeNodes) -> None:
-        flow_manager = griptape_nodes.FlowManager()
+    def test_empty_input_returns_empty(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
 
         assert flow_manager.exclude_subflow_group_children([]) == []
 
@@ -725,46 +715,46 @@ class TestClassifyNodesForDag:
     """
 
     @staticmethod
-    def _classify(griptape_nodes: GriptapeNodes, nodes: list, connections: Connections) -> DagNodeCategories:
+    def _classify(engine: Engine, nodes: list, connections: Connections) -> DagNodeCategories:
         from unittest.mock import patch
 
-        flow_manager = griptape_nodes.FlowManager()
+        flow_manager = engine.flow_manager
         with patch.object(flow_manager, "get_connections", return_value=connections):
             return flow_manager.classify_nodes_for_dag(nodes)
 
-    def test_start_node_is_a_start_node(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_start_node_is_a_start_node(self, engine: Engine) -> None:
         start = _ClassifyStartNode("Start")
         data = _ClassifyDataNode("Data")
         connections = Connections()
         connections.add_connection(start, _param(start, "value"), data, _param(data, "value"))
 
-        categories = self._classify(griptape_nodes, [start, data], connections)
+        categories = self._classify(engine, [start, data], connections)
 
         assert [node.name for node in categories.start_nodes] == ["Start"]
         # Data has an incoming data connection and no outgoing one, so it is a terminal sink.
         assert [node.name for node in categories.data_sink_nodes] == ["Data"]
         assert categories.control_nodes == []
 
-    def test_data_node_with_external_outgoing_is_not_a_sink(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_data_node_with_external_outgoing_is_not_a_sink(self, engine: Engine) -> None:
         upstream = _ClassifyDataNode("Upstream")
         downstream = _ClassifyDataNode("Downstream")
         connections = Connections()
         connections.add_connection(upstream, _param(upstream, "value"), downstream, _param(downstream, "value"))
 
-        categories = self._classify(griptape_nodes, [upstream, downstream], connections)
+        categories = self._classify(engine, [upstream, downstream], connections)
 
         # Only the leaf (Downstream) is a sink; Upstream feeds a downstream node so it is skipped.
         assert [node.name for node in categories.data_sink_nodes] == ["Downstream"]
         assert categories.start_nodes == []
         assert categories.control_nodes == []
 
-    def test_control_chain_first_node_is_control_entry(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_control_chain_first_node_is_control_entry(self, engine: Engine) -> None:
         first = _ClassifyControlNode("First")
         second = _ClassifyControlNode("Second")
         connections = Connections()
         connections.add_connection(first, _param(first, "exec_out"), second, _param(second, "exec_in"))
 
-        categories = self._classify(griptape_nodes, [first, second], connections)
+        categories = self._classify(engine, [first, second], connections)
 
         # First drives the control flow; Second has an external incoming control edge so the
         # forward control walk reaches it and it is not seeded as an entry node.
@@ -772,13 +762,11 @@ class TestClassifyNodesForDag:
         assert categories.start_nodes == []
         assert categories.data_sink_nodes == []
 
-    def test_control_node_without_control_connections_is_treated_as_data_sink(
-        self, griptape_nodes: GriptapeNodes
-    ) -> None:
+    def test_control_node_without_control_connections_is_treated_as_data_sink(self, engine: Engine) -> None:
         lone = _ClassifyControlNode("Lone")
         connections = Connections()
 
-        categories = self._classify(griptape_nodes, [lone], connections)
+        categories = self._classify(engine, [lone], connections)
 
         # Control params exist but are unused, so the node is a plain data node with no outgoing
         # connection, i.e. a terminal sink.
@@ -786,7 +774,7 @@ class TestClassifyNodesForDag:
         assert categories.control_nodes == []
         assert categories.start_nodes == []
 
-    def test_internal_node_group_outgoing_does_not_disqualify_sink(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_internal_node_group_outgoing_does_not_disqualify_sink(self, engine: Engine) -> None:
         source = _ClassifyDataNode("Source")
         target = _ClassifyDataNode("Target")
         connections = Connections()
@@ -798,14 +786,14 @@ class TestClassifyNodesForDag:
             is_node_group_internal=True,
         )
 
-        categories = self._classify(griptape_nodes, [source, target], connections)
+        categories = self._classify(engine, [source, target], connections)
 
         # Internal NodeGroup connections do not count as external outgoing, so both nodes remain
         # terminal sinks.
         assert sorted(node.name for node in categories.data_sink_nodes) == ["Source", "Target"]
 
-    def test_empty_scope_returns_empty_categories(self, griptape_nodes: GriptapeNodes) -> None:
-        categories = self._classify(griptape_nodes, [], Connections())
+    def test_empty_scope_returns_empty_categories(self, engine: Engine) -> None:
+        categories = self._classify(engine, [], Connections())
 
         assert categories.start_nodes == []
         assert categories.control_nodes == []
@@ -813,16 +801,16 @@ class TestClassifyNodesForDag:
 
 
 @pytest.fixture
-def clean_object_state(griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+def clean_object_state(engine: Engine) -> Generator[None, None, None]:
     """Clear all object state around a test so leftover flows never bleed across tests.
 
     Yield-based so the teardown clear runs even when the test body fails.
     """
-    griptape_nodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+    engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
     try:
         yield
     finally:
-        griptape_nodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
 
 
 class TestSerializeFlowSkipsTransientChildFlows:
@@ -834,23 +822,23 @@ class TestSerializeFlowSkipsTransientChildFlows:
     """
 
     @pytest.mark.usefixtures("clean_object_state")
-    def test_transient_child_flow_is_not_serialized(self, griptape_nodes: GriptapeNodes) -> None:
-        griptape_nodes.ContextManager().push_workflow("transient_wf")
+    def test_transient_child_flow_is_not_serialized(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow("transient_wf")
 
-        parent = griptape_nodes.handle_request(
+        parent = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name="parent", set_as_new_context=True)
         )
         assert isinstance(parent, CreateFlowResultSuccess)
-        keep = griptape_nodes.handle_request(
+        keep = engine.handle_request(
             CreateFlowRequest(parent_flow_name=parent.flow_name, flow_name="child_keep", set_as_new_context=False)
         )
         assert isinstance(keep, CreateFlowResultSuccess)
-        transient = griptape_nodes.handle_request(
+        transient = engine.handle_request(
             CreateFlowRequest(parent_flow_name=parent.flow_name, flow_name="child_transient", set_as_new_context=False)
         )
         assert isinstance(transient, CreateFlowResultSuccess)
 
-        flow_manager = griptape_nodes.FlowManager()
+        flow_manager = engine.flow_manager
         flow_manager.get_flow_by_name(transient.flow_name).metadata[TRANSIENT_KEY] = True
 
         result = flow_manager.on_serialize_flow_to_commands(
@@ -863,9 +851,7 @@ class TestSerializeFlowSkipsTransientChildFlows:
         assert transient.flow_name not in serialized_child_flows
 
     @pytest.mark.usefixtures("clean_object_state")
-    def test_transient_child_flow_internal_connections_do_not_fail_serialization(
-        self, griptape_nodes: GriptapeNodes
-    ) -> None:
+    def test_transient_child_flow_internal_connections_do_not_fail_serialization(self, engine: Engine) -> None:
         """A transient child flow with internal connections must not break the parent save.
 
         Transient flows are skipped by node serialization, so their nodes never enter the UUID map.
@@ -875,28 +861,28 @@ class TestSerializeFlowSkipsTransientChildFlows:
         from griptape_nodes.retained_mode.events.connection_events import CreateConnectionRequest
         from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
 
-        griptape_nodes.ContextManager().push_workflow("transient_conn_wf")
-        parent = griptape_nodes.handle_request(
+        engine.context_manager.push_workflow("transient_conn_wf")
+        parent = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name="parent", set_as_new_context=True)
         )
         assert isinstance(parent, CreateFlowResultSuccess)
-        transient = griptape_nodes.handle_request(
+        transient = engine.handle_request(
             CreateFlowRequest(parent_flow_name=parent.flow_name, flow_name="child_transient", set_as_new_context=False)
         )
         assert isinstance(transient, CreateFlowResultSuccess)
 
-        flow_manager = griptape_nodes.FlowManager()
+        flow_manager = engine.flow_manager
         flow_manager.get_flow_by_name(transient.flow_name).metadata[TRANSIENT_KEY] = True
 
         # Two connected Note nodes INSIDE the transient flow (Note has connectable data params
         # and no external deps). This mirrors a per-iteration loop-body flow's internal wiring.
-        with griptape_nodes.ContextManager().flow(transient.flow_name):
+        with engine.context_manager.flow(transient.flow_name):
             node_names = []
             for desired in ("A", "B"):
-                created = griptape_nodes.handle_request(CreateNodeRequest(node_type="Note", node_name=desired))
+                created = engine.handle_request(CreateNodeRequest(node_type="Note", node_name=desired))
                 assert isinstance(created, CreateNodeResultSuccess)
                 node_names.append(created.node_name)
-            griptape_nodes.handle_request(
+            engine.handle_request(
                 CreateConnectionRequest(
                     source_node_name=node_names[0],
                     source_parameter_name="note",
@@ -928,18 +914,16 @@ class TestDeleteIterationFlows:
 
     @pytest.mark.asyncio
     @pytest.mark.usefixtures("clean_object_state")
-    async def test_deletes_all_tracked_flows(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_deletes_all_tracked_flows(self, engine: Engine) -> None:
         from griptape_nodes.common.node_executor import NodeExecutor
 
-        griptape_nodes.ContextManager().push_workflow("cleanup_wf")
-        griptape_nodes.handle_request(
-            CreateFlowRequest(parent_flow_name=None, flow_name="parent", set_as_new_context=True)
-        )
+        engine.context_manager.push_workflow("cleanup_wf")
+        engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="parent", set_as_new_context=True))
 
-        object_manager = griptape_nodes.ObjectManager()
+        object_manager = engine.object_manager
         deserialized_flows: list[tuple[int, str, dict[str, str]]] = []
         for i in range(3):
-            created = griptape_nodes.handle_request(
+            created = engine.handle_request(
                 CreateFlowRequest(parent_flow_name="parent", flow_name=f"iter_{i}", set_as_new_context=False)
             )
             assert isinstance(created, CreateFlowResultSuccess)
@@ -947,11 +931,11 @@ class TestDeleteIterationFlows:
 
         # Delete one flow out from under the helper to prove it tolerates an already-gone flow.
         already_gone = deserialized_flows[1][1]
-        griptape_nodes.handle_request(DeleteFlowRequest(flow_name=already_gone))
+        engine.handle_request(DeleteFlowRequest(flow_name=already_gone))
         assert object_manager.attempt_get_object_by_name(already_gone) is None
 
-        executor = NodeExecutor(engine=cast("Engine", griptape_nodes))
-        await executor._delete_iteration_flows(deserialized_flows, griptape_nodes.EventManager())
+        executor = NodeExecutor(engine=engine)
+        await executor._delete_iteration_flows(deserialized_flows, engine.event_manager)
 
         for _, flow_name, _ in deserialized_flows:
             assert object_manager.attempt_get_object_by_name(flow_name) is None
@@ -966,34 +950,32 @@ class TestReparentFlow:
     """
 
     @pytest.mark.usefixtures("clean_object_state")
-    def test_moves_flow_under_new_parent(self, griptape_nodes: GriptapeNodes) -> None:
-        griptape_nodes.ContextManager().push_workflow("reparent_wf")
-        top = griptape_nodes.handle_request(
-            CreateFlowRequest(parent_flow_name=None, flow_name="top", set_as_new_context=False)
-        )
+    def test_moves_flow_under_new_parent(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow("reparent_wf")
+        top = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="top", set_as_new_context=False))
         assert isinstance(top, CreateFlowResultSuccess)
-        outer = griptape_nodes.handle_request(
+        outer = engine.handle_request(
             CreateFlowRequest(parent_flow_name=top.flow_name, flow_name="outer", set_as_new_context=False)
         )
         assert isinstance(outer, CreateFlowResultSuccess)
-        inner = griptape_nodes.handle_request(
+        inner = engine.handle_request(
             CreateFlowRequest(parent_flow_name=top.flow_name, flow_name="inner", set_as_new_context=False)
         )
         assert isinstance(inner, CreateFlowResultSuccess)
 
-        flow_manager = griptape_nodes.FlowManager()
+        flow_manager = engine.flow_manager
         flow_manager.reparent_flow(inner.flow_name, outer.flow_name)
 
         assert flow_manager.get_parent_flow(inner.flow_name) == outer.flow_name
 
     @pytest.mark.usefixtures("clean_object_state")
-    def test_rejects_unknown_flows(self, griptape_nodes: GriptapeNodes) -> None:
-        griptape_nodes.ContextManager().push_workflow("reparent_unknown_wf")
-        real = griptape_nodes.handle_request(
+    def test_rejects_unknown_flows(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow("reparent_unknown_wf")
+        real = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name="real", set_as_new_context=False)
         )
         assert isinstance(real, CreateFlowResultSuccess)
-        flow_manager = griptape_nodes.FlowManager()
+        flow_manager = engine.flow_manager
 
         with pytest.raises(ValueError, match="doesn't exist"):
             flow_manager.reparent_flow("ghost", real.flow_name)
@@ -1001,30 +983,30 @@ class TestReparentFlow:
             flow_manager.reparent_flow(real.flow_name, "ghost")
 
     @pytest.mark.usefixtures("clean_object_state")
-    def test_rejects_making_a_flow_its_own_parent(self, griptape_nodes: GriptapeNodes) -> None:
-        griptape_nodes.ContextManager().push_workflow("reparent_self_wf")
-        solo = griptape_nodes.handle_request(
+    def test_rejects_making_a_flow_its_own_parent(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow("reparent_self_wf")
+        solo = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name="solo", set_as_new_context=False)
         )
         assert isinstance(solo, CreateFlowResultSuccess)
 
         with pytest.raises(ValueError, match="its own parent"):
-            griptape_nodes.FlowManager().reparent_flow(solo.flow_name, solo.flow_name)
+            engine.flow_manager.reparent_flow(solo.flow_name, solo.flow_name)
 
     @pytest.mark.usefixtures("clean_object_state")
-    def test_rejects_moving_a_flow_inside_its_own_descendant(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_rejects_moving_a_flow_inside_its_own_descendant(self, engine: Engine) -> None:
         """That move would detach the branch and leave the ancestor walk with no way out."""
-        griptape_nodes.ContextManager().push_workflow("reparent_cycle_wf")
-        outer = griptape_nodes.handle_request(
+        engine.context_manager.push_workflow("reparent_cycle_wf")
+        outer = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name="outer", set_as_new_context=False)
         )
         assert isinstance(outer, CreateFlowResultSuccess)
-        inner = griptape_nodes.handle_request(
+        inner = engine.handle_request(
             CreateFlowRequest(parent_flow_name=outer.flow_name, flow_name="inner", set_as_new_context=False)
         )
         assert isinstance(inner, CreateFlowResultSuccess)
 
-        flow_manager = griptape_nodes.FlowManager()
+        flow_manager = engine.flow_manager
         with pytest.raises(ValueError, match="already inside"):
             flow_manager.reparent_flow(outer.flow_name, inner.flow_name)
 

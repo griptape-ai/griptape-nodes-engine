@@ -35,10 +35,11 @@ from griptape_nodes.retained_mode.events.library_events import (
 )
 from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from griptape_nodes.retained_mode.engine import Engine
 
 # Timeout with thread dump.
 pytestmark = pytest.mark.timeout(300, method="thread")
@@ -48,7 +49,7 @@ FIXTURE_LIBRARY_JSON_TEMPLATE = FIXTURE_LIBRARY_DIR / "griptape_nodes_library.js
 FIXTURE_NODE_FILE = FIXTURE_LIBRARY_DIR / "echo_node.py"
 
 
-def _generate_echo_workflow_source(library_json: Path) -> str:
+def _generate_echo_workflow_source(engine: Engine, library_json: Path) -> str:
     """Build a flow with one EchoNode and serialize it to a Python module.
 
     Uses the same path the engine uses when saving a workflow: register the library,
@@ -56,19 +57,19 @@ def _generate_echo_workflow_source(library_json: Path) -> str:
     serialized commands through ``WorkflowManager._generate_workflow_file_content``.
     The resulting source is what a user would see saved to disk.
     """
-    GriptapeNodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+    engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
 
-    register_result = GriptapeNodes.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
+    register_result = engine.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(register_result, RegisterLibraryFromFileResultSuccess), register_result
 
-    GriptapeNodes.ContextManager().push_workflow(workflow_name="echo_e2e_workflow")
+    engine.context_manager.push_workflow(workflow_name="echo_e2e_workflow")
 
-    flow_result = GriptapeNodes.handle_request(
+    flow_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="ControlFlow_1", set_as_new_context=False)
     )
     assert isinstance(flow_result, CreateFlowResultSuccess), flow_result
 
-    node_result = GriptapeNodes.handle_request(
+    node_result = engine.handle_request(
         CreateNodeRequest(
             node_type="EchoNode",
             specific_library_name="Echo Library",
@@ -81,7 +82,7 @@ def _generate_echo_workflow_source(library_json: Path) -> str:
         f"Sanity: in-process registration must yield real node, got {node_result.node_type!r}"
     )
 
-    serialize_result = GriptapeNodes.handle_request(SerializeFlowToCommandsRequest(flow_name=flow_result.flow_name))
+    serialize_result = engine.handle_request(SerializeFlowToCommandsRequest(flow_name=flow_result.flow_name))
     assert isinstance(serialize_result, SerializeFlowToCommandsResultSuccess), serialize_result
 
     metadata = WorkflowMetadata(
@@ -94,7 +95,7 @@ def _generate_echo_workflow_source(library_json: Path) -> str:
         # workflow_shape=None keeps the file inert at import time.
         workflow_shape=None,
     )
-    return GriptapeNodes.WorkflowManager()._generate_workflow_file_content(
+    return engine.workflow_manager._generate_workflow_file_content(
         serialized_flow_commands=serialize_result.serialized_flow_commands,
         workflow_metadata=metadata,
     )
@@ -165,6 +166,7 @@ if __name__ == "__main__":
 )
 def test_standalone_workflow_registers_declared_libraries(
     tmp_path: Path,
+    engine: Engine,
     engine_subprocess_env: Callable[..., dict[str, str]],
     materialize_library: Callable[..., Path],
     write_isolated_config: Callable[..., None],
@@ -177,7 +179,9 @@ def test_standalone_workflow_registers_declared_libraries(
     inspection plus a recording stub.
     """
     workspace = tmp_path / "workspace"
-    workspace.mkdir()
+    # The engine's ConfigManager creates the configured workspace on init, so this only has to
+    # cover the case where it has not.
+    workspace.mkdir(exist_ok=True)
     config_root = tmp_path / "xdg_config"
     library_json = materialize_library(
         tmp_path / "library", template=FIXTURE_LIBRARY_JSON_TEMPLATE, node_file=FIXTURE_NODE_FILE
@@ -186,7 +190,7 @@ def test_standalone_workflow_registers_declared_libraries(
 
     # Generator runs in the test process where Echo Library can be registered locally,
     # so SerializeFlowToCommandsRequest can build a faithful command list.
-    workflow_source = _generate_echo_workflow_source(library_json)
+    workflow_source = _generate_echo_workflow_source(engine, library_json)
     runnable_source = _wrap_with_runtime_assertions(workflow_source)
     assert "RegisterLibraryFromFileRequest(library_name='Echo Library'" in workflow_source, (
         "build_workflow must emit the registration call; if this assertion fails the unit"

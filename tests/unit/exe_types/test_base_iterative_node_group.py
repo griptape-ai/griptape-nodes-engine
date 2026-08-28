@@ -17,7 +17,7 @@ from griptape_nodes.exe_types.node_groups.subflow_node_group import (
 )
 
 if TYPE_CHECKING:
-    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+    from griptape_nodes.retained_mode.engine import Engine
 
 
 class MockIterativeGroup(BaseIterativeNodeGroup):
@@ -31,7 +31,7 @@ class MockIterativeGroup(BaseIterativeNodeGroup):
 
 
 @pytest.fixture
-def iterative_group(griptape_nodes: GriptapeNodes) -> MockIterativeGroup:  # noqa: ARG001
+def iterative_group(engine: Engine) -> MockIterativeGroup:  # noqa: ARG001
     """Return a freshly constructed MockIterativeGroup."""
     return MockIterativeGroup(name="test_iterative_group")
 

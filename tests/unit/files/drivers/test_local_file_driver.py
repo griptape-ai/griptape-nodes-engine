@@ -4,13 +4,12 @@ import platform
 import sys
 from collections.abc import Iterator
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
 from griptape_nodes.files.drivers.local_file_driver import LocalFileDriver
 from griptape_nodes.files.path_utils import parse_file_uri
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 
 
@@ -337,19 +336,16 @@ class TestLocalFileDriverRelativePaths:
     def mock_config_manager_accessor(self, mock_config_manager: Mock) -> Iterator[Mock]:
         """Patch the facade accessor the driver uses to reach the ConfigManager.
 
-        Deliberately not `monkeypatch.setattr`: it snapshots `getattr(GriptapeNodes,
-        "ConfigManager")`, which for a classmethod is the *bound* method, and on teardown
-        writes that bound method into `GriptapeNodes.__dict__` instead of the original
-        classmethod descriptor. That permanently mutates a process-global facade class every
-        other test shares. Saving and restoring `__dict__` puts the real descriptor back.
+        Patched by dotted string rather than an imported `GriptapeNodes` reference: the
+        driver (src/griptape_nodes/files/drivers/local_file_driver.py) still calls the
+        facade's `ConfigManager()` classmethod, and `patch()` handles saving and restoring
+        the classmethod descriptor correctly on teardown.
         """
-        original_descriptor = GriptapeNodes.__dict__["ConfigManager"]
-        accessor = Mock(spec=GriptapeNodes.ConfigManager, return_value=mock_config_manager)
-        GriptapeNodes.ConfigManager = accessor  # type: ignore[method-assign]
-        try:
+        with patch(
+            "griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes.ConfigManager",
+            return_value=mock_config_manager,
+        ) as accessor:
             yield accessor
-        finally:
-            GriptapeNodes.ConfigManager = original_descriptor  # type: ignore[method-assign]
 
     @pytest.mark.asyncio
     async def test_read_bare_relative_path_uses_workspace_not_cwd(

@@ -36,7 +36,6 @@ from griptape_nodes.retained_mode.events.artifact_events import (
 from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload
 from griptape_nodes.retained_mode.events.config_events import SetConfigValueResultSuccess
 from griptape_nodes.retained_mode.events.project_events import MacroPath
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.artifact_manager import ArtifactManager, PreviewMetadata
 from griptape_nodes.retained_mode.managers.artifact_providers import (
     BaseArtifactProvider,
@@ -719,14 +718,14 @@ class TestGeneratePreview:
             yield Path(tmpdir)
 
     @pytest.fixture
-    def mock_project(self, temp_dir: Path) -> None:
+    def mock_project(self, temp_dir: Path, engine: Engine) -> None:
         """Set up a real project in ProjectManager with temp_dir as workspace."""
         from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
         from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
         from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
 
         # Get ProjectManager singleton
-        project_manager = GriptapeNodes.ProjectManager()
+        project_manager = engine.project_manager
 
         # Parse macros for the template
         validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
@@ -770,14 +769,14 @@ class TestGeneratePreview:
         return MacroPath(parsed_macro=parsed_macro, variables={})
 
     @pytest.fixture
-    def artifact_manager(self, mock_project: None, temp_dir: Path) -> ArtifactManager:  # noqa: ARG002
+    def artifact_manager(self, mock_project: None, temp_dir: Path, engine: Engine) -> ArtifactManager:  # noqa: ARG002
         """Create ArtifactManager instance with ImageArtifactProvider registered."""
         manager = ArtifactManager()
         # Register ImageArtifactProvider (no longer auto-registered)
         request = RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider)
         manager.on_handle_register_artifact_provider_request(request)
         # Set workspace_path after provider registration since registration triggers load_configs()
-        GriptapeNodes.ConfigManager().workspace_path = temp_dir
+        engine.config_manager.workspace_path = temp_dir
         return manager
 
     @pytest.mark.asyncio
@@ -1035,13 +1034,13 @@ class TestPreviewMetadataDoesNotCreateSidecar:
             yield Path(tmpdir)
 
     @pytest.fixture
-    def mock_project(self, temp_dir: Path) -> None:
+    def mock_project(self, temp_dir: Path, engine: Engine) -> None:
         """Set up a real project in ProjectManager with temp_dir as workspace."""
         from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
         from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
         from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
 
-        project_manager = GriptapeNodes.ProjectManager()
+        project_manager = engine.project_manager
 
         validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
         situation_schemas = project_manager._parse_situation_macros(DEFAULT_PROJECT_TEMPLATE.situations, validation)
@@ -1075,12 +1074,12 @@ class TestPreviewMetadataDoesNotCreateSidecar:
         return MacroPath(parsed_macro=parsed_macro, variables={})
 
     @pytest.fixture
-    def artifact_manager(self, mock_project: None, temp_dir: Path) -> ArtifactManager:  # noqa: ARG002
+    def artifact_manager(self, mock_project: None, temp_dir: Path, engine: Engine) -> ArtifactManager:  # noqa: ARG002
         """Create ArtifactManager instance with ImageArtifactProvider registered."""
         manager = ArtifactManager()
         request = RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider)
         manager.on_handle_register_artifact_provider_request(request)
-        GriptapeNodes.ConfigManager().workspace_path = temp_dir
+        engine.config_manager.workspace_path = temp_dir
         return manager
 
     @pytest.mark.asyncio
@@ -1157,14 +1156,14 @@ class TestGetPreviewForArtifact:
             yield Path(tmpdir)
 
     @pytest.fixture
-    def mock_project(self, temp_dir: Path) -> None:
+    def mock_project(self, temp_dir: Path, engine: Engine) -> None:
         """Set up a real project in ProjectManager with temp_dir as workspace."""
         from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
         from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
         from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
 
         # Get ProjectManager singleton
-        project_manager = GriptapeNodes.ProjectManager()
+        project_manager = engine.project_manager
 
         # Parse macros for the template
         validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
@@ -1204,14 +1203,14 @@ class TestGetPreviewForArtifact:
         return MacroPath(parsed_macro=parsed_macro, variables={})
 
     @pytest.fixture
-    def artifact_manager(self, mock_project: None, temp_dir: Path) -> ArtifactManager:  # noqa: ARG002
+    def artifact_manager(self, mock_project: None, temp_dir: Path, engine: Engine) -> ArtifactManager:  # noqa: ARG002
         """Create ArtifactManager with ImageArtifactProvider registered."""
         manager = ArtifactManager()
         # Register ImageArtifactProvider (no longer auto-registered)
         request = RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider)
         manager.on_handle_register_artifact_provider_request(request)
         # Set workspace_path after provider registration since registration triggers load_configs()
-        GriptapeNodes.ConfigManager().workspace_path = temp_dir
+        engine.config_manager.workspace_path = temp_dir
         return manager
 
     @pytest.fixture
@@ -1700,7 +1699,7 @@ class TestProviderRegistrationConfigLogLevels:
     are expected and should not produce ERROR-level logs that alarm users.
     """
 
-    def test_read_generator_config_uses_debug_failure_log_level(self) -> None:
+    def test_read_generator_config_uses_debug_failure_log_level(self, engine: Engine) -> None:
         """Test that _read_generator_config uses failure_log_level=DEBUG in GetConfigCategoryRequest."""
         import logging
 
@@ -1716,7 +1715,7 @@ class TestProviderRegistrationConfigLogLevels:
 
         def capture_requests(request: RequestPayload) -> ResultPayload:
             captured_requests.append(request)
-            return GriptapeNodes.handle_request(request)
+            return engine.handle_request(request)
 
         manager.engine.handle_request = capture_requests
         manager._read_generator_config(ImageArtifactProvider, PILThumbnailGenerator)
@@ -1725,7 +1724,7 @@ class TestProviderRegistrationConfigLogLevels:
         assert len(category_requests) == 1
         assert category_requests[0].failure_log_level == logging.DEBUG
 
-    def test_validate_and_write_provider_settings_uses_debug_failure_log_level(self) -> None:
+    def test_validate_and_write_provider_settings_uses_debug_failure_log_level(self, engine: Engine) -> None:
         """Test that _validate_and_write_provider_settings uses failure_log_level=DEBUG."""
         import logging
 
@@ -1738,7 +1737,7 @@ class TestProviderRegistrationConfigLogLevels:
 
         def capture_requests(request: RequestPayload) -> ResultPayload:
             captured_requests.append(request)
-            return GriptapeNodes.handle_request(request)
+            return engine.handle_request(request)
 
         manager.engine.handle_request = capture_requests
         manager._validate_and_write_provider_settings(ImageArtifactProvider)

@@ -1933,6 +1933,7 @@ class OSManager(EngineScoped):
                 scan_sequences,
                 mapping,
                 mapping.filename_pattern,
+                engine=self.engine,
                 policy=request.policy,
                 no_token_behavior=request.no_token_behavior,
                 start=request.start_number,
@@ -2812,7 +2813,7 @@ class OSManager(EngineScoped):
 
         # Write sidecar metadata file if caller opted in by providing file_metadata
         if request.file_metadata is not None:
-            write_sidecar(final_file_path, request.file_metadata)
+            write_sidecar(final_file_path, request.file_metadata, self.engine)
 
         if used_indexed_fallback:
             msg = f"File written to indexed path: {final_file_path} (original path '{path_display}' already existed)"

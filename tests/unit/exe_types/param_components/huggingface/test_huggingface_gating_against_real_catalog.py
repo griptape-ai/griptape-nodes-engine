@@ -193,13 +193,13 @@ def _deny_denied_provider(checkpoint: AuthorizationCheckpoint) -> CheckpointDeni
 
 
 @pytest.fixture
-def denying_policy(griptape_nodes) -> Iterator[None]:  # noqa: ANN001
+def denying_policy(engine) -> Iterator[None]:  # noqa: ANN001
     """Install the real deny hook for the duration of a test."""
-    griptape_nodes.EventManager().add_authorization_hook(_deny_denied_provider)
+    engine.event_manager.add_authorization_hook(_deny_denied_provider)
     try:
         yield
     finally:
-        griptape_nodes.EventManager().remove_authorization_hook(_deny_denied_provider)
+        engine.event_manager.remove_authorization_hook(_deny_denied_provider)
 
 
 class TestRealCatalogResolution:

@@ -10,6 +10,7 @@ import pytest
 from dotenv import dotenv_values
 
 from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
+from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.os_events import (
     DeleteFileRequest,
     DeleteFileResultSuccess,
@@ -31,7 +32,6 @@ from griptape_nodes.retained_mode.events.secrets_events import (
     GetAllSecretValuesRequest,
     GetAllSecretValuesResultSuccess,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.publishing.workflow_packager import (
     DOWNLOAD_MODELS_SCRIPT_NAME,
     WORKFLOW_DIR_MACRO,
@@ -1363,14 +1363,14 @@ class TestStagedPublish:
 
         assert (destination / "run.py").read_text(encoding="utf-8") == "new"
 
-    def test_restores_the_previous_bundle_if_the_swap_fails(self, tmp_path: Path) -> None:
+    def test_restores_the_previous_bundle_if_the_swap_fails(self, tmp_path: Path, engine: Engine) -> None:
         """A failure moving the new bundle into place leaves the destination populated."""
         packager = WorkflowPackager("test_workflow")
         destination = tmp_path / "bundle"
         destination.mkdir()
         (destination / "run.py").write_text("previous", encoding="utf-8")
 
-        real_handle_request = GriptapeNodes.handle_request
+        real_handle_request = engine.handle_request
         staged_bundle_move_attempted = False
 
         def fail_moving_new_bundle_into_place(request: object) -> object:
@@ -1400,14 +1400,14 @@ class TestStagedPublish:
 
         assert (destination / "run.py").read_text(encoding="utf-8") == "previous"
 
-    def test_keeps_the_moved_aside_bundle_when_rollback_fails(self, tmp_path: Path) -> None:
+    def test_keeps_the_moved_aside_bundle_when_rollback_fails(self, tmp_path: Path, engine: Engine) -> None:
         """If the destination cannot be restored, the only copy of the bundle is not deleted."""
         packager = WorkflowPackager("test_workflow")
         destination = tmp_path / "bundle"
         destination.mkdir()
         (destination / "run.py").write_text("previous", encoding="utf-8")
 
-        real_handle_request = GriptapeNodes.handle_request
+        real_handle_request = engine.handle_request
 
         def fail_every_move_to_the_destination(request: object) -> object:
             """Refuse both the swap and the rollback, leaving the destination missing."""
@@ -1435,14 +1435,14 @@ class TestStagedPublish:
         assert len(moved_aside) == 1
         assert (moved_aside[0] / "run.py").read_text(encoding="utf-8") == "previous"
 
-    def test_failure_names_the_destination_not_a_working_directory(self, tmp_path: Path) -> None:
+    def test_failure_names_the_destination_not_a_working_directory(self, tmp_path: Path, engine: Engine) -> None:
         """Every swap failure names the bundle the user published to, whichever move failed."""
         packager = WorkflowPackager("test_workflow")
         destination = tmp_path / "bundle"
         destination.mkdir()
         (destination / "run.py").write_text("previous", encoding="utf-8")
 
-        real_handle_request = GriptapeNodes.handle_request
+        real_handle_request = engine.handle_request
 
         def fail_moving_the_previous_bundle_aside(request: object) -> object:
             """Refuse the destination -> aside move, whose target is an internal path."""
@@ -1469,14 +1469,14 @@ class TestStagedPublish:
         assert f"'{destination}'" in str(failure.value)
         assert ".publish-" not in str(failure.value)
 
-    def test_cleanup_failure_does_not_fail_the_publish(self, tmp_path: Path) -> None:
+    def test_cleanup_failure_does_not_fail_the_publish(self, tmp_path: Path, engine: Engine) -> None:
         """A working directory that cannot be removed is logged, not raised over."""
         packager = WorkflowPackager("test_workflow")
         destination = tmp_path / "bundle"
         destination.mkdir()
         (destination / "run.py").write_text("previous", encoding="utf-8")
 
-        real_handle_request = GriptapeNodes.handle_request
+        real_handle_request = engine.handle_request
 
         def fail_deletes(request: object) -> object:
             """Report every delete as failed, leaving the working directories on disk."""
@@ -1495,7 +1495,7 @@ class TestStagedPublish:
 
         assert (destination / "run.py").read_text(encoding="utf-8") == "new"
 
-    def test_swap_routes_through_engine_requests(self, tmp_path: Path) -> None:
+    def test_swap_routes_through_engine_requests(self, tmp_path: Path, engine: Engine) -> None:
         """Staging directory creation and the swap go through OS request handlers."""
         packager = WorkflowPackager("test_workflow")
         destination = tmp_path / "bundle"
@@ -1503,7 +1503,7 @@ class TestStagedPublish:
         (destination / "run.py").write_text("previous", encoding="utf-8")
         seen: list[type] = []
 
-        real_handle_request = GriptapeNodes.handle_request
+        real_handle_request = engine.handle_request
 
         def record(request: object) -> object:
             seen.append(type(request))
