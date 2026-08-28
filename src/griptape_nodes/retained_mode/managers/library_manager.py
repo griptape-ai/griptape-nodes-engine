@@ -58,6 +58,7 @@ from griptape_nodes.node_library.library_registry import (
     LibrarySchema,
     NodeDefinition,
     NodeMetadata,
+    WidgetDefinition,
     WorkflowNodeDefinition,
 )
 from griptape_nodes.node_library.library_validation import (
@@ -660,7 +661,9 @@ class LibraryManager(EngineScoped):
             GetLibraryMetadataRequest,
             self.get_library_metadata_request,
         )
-        event_manager.assign_manager_to_request_type(GetAllInfoForLibraryRequest, self.get_all_info_for_library_request)
+        event_manager.assign_manager_to_request_type(
+            GetAllInfoForLibraryRequest, self.on_get_all_info_for_library_request
+        )
         event_manager.assign_manager_to_request_type(
             GetAllInfoForAllLibrariesRequest, self.on_get_all_info_for_all_libraries_request
         )
@@ -1367,8 +1370,20 @@ class LibraryManager(EngineScoped):
             git_remote=git_remote,
             git_ref=git_ref,
             enabled=enabled,
+            is_registered=self._is_library_name_registered(library_data.name),
             result_details=details,
         )
+
+    @staticmethod
+    def _is_library_name_registered(library_name: str) -> bool:
+        """Whether a library of this name is in the registry right now.
+
+        Metadata is derived from config while the registry holds what actually loaded, so the
+        two can disagree until libraries reload. Keyed on name because the requests a client
+        makes off the back of metadata (CheckLibraryUpdate, GetAllInfoForLibrary) are
+        name-keyed: if the name resolves, those calls succeed regardless of which copy loaded.
+        """
+        return library_name in LibraryRegistry.list_libraries()
 
     async def load_metadata_for_all_libraries_request(
         self,
@@ -1422,6 +1437,7 @@ class LibraryManager(EngineScoped):
                         git_remote=None,
                         git_ref=None,
                         enabled=True,
+                        is_registered=self._is_library_name_registered(scan_result.library_schema.name),
                         result_details=scan_result.result_details,
                     )
                 # else: Keep the load failure result
@@ -1583,6 +1599,7 @@ class LibraryManager(EngineScoped):
             git_remote=git_remote,
             git_ref=git_ref,
             enabled=True,
+            is_registered=self._is_library_name_registered(library_schema.name),
             result_details=details,
         )
 
@@ -3047,27 +3064,30 @@ class LibraryManager(EngineScoped):
         details = f"Successfully unloaded (and unregistered) library '{request.library_name}'."
         return UnloadLibraryFromRegistryResultSuccess(result_details=details)
 
-    def get_all_info_for_all_libraries_request(self, request: GetAllInfoForAllLibrariesRequest) -> ResultPayload:  # noqa: ARG002
+    async def get_all_info_for_all_libraries_request(self, request: GetAllInfoForAllLibrariesRequest) -> ResultPayload:  # noqa: ARG002
         libraries = LibraryRegistry.list_libraries()
 
         try:
-            # Create a mapping of library name to all its info.
-            library_name_to_all_info = {}
-
-            for library_name in libraries:
-                library_all_info_request = GetAllInfoForLibraryRequest(library=library_name)
-                library_all_info_result = self.get_all_info_for_library_request(library_all_info_request)
-
-                if not library_all_info_result.succeeded():
-                    details = f"Attempted to get all info for all libraries, but failed when getting all info for library named '{library_name}'."
-                    return GetAllInfoForAllLibrariesResultFailure(result_details=details)
-
-                library_all_info_success = cast("GetAllInfoForLibraryResultSuccess", library_all_info_result)
-
-                library_name_to_all_info[library_name] = library_all_info_success
+            # Each library's info is independent, and the per-library handler blocks on
+            # reading widget bundles, so gather rather than walking them one at a time.
+            library_all_info_results = await asyncio.gather(
+                *(
+                    self.get_all_info_for_library_request(GetAllInfoForLibraryRequest(library=library_name))
+                    for library_name in libraries
+                )
+            )
         except Exception as err:
             details = f"Attempted to get all info for all libraries. Encountered error {err}."
             return GetAllInfoForAllLibrariesResultFailure(result_details=details)
+
+        # Create a mapping of library name to all its info.
+        library_name_to_all_info = {}
+        for library_name, library_all_info_result in zip(libraries, library_all_info_results, strict=True):
+            if not library_all_info_result.succeeded():
+                details = f"Attempted to get all info for all libraries, but failed when getting all info for library named '{library_name}'."
+                return GetAllInfoForAllLibrariesResultFailure(result_details=details)
+
+            library_name_to_all_info[library_name] = cast("GetAllInfoForLibraryResultSuccess", library_all_info_result)
 
         # We're home free now
         details = "Successfully retrieved all info for all libraries."
@@ -3079,11 +3099,23 @@ class LibraryManager(EngineScoped):
     async def on_get_all_info_for_all_libraries_request(
         self, request: GetAllInfoForAllLibrariesRequest
     ) -> ResultPayload:
-        """Async handler for GetAllInfoForAllLibrariesRequest that waits for library loading to complete."""
+        """Registered entry point: hold the caller until any in-flight reload finishes."""
         await self._libraries_loading_complete.wait()
-        return await asyncio.to_thread(self.get_all_info_for_all_libraries_request, request)
+        return await self.get_all_info_for_all_libraries_request(request)
 
-    def get_all_info_for_library_request(self, request: GetAllInfoForLibraryRequest) -> ResultPayload:  # noqa: PLR0911, PLR0912, PLR0915, C901
+    async def on_get_all_info_for_library_request(self, request: GetAllInfoForLibraryRequest) -> ResultPayload:
+        """Registered entry point: hold the caller until any in-flight reload finishes.
+
+        Without the wait, a request arriving mid-reload reports the library as
+        unregistered even though the reload re-registers it moments later.
+
+        The gate is held here rather than inside the handler so an internal caller cannot
+        wait on a reload it is running inside.
+        """
+        await self._libraries_loading_complete.wait()
+        return await self.get_all_info_for_library_request(request)
+
+    async def get_all_info_for_library_request(self, request: GetAllInfoForLibraryRequest) -> ResultPayload:  # noqa: PLR0911
         # Does this library exist?
         try:
             library = LibraryRegistry.get_library(name=request.library)
@@ -3143,47 +3175,12 @@ class LibraryManager(EngineScoped):
             # Put it into the map.
             node_type_name_to_node_metadata_details[node_type_name] = node_metadata_result_success
 
-        # Build widget info list if the library has widgets
+        # Build widget info list if the library has widgets. Hashing reads every bundle
+        # off disk, the only blocking work in this handler, so it runs in a thread.
         widgets_info: list[WidgetInfo] | None = None
         library_data = library.get_library_data()
         if library_data.widgets:
-            logger.debug(
-                "Library '%s' has %d widget(s), building widget info",
-                request.library,
-                len(library_data.widgets),
-            )
-            # Get the static server base URL for constructing absolute bundle URLs
-            static_server_base_url = self.engine.static_files_manager.static_server_base_url
-            # Get the library directory so we can hash each bundle file
-            library_info_for_path = self.get_library_info_by_library_name(request.library)
-            library_dir = Path(library_info_for_path.library_path).parent if library_info_for_path is not None else None
-            widgets_info = []
-            for widget_def in library_data.widgets:
-                # Construct the full URL for this widget
-                # The frontend will fetch from: {static_server_base_url}/api/libraries/{library_name}/widgets/{path}
-                base_url = f"{static_server_base_url}/api/libraries/{request.library}/widgets/{widget_def.path}"
-                # Append a content hash so browsers re-fetch when the bundle file changes
-                try:
-                    if library_dir is not None:
-                        content_hash = hashlib.sha256((library_dir / widget_def.path).read_bytes()).hexdigest()[:8]
-                        bundle_url = f"{base_url}?v={content_hash}"
-                    else:
-                        bundle_url = base_url
-                except OSError:
-                    bundle_url = base_url
-                logger.debug(
-                    "Widget '%s' from library '%s': bundle_url=%s",
-                    widget_def.name,
-                    request.library,
-                    bundle_url,
-                )
-                widgets_info.append(
-                    WidgetInfo(
-                        name=widget_def.name,
-                        bundle_url=bundle_url,
-                        description=widget_def.description,
-                    )
-                )
+            widgets_info = await asyncio.to_thread(self._build_widget_info, request.library, library_data.widgets)
 
         details = f"Successfully got all library info for a Library named '{request.library}'."
         result = GetAllInfoForLibraryResultSuccess(
@@ -3194,6 +3191,42 @@ class LibraryManager(EngineScoped):
             result_details=details,
         )
         return result
+
+    def _build_widget_info(self, library_name: str, widget_defs: Sequence[WidgetDefinition]) -> list[WidgetInfo]:
+        """Resolve each widget bundle to a cache-busting URL.
+
+        Blocking: reads and hashes every bundle file. Callers run this off the event loop.
+        """
+        logger.debug("Library '%s' has %d widget(s), building widget info", library_name, len(widget_defs))
+        # Get the static server base URL for constructing absolute bundle URLs
+        static_server_base_url = self.engine.static_files_manager.static_server_base_url
+        # Get the library directory so we can hash each bundle file
+        library_info_for_path = self.get_library_info_by_library_name(library_name)
+        library_dir = Path(library_info_for_path.library_path).parent if library_info_for_path is not None else None
+
+        widgets_info = []
+        for widget_def in widget_defs:
+            # Construct the full URL for this widget
+            # The frontend will fetch from: {static_server_base_url}/api/libraries/{library_name}/widgets/{path}
+            base_url = f"{static_server_base_url}/api/libraries/{library_name}/widgets/{widget_def.path}"
+            # Append a content hash so browsers re-fetch when the bundle file changes
+            try:
+                if library_dir is not None:
+                    content_hash = hashlib.sha256((library_dir / widget_def.path).read_bytes()).hexdigest()[:8]
+                    bundle_url = f"{base_url}?v={content_hash}"
+                else:
+                    bundle_url = base_url
+            except OSError:
+                bundle_url = base_url
+            logger.debug("Widget '%s' from library '%s': bundle_url=%s", widget_def.name, library_name, bundle_url)
+            widgets_info.append(
+                WidgetInfo(
+                    name=widget_def.name,
+                    bundle_url=bundle_url,
+                    description=widget_def.description,
+                )
+            )
+        return widgets_info
 
     def _create_stable_namespace(self, library_name: str, file_path: Path) -> str:
         """Create a stable namespace for a dynamic module.
@@ -3653,6 +3686,22 @@ class LibraryManager(EngineScoped):
                 )
             )
 
+    def _close_libraries_loading_gate(self) -> None:
+        """Close the gate that library queries wait on while the registry is being rebuilt.
+
+        Recreates the Event rather than calling .clear(): an Event created by a previous
+        asyncio.run() call raises RuntimeError when awaited from a new loop (asyncio.Event
+        objects are bound to the loop they were created on).
+
+        An already-closed gate is left alone. A reload closes the gate before it unloads
+        libraries, so by the time load_all_libraries_from_config runs there may already be
+        callers suspended on this Event; replacing it would orphan them, because the
+        matching set() would fire on a different object.
+        """
+        if not self._libraries_loading_complete.is_set():
+            return
+        self._libraries_loading_complete = asyncio.Event()
+
     async def load_all_libraries_from_config(self, target_library_names: list[str] | None = None) -> list[str]:
         """Reconcile sourced libraries, then discover and load every enabled library.
 
@@ -3666,54 +3715,54 @@ class LibraryManager(EngineScoped):
 
         Returns the reconcile failure details (empty list on success).
         """
-        # Recreate the event bound to the current event loop. Calling .clear() on an event
-        # created by a previous asyncio.run() call raises RuntimeError when awaited from
-        # the new loop (asyncio.Event objects are bound to the loop they were created on).
-        self._libraries_loading_complete = asyncio.Event()
+        # Close the gate for the duration of the rebuild. A reload has already closed it
+        # before unloading, in which case this is a no-op and its waiters are preserved.
+        # The finally below reopens it on every exit path, so "closed" always means a load
+        # is in flight on the current loop.
+        self._close_libraries_loading_gate()
+        try:
+            reconcile_failures = await self._reconcile_libraries_from_config()
 
-        reconcile_failures = await self._reconcile_libraries_from_config()
+            # Discover all available libraries (config + sandbox)
+            discover_result = await self.discover_libraries_request(DiscoverLibrariesRequest())
+            if isinstance(discover_result, DiscoverLibrariesResultFailure):
+                logger.error("Failed to discover libraries: %s", discover_result.result_details)
+                return reconcile_failures
 
-        # Discover all available libraries (config + sandbox)
-        discover_result = await self.discover_libraries_request(DiscoverLibrariesRequest())
-        if isinstance(discover_result, DiscoverLibrariesResultFailure):
-            logger.error("Failed to discover libraries: %s", discover_result.result_details)
-            self._libraries_loading_complete.set()
+            # Build list of library paths to load
+            libraries_to_load = []
+            for discovered_lib in discover_result.libraries_discovered:
+                lib_path = str(discovered_lib.path)
+                lib_info = self._library_file_path_to_info.get(lib_path)
+
+                if lib_info and lib_info.lifecycle_state != LibraryManager.LibraryLifecycleState.DISABLED:
+                    libraries_to_load.append(lib_path)
+
+            if not libraries_to_load:
+                logger.info("No libraries found in configuration.")
+                return reconcile_failures
+
+            # Calculate total libraries for progress tracking
+            total_libraries = len(libraries_to_load)
+
+            for current_library_index, lib_path in enumerate(libraries_to_load, start=1):
+                # When running as a dedicated library worker, skip libraries that don't match the target.
+                # library_name is already populated in _library_file_path_to_info from the discovery phase.
+                lib_info = self._library_file_path_to_info.get(lib_path)
+                if target_library_names is not None and (
+                    lib_info is None or lib_info.library_name not in target_library_names
+                ):
+                    continue
+
+                await self._load_and_track_library(lib_path, current_library_index, total_libraries)
+
+            # Remove any missing libraries AFTER we've loaded them for the user.
+            user_libraries_section = LIBRARIES_TO_REGISTER_KEY
+            self._remove_missing_libraries_from_config(config_category=user_libraries_section)
+
             return reconcile_failures
-
-        # Build list of library paths to load
-        libraries_to_load = []
-        for discovered_lib in discover_result.libraries_discovered:
-            lib_path = str(discovered_lib.path)
-            lib_info = self._library_file_path_to_info.get(lib_path)
-
-            if lib_info and lib_info.lifecycle_state != LibraryManager.LibraryLifecycleState.DISABLED:
-                libraries_to_load.append(lib_path)
-
-        if not libraries_to_load:
-            logger.info("No libraries found in configuration.")
+        finally:
             self._libraries_loading_complete.set()
-            return reconcile_failures
-
-        # Calculate total libraries for progress tracking
-        total_libraries = len(libraries_to_load)
-
-        for current_library_index, lib_path in enumerate(libraries_to_load, start=1):
-            # When running as a dedicated library worker, skip libraries that don't match the target.
-            # library_name is already populated in _library_file_path_to_info from the discovery phase.
-            lib_info = self._library_file_path_to_info.get(lib_path)
-            if target_library_names is not None and (
-                lib_info is None or lib_info.library_name not in target_library_names
-            ):
-                continue
-
-            await self._load_and_track_library(lib_path, current_library_index, total_libraries)
-
-        # Remove any missing libraries AFTER we've loaded them for the user.
-        user_libraries_section = LIBRARIES_TO_REGISTER_KEY
-        self._remove_missing_libraries_from_config(config_category=user_libraries_section)
-
-        self._libraries_loading_complete.set()
-        return reconcile_failures
 
     async def on_preview_project_provisioning_request(
         self, request: PreviewProjectProvisioningRequest
@@ -5497,25 +5546,44 @@ class LibraryManager(EngineScoped):
             logger.error(details)
             return ReloadAllLibrariesResultFailure(result_details=details)
 
-        for library_name in all_libraries_result.libraries:
-            unload_library_request = UnloadLibraryFromRegistryRequest(library_name=library_name)
-            unload_library_result = self.engine.handle_request(unload_library_request)
-            if not unload_library_result.succeeded():
-                details = f"When preparing to reload all libraries, failed to unload library '{library_name}'."
-                logger.error(details)
-                return ReloadAllLibrariesResultFailure(result_details=details)
+        # Close the gate before the registry is emptied, and not any earlier: the
+        # enumeration above goes through on_list_registered_libraries_request, which waits on
+        # this same gate, so closing it first deadlocks the reload against itself.
+        #
+        # A single flag cannot describe two rebuilds at once, so overlapping reloads are not
+        # supported: the second shares this Event and the first to finish reopens it.
+        self._close_libraries_loading_gate()
 
-        # Notify pre-reload callbacks (e.g. to terminate worker processes) before
-        # load_all_libraries_from_config runs so that workers can be cleanly restarted.
-        for callback in self._pre_reload_callbacks:
-            try:
-                await callback()
-            except Exception as e:
-                logger.warning("Pre-reload callback raised an exception: %s", e)
+        try:
+            for library_name in all_libraries_result.libraries:
+                unload_library_request = UnloadLibraryFromRegistryRequest(library_name=library_name)
+                unload_library_result = self.engine.handle_request(unload_library_request)
+                if not unload_library_result.succeeded():
+                    details = f"When preparing to reload all libraries, failed to unload library '{library_name}'."
+                    logger.error(details)
+                    return ReloadAllLibrariesResultFailure(result_details=details)
 
-        # Load (or reload, which should trigger a hot reload) all libraries.
-        # Pass _target_library_names so workers reload only their designated libraries.
-        reconcile_failures = await self.load_all_libraries_from_config(target_library_names=self._target_library_names)
+            # Notify pre-reload callbacks (e.g. to terminate worker processes) before
+            # load_all_libraries_from_config runs so that workers can be cleanly restarted.
+            for callback in self._pre_reload_callbacks:
+                try:
+                    await callback()
+                except Exception as e:
+                    logger.warning("Pre-reload callback raised an exception: %s", e)
+
+            # Load (or reload, which should trigger a hot reload) all libraries.
+            # Pass _target_library_names so workers reload only their designated libraries.
+            reconcile_failures = await self.load_all_libraries_from_config(
+                target_library_names=self._target_library_names
+            )
+        finally:
+            # Bailing out above (a failed unload, or a raise) would otherwise leave the gate
+            # closed and every gated query waiting for the life of the process. Only reopen a
+            # gate still closed at this point: once load_all_libraries_from_config has run,
+            # it has already reopened this one, and re-setting it could open a gate a
+            # concurrent rebuild closed after that.
+            if not self._libraries_loading_complete.is_set():
+                self._libraries_loading_complete.set()
 
         # Re-spawn workers for libraries that require them; reset_workers terminated them above.
         await self._maybe_start_workers_for_existing_session()
@@ -6081,6 +6149,11 @@ class LibraryManager(EngineScoped):
     async def check_library_update_request(self, request: CheckLibraryUpdateRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
         """Check if a library has updates available via git."""
         library_name = request.library_name
+
+        # A reload unregisters every library before re-registering them one at a time, so a
+        # check landing in that window would report a perfectly healthy library as
+        # unregistered. Wait for the rebuild to finish first.
+        await self._libraries_loading_complete.wait()
 
         # Check if the library exists
         try:

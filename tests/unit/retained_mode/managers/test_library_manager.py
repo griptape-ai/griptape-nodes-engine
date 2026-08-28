@@ -40,6 +40,7 @@ from griptape_nodes.retained_mode.events.library_events import (
     GetAllInfoForAllLibrariesRequest,
     GetAllInfoForAllLibrariesResultFailure,
     GetAllInfoForAllLibrariesResultSuccess,
+    GetAllInfoForLibraryRequest,
     InstallLibraryDependenciesRequest,
     InstallLibraryDependenciesResultFailure,
     InstallLibraryDependenciesResultSuccess,
@@ -709,6 +710,7 @@ class TestLibraryManagerRegisterLibraryFromFile:
                 git_remote=None,
                 git_ref=None,
                 enabled=True,
+                is_registered=False,
                 result_details=ResultDetails(message="Success", level=20),
             )
             mock_venv.return_value.exists.return_value = True
@@ -748,6 +750,7 @@ class TestLibraryManagerRegisterLibraryFromFile:
                     git_remote=None,
                     git_ref=None,
                     enabled=True,
+                    is_registered=False,
                     result_details=ResultDetails(message="OK", level=20),
                 ),
             ),
@@ -776,6 +779,7 @@ class TestLibraryManagerInstallLibraryDependencies:
             git_remote=None,
             git_ref=None,
             enabled=True,
+            is_registered=False,
             result_details=ResultDetails(message="OK", level=20),
         )
 
@@ -1345,7 +1349,8 @@ class TestListRegisteredLibraries:
 class TestGetAllInfoForAllLibraries:
     """Test the get_all_info_for_all_libraries_request functionality in LibraryManager."""
 
-    def test_calls_library_registry_directly(self, engine: Engine) -> None:
+    @pytest.mark.asyncio
+    async def test_calls_library_registry_directly(self, engine: Engine) -> None:
         """Test that the method reads libraries from LibraryRegistry without going through on_list_registered_libraries_request."""
         library_manager = engine.library_manager
 
@@ -1354,13 +1359,14 @@ class TestGetAllInfoForAllLibraries:
             patch.object(library_manager, "on_list_registered_libraries_request") as mock_handler,
         ):
             request = GetAllInfoForAllLibrariesRequest()
-            result = library_manager.get_all_info_for_all_libraries_request(request)
+            result = await library_manager.get_all_info_for_all_libraries_request(request)
 
         mock_list.assert_called_once()
         mock_handler.assert_not_called()
         assert isinstance(result, GetAllInfoForAllLibrariesResultSuccess)
 
-    def test_returns_failure_when_individual_library_info_fails(self, engine: Engine) -> None:
+    @pytest.mark.asyncio
+    async def test_returns_failure_when_individual_library_info_fails(self, engine: Engine) -> None:
         """Test that the method returns failure when retrieving info for a library fails."""
         library_manager = engine.library_manager
 
@@ -1369,13 +1375,39 @@ class TestGetAllInfoForAllLibraries:
 
         with (
             patch.object(LibraryRegistry, "list_libraries", return_value=["BadLib"]),
-            patch.object(library_manager, "get_all_info_for_library_request", return_value=mock_failure),
+            patch.object(library_manager, "get_all_info_for_library_request", AsyncMock(return_value=mock_failure)),
         ):
             request = GetAllInfoForAllLibrariesRequest()
-            result = library_manager.get_all_info_for_all_libraries_request(request)
+            result = await library_manager.get_all_info_for_all_libraries_request(request)
 
         assert isinstance(result, GetAllInfoForAllLibrariesResultFailure)
         assert "BadLib" in str(result.result_details)
+
+    @pytest.mark.asyncio
+    async def test_gathers_libraries_concurrently(self, engine: Engine) -> None:
+        """Per-library info is gathered, so one library's bundle reads do not serialize behind another's."""
+        library_manager = engine.library_manager
+        in_flight = 0
+        peak_in_flight = 0
+
+        async def slow_success(request: GetAllInfoForLibraryRequest) -> MagicMock:  # noqa: ARG001
+            nonlocal in_flight, peak_in_flight
+            in_flight += 1
+            peak_in_flight = max(peak_in_flight, in_flight)
+            await asyncio.sleep(0)
+            in_flight -= 1
+            success = MagicMock()
+            success.succeeded.return_value = True
+            return success
+
+        with (
+            patch.object(LibraryRegistry, "list_libraries", return_value=["LibA", "LibB", "LibC"]),
+            patch.object(library_manager, "get_all_info_for_library_request", slow_success),
+        ):
+            result = await library_manager.get_all_info_for_all_libraries_request(GetAllInfoForAllLibrariesRequest())
+
+        assert isinstance(result, GetAllInfoForAllLibrariesResultSuccess)
+        assert peak_in_flight > 1, "libraries were walked one at a time instead of gathered"
 
 
 class TestAddLibraryPathsToSysPath:

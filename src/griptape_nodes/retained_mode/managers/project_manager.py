@@ -3102,6 +3102,30 @@ class ProjectManager(EngineScoped):
             ),
         )
 
+    def _refuse_unactivatable_project(
+        self, resolved_project_id: ProjectID, project_info: ProjectInfo | None
+    ) -> SetCurrentProjectResultFailure | None:
+        """Refuse an activation that cannot establish a coherent project config layer.
+
+        Returns the failure to surface, or None when activation may proceed. Callers must
+        invoke this before touching any config layer so a refusal is side-effect free.
+        """
+        # An id with no loaded template has no project config layer to establish. Refuse
+        # rather than letting activation fall through to its system-defaults branch: that
+        # remerges with no project layer, and because merge_dicts replaces lists rather than
+        # merging them, whatever `libraries_to_register` the user layer holds becomes the
+        # engine's library set. The worker adoption path refuses unknown ids for the same
+        # reason.
+        if project_info is None:
+            details = (
+                f"Attempted to activate project '{resolved_project_id}'. Failed because no loaded "
+                f"project template has that id, so its configuration could not be established."
+            )
+            logger.error(details)
+            return SetCurrentProjectResultFailure(result_details=details)
+
+        return self._refuse_unresolvable_declared_paths(project_info)
+
     async def _activate_project(self, resolved_project_id: ProjectID) -> _ProjectActivationOutcome:
         """Establish a project's config/workspace/env layers and reload libraries.
 
@@ -3123,7 +3147,10 @@ class ProjectManager(EngineScoped):
 
         project_info = self._successfully_loaded_project_templates.get(resolved_project_id)
 
-        gate_failure = self._refuse_unresolvable_declared_paths(project_info)
+        # Both refusals run before clear_project_layers() below, so a refused activation
+        # leaves every config layer untouched: config is never left in the cleared, unmerged
+        # state, and the caller's rollback has nothing to repair.
+        gate_failure = self._refuse_unactivatable_project(resolved_project_id, project_info)
         if gate_failure is not None:
             return _ProjectActivationOutcome(failure=gate_failure, workspace_changed=False)
 
@@ -3142,6 +3169,8 @@ class ProjectManager(EngineScoped):
         # below remerge via load_project_config()/load_workspace_config()/load_configs().
         self._config_manager.clear_project_layers()
 
+        # `project_info is not None` is already guaranteed by the refusal above; it is
+        # restated here so the type checker can narrow the accesses that follow.
         if project_info is not None and project_info.project_file_path is not None:
             project_file_path = project_info.project_file_path
             project_dir = project_file_path.parent
@@ -3157,11 +3186,12 @@ class ProjectManager(EngineScoped):
             # Load workspace config layer from the resolved workspace directory.
             self._config_manager.load_workspace_config(self._config_manager.workspace_path)
         else:
-            # Switching to system defaults (a loaded template with no backing file) or an
-            # unknown project id (no loaded template): clear_project_layers() above already
-            # dropped the prior project's override and config-file paths, so reloading
-            # configs now resolves workspace_path and all config layers from defaults only,
-            # rather than leaving config in the cleared, unmerged state.
+            # Switching to system defaults: a loaded template with no backing file, so there
+            # is no project-adjacent config to layer on. clear_project_layers() above already
+            # dropped the prior project's override and config-file paths, so reloading configs
+            # now resolves workspace_path and all config layers from defaults and the user
+            # config, rather than leaving config in the cleared, unmerged state. Ids with no
+            # loaded template were refused before any layer was touched.
             self._config_manager.load_configs()
 
         # Apply the new project's environment variables to os.environ. Happens after
