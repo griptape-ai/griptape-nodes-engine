@@ -18,6 +18,7 @@ resulting clusters, but neither is imported here.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -128,3 +129,75 @@ def compute_execution_clusters(
         exec_dependencies: frozenset[str] = frozenset().union(*(deps_by_name[name] for name in members))
         clusters.append(ExecutionCluster(node_names=frozenset(members), exec_dependencies=exec_dependencies))
     return clusters
+
+
+def exec_dependencies_for_library(library_name: str) -> frozenset[str]:
+    """The execution-dependency set a library declares, empty when it declares none.
+
+    This is the placement signal: a node whose library has execution dependencies cannot
+    run its ``process`` where those dependencies are not installed.
+    """
+    # Deferred import: this module is otherwise pure, and library_registry imports widely.
+    from griptape_nodes.node_library.library_registry import LibraryRegistry
+
+    library = LibraryRegistry.get_library(library_name)
+    dependencies = library.get_library_data().metadata.dependencies
+    if dependencies is None or not dependencies.pip_dependencies_exec:
+        return frozenset()
+    return frozenset(dependencies.pip_dependencies_exec)
+
+
+@dataclass(frozen=True)
+class NodeGraphEdge:
+    """A dataflow edge between two live nodes, as the graph layer describes it."""
+
+    source_node_name: str
+    source_parameter: str
+    target_node_name: str
+    target_parameter: str
+
+
+def clusters_for_nodes(
+    nodes: list[Any],
+    edges: list[NodeGraphEdge],
+) -> list[ExecutionCluster]:
+    """Compute execution clusters from live BaseNode instances and their dataflow edges.
+
+    The adapter between real graphs and the pure computation: each node's
+    execution-dependency set comes from its library (``metadata["library"]``), and an
+    edge is unserializable when the source node's output parameter is marked
+    ``serializable=False`` -- the producer's declaration governs, since it is the
+    producer's value that would have to cross a boundary.
+
+    Args:
+        nodes: Live BaseNode instances (typed as Any to keep this module import-light;
+            they need ``.name``, ``.metadata``, and ``.get_parameter_by_name``).
+        edges: Dataflow edges between those nodes.
+    """
+    cluster_nodes = []
+    for node in nodes:
+        library_name = node.metadata.get("library", "")
+        exec_dependencies = exec_dependencies_for_library(library_name) if library_name else frozenset()
+        cluster_nodes.append(ClusterNode(name=node.name, exec_dependencies=exec_dependencies))
+
+    nodes_by_name = {node.name: node for node in nodes}
+    cluster_edges = []
+    for edge in edges:
+        source = nodes_by_name.get(edge.source_node_name)
+        if source is None:
+            msg = (
+                f"Attempted to compute execution clusters, but edge source "
+                f"{edge.source_node_name!r} is not among the given nodes."
+            )
+            raise ValueError(msg)
+        parameter = source.get_parameter_by_name(edge.source_parameter)
+        serializable = parameter.serializable if parameter is not None else True
+        cluster_edges.append(
+            ClusterEdge(
+                source=edge.source_node_name,
+                target=edge.target_node_name,
+                serializable=serializable,
+            )
+        )
+
+    return compute_execution_clusters(cluster_nodes, cluster_edges)
