@@ -38,9 +38,3 @@ def isolate_user_config() -> Generator[Path, None, None]:
 def engine() -> Engine:
     """Provide the engine for this test, building it on first use."""
     return current_engine()
-
-
-@pytest.fixture
-def griptape_nodes() -> Engine:
-    """Alias of `engine`, named for the tests written against the old facade."""
-    return current_engine()

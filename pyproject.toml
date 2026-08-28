@@ -134,7 +134,13 @@ ignore = [
 "griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes".msg = "Engine-internal code should take an injected Engine (see griptape_nodes.retained_mode.engine) and reach peers via self.engine, not the process-wide GriptapeNodes facade. The facade exists for saved workflow files, node libraries, and process entry points; those are allowlisted in per-file-ignores."
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["S101", "D104", "TID251"]
+"tests/*" = ["S101", "D104"]
+# Fixture node libraries and saved workflow files under the e2e suite. Node libraries and
+# generated workflows are the intended facade audience, exactly as the ban message says.
+"tests/e2e/fixtures/**" = ["TID251"]
+# These two assert the facade's own behavior, so they have to name it.
+"tests/unit/retained_mode/test_engine.py" = ["TID251"]
+"tests/unit/retained_mode/managers/test_griptape_nodes.py" = ["TID251"]
 "libraries/**/tests/**" = ["S101", "D104", "INP001"]
 "src/griptape_nodes/retained_mode/events/*" = ["TC001"]
 # Example libraries shipped with the Advanced Libraries doc. Authors copy these files
