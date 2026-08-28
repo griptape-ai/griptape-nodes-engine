@@ -4141,7 +4141,9 @@ class ProjectManager(EngineScoped):
         required_secret_keys = self._collect_required_secret_keys()
 
         try:
-            result = package_project_to_zip(project_info, adjacent_config, destination_path, required_secret_keys)
+            result = package_project_to_zip(
+                self.engine, project_info, adjacent_config, destination_path, required_secret_keys
+            )
         except (RuntimeError, OSError) as err:
             return ExportProjectResultFailure(
                 result_details=(
