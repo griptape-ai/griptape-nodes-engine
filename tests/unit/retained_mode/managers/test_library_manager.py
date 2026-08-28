@@ -2197,10 +2197,9 @@ class TestInstalledLibraryVersion:
     def _config_manager_for(libraries_dir: Path) -> MagicMock:
         config_manager = MagicMock()
         config_manager.resolved_libraries_root.return_value = libraries_dir
-        # find_files_recursive resolves `discovery_max_depth` through this same
-        # config manager (via engine.config_manager), so it needs a real
-        # int here or the recursive walk's depth comparison blows up on a MagicMock.
-        config_manager.get_config_value.return_value = DEFAULT_MAX_SEARCH_DEPTH
+        # find_files_recursive takes its depth ceiling from `config_manager.discovery_max_depth`,
+        # so it needs a real int here or the recursive walk's depth comparison blows up on a MagicMock.
+        config_manager.discovery_max_depth = DEFAULT_MAX_SEARCH_DEPTH
         return config_manager
 
     @pytest.mark.asyncio
@@ -2341,6 +2340,7 @@ class TestInstalledDownloadVersion:
         # libraries_directory must never be read.
         live_config.get_config_value.return_value = str(tmp_path / "live" / "libraries")
         live_config.workspace_path = str(tmp_path / "live")
+        live_config.discovery_max_depth = DEFAULT_MAX_SEARCH_DEPTH
         with patch.object(engine, "_config_manager", live_config):
             assert await library_manager._installed_download_version(download, target_libs) == "3.3.0"
         live_config.get_config_value.assert_not_called()

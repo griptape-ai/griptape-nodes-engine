@@ -3974,8 +3974,7 @@ class LibraryManager(EngineScoped):
             return f"Failed to provision library '{library_label}' from '{git_url}': {download_result.result_details}"
         return None
 
-    @staticmethod
-    async def _installed_library_manifest_path(library_name: str, libraries_path: Path) -> Path | None:
+    async def _installed_library_manifest_path(self, library_name: str, libraries_path: Path) -> Path | None:
         """Return the on-disk manifest path for a provisioned library by name, or None.
 
         Scans the manifests under `libraries_directory` (where reconcile clones
@@ -3997,7 +3996,11 @@ class LibraryManager(EngineScoped):
         directory before re-cloning), guaranteeing the file the planner reasoned
         about is exactly the file overwrite targets.
         """
-        for manifest_path in await find_files_recursive(libraries_path, LibraryManager.LIBRARY_CONFIG_GLOB_PATTERN):
+        for manifest_path in await find_files_recursive(
+            libraries_path,
+            LibraryManager.LIBRARY_CONFIG_GLOB_PATTERN,
+            max_depth=self.engine.config_manager.discovery_max_depth,
+        ):
             try:
                 content = manifest_path.read_text(encoding="utf-8")
                 manifest = json.loads(content)
@@ -4008,19 +4011,19 @@ class LibraryManager(EngineScoped):
 
         return None
 
-    @staticmethod
-    async def _installed_library_version(library_name: str, libraries_path: Path) -> str | None:
+    async def _installed_library_version(self, library_name: str, libraries_path: Path) -> str | None:
         """Return the on-disk version of a library by manifest name, or None when absent.
 
         Locates the provisioned manifest via `_installed_library_manifest_path`
         (the shared resolver), then reads `metadata.library_version`. None when no
         manifest matches or the version is absent/unreadable.
         """
-        manifest_path = await LibraryManager._installed_library_manifest_path(library_name, libraries_path)
+        manifest_path = await self._installed_library_manifest_path(library_name, libraries_path)
         return LibraryManager._library_version_from_manifest(manifest_path)
 
-    @staticmethod
-    async def _installed_manifest_path_for_download(download: LibraryDownload, libraries_path: Path) -> Path | None:
+    async def _installed_manifest_path_for_download(
+        self, download: LibraryDownload, libraries_path: Path
+    ) -> Path | None:
         """Return the on-disk manifest path for a download entry, or None when absent.
 
         Locates the installed copy the same way the download handler lands it:
@@ -4036,14 +4039,13 @@ class LibraryManager(EngineScoped):
         libraries root (correct post-activation).
         """
         if download.name is not None:
-            return await LibraryManager._installed_library_manifest_path(download.name, libraries_path)
+            return await self._installed_library_manifest_path(download.name, libraries_path)
 
         repo_name = extract_repo_name_from_url(download.git_url)
         repo_directory = libraries_path / repo_name
         return find_file_in_directory(repo_directory, LibraryManager.LIBRARY_CONFIG_GLOB_PATTERN)
 
-    @staticmethod
-    async def _installed_download_version(download: LibraryDownload, libraries_path: Path) -> str | None:
+    async def _installed_download_version(self, download: LibraryDownload, libraries_path: Path) -> str | None:
         """Return the on-disk version for a download entry, or None when absent.
 
         Resolves the installed manifest via `_installed_manifest_path_for_download`
@@ -4052,7 +4054,7 @@ class LibraryManager(EngineScoped):
         libraries directory through for the preview, or the live config's
         resolved root for the real reconcile.
         """
-        manifest_path = await LibraryManager._installed_manifest_path_for_download(download, libraries_path)
+        manifest_path = await self._installed_manifest_path_for_download(download, libraries_path)
         return LibraryManager._library_version_from_manifest(manifest_path)
 
     @staticmethod
@@ -5937,7 +5939,11 @@ class LibraryManager(EngineScoped):
                 # Recursively find library files. find_files_recursive skips hidden
                 # directories and bounds recursion depth so a deep or symlink-looped
                 # tree can't stall the boot scan.
-                for lib_path in await find_files_recursive(path, LibraryManager.LIBRARY_CONFIG_GLOB_PATTERN):
+                for lib_path in await find_files_recursive(
+                    path,
+                    LibraryManager.LIBRARY_CONFIG_GLOB_PATTERN,
+                    max_depth=self.engine.config_manager.discovery_max_depth,
+                ):
                     if lib_path not in seen_paths:
                         seen_paths.add(lib_path)
                         discovered_entries.append(

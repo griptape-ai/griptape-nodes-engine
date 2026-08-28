@@ -1,10 +1,12 @@
 """Workflow metadata collection for files saved through the retained mode API."""
 
+from __future__ import annotations
+
 import base64
 import logging
 import pickle
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from griptape_nodes.exe_types.core_types import ParameterMode
 from griptape_nodes.exe_types.node_types import BaseNode
@@ -18,7 +20,9 @@ from griptape_nodes.retained_mode.events.node_events import (
     SerializeNodeToCommandsRequest,
     SerializeNodeToCommandsResultSuccess,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.engine import Engine
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -29,11 +33,12 @@ METADATA_NAMESPACE = "gtn_"
 FLOW_COMMANDS_KEY = f"{METADATA_NAMESPACE}flow_commands"
 
 
-def _serialize_node(node_name: str) -> str | None:
+def _serialize_node(node_name: str, engine: Engine) -> str | None:
     """Serialize a specific node to JSON commands.
 
     Args:
         node_name: Name of the node to serialize
+        engine: The engine whose request bus performs the serialization
 
     Returns:
         JSON string of serialized node commands, or None if serialization fails
@@ -41,7 +46,7 @@ def _serialize_node(node_name: str) -> str | None:
     serialize_request = SerializeNodeToCommandsRequest(
         node_name=node_name,
     )
-    serialize_result = GriptapeNodes.handle_request(serialize_request)
+    serialize_result = engine.handle_request(serialize_request)
 
     if isinstance(serialize_result, SerializeNodeToCommandsResultSuccess):
         # Convert to dict and then to JSON string
@@ -50,17 +55,18 @@ def _serialize_node(node_name: str) -> str | None:
     return None
 
 
-def _serialize_flow(flow_name: str | None = None) -> str | None:
+def _serialize_flow(engine: Engine, flow_name: str | None = None) -> str | None:
     """Serialize a flow to pickle + base64 encoded commands.
 
     Args:
+        engine: The engine whose request bus and context manager perform the serialization
         flow_name: Name of the flow to serialize (None for current context flow)
 
     Returns:
         Base64-encoded pickle string of serialized flow commands, or None if serialization fails
     """
     # Validation: Check if we have a flow context
-    if flow_name is None and not GriptapeNodes.ContextManager().has_current_flow():
+    if flow_name is None and not engine.context_manager.has_current_flow():
         logger.warning("Cannot serialize flow: no current flow context available")
         return None
 
@@ -69,7 +75,7 @@ def _serialize_flow(flow_name: str | None = None) -> str | None:
         flow_name=flow_name,
         include_create_flow_command=False,
     )
-    serialize_result = GriptapeNodes.handle_request(serialize_request)
+    serialize_result = engine.handle_request(serialize_request)
 
     # Validation: Check if serialization succeeded
     if not isinstance(serialize_result, SerializeFlowToCommandsResultSuccess):
@@ -90,17 +96,18 @@ def _serialize_flow(flow_name: str | None = None) -> str | None:
         return encoded_data
 
 
-def _collect_parameter_values(node_name: str) -> dict[str, Any] | None:
+def _collect_parameter_values(node_name: str, engine: Engine) -> dict[str, Any] | None:
     """Collect current parameter values from a node's INPUT and PROPERTY parameters.
 
     Args:
         node_name: Name of the node to collect parameters from
+        engine: The engine whose object manager resolves the node
 
     Returns:
         Dictionary of parameter names to serialized values, or None if collection fails
     """
     # Failure case: Attempt to get node object
-    obj_mgr = GriptapeNodes.ObjectManager()
+    obj_mgr = engine.object_manager
     try:
         node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
     except Exception as e:
@@ -169,11 +176,14 @@ def _collect_workflow_details(workflow_name: str, metadata: dict[str, str]) -> N
         pass
 
 
-def collect_workflow_metadata() -> dict[str, str]:
+def collect_workflow_metadata(engine: Engine) -> dict[str, str]:
     """Collect available workflow metadata from current execution context.
 
-    Gathers metadata from GriptapeNodes ContextManager and WorkflowRegistry.
+    Gathers metadata from the engine's ContextManager and WorkflowRegistry.
     All keys are prefixed with METADATA_NAMESPACE to avoid conflicts.
+
+    Args:
+        engine: The engine whose context manager and flow manager supply the metadata.
 
     Returns:
         Dictionary of metadata key-value pairs, may be empty if no context available
@@ -184,7 +194,7 @@ def collect_workflow_metadata() -> dict[str, str]:
     metadata[f"{METADATA_NAMESPACE}saved_at"] = datetime.now(UTC).isoformat()
 
     # Get context manager
-    context_manager = GriptapeNodes.ContextManager()
+    context_manager = engine.context_manager
 
     # Check workflow context
     if not context_manager.has_current_workflow():
@@ -205,7 +215,7 @@ def collect_workflow_metadata() -> dict[str, str]:
             metadata[f"{METADATA_NAMESPACE}flow_name"] = flow.name
 
             # Get resolving nodes (currently running nodes) from flow_state
-            flow_manager = GriptapeNodes.FlowManager()
+            flow_manager = engine.flow_manager
             _, resolving_nodes, _ = flow_manager.flow_state(flow)
 
             if resolving_nodes:
@@ -214,13 +224,13 @@ def collect_workflow_metadata() -> dict[str, str]:
 
             # Serialize the entire current flow to commands
             # This captures all nodes, connections, and parameter values in the flow
-            flow_commands = _serialize_flow()
+            flow_commands = _serialize_flow(engine)
             if flow_commands:
                 metadata[FLOW_COMMANDS_KEY] = flow_commands
 
             if resolving_nodes:
                 # Collect parameter values from the first resolving node
-                parameter_values = _collect_parameter_values(resolving_nodes[0])
+                parameter_values = _collect_parameter_values(resolving_nodes[0], engine)
                 if parameter_values:
                     # Store each parameter as its own metadata key
                     for param_name, param_value in parameter_values.items():

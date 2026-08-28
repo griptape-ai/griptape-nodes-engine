@@ -32,10 +32,11 @@ from griptape_nodes.retained_mode.events.project_events import (
     GetSituationRequest,
     GetSituationResultSuccess,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from griptape_nodes.retained_mode.engine import Engine
 
 
 logger = logging.getLogger("griptape_nodes")
@@ -65,7 +66,7 @@ class SidecarContent(BaseModel):
     situation: SituationMetadata | None = None
 
 
-def _resolve_sidecar_path(file_path: Path) -> Path:
+def _resolve_sidecar_path(file_path: Path, engine: Engine) -> Path:
     """Resolve the sidecar path for a given file via the project template system.
 
     Uses the 'save_griptape_nodes_metadata' situation from the current project template to determine
@@ -74,6 +75,7 @@ def _resolve_sidecar_path(file_path: Path) -> Path:
 
     Args:
         file_path: Absolute path to the saved file.
+        engine: The engine whose request bus resolves the project and situation.
 
     Returns:
         Absolute path to the sidecar JSON file.
@@ -81,7 +83,7 @@ def _resolve_sidecar_path(file_path: Path) -> Path:
     Raises:
         RuntimeError: If project not loaded, situation not found, or path resolution fails.
     """
-    get_project_result = GriptapeNodes.handle_request(GetCurrentProjectRequest())
+    get_project_result = engine.handle_request(GetCurrentProjectRequest())
     if not isinstance(get_project_result, GetCurrentProjectResultSuccess):
         msg = "No current project loaded"
         raise RuntimeError(msg)  # noqa: TRY004
@@ -89,7 +91,7 @@ def _resolve_sidecar_path(file_path: Path) -> Path:
     workspace_dir = get_project_result.project_info.project_base_dir
     decomposed = decompose_source_path(file_path, workspace_dir)
 
-    get_situation_result = GriptapeNodes.handle_request(
+    get_situation_result = engine.handle_request(
         GetSituationRequest(situation_name=BuiltInSituation.SAVE_GRIPTAPE_NODES_METADATA)
     )
     if not isinstance(get_situation_result, GetSituationResultSuccess):
@@ -102,7 +104,7 @@ def _resolve_sidecar_path(file_path: Path) -> Path:
 
     situation = get_situation_result.situation
     parsed_macro = ParsedMacro(situation.macro)
-    path_result = GriptapeNodes.handle_request(
+    path_result = engine.handle_request(
         GetPathForMacroRequest(
             parsed_macro=parsed_macro,
             variables=variables,
@@ -115,7 +117,7 @@ def _resolve_sidecar_path(file_path: Path) -> Path:
     return path_result.absolute_path
 
 
-def write_sidecar(file_path: Path, metadata: SidecarContent | None) -> None:
+def write_sidecar(file_path: Path, metadata: SidecarContent | None, engine: Engine) -> None:
     """Write a sidecar JSON metadata file for the saved file.
 
     Resolves the sidecar path via the project template's 'save_griptape_nodes_metadata' situation,
@@ -126,9 +128,10 @@ def write_sidecar(file_path: Path, metadata: SidecarContent | None) -> None:
     Args:
         file_path: Absolute path to the file that was just saved.
         metadata: Caller-provided situation and variable context (may be None).
+        engine: The engine whose request bus resolves the sidecar path.
     """
     try:
-        sidecar_path = _resolve_sidecar_path(file_path)
+        sidecar_path = _resolve_sidecar_path(file_path, engine)
         content = metadata or SidecarContent()
         output = {
             "schema_version": SCHEMA_VERSION,
