@@ -169,6 +169,12 @@ ignore = [
 # `retained_mode.publishing` re-export. Nothing inside src/ constructs it, so there is no Engine
 # to hand it and it belongs on this side of the split.
 "src/griptape_nodes/retained_mode/publishing/workflow_packager.py" = ["TID251"]
+# The File/Directory/FileSequence/ProjectFileDestination API is what node libraries import to
+# read and write files: the shipped libraries construct `File` in ~280 places and
+# `ProjectFileDestination` in ~50, and docs/development/custom_nodes/examples.md teaches both.
+# A library has no Engine to pass to those constructors, so the facade read inside them is the
+# engine lookup the caller cannot do itself.
+"src/griptape_nodes/files/**" = ["TID251"]
 #
 # Group 2 -- not yet migrated. Each of these should eventually receive an Engine instead.
 # Deleting an entry from this list is the definition of done; do not add new entries.
@@ -177,7 +183,6 @@ ignore = [
 # yet, so drivers cannot come off this list until exe_types does.
 "src/griptape_nodes/drivers/**" = ["TID251"]
 "src/griptape_nodes/exe_types/**" = ["TID251"]
-"src/griptape_nodes/files/**" = ["TID251"]
 # WorkflowRegistry is still a process-global fake singleton reaching the facade for config.
 # Making it engine-owned is its own change, since it alters what node libraries import.
 "src/griptape_nodes/node_library/workflow_registry.py" = ["TID251"]
