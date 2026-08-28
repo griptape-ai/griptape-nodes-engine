@@ -1,9 +1,10 @@
+from __future__ import annotations
+
 import logging
 import os
-from collections.abc import Callable
 from http import HTTPStatus
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -12,8 +13,13 @@ from griptape_nodes.drivers.cloud_credentials import resolve_cloud_credential
 from griptape_nodes.drivers.storage.base_storage_driver import BaseStorageDriver, CreateSignedUploadUrlResponse
 from griptape_nodes.files.path_utils import get_workspace_relative_path
 from griptape_nodes.retained_mode.events.os_events import ExistingFilePolicy
-from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import SidecarContent
 from griptape_nodes.utils.http_utils import request_with_retry, retry_on_transient_error
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import SidecarContent
+    from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -23,7 +29,7 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
 
     def __init__(
         self,
-        workspace_directory: Path,
+        config_manager: ConfigManager,
         *,
         bucket_id: str,
         api_key: str | None = None,
@@ -32,13 +38,13 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
         """Initialize the GriptapeCloudStorageDriver.
 
         Args:
-            workspace_directory: The base workspace directory path.
+            config_manager: Reports the current workspace directory.
             bucket_id: The ID of the bucket to use. Required.
             api_key: The credential for authentication. If not provided, it is resolved from the Griptape Nodes License, then "GT_CLOUD_API_KEY".
             static_files_directory: The directory path prefix for static files. If provided, file names will be prefixed with this path.
             **kwargs: Additional keyword arguments including base_url and headers.
         """
-        super().__init__(workspace_directory)
+        super().__init__(config_manager)
 
         self.base_url = kwargs.get("base_url") or os.environ.get("GT_CLOUD_BASE_URL", "https://cloud.griptape.ai")
         self.api_key = api_key if api_key is not None else resolve_cloud_credential()
