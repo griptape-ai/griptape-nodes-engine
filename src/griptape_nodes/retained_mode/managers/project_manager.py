@@ -3067,8 +3067,6 @@ class ProjectManager(EngineScoped):
         # re-derives the same project), so emit only post-init and only when the
         # project actually changed. A worker that boots like the orchestrator has the
         # same registry, so the id resolves there too.
-        # Published, not broadcast: publishing reaches in-process listeners and every IPC
-        # transport, so connected clients see the switch too.
         if self._initialization_complete and previous_project_id != resolved_project_id:
             self._event_manager.put_event(AppEvent(payload=CurrentProjectChanged(project_id=resolved_project_id)))
         return result
