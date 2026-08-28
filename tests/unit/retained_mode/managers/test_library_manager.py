@@ -798,6 +798,7 @@ class TestLibraryManagerInstallLibraryDependencies:
         schema.metadata.library_version = "1.0.0"
         schema.metadata.dependencies.pip_dependencies = []
         schema.metadata.dependencies.pip_install_flags = []
+        schema.metadata.dependencies.pip_dependencies_exec = None
 
         with (
             patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
@@ -865,6 +866,7 @@ class TestLibraryManagerInstallLibraryDependencies:
         schema.metadata.library_version = "1.0.0"
         schema.metadata.dependencies.pip_dependencies = []
         schema.metadata.dependencies.pip_install_flags = []
+        schema.metadata.dependencies.pip_dependencies_exec = None
 
         with (
             patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
@@ -887,6 +889,7 @@ class TestLibraryManagerInstallLibraryDependencies:
         schema.metadata.library_version = "1.0.0"
         schema.metadata.dependencies.pip_dependencies = []
         schema.metadata.dependencies.pip_install_flags = []
+        schema.metadata.dependencies.pip_dependencies_exec = None
 
         with (
             patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
@@ -916,6 +919,7 @@ class TestLibraryManagerInstallLibraryDependencies:
         schema.metadata.library_version = "1.0.0"
         schema.metadata.dependencies.pip_dependencies = []
         schema.metadata.dependencies.pip_install_flags = []
+        schema.metadata.dependencies.pip_dependencies_exec = None
 
         with (
             patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
@@ -952,6 +956,7 @@ class TestLibraryManagerInstallLibraryDependencies:
         schema.metadata.library_version = "1.0.0"
         schema.metadata.dependencies.pip_dependencies = ["a==1"]
         schema.metadata.dependencies.pip_install_flags = []
+        schema.metadata.dependencies.pip_dependencies_exec = None
 
         with (
             patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
@@ -992,6 +997,7 @@ class TestLibraryManagerInstallLibraryDependencies:
         schema.metadata.library_version = "1.0.0"
         schema.metadata.dependencies.pip_dependencies = ["a==1"]
         schema.metadata.dependencies.pip_install_flags = []
+        schema.metadata.dependencies.pip_dependencies_exec = None
         expected_attempts = 2
 
         with (
@@ -1039,6 +1045,7 @@ class TestLibraryManagerInstallLibraryDependencies:
         schema.metadata.library_version = "1.0.0"
         schema.metadata.dependencies.pip_dependencies = ["a==1"]
         schema.metadata.dependencies.pip_install_flags = []
+        schema.metadata.dependencies.pip_dependencies_exec = None
 
         with (
             patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
@@ -1079,6 +1086,7 @@ class TestLibraryManagerInstallLibraryDependencies:
         schema.metadata.library_version = "1.0.0"
         schema.metadata.dependencies.pip_dependencies = ["a==1"]
         schema.metadata.dependencies.pip_install_flags = []
+        schema.metadata.dependencies.pip_dependencies_exec = None
         expected_attempts = 2
 
         with (

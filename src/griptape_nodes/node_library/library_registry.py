@@ -62,9 +62,29 @@ class LibraryNameAndVersion(NamedTuple):
 
 
 class Dependencies(BaseModel):
-    """Pip packages that need to be installed for this library."""
+    """Pip packages that need to be installed for this library.
+
+    Dependencies are declared in two sets, because a library needs far less installed to be
+    *edited* than to be *run*:
+
+    - ``pip_dependencies`` (edit-time): everything needed to import the library's node modules
+      and instantiate its nodes. The orchestrator installs these, so they are what the editor,
+      workflow loading, and parameter/trait behavior depend on. Keep this set light.
+    - ``pip_dependencies_exec`` (execution-time): the heavy packages only ``process`` needs
+      (torch, diffusers, and friends). These are installed into a separate environment and are
+      only on ``sys.path`` where nodes actually execute, so they never enter the orchestrator's
+      import path and cannot collide with another library's pins there.
+
+    A library that declares no execution dependencies behaves exactly as it always has:
+    everything is edit-time, and it runs in the orchestrator.
+
+    ``pip_install_flags`` applies to both installs, since flags in practice configure where
+    packages come from (index URLs, ``--find-links``, backend selection) rather than which set
+    is being installed.
+    """
 
     pip_dependencies: list[str] | None = None
+    pip_dependencies_exec: list[str] | None = None
     pip_install_flags: list[str] | None = None
 
 
@@ -253,7 +273,9 @@ class LibrarySchema(BaseModel):
     library itself.
     """
 
-    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.11.0"
+    # 0.12.0 added Dependencies.pip_dependencies_exec. Older manifests still validate: the
+    # field is optional, and its absence means every dependency is edit-time.
+    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.12.0"
 
     name: str
     library_schema_version: str
