@@ -50,6 +50,7 @@ from griptape_nodes.retained_mode.events.library_events import (
 if TYPE_CHECKING:
     from collections.abc import Generator
 
+    from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload
     from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 # A library the engine had registered before the reload and re-registers after it.
@@ -219,11 +220,12 @@ class TestQueriesDuringLibraryReload:
         LibraryRegistry.generate_new_library(library_data=_schema(LIBRARY_NAME))
 
         failed_unload = ReloadAllLibrariesResultFailure(result_details="unload failed")
+        real_handle_request = griptape_nodes.handle_request
 
-        def refuse_unload(request: object) -> object:
+        def refuse_unload(request: RequestPayload) -> ResultPayload:
             if isinstance(request, UnloadLibraryFromRegistryRequest):
                 return failed_unload
-            return griptape_nodes.handle_request(request)
+            return real_handle_request(request)
 
         with (
             patch.object(library_manager, "load_all_libraries_from_config", AsyncMock(return_value=[])) as load_all,
