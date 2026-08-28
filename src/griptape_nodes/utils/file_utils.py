@@ -9,37 +9,16 @@ from dataclasses import dataclass
 from fnmatch import fnmatch
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import anyio
 import anyio.to_thread
 
-from griptape_nodes.retained_mode.managers.settings import DISCOVERY_MAX_DEPTH_KEY
-
-if TYPE_CHECKING:
-    from griptape_nodes.retained_mode.engine import Engine
-
 logger = logging.getLogger(__name__)
 
-# Fallback ceiling on how deep recursive discovery walks, used only when the
-# `discovery_max_depth` engine setting cannot be read. Bounds boot-time scans
-# against pathologically deep trees and symlink loops without a visited-set.
+# Fallback ceiling on how deep recursive discovery walks when a caller has no
+# operator-configured value of its own. Bounds boot-time scans against
+# pathologically deep trees and symlink loops without a visited-set.
 DEFAULT_MAX_SEARCH_DEPTH = 5
-
-
-def _resolve_discovery_max_depth(engine: Engine) -> int:
-    """Read the operator-configured ``discovery_max_depth`` ceiling for recursive discovery.
-
-    Returns the live `discovery_max_depth` engine setting (overridable via the
-    `GTN_CONFIG_DISCOVERY_MAX_DEPTH` env var), falling back to
-    DEFAULT_MAX_SEARCH_DEPTH only when the setting is absent.
-
-    Args:
-        engine: The engine whose ConfigManager holds the setting.
-    """
-    return engine.config_manager.get_config_value(
-        DISCOVERY_MAX_DEPTH_KEY, default=DEFAULT_MAX_SEARCH_DEPTH, cast_type=int
-    )
 
 
 def atomic_write_bytes(path: Path, data: bytes) -> None:
@@ -255,21 +234,21 @@ async def find_files_recursive(
     directory: Path,
     pattern: str,
     *,
-    engine: Engine,
+    max_depth: int,
     skip_hidden: bool = True,
     max_files: int | None = None,
 ) -> list[Path]:
     """Asynchronously search directory recursively for files matching pattern.
 
     Depth-bounded async finder suitable for the engine boot path: each directory read is
-    offloaded to a worker thread so it never blocks the event loop, and the
-    `discovery_max_depth` setting bounds recursion so a pathologically deep tree
-    or symlink loop can't stall startup.
+    offloaded to a worker thread so it never blocks the event loop, and `max_depth`
+    bounds recursion so a pathologically deep tree or symlink loop can't stall startup.
 
     Args:
         directory: Directory to search in
         pattern: Glob pattern to match file names against (e.g., '*.json')
-        engine: The engine whose ConfigManager supplies the `discovery_max_depth` ceiling.
+        max_depth: Ceiling on recursion depth, supplied by the caller (e.g. an
+            operator-configured setting).
         skip_hidden: If True, skip hidden directories (those starting with .).
             This avoids descending into large hidden trees like .git or .venv.
         max_files: If set, stop and return as soon as this many matches are found.
@@ -289,7 +268,7 @@ async def find_files_recursive(
     params = _AsyncWalkParams(
         pattern=pattern,
         skip_hidden=skip_hidden,
-        max_depth=_resolve_discovery_max_depth(engine),
+        max_depth=max_depth,
         max_files=max_files,
         matches=matches,
     )

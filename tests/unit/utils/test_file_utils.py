@@ -13,6 +13,7 @@ from unittest.mock import patch
 import pytest
 
 from griptape_nodes.utils.file_utils import (
+    DEFAULT_MAX_SEARCH_DEPTH,
     _arecurse_find,
     _AsyncWalkParams,
     atomic_write_bytes,
@@ -23,8 +24,6 @@ from griptape_nodes.utils.file_utils import (
 
 if TYPE_CHECKING:
     from collections.abc import Generator
-
-    from griptape_nodes.retained_mode.engine import Engine
 
 
 class _RaisingDirEntry:
@@ -292,34 +291,36 @@ class TestAfindFilesRecursive:
             yield Path(tmpdir)
 
     @pytest.mark.asyncio
-    async def test_when_directory_does_not_exist(self, engine: Engine) -> None:
+    async def test_when_directory_does_not_exist(self) -> None:
         """Empty list is returned when directory doesn't exist."""
-        result = await find_files_recursive(Path("/non/existent/directory"), "*.json", engine=engine)
+        result = await find_files_recursive(
+            Path("/non/existent/directory"), "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH
+        )
 
         assert result == []
 
     @pytest.mark.asyncio
-    async def test_when_path_is_not_directory(self, temp_dir: Path, engine: Engine) -> None:
+    async def test_when_path_is_not_directory(self, temp_dir: Path) -> None:
         """Empty list is returned when path is a file, not a directory."""
         test_file = temp_dir / "test.txt"
         test_file.write_text("content")
 
-        result = await find_files_recursive(test_file, "*.json", engine=engine)
+        result = await find_files_recursive(test_file, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
 
         assert result == []
 
     @pytest.mark.asyncio
-    async def test_when_no_files_match_pattern(self, temp_dir: Path, engine: Engine) -> None:
+    async def test_when_no_files_match_pattern(self, temp_dir: Path) -> None:
         """Empty list is returned when no files match the pattern."""
         (temp_dir / "test.txt").write_text("content")
         (temp_dir / "another.py").write_text("content")
 
-        result = await find_files_recursive(temp_dir, "*.json", engine=engine)
+        result = await find_files_recursive(temp_dir, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
 
         assert result == []
 
     @pytest.mark.asyncio
-    async def test_returns_sorted_results(self, temp_dir: Path, engine: Engine) -> None:
+    async def test_returns_sorted_results(self, temp_dir: Path) -> None:
         """Results are returned in sorted order."""
         file3 = temp_dir / "zebra.json"
         file1 = temp_dir / "apple.json"
@@ -328,12 +329,12 @@ class TestAfindFilesRecursive:
         file1.write_text("{}")
         file2.write_text("{}")
 
-        result = await find_files_recursive(temp_dir, "*.json", engine=engine)
+        result = await find_files_recursive(temp_dir, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
 
         assert result == [file1, file2, file3]
 
     @pytest.mark.asyncio
-    async def test_returns_sorted_results_with_subdirectories(self, temp_dir: Path, engine: Engine) -> None:
+    async def test_returns_sorted_results_with_subdirectories(self, temp_dir: Path) -> None:
         """Results from subdirectories are also sorted."""
         subdir_z = temp_dir / "z_dir"
         subdir_a = temp_dir / "a_dir"
@@ -347,12 +348,12 @@ class TestAfindFilesRecursive:
         file2.write_text("{}")
         file3.write_text("{}")
 
-        result = await find_files_recursive(temp_dir, "*.json", engine=engine)
+        result = await find_files_recursive(temp_dir, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
 
         assert result == [file1, file3, file2]
 
     @pytest.mark.asyncio
-    async def test_skips_hidden_directories_by_default(self, temp_dir: Path, engine: Engine) -> None:
+    async def test_skips_hidden_directories_by_default(self, temp_dir: Path) -> None:
         """Hidden directories are skipped by default."""
         hidden_dir = temp_dir / ".hidden"
         hidden_dir.mkdir()
@@ -361,12 +362,12 @@ class TestAfindFilesRecursive:
         hidden_file.write_text("{}")
         visible_file.write_text("{}")
 
-        result = await find_files_recursive(temp_dir, "*.json", engine=engine)
+        result = await find_files_recursive(temp_dir, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
 
         assert result == [visible_file]
 
     @pytest.mark.asyncio
-    async def test_includes_hidden_directories_when_requested(self, temp_dir: Path, engine: Engine) -> None:
+    async def test_includes_hidden_directories_when_requested(self, temp_dir: Path) -> None:
         """Hidden directories are included when skip_hidden=False."""
         hidden_dir = temp_dir / ".hidden"
         hidden_dir.mkdir()
@@ -375,12 +376,12 @@ class TestAfindFilesRecursive:
         hidden_file.write_text("{}")
         visible_file.write_text("{}")
 
-        result = await find_files_recursive(temp_dir, "*.json", engine=engine, skip_hidden=False)
+        result = await find_files_recursive(temp_dir, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH, skip_hidden=False)
 
         assert set(result) == {hidden_file, visible_file}
 
     @pytest.mark.asyncio
-    async def test_matches_glob_pattern(self, temp_dir: Path, engine: Engine) -> None:
+    async def test_matches_glob_pattern(self, temp_dir: Path) -> None:
         """Files are matched using glob patterns."""
         file1 = temp_dir / "my_library.json"
         file2 = temp_dir / "your_library.json"
@@ -388,26 +389,25 @@ class TestAfindFilesRecursive:
         file1.write_text("{}")
         file2.write_text("{}")
 
-        result = await find_files_recursive(temp_dir, "*library*.json", engine=engine)
+        result = await find_files_recursive(temp_dir, "*library*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
 
         assert result == sorted([file1, file2])
 
     @pytest.mark.asyncio
-    async def test_depth_zero_setting_scans_only_top_level(self, temp_dir: Path, engine: Engine) -> None:
-        """A discovery_max_depth setting of 0 returns only matches directly in the directory."""
+    async def test_depth_zero_setting_scans_only_top_level(self, temp_dir: Path) -> None:
+        """A max_depth of 0 returns only matches directly in the directory."""
         root_file = temp_dir / "root.json"
         nested_file = temp_dir / "sub" / "nested.json"
         nested_file.parent.mkdir()
         root_file.write_text("{}")
         nested_file.write_text("{}")
 
-        with patch("griptape_nodes.utils.file_utils._resolve_discovery_max_depth", return_value=0):
-            result = await find_files_recursive(temp_dir, "*.json", engine=engine)
+        result = await find_files_recursive(temp_dir, "*.json", max_depth=0)
 
         assert result == [root_file]
 
     @pytest.mark.asyncio
-    async def test_depth_setting_excludes_files_below_cap(self, temp_dir: Path, engine: Engine) -> None:
+    async def test_depth_setting_excludes_files_below_cap(self, temp_dir: Path) -> None:
         """Files at the depth cap are included; deeper files are excluded."""
         at_cap = temp_dir / "a" / "at_cap.json"
         below_cap = temp_dir / "a" / "b" / "below_cap.json"
@@ -415,23 +415,22 @@ class TestAfindFilesRecursive:
         at_cap.write_text("{}")
         below_cap.write_text("{}")
 
-        with patch("griptape_nodes.utils.file_utils._resolve_discovery_max_depth", return_value=1):
-            result = await find_files_recursive(temp_dir, "*.json", engine=engine)
+        result = await find_files_recursive(temp_dir, "*.json", max_depth=1)
 
         assert result == [at_cap]
 
     @pytest.mark.asyncio
-    async def test_max_files_limits_results(self, temp_dir: Path, engine: Engine) -> None:
+    async def test_max_files_limits_results(self, temp_dir: Path) -> None:
         """At most max_files matches are returned."""
         for name in ["a.json", "b.json", "c.json", "d.json"]:
             (temp_dir / name).write_text("{}")
 
-        result = await find_files_recursive(temp_dir, "*.json", engine=engine, max_files=2)
+        result = await find_files_recursive(temp_dir, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH, max_files=2)
 
         assert len(result) == 2  # noqa: PLR2004
 
     @pytest.mark.asyncio
-    async def test_follows_symlinked_directories(self, temp_dir: Path, engine: Engine) -> None:
+    async def test_follows_symlinked_directories(self, temp_dir: Path) -> None:
         """A symlinked directory is walked, so a workspace can reach content through a link.
 
         Guards against a walk that skips links (os.walk's default), which would silently
@@ -444,34 +443,34 @@ class TestAfindFilesRecursive:
         scan_root.mkdir()
         (scan_root / "linked").symlink_to(real_dir)
 
-        result = await find_files_recursive(scan_root, "*.json", engine=engine)
+        result = await find_files_recursive(scan_root, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
 
         assert result == [scan_root / "linked" / "found.json"]
 
     @pytest.mark.asyncio
-    async def test_symlink_loop_terminates(self, temp_dir: Path, engine: Engine) -> None:
+    async def test_symlink_loop_terminates(self, temp_dir: Path) -> None:
         """A directory symlink pointing back at an ancestor terminates via the depth cap."""
         nested = temp_dir / "a"
         nested.mkdir()
         (nested / "f.json").write_text("{}")
         (nested / "loop").symlink_to(temp_dir)
 
-        result = await find_files_recursive(temp_dir, "*.json", engine=engine)
+        result = await find_files_recursive(temp_dir, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
 
         assert nested / "f.json" in result
 
     @pytest.mark.asyncio
-    async def test_broken_symlink_is_skipped(self, temp_dir: Path, engine: Engine) -> None:
+    async def test_broken_symlink_is_skipped(self, temp_dir: Path) -> None:
         """A dangling symlink is neither matched nor fatal to the walk."""
         (temp_dir / "real.json").write_text("{}")
         (temp_dir / "broken.json").symlink_to(temp_dir / "does_not_exist")
 
-        result = await find_files_recursive(temp_dir, "*.json", engine=engine)
+        result = await find_files_recursive(temp_dir, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
 
         assert result == [temp_dir / "real.json"]
 
     @pytest.mark.asyncio
-    async def test_unreadable_directory_does_not_abort_walk(self, temp_dir: Path, engine: Engine) -> None:
+    async def test_unreadable_directory_does_not_abort_walk(self, temp_dir: Path) -> None:
         """A directory that cannot be listed is skipped, and its siblings still resolve.
 
         Uses a patched scandir rather than chmod so the case is exercised on Windows too,
@@ -491,12 +490,12 @@ class TestAfindFilesRecursive:
             return real_scandir(path)  # type: ignore[arg-type]
 
         with patch("griptape_nodes.utils.file_utils.os.scandir", side_effect=scandir_denying_one_dir):
-            result = await find_files_recursive(temp_dir, "*.json", engine=engine)
+            result = await find_files_recursive(temp_dir, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
 
         assert result == [temp_dir / "sibling" / "found.json"]
 
     @pytest.mark.asyncio
-    async def test_unclassifiable_entry_does_not_abort_directory(self, temp_dir: Path, engine: Engine) -> None:
+    async def test_unclassifiable_entry_does_not_abort_directory(self, temp_dir: Path) -> None:
         """An entry whose type cannot be determined is skipped, not fatal to its siblings.
 
         Mirrors a macOS protected path, where stat-ing one entry raises while the rest of
@@ -517,7 +516,7 @@ class TestAfindFilesRecursive:
             return _FakeScandir(entries)
 
         with patch("griptape_nodes.utils.file_utils.os.scandir", side_effect=scandir_with_one_bad_entry):
-            result = await find_files_recursive(temp_dir, "*.json", engine=engine)
+            result = await find_files_recursive(temp_dir, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
 
         assert result == [temp_dir / "good.json"]
 

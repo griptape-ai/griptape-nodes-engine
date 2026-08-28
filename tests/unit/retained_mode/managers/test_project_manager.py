@@ -45,6 +45,7 @@ from griptape_nodes.retained_mode.events.project_events import (
 )
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.project_manager import PROJECTS_TO_REGISTER_KEY, ProjectManager
+from griptape_nodes.utils.file_utils import DEFAULT_MAX_SEARCH_DEPTH
 
 
 def _stub_config_for_listing(mock_config: Mock, *, global_workspace: str = "/global/ws") -> None:
@@ -6048,9 +6049,8 @@ situations:
         cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
 
         mock_engine = MagicMock()
-        # find_files_recursive reads discovery_max_depth via self.engine.config_manager, so this
-        # mock config manager needs the same fallback-to-default behavior as pm._config_manager.
-        mock_engine.config_manager.get_config_value.side_effect = get_config_value_side_effect
+        # find_files_recursive takes its max_depth from self.engine.config_manager.discovery_max_depth.
+        mock_engine.config_manager.discovery_max_depth = DEFAULT_MAX_SEARCH_DEPTH
         with (
             patch.object(pm, "_engine", mock_engine),
             patch.object(pm, "_register_project_path") as mock_register,

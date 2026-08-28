@@ -3997,7 +3997,9 @@ class LibraryManager(EngineScoped):
         about is exactly the file overwrite targets.
         """
         for manifest_path in await find_files_recursive(
-            libraries_path, LibraryManager.LIBRARY_CONFIG_GLOB_PATTERN, engine=self.engine
+            libraries_path,
+            LibraryManager.LIBRARY_CONFIG_GLOB_PATTERN,
+            max_depth=self.engine.config_manager.discovery_max_depth,
         ):
             try:
                 content = manifest_path.read_text(encoding="utf-8")
@@ -5938,7 +5940,9 @@ class LibraryManager(EngineScoped):
                 # directories and bounds recursion depth so a deep or symlink-looped
                 # tree can't stall the boot scan.
                 for lib_path in await find_files_recursive(
-                    path, LibraryManager.LIBRARY_CONFIG_GLOB_PATTERN, engine=self.engine
+                    path,
+                    LibraryManager.LIBRARY_CONFIG_GLOB_PATTERN,
+                    max_depth=self.engine.config_manager.discovery_max_depth,
                 ):
                     if lib_path not in seen_paths:
                         seen_paths.add(lib_path)
