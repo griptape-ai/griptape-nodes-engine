@@ -64,7 +64,7 @@ from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER
 if TYPE_CHECKING:
     from collections.abc import Generator
 
-    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+    from griptape_nodes.retained_mode.engine import Engine
 
 # The library the current project legitimately registers at boot.
 REGISTERED_LIBRARY = "Nuke Nodes Library"
@@ -270,10 +270,10 @@ class TestDropoutProducesTheReportedErrors:
 
     @pytest.mark.asyncio
     async def test_dropping_the_project_layer_makes_the_engine_advertise_stale_libraries(
-        self, griptape_nodes: GriptapeNodes, two_installs_on_disk: Path
+        self, engine: Engine, two_installs_on_disk: Path
     ) -> None:
-        library_manager = griptape_nodes.LibraryManager()
-        config_manager = griptape_nodes.ConfigManager()
+        library_manager = engine.library_manager
+        config_manager = engine.config_manager
 
         # Boot: project layer loaded, only the project's library is registered.
         config_manager.load_project_config(two_installs_on_disk)
