@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -47,6 +48,12 @@ class SessionData(BaseModel):
     engine_id: str | None = None
     started_at: str
     last_updated: str
+    # PID of the engine process that claimed this session. Used at boot to tell a session
+    # left behind by a process that has since exited (safe to resume) from one another
+    # running engine is still serving (must not be resumed -- see
+    # `_get_or_initialize_active_session`). None on records written before this field
+    # existed, which are treated as unowned.
+    owner_pid: int | None = None
 
 
 class SessionsStorage(BaseModel):
@@ -120,6 +127,7 @@ class SessionManager:
             engine_id=engine_id,
             started_at=datetime.now(tz=UTC).isoformat(),
             last_updated=datetime.now(tz=UTC).isoformat(),
+            owner_pid=os.getpid(),
         )
 
         # Add or update the session
@@ -181,22 +189,59 @@ class SessionManager:
     def _get_or_initialize_active_session(self) -> str | None:
         """Get or initialize the active session ID.
 
-        Falls back to first available session if no active session is set.
+        Resumes the first saved session that no live engine is already serving. Returns
+        None when there is nothing safe to resume, which makes the next
+        AppStartSessionRequest mint a fresh session id.
+
+        Engine identity is itself re-adopted from disk (`engines.json` default_engine_id),
+        so two engines started on one machine land on the same `sessions.json`. Resuming
+        blindly meant both subscribed to `sessions/<id>/request` and BOTH serviced every
+        client request -- harmless for a read, but requests with side effects ran twice,
+        which is how one click on a library's "Open" button produced two file browsers.
 
         Returns:
-            str | None: The active session ID or None if no sessions exist
+            str | None: The session ID to resume, or None if none can be resumed
         """
-        # Fall back to first session if available
-        if self._sessions_data.sessions:
-            first_session = self._sessions_data.sessions[0]
+        for session in self._sessions_data.sessions:
+            if self._is_session_owned_by_live_process(session):
+                logger.info(
+                    "Not resuming session %s: it is still owned by running engine process %s. "
+                    "A new session will be created instead so both engines do not serve the same session.",
+                    session.session_id,
+                    session.owner_pid,
+                )
+                continue
             logger.debug(
-                "Initialized active session to first saved session: %s for engine: %s",
-                first_session.session_id,
-                first_session.engine_id,
+                "Initialized active session to saved session: %s for engine: %s",
+                session.session_id,
+                session.engine_id,
             )
-            return first_session.session_id
+            return session.session_id
 
         return None
+
+    def _is_session_owned_by_live_process(self, session: SessionData) -> bool:
+        """Whether another running process is still serving this session.
+
+        Records written before `owner_pid` existed, and records this very process wrote,
+        both count as unowned: the former carry no ownership information, and the latter
+        are this engine resuming its own session.
+        """
+        owner_pid = session.owner_pid
+        if owner_pid is None or owner_pid == os.getpid():
+            return False
+        try:
+            # Signal 0 performs the permission/existence check without delivering a signal.
+            os.kill(owner_pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            # The PID is live but owned by another user, so it is not one of our engines.
+            return False
+        except OSError:
+            # Cannot determine liveness; assume free rather than stranding the session.
+            return False
+        return True
 
     def _add_or_update_session(self, session_data: SessionData) -> None:
         """Add or update a session in the sessions data structure.
