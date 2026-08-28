@@ -10,6 +10,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 from uuid import uuid4
 
+from griptape_nodes.common.cluster_execution import execute_cluster
 from griptape_nodes.common.parameter_hydration import hydrate_parameter_values
 from griptape_nodes.common.strict_mode import (
     STRICT_MODE,
@@ -89,6 +90,7 @@ from griptape_nodes.retained_mode.events.execution_events import (
     CancelExecuteNodeRequest,
     CancelExecuteNodeResultSuccess,
     CancelFlowRequest,
+    ExecuteClusterRequest,
     ExecuteNodeRequest,
     ExecuteNodeResultFailure,
     ExecuteNodeResultSuccess,
@@ -408,6 +410,7 @@ class NodeManager(EngineScoped):
             BatchSetNodeLockStateRequest, self.on_batch_set_lock_node_state_request
         )
         event_manager.assign_manager_to_request_type(ExecuteNodeRequest, self.on_execute_node_request)
+        event_manager.assign_manager_to_request_type(ExecuteClusterRequest, self.on_execute_cluster_request)
         event_manager.assign_manager_to_request_type(CancelExecuteNodeRequest, self.on_cancel_execute_node_request)
 
     def handle_node_rename(self, old_name: str, new_name: str) -> None:
@@ -3098,6 +3101,10 @@ class NodeManager(EngineScoped):
         # callers do not have to poll check_for_existing_running_flow() themselves.
         details = f'Starting to resolve "{node_name}" in "{flow_name}"'
         return ResolveNodeResultSuccess(result_details=details)
+
+    async def on_execute_cluster_request(self, request: ExecuteClusterRequest) -> ResultPayload:
+        """Execute a dispatched cluster of nodes in this process (see common/cluster_execution.py)."""
+        return await execute_cluster(request, self.engine.event_manager)
 
     async def on_execute_node_request(self, request: ExecuteNodeRequest) -> ResultPayload:
         """Execute a node. Orchestrator path is lookup-only; worker path is a pure RPC.

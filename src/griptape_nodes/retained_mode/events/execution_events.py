@@ -567,3 +567,94 @@ class CancelExecuteNodeResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucce
 @PayloadRegistry.register
 class CancelExecuteNodeResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Cancellation could not be delivered."""
+
+
+@dataclass
+class ClusterNodeSpec:
+    """One node of a dispatched execution cluster.
+
+    Args:
+        node_name: Name the node carries inside this cluster (unique within the request).
+        node_type: Registered node class name.
+        library_name: Library that owns the node type.
+        parameter_values: Boundary input values for this node. Values arriving over the wire
+            are serializable by definition; values produced inside the cluster travel through
+            edges instead and never appear here.
+        node_metadata: Node metadata (node_type/library plus optional extras).
+    """
+
+    node_name: str
+    node_type: str
+    library_name: str
+    parameter_values: dict[str, Any] = field(default_factory=dict)
+    node_metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ClusterEdgeSpec:
+    """A dataflow edge internal to a dispatched cluster.
+
+    Values crossing these edges stay in the executing process as live references. This is the
+    reason clusters exist: a serializable=False value cannot cross a process boundary, so its
+    producer and consumer are dispatched together and hand it off locally.
+    """
+
+    source_node: str
+    source_parameter: str
+    target_node: str
+    target_parameter: str
+
+
+@dataclass
+@PayloadRegistry.register
+class ExecuteClusterRequest(RequestPayload):
+    """Execute a cluster of nodes together in this process.
+
+    The cluster is the dispatch unit for isolated execution: nodes joined by unserializable
+    values must run in one process, so they are sent as one request. Nodes are constructed
+    fresh, boundary inputs hydrated, and members executed in dependency order with
+    intra-cluster values handed off as live references. A single-node cluster with no edges
+    degenerates to ExecuteNodeRequest's worker path, which this request supersedes.
+
+    Args:
+        nodes: The cluster's members. Any order; execution order is derived from edges.
+        edges: Intra-cluster dataflow edges.
+        output_nodes: Names of members whose outputs should be returned. Only serializable
+            outputs return; a serializable=False output is by definition consumed inside the
+            cluster or not at all.
+        variables: Workflow variable dict for inline {VAR} substitution (see
+            ExecuteNodeRequest.variables).
+
+    Results: ExecuteClusterResultSuccess | ExecuteClusterResultFailure
+    """
+
+    nodes: list[ClusterNodeSpec] = field(default_factory=list)
+    edges: list[ClusterEdgeSpec] = field(default_factory=list)
+    output_nodes: list[str] = field(default_factory=list)
+    variables: dict[str, str | int] = field(default_factory=dict)
+
+
+@dataclass
+@PayloadRegistry.register
+class ExecuteClusterResultSuccess(ResultPayloadSuccess):
+    """Successful result from executing a cluster.
+
+    Args:
+        parameter_output_values: node_name -> parameter -> value, for the requested
+            output_nodes, restricted to serializable parameters.
+    """
+
+    parameter_output_values: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+
+@dataclass
+@PayloadRegistry.register
+class ExecuteClusterResultFailure(ResultPayloadFailure):
+    """Failed result from executing a cluster.
+
+    Args:
+        failed_node: Name of the member whose execution raised, when the failure came from
+            node execution rather than cluster validation.
+    """
+
+    failed_node: str | None = None
