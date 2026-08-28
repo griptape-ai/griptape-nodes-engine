@@ -115,6 +115,8 @@ class ConfigManager(EngineScoped):
         self._workspace_config_path: Path | None = None
         self._workspace_dir_override: str | None = None
         self._libraries_root_override: str | None = None
+        # Rebuilt by every load_configs(); declared here so the first load has it defined.
+        self._layers_without_user_snapshot: dict = {}
         self.load_configs()
 
         # Once per engine process, before any project YAML is read. See the method docstring for why
@@ -398,6 +400,56 @@ class ConfigManager(EngineScoped):
             logger.error("Error parsing %s config file: %s", label, e)
             return {}
 
+    def _merge_config_layers(self, *, include_user_layer: bool) -> dict:
+        """Merge the already-loaded layers in precedence order (later entries win).
+
+        The single source of truth for layer ordering, so `load_configs` and the
+        user-owned-write calculation in `set_config_value` can never disagree about
+        precedence. Operates purely on the loaded layer dicts and does no file I/O.
+
+        `include_user_layer=False` yields what every layer OTHER than the user's supplies,
+        which is what tells a write whether a value is the user's own contribution or
+        something a project handed them.
+        """
+        merged = merge_dicts({}, self.default_config)
+        if include_user_layer:
+            merged = merge_dicts(merged, self.user_config)
+        merged = merge_dicts(merged, self.project_config)
+        merged = merge_dicts(merged, self.workspace_config)
+        # Runtime workspace override (from ProjectManager's project_workspaces lookup or
+        # auto-default-to-project-dir). Sits above config files but below env vars.
+        if self._workspace_dir_override is not None:
+            merged = merge_dicts(merged, {"workspace_directory": self._workspace_dir_override})
+        return merge_dicts(merged, self.env_config)
+
+    def _user_owned_write_value(self, key: str, value: Any) -> Any:
+        """Strip list entries another layer already supplies, so they are not persisted.
+
+        The editor renders the MERGED config, so a write to a list-valued key hands back
+        the whole merged list. Persisting that verbatim copies entries owned by the project
+        or workspace layer into the user config file, where they outlive the project that
+        supplied them and resurface any time no project layer is loaded to shadow them.
+        That is how a user config ends up registering libraries from a project they no
+        longer have open.
+
+        Non-list values pass through unchanged. For a scalar the merged value IS the user's
+        intent, and a scalar the project also defines is a separate problem: the write
+        persists but the higher layer keeps winning, so the edit looks ignored.
+
+        Reads the snapshot taken at load time rather than recomputing from the live layers.
+        `get_config_value` returns references straight into those layers, and the
+        read-modify-write callers (a library download appending its clone path, for one)
+        mutate the returned list in place. By the time this runs, the live layer dicts can
+        already contain the very entry being added, which would make it look like something
+        another layer supplied and drop it.
+        """
+        if not isinstance(value, list):
+            return value
+        supplied_elsewhere = get_dot_value(self._layers_without_user_snapshot, key, None)
+        if not isinstance(supplied_elsewhere, list):
+            return value
+        return [entry for entry in value if entry not in supplied_elsewhere]
+
     def load_configs(self) -> None:
         """Load and merge configs from all sources in priority order.
 
@@ -406,18 +458,15 @@ class ConfigManager(EngineScoped):
         defaults → user → project-adjacent → workspace → env vars.
         """
         self.default_config = Settings().model_dump()
-        merged_config = self.default_config
 
         if USER_CONFIG_PATH.exists():
             self.user_config = self._load_config_from_file(USER_CONFIG_PATH, "user")
-            merged_config = merge_dicts(merged_config, self.user_config)
         else:
             self.user_config = {}
             logger.debug("User config file not found")
 
         if self._project_config_path is not None:
             self.project_config = self._load_config_from_file(self._project_config_path, "project-adjacent")
-            merged_config = merge_dicts(merged_config, self.project_config)
         else:
             self.project_config = {}
 
@@ -425,19 +474,19 @@ class ConfigManager(EngineScoped):
         # (this happens when workspace dir == project dir for self-contained projects).
         if self._workspace_config_path is not None and self._workspace_config_path != self._project_config_path:
             self.workspace_config = self._load_config_from_file(self._workspace_config_path, "workspace")
-            merged_config = merge_dicts(merged_config, self.workspace_config)
         else:
             self.workspace_config = {}
 
-        # Apply runtime workspace override (from ProjectManager's project_workspaces lookup
-        # or auto-default-to-project-dir). Sits above config files but below env vars.
-        if self._workspace_dir_override is not None:
-            merged_config["workspace_directory"] = self._workspace_dir_override
-
         self.env_config = self._load_config_from_env_vars()
         if self.env_config:
-            merged_config = merge_dicts(merged_config, self.env_config)
             logger.debug("Merged config from environment variables: %s", list(self.env_config.keys()))
+
+        merged_config = self._merge_config_layers(include_user_layer=True)
+
+        # Snapshot what the non-user layers supply, deep-copied so later in-place mutation
+        # of a list handed out by get_config_value cannot reach it. See
+        # `_user_owned_write_value`, which relies on this being pristine.
+        self._layers_without_user_snapshot = copy.deepcopy(self._merge_config_layers(include_user_layer=False))
 
         # Re-assign workspace path in case env var or project config overrides it. Uses the shared
         # precedence resolver (WITH the runtime override) so the active workspace and
@@ -738,7 +787,7 @@ class ConfigManager(EngineScoped):
         # Capture old value before making changes (for event emission)
         old_value = self.get_config_value(key, should_load_env_var_if_detected=False)
 
-        delta = set_dot_value({}, key, value)
+        delta = set_dot_value({}, key, self._user_owned_write_value(key, value))
         if key == "log_level":
             self._set_log_level(value)
         elif key == "workspace_directory":
