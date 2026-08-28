@@ -2959,28 +2959,43 @@ class LibraryManager(EngineScoped):
 
         return capabilities
 
-    def _get_library_venv_path(self, library_name: str, library_file_path: str | None = None) -> Path:
-        """Get the path to the virtual environment directory for a library.
+    def _get_library_venv_path(
+        self, library_name: str, library_file_path: str | None = None, *, execution: bool = False
+    ) -> Path:
+        """Get the path to a virtual environment directory for a library.
+
+        A library has up to two environments. The edit-time environment (``.venv``) holds the
+        dependencies needed to import and instantiate nodes, and is the one a developer's
+        ``uv sync`` already produces, so it is deliberately left at the conventional name. The
+        execution environment (``.venv-exec``) holds the heavy dependencies only ``process``
+        needs and is put on ``sys.path`` solely where nodes execute.
 
         Args:
             library_name: Name of the library
             library_file_path: Optional path to the library JSON file
+            execution: Whether to return the execution environment instead of the edit-time one
 
         Returns:
             Path to the virtual environment directory
         """
+        venv_dir_name = ".venv-exec" if execution else ".venv"
         clean_library_name = library_name.replace(" ", "_").strip()
 
         if library_file_path is not None:
             # Create venv relative to the library.json file
             library_dir = Path(library_file_path).parent.absolute()
-            return library_dir / ".venv"
+            return library_dir / venv_dir_name
 
         # Create venv relative to the xdg data home
-        return xdg_data_home() / "griptape_nodes" / "libraries" / clean_library_name / ".venv"
+        return xdg_data_home() / "griptape_nodes" / "libraries" / clean_library_name / venv_dir_name
 
     async def _add_library_paths_to_sys_path(self, library_name: str, library_file_path: str, base_dir: Path) -> None:
         """Add a library's directory and venv site-packages to sys.path.
+
+        The edit-time environment is added everywhere, because importing node modules and
+        instantiating nodes needs it. The execution environment is added only in a worker
+        process: the orchestrator must never have a library's heavy dependencies on its import
+        path, since keeping them out is what stops one library's pins from shadowing another's.
 
         Args:
             library_name: Name of the library (for venv lookup)
@@ -2989,18 +3004,30 @@ class LibraryManager(EngineScoped):
         """
         sys.path.insert(0, str(base_dir))
 
-        venv_path = self._get_library_venv_path(library_name, library_file_path)
-        if await anyio.Path(venv_path).exists():
-            site_packages = str(
-                Path(
-                    sysconfig.get_path(
-                        "purelib",
-                        vars={"base": str(venv_path), "platbase": str(venv_path)},
-                    )
+        await self._add_library_venv_to_sys_path(library_name, library_file_path, execution=False)
+
+        if self._is_worker:
+            await self._add_library_venv_to_sys_path(library_name, library_file_path, execution=True)
+
+    async def _add_library_venv_to_sys_path(
+        self, library_name: str, library_file_path: str, *, execution: bool
+    ) -> None:
+        """Add one of a library's venv site-packages directories to sys.path, if it exists."""
+        venv_path = self._get_library_venv_path(library_name, library_file_path, execution=execution)
+        if not await anyio.Path(venv_path).exists():
+            return
+
+        site_packages = str(
+            Path(
+                sysconfig.get_path(
+                    "purelib",
+                    vars={"base": str(venv_path), "platbase": str(venv_path)},
                 )
             )
-            sys.path.insert(0, site_packages)
-            logger.debug("Added library '%s' venv to sys.path: %s", library_name, site_packages)
+        )
+        sys.path.insert(0, site_packages)
+        venv_kind = "execution" if execution else "edit-time"
+        logger.debug("Added library '%s' %s venv to sys.path: %s", library_name, venv_kind, site_packages)
 
     def _can_write_to_venv_location(self, venv_python_path: Path) -> bool:
         """Check if we can write to the venv location (either create it or modify existing).
@@ -6855,14 +6882,14 @@ class LibraryManager(EngineScoped):
             result_details=details,
         )
 
-    async def install_library_dependencies_request(self, request: InstallLibraryDependenciesRequest) -> ResultPayload:  # noqa: PLR0911
-        """Install a library's dependencies, recovering from a corrupt reused venv.
+    async def install_library_dependencies_request(self, request: InstallLibraryDependenciesRequest) -> ResultPayload:
+        """Install a library's dependencies into its edit-time and execution environments.
 
-        Advanced library hooks (before_library_nodes_loaded) expect the venv to exist, so the
-        venv is always initialized even when there are no dependencies to install. When the
-        venv is reused from a previous session it may be corrupt (e.g. a dist-info directory
-        missing its METADATA file), which makes uv fail while planning the install; in that
-        case the venv is rebuilt once and the install retried against a clean environment.
+        Edit-time dependencies go into ``.venv``, which is always created even when there is
+        nothing to install, because advanced library hooks (before_library_nodes_loaded) expect
+        it to exist. Execution dependencies go into ``.venv-exec``, which is created only when
+        the library declares any, so a library with no execution dependencies produces exactly
+        the layout it always has.
         """
         library_file_path = request.library_file_path
 
@@ -6879,44 +6906,93 @@ class LibraryManager(EngineScoped):
         library_metadata = library_data.metadata
 
         pip_dependencies = []
+        pip_dependencies_exec = []
         pip_install_flags = []
         if library_metadata.dependencies:
             pip_dependencies = library_metadata.dependencies.pip_dependencies or []
+            pip_dependencies_exec = library_metadata.dependencies.pip_dependencies_exec or []
             pip_install_flags = library_metadata.dependencies.pip_install_flags or []
 
-        # Always initialize the venv, even if there are no dependencies to install.
-        # Advanced library hooks (before_library_nodes_loaded) expect the venv to exist.
-        venv_path = self._get_library_venv_path(library_name, library_file_path)
+        edit_failure = await self._install_dependency_set(
+            library_name=library_name,
+            library_file_path=library_file_path,
+            pip_dependencies=pip_dependencies,
+            pip_install_flags=pip_install_flags,
+            execution=False,
+        )
+        if edit_failure is not None:
+            return InstallLibraryDependenciesResultFailure(result_details=edit_failure)
+
+        exec_failure = await self._install_dependency_set(
+            library_name=library_name,
+            library_file_path=library_file_path,
+            pip_dependencies=pip_dependencies_exec,
+            pip_install_flags=pip_install_flags,
+            execution=True,
+        )
+        if exec_failure is not None:
+            return InstallLibraryDependenciesResultFailure(result_details=exec_failure)
+
+        installed_count = len(pip_dependencies) + len(pip_dependencies_exec)
+        if installed_count == 0:
+            details = f"Library '{library_name}' has no dependencies to install"
+        elif pip_dependencies_exec:
+            details = (
+                f"Installed {len(pip_dependencies)} edit-time and {len(pip_dependencies_exec)} "
+                f"execution dependencies for library '{library_name}'"
+            )
+        else:
+            details = f"Installed {len(pip_dependencies)} dependencies for library '{library_name}'"
+        logger.info(details)
+        return InstallLibraryDependenciesResultSuccess(
+            library_name=library_name, dependencies_installed=installed_count, result_details=details
+        )
+
+    async def _install_dependency_set(  # noqa: PLR0911
+        self,
+        *,
+        library_name: str,
+        library_file_path: str,
+        pip_dependencies: list[str],
+        pip_install_flags: list[str],
+        execution: bool,
+    ) -> str | None:
+        """Install one dependency set into its environment, creating the environment first.
+
+        Returns a user-facing failure detail, or None on success.
+
+        The edit-time environment is created even with nothing to install, because advanced
+        library hooks expect it to exist. The execution environment is skipped entirely when
+        the library declares no execution dependencies, so nothing new appears on disk for the
+        libraries that do not use them.
+        """
+        venv_kind = "execution" if execution else "edit-time"
+        if execution and not pip_dependencies:
+            return None
+
+        venv_path = self._get_library_venv_path(library_name, library_file_path, execution=execution)
 
         try:
             venv_init = await self._init_library_venv(venv_path)
         except RuntimeError as e:
-            details = f"Attempted to prepare the environment for library '{library_name}'. Failed due to: {e}"
-            return InstallLibraryDependenciesResultFailure(result_details=details)
+            return f"Attempted to prepare the {venv_kind} environment for library '{library_name}'. Failed due to: {e}"
         library_venv_python_path = venv_init.python_path
 
         if not self._can_write_to_venv_location(library_venv_python_path):
-            details = f"Attempted to set up the environment for library '{library_name}' at {venv_path}. Failed due to: the location is not writable."
+            details = f"Attempted to set up the {venv_kind} environment for library '{library_name}' at {venv_path}. Failed due to: the location is not writable."
             logger.warning(details)
-            return InstallLibraryDependenciesResultFailure(result_details=details)
+            return details
 
-        # Check disk space
         config_manager = self.engine.config_manager
         min_space_gb = config_manager.get_config_value("minimum_disk_space_gb_libraries")
         if not OSManager.check_available_disk_space(Path(venv_path), min_space_gb):
             error_msg = OSManager.format_disk_space_error(Path(venv_path))
-            details = f"Attempted to install the components required by library '{library_name}'. Failed due to insufficient disk space (requires {min_space_gb} GB): {error_msg}"
-            return InstallLibraryDependenciesResultFailure(result_details=details)
+            return f"Attempted to install the components required by library '{library_name}'. Failed due to insufficient disk space (requires {min_space_gb} GB): {error_msg}"
 
         if not pip_dependencies:
-            details = f"Library '{library_name}' has no dependencies to install"
-            logger.info(details)
-            return InstallLibraryDependenciesResultSuccess(
-                library_name=library_name, dependencies_installed=0, result_details=details
-            )
+            return None
 
-        # Install dependencies
-        logger.info("Installing %d dependencies for library '%s'", len(pip_dependencies), library_name)
+        logger.info("Installing %d %s dependencies for library '%s'", len(pip_dependencies), venv_kind, library_name)
         is_debug = config_manager.get_config_value("log_level").upper() == "DEBUG"
 
         try:
@@ -6940,19 +7016,11 @@ class LibraryManager(EngineScoped):
                 )
         except subprocess.CalledProcessError as e:
             reason = e.stderr or f"the installer exited with code {e.returncode}"
-            details = (
-                f"Attempted to install the components required by library '{library_name}'. Failed due to: {reason}"
-            )
-            return InstallLibraryDependenciesResultFailure(result_details=details)
+            return f"Attempted to install the components required by library '{library_name}'. Failed due to: {reason}"
         except RuntimeError as e:
-            details = f"Attempted to rebuild the environment for library '{library_name}'. Failed due to: {e}"
-            return InstallLibraryDependenciesResultFailure(result_details=details)
+            return f"Attempted to rebuild the {venv_kind} environment for library '{library_name}'. Failed due to: {e}"
 
-        details = f"Installed {len(pip_dependencies)} dependencies for library '{library_name}'"
-        logger.info(details)
-        return InstallLibraryDependenciesResultSuccess(
-            library_name=library_name, dependencies_installed=len(pip_dependencies), result_details=details
-        )
+        return None
 
     async def _install_deps_with_recovery(
         self,
