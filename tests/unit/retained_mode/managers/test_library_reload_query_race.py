@@ -126,9 +126,8 @@ class TestQueriesDuringLibraryReload:
     async def test_both_get_all_info_entry_points_wait_on_the_gate(self, engine: Engine) -> None:
         """The per-library and all-libraries entry points now agree about the reload window.
 
-        `get_all_info_for_library_request` stays synchronous and ungated because
-        `get_all_info_for_all_libraries_request` calls it directly once it has already
-        waited. The registered entry point is the async wrapper, which waits.
+        The gate lives on the `on_*` entry points, not in the handlers they call, so an
+        internal caller cannot end up waiting on a reload it is already running inside.
         """
         library_manager = engine.library_manager
         LibraryRegistry.generate_new_library(library_data=_schema(LIBRARY_NAME))

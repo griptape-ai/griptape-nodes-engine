@@ -58,6 +58,7 @@ from griptape_nodes.node_library.library_registry import (
     LibrarySchema,
     NodeDefinition,
     NodeMetadata,
+    WidgetDefinition,
     WorkflowNodeDefinition,
 )
 from griptape_nodes.node_library.library_validation import (
@@ -3063,27 +3064,30 @@ class LibraryManager(EngineScoped):
         details = f"Successfully unloaded (and unregistered) library '{request.library_name}'."
         return UnloadLibraryFromRegistryResultSuccess(result_details=details)
 
-    def get_all_info_for_all_libraries_request(self, request: GetAllInfoForAllLibrariesRequest) -> ResultPayload:  # noqa: ARG002
+    async def get_all_info_for_all_libraries_request(self, request: GetAllInfoForAllLibrariesRequest) -> ResultPayload:  # noqa: ARG002
         libraries = LibraryRegistry.list_libraries()
 
         try:
-            # Create a mapping of library name to all its info.
-            library_name_to_all_info = {}
-
-            for library_name in libraries:
-                library_all_info_request = GetAllInfoForLibraryRequest(library=library_name)
-                library_all_info_result = self.get_all_info_for_library_request(library_all_info_request)
-
-                if not library_all_info_result.succeeded():
-                    details = f"Attempted to get all info for all libraries, but failed when getting all info for library named '{library_name}'."
-                    return GetAllInfoForAllLibrariesResultFailure(result_details=details)
-
-                library_all_info_success = cast("GetAllInfoForLibraryResultSuccess", library_all_info_result)
-
-                library_name_to_all_info[library_name] = library_all_info_success
+            # Each library's info is independent, and the per-library handler blocks on
+            # reading widget bundles, so gather rather than walking them one at a time.
+            library_all_info_results = await asyncio.gather(
+                *(
+                    self.get_all_info_for_library_request(GetAllInfoForLibraryRequest(library=library_name))
+                    for library_name in libraries
+                )
+            )
         except Exception as err:
             details = f"Attempted to get all info for all libraries. Encountered error {err}."
             return GetAllInfoForAllLibrariesResultFailure(result_details=details)
+
+        # Create a mapping of library name to all its info.
+        library_name_to_all_info = {}
+        for library_name, library_all_info_result in zip(libraries, library_all_info_results, strict=True):
+            if not library_all_info_result.succeeded():
+                details = f"Attempted to get all info for all libraries, but failed when getting all info for library named '{library_name}'."
+                return GetAllInfoForAllLibrariesResultFailure(result_details=details)
+
+            library_name_to_all_info[library_name] = cast("GetAllInfoForLibraryResultSuccess", library_all_info_result)
 
         # We're home free now
         details = "Successfully retrieved all info for all libraries."
@@ -3095,24 +3099,25 @@ class LibraryManager(EngineScoped):
     async def on_get_all_info_for_all_libraries_request(
         self, request: GetAllInfoForAllLibrariesRequest
     ) -> ResultPayload:
-        """Async handler for GetAllInfoForAllLibrariesRequest that waits for library loading to complete."""
+        """Registered entry point: hold the caller until any in-flight reload finishes."""
         await self._libraries_loading_complete.wait()
-        return await asyncio.to_thread(self.get_all_info_for_all_libraries_request, request)
+        return await self.get_all_info_for_all_libraries_request(request)
 
     async def on_get_all_info_for_library_request(self, request: GetAllInfoForLibraryRequest) -> ResultPayload:
-        """Async handler for GetAllInfoForLibraryRequest that waits for library loading to complete.
+        """Registered entry point: hold the caller until any in-flight reload finishes.
 
-        The registered entry point for this request. Mirrors the all-libraries handler
-        above: without the wait, a request arriving mid-reload reports the library as
+        Without the wait, a request arriving mid-reload reports the library as
         unregistered even though the reload re-registers it moments later.
-        `get_all_info_for_library_request` stays synchronous because
-        `get_all_info_for_all_libraries_request` calls it directly per library, after
-        having already waited on the gate itself.
+
+        The gate lives on the entry points rather than in the handlers themselves so an
+        internal caller cannot wait on a reload it is already running inside. That is not
+        a hypothetical: `_run_reload_libraries` enumerates registered libraries through a
+        gated request, which is why the gate cannot close any earlier than it does.
         """
         await self._libraries_loading_complete.wait()
-        return await asyncio.to_thread(self.get_all_info_for_library_request, request)
+        return await self.get_all_info_for_library_request(request)
 
-    def get_all_info_for_library_request(self, request: GetAllInfoForLibraryRequest) -> ResultPayload:  # noqa: PLR0911, PLR0912, PLR0915, C901
+    async def get_all_info_for_library_request(self, request: GetAllInfoForLibraryRequest) -> ResultPayload:  # noqa: PLR0911
         # Does this library exist?
         try:
             library = LibraryRegistry.get_library(name=request.library)
@@ -3172,47 +3177,12 @@ class LibraryManager(EngineScoped):
             # Put it into the map.
             node_type_name_to_node_metadata_details[node_type_name] = node_metadata_result_success
 
-        # Build widget info list if the library has widgets
+        # Build widget info list if the library has widgets. Hashing reads every bundle
+        # off disk, the only blocking work in this handler, so it runs in a thread.
         widgets_info: list[WidgetInfo] | None = None
         library_data = library.get_library_data()
         if library_data.widgets:
-            logger.debug(
-                "Library '%s' has %d widget(s), building widget info",
-                request.library,
-                len(library_data.widgets),
-            )
-            # Get the static server base URL for constructing absolute bundle URLs
-            static_server_base_url = self.engine.static_files_manager.static_server_base_url
-            # Get the library directory so we can hash each bundle file
-            library_info_for_path = self.get_library_info_by_library_name(request.library)
-            library_dir = Path(library_info_for_path.library_path).parent if library_info_for_path is not None else None
-            widgets_info = []
-            for widget_def in library_data.widgets:
-                # Construct the full URL for this widget
-                # The frontend will fetch from: {static_server_base_url}/api/libraries/{library_name}/widgets/{path}
-                base_url = f"{static_server_base_url}/api/libraries/{request.library}/widgets/{widget_def.path}"
-                # Append a content hash so browsers re-fetch when the bundle file changes
-                try:
-                    if library_dir is not None:
-                        content_hash = hashlib.sha256((library_dir / widget_def.path).read_bytes()).hexdigest()[:8]
-                        bundle_url = f"{base_url}?v={content_hash}"
-                    else:
-                        bundle_url = base_url
-                except OSError:
-                    bundle_url = base_url
-                logger.debug(
-                    "Widget '%s' from library '%s': bundle_url=%s",
-                    widget_def.name,
-                    request.library,
-                    bundle_url,
-                )
-                widgets_info.append(
-                    WidgetInfo(
-                        name=widget_def.name,
-                        bundle_url=bundle_url,
-                        description=widget_def.description,
-                    )
-                )
+            widgets_info = await asyncio.to_thread(self._build_widget_info, request.library, library_data.widgets)
 
         details = f"Successfully got all library info for a Library named '{request.library}'."
         result = GetAllInfoForLibraryResultSuccess(
@@ -3223,6 +3193,42 @@ class LibraryManager(EngineScoped):
             result_details=details,
         )
         return result
+
+    def _build_widget_info(self, library_name: str, widget_defs: Sequence[WidgetDefinition]) -> list[WidgetInfo]:
+        """Resolve each widget bundle to a cache-busting URL.
+
+        Blocking: reads and hashes every bundle file. Callers run this off the event loop.
+        """
+        logger.debug("Library '%s' has %d widget(s), building widget info", library_name, len(widget_defs))
+        # Get the static server base URL for constructing absolute bundle URLs
+        static_server_base_url = self.engine.static_files_manager.static_server_base_url
+        # Get the library directory so we can hash each bundle file
+        library_info_for_path = self.get_library_info_by_library_name(library_name)
+        library_dir = Path(library_info_for_path.library_path).parent if library_info_for_path is not None else None
+
+        widgets_info = []
+        for widget_def in widget_defs:
+            # Construct the full URL for this widget
+            # The frontend will fetch from: {static_server_base_url}/api/libraries/{library_name}/widgets/{path}
+            base_url = f"{static_server_base_url}/api/libraries/{library_name}/widgets/{widget_def.path}"
+            # Append a content hash so browsers re-fetch when the bundle file changes
+            try:
+                if library_dir is not None:
+                    content_hash = hashlib.sha256((library_dir / widget_def.path).read_bytes()).hexdigest()[:8]
+                    bundle_url = f"{base_url}?v={content_hash}"
+                else:
+                    bundle_url = base_url
+            except OSError:
+                bundle_url = base_url
+            logger.debug("Widget '%s' from library '%s': bundle_url=%s", widget_def.name, library_name, bundle_url)
+            widgets_info.append(
+                WidgetInfo(
+                    name=widget_def.name,
+                    bundle_url=bundle_url,
+                    description=widget_def.description,
+                )
+            )
+        return widgets_info
 
     def _create_stable_namespace(self, library_name: str, file_path: Path) -> str:
         """Create a stable namespace for a dynamic module.
