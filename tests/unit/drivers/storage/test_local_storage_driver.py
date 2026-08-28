@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import Mock, patch
 
+import httpx
 import pytest
 
 from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
@@ -409,3 +410,50 @@ class TestLocalStorageDriverGetAssetUrl:
         url = driver.get_asset_url(Path("/elsewhere/media/photo.png"))
 
         assert url == str(Path("/elsewhere/media/photo.png").resolve())
+
+
+class TestLocalStorageDriverDeleteFile:
+    """Test LocalStorageDriver.delete_file() idempotency.
+
+    The static server answers 404 for a missing file, which means the requested end state
+    already holds. See griptape-ai/griptape-nodes-engine#4872.
+    """
+
+    MODULE = "griptape_nodes.drivers.storage.local_storage_driver"
+
+    @staticmethod
+    def _delete_mock(status_code: int | None) -> Mock:
+        response = Mock()
+        response.status_code = status_code
+        if status_code is None:
+            response.raise_for_status.return_value = None
+        else:
+            response.raise_for_status.side_effect = httpx.HTTPStatusError(
+                f"http {status_code}", request=Mock(), response=response
+            )
+        return Mock(return_value=response)
+
+    def test_deletes_through_static_files_endpoint(self) -> None:
+        driver = LocalStorageDriver(Path("/workspace"))
+        delete_mock = self._delete_mock(None)
+
+        with patch(f"{self.MODULE}.httpx.delete", delete_mock):
+            driver.delete_file(Path("artifact_url_storage/abc/video.mp4"))
+
+        args, _ = delete_mock.call_args
+        assert args[0].endswith("/static-files/artifact_url_storage/abc/video.mp4")
+
+    def test_absent_file_is_a_no_op(self) -> None:
+        driver = LocalStorageDriver(Path("/workspace"))
+
+        with patch(f"{self.MODULE}.httpx.delete", self._delete_mock(404)):
+            driver.delete_file(TEST_FILE_PATH)
+
+    def test_raises_on_server_error(self) -> None:
+        driver = LocalStorageDriver(Path("/workspace"))
+
+        with (
+            patch(f"{self.MODULE}.httpx.delete", self._delete_mock(500)),
+            pytest.raises(RuntimeError, match="Failed to delete file"),
+        ):
+            driver.delete_file(TEST_FILE_PATH)

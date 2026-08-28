@@ -477,3 +477,52 @@ class TestGriptapeCloudStorageDriverExtractBucketId:
         url = "https://cloud.griptape.ai/buckets/my-bucket_test-123/assets/file.txt"
         result = GriptapeCloudStorageDriver.extract_bucket_id_from_url(url)
         assert result == "my-bucket_test-123"
+
+
+class TestGriptapeCloudStorageDriverDeleteFile:
+    """Test GriptapeCloudStorageDriver.delete_file() idempotency.
+
+    Deleting an asset that is already gone means the requested end state holds, so a 404
+    is a no-op. Cleanup of a transient upload must not fail an otherwise-successful run
+    over it. See griptape-ai/griptape-nodes-engine#4872.
+    """
+
+    @pytest.fixture
+    def cloud_storage_driver(self) -> GriptapeCloudStorageDriver:
+        return GriptapeCloudStorageDriver(
+            workspace_directory=Path("/workspace"),
+            bucket_id=TEST_BUCKET_ID,
+            api_key=TEST_API_KEY,
+        )
+
+    @staticmethod
+    def _status_error(status_code: int) -> httpx.HTTPStatusError:
+        response = Mock()
+        response.status_code = status_code
+        return httpx.HTTPStatusError(f"http {status_code}", request=Mock(), response=response)
+
+    def test_deletes_asset_at_workspace_relative_path(self, cloud_storage_driver: GriptapeCloudStorageDriver) -> None:
+        with patch.object(cloud_storage_driver, "_request") as mock_request:
+            cloud_storage_driver.delete_file(Path("artifact_url_storage/abc/video.mp4"))
+
+        args, _ = mock_request.call_args
+        assert args[0] == "DELETE"
+        assert args[1].endswith(f"/api/buckets/{TEST_BUCKET_ID}/assets/artifact_url_storage/abc/video.mp4")
+
+    def test_absent_asset_is_a_no_op(self, cloud_storage_driver: GriptapeCloudStorageDriver) -> None:
+        with patch.object(cloud_storage_driver, "_request", side_effect=self._status_error(404)):
+            cloud_storage_driver.delete_file(TEST_FILE_PATH)
+
+    def test_raises_on_permission_denied(self, cloud_storage_driver: GriptapeCloudStorageDriver) -> None:
+        with (
+            patch.object(cloud_storage_driver, "_request", side_effect=self._status_error(403)),
+            pytest.raises(RuntimeError, match="Failed to delete file"),
+        ):
+            cloud_storage_driver.delete_file(TEST_FILE_PATH)
+
+    def test_raises_on_server_error(self, cloud_storage_driver: GriptapeCloudStorageDriver) -> None:
+        with (
+            patch.object(cloud_storage_driver, "_request", side_effect=self._status_error(500)),
+            pytest.raises(RuntimeError, match="Failed to delete file"),
+        ):
+            cloud_storage_driver.delete_file(TEST_FILE_PATH)
