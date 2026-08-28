@@ -19,6 +19,7 @@ from griptape_nodes.retained_mode.events.artifact_events import (
 from griptape_nodes.retained_mode.events.base_events import ResultPayload
 from griptape_nodes.retained_mode.events.config_events import (
     ConfigLayer,
+    ConfigLayerName,
     ConfigValueSource,
     GetConfigCategoryRequest,
     GetConfigCategoryResultFailure,
@@ -75,6 +76,12 @@ USER_CONFIG_PATH = xdg_config_home() / "griptape_nodes" / "griptape_nodes_config
 # get_dot_value's own `default` parameter can't do this job: `None` is also its default.
 _KEY_NOT_IN_LAYER = object()
 
+# The only layers a settings write can control. `set_config_value` writes the user config
+# file, and "default" means nothing has overridden the Settings model, so a key sourced
+# from either is a key the user owns. Any other winning layer (project, workspace, env)
+# re-supplies its own value on every load_configs(), making a user-layer write invisible.
+_WRITABLE_LAYERS: frozenset[ConfigLayerName] = frozenset({"default", "user"})
+
 # Environment variable the engine PUBLISHES (it is never read as config input) carrying the absolute
 # directory libraries install under when no project declares a libraries_dir. Deliberately outside
 # the GTN_CONFIG_ prefix: that prefix is the highest-priority config INPUT layer, so publishing there
@@ -101,6 +108,38 @@ class EnvVarOverride(NamedTuple):
 # Outcomes of coercing an environment variable that no real config value can collide with.
 _REJECTED_BAD_VALUE = object()
 _REJECTED_UNKNOWN_KEY = object()
+
+
+class LoadedConfigFile(NamedTuple):
+    """One config file's parsed contents plus why it failed to parse, if it did.
+
+    `contents` is `{}` when the file is missing or unparsable. `parse_error` is None
+    unless the file EXISTS and failed to parse, so a caller can tell "no such file"
+    apart from "file is broken" without stat-ing the path a second time.
+    """
+
+    contents: dict
+    parse_error: str | None
+
+
+class ConfigWriteOutcome(NamedTuple):
+    """Whether a completed user-layer write is the value now in effect.
+
+    A write always lands in the user config file; whether it WINS depends on whether a
+    higher-priority layer also defines the key. See `ConfigManager._write_outcome`.
+    """
+
+    applied: bool
+    effective_value: Any
+    shadowed_by: ConfigValueSource | None
+
+
+class _LayerProbe(NamedTuple):
+    """One layer to check when resolving where a key's effective value comes from."""
+
+    layer: ConfigLayerName
+    values: dict
+    path: Path | None
 
 
 class ConfigManager(EngineScoped):
@@ -152,15 +191,14 @@ class ConfigManager(EngineScoped):
         # variable warns repeatedly for the life of this manager. Other ConfigManagers built
         # elsewhere in the process keep their own accounting.
         self._reported_invalid_env_vars: set[tuple[str, str]] = set()
-        # Parse error for the most recent load of each file layer, set by load_configs()
-        # via _load_config_from_file. None means either the file doesn't exist or it parsed
-        # fine; config_layers() distinguishes those two cases with `present`. Deliberately
-        # NOT touched by compute_project_provisioning_config / compute_system_defaults_provisioning_config's
-        # own _load_config_from_file calls, which preview a DIFFERENT project's config and
-        # would otherwise clobber the live layer's error with a preview's.
-        self._user_config_parse_error: str | None = None
-        self._project_config_parse_error: str | None = None
-        self._workspace_config_parse_error: str | None = None
+        # Parse error for the most recent load of each file layer, keyed by layer name and
+        # set by load_configs() via _load_file_layer. None means either the file doesn't
+        # exist or it parsed fine; config_layers() distinguishes those two cases with
+        # `present`. Deliberately NOT touched by compute_project_provisioning_config /
+        # compute_system_defaults_provisioning_config's own _load_config_from_file calls,
+        # which preview a DIFFERENT project's config and would otherwise clobber the live
+        # layer's error with a preview's.
+        self._layer_parse_errors: dict[ConfigLayerName, str | None] = {}
         self.load_configs()
 
         # Once per engine process, before any project YAML is read. See the method docstring for why
@@ -439,17 +477,28 @@ class ConfigManager(EngineScoped):
             key: Dot-notation key, e.g. "libraries_directory" or
                 "app_events.on_app_initialization_complete.libraries_to_register".
         """
-        if get_dot_value(self.env_config, key, _KEY_NOT_IN_LAYER) is not _KEY_NOT_IN_LAYER:
-            return ConfigValueSource(layer="env", env_var=f"GTN_CONFIG_{key.upper()}")
-        if get_dot_value(self.workspace_config, key, _KEY_NOT_IN_LAYER) is not _KEY_NOT_IN_LAYER:
-            path = str(self._workspace_config_path) if self._workspace_config_path is not None else None
-            return ConfigValueSource(layer="workspace", path=path)
-        if get_dot_value(self.project_config, key, _KEY_NOT_IN_LAYER) is not _KEY_NOT_IN_LAYER:
-            path = str(self._project_config_path) if self._project_config_path is not None else None
-            return ConfigValueSource(layer="project", path=path)
-        if get_dot_value(self.user_config, key, _KEY_NOT_IN_LAYER) is not _KEY_NOT_IN_LAYER:
-            return ConfigValueSource(layer="user", path=str(USER_CONFIG_PATH))
+        for probe in self._layer_probes():
+            if get_dot_value(probe.values, key, _KEY_NOT_IN_LAYER) is _KEY_NOT_IN_LAYER:
+                continue
+            if probe.layer == "env":
+                return ConfigValueSource(layer=probe.layer, env_var=f"GTN_CONFIG_{key.upper()}")
+            path = str(probe.path) if probe.path is not None else None
+            return ConfigValueSource(layer=probe.layer, path=path)
         return ConfigValueSource(layer="default")
+
+    def _layer_probes(self) -> list[_LayerProbe]:
+        """Return the file/env layers to check for a key, HIGHEST priority first.
+
+        The reverse of `load_configs`' merge order, minus "default", which every key falls
+        back to and which has no dict of its own to probe. Kept as one ordered list so
+        `value_source` cannot drift out of step with the merge it is describing.
+        """
+        return [
+            _LayerProbe(layer="env", values=self.env_config, path=None),
+            _LayerProbe(layer="workspace", values=self.workspace_config, path=self._workspace_config_path),
+            _LayerProbe(layer="project", values=self.project_config, path=self._project_config_path),
+            _LayerProbe(layer="user", values=self.user_config, path=USER_CONFIG_PATH),
+        ]
 
     def shadowed_by(self, key: str) -> ConfigValueSource | None:
         """Return the layer shadowing `key` from the user's own edits, or None if not shadowed.
@@ -465,7 +514,7 @@ class ConfigManager(EngineScoped):
             key: Dot-notation key, same as `value_source`.
         """
         source = self.value_source(key)
-        if source.layer in ("default", "user"):
+        if source.layer in _WRITABLE_LAYERS:
             return None
         return source
 
@@ -541,21 +590,21 @@ class ConfigManager(EngineScoped):
                 layer="user",
                 path=str(USER_CONFIG_PATH),
                 present=USER_CONFIG_PATH.exists(),
-                parse_error=self._user_config_parse_error,
+                parse_error=self._layer_parse_errors.get("user"),
                 values=self.user_config,
             ),
             ConfigLayer(
                 layer="project",
                 path=str(self._project_config_path) if self._project_config_path is not None else None,
                 present=self._project_config_path is not None and self._project_config_path.exists(),
-                parse_error=self._project_config_parse_error,
+                parse_error=self._layer_parse_errors.get("project"),
                 values=self.project_config,
             ),
             ConfigLayer(
                 layer="workspace",
                 path=str(self._workspace_config_path) if self._workspace_config_path is not None else None,
                 present=workspace_contributes,
-                parse_error=self._workspace_config_parse_error,
+                parse_error=self._layer_parse_errors.get("workspace"),
                 values=self.workspace_config,
             ),
             ConfigLayer(
@@ -707,27 +756,48 @@ class ConfigManager(EngineScoped):
         self._reported_invalid_env_vars.add(report_key)
         logger.warning("Ignoring environment variable %s: %s.", env_var_name, reason)
 
-    def _load_config_from_file(self, path: Path, label: str) -> tuple[dict, str | None]:
+    def _load_config_from_file(self, path: Path, label: str) -> LoadedConfigFile:
         """Read and parse a JSON config file.
 
-        Returns:
-            A tuple of (parsed contents, parse error). Contents is `{}` when the file is
-            missing or fails to parse. The error is `None` unless the file EXISTS and
-            failed to parse -- a missing file is not an error. A parse failure is still
-            logged at ERROR here, unchanged; the returned string additionally lets a
-            caller (currently only `load_configs`, for the three live layers) attribute
-            the failure to a specific layer for `config_layers()`, instead of it only ever
-            reaching a log line as before.
+        A parse failure is still logged at ERROR here, unchanged; the returned
+        `parse_error` additionally lets a caller (currently only `_load_file_layer`, for the
+        three live layers) attribute the failure to a specific layer for `config_layers()`,
+        instead of it only ever reaching a log line as before.
         """
         if not path.exists():
             logger.debug("No %s config file loaded", label)
-            return {}, None
+            return LoadedConfigFile(contents={}, parse_error=None)
         try:
-            return json.loads(path.read_text(encoding="utf-8")), None
+            return LoadedConfigFile(contents=json.loads(path.read_text(encoding="utf-8")), parse_error=None)
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
             error = f"{type(e).__name__}: {e}"
             logger.error("Error parsing %s config file: %s", label, e)
-            return {}, error
+            return LoadedConfigFile(contents={}, parse_error=error)
+
+    def _load_file_layer(self, layer: ConfigLayerName, path: Path | None, label: str) -> dict:
+        """Load one file-backed config layer and record its parse error under `layer`.
+
+        A None `path` means the layer has nothing to contribute -- no project is active, or
+        a workspace layer that resolves to the project's own file. That is not an error: the
+        layer loads empty and its recorded parse error is cleared, so a layer that failed to
+        parse for a previously active project cannot linger past the switch.
+
+        Args:
+            layer: Which layer this is, used as the parse-error key `config_layers()` reads.
+            path: The file backing this layer, or None when it has none.
+            label: Human-readable layer name for the log lines.
+
+        Returns:
+            This layer's own parsed contents, unmerged. `{}` when there is no file, the file
+            is missing, or it failed to parse.
+        """
+        if path is None:
+            self._layer_parse_errors[layer] = None
+            return {}
+
+        loaded = self._load_config_from_file(path, label)
+        self._layer_parse_errors[layer] = loaded.parse_error
+        return loaded.contents
 
     def load_configs(self) -> None:
         """Load and merge configs from all sources in priority order.
@@ -739,33 +809,19 @@ class ConfigManager(EngineScoped):
         self.default_config = Settings().model_dump()
         merged_config = self.default_config
 
-        if USER_CONFIG_PATH.exists():
-            self.user_config, self._user_config_parse_error = self._load_config_from_file(USER_CONFIG_PATH, "user")
-            merged_config = merge_dicts(merged_config, self.user_config)
-        else:
-            self.user_config = {}
-            self._user_config_parse_error = None
-            logger.debug("User config file not found")
+        self.user_config = self._load_file_layer("user", USER_CONFIG_PATH, "user")
+        merged_config = merge_dicts(merged_config, self.user_config)
 
-        if self._project_config_path is not None:
-            self.project_config, self._project_config_parse_error = self._load_config_from_file(
-                self._project_config_path, "project-adjacent"
-            )
-            merged_config = merge_dicts(merged_config, self.project_config)
-        else:
-            self.project_config = {}
-            self._project_config_parse_error = None
+        self.project_config = self._load_file_layer("project", self._project_config_path, "project-adjacent")
+        merged_config = merge_dicts(merged_config, self.project_config)
 
         # Skip workspace config when it points to the same file as project config
         # (this happens when workspace dir == project dir for self-contained projects).
-        if self._workspace_config_path is not None and self._workspace_config_path != self._project_config_path:
-            self.workspace_config, self._workspace_config_parse_error = self._load_config_from_file(
-                self._workspace_config_path, "workspace"
-            )
-            merged_config = merge_dicts(merged_config, self.workspace_config)
-        else:
-            self.workspace_config = {}
-            self._workspace_config_parse_error = None
+        workspace_config_path = self._workspace_config_path
+        if workspace_config_path == self._project_config_path:
+            workspace_config_path = None
+        self.workspace_config = self._load_file_layer("workspace", workspace_config_path, "workspace")
+        merged_config = merge_dicts(merged_config, self.workspace_config)
 
         # Apply runtime workspace override (from ProjectManager's project_workspaces lookup
         # or auto-default-to-project-dir). Sits above config files but below env vars.
@@ -853,18 +909,18 @@ class ConfigManager(EngineScoped):
         merged = Settings().model_dump()
 
         if USER_CONFIG_PATH.exists():
-            user_config, _ = self._load_config_from_file(USER_CONFIG_PATH, "user")
+            user_config = self._load_config_from_file(USER_CONFIG_PATH, "user").contents
             merged = merge_dicts(merged, user_config)
 
         project_config_path = project_dir / "griptape_nodes_config.json"
-        project_config, _ = self._load_config_from_file(project_config_path, "project-adjacent")
+        project_config = self._load_config_from_file(project_config_path, "project-adjacent").contents
         merged = merge_dicts(merged, project_config)
 
         # Skip the workspace layer when it resolves to the project-adjacent file
         # (workspace dir == project dir for self-contained projects), matching load_configs.
         workspace_config_path = workspace_dir / "griptape_nodes_config.json"
         if workspace_config_path != project_config_path:
-            workspace_config, _ = self._load_config_from_file(workspace_config_path, "workspace")
+            workspace_config = self._load_config_from_file(workspace_config_path, "workspace").contents
             merged = merge_dicts(merged, workspace_config)
 
         # Apply the runtime workspace override conditionally, mirroring _activate_project:
@@ -896,7 +952,7 @@ class ConfigManager(EngineScoped):
         merged = Settings().model_dump()
 
         if USER_CONFIG_PATH.exists():
-            user_config, _ = self._load_config_from_file(USER_CONFIG_PATH, "user")
+            user_config = self._load_config_from_file(USER_CONFIG_PATH, "user").contents
             merged = merge_dicts(merged, user_config)
 
         env_config = self._load_config_from_env_vars()
@@ -1036,8 +1092,7 @@ class ConfigManager(EngineScoped):
         Args:
             path: The config file to read.
         """
-        contents, _ = self._load_config_from_file(path, label=str(path))
-        return contents
+        return self._load_config_from_file(path, label=str(path)).contents
 
     def read_env_config(self) -> dict[str, Any]:
         """Return the config layer derived from GTN_CONFIG_ environment variables, mutating nothing.
@@ -1182,19 +1237,15 @@ class ConfigManager(EngineScoped):
             )
             return SetConfigCategoryResultFailure(result_details=result_details)
 
-        effective_value = self.get_config_value(request.category, should_load_env_var_if_detected=False)
-        shadowed = self.shadowed_by(request.category)
-        applied = shadowed is None
+        outcome = self._write_outcome(request.category)
 
         result_details = f"Successfully assigned the config dictionary for section '{request.category}'."
-        if not applied and shadowed is not None:
-            result_details += self._shadow_note(shadowed)
 
         return SetConfigCategoryResultSuccess(
-            result_details=result_details,
-            applied=applied,
-            effective_value=effective_value,
-            shadowed_by=shadowed,
+            result_details=self._append_shadow_note(result_details, outcome.shadowed_by),
+            applied=outcome.applied,
+            effective_value=outcome.effective_value,
+            shadowed_by=outcome.shadowed_by,
         )
 
     def on_handle_get_config_value_request(self, request: GetConfigValueRequest) -> ResultPayload:
@@ -1213,7 +1264,7 @@ class ConfigManager(EngineScoped):
         return GetConfigValueResultSuccess(
             value=find_results,
             source=source,
-            editable=source.layer in ("default", "user"),
+            editable=source.layer in _WRITABLE_LAYERS,
             result_details=result_details,
         )
 
@@ -1327,18 +1378,46 @@ class ConfigManager(EngineScoped):
                 formatted_lines.append(f"[{key}]:\n\tFROM: '{old}'\n\t  TO: '{new}'")
         return "\n".join(formatted_lines)
 
-    def _shadow_note(self, shadowed: ConfigValueSource) -> str:
-        """Format a human-readable suffix explaining which layer is shadowing a write.
+    def _write_outcome(self, key: str) -> ConfigWriteOutcome:
+        """Report whether a just-completed user-layer write to `key` is the value now in effect.
 
-        Appended to a Set*ResultSuccess's `result_details` when `applied` is False, so the
-        message a user sees (in a toast, a log, a CLI response) says WHY the write had no
-        visible effect instead of just reporting a bare success.
+        Called by the `Set*` handlers once the write is known to have reached disk. The write
+        always lands in the user layer, but a higher-priority layer (project, workspace, env)
+        that also defines `key` keeps winning the merge, which is what let those handlers
+        report a bare success for a write with no visible effect.
+
+        Reads the value back without env-var `$`-expansion, matching how the handlers read
+        `old_value`, so the reported value is the raw stored one rather than a resolved secret.
+
+        Args:
+            key: Dot-notation key that was written.
         """
+        shadowed = self.shadowed_by(key)
+        return ConfigWriteOutcome(
+            applied=shadowed is None,
+            effective_value=self.get_config_value(key, should_load_env_var_if_detected=False),
+            shadowed_by=shadowed,
+        )
+
+    def _append_shadow_note(self, result_details: str, shadowed: ConfigValueSource | None) -> str:
+        """Return `result_details` with an explanation appended when a higher layer shadows the write.
+
+        Returned unchanged when `shadowed` is None. Otherwise the message a user sees (in a
+        toast, a log, a CLI response) says WHY the write had no visible effect instead of
+        reporting a bare success.
+
+        Args:
+            result_details: The success message describing the write.
+            shadowed: The shadowing layer from `ConfigWriteOutcome.shadowed_by`.
+        """
+        if shadowed is None:
+            return result_details
+
         location = shadowed.path or shadowed.env_var or "an unknown source"
         return (
-            f" NOTE: a higher-priority '{shadowed.layer}' layer ({location}) currently "
-            "supplies the effective value, so this write has no visible effect until that "
-            "layer changes."
+            f"{result_details} NOTE: a higher-priority '{shadowed.layer}' layer ({location}) "
+            "currently supplies the effective value, so this write has no visible effect "
+            "until that layer changes."
         )
 
     def on_handle_set_config_value_request(self, request: SetConfigValueRequest) -> ResultPayload:
@@ -1366,11 +1445,8 @@ class ConfigManager(EngineScoped):
 
         # The write landed in the user layer; whether it's actually the value now in
         # effect depends on whether a higher-priority layer (project/workspace/env) also
-        # defines this key. Read back without env-var $-expansion, matching old_value
-        # above, so this reflects the raw stored value rather than a resolved secret.
-        effective_value = self.get_config_value(request.category_and_key, should_load_env_var_if_detected=False)
-        shadowed = self.shadowed_by(request.category_and_key)
-        applied = shadowed is None
+        # defines this key.
+        outcome = self._write_outcome(request.category_and_key)
 
         # For container types, indicate the change with a diff
         if isinstance(request.value, (dict, list)):
@@ -1386,14 +1462,11 @@ class ConfigManager(EngineScoped):
         else:
             result_details = f"Successfully assigned the config value for '{request.category_and_key}':\n\tFROM '{old_value_copy}'\n\tTO: '{request.value}'"
 
-        if not applied and shadowed is not None:
-            result_details += self._shadow_note(shadowed)
-
         return SetConfigValueResultSuccess(
-            result_details=result_details,
-            applied=applied,
-            effective_value=effective_value,
-            shadowed_by=shadowed,
+            result_details=self._append_shadow_note(result_details, outcome.shadowed_by),
+            applied=outcome.applied,
+            effective_value=outcome.effective_value,
+            shadowed_by=outcome.shadowed_by,
         )
 
     def _write_user_config_delta(self, user_config_delta: dict) -> bool:  # noqa: C901, PLR0911, PLR0912, PLR0915
