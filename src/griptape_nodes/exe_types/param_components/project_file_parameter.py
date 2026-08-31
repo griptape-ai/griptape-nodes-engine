@@ -8,10 +8,10 @@ from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.files.file import FileDestination, FileDestinationProvider
 from griptape_nodes.files.project_file import ProjectFileDestination
 from griptape_nodes.retained_mode.events.connection_events import (
+    CreateConnectionRequest,
     ListConnectionsForNodeRequest,
     ListConnectionsForNodeResultSuccess,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.retained_mode import RetainedMode
 from griptape_nodes.traits.button import Button, ButtonDetailsMessagePayload
 from griptape_nodes.traits.file_system_picker import FileSystemPicker
@@ -127,11 +127,11 @@ class ProjectFileParameter:
         Raises:
             ValueError: If an upstream FileDestinationProvider is connected but returns None.
         """
-        result = GriptapeNodes.handle_request(ListConnectionsForNodeRequest(node_name=self._node.name))
+        result = self._node.engine.handle_request(ListConnectionsForNodeRequest(node_name=self._node.name))
         if isinstance(result, ListConnectionsForNodeResultSuccess):
             for conn in result.incoming_connections:
                 if conn.target_parameter_name == self._name:
-                    source_node = GriptapeNodes.ObjectManager().attempt_get_object_by_name(conn.source_node_name)
+                    source_node = self._node.engine.object_manager.attempt_get_object_by_name(conn.source_node_name)
                     if isinstance(source_node, FileDestinationProvider):
                         file_dest = source_node.file_destination
                         if file_dest is None:
@@ -172,7 +172,7 @@ class ProjectFileParameter:
         node_name = self._node.name
 
         has_incoming = False
-        result = GriptapeNodes.handle_request(ListConnectionsForNodeRequest(node_name=node_name))
+        result = self._node.engine.handle_request(ListConnectionsForNodeRequest(node_name=node_name))
         if isinstance(result, ListConnectionsForNodeResultSuccess):
             has_incoming = any(conn.target_parameter_name == self._name for conn in result.incoming_connections)
 
@@ -186,6 +186,9 @@ class ProjectFileParameter:
 
         # TODO: https://github.com/griptape-ai/griptape-nodes/issues/4097
         # Replace with a non-RM utility for creating sibling nodes relative to a given node.
+        # Until then this is the one remaining path from exe_types to the facade: RetainedMode is
+        # a re-export, so the TID251 ban does not see it. It resolves the ambient engine, which is
+        # correct here only because button handlers run where the node lives.
         create_result = RetainedMode.create_node_relative_to(
             reference_node_name=node_name,
             new_node_type="FileOutputSettings",
@@ -205,7 +208,7 @@ class ProjectFileParameter:
 
         configure_node_name = create_result
 
-        configure_node = GriptapeNodes.ObjectManager().attempt_get_object_by_name(configure_node_name)
+        configure_node = self._node.engine.object_manager.attempt_get_object_by_name(configure_node_name)
         if configure_node is not None:
             configure_node.set_parameter_value("situation", self._situation_name)
             configure_node.publish_update_to_parameter("situation", self._situation_name)
@@ -215,9 +218,17 @@ class ProjectFileParameter:
                 configure_node.set_parameter_value("filename", current_filename)
                 configure_node.publish_update_to_parameter("filename", current_filename)
 
-        connection_result = RetainedMode.connect(
-            source=f"{configure_node_name}.file_destination",
-            destination=f"{node_name}.{self._name}",
+        # Dispatched through this node's engine rather than RetainedMode. RetainedMode is a
+        # facade re-export, so going through it resolves the ambient engine -- which the TID251
+        # ban does not catch, and which would answer from a different engine than the request
+        # above it.
+        connection_result = self._node.engine.handle_request(
+            CreateConnectionRequest(
+                source_node_name=configure_node_name,
+                source_parameter_name="file_destination",
+                target_node_name=node_name,
+                target_parameter_name=self._name,
+            )
         )
 
         if not connection_result.succeeded():

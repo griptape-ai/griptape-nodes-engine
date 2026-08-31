@@ -65,7 +65,7 @@ def _stub_engine() -> Iterator[None]:
     with (
         patch(f"{module}.huggingface_repo_parameter.list_repo_revisions_in_cache", return_value=[]),
         patch(f"{module}.huggingface_repo_parameter.list_all_repo_revisions_in_cache", return_value=[]),
-        patch(f"{module}.huggingface_model_parameter.GriptapeNodes.handle_request", side_effect=handle_request),
+        patch("griptape_nodes.retained_mode.engine.Engine.handle_request", side_effect=handle_request),
     ):
         yield
 
@@ -124,9 +124,8 @@ class TestFailClosed:
 
     def test_policy_resolution_failure_denies_everything(self) -> None:
         """A library that cannot be resolved must not silently open the gate."""
-        module = "griptape_nodes.exe_types.param_components.huggingface"
         with patch(
-            f"{module}.huggingface_model_parameter.GriptapeNodes.handle_request",
+            "griptape_nodes.retained_mode.engine.Engine.handle_request",
             return_value=QueryModelAccessForNodeResultFailure(result_details="node type not found"),
         ):
             param = _param(gated=True)
@@ -152,9 +151,8 @@ class TestTheEmptyCachePlaceholderIsNotBadgedAsUnlicensed:
     """
 
     def _unresolvable_param(self, *, add_parameters: bool = False) -> HuggingFaceRepoParameter:
-        module = "griptape_nodes.exe_types.param_components.huggingface"
         with patch(
-            f"{module}.huggingface_model_parameter.GriptapeNodes.handle_request",
+            "griptape_nodes.retained_mode.engine.Engine.handle_request",
             return_value=QueryModelAccessForNodeResultFailure(result_details="node type not found"),
         ):
             # `repo_ids=[]` + `list_all_models=True` is the "offer whatever is cached" config, and
@@ -195,8 +193,7 @@ class TestUngatedIsUnchanged:
         assert param.query_for_denial(UNDECLARED_REPO) is None
 
     def test_ungated_does_not_query_policy(self) -> None:
-        module = "griptape_nodes.exe_types.param_components.huggingface"
-        with patch(f"{module}.huggingface_model_parameter.GriptapeNodes.handle_request") as handle:
+        with patch("griptape_nodes.retained_mode.engine.Engine.handle_request") as handle:
             _param(gated=False)
         access_calls = [
             call for call in handle.call_args_list if isinstance(call.args[0], QueryModelAccessForNodeRequest)
@@ -235,9 +232,8 @@ class TestAutoDetect:
 
     def test_stays_ungated_when_the_node_declares_nothing(self) -> None:
         """An empty verdict list means no catalog to gate against, so offer everything."""
-        module = "griptape_nodes.exe_types.param_components.huggingface"
         with patch(
-            f"{module}.huggingface_model_parameter.GriptapeNodes.handle_request",
+            "griptape_nodes.retained_mode.engine.Engine.handle_request",
             return_value=QueryModelAccessForNodeResultSuccess(verdicts=[], result_details="ok"),
         ):
             param = _param(gated=None)
@@ -252,9 +248,8 @@ class TestAutoDetect:
         not be resolved at all (unregistered, ambiguous across two libraries, or mid-reload), and
         treating that as "allow everything" let an admin's deny be bypassed by a lookup error.
         """
-        module = "griptape_nodes.exe_types.param_components.huggingface"
         with patch(
-            f"{module}.huggingface_model_parameter.GriptapeNodes.handle_request",
+            "griptape_nodes.retained_mode.engine.Engine.handle_request",
             return_value=QueryModelAccessForNodeResultFailure(result_details="node type not found"),
         ):
             param = _param(gated=None)
@@ -263,9 +258,8 @@ class TestAutoDetect:
 
     def test_stays_ungated_for_a_library_that_declares_nothing(self) -> None:
         """The real pre-adoption path: a Success carrying no verdicts leaves gating off."""
-        module = "griptape_nodes.exe_types.param_components.huggingface"
         with patch(
-            f"{module}.huggingface_model_parameter.GriptapeNodes.handle_request",
+            "griptape_nodes.retained_mode.engine.Engine.handle_request",
             return_value=QueryModelAccessForNodeResultSuccess(verdicts=[], result_details="ok"),
         ):
             param = _param(gated=None)
@@ -274,9 +268,8 @@ class TestAutoDetect:
 
     def test_explicit_true_still_fails_closed_on_resolution_failure(self) -> None:
         """Opting in explicitly keeps the loud behavior auto-detect deliberately softens."""
-        module = "griptape_nodes.exe_types.param_components.huggingface"
         with patch(
-            f"{module}.huggingface_model_parameter.GriptapeNodes.handle_request",
+            "griptape_nodes.retained_mode.engine.Engine.handle_request",
             return_value=QueryModelAccessForNodeResultFailure(result_details="node type not found"),
         ):
             param = _param(gated=True)
@@ -328,8 +321,7 @@ class TestConstructionDefersBusRequests:
         return param
 
     def test_construction_issues_no_bus_requests(self) -> None:
-        module = "griptape_nodes.exe_types.param_components.huggingface"
-        with patch(f"{module}.huggingface_model_parameter.GriptapeNodes.handle_request") as handle:
+        with patch("griptape_nodes.retained_mode.engine.Engine.handle_request") as handle:
             self._construct_deferred(gated=True)
         handle.assert_not_called()
 
@@ -412,7 +404,6 @@ class TestConstructionWithoutAScopeStillQueries:
                 return QueryModelAccessForNodeResultSuccess(verdicts=_verdicts(), result_details="ok")
             return object()  # not a ResultSuccess -> "nothing downloading", as in _stub_engine
 
-        module = "griptape_nodes.exe_types.param_components.huggingface"
-        with patch(f"{module}.huggingface_model_parameter.GriptapeNodes.handle_request", side_effect=handle_request):
+        with patch("griptape_nodes.retained_mode.engine.Engine.handle_request", side_effect=handle_request):
             self._construct_in_init()
         assert ListModelDownloadsRequest in seen
