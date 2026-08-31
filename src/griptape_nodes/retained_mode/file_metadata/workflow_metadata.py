@@ -33,27 +33,10 @@ METADATA_NAMESPACE = "gtn_"
 FLOW_COMMANDS_KEY = f"{METADATA_NAMESPACE}flow_commands"
 
 # Parameter names containing any of these substrings (case-insensitive) are excluded from
-# the plaintext sidecar JSON to avoid accidentally persisting API keys, passwords, or other
-# credentials that users may have stored directly as node parameter values.
-# Note: bare "token" is intentionally absent — it matches common non-secret AI parameters
-# like max_tokens, num_tokens, and token_count. Use specific forms (auth_token, api_token,
-# etc.) that unambiguously identify credential tokens.
-_SENSITIVE_PARAM_SUBSTRINGS = frozenset(
-    {
-        "secret",
-        "password",
-        "passwd",
-        "api_key",
-        "apikey",
-        "credential",
-        "private",
-        "auth_token",
-        "access_token",
-        "api_token",
-        "bearer_token",
-        "refresh_token",
-    }
-)
+# the plaintext sidecar JSON. "password" covers the load_pdf node's password parameter for
+# password-protected PDFs — the only known case in the standard library where a node
+# parameter holds a genuine secret value directly.
+_SENSITIVE_PARAM_SUBSTRINGS = frozenset({"password"})
 
 
 def _serialize_node(node_name: str, engine: Engine) -> str | None:
