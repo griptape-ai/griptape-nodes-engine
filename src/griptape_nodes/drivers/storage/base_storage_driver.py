@@ -1,12 +1,18 @@
+from __future__ import annotations
+
 import logging
 from abc import ABC, abstractmethod
-from pathlib import Path
-from typing import TypedDict
+from typing import TYPE_CHECKING, TypedDict
 
 import httpx
 
 from griptape_nodes.retained_mode.events.os_events import ExistingFilePolicy
-from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import SidecarContent
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import SidecarContent
+    from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -28,26 +34,22 @@ class BaseStorageDriver(ABC):
     converting absolute paths to workspace-relative before calling driver methods.
     """
 
-    def __init__(self, workspace_directory: Path) -> None:  # noqa: B027
-        """Initialize the storage driver with a workspace directory.
+    def __init__(self, config_manager: ConfigManager) -> None:
+        """Initialize the storage driver.
 
         Args:
-            workspace_directory: The base workspace directory path (unused, kept for API compatibility).
-                Drivers now fetch the current workspace dynamically via the workspace_directory property.
+            config_manager: Reports the current workspace directory.
         """
-        # workspace_directory parameter is ignored - the property reads from ConfigManager instead.
-        # This ensures drivers always use the current workspace, even if it changes after initialization.
+        self._config_manager = config_manager
 
     @property
     def workspace_directory(self) -> Path:
-        """Get the current workspace directory from ConfigManager.
+        """Get the workspace directory in force right now.
 
         Returns the workspace path fresh on each access to handle dynamic workspace
         changes (e.g., project switches, workspace_dir overrides).
         """
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        return GriptapeNodes.ConfigManager().workspace_path
+        return self._config_manager.workspace_path
 
     @abstractmethod
     def create_signed_upload_url(

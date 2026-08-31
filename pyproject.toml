@@ -178,10 +178,6 @@ ignore = [
 #
 # Group 2 -- not yet migrated. Each of these should eventually receive an Engine instead.
 # Deleting an entry from this list is the definition of done; do not add new entries.
-# GriptapeCloudStorageDriver is constructed from inside exe_types
-# (param_components/artifact_url/public_artifact_url_parameter.py), which has no Engine of its own
-# yet, so drivers cannot come off this list until exe_types does.
-"src/griptape_nodes/drivers/**" = ["TID251"]
 "src/griptape_nodes/exe_types/**" = ["TID251"]
 # WorkflowRegistry is still a process-global fake singleton reaching the facade for config.
 # Making it engine-owned is its own change, since it alters what node libraries import.

@@ -1,7 +1,10 @@
+from __future__ import annotations
+
 import logging
 import time
 from http import HTTPStatus
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import urljoin
 
 import httpx
@@ -9,9 +12,12 @@ import httpx
 from griptape_nodes.drivers.storage.base_storage_driver import BaseStorageDriver, CreateSignedUploadUrlResponse
 from griptape_nodes.files.path_utils import canonicalize_to_posix, strip_windows_long_path_prefix
 from griptape_nodes.retained_mode.events.os_events import ExistingFilePolicy, WriteFileRequest, WriteFileResultSuccess
-from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import SidecarContent
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.utils import resolve_workspace_path
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import SidecarContent
+    from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
+    from griptape_nodes.retained_mode.managers.os_manager import OSManager
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -19,14 +25,21 @@ logger = logging.getLogger("griptape_nodes")
 class LocalStorageDriver(BaseStorageDriver):
     """Stores files using the engine's local static server."""
 
-    def __init__(self, workspace_directory: Path, base_url: str | None = None) -> None:
+    def __init__(
+        self,
+        config_manager: ConfigManager,
+        os_manager: OSManager,
+        base_url: str | None = None,
+    ) -> None:
         """Initialize the LocalStorageDriver.
 
         Args:
-            workspace_directory: The base workspace directory path.
+            config_manager: Reports the current workspace directory.
+            os_manager: Performs the policy-aware writes this driver delegates to.
             base_url: The base URL for the static file server. If not provided, it will be constructed
         """
-        super().__init__(workspace_directory)
+        super().__init__(config_manager)
+        self._os_manager = os_manager
 
         from griptape_nodes.servers.static import (
             STATIC_SERVER_ENABLED,
@@ -54,18 +67,17 @@ class LocalStorageDriver(BaseStorageDriver):
         # on_write_file_request seems to work most reliably with an absolute path.
         absolute_path = resolve_workspace_path(path, self.workspace_directory)
 
-        # Always delegate to OSManager for file path resolution and policy handling.
+        # Always delegate the write for file path resolution and policy handling.
         # Creating an empty file before the upload url gives us a chance to claim ownership
         # of that particular file when creating the upload url. The file policy is not
         # checked when actually uploading the file, it will always overwrite.
-        os_manager = GriptapeNodes.OSManager()
         write_request = WriteFileRequest(
             file_path=str(absolute_path),
             content=b"",  # Empty content for URL generation
             existing_file_policy=existing_file_policy,
             skip_metadata_injection=True,
         )
-        result = os_manager.on_write_file_request(write_request)
+        result = self._os_manager.on_write_file_request(write_request)
 
         if not result.succeeded():
             msg = f"WriteFileRequest failed: {result.result_details}"
@@ -130,7 +142,7 @@ class LocalStorageDriver(BaseStorageDriver):
         """
         absolute_path = resolve_workspace_path(path, self.workspace_directory)
 
-        result = GriptapeNodes.OSManager().on_write_file_request(
+        result = self._os_manager.on_write_file_request(
             WriteFileRequest(
                 file_path=str(absolute_path),
                 content=file_content,
