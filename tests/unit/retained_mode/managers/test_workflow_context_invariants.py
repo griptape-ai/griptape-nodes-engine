@@ -358,3 +358,130 @@ class TestProjectSwitchReconcilesContext:
         finally:
             config_manager.workspace_path = original_workspace
             _drain(context_manager)
+
+
+class TestFailedRunIsNotReportedAsOpen:
+    """The user-visible symptom of #406: the engine names a workflow that failed to load.
+
+    `TestRunWorkflowUnwindsOnFailure` pins the stack depth by calling `run_workflow`
+    directly. These go the other way -- through the request handlers a client actually
+    sends, and asserting on what `GetWorkflowContext` reports, which is the answer every
+    editor adoption path consumes. Against the pre-fix engine both of these report
+    `'explodes'`: the workflow that just raised is announced as the one that is open.
+    """
+
+    @staticmethod
+    def _write_exploding_workflow(workspace: Path, key: str) -> None:
+        """A workflow file shaped like the engine's own codegen, that raises after its push."""
+        (workspace / f"{key}.py").write_text(
+            "from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes\n"
+            "context_manager = GriptapeNodes.ContextManager()\n"
+            "if not context_manager.has_current_workflow():\n"
+            "    context_manager.push_workflow(file_path=__file__)\n"
+            "raise RuntimeError('boom: simulated bad node library')\n"
+        )
+
+    @staticmethod
+    async def _reported_workflow(griptape_nodes: Engine) -> str | None:
+        result = await griptape_nodes.ahandle_request(GetWorkflowContextRequest())
+        assert isinstance(result, GetWorkflowContextSuccess)
+        return result.workflow_name
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("request_type", ["from_scratch", "with_current_state"])
+    async def test_failed_load_is_not_announced_as_the_open_workflow(
+        self, griptape_nodes: Engine, tmp_path: Path, request_type: str
+    ) -> None:
+        """Both file-path run handlers must leave nothing behind for the editor to adopt."""
+        from griptape_nodes.retained_mode.events.workflow_events import (
+            RunWorkflowFromScratchRequest,
+            RunWorkflowWithCurrentStateRequest,
+        )
+
+        context_manager = griptape_nodes.ContextManager()
+        config_manager = griptape_nodes.ConfigManager()
+        workflow_manager = griptape_nodes.WorkflowManager()
+        _drain(context_manager)
+
+        self._write_exploding_workflow(tmp_path, "explodes")
+
+        original_workspace = config_manager.workspace_path
+        config_manager.workspace_path = tmp_path
+        try:
+            # Library resolution is not what is under test; the file declares no header.
+            async def no_library_work(**_kwargs: object) -> None:
+                return None
+
+            request = (
+                RunWorkflowFromScratchRequest(file_path="explodes.py")
+                if request_type == "from_scratch"
+                else RunWorkflowWithCurrentStateRequest(file_path="explodes.py")
+            )
+            with patch.object(workflow_manager, "_ensure_libraries_for_workflow", no_library_work):
+                result = await griptape_nodes.ahandle_request(request)
+
+            assert result.failed(), "the workflow raises, so the run must be reported as a failure"
+            assert await self._reported_workflow(griptape_nodes) is None, (
+                f"{request_type}: the engine announced the workflow that just failed to load as the "
+                "open one -- every editor adoption path reads this answer and opens that workflow"
+            )
+            assert not context_manager.has_current_workflow(), (
+                f"{request_type}: the failed run stranded a context entry"
+            )
+        finally:
+            config_manager.workspace_path = original_workspace
+            _drain(context_manager)
+
+
+class TestImportUnderOpenWorkflowKeepsTheUsersWorkflow:
+    """Importing a sub-flow must not change which workflow the user is looking at.
+
+    The imported file runs under the parent's context by design -- its nodes belong to the
+    parent. What must hold is that the parent is still the reported workflow afterwards,
+    including when the import fails partway through.
+
+    Unlike the tests above, this one passes against the pre-fix engine too. It is a guard,
+    not a regression: retiring the stack before a run (so "replace" means replace) is the
+    kind of change that could plausibly unseat a parent mid-import, and this pins that it
+    does not.
+    """
+
+    @pytest.mark.asyncio
+    async def test_failed_subflow_import_leaves_the_parent_in_context(
+        self, griptape_nodes: Engine, tmp_path: Path
+    ) -> None:
+        """A sub-flow that raises must not displace or unseat the workflow that is open."""
+        from griptape_nodes.retained_mode.events.workflow_events import (
+            ImportWorkflowAsReferencedSubFlowRequest,
+        )
+
+        context_manager = griptape_nodes.ContextManager()
+        config_manager = griptape_nodes.ConfigManager()
+        _drain(context_manager)
+
+        original_workspace = config_manager.workspace_path
+        config_manager.workspace_path = tmp_path
+        try:
+            _register_workflow(tmp_path, "parent_open")
+            TestFailedRunIsNotReportedAsOpen._write_exploding_workflow(tmp_path, "child")
+            metadata = WorkflowMetadata(
+                name="child",
+                schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
+                engine_version_created_with="test",
+                node_libraries_referenced=[],
+                creation_date=datetime.now(UTC),
+            )
+            WorkflowRegistry.generate_new_workflow(registry_key="child", metadata=metadata, file_path="child.py")
+
+            context_manager.push_workflow("parent_open")
+
+            await griptape_nodes.ahandle_request(ImportWorkflowAsReferencedSubFlowRequest(workflow_name="child"))
+
+            reported = await TestFailedRunIsNotReportedAsOpen._reported_workflow(griptape_nodes)
+            assert reported == "parent_open", (
+                f"a sub-flow import left {reported!r} as the open workflow; the user's own "
+                "workflow must survive the import, successful or not"
+            )
+        finally:
+            config_manager.workspace_path = original_workspace
+            _drain(context_manager)
