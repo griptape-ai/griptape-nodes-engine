@@ -197,12 +197,13 @@ class TestWriteSidecarFailurePaths:
 
         mock_engine = Mock()
         mock_engine.handle_request.side_effect = handle_request
+        mock_engine.context_manager.has_current_workflow.return_value = False
 
         write_sidecar(file_path, None, mock_engine)
 
         assert sidecar_path.exists()
         data = json.loads(sidecar_path.read_text())
-        assert data["schema_version"] == "0.1.0"
+        assert data["schema_version"] == "0.2.0"
         assert "saved_at" in data
         # No situation field because metadata was empty SidecarContent()
         assert "situation" not in data
