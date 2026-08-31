@@ -17,6 +17,7 @@ nodes are instantiated and edited) and a worker (where ``process`` runs).
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -496,3 +497,90 @@ class TestBinaryFileWritesFromAWorker:
         result = await _execute("WriteBytesNode", "OrchestratorBytes")
 
         assert result.parameter_output_values["bytes_survived"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_request_added_parameter_lands_authoritatively_not_locally(self) -> None:
+        """Execute the request-pattern node in the worker role and pin both halves.
+
+        EditorBehaviorNode's hook adds its dynamic parameter via AddParameterToNodeRequest.
+        During worker hydration that hook fires on the fresh executing copy; the request
+        resolves against the AUTHORITATIVE node (looked up by name), so the parameter lands
+        there while the copy that is running process() never sees it. That asymmetry is the
+        documented contract -- the live harness proves it across a real process boundary;
+        this pins it in-repo.
+        """
+        current_engine().library_manager._is_worker = True
+        registered = _make("EditorBehaviorNode", "RequestPathNode")
+
+        result = await _execute("EditorBehaviorNode", "RequestPathNode", mode="expand")
+
+        assert result.parameter_output_values["dynamic_visible_in_process"] is False
+        assert registered.get_parameter_by_name("dynamic_extra") is not None
+
+
+class TestStructureDerivesFromValues:
+    """The authoring contract: parameter structure is a deterministic function of values.
+
+    A fresh worker-side copy starts with only its __init__ shape and receives values in dict
+    order, which promises nothing. If a value for a derived parameter arrives before the value
+    that derives it, hydration must wait for the derivation rather than fail -- and a value for
+    a parameter nothing derives must cost that one value, not the run.
+    """
+
+    @pytest.mark.asyncio
+    async def test_hydration_order_cannot_defeat_derivation(self) -> None:
+        """The derived parameter's value arrives FIRST, before the value that creates it.
+
+        Single-pass hydration failed the whole execution here: `derived_in` does not exist on
+        the fresh copy until the `shape` hook runs, and setting a value on a missing parameter
+        raises. The second pass applies it after the derivation.
+        """
+        current_engine().library_manager._is_worker = True
+        _make("DerivedStructureNode", "DerivedOrder")
+
+        result = await _execute("DerivedStructureNode", "DerivedOrder", derived_in="payload", shape="expanded")
+
+        assert result.parameter_output_values["echo"] == "payload"
+
+    @pytest.mark.asyncio
+    async def test_a_derivation_chain_hydrates_in_the_most_adversarial_order(self) -> None:
+        """Depth two, values ordered deepest-first: the fixpoint must chase the chain.
+
+        `shape` derives `derived_in`, whose own hook derives `derived_deep` -- the shape real
+        dynamic UIs take (provider creates model, model creates options). A fixed two-pass
+        hydration claims `derived_in` on its second pass but leaves `derived_deep` an orphan,
+        silently running the node with its default; the contract puts no depth bound on
+        derivation, so hydration must not either.
+        """
+        current_engine().library_manager._is_worker = True
+        _make("DerivedStructureNode", "DerivedChain")
+
+        result = await _execute(
+            "DerivedStructureNode",
+            "DerivedChain",
+            derived_deep="from the bottom",
+            derived_in="deeper",
+            shape="expanded",
+        )
+
+        assert result.parameter_output_values["echo"] == "deeper"
+        assert result.parameter_output_values["deep_echo"] == "from the bottom"
+
+    @pytest.mark.asyncio
+    async def test_a_value_nothing_derives_is_skipped_not_fatal(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A parameter added to the authoritative node by request does not exist here.
+
+        The canonical producer is a user adding a parameter in the editor: the orchestrator's
+        node has it, values ship at execute, and the fresh worker copy has no hook that
+        re-creates it. Failing hydration made every such parameter fatal to a worker-routed
+        node; the contract's answer is that the value goes unapplied, loudly.
+        """
+        current_engine().library_manager._is_worker = True
+        _make("DerivedStructureNode", "DerivedGhost")
+
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            result = await _execute("DerivedStructureNode", "DerivedGhost", ghost="orphaned", shape="plain")
+
+        assert result.parameter_output_values["echo"] == ""
+        assert "ghost" in caplog.text
+        assert "derive" in caplog.text

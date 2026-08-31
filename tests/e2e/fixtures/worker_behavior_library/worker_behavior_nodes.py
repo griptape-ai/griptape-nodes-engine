@@ -10,6 +10,10 @@ the minimal fixtures did not cover:
   refused and a local read would answer from the wrong process.
 - ``UnshippableOutputNode``: outputs a value its author declared unserializable, which a
   worker must refuse to ship rather than drop on the wire.
+- ``DerivedStructureNode``: the authoring contract's reference shape -- parameter structure
+  derives from parameter values. Its value hook creates and removes a parameter as a pure
+  function of ``shape``, so any fresh copy of the node converges on the right structure the
+  moment its values hydrate, in any order.
 - ``WriteBytesNode``: writes binary through ``File``, the ordinary way a node emits a file.
   Reads it back and reports whether the bytes survived, so a routing change that sends file
   I/O across the process boundary fails a test instead of silently writing mojibake.
@@ -237,6 +241,15 @@ class EditorBehaviorNode(DataNode):
                 allowed_modes={ParameterMode.OUTPUT},
             )
         )
+        self.add_parameter(
+            Parameter(
+                name="dynamic_visible_in_process",
+                type="bool",
+                default_value=False,
+                tooltip="Whether the parameter after_value_set added is visible to process()",
+                allowed_modes={ParameterMode.OUTPUT},
+            )
+        )
 
     def after_value_set(self, parameter: Parameter, value: Any) -> None:
         if parameter.name != "mode":
@@ -263,6 +276,13 @@ class EditorBehaviorNode(DataNode):
 
     def process(self) -> None:
         self.parameter_output_values["observed_mode"] = self.get_parameter_value("mode")
+        # Whether the parameter this node's own after_value_set added is present on the instance
+        # that is executing. In a worker the add is a REQUEST, and requests are answered by the
+        # orchestrator -- so the parameter can land on the orchestrator's node while this copy,
+        # the one running process(), never sees it.
+        self.parameter_output_values["dynamic_visible_in_process"] = (
+            self.get_parameter_by_name(self.DYNAMIC_PARAMETER) is not None
+        )
 
 
 class ReadSecretNode(DataNode):
@@ -371,3 +391,86 @@ class WriteBytesNode(DataNode):
         read_back = target.read_bytes()
         self.parameter_output_values["bytes_survived"] = read_back == self.PAYLOAD
         self.parameter_output_values["byte_count"] = len(read_back)
+
+
+class DerivedStructureNode(DataNode):
+    """Parameter structure as a deterministic function of parameter values.
+
+    This is the sanctioned dynamic-structure pattern (the diffusers VAE decoder's, minus the
+    pipeline): the value hook mutates the LOCAL node directly, so the derivation runs wherever
+    the values land -- on the orchestrator at edit time, and again on a fresh worker copy as
+    hydration applies the same values. Nothing needs to sync structure, because structure is
+    recomputed. Contrast EditorBehaviorNode, whose hook goes through a request and therefore
+    mutates only the authoritative node.
+    """
+
+    def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
+        super().__init__(name, metadata=metadata)
+        self.add_parameter(
+            Parameter(
+                name="shape",
+                type="str",
+                default_value="plain",
+                tooltip="Set to 'expanded' to derive the extra parameter",
+                allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+            )
+        )
+        self.add_parameter(
+            Parameter(
+                name="echo",
+                type="str",
+                default_value="",
+                tooltip="Echoes the derived parameter's hydrated value",
+                allowed_modes={ParameterMode.OUTPUT},
+            )
+        )
+        self.add_parameter(
+            Parameter(
+                name="deep_echo",
+                type="str",
+                default_value="",
+                tooltip="Echoes the second-level derived parameter's hydrated value",
+                allowed_modes={ParameterMode.OUTPUT},
+            )
+        )
+
+    def after_value_set(self, parameter: Parameter, value: Any) -> None:
+        if parameter.name == "shape":
+            wants_derived = value == "expanded"
+            has_derived = self.get_parameter_by_name("derived_in") is not None
+            if wants_derived and not has_derived:
+                self.add_parameter(
+                    Parameter(
+                        name="derived_in",
+                        type="str",
+                        default_value="",
+                        tooltip="Exists exactly when shape is 'expanded'",
+                        allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+                    )
+                )
+            elif not wants_derived and has_derived:
+                self.remove_parameter_element_by_name("derived_in")
+            return
+        if parameter.name == "derived_in":
+            # Second derivation level: the chain shape real dynamic UIs take (provider creates
+            # model, model creates options). Exists exactly when derived_in is 'deeper'.
+            wants_deep = value == "deeper"
+            has_deep = self.get_parameter_by_name("derived_deep") is not None
+            if wants_deep and not has_deep:
+                self.add_parameter(
+                    Parameter(
+                        name="derived_deep",
+                        type="str",
+                        default_value="",
+                        tooltip="Exists exactly when derived_in is 'deeper'",
+                        allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+                    )
+                )
+            elif not wants_deep and has_deep:
+                self.remove_parameter_element_by_name("derived_deep")
+
+    def process(self) -> None:
+        derived = self.get_parameter_value("derived_in") if self.get_parameter_by_name("derived_in") else ""
+        self.parameter_output_values["echo"] = derived
+        deep = self.get_parameter_value("derived_deep") if self.get_parameter_by_name("derived_deep") else ""
+        self.parameter_output_values["deep_echo"] = deep
