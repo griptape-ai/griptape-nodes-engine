@@ -16,10 +16,10 @@ from griptape_nodes.retained_mode.file_metadata.workflow_metadata import (
 )
 
 
-def _make_param(name: str, *, private: bool = False, value: Any = None, modes: set | None = None) -> tuple[Mock, Any]:
+def _make_param(name: str, *, secret: bool = False, value: Any = None, modes: set | None = None) -> tuple[Mock, Any]:
     param = Mock()
     param.name = name
-    param.private = private
+    param.secret = secret
     param.allowed_modes = modes if modes is not None else {ParameterMode.INPUT, ParameterMode.PROPERTY}
     return param, value
 
@@ -115,7 +115,7 @@ class TestCollectParameterValues:
         assert result is None
         assert "bad_node" in caplog.text
 
-    def test_collects_non_private_parameters(self) -> None:
+    def test_collects_non_secret_parameters(self) -> None:
         p1, _ = _make_param("prompt", value=None)
         p2, _ = _make_param("model", value=None)
 
@@ -133,9 +133,9 @@ class TestCollectParameterValues:
         assert result.values == {"prompt": "hello", "model": "gpt-4"}
         assert result.omitted == []
 
-    def test_excludes_private_parameters_from_values(self) -> None:
+    def test_excludes_secret_parameters_from_values(self) -> None:
         pub, _ = _make_param("prompt", value=None)
-        priv, _ = _make_param("password", private=True, value=None)
+        priv, _ = _make_param("password", secret=True, value=None)
 
         values = {"prompt": "hello", "password": "secret"}
         node = Mock()
@@ -183,9 +183,9 @@ class TestCollectParameterValues:
         assert result is not None
         assert result.values == {}
 
-    def test_multiple_private_params_all_listed_in_omitted(self) -> None:
-        p1, _ = _make_param("api_password", private=True, value=None)
-        p2, _ = _make_param("db_password", private=True, value=None)
+    def test_multiple_secret_params_all_listed_in_omitted(self) -> None:
+        p1, _ = _make_param("api_password", secret=True, value=None)
+        p2, _ = _make_param("db_password", secret=True, value=None)
         p3, _ = _make_param("prompt", value=None)
 
         values = {"api_password": "s3cr3t", "db_password": "hunter2", "prompt": "hello"}
@@ -236,8 +236,8 @@ class TestCollectRawProvenance:
         assert result["flow"]["name"] == "ControlFlow_1"
         assert result["flow"]["resolving_nodes"] == ["MyNode"]
 
-    def test_parameters_omitted_present_for_private_params(self) -> None:
-        priv, _ = _make_param("password", private=True, value=None)
+    def test_parameters_omitted_present_for_secret_params(self) -> None:
+        priv, _ = _make_param("password", secret=True, value=None)
         pub, _ = _make_param("prompt", value=None)
 
         param_values = {"password": "secret", "prompt": "hi"}
@@ -291,8 +291,8 @@ class TestCollectSidecarProvenance:
         assert result["flow"]["node_name"] == "NodeA"
         assert "resolving_nodes" not in result["flow"]
 
-    def test_private_params_in_parameters_omitted_not_parameters(self) -> None:
-        priv, _ = _make_param("password", private=True, value=None)
+    def test_secret_params_in_parameters_omitted_not_parameters(self) -> None:
+        priv, _ = _make_param("password", secret=True, value=None)
         pub, _ = _make_param("prompt", value=None)
 
         param_values = {"password": "s3cr3t", "prompt": "hi"}
@@ -312,7 +312,7 @@ class TestCollectSidecarProvenance:
         assert result["parameters"] == {"prompt": "hi"}
         assert result["parameters_omitted"] == ["password"]
 
-    def test_parameters_omitted_absent_when_no_private_params(self) -> None:
+    def test_parameters_omitted_absent_when_no_secret_params(self) -> None:
         pub, _ = _make_param("prompt", value=None)
 
         node = Mock()
@@ -353,8 +353,8 @@ class TestCollectWorkflowMetadata:
 
         assert "gtn_saved_at" in result
 
-    def test_private_params_excluded_from_png_metadata(self) -> None:
-        priv, _ = _make_param("password", private=True, value=None)
+    def test_secret_params_excluded_from_png_metadata(self) -> None:
+        priv, _ = _make_param("password", secret=True, value=None)
         pub, _ = _make_param("prompt", value=None)
 
         param_values = {"password": "s3cr3t", "prompt": "hello"}
