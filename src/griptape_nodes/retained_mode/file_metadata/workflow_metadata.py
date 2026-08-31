@@ -6,7 +6,7 @@ import base64
 import logging
 import pickle
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from griptape_nodes.exe_types.core_types import ParameterMode
 from griptape_nodes.exe_types.node_types import BaseNode
@@ -32,11 +32,10 @@ METADATA_NAMESPACE = "gtn_"
 # Metadata key for storing flow commands
 FLOW_COMMANDS_KEY = f"{METADATA_NAMESPACE}flow_commands"
 
-# Parameter names containing any of these substrings (case-insensitive) are excluded from
-# the plaintext sidecar JSON. "password" covers the load_pdf node's password parameter for
-# password-protected PDFs — the only known case in the standard library where a node
-# parameter holds a genuine secret value directly.
-_SENSITIVE_PARAM_SUBSTRINGS = frozenset({"password"})
+
+class _ParameterCollection(NamedTuple):
+    values: dict[str, Any]
+    omitted: list[str]
 
 
 def _serialize_node(node_name: str, engine: Engine) -> str | None:
@@ -102,17 +101,21 @@ def _serialize_flow(engine: Engine, flow_name: str | None = None) -> str | None:
         return encoded_data
 
 
-def _collect_parameter_values(node_name: str, engine: Engine) -> dict[str, Any] | None:
+def _collect_parameter_values(node_name: str, engine: Engine) -> _ParameterCollection | None:
     """Collect current parameter values from a node's INPUT and PROPERTY parameters.
+
+    Parameters marked private=True are excluded from the returned values and listed
+    in the omitted field instead, so callers can surface the omission without revealing
+    the value.
 
     Args:
         node_name: Name of the node to collect parameters from
         engine: The engine whose object manager resolves the node
 
     Returns:
-        Dictionary of parameter names to serialized values, or None if collection fails
+        _ParameterCollection with serialized values and omitted private parameter names,
+        or None if the node cannot be resolved.
     """
-    # Failure case: Attempt to get node object
     obj_mgr = engine.object_manager
     try:
         node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
@@ -124,43 +127,30 @@ def _collect_parameter_values(node_name: str, engine: Engine) -> dict[str, Any] 
         logger.warning("Node '%s' not found for parameter collection", node_name)
         return None
 
-    # Get all parameters from node
-    all_parameters = node.parameters
-
-    # Filter to INPUT and PROPERTY mode parameters only
     eligible_parameters = [
         param
-        for param in all_parameters
+        for param in node.parameters
         if ParameterMode.INPUT in param.allowed_modes or ParameterMode.PROPERTY in param.allowed_modes
     ]
 
-    # Collect and serialize parameter values
-    parameter_values = {}
+    values: dict[str, Any] = {}
+    omitted: list[str] = []
 
     for param in eligible_parameters:
-        # Get current value
-        value = node.get_parameter_value(param.name)
+        if param.private:
+            omitted.append(param.name)
+            continue
 
-        # Skip None values (not set)
+        value = node.get_parameter_value(param.name)
         if value is None:
             continue
 
-        # Serialize value with error handling
         try:
-            serialized_value = safe_unstructure(value)
-            parameter_values[param.name] = serialized_value
+            values[param.name] = safe_unstructure(value)
         except Exception as e:
             logger.warning("Failed to serialize parameter '%s' on node '%s': %s", param.name, node_name, e)
-            continue
 
-    # Success path: return collected values (may be empty dict)
-    return parameter_values
-
-
-def _is_sensitive_parameter(param_name: str) -> bool:
-    """Return True if the parameter name suggests it holds a secret value."""
-    lower = param_name.lower()
-    return any(sensitive in lower for sensitive in _SENSITIVE_PARAM_SUBSTRINGS)
+    return _ParameterCollection(values=values, omitted=omitted)
 
 
 def _collect_workflow_info(workflow_name: str) -> dict[str, Any]:
@@ -216,9 +206,12 @@ def _collect_raw_provenance(engine: Engine) -> dict[str, Any]:
         result["flow"] = {"name": flow.name, "resolving_nodes": list(resolving_nodes)}
 
         if resolving_nodes:
-            parameter_values = _collect_parameter_values(resolving_nodes[0], engine) or {}
-            if parameter_values:
-                result["parameters"] = parameter_values
+            collection = _collect_parameter_values(resolving_nodes[0], engine)
+            if collection is not None:
+                if collection.values:
+                    result["parameters"] = collection.values
+                if collection.omitted:
+                    result["parameters_omitted"] = collection.omitted
     except Exception:
         logger.exception("Failed to collect flow/node metadata for provenance")
 
@@ -228,9 +221,10 @@ def _collect_raw_provenance(engine: Engine) -> dict[str, Any]:
 def collect_sidecar_provenance(engine: Engine) -> dict[str, Any]:
     """Collect structured provenance data for the sidecar JSON file.
 
-    Delegates to _collect_raw_provenance() then applies sensitivity filtering and
-    reshapes the flow block for the sidecar's JSON schema. Unlike collect_workflow_metadata(),
-    values stay typed (not stringified) and sensitive parameter names are excluded.
+    Delegates to _collect_raw_provenance() and reshapes the flow block for the
+    sidecar's JSON schema. Private parameters are already excluded by
+    _collect_parameter_values(); this function passes 'parameters_omitted' through
+    unchanged. Unlike collect_workflow_metadata(), values stay typed (not stringified).
 
     Args:
         engine: The engine whose context manager and flow manager supply the metadata.
@@ -252,17 +246,10 @@ def collect_sidecar_provenance(engine: Engine) -> dict[str, Any]:
         result["flow"] = flow_info
 
     if "parameters" in raw:
-        safe_params: dict[str, Any] = {}
-        omitted_names: list[str] = []
-        for name, value in raw["parameters"].items():
-            if _is_sensitive_parameter(name):
-                omitted_names.append(name)
-            else:
-                safe_params[name] = value
-        if safe_params:
-            result["parameters"] = safe_params
-        if omitted_names:
-            result["parameters_omitted"] = omitted_names
+        result["parameters"] = raw["parameters"]
+
+    if "parameters_omitted" in raw:
+        result["parameters_omitted"] = raw["parameters_omitted"]
 
     return result
 
