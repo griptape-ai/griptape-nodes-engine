@@ -85,6 +85,7 @@ class SidecarContent(BaseModel):
     workflow: WorkflowInfo | None = None
     flow: FlowInfo | None = None
     parameters: dict[str, Any] | None = None
+    parameters_omitted: list[str] | None = None
 
 
 def _resolve_sidecar_path(file_path: Path, engine: Engine) -> Path:
@@ -160,6 +161,7 @@ def write_sidecar(file_path: Path, metadata: SidecarContent | None, engine: Engi
             workflow=WorkflowInfo(**provenance["workflow"]) if "workflow" in provenance else None,
             flow=FlowInfo(**provenance["flow"]) if "flow" in provenance else None,
             parameters=provenance.get("parameters"),
+            parameters_omitted=provenance.get("parameters_omitted"),
         )
         output = {
             "schema_version": SCHEMA_VERSION,

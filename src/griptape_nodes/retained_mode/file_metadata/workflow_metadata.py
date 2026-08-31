@@ -35,8 +35,24 @@ FLOW_COMMANDS_KEY = f"{METADATA_NAMESPACE}flow_commands"
 # Parameter names containing any of these substrings (case-insensitive) are excluded from
 # the plaintext sidecar JSON to avoid accidentally persisting API keys, passwords, or other
 # credentials that users may have stored directly as node parameter values.
+# Note: bare "token" is intentionally absent — it matches common non-secret AI parameters
+# like max_tokens, num_tokens, and token_count. Use specific forms (auth_token, api_token,
+# etc.) that unambiguously identify credential tokens.
 _SENSITIVE_PARAM_SUBSTRINGS = frozenset(
-    {"secret", "password", "passwd", "token", "api_key", "apikey", "credential", "private"}
+    {
+        "secret",
+        "password",
+        "passwd",
+        "api_key",
+        "apikey",
+        "credential",
+        "private",
+        "auth_token",
+        "access_token",
+        "api_token",
+        "bearer_token",
+        "refresh_token",
+    }
 )
 
 
@@ -207,25 +223,34 @@ def _collect_workflow_info(workflow_name: str) -> dict[str, Any]:
     return info
 
 
-def _collect_flow_and_params(engine: Engine) -> tuple[dict[str, Any], dict[str, Any]]:
+def _collect_flow_and_params(
+    engine: Engine,
+) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
     """Build the 'flow' and 'parameters' provenance blocks from current flow context.
 
     Returns:
-        A (flow_info, parameters) tuple; either may be empty if unavailable.
+        A (flow_info, safe_parameters, omitted_names) tuple.
+        safe_parameters excludes sensitive names; omitted_names lists what was excluded.
     """
     flow = engine.context_manager.get_current_flow()
     flow_info: dict[str, Any] = {"name": flow.name}
 
     _, resolving_nodes, _ = engine.flow_manager.flow_state(flow)
     if not resolving_nodes:
-        return flow_info, {}
+        return flow_info, {}, []
 
     node_name = resolving_nodes[0]
     flow_info["node_name"] = node_name
 
     parameter_values = _collect_parameter_values(node_name, engine) or {}
-    safe_params = {name: value for name, value in parameter_values.items() if not _is_sensitive_parameter(name)}
-    return flow_info, safe_params
+    safe_params: dict[str, Any] = {}
+    omitted_names: list[str] = []
+    for name, value in parameter_values.items():
+        if _is_sensitive_parameter(name):
+            omitted_names.append(name)
+        else:
+            safe_params[name] = value
+    return flow_info, safe_params, omitted_names
 
 
 def collect_sidecar_provenance(engine: Engine) -> dict[str, Any]:
@@ -250,17 +275,19 @@ def collect_sidecar_provenance(engine: Engine) -> dict[str, Any]:
     try:
         workflow_name = context_manager.get_current_workflow_name()
         result["workflow"] = _collect_workflow_info(workflow_name)
-    except Exception:  # noqa: S110
-        pass
+    except Exception:
+        logger.warning("Failed to collect workflow name for sidecar")
 
     if not context_manager.has_current_flow():
         return result
 
     try:
-        flow_info, safe_params = _collect_flow_and_params(engine)
+        flow_info, safe_params, omitted_names = _collect_flow_and_params(engine)
         result["flow"] = flow_info
         if safe_params:
             result["parameters"] = safe_params
+        if omitted_names:
+            result["parameters_omitted"] = omitted_names
     except Exception:
         logger.exception("Failed to collect flow/node metadata for sidecar")
 
