@@ -710,6 +710,19 @@ class ExecuteDagState(State):
             node_reference.node_state = NodeState.PROCESSING
             node_reference.node_reference.state = NodeResolutionState.RESOLVING
 
+            # A cancel sets this flag on every node in the DAG (`cancel_all_nodes`), but the
+            # only thing that clears it is `clear_node()`, which the teardown reaches solely for
+            # the run's entry nodes (`ControlFlowContext.reset` iterates `current_nodes`). A node
+            # that was cancelled mid-run as a data dependency therefore carried the flag into its
+            # next run and short-circuited immediately, reporting whatever its cooperative-cancel
+            # branch leaves behind rather than a cancellation. Clearing at dispatch scopes the flag
+            # to the execution it belongs to, which is the invariant the cancel paths kept missing:
+            # it holds no matter which of them ran, and whether or not a reset followed at all.
+            # Safe against a cancel racing this dispatch — nothing awaits between here and the
+            # create_task below, and a cancel arriving after it still sets the flag on this node
+            # and cancels the task.
+            node_reference.node_reference.clear_cancellation()
+
             node_task = asyncio.create_task(ExecuteDagState.execute_node(context.engine, node_reference))
             context.task_to_node[node_task] = node_reference
             node_reference.task_reference = node_task
