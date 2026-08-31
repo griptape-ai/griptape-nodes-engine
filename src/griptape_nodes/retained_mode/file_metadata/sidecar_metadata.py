@@ -1,10 +1,10 @@
 """Sidecar metadata file creation for files written through the retained mode API.
 
 When a file is saved, a sidecar JSON file is written to the project's metadata
-directory (`.griptape-nodes-metadata/`) with preserved path hierarchy. The sidecar captures
-caller-provided project context (situation name, macro template, variable values)
-merged with auto-collected workflow metadata (workflow name, flow context, node
-parameters).
+directory (`.griptape-nodes-metadata/`) with preserved path hierarchy. The sidecar
+captures the situation that triggered the save (name, macro, policy, variables) plus
+auto-collected workflow provenance (workflow name and dates, flow name, resolving node
+name, and node parameter values — with sensitive parameter names excluded).
 
 Example layout (for a file at <workspace>/outputs/image.png):
     .griptape-nodes-metadata/
@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
 
@@ -32,6 +32,7 @@ from griptape_nodes.retained_mode.events.project_events import (
     GetSituationRequest,
     GetSituationResultSuccess,
 )
+from griptape_nodes.retained_mode.file_metadata.workflow_metadata import collect_sidecar_provenance
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -41,7 +42,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("griptape_nodes")
 
-SCHEMA_VERSION = "0.1.0"
+SCHEMA_VERSION = "0.2.0"
 
 
 class SituationPolicy(BaseModel):
@@ -60,10 +61,30 @@ class SituationMetadata(BaseModel):
     variables: dict[str, str] | None = None
 
 
+class WorkflowInfo(BaseModel):
+    """Workflow-level provenance captured at save time."""
+
+    name: str | None = None
+    created: str | None = None
+    modified: str | None = None
+    engine_version: str | None = None
+    description: str | None = None
+
+
+class FlowInfo(BaseModel):
+    """Flow and node provenance captured at save time."""
+
+    name: str | None = None
+    node_name: str | None = None
+
+
 class SidecarContent(BaseModel):
-    """Caller-provided context written to the sidecar JSON file alongside saved files."""
+    """Context written to the sidecar JSON file alongside saved files."""
 
     situation: SituationMetadata | None = None
+    workflow: WorkflowInfo | None = None
+    flow: FlowInfo | None = None
+    parameters: dict[str, Any] | None = None
 
 
 def _resolve_sidecar_path(file_path: Path, engine: Engine) -> Path:
@@ -132,7 +153,14 @@ def write_sidecar(file_path: Path, metadata: SidecarContent | None, engine: Engi
     """
     try:
         sidecar_path = _resolve_sidecar_path(file_path, engine)
-        content = metadata or SidecarContent()
+        base = metadata or SidecarContent()
+        provenance = collect_sidecar_provenance(engine)
+        content = SidecarContent(
+            situation=base.situation,
+            workflow=WorkflowInfo(**provenance["workflow"]) if "workflow" in provenance else None,
+            flow=FlowInfo(**provenance["flow"]) if "flow" in provenance else None,
+            parameters=provenance.get("parameters"),
+        )
         output = {
             "schema_version": SCHEMA_VERSION,
             "saved_at": datetime.now(UTC).isoformat(),
