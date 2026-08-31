@@ -174,31 +174,6 @@ def _collect_parameter_values(node_name: str, engine: Engine) -> dict[str, Any] 
     return parameter_values
 
 
-def _collect_workflow_details(workflow_name: str, metadata: dict[str, str]) -> None:
-    """Collect workflow details from registry and add to metadata dict.
-
-    Args:
-        workflow_name: Name of the workflow
-        metadata: Dictionary to populate with workflow metadata (modified in-place)
-    """
-    try:
-        workflow = WorkflowRegistry.get_workflow_by_name(workflow_name)
-
-        if workflow.metadata.creation_date:
-            metadata[f"{METADATA_NAMESPACE}workflow_created"] = workflow.metadata.creation_date.isoformat()
-
-        if workflow.metadata.last_modified_date:
-            metadata[f"{METADATA_NAMESPACE}workflow_modified"] = workflow.metadata.last_modified_date.isoformat()
-
-        if workflow.metadata.engine_version_created_with:
-            metadata[f"{METADATA_NAMESPACE}engine_version"] = workflow.metadata.engine_version_created_with
-
-        if workflow.metadata.description:
-            metadata[f"{METADATA_NAMESPACE}workflow_description"] = workflow.metadata.description
-    except Exception:  # noqa: S110
-        pass
-
-
 def _is_sensitive_parameter(param_name: str) -> bool:
     """Return True if the parameter name suggests it holds a secret value."""
     lower = param_name.lower()
@@ -206,7 +181,7 @@ def _is_sensitive_parameter(param_name: str) -> bool:
 
 
 def _collect_workflow_info(workflow_name: str) -> dict[str, Any]:
-    """Build the 'workflow' provenance block for a given workflow name."""
+    """Build the structured workflow provenance block for a given workflow name."""
     info: dict[str, Any] = {"name": workflow_name}
     try:
         workflow = WorkflowRegistry.get_workflow_by_name(workflow_name)
@@ -223,48 +198,19 @@ def _collect_workflow_info(workflow_name: str) -> dict[str, Any]:
     return info
 
 
-def _collect_flow_and_params(
-    engine: Engine,
-) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
-    """Build the 'flow' and 'parameters' provenance blocks from current flow context.
+def _collect_raw_provenance(engine: Engine) -> dict[str, Any]:
+    """Collect structured provenance from current execution context without any output formatting.
 
-    Returns:
-        A (flow_info, safe_parameters, omitted_names) tuple.
-        safe_parameters excludes sensitive names; omitted_names lists what was excluded.
-    """
-    flow = engine.context_manager.get_current_flow()
-    flow_info: dict[str, Any] = {"name": flow.name}
-
-    _, resolving_nodes, _ = engine.flow_manager.flow_state(flow)
-    if not resolving_nodes:
-        return flow_info, {}, []
-
-    node_name = resolving_nodes[0]
-    flow_info["node_name"] = node_name
-
-    parameter_values = _collect_parameter_values(node_name, engine) or {}
-    safe_params: dict[str, Any] = {}
-    omitted_names: list[str] = []
-    for name, value in parameter_values.items():
-        if _is_sensitive_parameter(name):
-            omitted_names.append(name)
-        else:
-            safe_params[name] = value
-    return flow_info, safe_params, omitted_names
-
-
-def collect_sidecar_provenance(engine: Engine) -> dict[str, Any]:
-    """Collect structured provenance data for the sidecar JSON file.
-
-    Returns typed, nested data suitable for JSON serialization, unlike
-    collect_workflow_metadata() which flattens everything into strings for
-    PNG text-chunk injection. Sensitive parameter names are excluded.
+    This is the single source of truth for provenance data. Both collect_sidecar_provenance()
+    and collect_workflow_metadata() delegate here and then format the result for their
+    respective targets (JSON sidecar vs. flat PNG text-chunk strings).
 
     Args:
         engine: The engine whose context manager and flow manager supply the metadata.
 
     Returns:
-        Dict with optional 'workflow', 'flow', 'parameters', and 'parameters_omitted' keys.
+        Dict with optional 'workflow', 'flow', and 'parameters' keys. 'flow' always includes
+        a 'resolving_nodes' list so callers can decide how to present multiple nodes.
     """
     result: dict[str, Any] = {}
     context_manager = engine.context_manager
@@ -276,84 +222,120 @@ def collect_sidecar_provenance(engine: Engine) -> dict[str, Any]:
         workflow_name = context_manager.get_current_workflow_name()
         result["workflow"] = _collect_workflow_info(workflow_name)
     except Exception:
-        logger.warning("Failed to collect workflow name for sidecar")
+        logger.warning("Failed to collect workflow name for provenance")
 
     if not context_manager.has_current_flow():
         return result
 
     try:
-        flow_info, safe_params, omitted_names = _collect_flow_and_params(engine)
-        result["flow"] = flow_info
-        if safe_params:
-            result["parameters"] = safe_params
-        if omitted_names:
-            result["parameters_omitted"] = omitted_names
+        flow = context_manager.get_current_flow()
+        _, resolving_nodes, _ = engine.flow_manager.flow_state(flow)
+        result["flow"] = {"name": flow.name, "resolving_nodes": list(resolving_nodes)}
+
+        if resolving_nodes:
+            parameter_values = _collect_parameter_values(resolving_nodes[0], engine) or {}
+            if parameter_values:
+                result["parameters"] = parameter_values
     except Exception:
-        logger.exception("Failed to collect flow/node metadata for sidecar")
+        logger.exception("Failed to collect flow/node metadata for provenance")
 
     return result
 
 
-def collect_workflow_metadata(engine: Engine) -> dict[str, str]:
-    """Collect available workflow metadata from current execution context.
+def collect_sidecar_provenance(engine: Engine) -> dict[str, Any]:
+    """Collect structured provenance data for the sidecar JSON file.
 
-    Gathers metadata from the engine's ContextManager and WorkflowRegistry.
-    All keys are prefixed with METADATA_NAMESPACE to avoid conflicts.
+    Delegates to _collect_raw_provenance() then applies sensitivity filtering and
+    reshapes the flow block for the sidecar's JSON schema. Unlike collect_workflow_metadata(),
+    values stay typed (not stringified) and sensitive parameter names are excluded.
 
     Args:
         engine: The engine whose context manager and flow manager supply the metadata.
 
     Returns:
-        Dictionary of metadata key-value pairs, may be empty if no context available
+        Dict with optional 'workflow', 'flow', 'parameters', and 'parameters_omitted' keys.
     """
-    metadata = {}
+    raw = _collect_raw_provenance(engine)
+    result: dict[str, Any] = {}
 
-    # Add save timestamp (always available)
+    if "workflow" in raw:
+        result["workflow"] = raw["workflow"]
+
+    if "flow" in raw:
+        resolving_nodes = raw["flow"]["resolving_nodes"]
+        flow_info: dict[str, Any] = {"name": raw["flow"]["name"]}
+        if resolving_nodes:
+            flow_info["node_name"] = resolving_nodes[0]
+        result["flow"] = flow_info
+
+    if "parameters" in raw:
+        safe_params: dict[str, Any] = {}
+        omitted_names: list[str] = []
+        for name, value in raw["parameters"].items():
+            if _is_sensitive_parameter(name):
+                omitted_names.append(name)
+            else:
+                safe_params[name] = value
+        if safe_params:
+            result["parameters"] = safe_params
+        if omitted_names:
+            result["parameters_omitted"] = omitted_names
+
+    return result
+
+
+def _flatten_workflow_info(wf: dict[str, Any], metadata: dict[str, str]) -> None:
+    """Write a workflow provenance block into a flat gtn_-prefixed string dict."""
+    metadata[f"{METADATA_NAMESPACE}workflow_name"] = wf["name"]
+    if wf.get("created"):
+        metadata[f"{METADATA_NAMESPACE}workflow_created"] = wf["created"]
+    if wf.get("modified"):
+        metadata[f"{METADATA_NAMESPACE}workflow_modified"] = wf["modified"]
+    if wf.get("engine_version"):
+        metadata[f"{METADATA_NAMESPACE}engine_version"] = wf["engine_version"]
+    if wf.get("description"):
+        metadata[f"{METADATA_NAMESPACE}workflow_description"] = wf["description"]
+
+
+def collect_workflow_metadata(engine: Engine) -> dict[str, str]:
+    """Collect available workflow metadata from current execution context.
+
+    Delegates to _collect_raw_provenance() then flattens the result to a gtn_-prefixed
+    string dict suitable for PNG text-chunk injection. Also appends the serialized flow
+    commands blob, which is only needed for the embedded-metadata path.
+
+    Args:
+        engine: The engine whose context manager and flow manager supply the metadata.
+
+    Returns:
+        Dictionary of metadata key-value pairs, may be empty if no context available.
+    """
+    metadata: dict[str, str] = {}
     metadata[f"{METADATA_NAMESPACE}saved_at"] = datetime.now(UTC).isoformat()
 
-    # Get context manager
-    context_manager = engine.context_manager
+    raw = _collect_raw_provenance(engine)
 
-    # Check workflow context
-    if not context_manager.has_current_workflow():
+    if "workflow" in raw:
+        _flatten_workflow_info(raw["workflow"], metadata)
+
+    if "flow" not in raw:
         return metadata
 
-    # Get workflow name
-    try:
-        workflow_name = context_manager.get_current_workflow_name()
-        metadata[f"{METADATA_NAMESPACE}workflow_name"] = workflow_name
-        _collect_workflow_details(workflow_name, metadata)
-    except Exception:  # noqa: S110
-        pass
+    fl = raw["flow"]
+    metadata[f"{METADATA_NAMESPACE}flow_name"] = fl["name"]
+    resolving_nodes = fl["resolving_nodes"]
 
-    # Get flow context and resolving nodes
-    if context_manager.has_current_flow():
-        try:
-            flow = context_manager.get_current_flow()
-            metadata[f"{METADATA_NAMESPACE}flow_name"] = flow.name
+    if resolving_nodes:
+        metadata[f"{METADATA_NAMESPACE}node_name"] = ", ".join(resolving_nodes)
 
-            # Get resolving nodes (currently running nodes) from flow_state
-            flow_manager = engine.flow_manager
-            _, resolving_nodes, _ = flow_manager.flow_state(flow)
+    # Serialize the entire flow to commands — only needed for embedded image metadata,
+    # not the sidecar (the pickle+base64 blob is too large and not useful in JSON).
+    flow_commands = _serialize_flow(engine)
+    if flow_commands:
+        metadata[FLOW_COMMANDS_KEY] = flow_commands
 
-            if resolving_nodes:
-                # Store node name(s) - if multiple, join with comma
-                metadata[f"{METADATA_NAMESPACE}node_name"] = ", ".join(resolving_nodes)
-
-            # Serialize the entire current flow to commands
-            # This captures all nodes, connections, and parameter values in the flow
-            flow_commands = _serialize_flow(engine)
-            if flow_commands:
-                metadata[FLOW_COMMANDS_KEY] = flow_commands
-
-            if resolving_nodes:
-                # Collect parameter values from the first resolving node
-                parameter_values = _collect_parameter_values(resolving_nodes[0], engine)
-                if parameter_values:
-                    # Store each parameter as its own metadata key
-                    for param_name, param_value in parameter_values.items():
-                        metadata[f"{METADATA_NAMESPACE}param_{param_name}"] = str(param_value)
-        except Exception:
-            logger.exception("Failed to collect flow/node metadata")
+    if "parameters" in raw:
+        for param_name, param_value in raw["parameters"].items():
+            metadata[f"{METADATA_NAMESPACE}param_{param_name}"] = str(param_value)
 
     return metadata
