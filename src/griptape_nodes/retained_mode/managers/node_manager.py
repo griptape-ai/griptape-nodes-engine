@@ -165,6 +165,7 @@ from griptape_nodes.retained_mode.events.node_events import (
     SerializeNodeToCommandsResultFailure,
     SerializeNodeToCommandsResultSuccess,
     SerializeSelectedNodesToCommandsRequest,
+    SerializeSelectedNodesToCommandsResultFailure,
     SerializeSelectedNodesToCommandsResultSuccess,
     SetLockNodeStateRequest,
     SetLockNodeStateResultFailure,
@@ -3763,6 +3764,7 @@ class NodeManager(EngineScoped):
                     create_node_request=create_node_request,
                     workflow_manager=self.engine.workflow_manager,
                     use_pickling=request.use_pickling,
+                    serialize_all_parameter_values=request.serialize_all_parameter_values,
                 )
                 if set_param_value_requests is not None:
                     set_value_commands.extend(set_param_value_requests)
@@ -3993,7 +3995,7 @@ class NodeManager(EngineScoped):
             node = self.engine.object_manager.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 details = f"Attempted to serialize a selection of Nodes. Failed to get node '{node_name}'."
-                return SerializeNodeToCommandsResultFailure(result_details=details)
+                return SerializeSelectedNodesToCommandsResultFailure(result_details=details)
 
             if isinstance(node, BaseNodeGroup):
                 # Use special method to handle group + children
@@ -4005,7 +4007,7 @@ class NodeManager(EngineScoped):
 
                 if group_result.group_command is None:
                     details = f"Attempted to serialize a selection of Nodes. Failed to serialize group '{node_name}'."
-                    return SerializeNodeToCommandsResultFailure(result_details=details)
+                    return SerializeSelectedNodesToCommandsResultFailure(result_details=details)
 
                 # Process the group node command
                 node_commands[node_name] = group_result.group_command
@@ -4018,7 +4020,7 @@ class NodeManager(EngineScoped):
                     child_name = child_command.create_node_command.node_name
                     if not child_name:
                         details = f"Attempted to serialize group node '{node.name}'. Failed because child node command has no name."
-                        return SerializeNodeToCommandsResultFailure(result_details=details)
+                        return SerializeSelectedNodesToCommandsResultFailure(result_details=details)
                     if child_name in explicitly_selected and child_name in node_commands:
                         # We need to remove the explicitly selected name from the commands that already exist
                         node_commands.pop(child_name)
@@ -4053,7 +4055,7 @@ class NodeManager(EngineScoped):
                 )
                 if not isinstance(result, SerializeNodeToCommandsResultSuccess):
                     details = f"Attempted to serialize a selection of Nodes. Failed to serialize {node_name}."
-                    return SerializeNodeToCommandsResultFailure(result_details=details)
+                    return SerializeSelectedNodesToCommandsResultFailure(result_details=details)
                 node_commands[node_name] = result.serialized_node_commands
                 node_name_to_uuid[node_name] = result.serialized_node_commands.node_uuid
                 parameter_commands[result.serialized_node_commands.node_uuid] = result.set_parameter_value_commands
