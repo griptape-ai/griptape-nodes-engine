@@ -238,6 +238,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointDenial,
     CheckpointSubjectType,
 )
+from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.retained_mode import RetainedMode
 from griptape_nodes.utils.exception_utils import readable_exception_message
 
@@ -3146,13 +3147,22 @@ class NodeManager(EngineScoped):
         # scope, not ours. Decide forwarding first; only open a local scope when
         # this process is actually going to execute the node.
         if not is_worker:
-            # The worker registers before it has loaded its library; routing in that window
-            # fails in the worker with "Library not found". Wait for the worker's
-            # LibraryLoadedNotification first -- immediate for any library without a
-            # spawned worker.
-            if library_name:
-                await library_manager.wait_for_worker_library_load(library_name)
-            worker = library_manager.get_worker_for_library(library_name) if library_name else None
+            # "This library cannot run right now" is an expected, recoverable state -- an evicted
+            # worker, or one that never started -- and get_worker_for_library reports it by raising.
+            # Left to propagate it came out of the handler as "Unhandled exception while processing
+            # async ExecuteNodeRequest: ..." with advice to restart the engine, burying a message
+            # written specifically for an artist. It is a node failure, so report it as one.
+            #
+            # The wait comes first: a worker registers before it has loaded its library, and
+            # routing in that window fails in the worker with "Library not found". Waiting on the
+            # worker's LibraryLoadedNotification is immediate for any library without a spawned
+            # worker, and a timeout is the same kind of node failure as a missing worker.
+            try:
+                if library_name:
+                    await library_manager.wait_for_worker_library_load(library_name)
+                worker = library_manager.get_worker_for_library(library_name) if library_name else None
+            except RuntimeError as err:
+                return ExecuteNodeResultFailure(result_details=str(err), exception=err)
             wm = self.engine.worker_manager
             if wm is not None and worker is not None:
                 return await self._execute_node_via_worker(request, wm, worker)
@@ -3226,9 +3236,58 @@ class NodeManager(EngineScoped):
                 specific_library_name=library_name,
             )
         except Exception as e:
-            return ExecuteNodeResultFailure(
-                result_details=f"Failed to create node '{node_name}' of type '{node_type}': {e}",
+            # In a worker, this almost always means the process could not load the one library
+            # it exists to run -- most often because an execution dependency would not install.
+            # The orchestrator holds that library perfectly well and is drawing its nodes on the
+            # canvas, so "Library not found" sends whoever reads it hunting for a missing library
+            # that is right in front of them. When this process knows better, say that instead.
+            reason = self._local_library_load_failure(library_name)
+            if reason is None:
+                return ExecuteNodeResultFailure(
+                    result_details=f"Failed to create node '{node_name}' of type '{node_type}': {e}"
+                )
+
+            # The library's own account of why -- resolver output, environment paths, version
+            # solving -- is for whoever maintains the library, and an artist cannot act on any of
+            # it. It goes to the log, the way a model-policy failure's diagnostic does, while the
+            # surfaced message stays about what happened and what still works.
+            logger.error(
+                "The worker for library '%s' could not load it, so node '%s' (%s) cannot run: %s (%s)",
+                library_name,
+                node_name,
+                node_type,
+                reason,
+                e,
             )
+            return ExecuteNodeResultFailure(
+                result_details=(
+                    f"Attempted to run '{node_name}' ({node_type}). Failed because the separate process "
+                    f"that runs '{library_name}' could not start it up. Editing the node still works and "
+                    f"your workflow keeps it. Ask whoever maintains '{library_name}' to check its "
+                    f"installation; the details are in the engine log."
+                )
+            )
+
+    def _local_library_load_failure(self, library_name: str | None) -> str | None:
+        """What THIS process recorded about failing to load ``library_name``, if anything.
+
+        Worker-only: on the orchestrator a library that failed to load has no nodes to execute
+        in the first place, so there is nothing to explain here.
+        """
+        library_manager = self.engine.library_manager
+        if not library_name or not library_manager.is_worker:
+            return None
+        library_info = library_manager.get_library_info_by_library_name(library_name)
+        if library_info is None:
+            return None
+        # Whether the library LOADED, not whether it has any problem. A library can be LOADED and
+        # FLAWED -- one node module of twenty failed to import, a duplicate node name -- and be
+        # running everything else perfectly well. Treating that as "the process could not start"
+        # would misattribute a single broken node type to the whole library. Note the state after
+        # a failed dependency install is EVALUATED, not FAILURE, so this cannot test for FAILURE.
+        if library_info.lifecycle_state is LibraryManager.LibraryLifecycleState.LOADED:
+            return None
+        return library_manager.get_collated_problems_for_library(library_name)
 
     async def _execute_node_via_worker(
         self,
