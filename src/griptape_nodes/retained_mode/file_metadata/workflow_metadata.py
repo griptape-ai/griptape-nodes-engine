@@ -264,7 +264,7 @@ def collect_sidecar_provenance(engine: Engine) -> dict[str, Any]:
         engine: The engine whose context manager and flow manager supply the metadata.
 
     Returns:
-        Dict with optional 'workflow', 'flow', and 'parameters' keys.
+        Dict with optional 'workflow', 'flow', 'parameters', and 'parameters_omitted' keys.
     """
     result: dict[str, Any] = {}
     context_manager = engine.context_manager
