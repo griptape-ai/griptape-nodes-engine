@@ -113,7 +113,6 @@ from griptape_nodes.retained_mode.events.access_events import (
     QueryModelAccessForNodeRequest,
     QueryModelAccessForNodeResultSuccess,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.traits.button import Button
 from griptape_nodes.traits.options import Options
 
@@ -393,7 +392,7 @@ class ModelAccessComponent:
         # refresh is honored at run time in BOTH directions -- a newly granted permission unblocks
         # the artist without waiting for a refresh, and a newly revoked one still denies. Returning
         # a cached denial early would make grants invisible.
-        result = GriptapeNodes.handle_request(
+        result = self._node.engine.handle_request(
             QueryModelAccessForNodeRequest(
                 node_type=type(self._node).__name__,
                 candidate_model_ids=list(catalog_ids),
@@ -575,7 +574,7 @@ class ModelAccessComponent:
         ``DEFERRED_SNAPSHOT`` comes back instead (see ``query_model_policy``);
         ``query_for_denial`` re-fetches it before its first real verdict.
         """
-        return query_model_policy(type(self._node).__name__)
+        return query_model_policy(self._node.engine, type(self._node).__name__)
 
     def _build_ui_options(self) -> dict[str, Any]:
         """Build the ``ui_options`` dict that decorates the dropdown row-by-row.

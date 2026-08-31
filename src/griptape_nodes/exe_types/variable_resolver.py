@@ -3,11 +3,14 @@ from __future__ import annotations
 import logging
 import re
 from contextvars import ContextVar
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from griptape_nodes.common.macro_parser.core import ParsedMacro
 from griptape_nodes.common.macro_parser.exceptions import MacroResolutionError, MacroSyntaxError
 from griptape_nodes.common.macro_parser.segments import ParsedVariable
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.engine import Engine
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -25,8 +28,9 @@ _aprocess_variable_cache: ContextVar[dict | object | None] = ContextVar(
 class VariableResolver:
     """Resolves inline {VAR} macro references in node parameter values during aprocess().
 
-    All GriptapeNodes singleton access is concentrated in this class's static methods,
-    keeping the lazy-import cycle-break in one place rather than scattered across BaseNode.
+    The methods that need engine state take the engine as their first argument rather than
+    reaching for process-wide state, so a resolver call answers from the same engine as the
+    node that asked.
     """
 
     _HAS_VARIABLE_MACRO: ClassVar[re.Pattern[str]] = re.compile(r"\{[A-Za-z_]")
@@ -121,15 +125,32 @@ class VariableResolver:
         _aprocess_variable_cache.reset(token)  # type: ignore[arg-type]
 
     @staticmethod
-    def is_substitution_enabled() -> bool:
-        """Return True if variable substitution is enabled for the active workflow."""
-        # GriptapeNodes import is lazy to avoid circular dependency between exe_types and retained_mode.
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+    def is_substitution_enabled(engine: Engine) -> bool:
+        """Return True if variable substitution is enabled for the active workflow.
 
-        return GriptapeNodes.WorkflowManager().is_variable_substitution_enabled()
+        KNOWN LIMITATION in a worker: this reads a local manager, and
+        `is_variable_substitution_enabled` answers True whenever there is no current workflow,
+        which is always the case in a worker process.
+
+        The orchestrator encodes "disabled" as an EMPTY variable dict when it pre-seeds one for a
+        dispatch, and substituting with an empty dict is not the same as not substituting:
+        `{VAR}` is preserved either way, but `{VAR?}` collapses to "" instead of staying literal.
+        So an optional macro resolves differently for a worker-executed node than for the same
+        node in-process, on a workflow that turned substitution off. The other affected readers
+        are the ones using this answer to decide whether a stored value is still an unresolved
+        template -- `node_types._variable_template_to_preserve`, and through it the display value
+        and the output write-back -- plus the sibling local read in `get_variables_if_enabled`.
+
+        Routing it through GetVariableSubstitutionEnabledRequest so it forwards was tried and
+        backed out: `parameter_output_values[...] = x` inside a node `__init__` reaches this
+        through TrackedParameterOutputValues, so every node construction became a bus request
+        and tripped `reentrant-bus-in-init`. Fixing it properly means resolving the answer once
+        per execution and carrying it, rather than asking per value.
+        """
+        return engine.workflow_manager.is_variable_substitution_enabled()
 
     @staticmethod
-    def get_variables_if_enabled(node_name: str) -> dict[str, str | int] | None:
+    def get_variables_if_enabled(engine: Engine, node_name: str) -> dict[str, str | int] | None:
         """Return the variable dict if substitution is enabled, else None.
 
         Checks the per-aprocess cache first to avoid repeated singleton lookups.
@@ -147,10 +168,9 @@ class VariableResolver:
         orchestrator-resolved variable dict, so this fallback path is only reached for
         in-process nodes whose request predates the variables field (e.g. unit tests).
         """
-        # GriptapeNodes import is lazy to avoid circular dependency between exe_types and retained_mode.
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        if not GriptapeNodes.WorkflowManager().is_variable_substitution_enabled():
+        # Same local read as is_substitution_enabled, and the same worker limitation applies;
+        # see the note there.
+        if not engine.workflow_manager.is_variable_substitution_enabled():
             return None
 
         cached = _aprocess_variable_cache.get()
@@ -166,11 +186,11 @@ class VariableResolver:
         from griptape_nodes.retained_mode.variable_types import VariableScope
 
         try:
-            flow_name = GriptapeNodes.NodeManager().get_node_parent_flow_by_name(node_name)
+            flow_name = engine.node_manager.get_node_parent_flow_by_name(node_name)
         except KeyError:
             _aprocess_variable_cache.set(_NO_FLOW)
             return None
-        result = GriptapeNodes.handle_request(
+        result = engine.handle_request(
             ListVariablesRequest(starting_flow=flow_name, lookup_scope=VariableScope.HIERARCHICAL)
         )
         if not isinstance(result, ListVariablesResultSuccess):
@@ -232,7 +252,7 @@ class VariableResolver:
         return False
 
     @staticmethod
-    def get_variables_without_memoizing(node_name: str) -> dict[str, str | int] | None:
+    def get_variables_without_memoizing(engine: Engine, node_name: str) -> dict[str, str | int] | None:
         """Like `get_variables_if_enabled`, but never leaves the memo cache set.
 
         ``get_variables_if_enabled`` memoises its lookup into the ContextVar without
@@ -243,10 +263,10 @@ class VariableResolver:
         outside ``aprocess_scope()``. An already-populated cache is left untouched.
         """
         if _aprocess_variable_cache.get() is not None:
-            return VariableResolver.get_variables_if_enabled(node_name)
+            return VariableResolver.get_variables_if_enabled(engine, node_name)
         token = _aprocess_variable_cache.set(None)
         try:
-            return VariableResolver.get_variables_if_enabled(node_name)
+            return VariableResolver.get_variables_if_enabled(engine, node_name)
         finally:
             _aprocess_variable_cache.reset(token)
 

@@ -414,8 +414,6 @@ class BaseNodeElement:
 
     def _emit_alter_element_event_if_possible(self) -> None:
         """Emit an AlterElementEvent if we have node context and the necessary dependencies."""
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
         if self._node_context is None:
             return
 
@@ -449,7 +447,8 @@ class BaseNodeElement:
             wrapped_event=ExecutionEvent(payload=AlterElementEvent(element_details=event_data))
         )
 
-        GriptapeNodes.EventManager().put_event(event)
+        # This is an element, not a node, so the engine comes from the node it belongs to.
+        self._node_context.engine.event_manager.put_event(event)
         self._changes.clear()
 
     def to_dict(self) -> dict[str, Any]:

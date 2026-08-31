@@ -35,6 +35,15 @@ from griptape_nodes.retained_mode.events.base_events import (
     ProgressEvent,
     RequestPayload,
 )
+from griptape_nodes.retained_mode.events.config_events import (
+    GetConfigValueRequest,
+    GetConfigValueResultSuccess,
+    SetConfigValueRequest,
+)
+from griptape_nodes.retained_mode.events.connection_events import (
+    ListConnectionsForNodeRequest,
+    ListConnectionsForNodeResultSuccess,
+)
 from griptape_nodes.retained_mode.events.event_converter import safe_unstructure
 from griptape_nodes.retained_mode.events.parameter_events import (
     AddParameterToNodeRequest,
@@ -48,6 +57,7 @@ from griptape_nodes.utils import async_utils
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.core_types import NodeMessagePayload
     from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
+    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.variable_types import VariableScope
 
 logger = logging.getLogger("griptape_nodes")
@@ -284,13 +294,15 @@ class NodeResolutionState(StrEnum):
     RESOLVED = auto()
 
 
-def get_library_names_with_publish_handlers() -> list[str]:
-    """Get names of all registered libraries that have PublishWorkflowRequest handlers."""
-    from griptape_nodes.retained_mode.events.workflow_events import PublishWorkflowRequest
-    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+def get_library_names_with_publish_handlers(engine: Engine) -> list[str]:
+    """Get names of all registered libraries that have PublishWorkflowRequest handlers.
 
-    library_manager = GriptapeNodes.LibraryManager()
-    event_handlers = library_manager.get_registered_event_handlers(PublishWorkflowRequest)
+    Takes the engine rather than reaching for the facade: a free function has no ``self`` to
+    resolve it from, so its caller (a node, which has one) supplies it.
+    """
+    from griptape_nodes.retained_mode.events.workflow_events import PublishWorkflowRequest
+
+    event_handlers = engine.library_manager.get_registered_event_handlers(PublishWorkflowRequest)
 
     # Always include "local" and "private" as the first options
     library_names = [LOCAL_EXECUTION, PRIVATE_EXECUTION]
@@ -319,6 +331,7 @@ class BaseNode(ABC):
     )
     lock: bool = False  # When lock is true, the node is locked and can't be modified. When lock is false, the node is unlocked and can be modified.
     _cancellation_requested: threading.Event  # Event indicating if cancellation has been requested for this node
+    _engine: Engine | None
 
     @property
     def parameters(self) -> list[Parameter]:
@@ -332,7 +345,27 @@ class BaseNode(ABC):
         name: str,
         metadata: dict[Any, Any] | None = None,
         state: NodeResolutionState = NodeResolutionState.UNRESOLVED,
+        *,
+        engine: Engine | None = None,
     ) -> None:
+        """Initialize the node.
+
+        Args:
+            name: Node name, unique within its flow.
+            metadata: Node metadata (node_type and library, plus optional extras).
+            state: Initial resolution state.
+            engine: The engine this node belongs to. Keyword-only and optional so a library's
+                ``super().__init__(name, metadata=metadata)`` keeps working untouched.
+
+                Nothing in the engine passes it today: ``LibraryRegistry.create_node`` builds
+                nodes as ``node_class(name=name, metadata=metadata)``, and it cannot start
+                passing an engine without breaking every library node and several engine-internal
+                subclasses, all of which fix their signature at two arguments. So in practice a
+                node resolves the ambient engine via ``current_engine()``. The parameter exists
+                for embedders and tests that DO hold a reference, and so the fallback has
+                somewhere to be overridden from -- which is what the unit tests use it for.
+        """
+        self._engine = engine
         self.name = name
         self._state = state
         if metadata is None:
@@ -349,6 +382,29 @@ class BaseNode(ABC):
         self._cancellation_requested = threading.Event()
         self._parent_group = None
         self.set_entry_control_parameter(None)
+
+    @property
+    def engine(self) -> Engine:
+        """The engine this node belongs to.
+
+        Node machinery reaches managers and dispatches requests through here rather than the
+        process-wide ``GriptapeNodes`` facade. The facade remains what it is documented to be:
+        the surface for separately-versioned library code and saved workflow files.
+
+        For a node built without an explicit engine -- which is every node the engine itself
+        creates -- this resolves the ambient one, so the lookup is the same process-wide
+        resolution the facade would have done. What the migration buys is not per-node isolation
+        but the classification it forced: questions about workflow state now travel as requests,
+        which is what makes them answerable from inside a worker.
+        """
+        if self._engine is None:
+            # Deferred import: griptape_nodes.retained_mode.engine pulls in the manager graph,
+            # which pulls in the event payloads, which import this module for
+            # NodeDependencies/NodeResolutionState. Importing it at module scope is a cycle.
+            from griptape_nodes.retained_mode.engine import current_engine
+
+            return current_engine()
+        return self._engine
 
     @property
     def state(self) -> NodeResolutionState:
@@ -393,15 +449,13 @@ class BaseNode(ABC):
     # This is gross and we need to have a universal pass on resolution state changes and emission of events. That's what this ticket does!
     # https://github.com/griptape-ai/griptape-nodes/issues/994
     def make_node_unresolved(self, current_states_to_trigger_change_event: set[NodeResolutionState] | None) -> None:
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
         # See if the current state is in the set of states to trigger a change event.
         if current_states_to_trigger_change_event is not None and self.state in current_states_to_trigger_change_event:
             # Trigger the change event.
             # Send an event to the GUI so it knows this node has changed resolution state.
             from griptape_nodes.retained_mode.events.execution_events import NodeUnresolvedEvent
 
-            GriptapeNodes.EventManager().put_event(
+            self.engine.event_manager.put_event(
                 ExecutionGriptapeNodeEvent(
                     wrapped_event=ExecutionEvent(payload=NodeUnresolvedEvent(node_name=self.name))
                 )
@@ -1066,10 +1120,8 @@ class BaseNode(ABC):
             self.metadata["size"] = {"width": width, "height": height}
 
     def kill_parameter_children(self, parameter: Parameter) -> None:
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
         for child in parameter.find_elements_by_type(Parameter):
-            GriptapeNodes.handle_request(RemoveParameterFromNodeRequest(parameter_name=child.name, node_name=self.name))
+            self.engine.handle_request(RemoveParameterFromNodeRequest(parameter_name=child.name, node_name=self.name))
 
     def get_parameter_value(self, param_name: str) -> Any:
         param = self.get_parameter_by_name(param_name)
@@ -1188,7 +1240,7 @@ class BaseNode(ABC):
     # if not implemented, it will return no issues.
     def validate_before_workflow_run(self) -> list[Exception] | None:
         """Runs before the entire workflow is run."""
-        if VariableResolver.is_substitution_enabled():
+        if VariableResolver.is_substitution_enabled(self.engine):
             for param in self.parameters:
                 if not param.allow_variable_substitution:
                     continue
@@ -1246,29 +1298,32 @@ class BaseNode(ABC):
         return None
 
     def get_config_value(self, service: str, value: str) -> str:
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
         warnings.warn(
-            "get_config_value() is deprecated. Use GriptapeNodes.SecretsManager().get_secret() for secrets/API keys "
-            "or GriptapeNodes.ConfigManager().get_config_value() for other config values.",
+            "get_config_value() is deprecated. Use GetSecretValueRequest for secrets/API keys or "
+            "GetConfigValueRequest for other config values. Both are answered by the main engine "
+            "even when your node runs in an isolated process, where the manager accessors are "
+            "refused.",
             UserWarning,
             stacklevel=2,
         )
 
-        config_value = GriptapeNodes.ConfigManager().get_config_value(f"nodes.{service}.{value}")
+        result = self.engine.handle_request(GetConfigValueRequest(category_and_key=f"nodes.{service}.{value}"))
+        # Typed loosely on purpose: config values are `Any`, and an absent key has always
+        # come back as None here despite the declared return type.
+        config_value: Any = result.value if isinstance(result, GetConfigValueResultSuccess) else None
         return config_value
 
     def set_config_value(self, service: str, value: str, new_value: str) -> None:
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
         warnings.warn(
-            "set_config_value() is deprecated. Use GriptapeNodes.SecretsManager().set_secret() for secrets/API keys "
-            "or GriptapeNodes.ConfigManager().set_config_value() for other config values.",
+            "set_config_value() is deprecated. Use SetSecretValueRequest for secrets/API keys or "
+            "SetConfigValueRequest for other config values. Both are answered by the main engine "
+            "even when your node runs in an isolated process, where the manager accessors are "
+            "refused.",
             UserWarning,
             stacklevel=2,
         )
 
-        GriptapeNodes.ConfigManager().set_config_value(f"nodes.{service}.{value}", new_value)
+        self.engine.handle_request(SetConfigValueRequest(category_and_key=f"nodes.{service}.{value}", value=new_value))
 
     def clear_node(self) -> None:
         # set state to unresolved
@@ -1357,8 +1412,6 @@ class BaseNode(ABC):
         return None
 
     def append_value_to_parameter(self, parameter_name: str, value: Any) -> None:
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
         # Add the value to the node
         if parameter_name in self.parameter_output_values:
             try:
@@ -1394,13 +1447,12 @@ class BaseNode(ABC):
             return
 
         # Publish the event up!
-        GriptapeNodes.EventManager().put_event(
+        self.engine.event_manager.put_event(
             ProgressEvent(value=value, node_name=self.name, parameter_name=parameter_name)
         )
 
     def publish_update_to_parameter(self, parameter_name: str, value: Any) -> None:
         from griptape_nodes.retained_mode.events.execution_events import ParameterValueUpdateEvent
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         parameter = self.get_parameter_by_name(parameter_name)
         if parameter:
@@ -1416,7 +1468,7 @@ class BaseNode(ABC):
                 value=safe_unstructure(self.get_display_value_for_output(parameter_name, value)),
             )
 
-            GriptapeNodes.EventManager().put_event(
+            self.engine.event_manager.put_event(
                 ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload))
             )
         else:
@@ -1531,14 +1583,17 @@ class BaseNode(ABC):
         self.reorder_elements(list(new_order))
 
     def _param_has_incoming_connection(self, param_name: str) -> bool:
-        # GriptapeNodes import is lazy to avoid circular dependency between exe_types and retained_mode
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        """Whether ``param_name`` is fed by a connection.
 
-        connections = GriptapeNodes.FlowManager().get_connections()
-        node_connections = connections.incoming_index.get(self.name)
-        if node_connections is None:
+        Asked as a request rather than read from a local manager: this is a question about
+        the workflow, and the workflow's single source of truth is the orchestrator. A node
+        executing in an isolated process holds only a transient copy of itself, so reading
+        its own process's connection index would answer from almost nothing.
+        """
+        result = self.engine.handle_request(ListConnectionsForNodeRequest(node_name=self.name, broadcast_result=False))
+        if not isinstance(result, ListConnectionsForNodeResultSuccess):
             return False
-        return param_name in node_connections
+        return any(connection.target_parameter_name == param_name for connection in result.incoming_connections)
 
     def _has_connected_whole_list_value(self, parameter_list: ParameterList) -> bool:
         """Whether a ParameterList was handed an entire list through a connection to the list itself.
@@ -1553,11 +1608,15 @@ class BaseNode(ABC):
         param_name = parameter_list.name
         if param_name not in self.parameter_values:
             return False
-        if not self._param_has_incoming_connection(param_name):
-            return False
 
+        # Both cheap local checks run before the connection question, which costs a request
+        # dispatch -- and a cross-process round trip in a worker -- on a path that
+        # get_parameter_value reaches for every read of a populated list.
         value = self.parameter_values[param_name]
         if not isinstance(value, list):
+            return False
+
+        if not self._param_has_incoming_connection(param_name):
             return False
 
         child_count = len(parameter_list.find_elements_by_type(Parameter, find_recursively=False))
@@ -1584,13 +1643,13 @@ class BaseNode(ABC):
 
     def _resolve_variables_in_value(self, value: Any) -> Any:
         """Recursively substitute workflow variables in any str/dict/list value."""
-        variables = VariableResolver.get_variables_if_enabled(self.name)
+        variables = VariableResolver.get_variables_if_enabled(self.engine, self.name)
         if variables is None:
             return value
         return VariableResolver.resolve_value(value, variables, self.name)
 
     def _resolve_variables_in_string(self, text: str) -> str:
-        variables = VariableResolver.get_variables_if_enabled(self.name)
+        variables = VariableResolver.get_variables_if_enabled(self.engine, self.name)
         if variables is None:
             return text
         return VariableResolver.resolve_string(text, variables, self.name)
@@ -1629,7 +1688,7 @@ class BaseNode(ABC):
         # get_variables_without_memoizing, not get_variables_if_enabled: this runs
         # outside aprocess_scope(), where the latter's memo write has no reset token
         # and would leave a stale variable dict on the surrounding context.
-        variables = VariableResolver.get_variables_without_memoizing(self.name)
+        variables = VariableResolver.get_variables_without_memoizing(self.engine, self.name)
         if variables is None:
             return True
         return VariableResolver.would_substitute(raw_value, variables)
@@ -1648,7 +1707,7 @@ class BaseNode(ABC):
         connection never gets substituted, so its output is genuine and its
         stored value must stay writable.
         """
-        if not VariableResolver.is_substitution_enabled():
+        if not VariableResolver.is_substitution_enabled(self.engine):
             return None
         parameter = self.get_parameter_by_name(parameter_name)
         if parameter is None:
@@ -1656,8 +1715,8 @@ class BaseNode(ABC):
         raw_value = self.parameter_values.get(parameter_name, parameter.default_value)
         # One short-circuiting chain rather than a ladder of early returns, so the
         # cheap checks stay ordered ahead of the expensive ones. The connection
-        # lookup is last: it reaches through the GriptapeNodes singleton to the
-        # FlowManager, and the checks before it already rule out the common case.
+        # lookup is last: it costs a request round trip to the FlowManager, and the
+        # checks before it already rule out the common case.
         substitution_would_have_applied = (
             ParameterMode.PROPERTY in parameter.allowed_modes
             and parameter.allow_variable_substitution
@@ -1754,7 +1813,6 @@ class BaseNode(ABC):
         """Emit an AlterElementEvent for parameter add/remove operations."""
         from griptape_nodes.retained_mode.events.base_events import ExecutionEvent, ExecutionGriptapeNodeEvent
         from griptape_nodes.retained_mode.events.parameter_events import AlterElementEvent
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         # Create event data using the parameter's to_event method
         if remove:
@@ -1776,7 +1834,7 @@ class BaseNode(ABC):
                 wrapped_event=ExecutionEvent(payload=AlterElementEvent(element_details=event_data))
             )
 
-        GriptapeNodes.EventManager().put_event(event)
+        self.engine.event_manager.put_event(event)
 
     def _get_element_name(self, element: str | int, element_names: list[str]) -> str:
         """Convert an element identifier (name or index) to its name.
@@ -1978,7 +2036,6 @@ class TrackedParameterOutputValues(dict[str, Any]):
         if parameter is not None:
             from griptape_nodes.retained_mode.events.base_events import ExecutionEvent, ExecutionGriptapeNodeEvent
             from griptape_nodes.retained_mode.events.parameter_events import AlterElementEvent
-            from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
             # Create event data using the parameter's to_event method
             event_data = parameter.to_event(self._node)
@@ -2011,7 +2068,9 @@ class TrackedParameterOutputValues(dict[str, Any]):
                 wrapped_event=ExecutionEvent(payload=AlterElementEvent(element_details=event_data))
             )
 
-            GriptapeNodes.EventManager().put_event(event)
+            # This is a plain dict subclass, not a node, so the engine comes from the node it
+            # belongs to.
+            self._node.engine.event_manager.put_event(event)
 
 
 class ControlNode(BaseNode):
@@ -2109,18 +2168,10 @@ class SuccessFailureNode(BaseNode):
 
     def _has_outgoing_connections(self, parameter: Parameter) -> bool:
         """Check if a specific parameter has outgoing connections."""
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        connections = GriptapeNodes.FlowManager().get_connections()
-
-        # Check if node has any outgoing connections
-        node_connections = connections.outgoing_index.get(self.name)
-        if node_connections is None:
+        result = self.engine.handle_request(ListConnectionsForNodeRequest(node_name=self.name, broadcast_result=False))
+        if not isinstance(result, ListConnectionsForNodeResultSuccess):
             return False
-
-        # Check if this specific parameter has any outgoing connections
-        param_connections = node_connections.get(parameter.name, [])
-        return len(param_connections) > 0
+        return any(connection.source_parameter_name == parameter.name for connection in result.outgoing_connections)
 
     def _create_status_parameters(
         self,
@@ -2381,8 +2432,6 @@ class ErrorProxyNode(BaseNode):
 
         if existing_param is None:
             # Create new universal parameter with all modes enabled
-            from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
             request = AddParameterToNodeRequest(
                 node_name=self.name,
                 parameter_name=param_name,
@@ -2396,7 +2445,7 @@ class ErrorProxyNode(BaseNode):
                 is_user_defined=False,  # Don't serialize this parameter
                 initial_setup=True,  # Allows setting non-settable parameters and prevents resolution cascades during workflow loading
             )
-            result = GriptapeNodes.handle_request(request)
+            result = self.engine.handle_request(request)
 
             # Check if parameter creation was successful
             from griptape_nodes.retained_mode.events.parameter_events import AddParameterToNodeResultSuccess
