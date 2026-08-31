@@ -56,12 +56,17 @@ class TestWorkspaceStaticFiles:
     """Test that WorkspaceStaticFiles resolves the served directory live, per request."""
 
     def _patch_workspace(self, workspace: Path) -> AbstractContextManager[MagicMock]:
-        """Patch ConfigManager().workspace_path to return the given directory."""
+        """Point the served workspace at the given directory.
+
+        Patches the ambient engine lookup rather than the GriptapeNodes facade: this module reads
+        its managers off the engine, because the facade's worker guard keys off a process-wide
+        in-node-execution refcount and would raise on uvicorn's thread while any node ran.
+        """
         config_manager = MagicMock()
         config_manager.workspace_path = workspace
-        griptape_nodes = MagicMock()
-        griptape_nodes.ConfigManager.return_value = config_manager
-        return patch("griptape_nodes.servers.static.GriptapeNodes", griptape_nodes)
+        engine = MagicMock()
+        engine.config_manager = config_manager
+        return patch("griptape_nodes.servers.static.current_engine", return_value=engine)
 
     def test_lookup_follows_workspace_change(self, tmp_path: Path) -> None:
         """A file written under the new workspace resolves after the workspace changes at runtime."""

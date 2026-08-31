@@ -3,11 +3,13 @@ from __future__ import annotations
 import logging
 import traceback
 import types
+from collections.abc import Mapping, MutableMapping
 from dataclasses import fields as dc_fields
 from dataclasses import is_dataclass
 from datetime import datetime
+from functools import cache
 from pathlib import Path
-from typing import Any, Union, get_args, get_origin
+from typing import Any, Union, get_args, get_origin, get_type_hints
 
 from cattrs.gen import make_dict_structure_fn, make_dict_unstructure_fn, override
 from cattrs.preconf.json import make_converter
@@ -169,12 +171,96 @@ def _fallback_unstructure(obj: Any) -> dict[str, Any]:
     return result
 
 
+# Classes already reported as arriving with an unstructured field, so the warning below fires
+# once per class rather than once per payload.
+_REPORTED_DEGRADED_CLASSES: set[type] = set()
+
+# Annotation fragments meaning "a dict here IS the declared type", so a dict-valued field is not
+# evidence of anything going wrong. Includes project aliases OF a mapping: `Requirements` is
+# `dict[str, RequirementValue]`, and reads as neither "dict" nor "Mapping", so without it every
+# forwarded resource-lock request reported its own `requirements` as corrupted. Matched as text
+# because the classes reaching this path are precisely the ones whose annotations cannot be
+# resolved -- get_type_hints is tried first for the ones that can.
+_DICT_SHAPED_ANNOTATIONS = ("dict", "Dict", "Mapping", "Any", "object", "Requirements")
+
+
+@cache
+def _dict_shaped_fields(cls: type) -> frozenset[str]:
+    """Fields where a dict IS the declared type, so a dict value proves nothing is wrong.
+
+    Resolved properly where possible rather than matched as text, because an alias hides the shape:
+    ``Requirements = dict[str, RequirementValue]`` reads as neither "dict" nor "Mapping", so a text
+    rule reported a GPU-lock request's `requirements` as corrupted every time one was forwarded --
+    the exact false-alarm class this reporting was gated to avoid. Falls back to annotation text for
+    fields that cannot be resolved, which is the situation this whole code path exists for.
+    """
+    shaped: set[str] = set()
+    try:
+        hints = get_type_hints(cls)
+    except Exception:
+        hints = {}
+    for field in dc_fields(cls):
+        resolved = hints.get(field.name)
+        if resolved is not None:
+            origin = get_origin(resolved) or resolved
+            if origin in (dict, Mapping, MutableMapping) or resolved in (Any, object):
+                shaped.add(field.name)
+            continue
+        annotation = field.type if isinstance(field.type, str) else getattr(field.type, "__name__", "")
+        if any(fragment in annotation for fragment in _DICT_SHAPED_ANNOTATIONS):
+            shaped.add(field.name)
+    return frozenset(shaped)
+
+
+def _looks_unstructured(value: Any) -> bool:
+    """Whether a value came through as raw JSON rather than the type its field declares.
+
+    Lists count: a field declared ``list[SomeDataclass]`` degrades into a list of dicts exactly
+    the way a single field degrades into one dict, and reporting only the scalar case would miss
+    every collection-valued payload.
+    """
+    if isinstance(value, dict):
+        return True
+    return isinstance(value, list) and any(isinstance(item, dict) for item in value)
+
+
+def _report_unstructured_fields(cls: type, values: dict[str, Any]) -> None:
+    """Warn when the fallback left a field holding a raw dict.
+
+    Checked against the actual value rather than the annotation, because the annotation is
+    unresolvable by definition in this path -- that is why the fallback is running. A dict where
+    the declared type is something else is the corruption signature: the object passes isinstance()
+    while the field is not the type it claims, and the mismatch surfaces later as
+    "'dict' object has no attribute ...", arbitrarily far from here.
+
+    Deliberately silent for classes that reach the fallback over an alias of a builtin
+    (``ProjectID = str``), which is most of them. There the raw JSON value is already the right
+    type and nothing degrades; warning would bury the cases that matter in false alarms.
+    """
+    if cls in _REPORTED_DEGRADED_CLASSES:
+        return
+    dict_shaped = _dict_shaped_fields(cls)
+    degraded = [name for name, value in values.items() if _looks_unstructured(value) and name not in dict_shaped]
+    if not degraded:
+        return
+    _REPORTED_DEGRADED_CLASSES.add(cls)
+    logger.warning(
+        "'%s' was rebuilt from a serialized payload with %s left as raw dict(s), because its "
+        "annotations could not be resolved (usually a TYPE_CHECKING-only import). Attribute "
+        "access on those fields will fail. Give the annotation a runtime-importable name, or "
+        "register an explicit structure hook for this class.",
+        cls.__name__,
+        ", ".join(f"'{name}'" for name in degraded),
+    )
+
+
 def _make_fallback_structure_fn(cls: type) -> Any:
     """Fallback structure for dataclasses where get_type_hints() fails."""
 
     def structure_fn(data: dict[str, Any], _cls: type = cls) -> Any:
         init_fields = {f.name for f in dc_fields(_cls) if f.init}
         filtered = {k: v for k, v in data.items() if k in init_fields}
+        _report_unstructured_fields(_cls, filtered)
         return _cls(**filtered)
 
     return structure_fn
@@ -196,7 +282,11 @@ def _make_dataclass_structure_fn(cls: type) -> Any:
             if not f.init:
                 overrides[f.name] = override(omit=True)
         return make_dict_structure_fn(cls, converter, **overrides)
-    except NameError:
+    except NameError as err:
+        # Reported when a payload actually arrives with an unstructured field, not here: most
+        # classes reaching this branch do so over an alias of a builtin and degrade in no way.
+        # See _report_unstructured_fields.
+        logger.debug("Falling back to field-iteration structuring for '%s': %s", cls.__name__, err)
         return _make_fallback_structure_fn(cls)
 
 

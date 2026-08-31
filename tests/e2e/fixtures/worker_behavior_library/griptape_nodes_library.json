@@ -87,6 +87,33 @@
         "description": "Converters, validators, dynamic parameters",
         "display_name": "EditorBehaviorNode"
       }
+    },
+    {
+      "class_name": "ReadSecretNode",
+      "file_path": "worker_behavior_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Reads a secret via a request",
+        "display_name": "ReadSecretNode"
+      }
+    },
+    {
+      "class_name": "UnshippableOutputNode",
+      "file_path": "worker_behavior_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Outputs a value that cannot be serialized",
+        "display_name": "UnshippableOutputNode"
+      }
+    },
+    {
+      "class_name": "WriteBytesNode",
+      "file_path": "worker_behavior_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Writes binary through File and verifies it survived",
+        "display_name": "WriteBytesNode"
+      }
     }
   ]
 }

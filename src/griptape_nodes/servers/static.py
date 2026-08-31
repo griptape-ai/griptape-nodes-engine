@@ -19,7 +19,12 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from rich.logging import RichHandler
 
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+# Reaches managers through the ambient engine rather than the GriptapeNodes facade. This module
+# runs on uvicorn's thread, and the facade's worker guard keys off a PROCESS-WIDE
+# in-node-execution refcount rather than a contextvar -- so serving a workspace asset while any
+# node was executing raised, and a worker running its own static server would 500 on every
+# fetch. servers/** is TID251-allowlisted, so nothing would have flagged it.
+from griptape_nodes.retained_mode.engine import current_engine
 
 # Whether to enable the static server
 STATIC_SERVER_ENABLED = os.getenv("STATIC_SERVER_ENABLED", "true").lower() == "true"
@@ -45,7 +50,7 @@ async def _create_static_file_upload_url(request: Request) -> dict:
 
     Similar to a presigned URL, but for uploading files to the static server.
     """
-    base_url = GriptapeNodes.StaticFilesManager().static_server_base_url
+    base_url = current_engine().static_files_manager.static_server_base_url
 
     body = await request.json()
     file_path = body["file_path"].lstrip("/")
@@ -60,7 +65,7 @@ async def _create_static_file(request: Request, file_path: str) -> dict:
         msg = "Static server is not enabled. Please set STATIC_SERVER_ENABLED to True."
         raise ValueError(msg)
 
-    workspace_directory = GriptapeNodes.ConfigManager().workspace_path
+    workspace_directory = current_engine().config_manager.workspace_path
     full_file_path = workspace_directory / file_path
 
     # Create parent directories if they don't exist
@@ -78,7 +83,7 @@ async def _create_static_file(request: Request, file_path: str) -> dict:
         logger.error(msg)
         raise HTTPException(status_code=500, detail=msg) from e
 
-    base_url = GriptapeNodes.StaticFilesManager().static_server_base_url
+    base_url = current_engine().static_files_manager.static_server_base_url
     static_url = urljoin(f"{base_url}{STATIC_SERVER_URL}/", file_path)
     return {"url": static_url}
 
@@ -89,7 +94,7 @@ async def _list_static_files(file_path_prefix: str = "") -> dict:
         msg = "Static server is not enabled. Please set STATIC_SERVER_ENABLED to True."
         raise HTTPException(status_code=500, detail=msg)
 
-    workspace_directory = GriptapeNodes.ConfigManager().workspace_path
+    workspace_directory = current_engine().config_manager.workspace_path
 
     # Handle the prefix path
     if file_path_prefix:
@@ -119,7 +124,7 @@ async def _delete_static_file(file_path: str) -> dict:
         msg = "Static server is not enabled. Please set STATIC_SERVER_ENABLED to True."
         raise HTTPException(status_code=500, detail=msg)
 
-    workspace_directory = GriptapeNodes.ConfigManager().workspace_path
+    workspace_directory = current_engine().config_manager.workspace_path
     file_full_path = workspace_directory / file_path
 
     anyio_file_path = anyio.Path(file_full_path)
@@ -163,7 +168,7 @@ async def _serve_library_widget(library_name: str, file_path: str) -> FileRespon
     Raises:
         HTTPException: If library not found, file not found, or path traversal detected
     """
-    library_manager = GriptapeNodes.LibraryManager()
+    library_manager = current_engine().library_manager
 
     # Find the library's directory by looking up its info
     library_info = library_manager.get_library_info_by_library_name(library_name)
@@ -278,7 +283,7 @@ class WorkspaceStaticFiles(StaticFiles):
         return super().lookup_path(path)
 
     def _current_directory(self) -> Path:
-        workspace_directory = GriptapeNodes.ConfigManager().workspace_path
+        workspace_directory = current_engine().config_manager.workspace_path
         if self._subdirectory is None:
             return workspace_directory
         return workspace_directory / self._subdirectory
@@ -321,7 +326,7 @@ def start_static_server(sock: socket.socket) -> None:
         "http://localhost:5173",
         "http://localhost:5174",
         "gtn-editor://editor",
-        GriptapeNodes.StaticFilesManager().static_server_base_url,
+        current_engine().static_files_manager.static_server_base_url,
     ]
 
     # Add CORS middleware
@@ -336,8 +341,8 @@ def start_static_server(sock: socket.socket) -> None:
 
     # Mount static files. The served directories resolve the workspace live on each request
     # (see WorkspaceStaticFiles) so they follow runtime workspace changes such as project switches.
-    workspace_directory = GriptapeNodes.ConfigManager().workspace_path
-    static_files_directory = GriptapeNodes.ConfigManager().get_config_value("static_files_directory")
+    workspace_directory = current_engine().config_manager.workspace_path
+    static_files_directory = current_engine().config_manager.get_config_value("static_files_directory")
 
     app.mount(
         STATIC_SERVER_URL,

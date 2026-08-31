@@ -469,7 +469,21 @@ class StaticFilesManager(EngineScoped):
         if not isinstance(self.storage_driver, LocalStorageDriver):
             return
 
-        if payload.static_server_base_url is not None:
+        # Checked ahead of the payload deliberately. A parent that set this is telling us it
+        # serves the shared workspace on a port that outlives this process, which is a strictly
+        # stronger signal than "some process serves it" -- and the host announces its own URL on
+        # the payload either way, so testing the payload first made this branch unreachable and
+        # the app repo the only thing standing between a worker and an ephemeral-port URL.
+        # Gated on being a worker: only a spawning orchestrator sets this variable on purpose,
+        # so in any other process it is a leaked shell export, and adopting it would silently
+        # point every asset URL at an address nothing here controls. The payload's own flag is
+        # the only race-free source: the engine-level worker flag is set by LibraryManager's
+        # listener for this same event, and listeners run concurrently in no defined order.
+        if payload.is_worker and os.getenv(ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV):
+            adopted = os.environ[ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV].rstrip("/")
+            self._static_server_base_url = adopted
+            logger.debug("Adopted the orchestrator's static server at %s", adopted)
+        elif payload.static_server_base_url is not None:
             # The host process serves this workspace and told us where. Pointing at its server
             # keeps asset URLs valid for as long as the host runs, rather than only as long as
             # this engine does.
@@ -479,13 +493,6 @@ class StaticFilesManager(EngineScoped):
             # Initialization can complete more than once per process: a workflow executor
             # broadcasts it for its own run. Where the workspace is served is already settled.
             logger.debug("Static server already settled at %s", self._static_server_base_url)
-        elif os.getenv(ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV):
-            # A worker: the orchestrator that spawned this process already serves the shared
-            # workspace, and its server outlives this one. Adopting it keeps asset URLs valid
-            # after this worker is evicted, where a URL on our own ephemeral port would not be.
-            adopted = os.environ[ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV].rstrip("/")
-            self._static_server_base_url = adopted
-            logger.debug("Adopted the orchestrator's static server at %s", adopted)
         else:
             # No host-provided server, so serve the workspace here.
             #

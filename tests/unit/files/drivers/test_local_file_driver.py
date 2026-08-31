@@ -334,16 +334,15 @@ class TestLocalFileDriverRelativePaths:
 
     @pytest.fixture
     def mock_config_manager_accessor(self, mock_config_manager: Mock) -> Iterator[Mock]:
-        """Patch the facade accessor the driver uses to reach the ConfigManager.
+        """Patch the engine lookup the driver uses to reach the ConfigManager.
 
-        Patched by dotted string rather than an imported `GriptapeNodes` reference: the
-        driver (src/griptape_nodes/files/drivers/local_file_driver.py) still calls the
-        facade's `ConfigManager()` classmethod, and `patch()` handles saving and restoring
-        the classmethod descriptor correctly on teardown.
+        The tests assert on this mock to pin WHETHER the driver consulted the workspace at
+        all, which is the difference between anchoring a bare relative path and trusting the
+        process's cwd.
         """
         with patch(
-            "griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes.ConfigManager",
-            return_value=mock_config_manager,
+            "griptape_nodes.files.drivers.local_file_driver.current_engine",
+            return_value=Mock(config_manager=mock_config_manager),
         ) as accessor:
             yield accessor
 

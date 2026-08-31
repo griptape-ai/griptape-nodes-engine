@@ -20,7 +20,9 @@ from __future__ import annotations
 import json
 import logging
 import shutil
+import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -43,6 +45,9 @@ from griptape_nodes.traits.button import Button, ButtonDetailsMessagePayload
 from griptape_nodes.utils.version_utils import engine_version
 from tests.e2e.fixtures.behavior_preservation_library.behavior_preservation_node import CLICK_ACKNOWLEDGEMENT
 from tests.e2e.offline_wheels import build_wheel, offline_install_flags
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 EXEC_FIXTURE = Path(__file__).parent / "fixtures" / "exec_dep_library"
 NONSERIALIZABLE_FIXTURE = Path(__file__).parent / "fixtures" / "nonserializable_library"
@@ -88,6 +93,29 @@ def _register(  # noqa: PLR0913 (a test-library builder; each knob is one manife
 
 def _library_info(library_json: str) -> LibraryManager.LibraryInfo:
     return current_engine().library_manager._library_file_path_to_info[library_json]
+
+
+EDIT_DEP = "fakeedit"
+EXEC_DEP = "fakeexec"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_import_state() -> Iterator[None]:
+    """Keep sys.path and sys.modules from leaking between tests.
+
+    Every registration inserts paths and imports modules. Without this, a dependency imported
+    by one test would satisfy the next test's import from the module cache, which would hide
+    exactly the wiring these tests exist to check.
+    """
+    original_path = list(sys.path)
+    original_is_worker = current_engine().library_manager._is_worker
+    for dep in (EDIT_DEP, EXEC_DEP):
+        sys.modules.pop(dep, None)
+    yield
+    sys.path[:] = original_path
+    current_engine().library_manager._is_worker = original_is_worker
+    for dep in (EDIT_DEP, EXEC_DEP):
+        sys.modules.pop(dep, None)
 
 
 class TestRoutingFact:
@@ -386,14 +414,20 @@ class TestUnshippableOutputGuardrail:
             ExecuteNodeResultSuccess,
         )
 
+        # Set BEFORE registering: the execution venv is spliced onto sys.path during load, and only
+        # for a worker, so flipping the flag afterwards leaves the heavy import unavailable.
+        current_engine().library_manager._is_worker = True
         _register(
             tmp_path,
             fixture_dir=EXEC_FIXTURE,
             node_file="exec_dep_node.py",
             name="Guardrail Serializable",
             edit_dependencies=["fakeedit"],
+            # Installed so process() actually completes. Without it the node raised on the missing
+            # import every time, so the branch this test is named for never ran and the assertion
+            # below could not distinguish success from any unrelated failure.
+            exec_dependencies=["fakeexec"],
         )
-        current_engine().library_manager._is_worker = True
         node = LibraryRegistry.create_node(
             node_type="ExecDepNode", name="Fine", specific_library_name="Guardrail Serializable"
         )
@@ -406,12 +440,14 @@ class TestUnshippableOutputGuardrail:
             )
         )
 
-        # fakeexec is not importable here, so process() raises -- but on the exec dep, NOT
-        # on the guardrail. What matters is the guardrail did not fire for its string outputs.
-        if isinstance(result, ExecuteNodeResultSuccess):
-            assert result.parameter_output_values["edit_dep_version"] == "1.0.0"
-        else:
-            assert "cannot leave" not in str(result.result_details)
+        # A node whose outputs are all serializable must ship them, so the unshippable-output
+        # guardrail must NOT fire. Asserted on success rather than either-branch: the previous
+        # version passed whether or not the node ran.
+        assert isinstance(result, ExecuteNodeResultSuccess), getattr(result, "result_details", result)
+        # This suite builds both wheels at 1.0.0; the version itself is not the point, having
+        # BOTH outputs is -- one proves the edit environment, the other the execution one.
+        assert result.parameter_output_values["edit_dep_version"] == "1.0.0"
+        assert result.parameter_output_values["exec_dep_version"] == "1.0.0"
 
 
 class TestManagerAccessDuringWorkerExecution:
@@ -437,6 +473,31 @@ class TestManagerAccessDuringWorkerExecution:
                 GriptapeNodes.SecretsManager()
             with pytest.raises(RuntimeError, match="ReadFileRequest"):
                 GriptapeNodes.OSManager()
+
+    def test_the_guard_covers_every_manager_but_static_files(self) -> None:
+        """The guard is broad by design: silently-wrong local answers are worse than errors.
+
+        Sweeps every manager accessor on the facade rather than naming a few, so adding an
+        accessor without deciding its worker story fails here instead of shipping unguarded.
+        """
+        current_engine().library_manager._is_worker = True
+        event_manager = current_engine().event_manager
+
+        minimum_believable_sweep = 20
+        accessors = [
+            name
+            for name, member in vars(GriptapeNodes).items()
+            if isinstance(member, classmethod) and name[0].isupper() and name.endswith("Manager")
+        ]
+        assert len(accessors) > minimum_believable_sweep, "sweep found too few accessors to be believed"
+
+        with event_manager.worker_node_execution_scope():
+            for name in accessors:
+                if name == "StaticFilesManager":
+                    assert getattr(GriptapeNodes, name)() is not None
+                    continue
+                with pytest.raises(RuntimeError, match=name):
+                    getattr(GriptapeNodes, name)()
 
     def test_managers_work_outside_node_execution_in_a_worker(self) -> None:
         """Engine boot and library load happen in the worker too, and need real managers."""
