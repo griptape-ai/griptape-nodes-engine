@@ -58,6 +58,7 @@ class ParameterString(Parameter):
         serializable: bool = True,
         user_defined: bool = False,
         private: bool = False,
+        exclude_from_metadata: bool = False,
         allow_variable_substitution: bool = True,
         element_id: str | None = None,
         element_type: str | None = None,
@@ -97,6 +98,7 @@ class ParameterString(Parameter):
             serializable: Whether the parameter is serializable
             user_defined: Whether the parameter is user-defined
             private: Whether this parameter is private
+            exclude_from_metadata: Whether this parameter is excluded from plaintext sidecar and image metadata
             allow_variable_substitution: Whether {VAR} tokens in this parameter's value are substituted at execution time
             element_id: Element ID
             element_type: Element type
@@ -167,6 +169,7 @@ class ParameterString(Parameter):
             serializable=serializable,
             user_defined=user_defined,
             private=private,
+            exclude_from_metadata=exclude_from_metadata,
             allow_variable_substitution=allow_variable_substitution,
             element_id=element_id,
             element_type=element_type,
