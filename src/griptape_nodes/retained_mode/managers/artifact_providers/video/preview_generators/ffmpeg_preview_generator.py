@@ -217,7 +217,7 @@ class FFmpegPreviewGenerator(BaseArtifactPreviewGenerator):
 
         # FAILURE CASE: output file was not created
         if not await anyio.Path(temp_path).exists():
-            msg = f"ffmpeg did not produce output file: {destination_path}"
+            msg = f"Attempted to generate a preview at {destination_path}. Failed because ffmpeg produced no output file."
             raise OSError(msg)
 
         # Same directory keeps the rename on one filesystem, so it is atomic: a reader sees either
