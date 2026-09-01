@@ -300,7 +300,7 @@ def collect_workflow_metadata(engine: Engine) -> dict[str, str]:
     if resolving_nodes:
         metadata[f"{METADATA_NAMESPACE}node_name"] = ", ".join(resolving_nodes)
 
-    # Serialize the entire flow to commands — only needed for embedded image metadata,
+    # Serialize the entire flow to commands. Only needed for embedded image metadata,
     # not the sidecar (the pickle+base64 blob is too large and not useful in JSON).
     flow_commands = _serialize_flow(engine)
     if flow_commands:
