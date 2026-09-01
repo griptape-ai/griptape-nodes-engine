@@ -1479,6 +1479,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
 
     user_defined: bool = False
     private: bool = False
+    exclude_from_metadata: bool = False
     allow_variable_substitution: bool = True
     _allowed_modes: set = field(
         default_factory=lambda: {
@@ -1525,6 +1526,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         serializable: bool = True,
         user_defined: bool = False,
         private: bool = False,
+        exclude_from_metadata: bool = False,
         allow_variable_substitution: bool = True,
         element_id: str | None = None,
         element_type: str | None = None,
@@ -1562,6 +1564,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         self.serializable = serializable
         self.user_defined = user_defined
         self.private = private
+        self.exclude_from_metadata = exclude_from_metadata
         self.allow_variable_substitution = allow_variable_substitution
 
         # Process allowed_modes - use convenience parameters if allowed_modes not explicitly set
@@ -1736,6 +1739,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         our_dict["settable"] = self.settable
         our_dict["serializable"] = self.serializable
         our_dict["private"] = self.private
+        our_dict["exclude_from_metadata"] = self.exclude_from_metadata
         our_dict["allow_variable_substitution"] = self.allow_variable_substitution
         our_dict["ui_options"] = self.ui_options
 
@@ -2248,6 +2252,7 @@ class ControlParameter(Parameter, ABC):
         display_name: str | None = None,
         user_defined: bool = False,
         private: bool = False,
+        exclude_from_metadata: bool = False,
     ):
         # Process ui_options before passing to parent
         if ui_options is None:
@@ -2300,6 +2305,7 @@ class ControlParameter(Parameter, ABC):
             display_name=display_name,
             user_defined=user_defined,
             private=private,
+            exclude_from_metadata=exclude_from_metadata,
             element_type=self.__class__.__name__,
         )
 
@@ -2320,6 +2326,7 @@ class ControlParameterInput(ControlParameter):
         parameter_render_location: ParameterRenderLocation | None = None,
         user_defined: bool = False,
         private: bool = False,
+        exclude_from_metadata: bool = False,
     ):
         allowed_modes = {ParameterMode.INPUT}
         input_types = [ParameterTypeBuiltin.CONTROL_TYPE.value]
@@ -2341,6 +2348,7 @@ class ControlParameterInput(ControlParameter):
             display_name=display_name,
             user_defined=user_defined,
             private=private,
+            exclude_from_metadata=exclude_from_metadata,
         )
 
 
@@ -2360,6 +2368,7 @@ class ControlParameterOutput(ControlParameter):
         parameter_render_location: ParameterRenderLocation | None = None,
         user_defined: bool = False,
         private: bool = False,
+        exclude_from_metadata: bool = False,
     ):
         allowed_modes = {ParameterMode.OUTPUT}
         output_type = ParameterTypeBuiltin.CONTROL_TYPE.value
@@ -2381,6 +2390,7 @@ class ControlParameterOutput(ControlParameter):
             display_name=display_name,
             user_defined=user_defined,
             private=private,
+            exclude_from_metadata=exclude_from_metadata,
         )
 
 
@@ -2413,6 +2423,7 @@ class ParameterContainer(Parameter, ABC):
         settable: bool = True,
         user_defined: bool = False,
         private: bool = False,
+        exclude_from_metadata: bool = False,
         element_id: str | None = None,
         element_type: str | None = None,
     ):
@@ -2436,6 +2447,7 @@ class ParameterContainer(Parameter, ABC):
             settable=settable,
             user_defined=user_defined,
             private=private,
+            exclude_from_metadata=exclude_from_metadata,
             element_id=element_id,
             element_type=element_type,
         )
@@ -2487,6 +2499,7 @@ class ParameterList(ParameterContainer):
         settable: bool = True,
         user_defined: bool = False,
         private: bool = False,
+        exclude_from_metadata: bool = False,
         element_id: str | None = None,
         element_type: str | None = None,
         max_items: int | None = None,
@@ -2529,6 +2542,7 @@ class ParameterList(ParameterContainer):
             settable=settable,
             user_defined=user_defined,
             private=private,
+            exclude_from_metadata=exclude_from_metadata,
             element_id=element_id,
             element_type=element_type,
         )
@@ -2874,6 +2888,7 @@ class ParameterKeyValuePair(Parameter):
         settable: bool = True,
         user_defined: bool = False,
         private: bool = False,
+        exclude_from_metadata: bool = False,
         element_id: str | None = None,
         element_type: str | None = None,
     ):
@@ -2895,6 +2910,7 @@ class ParameterKeyValuePair(Parameter):
             settable=settable,
             user_defined=user_defined,
             private=private,
+            exclude_from_metadata=exclude_from_metadata,
             element_id=element_id,
             element_type=element_type,
         )
@@ -2998,6 +3014,7 @@ class ParameterDictionary(ParameterContainer):
         settable: bool = True,
         user_defined: bool = False,
         private: bool = False,
+        exclude_from_metadata: bool = False,
         element_id: str | None = None,
         element_type: str | None = None,
     ):
@@ -3019,6 +3036,7 @@ class ParameterDictionary(ParameterContainer):
             settable=settable,
             user_defined=user_defined,
             private=private,
+            exclude_from_metadata=exclude_from_metadata,
             element_id=element_id,
             element_type=element_type,
         )
