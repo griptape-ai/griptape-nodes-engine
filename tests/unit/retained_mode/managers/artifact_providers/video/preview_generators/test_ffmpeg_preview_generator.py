@@ -62,6 +62,50 @@ def temp_test_video() -> Generator[str, None, None]:
 
 
 @pytest.fixture
+def temp_prores_video_with_extra_streams() -> Generator[str, None, None]:
+    """Create a 10-bit 4:2:2 ProRes MOV carrying 5.1 audio and a timecode track."""
+    with tempfile.NamedTemporaryFile(suffix=".mov", delete=False) as f:
+        temp_path = f.name
+
+    subprocess.run(  # noqa: S603
+        [
+            _FFMPEG_PATH,
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=1:size=200x100:rate=25",
+            "-f",
+            "lavfi",
+            "-i",
+            "anoisesrc=duration=1:sample_rate=48000",
+            "-af",
+            "pan=5.1|c0=c0|c1=c0|c2=c0|c3=c0|c4=c0|c5=c0",
+            "-c:v",
+            "prores_ks",
+            "-profile:v",
+            "3",
+            "-pix_fmt",
+            "yuv422p10le",
+            "-c:a",
+            "pcm_s24le",
+            "-timecode",
+            "01:00:00:00",
+            "-y",
+            temp_path,
+        ],
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+
+    yield temp_path
+
+    temp_file = Path(temp_path)
+    if temp_file.exists():
+        temp_file.unlink()
+
+
+@pytest.fixture
 def temp_output_dir() -> Generator[str, None, None]:
     """Create temporary output directory."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -286,6 +330,41 @@ class TestFFmpegPreviewGeneratorGeneration:
 
         with pytest.raises(FileNotFoundError):
             await generator.attempt_generate_preview()
+
+    @pytest.mark.asyncio
+    async def test_generate_forces_browser_decodable_streams(
+        self, temp_prores_video_with_extra_streams: str, temp_output_dir: str
+    ) -> None:
+        """Test that a 10-bit 4:2:2 / 5.1 / timecode source is normalized to what browsers decode."""
+        generator = FFmpegPreviewGenerator(
+            source_file_location=temp_prores_video_with_extra_streams,
+            preview_format="mp4",
+            destination_preview_directory=temp_output_dir,
+            destination_preview_file_name="output.mp4",
+            params={"max_width": 150, "max_height": 150},
+        )
+
+        result_filename = await generator.attempt_generate_preview()
+        output_path = Path(temp_output_dir) / result_filename
+
+        result = await subprocess_run(
+            [_FFPROBE_PATH, "-v", "error", "-print_format", "json", "-show_streams", str(output_path)],
+            capture_output=True,
+            text=True,
+        )
+        streams = json.loads(result.stdout)["streams"]
+
+        video_stream = next(s for s in streams if s["codec_type"] == "video")
+        assert video_stream["codec_name"] == "h264"
+        assert video_stream["pix_fmt"] == "yuv420p"
+        assert video_stream["profile"] == "High"
+
+        audio_stream = next(s for s in streams if s["codec_type"] == "audio")
+        assert audio_stream["codec_name"] == "aac"
+        assert audio_stream["channels"] == 2  # noqa: PLR2004
+
+        # The source timecode track must not ride along into the preview.
+        assert [s["codec_type"] for s in streams if s["codec_type"] not in {"video", "audio"}] == []
 
     @pytest.mark.asyncio
     async def test_generate_leaves_no_scratch_files(self, temp_test_video: str, temp_output_dir: str) -> None:

@@ -49,6 +49,9 @@ class FFmpegPreviewGenerator(BaseArtifactPreviewGenerator):
 
     Converts video files to browser-playable H.264 MP4, scaled to fit within
     max_width x max_height while preserving aspect ratio.
+
+    Output is pinned to what Chrome, Firefox and Safari all decode regardless of what the source
+    carries: H.264 High profile 8-bit 4:2:0 video and stereo AAC audio, with no other streams.
     """
 
     def __init__(  # noqa: PLR0913
@@ -110,8 +113,8 @@ class FFmpegPreviewGenerator(BaseArtifactPreviewGenerator):
     async def attempt_generate_preview(self) -> str:
         """Execute video preview generation.
 
-        Converts the source video to H.264 MP4 scaled to fit within max_width x max_height,
-        then moves it into place atomically.
+        Converts the source video to browser-decodable H.264 MP4 scaled to fit within
+        max_width x max_height, then moves it into place atomically.
 
         Raises:
             FileNotFoundError: If ffmpeg is not installed or source file not found
@@ -156,6 +159,13 @@ class FFmpegPreviewGenerator(BaseArtifactPreviewGenerator):
             # Video: H.264 codec for broad browser compatibility
             "-c:v",
             "libx264",
+            # Chrome, Firefox and Safari decode H.264 only up to High profile, 8-bit 4:2:0. libx264
+            # otherwise inherits the source pixel format, so a 10-bit 4:2:2 source (ProRes 422,
+            # DNxHR HQX) yields a High 4:2:2 stream that muxes and probes cleanly but plays nowhere.
+            "-pix_fmt",
+            "yuv420p",
+            "-profile:v",
+            "high",
             # Constant Rate Factor: 0 (lossless) to 51 (worst). 23 is the default, good balance of quality and size.
             "-crf",
             "23",
@@ -168,6 +178,18 @@ class FFmpegPreviewGenerator(BaseArtifactPreviewGenerator):
             # Audio: AAC codec for broad browser compatibility
             "-c:a",
             "aac",
+            # Browser AAC decoders are only dependable at up to two channels, and editorial sources
+            # routinely carry 5.1 or discrete stems.
+            "-ac",
+            "2",
+            # Drop the source's data and subtitle tracks, which ffmpeg's default stream selection
+            # would otherwise carry into a preview that has no use for them.
+            "-dn",
+            "-sn",
+            # -dn only discards input streams; the mov muxer still synthesizes a timecode track from
+            # the source's timecode metadata, so a tmcd stream reappears in the output without this.
+            "-write_tmcd",
+            "0",
             # Move the MP4 metadata to the start of the file so the browser can begin playback before fully downloading
             "-movflags",
             "+faststart",
