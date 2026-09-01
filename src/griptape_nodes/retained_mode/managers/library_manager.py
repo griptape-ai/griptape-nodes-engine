@@ -5164,7 +5164,7 @@ class LibraryManager(EngineScoped):
                         settable=param.settable,
                         serializable=param.serializable,
                         private=param.private,
-                        secret=param.secret,
+                        exclude_from_metadata=param.exclude_from_metadata,
                         ui_options=self._try_json_serialize(param.ui_options) if param.ui_options else None,
                     )
                 )

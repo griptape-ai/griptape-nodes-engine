@@ -104,7 +104,7 @@ def _serialize_flow(engine: Engine, flow_name: str | None = None) -> str | None:
 def _collect_parameter_values(node_name: str, engine: Engine) -> _ParameterCollection | None:
     """Collect current parameter values from a node's INPUT and PROPERTY parameters.
 
-    Parameters marked secret=True are excluded from the returned values and listed
+    Parameters marked exclude_from_metadata=True are excluded from the returned values and listed
     in the omitted field instead, so callers can surface the omission without revealing
     the value.
 
@@ -137,7 +137,7 @@ def _collect_parameter_values(node_name: str, engine: Engine) -> _ParameterColle
     omitted: list[str] = []
 
     for param in eligible_parameters:
-        if param.secret:
+        if param.exclude_from_metadata:
             omitted.append(param.name)
             continue
 
