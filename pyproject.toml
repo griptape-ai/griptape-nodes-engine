@@ -23,7 +23,7 @@ dependencies = [
   # pydantic-ai-slim reaches mcp through fastmcp-slim[client]<4, and every fastmcp-slim release
   # under that cap requires mcp<2.0, so asking for 2.x makes the resolve unsatisfiable.
   # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/5218
-  "mcp>=1.10.1,<2",
+  "mcp>=1.10.1,<3",
   "binaryornot>=0.4.4",
   "pillow>=11.3.0",
   "static-ffmpeg>=3.0",
