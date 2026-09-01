@@ -25,6 +25,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("griptape_nodes")
 
+# Marks the scratch file an in-progress encode writes to, so residue from a killed process is
+# greppable rather than anonymous.
+PARTIAL_PREVIEW_PREFIX = "gtn-preview-partial-"
+
 
 class FFmpegPreviewParameters(BaseGeneratorParameters):
     """Parameters for FFmpeg video preview generation."""
@@ -50,8 +54,14 @@ class FFmpegPreviewGenerator(BaseArtifactPreviewGenerator):
     Converts video files to browser-playable H.264 MP4, scaled to fit within
     max_width x max_height while preserving aspect ratio.
 
-    Output is pinned to what Chrome, Firefox and Safari all decode regardless of what the source
-    carries: H.264 High profile 8-bit 4:2:0 video and stereo AAC audio, with no other streams.
+    Codec, pixel format, channel count and stream list are pinned to what Chrome, Firefox and Safari
+    all decode whatever the source carries: H.264 High profile 8-bit 4:2:0 video and stereo AAC audio,
+    with no other streams. Colour is not converted, so an HDR or log source yields a preview that
+    plays but is tonally wrong.
+
+    The preview is written to a private sibling file and renamed into place, because two generations
+    racing on the served path interleave into a torn file that still carries a valid moov atom and so
+    gets cached as a good preview.
     """
 
     def __init__(  # noqa: PLR0913
@@ -139,11 +149,12 @@ class FFmpegPreviewGenerator(BaseArtifactPreviewGenerator):
         await destination_dir.mkdir(parents=True, exist_ok=True)
         destination_path = Path(self.destination_preview_directory) / self.destination_preview_file_name
 
-        # ffmpeg writes to a private sibling file that is renamed into place only once complete.
-        # Writing the served path directly lets two generations for the same preview interleave into
-        # one torn file, which still carries a valid moov atom and so gets cached as a good preview.
-        # The name keeps the preview extension so ffmpeg still infers the muxer from it.
-        temp_path = destination_path.with_name(f".{uuid.uuid4().hex}.{destination_path.name}")
+        # Only the extension matters, so ffmpeg still infers the muxer. Deliberately not derived from
+        # the destination name: that name is already the full source filename plus a suffix, so adding
+        # to it can push past the 255-byte component limit for a file that previously worked. A killed
+        # process skips the cleanup below, so the prefix is what makes the residue identifiable in a
+        # user's project tree; nothing reaps this directory.
+        temp_path = destination_path.with_name(f".{PARTIAL_PREVIEW_PREFIX}{uuid.uuid4().hex}.{self.preview_format}")
 
         # Build the scale filter to fit within max dimensions while preserving aspect ratio.
         # force_divisible_by=2 ensures even dimensions (required by H.264).
@@ -152,6 +163,10 @@ class FFmpegPreviewGenerator(BaseArtifactPreviewGenerator):
             f":force_original_aspect_ratio=decrease:force_divisible_by=2"
         )
 
+        # Changing anything below only affects previews that do not exist yet: cached previews are
+        # reused unless the source changes or PreviewMetadata.LATEST_SCHEMA_VERSION moves, and the
+        # sidecar records max_width/max_height but none of these arguments. Bump that version in the
+        # same change, or existing users keep the old encode forever.
         cmd = [
             ffmpeg_path,
             "-i",
@@ -198,38 +213,55 @@ class FFmpegPreviewGenerator(BaseArtifactPreviewGenerator):
             str(temp_path),
         ]
 
+        # Every exit path discards the scratch file, including a cancelled ffmpeg await and a failed
+        # rename. A successful rename leaves nothing behind, so the cleanup is then a no-op.
         try:
-            result = await subprocess_run(
-                cmd,
-                capture_output=True,
-                text=True,
-            )
-        except OSError as e:
+            try:
+                result = await subprocess_run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                )
+            except OSError as e:
+                msg = f"Attempted to run ffmpeg for preview generation. Failed because: {e}"
+                raise OSError(msg) from e
+
+            # FAILURE CASE: ffmpeg exited with error
+            if result.returncode != 0:
+                # Leads with the destination, because the scratch path ffmpeg's stderr refers to is
+                # already unlinked by the time anyone reads this.
+                msg = (
+                    f"Attempted to generate a preview at {destination_path}. "
+                    f"Failed because ffmpeg exited with code {result.returncode}: {result.stderr}"
+                )
+                raise OSError(msg)
+
+            # FAILURE CASE: output file was not created
+            if not await anyio.Path(temp_path).exists():
+                msg = f"Attempted to generate a preview at {destination_path}. Failed because ffmpeg produced no output file."
+                raise OSError(msg)
+
+            # Same directory keeps the rename on one filesystem, so it is atomic: a reader sees
+            # either the previous preview or this finished one. Serving the destination can hold it
+            # open on Windows, so this can fail and must not orphan the scratch file.
+            await anyio.Path(temp_path).replace(destination_path)
+        finally:
             await self._discard_partial_preview(temp_path)
-            msg = f"Attempted to run ffmpeg for preview generation. Failed because: {e}"
-            raise OSError(msg) from e
-
-        # FAILURE CASE: ffmpeg exited with error
-        if result.returncode != 0:
-            await self._discard_partial_preview(temp_path)
-            msg = f"ffmpeg failed with exit code {result.returncode}: {result.stderr}"
-            raise OSError(msg)
-
-        # FAILURE CASE: output file was not created
-        if not await anyio.Path(temp_path).exists():
-            msg = f"Attempted to generate a preview at {destination_path}. Failed because ffmpeg produced no output file."
-            raise OSError(msg)
-
-        # Same directory keeps the rename on one filesystem, so it is atomic: a reader sees either
-        # the previous preview or this finished one.
-        await anyio.Path(temp_path).replace(destination_path)
 
         return self.destination_preview_file_name
 
     async def _discard_partial_preview(self, temp_path: Path) -> None:
         """Remove the incomplete preview left behind by a failed ffmpeg run.
 
+        Never raises. This runs from a `finally`, where an exception would replace the failure that
+        is actually being reported (including a `CancelledError`, which would turn a cancelled request
+        into a failed one). On Windows a still-running ffmpeg child holds the handle open, so the
+        unlink genuinely can fail.
+
         Args:
             temp_path: The private file ffmpeg was writing to
         """
-        await anyio.Path(temp_path).unlink(missing_ok=True)
+        try:
+            await anyio.Path(temp_path).unlink(missing_ok=True)
+        except OSError as e:
+            logger.warning("Could not remove the incomplete video preview at %s: %s", temp_path, e)

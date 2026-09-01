@@ -140,7 +140,12 @@ class PreviewMetadata(BaseModel):
         preview_generator_parameters: Parameters supplied to preview generator
     """
 
-    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.1.0"
+    # 0.2.0 retires previews written before video previews were pinned to a browser-decodable format.
+    # The sidecar records no encoder settings, so an unplayable 4:2:2 preview and a torn one from the
+    # pre-atomic-write race are indistinguishable from a good preview; bumping the schema is the only
+    # signal that regenerates them. It is shared across media types, so image and audio previews
+    # rebuild once too.
+    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.2.0"
 
     version: str
     source_macro_path: str
