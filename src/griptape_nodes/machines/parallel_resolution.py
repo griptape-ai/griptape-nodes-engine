@@ -710,6 +710,8 @@ class ExecuteDagState(State):
             node_reference.node_state = NodeState.PROCESSING
             node_reference.node_reference.state = NodeResolutionState.RESOLVING
 
+            node_reference.node_reference.clear_cancellation()
+
             node_task = asyncio.create_task(ExecuteDagState.execute_node(context.engine, node_reference))
             context.task_to_node[node_task] = node_reference
             node_reference.task_reference = node_task
