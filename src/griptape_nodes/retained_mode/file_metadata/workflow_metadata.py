@@ -113,7 +113,7 @@ def _collect_parameter_values(node_name: str, engine: Engine) -> _ParameterColle
         engine: The engine whose object manager resolves the node
 
     Returns:
-        _ParameterCollection with serialized values and omitted private parameter names,
+        _ParameterCollection with serialized values and omitted exclude_from_metadata parameter names,
         or None if the node cannot be resolved.
     """
     obj_mgr = engine.object_manager
@@ -182,8 +182,10 @@ def _collect_raw_provenance(engine: Engine) -> dict[str, Any]:
         engine: The engine whose context manager and flow manager supply the metadata.
 
     Returns:
-        Dict with optional 'workflow', 'flow', and 'parameters' keys. 'flow' always includes
-        a 'resolving_nodes' list so callers can decide how to present multiple nodes.
+        Dict with optional 'workflow', 'flow', 'parameters', and 'parameters_omitted' keys.
+        'flow' always includes a 'resolving_nodes' list so callers can decide how to present
+        multiple nodes. 'parameters_omitted' is present when at least one parameter has
+        exclude_from_metadata=True.
     """
     result: dict[str, Any] = {}
     context_manager = engine.context_manager

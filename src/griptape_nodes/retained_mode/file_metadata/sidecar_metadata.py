@@ -4,7 +4,7 @@ When a file is saved, a sidecar JSON file is written to the project's metadata
 directory (`.griptape-nodes-metadata/`) with preserved path hierarchy. The sidecar
 captures the situation that triggered the save (name, macro, policy, variables) plus
 auto-collected workflow provenance (workflow name and dates, flow name, resolving node
-name, and node parameter values — with sensitive parameter names excluded).
+name, and node parameter values, with parameters marked exclude_from_metadata=True omitted).
 
 Example layout (for a file at <workspace>/outputs/image.png):
     .griptape-nodes-metadata/

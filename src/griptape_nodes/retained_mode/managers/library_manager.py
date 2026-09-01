@@ -4534,6 +4534,7 @@ class LibraryManager(EngineScoped):
                         serializable=schema.serializable,
                         user_defined=schema.user_defined,
                         private=schema.private,
+                        exclude_from_metadata=schema.exclude_from_metadata,
                         ui_options=schema.ui_options,
                     )
                 )
