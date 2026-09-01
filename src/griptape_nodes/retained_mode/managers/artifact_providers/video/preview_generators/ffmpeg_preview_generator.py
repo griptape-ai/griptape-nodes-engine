@@ -149,11 +149,9 @@ class FFmpegPreviewGenerator(BaseArtifactPreviewGenerator):
         await destination_dir.mkdir(parents=True, exist_ok=True)
         destination_path = Path(self.destination_preview_directory) / self.destination_preview_file_name
 
-        # Only the extension matters, so ffmpeg still infers the muxer. Deliberately not derived from
-        # the destination name: that name is already the full source filename plus a suffix, so adding
-        # to it can push past the 255-byte component limit for a file that previously worked. A killed
-        # process skips the cleanup below, so the prefix is what makes the residue identifiable in a
-        # user's project tree; nothing reaps this directory.
+        # Fixed length, because the destination name is already a full source filename plus a suffix
+        # and extending it can cross the 255-byte component limit. Only the extension has to survive,
+        # so ffmpeg still infers the muxer.
         temp_path = destination_path.with_name(f".{PARTIAL_PREVIEW_PREFIX}{uuid.uuid4().hex}.{self.preview_format}")
 
         # Build the scale filter to fit within max dimensions while preserving aspect ratio.
@@ -163,10 +161,8 @@ class FFmpegPreviewGenerator(BaseArtifactPreviewGenerator):
             f":force_original_aspect_ratio=decrease:force_divisible_by=2"
         )
 
-        # Changing anything below only affects previews that do not exist yet: cached previews are
-        # reused unless the source changes or PreviewMetadata.LATEST_SCHEMA_VERSION moves, and the
-        # sidecar records max_width/max_height but none of these arguments. Bump that version in the
-        # same change, or existing users keep the old encode forever.
+        # Editing these arguments does nothing for previews already on disk unless
+        # PreviewMetadata.LATEST_SCHEMA_VERSION is raised in the same change.
         cmd = [
             ffmpeg_path,
             "-i",
