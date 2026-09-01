@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -109,8 +110,8 @@ class FFmpegPreviewGenerator(BaseArtifactPreviewGenerator):
     async def attempt_generate_preview(self) -> str:
         """Execute video preview generation.
 
-        Converts the source video to H.264 MP4 scaled to fit within
-        max_width x max_height.
+        Converts the source video to H.264 MP4 scaled to fit within max_width x max_height,
+        then moves it into place atomically.
 
         Raises:
             FileNotFoundError: If ffmpeg is not installed or source file not found
@@ -134,6 +135,12 @@ class FFmpegPreviewGenerator(BaseArtifactPreviewGenerator):
         destination_dir = anyio.Path(self.destination_preview_directory)
         await destination_dir.mkdir(parents=True, exist_ok=True)
         destination_path = Path(self.destination_preview_directory) / self.destination_preview_file_name
+
+        # ffmpeg writes to a private sibling file that is renamed into place only once complete.
+        # Writing the served path directly lets two generations for the same preview interleave into
+        # one torn file, which still carries a valid moov atom and so gets cached as a good preview.
+        # The name keeps the preview extension so ffmpeg still infers the muxer from it.
+        temp_path = destination_path.with_name(f".{uuid.uuid4().hex}.{destination_path.name}")
 
         # Build the scale filter to fit within max dimensions while preserving aspect ratio.
         # force_divisible_by=2 ensures even dimensions (required by H.264).
@@ -166,7 +173,7 @@ class FFmpegPreviewGenerator(BaseArtifactPreviewGenerator):
             "+faststart",
             # Overwrite output file without prompting
             "-y",
-            str(destination_path),
+            str(temp_path),
         ]
 
         try:
@@ -176,17 +183,31 @@ class FFmpegPreviewGenerator(BaseArtifactPreviewGenerator):
                 text=True,
             )
         except OSError as e:
+            await self._discard_partial_preview(temp_path)
             msg = f"Attempted to run ffmpeg for preview generation. Failed because: {e}"
             raise OSError(msg) from e
 
         # FAILURE CASE: ffmpeg exited with error
         if result.returncode != 0:
+            await self._discard_partial_preview(temp_path)
             msg = f"ffmpeg failed with exit code {result.returncode}: {result.stderr}"
             raise OSError(msg)
 
         # FAILURE CASE: output file was not created
-        if not await anyio.Path(destination_path).exists():
+        if not await anyio.Path(temp_path).exists():
             msg = f"ffmpeg did not produce output file: {destination_path}"
             raise OSError(msg)
 
+        # Same directory keeps the rename on one filesystem, so it is atomic: a reader sees either
+        # the previous preview or this finished one.
+        await anyio.Path(temp_path).replace(destination_path)
+
         return self.destination_preview_file_name
+
+    async def _discard_partial_preview(self, temp_path: Path) -> None:
+        """Remove the incomplete preview left behind by a failed ffmpeg run.
+
+        Args:
+            temp_path: The private file ffmpeg was writing to
+        """
+        await anyio.Path(temp_path).unlink(missing_ok=True)

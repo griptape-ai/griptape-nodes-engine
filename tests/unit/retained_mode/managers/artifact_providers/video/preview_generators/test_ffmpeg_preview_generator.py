@@ -1,11 +1,13 @@
 """Tests for FFmpegPreviewGenerator."""
 
+import asyncio
 import json
 import subprocess
 import tempfile
 from collections.abc import Generator
 from pathlib import Path
 
+import anyio
 import pytest
 from pydantic import ValidationError
 from static_ffmpeg import run as static_ffmpeg_run
@@ -22,6 +24,11 @@ except Exception:
     _FFMPEG_PATH = ""
     _FFPROBE_PATH = ""
     FFMPEG_AVAILABLE = False
+
+
+async def _entry_names(directory: str) -> set[str]:
+    """Return the names of every entry in a directory."""
+    return {entry.name async for entry in anyio.Path(directory).iterdir()}
 
 
 @pytest.fixture
@@ -279,6 +286,86 @@ class TestFFmpegPreviewGeneratorGeneration:
 
         with pytest.raises(FileNotFoundError):
             await generator.attempt_generate_preview()
+
+    @pytest.mark.asyncio
+    async def test_generate_leaves_no_scratch_files(self, temp_test_video: str, temp_output_dir: str) -> None:
+        """Test that a successful generation leaves only the finished preview behind."""
+        generator = FFmpegPreviewGenerator(
+            source_file_location=temp_test_video,
+            preview_format="mp4",
+            destination_preview_directory=temp_output_dir,
+            destination_preview_file_name="output.mp4",
+            params={"max_width": 150, "max_height": 150},
+        )
+
+        await generator.attempt_generate_preview()
+
+        assert await _entry_names(temp_output_dir) == {"output.mp4"}
+
+    @pytest.mark.asyncio
+    async def test_failed_generation_preserves_existing_preview(
+        self, temp_test_video: str, dummy_source_path: str, temp_output_dir: str
+    ) -> None:
+        """Test that a failed generation does not clobber the preview already being served."""
+        generator = FFmpegPreviewGenerator(
+            source_file_location=temp_test_video,
+            preview_format="mp4",
+            destination_preview_directory=temp_output_dir,
+            destination_preview_file_name="output.mp4",
+            params={"max_width": 150, "max_height": 150},
+        )
+        await generator.attempt_generate_preview()
+
+        output_path = Path(temp_output_dir) / "output.mp4"
+        original_bytes = await anyio.Path(output_path).read_bytes()
+
+        # dummy_source_path is an empty .mov, so ffmpeg cannot demux it and exits non-zero.
+        failing_generator = FFmpegPreviewGenerator(
+            source_file_location=dummy_source_path,
+            preview_format="mp4",
+            destination_preview_directory=temp_output_dir,
+            destination_preview_file_name="output.mp4",
+            params={"max_width": 150, "max_height": 150},
+        )
+
+        with pytest.raises(OSError, match="ffmpeg failed"):
+            await failing_generator.attempt_generate_preview()
+
+        assert await anyio.Path(output_path).read_bytes() == original_bytes
+        assert await _entry_names(temp_output_dir) == {"output.mp4"}
+
+    @pytest.mark.asyncio
+    async def test_concurrent_generation_produces_decodable_preview(
+        self, temp_test_video: str, temp_output_dir: str
+    ) -> None:
+        """Test that two generations racing on one destination still yield a decodable preview."""
+        generators = [
+            FFmpegPreviewGenerator(
+                source_file_location=temp_test_video,
+                preview_format="mp4",
+                destination_preview_directory=temp_output_dir,
+                destination_preview_file_name="output.mp4",
+                params={"max_width": 150, "max_height": 150},
+            )
+            for _ in range(2)
+        ]
+
+        await asyncio.gather(*(generator.attempt_generate_preview() for generator in generators))
+
+        output_path = Path(temp_output_dir) / "output.mp4"
+        result = await subprocess_run(
+            [_FFPROBE_PATH, "-v", "error", "-print_format", "json", "-show_streams", str(output_path)],
+            capture_output=True,
+            text=True,
+        )
+        streams = json.loads(result.stdout)["streams"]
+        video_stream = next(s for s in streams if s["codec_type"] == "video")
+
+        # A torn file still parses as MP4, but its H.264 extradata does not, so pix_fmt reads back as
+        # "unknown" and the decoder logs NAL unit errors on stderr.
+        assert result.stderr == ""
+        assert video_stream["pix_fmt"] != "unknown"
+        assert await _entry_names(temp_output_dir) == {"output.mp4"}
 
     @pytest.mark.asyncio
     async def test_generate_creates_parent_directories(self, temp_test_video: str, temp_output_dir: str) -> None:
