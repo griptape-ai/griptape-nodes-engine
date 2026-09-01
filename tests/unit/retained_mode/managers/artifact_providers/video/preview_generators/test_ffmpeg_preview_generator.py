@@ -406,9 +406,7 @@ class TestFFmpegPreviewGeneratorGeneration:
         output_path = Path(temp_output_dir) / "output.mp4"
         original_bytes = await anyio.Path(output_path).read_bytes()
 
-        async def fail_after_opening_output(
-            cmd: list[str], **_kwargs: object
-        ) -> subprocess.CompletedProcess[str]:
+        async def fail_after_opening_output(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
             await anyio.Path(cmd[-1]).write_bytes(b"truncated")
             return subprocess.CompletedProcess(cmd, 1, "", "Conversion failed!")
 
