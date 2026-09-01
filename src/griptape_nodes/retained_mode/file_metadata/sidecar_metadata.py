@@ -79,7 +79,17 @@ class FlowInfo(BaseModel):
 
 
 class SidecarContent(BaseModel):
-    """Context written to the sidecar JSON file alongside saved files."""
+    """Caller-supplied context for the sidecar JSON file.
+
+    Only `situation` is read by `write_sidecar()`; provenance fields
+    (workflow, flow, parameters) are always auto-collected from the engine.
+    """
+
+    situation: SituationMetadata | None = None
+
+
+class _SidecarDocument(BaseModel):
+    """Assembled sidecar document written to disk. Internal to write_sidecar()."""
 
     situation: SituationMetadata | None = None
     workflow: WorkflowInfo | None = None
@@ -154,10 +164,9 @@ def write_sidecar(file_path: Path, metadata: SidecarContent | None, engine: Engi
     """
     try:
         sidecar_path = _resolve_sidecar_path(file_path, engine)
-        base = metadata or SidecarContent()
         provenance = collect_sidecar_provenance(engine)
-        content = SidecarContent(
-            situation=base.situation,
+        content = _SidecarDocument(
+            situation=metadata.situation if metadata else None,
             workflow=WorkflowInfo(**provenance["workflow"]) if "workflow" in provenance else None,
             flow=FlowInfo(**provenance["flow"]) if "flow" in provenance else None,
             parameters=provenance.get("parameters"),
