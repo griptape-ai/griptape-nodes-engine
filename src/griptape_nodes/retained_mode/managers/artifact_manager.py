@@ -89,6 +89,7 @@ from griptape_nodes.retained_mode.managers.artifact_providers import (
     BaseGeneratorParameters,
     ImageArtifactProvider,
     ProviderRegistry,
+    SVGArtifactProvider,
     VideoArtifactProvider,
     WriteVettingPolicy,
 )
@@ -406,10 +407,16 @@ class ArtifactManager(EngineScoped):
         # no-op. See utils/ffmpeg_cache.py.
         install_ffmpeg_cache_redirect(self.engine.config_manager.get_config_value("ffmpeg_directory", default=""))
 
-        # Register default providers (order matters: Image, Video, Audio)
+        # Register default providers (order matters: Image, Video, Audio, SVG)
         # Generator settings are now registered automatically via _register_provider_settings()
         failures = []
-        for provider_class in [ImageArtifactProvider, VideoArtifactProvider, AudioArtifactProvider]:
+        default_providers = [
+            ImageArtifactProvider,
+            VideoArtifactProvider,
+            AudioArtifactProvider,
+            SVGArtifactProvider,
+        ]
+        for provider_class in default_providers:
             request = RegisterArtifactProviderRequest(provider_class=provider_class)
             result = self.on_handle_register_artifact_provider_request(request)
             if isinstance(result, RegisterArtifactProviderResultFailure):

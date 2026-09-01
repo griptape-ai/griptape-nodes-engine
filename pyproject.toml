@@ -43,6 +43,8 @@ dependencies = [
   "fileseq>=3.2.0",
   "pydantic-ai-slim[mcp,openai]>=1.95.1",
   "pydantic-ai-skills>=0.11.0",
+  "resvg-py>=0.4.0",
+  "defusedxml>=0.7.1",
 ]
 
 [project.optional-dependencies]
