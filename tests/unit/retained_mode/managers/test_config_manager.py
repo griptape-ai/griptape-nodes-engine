@@ -2197,6 +2197,83 @@ class TestConfigProvenance:
         assert editable_result.source.layer == "user"
         assert editable_result.editable is True
 
+    def test_get_config_value_request_editable_is_leaf_aware_for_a_category(
+        self, tmp_path: Path, isolate_user_config: Path
+    ) -> None:
+        """`editable` must be judged per leaf, the way the write path judges `applied`.
+
+        A project layer owning one leaf says nothing about its siblings. Reporting the whole
+        category as locked disables a control the engine would have accepted, and contradicts
+        the write path, which reports success for exactly that write.
+        """
+        self._write_layer_config(tmp_path, {"worker": {"heartbeat_timeout_s": 99.0}})
+
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.load_project_config(tmp_path)
+
+            shadowed_category = manager.on_handle_get_config_value_request(
+                GetConfigValueRequest(category_and_key="worker")
+            )
+            # A sibling leaf the project does not own is still the user's to set.
+            sibling_write = manager.on_handle_set_config_value_request(
+                SetConfigValueRequest(category_and_key="worker", value={"heartbeat_interval_s": 30.0})
+            )
+            untouched_category = manager.on_handle_get_config_value_request(
+                GetConfigValueRequest(category_and_key="library")
+            )
+
+        assert isinstance(shadowed_category, GetConfigValueResultSuccess)
+        assert shadowed_category.editable is False
+
+        assert isinstance(untouched_category, GetConfigValueResultSuccess)
+        assert untouched_category.editable is True
+
+        # The contradiction the leaf-aware read removes: this write really does take effect.
+        assert isinstance(sibling_write, SetConfigValueResultSuccess)
+        assert sibling_write.applied is True
+        assert json.loads(isolate_user_config.read_text())["worker"] == {"heartbeat_interval_s": 30.0}
+
+    def test_set_config_value_request_reports_value_the_settings_model_rejects(self, isolate_user_config: Path) -> None:
+        """A write no layer shadows can still fail to take effect, and must not report otherwise.
+
+        `load_configs` catches the `ValidationError` and falls back to defaults, so nothing
+        propagates out of the handler. Judging the outcome from layer ownership alone called
+        this a success while the effective value stayed at the default.
+        """
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            result = manager.on_handle_set_config_value_request(
+                SetConfigValueRequest(category_and_key="max_nodes_in_parallel", value="not-an-int")
+            )
+
+        assert isinstance(result, SetConfigValueResultSuccess)
+        assert result.applied is False
+        # No layer is at fault, so there is no layer to name.
+        assert result.shadowed_by is None
+        assert result.effective_value != "not-an-int"
+        assert "max_nodes_in_parallel" in str(result.result_details)
+        assert "not one this setting accepts" in str(result.result_details)
+
+        # Still stored, like any other write that does not take effect.
+        assert json.loads(isolate_user_config.read_text())["max_nodes_in_parallel"] == "not-an-int"
+
+    def test_set_config_value_request_applied_stays_true_for_an_accepted_write(self, isolate_user_config: Path) -> None:
+        """Guard against the divergence check firing on a write that did land."""
+        accepted_value = 9
+
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            result = manager.on_handle_set_config_value_request(
+                SetConfigValueRequest(category_and_key="max_nodes_in_parallel", value=accepted_value)
+            )
+
+        assert isinstance(result, SetConfigValueResultSuccess)
+        assert result.applied is True
+        assert result.shadowed_by is None
+        assert result.effective_value == accepted_value
+        assert json.loads(isolate_user_config.read_text())["max_nodes_in_parallel"] == accepted_value
+
     def test_get_config_category_request_sources_keyed_by_full_root_relative_path(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             result = ConfigManager().on_handle_get_config_category_request(

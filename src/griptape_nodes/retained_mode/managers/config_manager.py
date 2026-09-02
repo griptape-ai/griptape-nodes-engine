@@ -125,15 +125,18 @@ class LoadedConfigFile(NamedTuple):
 class ConfigWriteOutcome(NamedTuple):
     """Whether a completed user-layer write is the value now in effect.
 
-    A write always lands in the user config file; whether it WINS depends on whether a
-    higher-priority layer also defines any of the keys it wrote. `shadowed_key` names the
-    first such key, which for a category write is a leaf under it rather than the category
-    itself. See `ConfigManager._write_outcome`.
+    A write always lands in the user config file; whether it takes effect depends on two
+    separate things. A higher-priority layer may also define one of the keys it wrote, and
+    the merged result may have failed `Settings` validation, in which case `load_configs`
+    discards the whole merge. `unapplied_key` names the first key that did not take effect,
+    which for a category write is a leaf under it rather than the category itself.
+    `shadowed_by` is set only for the first cause; validation leaves it None. See
+    `ConfigManager._write_outcome`.
     """
 
     applied: bool
     effective_value: Any
-    shadowed_key: str | None
+    unapplied_key: str | None
     shadowed_by: ConfigValueSource | None
 
 
@@ -142,6 +145,17 @@ class _ShadowedLeaf(NamedTuple):
 
     key: str
     source: ConfigValueSource
+
+
+class _UnappliedLeaf(NamedTuple):
+    """One written key whose value is not the one now in effect, and the layer to blame if any.
+
+    `source` is None when no layer is responsible, which today means the merged config failed
+    `Settings` validation and was discarded.
+    """
+
+    key: str
+    source: ConfigValueSource | None
 
 
 class _LayerProbe(NamedTuple):
@@ -1302,7 +1316,7 @@ class ConfigManager(EngineScoped):
         return GetConfigValueResultSuccess(
             value=find_results,
             source=source,
-            editable=source.layer in _WRITABLE_LAYERS,
+            editable=self._first_shadowed_leaf(request.category_and_key, find_results) is None,
             result_details=result_details,
         )
 
@@ -1419,12 +1433,21 @@ class ConfigManager(EngineScoped):
     def _write_outcome(self, key: str, value: Any) -> ConfigWriteOutcome:
         """Report whether a just-completed user-layer write is the value now in effect.
 
-        Called by the `Set*` handlers once the write is known to have reached disk. The write
-        always lands in the user layer, but a higher-priority layer (project, workspace, env)
-        that also defines what was written keeps winning the merge, which is what let those
-        handlers report a bare success for a write with no visible effect.
+        Called by the `Set*` handlers once the write is known to have reached disk. A write
+        lands in the user layer but can still fail to take effect two ways, and both are
+        checked because neither implies the other:
 
-        Judged on the keys the caller actually WROTE, which for a dict `value` means its
+        1. A higher-priority layer (project, workspace, runtime, env) also defines what was
+           written and keeps winning the merge. `shadowed_by` names it.
+        2. The merged result failed `Settings` validation, so `load_configs` discarded it and
+           fell back to defaults. No layer is at fault, so `shadowed_by` stays None.
+
+        Ownership is judged before values are compared, because writing the value a higher
+        layer already holds is still not a write that took effect: the user's copy is inert and
+        the next remerge keeps reporting the other layer's. Comparing values alone would call
+        that success.
+
+        Judged on the keys the caller actually wrote, which for a dict `value` means its
         leaves rather than `key` itself -- writing `{"port": 8080}` to category "nuke" is
         unaffected by a project layer that defines only "nuke.executable".
 
@@ -1436,17 +1459,37 @@ class ConfigManager(EngineScoped):
             value: The value written to `key`, descended into when it is a dict.
         """
         effective_value = self.get_config_value(key, should_load_env_var_if_detected=False)
-        shadowed_leaf = self._first_shadowed_leaf(key, value)
-        if shadowed_leaf is None:
+        unapplied_leaf = self._first_unapplied_leaf(key, value)
+        if unapplied_leaf is None:
             return ConfigWriteOutcome(
-                applied=True, effective_value=effective_value, shadowed_key=None, shadowed_by=None
+                applied=True, effective_value=effective_value, unapplied_key=None, shadowed_by=None
             )
         return ConfigWriteOutcome(
             applied=False,
             effective_value=effective_value,
-            shadowed_key=shadowed_leaf.key,
-            shadowed_by=shadowed_leaf.source,
+            unapplied_key=unapplied_leaf.key,
+            shadowed_by=unapplied_leaf.source,
         )
+
+    def _first_unapplied_leaf(self, key: str, value: Any) -> _UnappliedLeaf | None:
+        """Return the first written key whose value is not the one now in effect, or None.
+
+        Shadowing is reported in preference to divergence: when a higher layer owns the key,
+        that layer is the actionable explanation, and the two causes overlap in the common case.
+
+        Args:
+            key: Dot-notation key `value` was written to.
+            value: The written value, descended into when it is a dict.
+        """
+        shadowed_leaf = self._first_shadowed_leaf(key, value)
+        if shadowed_leaf is not None:
+            return _UnappliedLeaf(key=shadowed_leaf.key, source=shadowed_leaf.source)
+
+        diverged_key = self._first_diverged_leaf(key, value)
+        if diverged_key is not None:
+            return _UnappliedLeaf(key=diverged_key, source=None)
+
+        return None
 
     def _first_shadowed_leaf(self, key: str, value: Any) -> _ShadowedLeaf | None:
         """Return the first written key a higher-priority layer shadows, or None if none is.
@@ -1454,6 +1497,9 @@ class ConfigManager(EngineScoped):
         A dict `value` is descended into so each leaf is judged on its own dot path, matching
         the leaf-level granularity `category_sources` reports on the read side. A non-dict
         value -- and an empty dict, which names no leaves -- is one leaf: `key` itself.
+
+        Also used by the read path to decide whether a whole category is editable, where
+        `value` is the category's current contents rather than something being written.
 
         "First" is in the caller's own key order, so the reported key is the one nearest the
         top of what they wrote. One shadowed leaf is enough to make the write's outcome
@@ -1475,24 +1521,55 @@ class ConfigManager(EngineScoped):
                 return shadowed_leaf
         return None
 
-    def _append_shadow_note(self, result_details: str, outcome: ConfigWriteOutcome) -> str:
-        """Return `result_details` with an explanation appended when a higher layer shadows the write.
+    def _first_diverged_leaf(self, key: str, value: Any) -> str | None:
+        """Return the first written leaf whose merged value differs from what was written.
 
-        Returned unchanged when nothing was shadowed. Otherwise the message a user sees (in a
-        toast, a log, a CLI response) names the shadowed key and says WHY it did not change,
-        instead of reporting a bare success. Naming the key matters for a category write,
-        where the rest of the category may well have taken effect.
+        Catches the write no layer shadows but that still did not land, which today means
+        `Settings` validation rejected the merged result and `load_configs` fell back to
+        defaults. Reads each leaf back on its own rather than comparing whole dicts, because a
+        category's merged value legitimately holds keys the caller never wrote.
+
+        Args:
+            key: Dot-notation key `value` was written to.
+            value: The written value, descended into when it is a dict.
+        """
+        if not isinstance(value, dict) or not value:
+            effective = self.get_config_value(key, should_load_env_var_if_detected=False)
+            if effective == value:
+                return None
+            return key
+
+        for leaf_name, leaf_value in value.items():
+            diverged_key = self._first_diverged_leaf(f"{key}.{leaf_name}", leaf_value)
+            if diverged_key is not None:
+                return diverged_key
+        return None
+
+    def _append_shadow_note(self, result_details: str, outcome: ConfigWriteOutcome) -> str:
+        """Return `result_details` with an explanation appended when the write did not take effect.
+
+        Returned unchanged when the write applied. Otherwise the message a user sees (in a
+        toast, a log, a CLI response) names the key that did not change and says why, instead
+        of reporting a bare success. Naming the key matters for a category write, where the
+        rest of the category may well have taken effect.
 
         Args:
             result_details: The success message describing the write.
             outcome: The outcome from `_write_outcome`.
         """
-        if outcome.shadowed_by is None:
+        if outcome.applied:
             return result_details
+
+        if outcome.shadowed_by is None:
+            return (
+                f"{result_details} NOTE: '{outcome.unapplied_key}' is still "
+                f"'{outcome.effective_value}'. The value was saved but is not one this setting "
+                "accepts, so the engine kept the previous configuration."
+            )
 
         location = outcome.shadowed_by.path or outcome.shadowed_by.env_var or "an unknown source"
         return (
-            f"{result_details} NOTE: '{outcome.shadowed_key}' is supplied by a higher-priority "
+            f"{result_details} NOTE: '{outcome.unapplied_key}' is supplied by a higher-priority "
             f"'{outcome.shadowed_by.layer}' layer ({location}), so that value does not change "
             "until that layer does."
         )

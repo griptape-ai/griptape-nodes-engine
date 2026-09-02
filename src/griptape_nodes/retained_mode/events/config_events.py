@@ -108,10 +108,14 @@ class GetConfigValueResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess)
 
     Args:
         value: The configuration value (can be any type)
-        source: Which config layer currently supplies this value.
-        editable: Whether a `SetConfigValueRequest` for this same key can actually change
-            the effective value (True when `source.layer` is "default" or "user"; False
-            when a higher-priority project/workspace/env layer would keep overriding it).
+        source: Which config layer currently supplies this value. For a category (dict) key
+            this names the highest-priority layer that mentions the category at all, which
+            says nothing about the individual leaves under it; use
+            `GetConfigCategoryResultSuccess.sources` for per-leaf provenance.
+        editable: Whether a `SetConfigValueRequest` for this same key can actually change the
+            effective value. Judged leaf by leaf, matching how the write path judges
+            `applied`: a category is editable when no leaf under it is shadowed, so a project
+            layer pinning "nuke.executable" does not lock "nuke.port".
     """
 
     value: Any
@@ -150,24 +154,23 @@ class SetConfigValueResultSuccess(ResultPayloadSuccess):
     """Configuration value set successfully.
 
     A success here means the write reached disk; it does NOT mean the value took
-    effect. Check `applied` and `shadowed_by` before assuming so -- a project or
-    workspace config layer (or a GTN_CONFIG_ environment variable) can outrank the
-    write, in which case it is stored but has no visible effect until that layer changes.
-
-    One key is exempt from that guarantee: `workspace_directory` can also be pinned by a
-    runtime per-project override, which is not one of the layers shadowing is computed
-    from. A write to it while a project pins the workspace can report `applied` True with
-    an `effective_value` that still differs from what was written.
+    effect. Check `applied` and `shadowed_by` before assuming so -- a project, workspace or
+    runtime layer (or a GTN_CONFIG_ environment variable) can outrank the write, in which
+    case it is stored but has no visible effect until that layer changes. A value the
+    `Settings` model rejects is also stored without taking effect.
 
     Args:
-        applied: Whether the requested value is now the effective (merged) value. False
-            means some higher-priority layer still supplies a different value; see
-            `shadowed_by`. A dict value is judged leaf by leaf, so False means at least
-            one leaf it wrote is shadowed, not necessarily all of them.
+        applied: Whether the requested value is now the effective (merged) value. False means
+            either a higher-priority layer still supplies a different value (see
+            `shadowed_by`) or the merged result failed validation and was discarded. A dict
+            value is judged leaf by leaf, so False means at least one leaf it wrote did not
+            take effect, not necessarily all of them.
         effective_value: What `GetConfigValueRequest` for this same key would return right
             now, after this write. Equal to the requested value when `applied` is True.
-        shadowed_by: The layer that won instead, when `applied` is False. None when
-            `applied` is True. `result_details` names which key that layer supplies.
+        shadowed_by: The layer that won instead, when `applied` is False. None when `applied`
+            is True, and also None when `applied` is False because validation rejected the
+            value rather than because a layer outranked it. `result_details` names the key
+            that did not change and explains which case it was.
     """
 
     applied: bool = True
@@ -255,10 +258,10 @@ class SetConfigCategoryResultSuccess(ResultPayloadSuccess):
     user layer at once, has no single key to check, and leaves these three at their
     defaults.
 
-    Shadowing is judged per leaf of `contents`, so a higher-priority layer that defines a
-    DIFFERENT key under the same category does not make this write shadowed. `applied`
-    False therefore means at least one of the written leaves is shadowed; the rest may
-    well have taken effect. `result_details` names the first shadowed leaf.
+    Whether a write took effect is judged per leaf of `contents`, so a higher-priority layer
+    that defines a different key under the same category does not make this write unapplied.
+    `applied` False therefore means at least one of the written leaves did not take effect;
+    the rest may well have. `result_details` names the first such leaf.
 
     Args:
         applied: See `SetConfigValueResultSuccess.applied`. Always True (default) for a
