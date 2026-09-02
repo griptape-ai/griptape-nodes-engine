@@ -4462,7 +4462,19 @@ class LibraryManager(EngineScoped):
         Nothing else does this: the workspace rescan deliberately spares library-owned
         entries, so without this an install -> uninstall -> reinstall cycle accumulates stale
         entries and an unloaded library keeps offering workflows for the life of the process.
+
+        Guarded on this engine knowing the library, the same condition
+        `register_workflows_for_all_libraries` registers under. `WorkflowRegistry` is
+        process-global and entries are keyed by contributing library name only, so in a process
+        running more than one Engine an unguarded delete would take the other engine's entries
+        for a library this one never registered -- the exact case the register side defends
+        against. Called before the unload path drops the library's info, so the lookup still
+        resolves for a library this engine is unloading.
         """
+        if self.get_library_info_by_library_name(library_name) is None:
+            logger.debug("Library '%s' is not known to this engine; leaving its workflows alone.", library_name)
+            return
+
         removed_keys = WorkflowRegistry.remove_workflows_from_library(library_name)
         if not removed_keys:
             return

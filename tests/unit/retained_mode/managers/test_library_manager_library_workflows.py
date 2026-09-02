@@ -299,6 +299,17 @@ class TestRegisterWorkflowsForAllLibraries:
 
 
 class TestUnregisterWorkflowsForLibrary:
+    @pytest.fixture(autouse=True)
+    def _engine_knows_the_library(self, engine: Engine, tmp_path: Path) -> Iterator[None]:
+        """The library is one this engine loaded, which is the only way unloading it is reached."""
+        library_info = _library_info(tmp_path / "griptape_nodes_library.json")
+        with patch.dict(
+            engine.library_manager._library_file_path_to_info,
+            {library_info.library_path: library_info},
+            clear=True,
+        ):
+            yield
+
     def test_removes_the_library_workflows_and_announces_them(self, engine: Engine) -> None:
         library_manager = engine.library_manager
         event_manager = MagicMock()
@@ -332,6 +343,26 @@ class TestUnregisterWorkflowsForLibrary:
             patch.object(engine, "_event_manager", event_manager),
         ):
             engine.library_manager._unregister_workflows_for_library(LIBRARY_NAME)
+
+        assert _emitted_workflow_changes(event_manager) == []
+
+    def test_leaves_alone_a_library_this_engine_never_registered(self, engine: Engine) -> None:
+        """The mirror of the guard on the register side, and for the same reason.
+
+        `WorkflowRegistry` is process-global and its entries record only the contributing
+        library's name, so in a process running more than one Engine an unguarded delete would
+        take the other engine's entries for a library this one has never seen.
+        """
+        event_manager = MagicMock()
+
+        with (
+            patch.dict(engine.library_manager._library_file_path_to_info, {}, clear=True),
+            patch.dict(WorkflowRegistry._workflows, {"lib/example": MagicMock(library_name=LIBRARY_NAME)}, clear=True),
+            patch.object(engine, "_event_manager", event_manager),
+        ):
+            engine.library_manager._unregister_workflows_for_library(LIBRARY_NAME)
+
+            assert list(WorkflowRegistry._workflows) == ["lib/example"]
 
         assert _emitted_workflow_changes(event_manager) == []
 
