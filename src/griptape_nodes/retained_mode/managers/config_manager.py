@@ -114,7 +114,7 @@ class LoadedConfigFile(NamedTuple):
     """One config file's parsed contents plus why it failed to parse, if it did.
 
     `contents` is `{}` when the file is missing or unparsable. `parse_error` is None
-    unless the file EXISTS and failed to parse, so a caller can tell "no such file"
+    unless the file exists and failed to parse, so a caller can tell "no such file"
     apart from "file is broken" without stat-ing the path a second time.
     """
 
@@ -150,7 +150,7 @@ class _ShadowedLeaf(NamedTuple):
 class _UnappliedLeaf(NamedTuple):
     """One written key whose value is not the one now in effect, and the layer to blame if any.
 
-    `source` is None when no layer is responsible, which today means the merged config failed
+    `source` is None when no layer is responsible, meaning the merged config failed
     `Settings` validation and was discarded.
     """
 
@@ -220,9 +220,9 @@ class ConfigManager(EngineScoped):
         # Parse error for the most recent load of each file layer, keyed by layer name and
         # set by load_configs() via _load_file_layer. None means either the file doesn't
         # exist or it parsed fine; config_layers() distinguishes those two cases with
-        # `present`. Deliberately NOT touched by compute_project_provisioning_config /
+        # `present`. Deliberately left alone by compute_project_provisioning_config /
         # compute_system_defaults_provisioning_config's own _load_config_from_file calls,
-        # which preview a DIFFERENT project's config and would otherwise clobber the live
+        # which preview some other project's config and would otherwise clobber the live
         # layer's error with a preview's.
         self._layer_parse_errors: dict[ConfigLayerName, str | None] = {}
         self.load_configs()
@@ -486,9 +486,9 @@ class ConfigManager(EngineScoped):
         Walks the same layers `load_configs` merges, in the same priority order (env
         highest, then the runtime workspace pin, workspace, project, user, default lowest),
         and returns the first (highest-priority) layer whose own dict contains `key` at all.
-        That layer WINS the merge for `key` regardless of what any lower layer's value is, so
-        it is reported as the source even if, say, the project layer's value happens to equal
-        the user layer's. Every key resolves to at least "default", since
+        That layer wins the merge for `key` whatever any lower layer holds, so it is reported
+        as the source even if, say, the project layer's value happens to equal the user
+        layer's. Every key resolves to at least "default", since
         `Settings().model_dump()` always populates `default_config`.
 
         Args:
@@ -565,7 +565,7 @@ class ConfigManager(EngineScoped):
 
         A dict value is treated as a sub-category and is recursed into. A list (or any
         other non-dict) value is one leaf entry -- a list is never split into per-item
-        entries, since whichever layer set the WHOLE list is the source for all of it.
+        entries, since whichever layer set the entire list is the source for all of it.
 
         Args:
             category: Dot-notation category, or None/"" for the whole merged config.
@@ -594,7 +594,7 @@ class ConfigManager(EngineScoped):
     def config_layers(self) -> list[ConfigLayer]:
         """Return every config layer in isolation, lowest to highest priority.
 
-        Unlike `merged_config`, each returned layer's `values` is that layer's OWN parsed
+        Unlike `merged_config`, each returned layer's `values` is that layer's own parsed
         contents, not merged with any other layer -- this is what lets a caller see which
         layer a key came from, and whether a layer's file exists but failed to parse
         (`parse_error`), e.g. for `gtn self info` or a support/environment report. Always
@@ -603,7 +603,7 @@ class ConfigManager(EngineScoped):
         currently active (`_project_config_path`/`_workspace_config_path` unset).
 
         `present` means "this layer contributes to the merge", not merely "its file
-        exists". That distinction matters for one real case: when the workspace dir IS the
+        exists". That distinction matters for one real case: when the workspace dir is the
         project dir, both layers name the same file and `load_configs` deliberately loads
         it once, as `project`. The `workspace` entry then keeps its `path` (so a caller can
         see which file it would have been) but reports `present=False` with empty `values`,
@@ -662,7 +662,7 @@ class ConfigManager(EngineScoped):
     def _workspace_layer_path(self) -> Path | None:
         """Return the file the workspace layer loads, or None when it contributes nothing.
 
-        None means either no workspace is resolved, or the workspace dir IS the project dir,
+        None means either no workspace is resolved, or the workspace dir is the project dir,
         so both layers name the same file. `load_configs` loads that file once, as `project`,
         and this is the single place that decides so, keeping the load and `config_layers`'
         `present` report from disagreeing about whether the workspace layer applies.
@@ -814,10 +814,9 @@ class ConfigManager(EngineScoped):
     def _load_config_from_file(self, path: Path, label: str) -> LoadedConfigFile:
         """Read and parse a JSON config file.
 
-        A parse failure is still logged at ERROR here, unchanged; the returned
-        `parse_error` additionally lets a caller (currently only `_load_file_layer`, for the
-        three live layers) attribute the failure to a specific layer for `config_layers()`,
-        instead of it only ever reaching a log line as before.
+        A parse failure is logged at ERROR and also returned as `parse_error`, which lets a
+        caller (currently only `_load_file_layer`, for the three live layers) attribute the
+        failure to a specific layer for `config_layers()`.
         """
         if not path.exists():
             logger.debug("No %s config file loaded", label)
@@ -1524,7 +1523,7 @@ class ConfigManager(EngineScoped):
     def _first_diverged_leaf(self, key: str, value: Any) -> str | None:
         """Return the first written leaf whose merged value differs from what was written.
 
-        Catches the write no layer shadows but that still did not land, which today means
+        Catches the write no layer shadows but that still did not land, meaning
         `Settings` validation rejected the merged result and `load_configs` fell back to
         defaults. Reads each leaf back on its own rather than comparing whole dicts, because a
         category's merged value legitimately holds keys the caller never wrote.

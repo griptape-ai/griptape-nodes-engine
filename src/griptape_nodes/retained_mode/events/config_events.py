@@ -56,7 +56,7 @@ class ConfigLayer(BaseModel):
 
     Used by `GetConfigLayersRequest` to answer "which layer set this key" and "did this
     layer's file even parse" without requiring the caller to already know the answer --
-    unlike `ConfigManager.merged_config`, which only ever shows the WINNING value.
+    unlike `ConfigManager.merged_config`, which only ever shows the winning value.
     """
 
     layer: ConfigLayerName
@@ -74,7 +74,7 @@ class ConfigLayer(BaseModel):
     parse_error: str | None = Field(
         default=None,
         description=(
-            "Set only when this layer's file EXISTS but failed to parse as JSON. A missing "
+            "Set only when this layer's file exists but failed to parse as JSON. A missing "
             "file is not an error and leaves this None with present=False."
         ),
     )
@@ -153,7 +153,7 @@ class SetConfigValueRequest(RequestPayload):
 class SetConfigValueResultSuccess(ResultPayloadSuccess):
     """Configuration value set successfully.
 
-    A success here means the write reached disk; it does NOT mean the value took
+    A success here means the write reached disk; it does not mean the value took
     effect. Check `applied` and `shadowed_by` before assuming so -- a project, workspace or
     runtime layer (or a GTN_CONFIG_ environment variable) can outrank the write, in which
     case it is stored but has no visible effect until that layer changes. A value the
@@ -349,9 +349,9 @@ class GetConfigLayersRequest(RequestPayload):
     Use when: diagnosing why a setting doesn't take effect, building a settings UI that
     shows provenance (which file, or which GTN_CONFIG_ variable, currently owns a value),
     or writing an environment/support report. Unlike `GetConfigCategoryRequest`, which
-    only ever returns the MERGED (winning) values, this returns each layer's own contents
-    separately -- including a layer whose file exists but failed to parse, which today
-    only ever reaches a log line.
+    only ever returns the merged (winning) values, this returns each layer's own contents
+    separately -- including a layer whose file exists but failed to parse, which otherwise
+    reaches only a log line.
 
     Results: GetConfigLayersResultSuccess (with layers, lowest to highest priority)
     """

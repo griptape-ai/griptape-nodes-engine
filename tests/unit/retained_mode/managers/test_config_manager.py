@@ -1941,7 +1941,7 @@ class TestConfigProvenance:
         assert "workspace_directory" in sources
 
     def test_category_sources_list_value_is_single_leaf_not_descended(self, tmp_path: Path) -> None:
-        """A list is one leaf entry: the source of the WHOLE list, never split per item."""
+        """A list is one leaf entry: the source of the entire list, never split per item."""
         self._write_layer_config(
             tmp_path, {"app_events": {"on_app_initialization_complete": {"libraries_to_register": ["a", "b"]}}}
         )
@@ -1999,8 +1999,8 @@ class TestConfigProvenance:
         """A layer's parse error must not outlive the project it came from.
 
         Switching to a project whose config parses (or to none at all) has to clear the
-        previous project's error, or `gtn self info` keeps blaming a file that is no longer
-        part of the merge.
+        previous project's error, or `gtn self info` blames a file that is not part of the
+        merge.
         """
         broken_dir, good_dir = self._managed_dirs(tmp_path)
         self._write_layer_config(broken_dir, "not valid json")
@@ -2078,7 +2078,7 @@ class TestConfigProvenance:
     ) -> None:
         """A shadowed write must not report unqualified success.
 
-        The write still reaches disk (see the assertion at the end) -- only the REPORTING
+        The write still reaches disk (see the assertion at the end) -- only the reporting
         becomes honest; this change does not refuse the write or change where it lands.
         """
         project_config = self._write_layer_config(tmp_path, {"libraries_directory": "/from/project"})
@@ -2137,9 +2137,9 @@ class TestConfigProvenance:
     def test_set_config_value_request_write_back_of_shadowed_value_stays_unapplied(self, tmp_path: Path) -> None:
         """Writing back exactly the value the merged config is showing does not make it 'yours'.
 
-        Shadowing is about which LAYER wins, not whether the values agree. This is the
-        settings-panel write-back from the bug thread, where re-saving the displayed value
-        looked like a no-op but the key remained just as unowned as before.
+        Shadowing is about which layer wins, not whether the values agree. This is the
+        settings-panel write-back from the bug thread: re-saving the displayed value looks
+        like a no-op, and the key stays unowned.
         """
         self._write_layer_config(tmp_path, {"libraries_directory": "/from/project"})
 
@@ -2338,8 +2338,8 @@ class TestConfigProvenance:
     def test_set_config_category_request_partial_shadow_names_the_shadowed_leaf(self, tmp_path: Path) -> None:
         """A write where only some leaves are shadowed reports the one that is.
 
-        `applied` False covers the whole write, so the message has to say WHICH key did not
-        change; the rest of the category did.
+        `applied` False covers the whole write, so the message has to name the key that did
+        not change; the rest of the category did.
         """
         self._write_layer_config(tmp_path, {"nuke": {"executable": "/from/project"}})
 
