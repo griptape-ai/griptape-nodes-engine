@@ -84,6 +84,8 @@ from griptape_nodes.retained_mode.events.flow_events import (
     PackageNodesAsSerializedFlowResultSuccess,
 )
 from griptape_nodes.retained_mode.events.node_events import (
+    CreateNodeResultFailure,
+    CreateNodeResultSuccess,
     DeserializeNodeFromCommandsResultFailure,
     DeserializeNodeFromCommandsResultSuccess,
     SetLockNodeStateResultFailure,
@@ -141,7 +143,34 @@ class IterationControlAction(StrEnum):
     BREAK = "break"  # Break out of loop immediately
 
 
+@dataclass(frozen=True)
+class IterationFailure:
+    """One loop iteration that did not finish, with the reason it gave.
+
+    ``iteration_index`` is zero-based to match the executor's internal indexing;
+    everything shown to an artist adds one, because a loop's first pass is
+    iteration 1 to the person who built it.
+    """
+
+    iteration_index: int
+    detail: str
+
+
+# How many distinct failure reasons a loop error message names before deferring to the log.
+MAX_REPORTED_ITERATION_FAILURES = 5
+
+# Results the engine produces while rebuilding a loop body into a transient flow. They describe
+# node copies the artist never placed, in a flow that is deleted before the run ends, so an editor
+# that hears about them asks the engine for a flow that no longer exists and reports an error.
+#
+# CreateNodeResultSuccess/Failure are here because node_manager.on_deserialize_node_from_commands
+# dispatches a nested CreateNodeRequest whose result names the transient flow as the node's parent
+# -- the specific leak behind the "no Flow with that name exists" toast on every loop run.
+# _silence_packaged_node_creation_broadcasts covers the same leak at the source; this set is the
+# backstop for any future creation path that escapes it.
 LOOP_EVENTS_TO_SUPPRESS = {
+    CreateNodeResultSuccess,
+    CreateNodeResultFailure,
     CreateFlowResultSuccess,
     CreateFlowResultFailure,
     ImportWorkflowAsReferencedSubFlowResultSuccess,
@@ -158,6 +187,12 @@ LOOP_EVENTS_TO_SUPPRESS = {
     DeserializeFlowFromCommandsResultFailure,
 }
 
+# NOTE: unlike LOOP_EVENTS_TO_SUPPRESS, this set is inert. Execution events are emitted through
+# put_event/aput_event, which never consult should_suppress_event -- only request results are
+# checked (engine.py). Left in place as the record of intent: the aim is to stop parallel
+# iterations from flooding the websocket with per-node execution traffic. Wiring put_event up to
+# suppression would also silence the node highlighting that EventTranslationContext exists to
+# provide, so it needs its own design rather than a one-line change.
 EXECUTION_EVENTS_TO_SUPPRESS = {
     CurrentControlNodeEvent,
     CurrentDataNodeEvent,
@@ -343,6 +378,78 @@ class NodeExecutor(EngineScoped):
         return (
             f"Node '{node_name}' execution failed: {type_prefix}{getattr(result, 'result_details', result)}{tb_suffix}"
         )
+
+    @staticmethod
+    def _format_loop_failure_message(
+        loop_name: str, total_iterations: int, iteration_failures: list[IterationFailure]
+    ) -> str:
+        """Compose the RuntimeError message for a loop that lost iterations.
+
+        This lands on the artist's node via the execution machine, so it leads with what was
+        attempted and how much was lost, then names the iterations and their reasons.
+        """
+        summary = (
+            f"Attempted to run all {total_iterations} iterations of loop '{loop_name}'. "
+            f"Failed because {len(iteration_failures)} of them did not finish."
+        )
+        detail_lines = NodeExecutor._format_iteration_failure_lines(iteration_failures)
+        if not detail_lines:
+            return summary
+        return "\n".join([summary, *detail_lines])
+
+    @staticmethod
+    def _format_iteration_failure_lines(
+        iteration_failures: list[IterationFailure], *, max_lines: int = MAX_REPORTED_ITERATION_FAILURES
+    ) -> list[str]:
+        """Render one indented line per distinct failure reason.
+
+        Iterations that failed for the same reason share a line: the common case is every
+        iteration failing identically, and repeating one sentence dozens of times buries it.
+        At most ``max_lines`` reasons are rendered so a long loop cannot produce an unreadable
+        wall of text; the engine log has already recorded every iteration individually, so the
+        tail line points there.
+        """
+        if not iteration_failures:
+            return []
+
+        iterations_by_detail: dict[str, list[int]] = {}
+        for iteration_failure in iteration_failures:
+            iterations_by_detail.setdefault(iteration_failure.detail, []).append(iteration_failure.iteration_index + 1)
+
+        lines = []
+        for detail, iteration_numbers in list(iterations_by_detail.items())[:max_lines]:
+            if len(iteration_numbers) == 1:
+                label = f"Iteration {iteration_numbers[0]}"
+            else:
+                label = f"Iterations {', '.join(str(number) for number in iteration_numbers)}"
+            lines.append(f"  {label}: {detail}")
+
+        unreported_count = len(iterations_by_detail) - len(lines)
+        if unreported_count > 0:
+            lines.append(f"  ... and {unreported_count} more reason(s). See the engine log for every iteration.")
+        return lines
+
+    @staticmethod
+    def _silence_packaged_node_creation_broadcasts(
+        package_result: PackageNodesAsSerializedFlowResultSuccess,
+    ) -> None:
+        """Keep editors from ever hearing about the nodes inside a packaged loop body.
+
+        A loop body is rebuilt into a transient child flow on every run and torn down
+        afterwards. Each rebuild dispatches a nested CreateNodeRequest whose success result
+        names that transient flow, and an editor that receives it turns around and asks the
+        engine for the flow's details -- by which time the flow is gone, so the artist gets an
+        error toast naming a flow they never made. Marking the creation commands non-broadcast
+        keeps the rebuild entirely inside the engine: in-process callers still get the full
+        result, only the queued broadcast is skipped.
+
+        Set here rather than in the packaging handler on purpose. That handler also serves
+        workflow publishing, and generated workflow files are emitted by reflecting over each
+        create command's non-default fields (workflow_manager._generate_node_creation_code), so
+        flipping the flag there would bake a transport detail into saved artifacts.
+        """
+        for serialized_node in package_result.serialized_flow_commands.serialized_node_commands:
+            serialized_node.create_node_command.broadcast_result = False
 
     async def _execute_and_apply_workflow(
         self,
@@ -838,6 +945,8 @@ class NodeExecutor(EngineScoped):
             msg = f"Failed to package loop nodes for '{end_node.name}'. Error: {package_result.result_details}"
             raise TypeError(msg)
 
+        self._silence_packaged_node_creation_broadcasts(package_result)
+
         logger.info(
             "Successfully packaged %d nodes for loop execution from '%s' to '%s'",
             len(all_nodes),
@@ -1048,7 +1157,7 @@ class NodeExecutor(EngineScoped):
         total_iterations: int,
         parameter_values_per_iteration: dict[int, dict[str, Any]],
         end_loop_node: BaseIterativeEndNode | BaseIterativeNodeGroup,
-    ) -> tuple[dict[int, Any], list[int], dict[str, Any], int, bool, list[int]]:
+    ) -> tuple[dict[int, Any], list[int], dict[str, Any], int, bool, list[IterationFailure]]:
         """Execute loop iterations sequentially by running one flow instance N times.
 
         Args:
@@ -1064,7 +1173,7 @@ class NodeExecutor(EngineScoped):
             - last_iteration_values: Dict mapping parameter names -> values from last iteration
             - skipped_count: Number of iterations that were skipped via skip control signal
             - break_occurred: True if the loop exited early due to a break signal
-            - failed_iterations: List of iteration indices that raised a subflow error
+            - iteration_failures: One IterationFailure per iteration that raised a subflow error
         """
         # Deserialize the loop body once and reuse it for every iteration.
         # Everything from deserialization onward is inside the try so the finally deletes the
@@ -1103,7 +1212,7 @@ class NodeExecutor(EngineScoped):
 
             iteration_results: dict[int, Any] = {}
             successful_iterations: list[int] = []
-            failed_iterations: list[int] = []
+            iteration_failures: list[IterationFailure] = []
             skipped_count = 0
             break_occurred = False
 
@@ -1168,7 +1277,12 @@ class NodeExecutor(EngineScoped):
                     )
                     # Don't immediately store None - try to extract results first in case there are partial results
                     # (e.g., nested loop that had some failures but still produced output)
-                    failed_iterations.append(iteration_index)
+                    iteration_failures.append(
+                        IterationFailure(
+                            iteration_index=iteration_index,
+                            detail=str(start_subflow_result.result_details),
+                        )
+                    )
                 else:
                     successful_iterations.append(iteration_index)
 
@@ -1236,7 +1350,7 @@ class NodeExecutor(EngineScoped):
                 last_iteration_values,
                 skipped_count,
                 break_occurred,
-                failed_iterations,
+                iteration_failures,
             )
 
         finally:
@@ -1292,7 +1406,7 @@ class NodeExecutor(EngineScoped):
 
         # Execute iterations sequentially based on execution environment
         break_occurred = False
-        failed_iterations: list[int] = []
+        iteration_failures: list[IterationFailure] = []
         if execution_type == LOCAL_EXECUTION:
             (
                 iteration_results,
@@ -1300,7 +1414,7 @@ class NodeExecutor(EngineScoped):
                 last_iteration_values,
                 _skipped_count,
                 break_occurred,
-                failed_iterations,
+                iteration_failures,
             ) = await self._execute_loop_iterations_sequentially(
                 package_result=package_result,
                 total_iterations=total_iterations,
@@ -1339,8 +1453,14 @@ class NodeExecutor(EngineScoped):
                 len(successful_iterations),
                 total_iterations,
             )
-        elif failed_iterations:
-            msg = f"Loop execution failed: {len(failed_iterations)} of {total_iterations} iterations failed"
+        # Only the local sequential path reports per-iteration failures; private and cloud loops
+        # leave this empty and fall through to the short-count branch below.
+        elif iteration_failures:
+            msg = self._format_loop_failure_message(
+                loop_name=end_node.name,
+                total_iterations=total_iterations,
+                iteration_failures=iteration_failures,
+            )
             raise RuntimeError(msg)
         elif len(successful_iterations) < total_iterations:
             logger.info(
@@ -2113,6 +2233,8 @@ class NodeExecutor(EngineScoped):
             msg = f"Failed to package {label} '{node.name}'. Error: {package_result.result_details}"
             raise TypeError(msg)
 
+        self._silence_packaged_node_creation_broadcasts(package_result)
+
         logger.info(
             "Successfully packaged %d nodes for %s '%s'",
             len(node_names),
@@ -2278,7 +2400,7 @@ class NodeExecutor(EngineScoped):
 
         # Execute iterations sequentially based on execution environment
         break_occurred = False
-        failed_iterations: list[int] = []
+        iteration_failures: list[IterationFailure] = []
         match execution_type:
             case node_types.LOCAL_EXECUTION:
                 (
@@ -2287,7 +2409,7 @@ class NodeExecutor(EngineScoped):
                     last_iteration_values,
                     _skipped_count,
                     break_occurred,
-                    failed_iterations,
+                    iteration_failures,
                 ) = await self._execute_loop_iterations_sequentially(
                     package_result=package_result,
                     total_iterations=total_iterations,
@@ -2326,8 +2448,14 @@ class NodeExecutor(EngineScoped):
                 len(successful_iterations),
                 total_iterations,
             )
-        elif failed_iterations:
-            msg = f"Iterative group execution failed: {len(failed_iterations)} of {total_iterations} iterations failed"
+        # Only the local sequential path reports per-iteration failures; private and cloud loops
+        # leave this empty and fall through to the short-count branch below.
+        elif iteration_failures:
+            msg = self._format_loop_failure_message(
+                loop_name=node.name,
+                total_iterations=total_iterations,
+                iteration_failures=iteration_failures,
+            )
             raise RuntimeError(msg)
         elif len(successful_iterations) < total_iterations:
             logger.info(
@@ -3103,13 +3231,13 @@ class NodeExecutor(EngineScoped):
             # Step 5: Collect successful and failed iterations
             successful_iterations = []
             failed_iteration_indices = []
-            failed_iteration_errors = {}  # Map iteration_index -> error
+            iteration_failures: list[IterationFailure] = []
 
             for idx, result in enumerate(iteration_task_results):
                 if isinstance(result, Exception):
                     # Exception doesn't include iteration_index, use enumerate index
                     failed_iteration_indices.append(idx)
-                    failed_iteration_errors[idx] = str(result)
+                    iteration_failures.append(IterationFailure(iteration_index=idx, detail=str(result)))
                     continue
                 if isinstance(result, tuple):
                     iteration_index, success = result
@@ -3117,14 +3245,20 @@ class NodeExecutor(EngineScoped):
                         successful_iterations.append(iteration_index)
                     else:
                         failed_iteration_indices.append(iteration_index)
-                        failed_iteration_errors[iteration_index] = "Iteration failed"
+                        iteration_failures.append(
+                            IterationFailure(
+                                iteration_index=iteration_index,
+                                detail="The iteration reported failure without a reason.",
+                            )
+                        )
 
             if failed_iteration_indices:
                 logger.warning(
-                    "Loop execution: %d of %d parallel iterations failed. Results will contain None for failed iterations. Errors: %s",
+                    "Loop execution: %d of %d parallel iterations failed. Results will contain None for failed "
+                    "iterations.\n%s",
                     len(failed_iteration_indices),
                     total_iterations,
-                    failed_iteration_errors,
+                    "\n".join(self._format_iteration_failure_lines(iteration_failures)),
                 )
 
             # Step 6: Extract parameter values from iterations BEFORE cleanup

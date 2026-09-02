@@ -10,17 +10,28 @@ These tests cover small, near-pure helpers that decide loop control flow:
   pair has fired its control output.
 * ``_find_source_for_control_param`` - return the first source for a given
   control parameter name, or None.
+* ``_format_loop_failure_message`` / ``_format_iteration_failure_lines`` - compose
+  the artist-facing error naming which iterations failed and why.
+* ``_silence_packaged_node_creation_broadcasts`` - keep a packaged loop body's node
+  creations from reaching editors.
 """
 
+import logging
 from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from griptape_nodes.common.node_executor import IterationControlAction, NodeExecutor
+from griptape_nodes.common.node_executor import IterationControlAction, IterationFailure, NodeExecutor
 from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeEndNode
 from griptape_nodes.exe_types.node_groups.base_iterative_node_group import BaseIterativeNodeGroup
-from griptape_nodes.retained_mode.events.node_events import ListConnectionsForNodeResultSuccess
+from griptape_nodes.retained_mode.events.base_events import ResultDetail, ResultDetails
+from griptape_nodes.retained_mode.events.node_events import (
+    CreateNodeRequest,
+    ListConnectionsForNodeResultSuccess,
+    NodeDependencies,
+    SerializedNodeCommands,
+)
 
 
 def _make_executor() -> NodeExecutor:
@@ -398,3 +409,160 @@ class TestGetIterationControlActionEndToEnd:
         # CondNode_orig is NOT in node_name_mappings
         result = self._run_real(end_node, connections, {}, {})
         assert result == IterationControlAction.ADD
+
+
+def _make_iteration_failures(details: list[str]) -> list[IterationFailure]:
+    """One IterationFailure per detail, indexed 0..n-1."""
+    return [IterationFailure(iteration_index=index, detail=detail) for index, detail in enumerate(details)]
+
+
+class TestFormatIterationFailureLines:
+    """Renders one indented line per distinct reason, collapsing iterations that agree."""
+
+    def test_returns_no_lines_for_no_failures(self) -> None:
+        assert NodeExecutor._format_iteration_failure_lines([]) == []
+
+    def test_renders_one_based_iteration_number(self) -> None:
+        """Iteration 0 internally is iteration 1 to the artist who built the loop."""
+        lines = NodeExecutor._format_iteration_failure_lines([IterationFailure(iteration_index=0, detail="boom")])
+        assert lines == ["  Iteration 1: boom"]
+
+    def test_collapses_iterations_sharing_a_detail(self) -> None:
+        """The common case is every iteration failing identically; say the reason once."""
+        failures = [IterationFailure(iteration_index=index, detail="same reason") for index in range(3)]
+        lines = NodeExecutor._format_iteration_failure_lines(failures)
+        assert lines == ["  Iterations 1, 2, 3: same reason"]
+
+    def test_keeps_distinct_details_on_separate_lines(self) -> None:
+        lines = NodeExecutor._format_iteration_failure_lines(_make_iteration_failures(["first", "second"]))
+        assert lines == ["  Iteration 1: first", "  Iteration 2: second"]
+
+    def test_caps_lines_and_reports_the_remainder(self) -> None:
+        reason_count = 8
+        max_lines = 3
+        failures = _make_iteration_failures([f"reason {index}" for index in range(reason_count)])
+        lines = NodeExecutor._format_iteration_failure_lines(failures, max_lines=max_lines)
+        assert len(lines) == max_lines + 1  # the capped reasons, plus the tail line
+        assert f"... and {reason_count - max_lines} more reason(s)" in lines[-1]
+        assert "engine log" in lines[-1]
+
+    def test_does_not_add_a_tail_line_when_everything_fits(self) -> None:
+        failures = _make_iteration_failures(["a", "b", "c"])
+        lines = NodeExecutor._format_iteration_failure_lines(failures, max_lines=len(failures) + 2)
+        assert len(lines) == len(failures)
+        assert not any("more reason" in line for line in lines)
+
+    def test_preserves_multiline_detail_text(self) -> None:
+        """ResultDetails.__str__ joins several messages with newlines; keep them verbatim."""
+        detail = "Attempted to run node 'Blur'.\nFailed because the input image was empty."
+        lines = NodeExecutor._format_iteration_failure_lines([IterationFailure(iteration_index=4, detail=detail)])
+        assert lines == [f"  Iteration 5: {detail}"]
+
+
+class TestFormatLoopFailureMessage:
+    """Leads with what was attempted and how much was lost, then names the reasons."""
+
+    def test_includes_loop_name_and_counts(self) -> None:
+        msg = NodeExecutor._format_loop_failure_message(
+            loop_name="Trim Frames End",
+            total_iterations=4,
+            iteration_failures=_make_iteration_failures(["first", "second"]),
+        )
+        assert "'Trim Frames End'" in msg
+        assert "all 4 iterations" in msg
+        assert "2 of them did not finish" in msg
+
+    def test_follows_the_attempted_failed_because_form(self) -> None:
+        msg = NodeExecutor._format_loop_failure_message(
+            loop_name="Trim Frames End",
+            total_iterations=1,
+            iteration_failures=_make_iteration_failures(["boom"]),
+        )
+        assert msg.startswith("Attempted to run all")
+        assert ". Failed because " in msg
+
+    def test_appends_one_detail_line_per_reason(self) -> None:
+        failures = _make_iteration_failures(["first", "second"])
+        msg = NodeExecutor._format_loop_failure_message(
+            loop_name="Trim Frames End",
+            total_iterations=len(failures),
+            iteration_failures=failures,
+        )
+        # One newline joining the summary to the detail block, then one per extra reason.
+        assert msg.count("\n") == len(failures)
+
+    def test_returns_summary_only_when_failures_empty(self) -> None:
+        """Guards the branch even though production only calls this with failures."""
+        msg = NodeExecutor._format_loop_failure_message(
+            loop_name="Trim Frames End", total_iterations=3, iteration_failures=[]
+        )
+        assert "\n" not in msg
+
+    def test_message_survives_str_of_result_details(self) -> None:
+        """The collector stores str(result_details); both messages must reach the artist."""
+        details = ResultDetails(
+            ResultDetail(message="Attempted to run node 'Blur'.", level=logging.ERROR),
+            ResultDetail(message="Failed because the input image was empty.", level=logging.ERROR),
+        )
+        msg = NodeExecutor._format_loop_failure_message(
+            loop_name="Trim Frames End",
+            total_iterations=1,
+            iteration_failures=[IterationFailure(iteration_index=0, detail=str(details))],
+        )
+        assert "Attempted to run node 'Blur'." in msg
+        assert "Failed because the input image was empty." in msg
+
+
+def _make_package_result_with_nodes(node_count: int) -> MagicMock:
+    """Package result whose serialized_node_commands are real, so flag flips are observable."""
+    serialized_nodes = [
+        SerializedNodeCommands(
+            create_node_command=CreateNodeRequest(node_type="Note", node_name=f"Body Node {index}"),
+            element_modification_commands=[],
+            node_dependencies=NodeDependencies(),
+        )
+        for index in range(node_count)
+    ]
+    package_result = MagicMock()
+    package_result.serialized_flow_commands.serialized_node_commands = serialized_nodes
+    return package_result
+
+
+class TestSilencePackagedNodeCreationBroadcasts:
+    """A packaged loop body is engine-internal; its node creations must not reach editors."""
+
+    def test_clears_broadcast_on_every_create_command(self) -> None:
+        package_result = _make_package_result_with_nodes(3)
+        serialized_nodes = package_result.serialized_flow_commands.serialized_node_commands
+        assert all(node.create_node_command.broadcast_result for node in serialized_nodes)
+
+        NodeExecutor._silence_packaged_node_creation_broadcasts(package_result)
+
+        assert all(node.create_node_command.broadcast_result is False for node in serialized_nodes)
+
+    def test_is_idempotent(self) -> None:
+        """The parallel path deserializes the same commands once per iteration."""
+        node_count = 3
+        package_result = _make_package_result_with_nodes(node_count)
+        NodeExecutor._silence_packaged_node_creation_broadcasts(package_result)
+        NodeExecutor._silence_packaged_node_creation_broadcasts(package_result)
+
+        serialized_nodes = package_result.serialized_flow_commands.serialized_node_commands
+        assert len(serialized_nodes) == node_count
+        assert all(node.create_node_command.broadcast_result is False for node in serialized_nodes)
+
+    def test_does_not_touch_other_create_command_fields(self) -> None:
+        """Guards against a future rewrite reaching for replace() and dropping fields."""
+        package_result = _make_package_result_with_nodes(2)
+        serialized_nodes = package_result.serialized_flow_commands.serialized_node_commands
+        before = [(node.create_node_command.node_type, node.create_node_command.node_name) for node in serialized_nodes]
+
+        NodeExecutor._silence_packaged_node_creation_broadcasts(package_result)
+
+        after = [(node.create_node_command.node_type, node.create_node_command.node_name) for node in serialized_nodes]
+        assert after == before
+
+    def test_handles_a_flow_with_no_nodes(self) -> None:
+        package_result = _make_package_result_with_nodes(0)
+        NodeExecutor._silence_packaged_node_creation_broadcasts(package_result)
+        assert package_result.serialized_flow_commands.serialized_node_commands == []
