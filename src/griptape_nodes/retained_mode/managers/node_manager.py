@@ -3450,6 +3450,8 @@ class NodeManager(EngineScoped):
         group_node: BaseNodeGroup,
         unique_uuid_to_values: dict,
         serialized_parameter_value_tracker: SerializedParameterValueTracker,
+        *,
+        serialize_all_parameter_values: bool = False,
     ) -> SerializedGroupResult:
         """Serialize a group node and its children for copy/paste operations.
 
@@ -3462,6 +3464,8 @@ class NodeManager(EngineScoped):
             group_node: The group node to serialize
             unique_uuid_to_values: Shared dictionary for tracking pickled parameter values
             serialized_parameter_value_tracker: Tracker for parameter value hashes
+            serialize_all_parameter_values: If True, capture every parameter value on the group and
+                on each child, not just the ones the ordinary save condition would record
 
         Returns:
             SerializedGroupResult containing the group command, child commands, and child UUIDs
@@ -3478,6 +3482,7 @@ class NodeManager(EngineScoped):
                 unique_parameter_uuid_to_values=unique_uuid_to_values,
                 serialized_parameter_value_tracker=serialized_parameter_value_tracker,
                 use_pickling=True,
+                serialize_all_parameter_values=serialize_all_parameter_values,
             )
         )
 
@@ -3504,6 +3509,7 @@ class NodeManager(EngineScoped):
                     unique_parameter_uuid_to_values=unique_uuid_to_values,
                     serialized_parameter_value_tracker=serialized_parameter_value_tracker,
                     use_pickling=True,
+                    serialize_all_parameter_values=serialize_all_parameter_values,
                 )
             )
 
@@ -4390,7 +4396,7 @@ class NodeManager(EngineScoped):
                     try:
                         unique_parameter_uuid_to_values[unique_uuid] = copy.deepcopy(value)
                     except Exception:
-                        details = f"Attempted to serialize parameter '{parameter_name}` on node '{node_name}'. The parameter value could not be copied. It will be serialized by value. If problems arise from this, ensure the type '{type(value)}' works with copy.deepcopy()."
+                        details = f"Attempted to serialize parameter '{parameter_name}' on node '{node_name}'. The parameter value could not be copied. It will be serialized by value. If problems arise from this, ensure the type '{type(value)}' works with copy.deepcopy()."
                         logger.warning(details)
                         unique_parameter_uuid_to_values[unique_uuid] = value
                 serialized_parameter_value_tracker.add_as_serializable(value_id, unique_uuid)

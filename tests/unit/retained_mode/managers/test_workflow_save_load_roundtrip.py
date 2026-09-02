@@ -666,10 +666,11 @@ class TestDeterministicSaveOutput:
         first_source = _read_saved_source(first_path)
         second_source = _read_saved_source(second_path)
 
-        # The two files were saved under different names, so their embedded `name = "..."`
-        # metadata line legitimately differs; everything else must not.
-        first_lines = [line for line in first_source.splitlines() if "name = " not in line]
-        second_lines = [line for line in second_source.splitlines() if "name = " not in line]
+        # Only the embedded workflow-name metadata line legitimately differs (the two files were
+        # saved under different names). Everything else, including the node and flow creation
+        # lines that assign to `<thing>N_name`, must match.
+        first_lines = [line for line in first_source.splitlines() if not line.strip().startswith("# name = ")]
+        second_lines = [line for line in second_source.splitlines() if not line.strip().startswith("# name = ")]
         assert first_lines == second_lines
 
 
@@ -718,6 +719,9 @@ class TestIdempotentSaveLoadSave:
             second_path = _save_flow_to_disk(engine, flow_name, tmp_path, "roundtrip_resaved")
             second_source = _read_saved_source(second_path)
 
-        first_lines = [line for line in first_source.splitlines() if "name = " not in line]
-        second_lines = [line for line in second_source.splitlines() if "name = " not in line]
+        # Only the embedded workflow-name metadata line legitimately differs (the resave was
+        # written under a different name). Everything else, including the node and flow creation
+        # lines that assign to `<thing>N_name`, must match.
+        first_lines = [line for line in first_source.splitlines() if not line.strip().startswith("# name = ")]
+        second_lines = [line for line in second_source.splitlines() if not line.strip().startswith("# name = ")]
         assert first_lines == second_lines

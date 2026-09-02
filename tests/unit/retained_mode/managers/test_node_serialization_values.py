@@ -357,7 +357,7 @@ class TestHandleValueHashing:
     def test_deepcopy_failure_falls_back_to_storing_the_raw_value_with_a_warning(
         self, engine: Engine, caplog: pytest.LogCaptureFixture
     ) -> None:
-        parameter = _make_param("p")
+        parameter = _make_param("hostile_param")
         tracker = SerializedParameterValueTracker()
         pool: dict[Any, Any] = {}
         hostile_value = _DeepcopyHostile("payload")
@@ -370,8 +370,8 @@ class TestHandleValueHashing:
             serialized_parameter_value_tracker=tracker,
             unique_parameter_uuid_to_values=pool,
             parameter=parameter,
-            parameter_name="p",
-            node_name="n",
+            parameter_name="hostile_param",
+            node_name="hostile_node",
             is_output=False,
             workflow_manager=engine.workflow_manager,
             use_pickling=False,
@@ -381,7 +381,8 @@ class TestHandleValueHashing:
         assert pool[command.unique_value_uuid] is hostile_value
         warning_messages = [record.message for record in caplog.records if record.levelno == logging.WARNING]
         assert any(
-            "could not be copied" in message and "p" in message and "n" in message for message in warning_messages
+            "could not be copied" in message and "'hostile_param'" in message and "'hostile_node'" in message
+            for message in warning_messages
         )
 
     def test_returns_an_indirect_set_parameter_value_command_referencing_the_pool(self, engine: Engine) -> None:

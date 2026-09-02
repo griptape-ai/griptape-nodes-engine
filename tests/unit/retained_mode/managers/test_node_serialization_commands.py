@@ -497,6 +497,45 @@ class TestSerializeGroupWithChildren:
         )
         assert child_command.node_uuid in group_serialization.child_uuids
 
+    def test_serialize_all_parameter_values_reaches_the_group_and_its_children(
+        self, engine: Engine, library_name: str
+    ) -> None:
+        """The all-values flag must not stop at the group; children are serialized by sub-requests.
+
+        _ComputedValueNode's 'computed' parameter is never explicitly set and its declared default
+        is None, so the ordinary save condition records nothing for it. A caller asking for all
+        parameter values must get it whether the node is serialized directly or as a group child.
+        """
+        group_result = engine.handle_request(
+            CreateNodeRequest(node_type="_GroupNode", specific_library_name=library_name, node_name="G1")
+        )
+        assert isinstance(group_result, CreateNodeResultSuccess), group_result
+        child_result = engine.handle_request(
+            CreateNodeRequest(
+                node_type="_ComputedValueNode",
+                specific_library_name=library_name,
+                node_name="C1",
+                parent_group_name="G1",
+            )
+        )
+        assert isinstance(child_result, CreateNodeResultSuccess), child_result
+        group_node = engine.node_manager.get_node_by_name("G1")
+        assert isinstance(group_node, BaseNodeGroup)
+
+        from griptape_nodes.retained_mode.events.node_events import SerializedParameterValueTracker
+
+        without_flag = engine.node_manager._serialize_group_with_children(
+            group_node, {}, SerializedParameterValueTracker(), serialize_all_parameter_values=False
+        )
+        with_flag = engine.node_manager._serialize_group_with_children(
+            group_node, {}, SerializedParameterValueTracker(), serialize_all_parameter_values=True
+        )
+
+        child_uuid_without_flag = without_flag.child_commands[0].node_uuid
+        child_uuid_with_flag = with_flag.child_commands[0].node_uuid
+        assert without_flag.child_parameter_commands[child_uuid_without_flag] == []
+        assert len(with_flag.child_parameter_commands[child_uuid_with_flag]) == 1
+
     def test_subflow_name_is_dropped_for_copy_paste(self, engine: Engine, library_name: str) -> None:
         group_result = engine.handle_request(
             CreateNodeRequest(node_type="_GroupNode", specific_library_name=library_name, node_name="G1")
