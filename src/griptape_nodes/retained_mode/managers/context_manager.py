@@ -9,7 +9,9 @@ from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.files.path_utils import canonicalize_for_identity, derive_registry_key
 from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
 from griptape_nodes.retained_mode.engine import EngineScoped
+from griptape_nodes.retained_mode.events.base_events import AppEvent
 from griptape_nodes.retained_mode.events.context_events import (
+    CurrentWorkflowChanged,
     EnsureWorkflowAndFlowRequest,
     EnsureWorkflowAndFlowResultFailure,
     EnsureWorkflowAndFlowResultSuccess,
@@ -41,6 +43,7 @@ class ContextManager(EngineScoped):
     """
 
     _workflow_stack: list[ContextManager.WorkflowContextState]
+    _last_notified_workflow_name: str | None
 
     class WorkflowContextError(Exception):
         """Base exception for workflow context errors."""
@@ -266,6 +269,9 @@ class ContextManager(EngineScoped):
         """Initialize the context manager with empty workflow and flow stacks."""
         super().__init__(engine)
         self._workflow_stack = []
+        # What the last CurrentWorkflowChanged told clients. Starts as None, which is exactly
+        # what an empty stack reports, so a fresh engine owes nobody a notification.
+        self._last_notified_workflow_name = None
         event_manager.assign_manager_to_request_type(
             request_type=SetWorkflowContextRequest, callback=self.on_set_workflow_context_request
         )
@@ -278,8 +284,20 @@ class ContextManager(EngineScoped):
 
     def on_set_workflow_context_request(self, request: SetWorkflowContextRequest) -> ResultPayload:
         # As of today, we only allow a single Workflow context at a time. This may change in the future.
+        # Point the caller at the request that actually opens a workflow first: this one is
+        # bookkeeping, so on its own it would leave them with the name of a workflow and none
+        # of its nodes. ClearAllObjectState is named second because it is the destructive route
+        # to the same goal, and callers reached for it purely because it used to be the only
+        # thing this message mentioned.
         if self.has_current_workflow():
-            msg = f"Attempted to set the Workflow '{request.workflow_name}' as the Current Context. Failed because an existing workflow, '{self.get_current_workflow_name()}', is already in the Current Context. In order to clear the existing workflow and remove all objects and references to it, issue a ClearAllObjectState request."
+            msg = (
+                f"Attempted to set the Workflow '{request.workflow_name}' as the Current Context. "
+                f"Failed because an existing workflow, '{self.get_current_workflow_name()}', is already "
+                f"in the Current Context. To open a saved workflow -- loading its nodes, connections, and "
+                f"values, and replacing whatever is open now -- issue a RunWorkflowFromRegistry request "
+                f"instead; it does not require an empty context. To close the existing workflow and "
+                f"discard all of its objects without opening anything, issue a ClearAllObjectState request."
+            )
             return SetWorkflowContextFailure(result_details=msg)
 
         # Normalized here rather than at read time so `workflow_dir` never has to care whether
@@ -589,6 +607,7 @@ class ContextManager(EngineScoped):
             raise self.NoActiveWorkflowError(msg)
 
         self._workflow_stack[-1]._name = new_name
+        self._notify_current_workflow_changed()
 
     def set_current_workflow_file_path(self, new_file_path: str | None) -> None:
         """Update the file path retained on the current Workflow context.
@@ -734,6 +753,7 @@ class ContextManager(EngineScoped):
             resolved_name, file_path=file_path, working_directory=working_directory
         )
         self._workflow_stack.append(workflow_context_state)
+        self._notify_current_workflow_changed()
         return resolved_name
 
     def pop_workflow(self) -> str:
@@ -750,6 +770,7 @@ class ContextManager(EngineScoped):
             raise self.EmptyStackError(msg)
 
         workflow_context = self._workflow_stack.pop()
+        self._notify_current_workflow_changed()
         return workflow_context._name
 
     def push_flow(self, flow: ControlFlow) -> ControlFlow:
@@ -877,3 +898,36 @@ class ContextManager(EngineScoped):
 
         current_node = current_flow._node_stack[-1]
         return current_node.pop_element()
+
+    def _notify_current_workflow_changed(self) -> None:
+        """Broadcast which Workflow is now current, when that answer has changed.
+
+        Called from every method that changes which Workflow sits on top of the stack:
+        `push_workflow`, `pop_workflow`, and `set_current_workflow_name`. Clients cannot see
+        those mutations any other way. Most of them happen deep inside some other request --
+        RunWorkflowFromRegistry pushes, ClearAllObjectState and DeleteWorkflow pop, Save As
+        and Move rename -- and none of those results name the workflow that ended up in
+        context, so a client that did not issue the request learns nothing. With two editors
+        on one engine that is worse than stale: opening a workflow in one leaves the other
+        showing the newly loaded nodes under its own previous workflow's title.
+
+        Reports the registry key only. The key is what identifies the workflow to every other
+        request; a client that also needs the location or the display name reads them with
+        GetWorkflowContextRequest, which is why `set_current_workflow_file_path` deliberately
+        does not notify -- the path is not part of this signal, and Save As and Move set the
+        name and the path one after the other, so notifying from both would put a
+        (new name, old path) pair on the wire in between.
+
+        Deduped so "changed" means what it says: re-entering the workflow that is already
+        current, or renaming it to the name clients were already told, is not something
+        anyone needs to act on.
+        """
+        workflow_name = None
+        if self.has_current_workflow():
+            workflow_name = self.get_current_workflow_name()
+
+        if workflow_name == self._last_notified_workflow_name:
+            return
+
+        self._last_notified_workflow_name = workflow_name
+        self.engine.event_manager.put_event(AppEvent(payload=CurrentWorkflowChanged(workflow_name=workflow_name)))
