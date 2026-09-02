@@ -802,26 +802,29 @@ class LibraryManager(EngineScoped):
         """
         if library_name:
             library_info = self.get_library_info_by_library_name(library_name)
+            # Checked ahead of the worker lookup because execution can be unavailable for
+            # reasons that have nothing to do with a worker -- a declared resource this machine
+            # does not have -- and those apply to an in-process library too, which never reaches
+            # the branch below.
+            if library_info and library_info.execution_unavailable_reason:
+                msg = (
+                    f"Library '{library_name}' cannot run right now: "
+                    f"{library_info.execution_unavailable_reason} Editing its nodes still works, "
+                    "and a saved workflow keeps them."
+                )
+                raise RuntimeError(msg)
             if library_info and library_info.executes_in_worker:
                 wm = self._worker_manager
                 if wm:
                     worker = wm.get_worker_for_key(library_name)
                     if worker:
                         return worker
-                    # Distinguish "not ready yet" from "went away", which read identically
-                    # before: a library whose worker had been evicted reported that it might
-                    # still be starting up, forever.
-                    if library_info.execution_unavailable_reason:
-                        msg = (
-                            f"Library '{library_name}' cannot run right now: "
-                            f"{library_info.execution_unavailable_reason} Editing its nodes still "
-                            "works, and a saved workflow keeps them."
-                        )
-                    else:
-                        msg = (
-                            f"Library '{library_name}' requires a dedicated worker process "
-                            "that is not yet registered. The worker may still be starting up."
-                        )
+                    # A reason set on the library was already reported above, so reaching here
+                    # means there is none: the worker genuinely has not registered yet.
+                    msg = (
+                        f"Library '{library_name}' requires a dedicated worker process "
+                        "that is not yet registered. The worker may still be starting up."
+                    )
                     raise RuntimeError(msg)
                 msg = (
                     f"Library '{library_name}' requires a dedicated worker process. "
@@ -2469,12 +2472,19 @@ class LibraryManager(EngineScoped):
                             library_requirements, library_data.name
                         )
                         if requirements_check_result is not None:
-                            library_info.fitness = LibraryManager.LibraryFitness.UNUSABLE
+                            # A declared resource this machine does not have costs EXECUTION, not
+                            # loading. Nothing about a missing GPU stops the orchestrator importing
+                            # base-clean node modules, drawing their parameters, or saving a
+                            # workflow that uses them -- and refusing to register took all of that
+                            # away, leaving placeholder nodes reading "Library not found" on every
+                            # machine that was only ever going to edit. It is the same rule the
+                            # engine applies to a dependency that will not install: the capability
+                            # gates the run, and the artist finds out when they run.
+                            library_info.fitness = LibraryManager.LibraryFitness.FLAWED
                             library_info.problems.append(requirements_check_result)
-                            library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.FAILURE
-                            self._library_file_path_to_info[library_info.library_path] = library_info
-                            details = f"Library '{library_data.name}' requirements not met: {library_requirements}"
-                            return RegisterLibraryFromFileResultFailure(result_details=details)
+                            library_info.execution_unavailable_reason = self._describe_unmet_requirements(
+                                requirements_check_result
+                            )
 
                     library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.EVALUATED
 
@@ -2983,6 +2993,31 @@ class LibraryManager(EngineScoped):
         logger.debug("Created virtual environment at %s", library_venv_path)
 
         return LibraryVenvInitResult(python_path=venv_python_path(library_venv_path), reused=False)
+
+    @staticmethod
+    def _describe_unmet_requirements(problem: IncompatibleRequirementsProblem) -> str:
+        """Phrase an unmet resource requirement for whoever has to act on it.
+
+        The raw dicts read like internals ("{'compute': (['cuda'], 'has_any')}"), so the
+        capability and what this machine actually reports are named plainly instead.
+        """
+
+        def render(value: Any) -> str:
+            # Capability values arrive as enums and nested tuples; their reprs
+            # ("<ComputeBackend.MPS: 'mps'>") have no business in a message an artist reads.
+            if isinstance(value, (list, tuple)):
+                return ", ".join(render(item) for item in value)
+            return str(getattr(value, "value", value))
+
+        wanted = ", ".join(
+            f"{capability} {render(value[0] if isinstance(value, (list, tuple)) else value)}"
+            for capability, value in problem.requirements.items()
+        )
+        have = (
+            ", ".join(f"{key} {render(value)}" for key, value in problem.system_capabilities.items())
+            or "nothing detectable"
+        )
+        return f"it needs {wanted}, and this machine has {have}."
 
     def _check_library_requirements(
         self, requirements: dict[str, Any], library_name: str
