@@ -231,12 +231,11 @@ class TestConfigManager:
             assert manager.get_config_value("worker.heartbeat_interval_s") == 5.0  # noqa: PLR2004
 
     def test_flat_and_nested_worker_env_vars_together_nested_wins(self, caplog: pytest.LogCaptureFixture) -> None:
-        """A flat GTN_CONFIG_WORKER is dropped as a prefix of GTN_CONFIG_WORKER__X, in either order.
+        """A flat GTN_CONFIG_WORKER cannot clobber GTN_CONFIG_WORKER__X, in either order.
 
-        `worker` is a strict prefix of `worker.heartbeat_timeout_s`, so exporting both asks for
-        `worker` to be a scalar value and a section at once. The prefix filter drops the shallower
-        key before either reaches validation, independent of `os.environ` iteration order, so the
-        deeper key always survives.
+        `worker` is a declared `WorkerSettings` field, so the bare string fails validation and is
+        dropped for that reason rather than for overlapping. The deeper key therefore survives
+        regardless of `os.environ` iteration order, and the prefix filter never has to weigh in.
         """
         for env in (
             {"GTN_CONFIG_WORKER": "x", "GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S": "30"},
@@ -250,9 +249,42 @@ class TestConfigManager:
 
                 assert env_config == {"worker": {"heartbeat_timeout_s": 30.0}}
                 warnings = [
-                    record for record in caplog.records if "is also the start of a longer path" in record.message
+                    record for record in caplog.records if "is not a valid value for the 'worker'" in record.message
                 ]
                 assert len(warnings) == 1
+
+    def test_invalid_deeper_path_does_not_discard_a_valid_shallower_override(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A rejected deeper variable leaves its valid prefix alone.
+
+        Overlap is only a real conflict when both paths are individually valid, so a variable that
+        fails validation must be dropped before overlap is judged. `agent.system_prompt` is a `str`
+        with no sub-keys, and a stray trailing separator produces the same shape, so both of these
+        would otherwise silently take a correct neighbour down with them.
+        """
+        cases = [
+            (
+                {"GTN_CONFIG_AGENT__SYSTEM_PROMPT": "hi", "GTN_CONFIG_AGENT__SYSTEM_PROMPT__OOPS": "x"},
+                {"agent": {"system_prompt": "hi"}},
+            ),
+            (
+                {"GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S": "30", "GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S__": "99"},
+                {"worker": {"heartbeat_timeout_s": 30.0}},
+            ),
+        ]
+        for env, want in cases:
+            caplog.clear()
+            with patch.dict(os.environ, env, clear=True):
+                with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+                    manager = ConfigManager()
+                    env_config = manager._load_config_from_env_vars()
+
+                assert env_config == want
+                prefix_warnings = [
+                    record for record in caplog.records if "is also the start of a longer path" in record.message
+                ]
+                assert prefix_warnings == []
 
     def test_mapping_entry_settable_via_env(self) -> None:
         """An entry in a mapping-valued setting (not a nested model) can be set with `__<KEY>`.

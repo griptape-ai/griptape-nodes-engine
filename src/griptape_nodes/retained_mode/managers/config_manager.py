@@ -81,11 +81,12 @@ ENV_VAR_PATH_SEPARATOR = "__"
 
 
 class EnvVarOverride(NamedTuple):
-    """One GTN_CONFIG_ variable, paired with the config key it resolves to."""
+    """One GTN_CONFIG_ variable, with the config key and coerced value it resolves to."""
 
     env_var_name: str
     config_key: str
     raw_value: str
+    value: Any
 
 
 # Outcomes of coercing an environment variable that no real config value can collide with.
@@ -411,44 +412,55 @@ class ConfigManager(EngineScoped):
         """
         env_config: dict[str, Any] = {}
         for override in self._collect_env_var_overrides():
-            coerced_value = self._coerce_env_var_value(override.config_key, override.raw_value)
-            if coerced_value is _REJECTED_BAD_VALUE:
-                self._report_ignored_env_var(
-                    override,
-                    f"'{override.raw_value}' is not a valid value for the '{override.config_key}' setting",
-                )
-                continue
-            if coerced_value is _REJECTED_UNKNOWN_KEY:
-                self._report_ignored_env_var(override, f"there is no '{override.config_key}' setting")
-                continue
-            set_dot_value(env_config, override.config_key, coerced_value)
+            set_dot_value(env_config, override.config_key, override.value)
             logger.debug("Loaded config from env var: %s -> %s", override.env_var_name, override.config_key)
 
         return env_config
 
     def _collect_env_var_overrides(self) -> list[EnvVarOverride]:
-        """Gather the GTN_CONFIG_ variables to apply, dropping paths that contradict each other.
+        """Resolve the GTN_CONFIG_ variables to apply, reporting each one ignored along the way.
 
-        Two variables conflict when one's key is a strict prefix of another's: exporting both
-        GTN_CONFIG_ARTIFACTS__IMAGE and GTN_CONFIG_ARTIFACTS__IMAGE__PREVIEW_FORMAT asks for
-        `artifacts.image` to be a value and a section at once. `set_dot_value` honors whichever
-        `os.environ` yields last, so the winner would depend on iteration order. The deeper path is
-        kept because it carries strictly more of what was asked for; the prefix is dropped.
+        Three things get a variable ignored: a value the setting's type rejects, a path that names no
+        setting, and a path that is a strict prefix of another surviving path.
+
+        The prefix case is last because it only has to separate overrides that are each valid on
+        their own. Exporting both GTN_CONFIG_ARTIFACTS__IMAGE and
+        GTN_CONFIG_ARTIFACTS__IMAGE__PREVIEW_FORMAT asks for `artifacts.image` to be a value and a
+        section at once, and `dict[str, Any]` accepts either, so something has to break the tie:
+        `set_dot_value` would otherwise honor whichever `os.environ` yielded last. The deeper path
+        wins because it carries strictly more of what was asked for. An override that fails
+        validation is not competing for anything, so it must be dropped before the tie is broken;
+        judging overlap first would let a typo like GTN_CONFIG_AGENT__SYSTEM_PROMPT__OOPS, or a
+        stray trailing separator, take a correct neighbour down with it.
 
         Returns:
-            The overrides to apply, in environment order, minus the dropped prefixes.
+            The overrides to apply, in environment order.
         """
-        overrides = []
+        coerced = []
         for env_var_name, raw_value in os.environ.items():
             if not env_var_name.startswith(ENV_VAR_PREFIX):
                 continue
             config_key = env_var_name.removeprefix(ENV_VAR_PREFIX).lower().replace(ENV_VAR_PATH_SEPARATOR, ".")
-            overrides.append(EnvVarOverride(env_var_name=env_var_name, config_key=config_key, raw_value=raw_value))
+            override = EnvVarOverride(
+                env_var_name=env_var_name,
+                config_key=config_key,
+                raw_value=raw_value,
+                value=self._coerce_env_var_value(config_key, raw_value),
+            )
+            if override.value is _REJECTED_BAD_VALUE:
+                self._report_ignored_env_var(
+                    override, f"'{raw_value}' is not a valid value for the '{config_key}' setting"
+                )
+                continue
+            if override.value is _REJECTED_UNKNOWN_KEY:
+                self._report_ignored_env_var(override, f"there is no '{config_key}' setting")
+                continue
+            coerced.append(override)
 
         applicable = []
-        for override in overrides:
+        for override in coerced:
             deeper_keys = sorted(
-                other.config_key for other in overrides if other.config_key.startswith(f"{override.config_key}.")
+                other.config_key for other in coerced if other.config_key.startswith(f"{override.config_key}.")
             )
             if deeper_keys:
                 self._report_ignored_env_var(
