@@ -425,7 +425,6 @@ class EventManager(EngineScoped):
                         f"'{type(request).__name__}'. Failed because hook "
                         f"'{getattr(hook, '__name__', hook)}' raised {type(exc).__name__}: {exc}"
                     )
-                    logging.getLogger("griptape_nodes").exception(msg)
                     return GenericResultFailure(exception=exc, result_details=msg)
                 if short_circuit is not None:
                     return short_circuit
@@ -448,8 +447,8 @@ class EventManager(EngineScoped):
         operation, because the result has already been returned. Specifically:
 
         - It fires for both success and failure results, including when the handler
-          raised (in that case the payload is an equivalent `GenericResultFailure`, not
-          the identical object the client received).
+          raised (in that case the payload is the `GenericResultFailure` synthesized for
+          the client).
         - `request` and `result` must be treated as read-only. The same `request` object
           is referenced by the result event still queued for the client, so mutating it
           corrupts what the client sees.
@@ -531,31 +530,6 @@ class EventManager(EngineScoped):
                 )
                 continue
             self._schedule_post_dispatch_hook(request_type, callback, request, result, active)
-
-    def _fire_post_dispatch_hooks_for_handler_exception(self, request: RequestPayload, exception: Exception) -> None:
-        """Notify hooks that no result event will be built for this request.
-
-        Neither dispatch method catches handler exceptions -- they propagate to
-        `Engine.handle_request`, which logs and returns a synthesized failure. Without
-        this the most interesting failure mode would be invisible to hooks. The payload is
-        equivalent to the one the client receives, not the identical object, which is why
-        `add_post_dispatch_hook` says so explicitly.
-
-        The caller's `try` covers the parameter-change flush as well as the handler, so a
-        handler that returned a result and then had `_flush_tracked_parameter_changes`
-        raise also lands here. That is deliberate: the exception escapes either way, the
-        client gets a synthesized failure either way, and hooks reporting success for a
-        request the client saw fail would be worse than the coarser attribution.
-        """
-        result_details = f"Unhandled exception while processing {type(request).__name__}: {exception}"
-        # `_handle_request_core` scrubs the request on its way to building the result event,
-        # but a raising handler never gets there. Without this, hooks would be the one place
-        # an omitted field still surfaces -- and those fields are omitted precisely because
-        # they are sensitive or bulky.
-        self._scrub_omitted_request_fields(request)
-        self._fire_post_dispatch_hooks(
-            request, GenericResultFailure(exception=exception, result_details=result_details)
-        )
 
     def _scrub_omitted_request_fields(self, request: RequestPayload) -> None:
         """Null out the request fields marked `omit_from_result`, in place.
@@ -1016,15 +990,38 @@ class EventManager(EngineScoped):
         repeated here. Without the skip every violation would log
         twice -- once from the reporter and once from this loop.
 
+        A dispatcher-synthesized failure also gets its traceback attached, because nothing else
+        logs one: a handler that authors its own failure logs whatever it wants to, and
+        attaching frames to those too would duplicate what those call sites already emit.
+
         Args:
             result: The result payload containing details to log
         """
         if isinstance(result.result_details, ResultDetails):
             logger = logging.getLogger("griptape_nodes")
+            exc_info = self._exception_for_logging(result)
             for detail in result.result_details.result_details:
                 if isinstance(detail, StrictModeViolationDetail):
                     continue
-                logger.log(detail.level, detail.message)
+                logger.log(detail.level, detail.message, exc_info=exc_info)
+                exc_info = None
+
+    @staticmethod
+    def _exception_for_logging(result: ResultPayload) -> Exception | None:
+        """The exception to attach as `exc_info`, or None to log the message alone.
+
+        Restricted to `GenericResultFailure`, which this manager synthesizes and nothing else
+        logs. A handler-authored failure carries an exception too, and several already log it.
+
+        A `ForwardedException` is constructed rather than raised, so `__traceback__` is None and
+        `exc_info` would render only "NoneType: None". Its frames survive the wire on the
+        `original_traceback` attribute instead, which nothing logs here.
+        """
+        if not isinstance(result, GenericResultFailure):
+            return None
+        if result.exception is None or result.exception.__traceback__ is None:
+            return None
+        return result.exception
 
     def _handle_request_core(
         self,
@@ -1044,8 +1041,14 @@ class EventManager(EngineScoped):
             if workflow_mgr.should_squelch_workflow_altered():
                 callback_result.altered_workflow_state = False
 
-            # Override failure log level if requested
-            if callback_result.failed() and request.failure_log_level is not None:
+            # Override failure log level if requested, except for a synthesized failure:
+            # `failure_log_level` silences failures its caller EXPECTS, so honoring it for an
+            # unhandled exception would hide a crash behind a level chosen for a routine miss.
+            if (
+                callback_result.failed()
+                and request.failure_log_level is not None
+                and not isinstance(callback_result, GenericResultFailure)
+            ):
                 self._override_result_log_level(callback_result, request.failure_log_level)
 
             # Log result details (after potential level override)
@@ -1082,6 +1085,22 @@ class EventManager(EngineScoped):
         self._fire_post_dispatch_hooks(request, callback_result)
 
         return result_event
+
+    def _result_for_handler_exception(
+        self, request: RP, exception: Exception, *, context: ResultContext
+    ) -> EventResultSuccess | EventResultFailure:
+        """Build the failure result event for a handler that raised instead of returning one.
+
+        An escaping exception leaves the response future of whoever is waiting on
+        `request_id`/`response_topic` unsettled forever. `_handle_request_core` is what addresses
+        the result to that caller, and logs it.
+        """
+        result_details = f"Unhandled exception while processing {type(request).__name__}: {exception}"
+        return self._handle_request_core(
+            request,
+            GenericResultFailure(exception=exception, result_details=result_details),
+            context=context,
+        )
 
     async def ahandle_request(
         self,
@@ -1130,8 +1149,7 @@ class EventManager(EngineScoped):
                     if type(result_payload) not in RESULT_TYPES_THAT_SKIP_FLUSH:
                         self._flush_tracked_parameter_changes()
             except Exception as exc:
-                self._fire_post_dispatch_hooks_for_handler_exception(request, exc)
-                raise
+                return self._result_for_handler_exception(request, exc, context=result_context)
 
             return self._handle_request_core(
                 request,
@@ -1187,8 +1205,7 @@ class EventManager(EngineScoped):
                     if type(result_payload) not in RESULT_TYPES_THAT_SKIP_FLUSH:
                         self._flush_tracked_parameter_changes()
             except Exception as exc:
-                self._fire_post_dispatch_hooks_for_handler_exception(request, exc)
-                raise
+                return self._result_for_handler_exception(request, exc, context=result_context)
 
             return self._handle_request_core(
                 request,

@@ -14,6 +14,7 @@ from griptape_nodes.app.worker_routing import RemoteHandler
 from griptape_nodes.retained_mode.engine import Engine, current_engine
 from griptape_nodes.retained_mode.events.app_events import ConfigChanged
 from griptape_nodes.retained_mode.events.base_events import (
+    EventResultFailure,
     EventResultSuccess,
     ExecutionEvent,
     ExecutionGriptapeNodeEvent,
@@ -37,7 +38,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointFailure,
     CheckpointSubjectType,
 )
-from griptape_nodes.retained_mode.managers.event_manager import EventManager
+from griptape_nodes.retained_mode.managers.event_manager import EventManager, ResultContext
 
 
 class TestEventManagerBroadcasting:
@@ -947,16 +948,16 @@ class TestPostDispatchHooks:
         seen: list[ResultPayload] = []
         event_manager.add_post_dispatch_hook(_ProbeRequest, _RecordingHook(seen))
 
-        # The exception propagates to Engine.handle_request, which synthesizes the
-        # failure the client sees. Hooks get an equivalent payload rather than that one.
-        with pytest.raises(RuntimeError, match="handler exploded"):
-            event_manager.handle_request(_ProbeRequest())
+        event = event_manager.handle_request(_ProbeRequest())
 
+        assert event.result.failed()
         assert len(seen) == 1
         failure = seen[0]
         assert failure.failed()
         assert isinstance(failure, GenericResultFailure)
         assert isinstance(failure.exception, RuntimeError)
+        # Hooks see the very payload the client receives, not an equivalent copy.
+        assert failure is event.result
 
     @pytest.mark.asyncio
     async def test_hook_fires_when_an_async_handler_raises(self) -> None:
@@ -971,11 +972,72 @@ class TestPostDispatchHooks:
         seen: list[ResultPayload] = []
         event_manager.add_post_dispatch_hook(_ProbeRequest, _RecordingHook(seen))
 
-        with pytest.raises(RuntimeError, match="async handler exploded"):
-            await event_manager.ahandle_request(_ProbeRequest())
+        event = await event_manager.ahandle_request(_ProbeRequest())
 
+        assert event.result.failed()
         assert len(seen) == 1
         assert seen[0].failed()
+
+    def test_raising_handler_logs_its_failure_exactly_once_with_the_traceback(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """One record carrying both the message and the frames.
+
+        The traceback is often the only thing identifying a failure raised deep inside an
+        unrelated import, so it must survive without the message being logged twice.
+        """
+
+        def handler(_request: _ProbeRequest) -> _ProbeResult:
+            msg = "handler exploded"
+            raise RuntimeError(msg)
+
+        event_manager = self._manager_with_handler(handler)
+
+        with caplog.at_level(logging.ERROR, logger="griptape_nodes"):
+            event_manager.handle_request(_ProbeRequest())
+
+        records = [r for r in caplog.records if "handler exploded" in r.getMessage()]
+        assert len(records) == 1
+        assert records[0].exc_info is not None
+        assert "RuntimeError: handler exploded" in caplog.text
+
+    def test_unhandled_crash_ignores_the_caller_s_failure_log_level(self, caplog: pytest.LogCaptureFixture) -> None:
+        """`failure_log_level` silences failures the caller expects, not crashes.
+
+        Callers pass DEBUG to keep a routine miss (an absent config key, a probe) out of the
+        log. Honoring it for a synthesized failure would hide an unhandled exception and its
+        traceback behind a level chosen for something else entirely.
+        """
+
+        def handler(_request: _ProbeRequest) -> _ProbeResult:
+            msg = "handler exploded"
+            raise RuntimeError(msg)
+
+        event_manager = self._manager_with_handler(handler)
+
+        with caplog.at_level(logging.DEBUG, logger="griptape_nodes"):
+            event_manager.handle_request(_ProbeRequest(failure_log_level=logging.DEBUG))
+
+        records = [r for r in caplog.records if "handler exploded" in r.getMessage()]
+        assert [r.levelno for r in records] == [logging.ERROR]
+
+    def test_raising_handler_still_addresses_its_result_to_the_waiting_client(self) -> None:
+        """The IPC ingress replies on these, so a failure missing them is a dropped reply."""
+
+        def handler(_request: _ProbeRequest) -> _ProbeResult:
+            msg = "handler exploded"
+            raise RuntimeError(msg)
+
+        event_manager = self._manager_with_handler(handler)
+
+        event = event_manager.handle_request(
+            _ProbeRequest(),
+            result_context=ResultContext(request_id="req-1", response_topic="topic-1"),
+        )
+
+        assert isinstance(event, EventResultFailure)
+        assert event.request_id == "req-1"
+        assert event.response_topic == "topic-1"
 
     def test_hook_is_not_invoked_for_a_subclass_of_its_request_type(self) -> None:
         def handler(_request: _ProbeRequest) -> _ProbeResult:
@@ -1275,11 +1337,11 @@ class TestPostDispatchHooks:
         assert depths == [0]
 
     def test_omitted_request_fields_are_scrubbed_when_the_handler_raises(self) -> None:
-        """The scrub lives on the result-building path, which a raising handler skips.
+        """The scrub lives on the result-building path, which a raising handler also takes.
 
         `omit_from_result` exists to keep sensitive and bulky values out of anything
         downstream, so the exception path -- the one this feature advertises as its most
-        interesting case -- must not be the hole that leaks them to a library.
+        interesting case -- must not be the hole that leaks them to a library or a client.
         """
 
         def handler(_request: _OmitFieldProbeRequest) -> _ProbeResult:
@@ -1298,10 +1360,11 @@ class TestPostDispatchHooks:
 
         event_manager.add_post_dispatch_hook(_OmitFieldProbeRequest, hook)
 
-        with pytest.raises(RuntimeError):
-            event_manager.handle_request(_OmitFieldProbeRequest(secret="super-secret"))  # noqa: S106
+        event = event_manager.handle_request(_OmitFieldProbeRequest(secret="super-secret"))  # noqa: S106
 
         assert seen == [None]
+        assert isinstance(event.request, _OmitFieldProbeRequest)
+        assert event.request.secret is None
 
     def test_hook_runs_inline_when_the_stored_loop_is_open_but_never_driven(self) -> None:
         """`create_task` on an undriven loop returns a task that never executes.
