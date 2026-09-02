@@ -12,14 +12,17 @@ node code reaches them through `BaseNode.execution_module(...)`.
 
 from __future__ import annotations
 
+import ast
 import json
 import shutil
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
+from unittest.mock import patch
 
 import pytest
 
+import griptape_nodes.retained_mode.managers.library_manager as library_manager_module
 from griptape_nodes.node_library.library_registry import LibraryRegistry, LibrarySchema
 from griptape_nodes.retained_mode.engine import current_engine
 from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeRequest, ExecuteNodeResultSuccess
@@ -39,6 +42,19 @@ FIXTURE = Path(__file__).parent / "fixtures" / "execution_module_library"
 LIBRARY = "Execution Module Library"
 EXEC_DEP = "fakeexec"
 EXEC_DEP_VERSION = "1.0.0"
+
+
+@pytest.fixture(autouse=True)
+def _isolated_asset_root(tmp_path: Path) -> Iterator[Path]:
+    """Point the engine-owned model-asset cache at a scratch dir.
+
+    Its real root is under xdg_data_home, which is right for production and wrong for a suite: it
+    persists across runs and it is the developer's own home directory.
+    """
+    root = tmp_path / "asset_root"
+    root.mkdir(exist_ok=True)
+    with patch.object(library_manager_module, "xdg_data_home", return_value=root):
+        yield root
 
 
 @pytest.fixture(autouse=True)
@@ -63,7 +79,12 @@ def _isolate_import_state() -> Iterator[None]:
         sys.modules.pop(name, None)
 
 
-def _register(tmp_path: Path, *, extra_nodes: list[dict] | None = None) -> str:
+def _register(
+    tmp_path: Path,
+    *,
+    extra_nodes: list[dict] | None = None,
+    model_assets: dict[str, dict[str, object]] | None = None,
+) -> str:
     """Materialise the fixture with a real installable execution dependency."""
     library_dir = tmp_path / "execution_module_library"
     shutil.copytree(FIXTURE, library_dir)
@@ -81,6 +102,8 @@ def _register(tmp_path: Path, *, extra_nodes: list[dict] | None = None) -> str:
     }
     if extra_nodes:
         manifest["nodes"].extend(extra_nodes)
+    if model_assets is not None:
+        manifest["model_assets"] = model_assets
     manifest_path.write_text(json.dumps(manifest, indent=2))
 
     result = current_engine().handle_request(RegisterLibraryFromFileRequest(file_path=str(manifest_path)))
@@ -282,3 +305,84 @@ class TestTheBoundaryIsEnforced:
         assert "leaky_node.py" in message
         assert "runner.py" in message
         assert "self.execution_module" in message, "the message must name the sanctioned alternative"
+
+
+class TestAllThreeMechanismsTogether:
+    """One node, no heavy import in it, three answers it could not compute for itself.
+
+    This is the arrangement the engine-owned mechanisms exist to produce: the framework import
+    lives behind the boundary, the device comes from the engine's own detection, and the weights
+    come from a declaration with an engine-owned cache. A node written this way contains no import
+    that could fail on a machine that only edits.
+    """
+
+    def test_the_node_module_imports_nothing_heavy(self) -> None:
+        """Asserted on the source, because this is the property the whole design is for."""
+        source = (FIXTURE / "boundary_node.py").read_text()
+        tree = ast.parse(source)
+        imported: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported |= {alias.name.split(".")[0] for alias in node.names}
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module.split(".")[0])
+
+        assert EXEC_DEP not in imported, "the node module imports the execution dependency"
+        assert "execution" not in imported, "the node module imports the execution module directly"
+        # Not even deferred: no import statement anywhere in the file mentions them.
+        assert EXEC_DEP not in source
+
+    @pytest.mark.asyncio
+    async def test_device_and_weights_reach_the_execution_module(self, tmp_path: Path) -> None:
+        """The node hands the engine's answers to the execution module, which uses both."""
+        current_engine().library_manager._is_worker = True
+        _register(tmp_path, model_assets={"stand-in-weights": {"source": "hf:owner/repo", "revision": "pinned"}})
+
+        # Stand in for a fetch: put files where the engine-owned cache would have written them.
+        from griptape_nodes.node_library.library_registry import ModelAsset
+
+        manager = current_engine().library_manager
+        target = manager._model_asset_path(
+            LIBRARY, "stand-in-weights", ModelAsset(source="hf:owner/repo", revision="pinned")
+        )
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "model.safetensors").write_text("weights")
+
+        node = LibraryRegistry.create_node(node_type="BoundaryNode", name="all_three", specific_library_name=LIBRARY)
+        current_engine().object_manager.add_object_by_name("all_three", node)
+        result = await current_engine().ahandle_request(
+            ExecuteNodeRequest(
+                node_name="all_three",
+                parameter_values={},
+                node_metadata={"node_type": "BoundaryNode", "library": LIBRARY},
+            )
+        )
+
+        assert isinstance(result, ExecuteNodeResultSuccess), getattr(result, "result_details", result)
+        outputs = result.parameter_output_values
+        assert outputs["reported_version"] == EXEC_DEP_VERSION
+        assert outputs["chosen_device"] in {"cuda", "mps", "cpu"}
+        # The execution module saw both the device and the weight file.
+        assert outputs["chosen_device"] in outputs["run_summary"]
+        assert "model.safetensors" in outputs["run_summary"]
+
+    @pytest.mark.asyncio
+    async def test_a_missing_asset_declaration_fails_the_node_with_a_reason(self, tmp_path: Path) -> None:
+        """Weights that were never declared should say so, not fail somewhere far away."""
+        current_engine().library_manager._is_worker = True
+        _register(tmp_path)  # no model_assets declared
+
+        node = LibraryRegistry.create_node(node_type="BoundaryNode", name="no_assets", specific_library_name=LIBRARY)
+        current_engine().object_manager.add_object_by_name("no_assets", node)
+        result = await current_engine().ahandle_request(
+            ExecuteNodeRequest(
+                node_name="no_assets",
+                parameter_values={},
+                node_metadata={"node_type": "BoundaryNode", "library": LIBRARY},
+            )
+        )
+
+        assert isinstance(result, ExecuteNodeResultSuccess), getattr(result, "result_details", result)
+        summary = result.parameter_output_values["run_summary"]
+        assert "declares no model asset" in summary
+        assert "stand-in-weights" in summary

@@ -36,6 +36,24 @@ class BoundaryNode(DataNode):
         )
         self.add_parameter(
             Parameter(
+                name="chosen_device",
+                type="str",
+                default_value="",
+                tooltip="The device the engine chose, with no framework imported to ask",
+                allowed_modes={ParameterMode.OUTPUT},
+            )
+        )
+        self.add_parameter(
+            Parameter(
+                name="run_summary",
+                type="str",
+                default_value="",
+                tooltip="What the execution module produced from the device and the asset path",
+                allowed_modes={ParameterMode.OUTPUT},
+            )
+        )
+        self.add_parameter(
+            Parameter(
                 name="reported_version",
                 type="str",
                 default_value="",
@@ -60,5 +78,14 @@ class BoundaryNode(DataNode):
             self.set_parameter_value("boundary_answer", str(err))
 
     def process(self) -> None:
+        # Three engine-owned answers, none of which this module could compute for itself without
+        # importing something that does not exist in the process that edits it.
         runner = self.execution_module("runner")
         self.parameter_output_values["reported_version"] = runner.dependency_version()
+        self.parameter_output_values["chosen_device"] = self.execution_device
+        try:
+            weights = self.model_asset("stand-in-weights")
+        except RuntimeError as err:
+            self.parameter_output_values["run_summary"] = f"no weights: {err}"
+            return
+        self.parameter_output_values["run_summary"] = runner.load_and_run(self.execution_device, weights)
