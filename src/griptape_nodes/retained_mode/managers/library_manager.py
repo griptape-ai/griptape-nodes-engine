@@ -470,6 +470,37 @@ class NodeTypePortProbeOutcome(NamedTuple):
     thread_lost: bool = False
 
 
+class ProbeThreadSignals(NamedTuple):
+    """What a probe's worker thread reports about itself, on the way in and on the way out.
+
+    The worker has to be the one to say, because nothing on the loop's side can. Cancelling either
+    the task or the executor future leaves a running worker running, so a construction that is still
+    holding a thread looks exactly like one that returned. And a work item cancelled out of the
+    executor's queue before any thread picked it up looks the same again, while holding nothing: a
+    `concurrent.futures.Future` still in PENDING cancels for real, and the callable never runs.
+
+    That last case is why "started" is recorded as well as "finished". Reading a clear `finished` as
+    "still holding a thread" charged the engine-wide ceiling for probes that never ran, and a busy
+    executor is exactly when it would happen -- so a burst of contention could permanently stop
+    probing on an engine holding no probe threads at all.
+    """
+
+    started: threading.Event
+    finished: threading.Event
+
+    @property
+    def thread_is_held(self) -> bool:
+        """Whether a worker is inside the node's `__init__` right now, holding an unreclaimable thread.
+
+        There is a window of a few instructions where a worker that has been handed the work item
+        has not yet set `started`, and this reads False for a thread that is in fact held. Erring
+        that way on purpose: the cost of undercounting is one probe's worth of slack in a ceiling
+        that only decides when to stop probing, while overcounting -- the case above -- permanently
+        disables connection ranking for the whole process.
+        """
+        return self.started.is_set() and not self.finished.is_set()
+
+
 class LibraryGitOperationContext(NamedTuple):
     """Context information for git operations on a library."""
 
@@ -753,8 +784,8 @@ class LibraryManager(EngineScoped):
         # This never decreases, and _PROBE_THREAD_LEAK_CEILING is the only bound expressed in terms
         # of the executor actually being drained.
         self._port_summary_timed_out_threads: int = 0
-        # The "worker finished" signal of every construction abandoned by a cancellation, kept until
-        # it fires. A timeout means the thread is gone for the life of the process, but a
+        # The "worker finished" signal of every started construction abandoned by a cancellation,
+        # kept until it fires. A timeout means the thread is gone for the life of the process, but a
         # cancellation usually catches a perfectly healthy __init__ a few milliseconds in, and that
         # thread is back in the pool almost immediately. Charging those permanently would walk the
         # ceiling up on every reload -- each one cancels the warm pass, often mid-probe -- and
@@ -2321,20 +2352,23 @@ class LibraryManager(EngineScoped):
         node_type: str,
         node_class: type[BaseNode],
         library_node_metadata: dict[str, Any],
-        finished: threading.Event,
+        signals: ProbeThreadSignals,
     ) -> NodeProbeResult:
-        """Construct a probe node and record, from inside the worker, that the thread is free again.
+        """Construct a probe node, reporting from inside the worker when it takes a thread and frees it.
 
-        Exists because a caller that gave up on this construction cannot otherwise tell whether the
-        thread it started is still held: neither `asyncio.wait_for`'s timeout nor a cancellation
-        reaches into the worker, and both leave the task looking finished while `__init__` runs on.
+        Exists because a caller that gave up on this construction cannot otherwise tell whether a
+        thread is held: neither `asyncio.wait_for`'s timeout nor a cancellation reaches into the
+        worker, and both leave the task looking finished whether `__init__` is running on, already
+        returned, or never started at all. See `ProbeThreadSignals`.
+
         `finished` is set even when construction fails, since a raising `__init__` returns its thread
         just as a successful one does.
         """
+        signals.started.set()
         try:
             return self._construct_probe_node(library_name, node_type, node_class, library_node_metadata)
         finally:
-            finished.set()
+            signals.finished.set()
 
     def list_categories_in_library_request(self, request: ListCategoriesInLibraryRequest) -> ResultPayload:
         # Does this library exist?
@@ -3608,26 +3642,34 @@ class LibraryManager(EngineScoped):
             return
 
         task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            # The expected outcome, and not this coroutine's own cancellation: `task` is not the
-            # caller's task, so awaiting it raises the cancellation we just requested.
-            pass
-        except Exception as err:
-            # The pass answered the cancellation by failing instead -- a broken `finally` on its way
-            # out, say. (A pass that had already failed cannot arrive here: the check above skips a
-            # task that is `done()`.) Callers use this to make an unload safe, not to find out how
-            # warming went, and letting it propagate would abort a reload over a background task that
-            # is already off the loop -- exactly what the reload would fix. DEBUG rather than WARNING
-            # because `_on_port_summary_warm_done` has already logged this same exception for the
-            # operator; two warnings for one failure only invite chasing it twice.
-            logger.debug(
-                "Port summary warming raised while being stopped: %s: %s. Summaries will be recomputed after this "
-                "reload.",
-                type(err).__name__,
-                err,
-            )
+        # Waited on through `asyncio.wait` rather than by awaiting the task, which would make it this
+        # coroutine's `_fut_waiter`: cancelling *this* coroutine then cancels `task` and raises here
+        # indistinguishably from the cancellation just requested, so swallowing that -- as this used
+        # to -- loses the caller's cancellation. That is the shutdown-during-reload case, and losing
+        # it means the reload carries on tearing the registry down for a caller that has gone away.
+        # `asyncio.wait` suspends on a future of its own, so it returns when the pass is off the loop
+        # and raises only when this coroutine is really being cancelled.
+        await asyncio.wait({task})
+
+        if task.cancelled():
+            return
+
+        error = task.exception()
+        if error is None:
+            return
+
+        # The pass answered the cancellation by failing instead -- a broken `finally` on its way out,
+        # say. (A pass that had already failed cannot arrive here: the check above skips a task that
+        # is `done()`.) Callers use this to make an unload safe, not to find out how warming went, and
+        # raising it would abort a reload over a background task that is already off the loop --
+        # exactly what the reload would fix. DEBUG rather than WARNING because
+        # `_on_port_summary_warm_done` has already logged this same exception for the operator; two
+        # warnings for one failure only invite chasing it twice.
+        logger.debug(
+            "Port summary warming raised while being stopped: %s: %s. Summaries will be recomputed after this reload.",
+            type(error).__name__,
+            error,
+        )
 
     async def _warm_port_summaries(self) -> None:
         """Probe every registered library's node types so the first real request is a cache hit.
@@ -4175,10 +4217,9 @@ class LibraryManager(EngineScoped):
             )
             return NodeTypePortProbeOutcome(summary=None, timed_out=False)
 
-        # Set by the worker itself, so it is the one signal that distinguishes "this construction is
-        # still holding a thread" from "it finished and the worker went back to the pool". Neither
-        # the task nor the future can say: cancelling either leaves the thread running.
-        probe_finished = threading.Event()
+        # The worker's own account of the thread it takes, which is the only account available: see
+        # `ProbeThreadSignals`.
+        signals = ProbeThreadSignals(started=threading.Event(), finished=threading.Event())
         try:
             probe_result = await asyncio.wait_for(
                 asyncio.to_thread(
@@ -4187,7 +4228,7 @@ class LibraryManager(EngineScoped):
                     node_type,
                     resolution.node_class,
                     library_node_metadata,
-                    probe_finished,
+                    signals,
                 ),
                 timeout=self._SCHEMA_PROBE_TIMEOUT_S,
             )
@@ -4200,8 +4241,8 @@ class LibraryManager(EngineScoped):
             # the usual abandoned construction is a healthy one that finishes moments later: see
             # `_leaked_probe_thread_count`. Not charged to the library or the pass either way, both
             # being about to be discarded.
-            if not probe_finished.is_set():
-                self._abandoned_probe_signals.append(probe_finished)
+            if signals.thread_is_held:
+                self._abandoned_probe_signals.append(signals.finished)
                 logger.warning(
                     "Port summary probing was stopped while constructing node type '%s' in library '%s'. Its thread "
                     "cannot be cancelled, so it is held until that construction returns (%d thread(s) held now); "
@@ -4213,9 +4254,7 @@ class LibraryManager(EngineScoped):
                 )
             raise
         except TimeoutError:
-            return self._timed_out_probe_outcome(
-                library_name=library_name, node_type=node_type, probe_finished=probe_finished
-            )
+            return self._timed_out_probe_outcome(library_name=library_name, node_type=node_type, signals=signals)
         except Exception:
             # _construct_probe_node already converts a raising __init__ into a result, so reaching
             # here means the failure was outside it -- the executor refusing work during interpreter
@@ -4256,32 +4295,49 @@ class LibraryManager(EngineScoped):
         return NodeTypePortProbeOutcome(summary=summary, timed_out=False)
 
     def _timed_out_probe_outcome(
-        self, *, library_name: str, node_type: str, probe_finished: threading.Event
+        self, *, library_name: str, node_type: str, signals: ProbeThreadSignals
     ) -> NodeTypePortProbeOutcome:
         """Report a construction that missed its deadline, saying whether its thread went with it.
 
-        `asyncio.to_thread` cannot be cancelled, so a timed-out construction usually holds a worker
-        of the loop's default executor until `__init__` returns, which for a genuinely stuck node
-        means for the life of the process. That is why the caller both bounds how many timeouts one
-        pass will spend and grants a node type one retry rather than one per request.
+        Three different things end up here, and only the first costs a thread.
 
-        Except when the construction landed in the window between its deadline passing and
-        `TimeoutError` being raised, in which case the worker is already back in the pool and only
-        the result was lost. Same question the cancellation branch asks, and the same answer: nothing
-        is charged to the engine-wide ceiling for a thread that is not held. Past the deadline the
-        engine has no basis to expect a *later* return, though, so a node that hands its thread back
-        at 10.5s is still charged -- conservative on purpose, and exactly the shape of node the
-        ceiling exists to stop paying for.
+        Usually the node's `__init__` is still running: `asyncio.to_thread` cannot be cancelled, so
+        it holds a worker of the loop's default executor until it returns, which for a genuinely
+        stuck node means for the life of the process. That is why the caller both bounds how many
+        timeouts one pass will spend and grants a node type one retry rather than one per request.
+
+        Or the construction landed in the window between its deadline passing and `TimeoutError`
+        being raised, so the worker is already back in the pool and only the result was lost. Past
+        the deadline the engine has no basis to expect a *later* return, so a node that hands its
+        thread back at 10.5s is still charged -- conservative on purpose, and exactly the shape of
+        node the ceiling exists to stop paying for.
+
+        Or the work item was never picked up at all, because every thread in the pool was busy for
+        the whole deadline. Nothing was learned about the node, and no thread is held.
+
+        The timeout itself is charged to the library and the pass in all three cases: the caller
+        really did wait out the deadline. Only the engine-wide ceiling distinguishes them, and it is
+        the one that has to, since it is the bound that never resets.
         """
-        thread_lost = not probe_finished.is_set()
+        thread_lost = signals.thread_is_held
         if thread_lost:
-            thread_note = " and leaking its probe thread, which cannot be cancelled"
+            thread_note = (
+                " and leaking its probe thread, which cannot be cancelled. The node's __init__ likely makes a "
+                "blocking call"
+            )
+        elif signals.started.is_set():
+            thread_note = (
+                ", though its probe thread finished in time to go back to the pool. The node's __init__ is close to "
+                "the time limit"
+            )
         else:
-            thread_note = ", though its probe thread finished in time to go back to the pool"
+            thread_note = (
+                ", though its construction never started: every thread in the engine's pool was busy for the whole "
+                "time limit, so this says nothing about the node itself"
+            )
 
         logger.warning(
-            "Port summary probe for node type '%s' in library '%s' timed out after %.1fs; skipping it%s. The node's "
-            "__init__ likely makes a blocking call.",
+            "Port summary probe for node type '%s' in library '%s' timed out after %.1fs; skipping it%s.",
             node_type,
             library_name,
             self._SCHEMA_PROBE_TIMEOUT_S,
@@ -6791,12 +6847,17 @@ class LibraryManager(EngineScoped):
         return new_downloads
 
     async def reload_libraries_request(self, request: ReloadAllLibrariesRequest) -> ResultPayload:
-        # Stop any background port summary warming before anything is torn down, and keep anything
-        # else from starting one until this is finished. The pass resolves node classes, so one left
+        # Keep anything else from starting a background port summary warm pass, then stop the one
+        # that is running, before anything is torn down. The pass resolves node classes, so one left
         # running -- or one begun in the several awaits it takes to tear the registry down -- would
         # import modules belonging to libraries this is about to unload, reviving exactly what the
         # reload exists to replace.
-        await self._cancel_port_summary_warm()
+        #
+        # In that order because the cancel suspends, and it clears the handle before it does: a
+        # notification handler landing in that window -- `_on_library_loaded_notification` runs as its
+        # own task and asks for a pass whenever a worker reports its node types -- would start one the
+        # cancel had already walked past, and the `finally` below would find it in flight and leave it
+        # running over the rebuild.
         self._port_summary_warm_suppressed += 1
 
         # Bracket the reload like on_app_initialization_complete so the heartbeat reports
@@ -6804,6 +6865,7 @@ class LibraryManager(EngineScoped):
         self._is_initializing = True
         restart_warming = True
         try:
+            await self._cancel_port_summary_warm()
             return await self._run_reload_libraries(request)
         except asyncio.CancelledError:
             # The reload itself was cancelled, which happens when the engine is shutting down or the
@@ -7717,10 +7779,12 @@ class LibraryManager(EngineScoped):
             On success: new_version (str, may be "unknown")
             On failure: ResultPayloadFailure instance
         """
-        await self._cancel_port_summary_warm()
+        # Raised before the cancel, which suspends after clearing the handle: see
+        # `reload_libraries_request`, which brackets itself the same way and for the same reason.
         self._port_summary_warm_suppressed += 1
         restart_warming = True
         try:
+            await self._cancel_port_summary_warm()
             return await self._run_reload_library_after_git_operation(
                 library_name=library_name,
                 library_file_path=library_file_path,

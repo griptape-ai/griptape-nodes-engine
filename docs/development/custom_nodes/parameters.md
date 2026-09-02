@@ -849,6 +849,12 @@ the element type its children take. A `ParameterList(input_types=["str"])` repor
 `list[str]`, `list`, *and* `str`, so dragging a single string finds your expander node — not
 just dragging a whole list.
 
+One exception: a library
+[hosted in a worker](node_isolation_with_workers.md) reports its parameters to the orchestrator as
+flat descriptions, so its lists are summarized as `list[str]` and `list` without the element type.
+Dragging a single `str` will not float a worker-hosted expander node the way it floats the same node
+in an in-process library. Everything else in this section applies to both.
+
 The two type lists hold raw declared type names, and the engine's matching rules are not plain
 string equality: matching is case-insensitive; a target of `any` accepts anything (but a source
 of `any` is not accepted by a specific target); `none` on either side matches nothing, `any`
@@ -892,7 +898,9 @@ left as-is until it reloads.
 The pass normally runs in the background, right after libraries finish loading and again after a
 reload, so the menu is ready before anyone opens it. Worth knowing while authoring: **your
 `__init__` runs shortly after startup whether or not anyone creates your node**, so anything it does
-eagerly — an auth check, a model download, a directory it creates — happens then too. That is
+eagerly — an auth check, a model download, a directory it creates — happens then too. (In a
+worker-hosted library that already happens when the worker loads your library and serializes its
+schemas; the orchestrator summarizes what the worker reported and never constructs your node.) That is
 another reason to keep it cheap and offline. Setting `library.warm_port_summaries` to `false` in
 your config turns the background pass off; the summaries are then computed by the first request that
 needs them, which moves the cost back into the artist's first drag rather than removing it.

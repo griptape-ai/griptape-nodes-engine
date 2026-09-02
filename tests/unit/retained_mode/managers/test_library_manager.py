@@ -3357,6 +3357,81 @@ class TestPortSummaryWarming:
         assert library_manager._leaked_probe_thread_count() == 0
 
     @pytest.mark.asyncio
+    async def test_a_probe_the_thread_pool_never_picked_up_charges_nothing(
+        self, engine: Engine, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A work item cancelled out of the executor's queue ran no code and holds no thread.
+
+        `asyncio.to_thread` submits to the loop's shared default executor, and a future still waiting
+        in that queue cancels for real: the callable never runs. Reading a clear "finished" signal as
+        "still holding a thread" charged the engine-wide ceiling for these, and a busy executor is
+        exactly when it happens -- so a burst of contention could permanently stop probing on an
+        engine holding no probe threads at all. It also told the operator that a node's `__init__`
+        blocks when that `__init__` had never run.
+        """
+        library_manager = engine.library_manager
+        self._register_probe_library(_PortSummaryDataOnlyProbe)
+        library = LibraryRegistry.get_library(self._LIBRARY_NAME)
+
+        async def never_reach_the_worker(_func: Callable[..., Any], *_args: Any) -> Any:
+            # Never calls the callable, which is what a work item cancelled out of the queue looks
+            # like: from the loop's side, identical to a construction that hung.
+            await asyncio.sleep(0.2)
+
+        with (
+            patch.object(_LibraryManager, "_SCHEMA_PROBE_TIMEOUT_S", 0.05),
+            patch.object(asyncio, "to_thread", new=never_reach_the_worker),
+            caplog.at_level(logging.WARNING, logger="griptape_nodes"),
+        ):
+            outcome = await library_manager._probe_node_type_port_summary(
+                library=library,
+                library_name=self._LIBRARY_NAME,
+                node_type=_PortSummaryDataOnlyProbe.__name__,
+            )
+
+        assert outcome.timed_out is True
+        assert outcome.thread_lost is False
+        assert library_manager._leaked_probe_thread_count() == 0
+        # And the warning says what actually happened rather than blaming the node.
+        timeout_warnings = [record.getMessage() for record in caplog.records if "timed out" in record.getMessage()]
+        assert len(timeout_warnings) == 1
+        assert "never started" in timeout_warnings[0]
+        assert "blocking call" not in timeout_warnings[0]
+
+    @pytest.mark.asyncio
+    async def test_cancelling_a_probe_the_thread_pool_never_picked_up_charges_nothing(self, engine: Engine) -> None:
+        """The cancellation path asks the same question as the timeout path and must answer it the same.
+
+        A reload cancels the warm pass, and the probe it lands on may be one the executor never got
+        to. Holding a signal that nothing will ever set would pause probing engine-wide until the
+        process restarted, for a thread that was never taken.
+        """
+        library_manager = engine.library_manager
+        self._register_probe_library(_PortSummaryDataOnlyProbe)
+        library = LibraryRegistry.get_library(self._LIBRARY_NAME)
+
+        async def never_reach_the_worker(_func: Callable[..., Any], *_args: Any) -> Any:
+            await asyncio.Event().wait()
+
+        with patch.object(asyncio, "to_thread", new=never_reach_the_worker):
+            probe_task = asyncio.create_task(
+                library_manager._probe_node_type_port_summary(
+                    library=library,
+                    library_name=self._LIBRARY_NAME,
+                    node_type=_PortSummaryDataOnlyProbe.__name__,
+                )
+            )
+            # One cycle puts the probe inside the construction it will be cancelled in: everything
+            # before that await is synchronous.
+            await asyncio.sleep(0)
+            probe_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await probe_task
+
+        assert library_manager._abandoned_probe_signals == []
+        assert library_manager._leaked_probe_thread_count() == 0
+
+    @pytest.mark.asyncio
     async def test_a_warm_handle_left_by_a_previous_event_loop_is_discarded(self, engine: Engine) -> None:
         """The manager outlives any one loop, and a task suspended in a closed one cannot be cancelled.
 
@@ -3486,6 +3561,106 @@ class TestPortSummaryWarming:
             assert library_manager._port_summary_warm_task is not None
         finally:
             await library_manager._cancel_port_summary_warm()
+
+    @pytest.mark.asyncio
+    async def test_nothing_can_start_a_pass_inside_the_reloads_own_cancel(self, engine: Engine) -> None:
+        """Stopping the running pass suspends, and clears the handle first, so that window counts too.
+
+        `_on_library_loaded_notification` runs as its own task and asks for a warm pass whenever a
+        worker reports its node types, so the ask can land anywhere -- including inside the reload's
+        own cancel. A pass started there is not the one the reload cancelled, and the restart at the
+        end finds it in flight and deliberately leaves it, so it runs on across the teardown the
+        cancel was there to protect.
+        """
+        library_manager = engine.library_manager
+        self._register_probe_library(_PortSummaryDataOnlyProbe)
+        task_started_inside_the_cancel: list[Any] = []
+
+        async def start_a_pass_while_cancelling() -> None:
+            library_manager._start_port_summary_warm()
+            task_started_inside_the_cancel.append(library_manager._port_summary_warm_task)
+
+        async def reload_nothing(_request: object) -> Any:
+            return MagicMock()
+
+        with (
+            patch.object(library_manager, "_cancel_port_summary_warm", side_effect=start_a_pass_while_cancelling),
+            patch.object(library_manager, "_run_reload_libraries", side_effect=reload_nothing),
+        ):
+            await library_manager.reload_libraries_request(ReloadAllLibrariesRequest())
+
+        assert task_started_inside_the_cancel == [None]
+        # The reload's own restart, on the far side of the rebuild, is the one pass that survives.
+        await library_manager._cancel_port_summary_warm()
+
+    @pytest.mark.asyncio
+    async def test_nothing_can_start_a_pass_inside_a_git_reloads_own_cancel(self, engine: Engine) -> None:
+        """The same window, with less behind it: this path never closes the loading gate.
+
+        A pass that escapes here has only the registry-identity check to stop it, and that cannot fire
+        until the library has actually been swapped -- which is after the unload the pass would
+        otherwise resolve node classes across.
+        """
+        library_manager = engine.library_manager
+        self._register_probe_library(_PortSummaryDataOnlyProbe)
+        task_started_inside_the_cancel: list[Any] = []
+
+        async def start_a_pass_while_cancelling() -> None:
+            library_manager._start_port_summary_warm()
+            task_started_inside_the_cancel.append(library_manager._port_summary_warm_task)
+
+        def fail_the_unload(_request: object) -> Any:
+            failure = MagicMock()
+            failure.succeeded.return_value = False
+            return failure
+
+        with (
+            patch.object(library_manager, "_cancel_port_summary_warm", side_effect=start_a_pass_while_cancelling),
+            patch.object(engine, "handle_request", side_effect=fail_the_unload),
+        ):
+            await library_manager._reload_library_after_git_operation(
+                library_name="updated-library",
+                library_file_path="/libs/updated-library/griptape_nodes_library.json",
+                failure_result_class=RegisterLibraryFromFileResultFailure,
+            )
+
+        assert task_started_inside_the_cancel == [None]
+        await library_manager._cancel_port_summary_warm()
+
+    @pytest.mark.asyncio
+    async def test_cancelling_the_caller_that_is_stopping_a_pass_is_not_swallowed(self, engine: Engine) -> None:
+        """A reload cancelled while it waits for the pass to stop must not carry on reloading.
+
+        Awaiting the pass directly makes it the caller's `_fut_waiter`, so cancelling the caller
+        cancels the pass and raises here indistinguishably from the cancellation the caller itself
+        requested. Swallowing that as "the pass has stopped, carry on" is how a shutdown ends up
+        tearing the registry down on behalf of a request that has already gone away.
+        """
+        library_manager = engine.library_manager
+        self._register_probe_library(_PortSummaryDataOnlyProbe)
+        pass_reached_first_probe = asyncio.Event()
+
+        async def block_on_first_probe(*_args: Any, **_kwargs: Any) -> Any:
+            pass_reached_first_probe.set()
+            await asyncio.Event().wait()
+
+        with patch.object(library_manager, "_probe_node_type_port_summary", side_effect=block_on_first_probe):
+            library_manager._start_port_summary_warm()
+            warm_task = library_manager._port_summary_warm_task
+            assert warm_task is not None
+            await pass_reached_first_probe.wait()
+
+            stopper = asyncio.create_task(library_manager._cancel_port_summary_warm())
+            # One cycle is enough to reach the wait: everything before it is synchronous.
+            await asyncio.sleep(0)
+            stopper.cancel()
+
+            with pytest.raises(asyncio.CancelledError):
+                await stopper
+
+        # And the pass it was stopping is off the loop either way, cancelled on the way in.
+        await asyncio.wait({warm_task})
+        assert warm_task.cancelled()
 
     @pytest.mark.asyncio
     async def test_a_waiting_request_takes_the_throttle_off_the_warm_pass(self, engine: Engine) -> None:
