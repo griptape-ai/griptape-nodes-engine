@@ -84,16 +84,33 @@ class RunWorkflowWithCurrentStateResultFailure(ResultPayloadFailure):
 @dataclass
 @PayloadRegistry.register
 class RunWorkflowFromRegistryRequest(RequestPayload):
-    """Run a workflow from the registry.
+    """Open a saved workflow from the registry and make it the Current Context.
 
-    Use when: Executing registered workflows, running workflows by name,
-    using workflow templates, automated workflow execution.
+    Use when: Opening a workflow by name, switching which workflow is open, loading a
+    workflow template. This is the request that OPENS a workflow: it executes the saved
+    `.py` file, which rebuilds the workflow's nodes, connections, and parameter values in
+    the engine, then leaves that workflow in the Current Context. Use this rather than
+    SetWorkflowContextRequest, which only records the name and would leave you holding an
+    empty engine -- and which refuses outright while another workflow is open.
+
+    Building the graph is where this stops. It does NOT execute the workflow; issue a
+    StartFlowRequest afterwards to do that. It also cannot open an unsaved workflow,
+    because there is no file to replay.
+
+    Whether it succeeds or fails, the engine emits a CurrentWorkflowChanged app event
+    naming the workflow that ended up in context (or None, if the failed open left the
+    engine empty). The one silent case is re-opening the workflow that is already current
+    with run_with_clean_slate=False, where the answer never changed.
 
     Args:
-        workflow_name: Name of the workflow in the registry to execute
-        run_with_clean_slate: Whether to start with a clean state (default: True)
+        workflow_name: Registry key of the workflow to open, as returned by
+            ListAllWorkflowsRequest. Not the display name.
+        run_with_clean_slate: Whether to discard everything currently in the engine before
+            opening (default: True). True is the normal "open this workflow" behavior.
+            False loads the workflow's objects alongside whatever is already there and
+            replaces the Current Context, which is rarely what you want.
 
-    Results: RunWorkflowFromRegistryResultSuccess | RunWorkflowFromRegistryResultFailure (workflow not found, execution error)
+    Results: RunWorkflowFromRegistryResultSuccess | RunWorkflowFromRegistryResultFailure (workflow not found, workflow unsaved, execution error)
     """
 
     workflow_name: str

@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 
 from griptape_nodes.retained_mode.events.base_events import (
+    AppPayload,
     RequestPayload,
     ResultPayloadFailure,
     ResultPayloadSuccess,
@@ -157,3 +158,30 @@ class EnsureWorkflowAndFlowResultSuccess(WorkflowAlteredMixin, ResultPayloadSucc
 @PayloadRegistry.register
 class EnsureWorkflowAndFlowResultFailure(ResultPayloadFailure):
     """EnsureWorkflowAndFlow failed. Common causes: could not push workflow context, flow creation rejected by the engine."""
+
+
+@dataclass
+@PayloadRegistry.register
+class CurrentWorkflowChanged(AppPayload):
+    """Current workflow switched notification.
+
+    Emitted by ContextManager whenever the workflow at the top of the context stack
+    changes: opening a saved workflow, starting a scratch one, clearing all object
+    state, deleting the workflow that was open, or renaming/moving it so its registry
+    key changes.
+
+    This is the authoritative "you are now looking at a different workflow" signal, and
+    the one a client should drive its title and canvas state from. Unlike
+    SetWorkflowContextSuccess it is not the result of a request, so a client observes it
+    even when it was not the one that asked -- a second editor attached to the same
+    engine, or an agent driving the engine over MCP. Most of these switches happen deep
+    inside another request, where no result event names the new workflow at all.
+
+    Args:
+        workflow_name: Registry key of the workflow now in context, or None when the
+            engine has no current workflow (the state right after ClearAllObjectState,
+            and the state a failed open reverts to). A workflow that has never been
+            saved reports its "unsaved:<uuid>" key.
+    """
+
+    workflow_name: str | None = None

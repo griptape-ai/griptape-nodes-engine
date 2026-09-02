@@ -26,7 +26,8 @@ from griptape_nodes.node_library.workflow_registry import (
     read_workflow_metadata,
 )
 from griptape_nodes.retained_mode.engine import Engine
-from griptape_nodes.retained_mode.events.base_events import ResultDetails
+from griptape_nodes.retained_mode.events.base_events import AppEvent, ResultDetails
+from griptape_nodes.retained_mode.events.context_events import CurrentWorkflowChanged
 from griptape_nodes.retained_mode.events.flow_events import SerializedFlowCommands
 from griptape_nodes.retained_mode.events.workflow_events import (
     BranchWorkflowRequest,
@@ -64,6 +65,9 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     RegisterWorkflowResultSuccess,
     ResetWorkflowBranchRequest,
     ResetWorkflowBranchResultSuccess,
+    RunWorkflowFromRegistryRequest,
+    RunWorkflowFromRegistryResultFailure,
+    RunWorkflowFromRegistryResultSuccess,
     SetWorkflowMetadataRequest,
     SetWorkflowMetadataResultSuccess,
     WorkflowDependencyInfo,
@@ -4838,3 +4842,135 @@ class TestRepairPathShapedDisplayName:
         assert isinstance(result, BranchWorkflowResultSuccess)
         branch = WorkflowRegistry.get_workflow_by_name(result.branched_workflow_name)
         assert branch.metadata.name == "comp (branch 1)"
+
+
+class TestRunWorkflowFromRegistryNotifiesContextChange:
+    """Opening a workflow has to be observable to clients that did not ask for it.
+
+    RunWorkflowFromRegistry pushes the opened workflow onto the context stack directly, so no
+    result event names it. With two editors on one engine that left the one that did not open
+    the workflow showing the newly loaded nodes under its own previous workflow's title, and
+    it left an MCP-driven open invisible to every editor. The push emits CurrentWorkflowChanged
+    instead, and the failure path's teardown emits the revert.
+    """
+
+    @staticmethod
+    def _notified_workflow_names(put_event: Mock) -> list[str | None]:
+        """The workflow_name off every CurrentWorkflowChanged put on the queue, in order."""
+        names: list[str | None] = []
+        for put_call in put_event.call_args_list:
+            event = put_call.args[0]
+            if isinstance(event, AppEvent) and isinstance(event.payload, CurrentWorkflowChanged):
+                names.append(event.payload.workflow_name)
+        return names
+
+    @staticmethod
+    def _saved_workflow(key: str) -> Mock:
+        """A registry entry backed by a file. `run_workflow` is mocked, so the file is never read."""
+        workflow = Mock(spec=Workflow)
+        workflow.file_path = f"{key}.py"
+        return workflow
+
+    @staticmethod
+    def _run_workflow_result(*, successful: bool) -> AsyncMock:
+        details = "ok"
+        if not successful:
+            details = "boom"
+        return AsyncMock(
+            return_value=WorkflowManager.WorkflowExecutionResult(
+                execution_successful=successful, execution_details=details
+            )
+        )
+
+    @pytest.mark.asyncio
+    async def test_clean_slate_open_notifies_the_opened_workflow_last(self, engine: Engine) -> None:
+        """The GUI's normal open path: the clear reports an empty engine, then the opened workflow."""
+        workflow_manager = engine.workflow_manager
+        workflow_manager._workflows_loading_complete.set()
+        context_manager = engine.context_manager
+        context_manager.push_workflow(workflow_name="was_open_before")
+
+        with (
+            patch.object(WorkflowRegistry, "get_workflow_by_name", return_value=self._saved_workflow("opened")),
+            patch.object(workflow_manager, "run_workflow", self._run_workflow_result(successful=True)),
+            patch.object(engine.event_manager, "put_event", Mock()) as put_event,
+        ):
+            result = await workflow_manager.on_run_workflow_from_registry_request(
+                RunWorkflowFromRegistryRequest(workflow_name="opened", run_with_clean_slate=True)
+            )
+
+        assert isinstance(result, RunWorkflowFromRegistryResultSuccess)
+        # The clean slate empties the context before the open fills it, and clients hear both.
+        assert self._notified_workflow_names(put_event) == [None, "opened"]
+        assert context_manager.get_current_workflow_name() == "opened"
+
+        context_manager.pop_workflow()
+
+    @pytest.mark.asyncio
+    async def test_bare_open_notifies_even_though_a_workflow_was_already_in_context(self, engine: Engine) -> None:
+        """run_with_clean_slate=False pushes on top of the old context, and that still notifies."""
+        workflow_manager = engine.workflow_manager
+        workflow_manager._workflows_loading_complete.set()
+        context_manager = engine.context_manager
+        context_manager.push_workflow(workflow_name="was_open_before")
+
+        with (
+            patch.object(WorkflowRegistry, "get_workflow_by_name", return_value=self._saved_workflow("opened_bare")),
+            patch.object(workflow_manager, "run_workflow", self._run_workflow_result(successful=True)),
+            patch.object(engine.event_manager, "put_event", Mock()) as put_event,
+        ):
+            result = await workflow_manager.on_run_workflow_from_registry_request(
+                RunWorkflowFromRegistryRequest(workflow_name="opened_bare", run_with_clean_slate=False)
+            )
+
+        assert isinstance(result, RunWorkflowFromRegistryResultSuccess)
+        assert self._notified_workflow_names(put_event) == ["opened_bare"]
+        assert context_manager.get_current_workflow_name() == "opened_bare"
+
+        context_manager.pop_workflow()
+        context_manager.pop_workflow()
+
+    @pytest.mark.asyncio
+    async def test_failed_open_notifies_the_revert_so_clients_do_not_show_a_workflow_that_is_gone(
+        self, engine: Engine
+    ) -> None:
+        """A failed open tears the engine down, and clients are told the engine now has nothing."""
+        workflow_manager = engine.workflow_manager
+        workflow_manager._workflows_loading_complete.set()
+        context_manager = engine.context_manager
+
+        with (
+            patch.object(WorkflowRegistry, "get_workflow_by_name", return_value=self._saved_workflow("open_fails")),
+            patch.object(workflow_manager, "run_workflow", self._run_workflow_result(successful=False)),
+            patch.object(engine.event_manager, "put_event", Mock()) as put_event,
+        ):
+            result = await workflow_manager.on_run_workflow_from_registry_request(
+                RunWorkflowFromRegistryRequest(workflow_name="open_fails", run_with_clean_slate=True)
+            )
+
+        assert isinstance(result, RunWorkflowFromRegistryResultFailure)
+        # Pushed hopefully, then reverted by the failure teardown -- and the last word is the truth.
+        assert self._notified_workflow_names(put_event)[-1] is None
+        assert not context_manager.has_current_workflow()
+
+    @pytest.mark.asyncio
+    async def test_unsaved_workflow_is_rejected_before_anything_is_notified(self, engine: Engine) -> None:
+        """An unsaved workflow has no file to replay, and the reject leaves the context untouched."""
+        workflow_manager = engine.workflow_manager
+        workflow_manager._workflows_loading_complete.set()
+        context_manager = engine.context_manager
+
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            _register_unsaved_workflow(key="unsaved:no-file", name="Untitled")
+            context_manager.push_workflow(workflow_name="stays_open")
+
+            with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
+                result = await workflow_manager.on_run_workflow_from_registry_request(
+                    RunWorkflowFromRegistryRequest(workflow_name="unsaved:no-file")
+                )
+
+            assert isinstance(result, RunWorkflowFromRegistryResultFailure)
+            assert self._notified_workflow_names(put_event) == []
+            assert context_manager.get_current_workflow_name() == "stays_open"
+
+            context_manager.pop_workflow()

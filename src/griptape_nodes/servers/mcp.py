@@ -88,6 +88,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
 )
 from griptape_nodes.retained_mode.events.workflow_events import (
     ListAllWorkflowsRequest,
+    RunWorkflowFromRegistryRequest,
     RunWorkflowWithCurrentStateRequest,
     SaveWorkflowRequest,
 )
@@ -97,6 +98,12 @@ from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
 
 SUPPORTED_REQUEST_EVENTS: dict[str, type[RequestPayload]] = {
     # Workflows
+    # RunWorkflowFromRegistryRequest is how an external client OPENS a workflow: it loads the
+    # saved file's nodes, connections, and values into the engine and puts it in the Current
+    # Context. SetWorkflowContextRequest only does the bookkeeping half, so without this an
+    # agent had no way to open anything -- and, because the editor always keeps a workflow in
+    # context, no way to get past SetWorkflowContext's already-in-context refusal either.
+    "RunWorkflowFromRegistryRequest": RunWorkflowFromRegistryRequest,
     "RunWorkflowWithCurrentStateRequest": RunWorkflowWithCurrentStateRequest,
     "ListAllWorkflowsRequest": ListAllWorkflowsRequest,
     # Workflow context

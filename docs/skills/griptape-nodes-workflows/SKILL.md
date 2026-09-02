@@ -9,7 +9,7 @@ This skill covers the full cold-start cycle (build → wire → run → read) ag
 
 ## Mental Model
 
-- **Workflow**: Top-level namespace. Only ONE can be active at a time. Reset with `ClearAllObjectStateRequest`.
+- **Workflow**: Top-level namespace. Only ONE can be active at a time. Open a saved one with `RunWorkflowFromRegistryRequest`; wipe back to an empty engine with `ClearAllObjectStateRequest`.
 - **Flow**: The canvas inside a workflow. A workflow has exactly one top-level "canvas" flow. Sub-flows are possible but rarely needed for scratch work.
 - **Node**: A unit of work with parameters (inputs, outputs, properties).
 - **Connection**: An edge between two parameters. Two kinds:
@@ -366,9 +366,26 @@ A typo here surfaces as an opaque validation error from pydantic, not a friendly
 
 ### Only one workflow in context at a time
 
-`SetWorkflowContextRequest` refuses if a workflow is already in context. To swap,
-`ClearAllObjectStateRequest(i_know_what_im_doing=True)` first — this wipes
-EVERYTHING (nodes, flows, connections, workflow). There is no softer reset today.
+`SetWorkflowContextRequest` refuses if a workflow is already in context — and when an
+editor is attached there always is one, because a blank canvas is itself an
+`unsaved:` workflow. Don't reach for `ClearAllObjectStateRequest` to get around that:
+
+- **To open a saved workflow**, send `RunWorkflowFromRegistryRequest(workflow_name=...)`.
+    That is the request that actually opens one: it replays the saved `.py`, rebuilding the
+    workflow's nodes, connections, and values, and leaves it in the Current Context. It
+    does not require an empty context, and by default (`run_with_clean_slate=True`) it
+    discards what was open first. It does NOT run the workflow — follow with
+    `StartFlowRequest` for that.
+- **To close what's open without opening anything**, send
+    `ClearAllObjectStateRequest(i_know_what_im_doing=True)`. This wipes EVERYTHING
+    (nodes, flows, connections, workflow) and leaves the engine with no current workflow.
+
+`SetWorkflowContextRequest` itself is bookkeeping only: it records a name and never reads
+a file, so on its own it would leave you holding a workflow name and none of its nodes.
+
+Either way the engine broadcasts a `CurrentWorkflowChanged` app event carrying the
+`workflow_name` now in context (`None` when the engine has none), so every attached
+editor follows along when an agent switches workflows out from under it.
 
 ### Agents cannot be interrupted mid-run
 
@@ -382,6 +399,8 @@ flow keeps running in the engine until it finishes or errors. A subsequent
 | Goal                                                            | Tool                                                                                                                                                      |
 | --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Bootstrap a workflow + flow from cold                           | `EnsureWorkflowAndFlowRequest`                                                                                                                            |
+| List the saved workflows (for their registry keys)              | `ListAllWorkflowsRequest`                                                                                                                                 |
+| Open a saved workflow (replacing what's open)                   | `RunWorkflowFromRegistryRequest(workflow_name=...)` — loads its nodes; does not run it                                                                    |
 | Fan N requests out in one round trip                            | `EventRequestBatch` (synthetic; pre-name nodes that later slots reference)                                                                                |
 | Discover libraries / node types                                 | `ListRegisteredLibrariesRequest`, `ListNodeTypesInLibraryRequest`, `ListCategoriesInLibraryRequest`                                                       |
 | Inspect a node type's parameters                                | `DescribeNodeTypeRequest`                                                                                                                                 |
@@ -402,7 +421,7 @@ flow keeps running in the engine until it finishes or errors. A subsequent
 | Inspect state                                                   | `ListNodesInFlowRequest`, `ListConnectionsForNodeRequest`, `GetNodeResolutionStateRequest`, `GetNodeMetadataRequest`, `GetConnectionsForParameterRequest` |
 | Find nodes by Python class (e.g. StartFlow, Agent)              | `ListNodesInFlowRequest(node_types=["StartFlow", "Agent"])` — returns only nodes whose class name matches; omit to get all nodes                          |
 | Register a sandbox node type from Python source already on disk | `RegisterSandboxNodeFromSourceRequest` (see Custom nodes below)                                                                                           |
-| Reset everything                                                | `ClearAllObjectStateRequest(i_know_what_im_doing=True)`                                                                                                   |
+| Reset everything                                                | `ClearAllObjectStateRequest(i_know_what_im_doing=True)` — leaves no current workflow                                                                      |
 
 ## Custom nodes
 

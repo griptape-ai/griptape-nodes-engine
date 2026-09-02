@@ -1057,6 +1057,9 @@ class WorkflowManager(EngineScoped):
                     return RunWorkflowFromRegistryResultFailure(result_details=details)
 
             # Let's run under the assumption that this Workflow will become our Current Context; if we fail, it will revert.
+            # This push is what tells clients the workflow changed: it emits CurrentWorkflowChanged,
+            # as does the revert below, so both the success and failure paths leave every attached
+            # client agreeing with the engine about what is open. Nothing to emit from here.
             self.engine.context_manager.push_workflow(request.workflow_name)
             # run file
             execution_result = await self.run_workflow(relative_file_path=relative_file_path)
