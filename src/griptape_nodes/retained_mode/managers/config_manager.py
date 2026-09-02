@@ -72,6 +72,17 @@ USER_CONFIG_PATH = xdg_config_home() / "griptape_nodes" / "griptape_nodes_config
 # would pin the resolved path above every config file and every project override.
 DEFAULT_LIBRARIES_ROOT_ENV_VAR = "GTN_DEFAULT_LIBRARIES_ROOT"
 
+# Prefix marking an environment variable as a config input, and the separator that splits the
+# remainder into a nested key path. A single underscore cannot serve as the separator because
+# setting names contain underscores themselves (`storage_backend`), so `WORKER_HEARTBEAT_TIMEOUT_S`
+# would be ambiguous.
+ENV_VAR_PREFIX = "GTN_CONFIG_"
+ENV_VAR_PATH_SEPARATOR = "__"
+
+# Outcomes of coercing an environment variable that no real config value can collide with.
+_REJECTED_BY_SCHEMA = object()
+_ABSENT_FROM_SCHEMA = object()
+
 
 class ConfigManager(EngineScoped):
     """A class to manage application configuration and file pathing.
@@ -84,8 +95,10 @@ class ConfigManager(EngineScoped):
     5. Environment variables with GTN_CONFIG_ prefix (highest priority)
 
     Environment variables starting with GTN_CONFIG_ are converted to config keys by removing the prefix
-    and converting to lowercase (e.g., GTN_CONFIG_FOO=bar becomes {"foo": "bar"}). That flow is
-    input-only: nothing here writes a GTN_CONFIG_ variable back out.
+    and converting to lowercase (e.g., GTN_CONFIG_FOO=bar becomes {"foo": "bar"}), with a double
+    underscore separating nested keys (GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S=30 becomes
+    {"worker": {"heartbeat_timeout_s": 30.0}}). That flow is input-only: nothing here writes a
+    GTN_CONFIG_ variable back out.
 
     The one variable this manager PUBLISHES is GTN_DEFAULT_LIBRARIES_ROOT, written once at
     construction so project templates can reference the engine's default libraries root. See
@@ -115,6 +128,10 @@ class ConfigManager(EngineScoped):
         self._workspace_config_path: Path | None = None
         self._workspace_dir_override: str | None = None
         self._libraries_root_override: str | None = None
+        # (variable name, value) pairs already reported as invalid. The env layer is re-read on every
+        # load_configs() and on each read_env_config() call, so without this a single bad variable
+        # warns repeatedly for the life of the process.
+        self._reported_invalid_env_vars: set[tuple[str, str]] = set()
         self.load_configs()
 
         # Once per engine process, before any project YAML is read. See the method docstring for why
@@ -374,18 +391,80 @@ class ConfigManager(EngineScoped):
         GTN_CONFIG_FOO=bar becomes {"foo": "bar"}
         GTN_CONFIG_STORAGE_BACKEND=gtc becomes {"storage_backend": "gtc"}
 
+        A double underscore separates nested keys, so
+        GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S=30 becomes {"worker": {"heartbeat_timeout_s": 30.0}}.
+        Because the whole name is lowercased, this only reaches settings whose keys are lowercase:
+        case-sensitive trees such as `nodes.<Library>.<SECRET>` stay config-file-only.
+
         Returns:
             Dictionary containing config values from environment variables
         """
-        env_config = {}
+        env_config: dict[str, Any] = {}
         for key, value in os.environ.items():
-            if key.startswith("GTN_CONFIG_"):
-                # Remove GTN_CONFIG_ prefix and convert to lowercase
-                config_key = key[11:].lower()  # len("GTN_CONFIG_") = 11
-                env_config[config_key] = value
-                logger.debug("Loaded config from env var: %s -> %s", key, config_key)
+            if not key.startswith(ENV_VAR_PREFIX):
+                continue
+            config_key = key.removeprefix(ENV_VAR_PREFIX).lower().replace(ENV_VAR_PATH_SEPARATOR, ".")
+            coerced_value = self._coerce_env_var_value(config_key, value)
+            if coerced_value is _REJECTED_BY_SCHEMA:
+                self._report_invalid_env_var(key, value, config_key)
+                continue
+            set_dot_value(env_config, config_key, coerced_value)
+            logger.debug("Loaded config from env var: %s -> %s", key, config_key)
 
         return env_config
+
+    def _coerce_env_var_value(self, config_key: str, raw_value: str) -> Any:
+        """Coerce one environment variable's string to the type the Settings model declares for it.
+
+        Environment variables are always strings, so a bool, number, or enum setting would otherwise
+        reach read sites as text -- and "false" is truthy. Validating a single-key delta against
+        Settings (every field has a default, so a partial dict validates) both converts the value and
+        contains the damage from a bad one to that key.
+
+        Args:
+            config_key: The dot-notation key the variable maps to.
+            raw_value: The variable's string value.
+
+        Returns:
+            The coerced value, the raw string when the key is outside the Settings schema, or
+            _REJECTED_BY_SCHEMA when the model rejects the value.
+        """
+        candidate = set_dot_value({}, config_key, raw_value)
+
+        try:
+            validated = Settings.model_validate(candidate)
+        except ValidationError:
+            return _REJECTED_BY_SCHEMA
+
+        coerced_value = get_dot_value(validated.model_dump(), config_key, _ABSENT_FROM_SCHEMA)
+        if coerced_value is _ABSENT_FROM_SCHEMA:
+            # A sub-key of a nested model that the model does not declare; it validated only because
+            # the model ignores unknown sub-keys. Keep the string so the value still reaches
+            # anything reading the key directly.
+            return raw_value
+
+        return coerced_value
+
+    def _report_invalid_env_var(self, env_var_name: str, raw_value: str, config_key: str) -> None:
+        """Warn once per variable and value that an environment override was ignored.
+
+        Args:
+            env_var_name: The full environment variable name.
+            raw_value: The value that failed validation.
+            config_key: The dot-notation setting the variable maps to.
+        """
+        report_key = (env_var_name, raw_value)
+        if report_key in self._reported_invalid_env_vars:
+            return
+
+        self._reported_invalid_env_vars.add(report_key)
+        logger.warning(
+            "Ignoring environment variable %s: '%s' is not a valid value for the '%s' setting. "
+            "Falling back to the configured value.",
+            env_var_name,
+            raw_value,
+            config_key,
+        )
 
     def _load_config_from_file(self, path: Path, label: str) -> dict:
         """Read and parse a JSON config file. Returns empty dict if missing or unparsable."""

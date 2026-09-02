@@ -3,7 +3,7 @@
 
 # Configuration Reference
 
-Every Griptape Nodes engine setting, grouped by category. Each setting can be placed in any `griptape_nodes_config.json` file (see [Engine Configuration](../guides/configuration.md) for the load order). Settings with a `GTN_CONFIG_*` env var can also be overridden from the environment; nested settings must be edited in a config file.
+Every Griptape Nodes engine setting, grouped by category. Each setting can be placed in any `griptape_nodes_config.json` file (see [Engine Configuration](../guides/configuration.md) for the load order). Settings with a `GTN_CONFIG_*` env var, including the `GTN_CONFIG_<NAME>__<SUB_KEY>` form for a nested setting's scalar sub-keys and the `GTN_CONFIG_<NAME>__<KEY>` form for a mapping-valued setting's entries, can also be overridden from the environment; list-valued settings must be edited in a config file. A mapping's keys are matched case-sensitively but the whole variable name is lowercased, so only an already-lowercase key is reachable from the environment (see the guide for details).
 
 ## File System
 
@@ -23,20 +23,20 @@ Directories and file paths for the application
 
 Configuration for application lifecycle events
 
-| Setting      | Type   | Default         | Environment variable           | Description                                                   |
-| ------------ | ------ | --------------- | ------------------------------ | ------------------------------------------------------------- |
-| `app_events` | object | (nested object) | n/a (nested; edit config file) | Nested settings; edit the sub-keys directly in a config file. |
+| Setting      | Type   | Default         | Environment variable                                                     | Description                                                                                                                      |
+| ------------ | ------ | --------------- | ------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------- |
+| `app_events` | object | (nested object) | `GTN_CONFIG_APP_EVENTS__ON_APP_INITIALIZATION_COMPLETE__REQUIRES_ENGINE` | Nested settings; the listed sub-keys can be set from the environment, and every sub-key can be edited directly in a config file. |
 
 ## Execution
 
 Workflow execution and processing settings
 
-| Setting                   | Type                                                   | Default         | Environment variable                 | Description                                                                                                                                                                                                             |
-| ------------------------- | ------------------------------------------------------ | --------------- | ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `log_level`               | one of `CRITICAL`, `ERROR`, `WARNING`, `INFO`, `DEBUG` | `"INFO"`        | `GTN_CONFIG_LOG_LEVEL`               | Logging verbosity for the engine. One of CRITICAL, ERROR, WARNING, INFO, or DEBUG, from least to most verbose.                                                                                                          |
-| `workflow_execution_mode` | one of `sequential`, `parallel`                        | `"sequential"`  | `GTN_CONFIG_WORKFLOW_EXECUTION_MODE` | Workflow execution mode for node processing. SEQUENTIAL mode uses ParallelResolutionMachine with max_nodes_in_parallel=1 to execute nodes one at a time. PARALLEL mode uses the configured max_nodes_in_parallel value. |
-| `max_nodes_in_parallel`   | integer                                                | `5`             | `GTN_CONFIG_MAX_NODES_IN_PARALLEL`   | Maximum number of nodes executing at a time for parallel execution.                                                                                                                                                     |
-| `worker`                  | object                                                 | (nested object) | n/a (nested; edit config file)       | Nested settings; edit the sub-keys directly in a config file.                                                                                                                                                           |
+| Setting                   | Type                                                   | Default         | Environment variable                                                                                                                | Description                                                                                                                                                                                                             |
+| ------------------------- | ------------------------------------------------------ | --------------- | ----------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `log_level`               | one of `CRITICAL`, `ERROR`, `WARNING`, `INFO`, `DEBUG` | `"INFO"`        | `GTN_CONFIG_LOG_LEVEL`                                                                                                              | Logging verbosity for the engine. One of CRITICAL, ERROR, WARNING, INFO, or DEBUG, from least to most verbose.                                                                                                          |
+| `workflow_execution_mode` | one of `sequential`, `parallel`                        | `"sequential"`  | `GTN_CONFIG_WORKFLOW_EXECUTION_MODE`                                                                                                | Workflow execution mode for node processing. SEQUENTIAL mode uses ParallelResolutionMachine with max_nodes_in_parallel=1 to execute nodes one at a time. PARALLEL mode uses the configured max_nodes_in_parallel value. |
+| `max_nodes_in_parallel`   | integer                                                | `5`             | `GTN_CONFIG_MAX_NODES_IN_PARALLEL`                                                                                                  | Maximum number of nodes executing at a time for parallel execution.                                                                                                                                                     |
+| `worker`                  | object                                                 | (nested object) | `GTN_CONFIG_WORKER__HEARTBEAT_INTERVAL_S`, `GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S`, `GTN_CONFIG_WORKER__HEARTBEAT_STARTUP_GRACE_S` | Nested settings; the listed sub-keys can be set from the environment, and every sub-key can be edited directly in a config file.                                                                                        |
 
 ## Storage
 
@@ -62,9 +62,9 @@ System resource requirements and limits
 
 Model Context Protocol server configurations
 
-| Setting       | Type  | Default | Environment variable           | Description                                          |
-| ------------- | ----- | ------- | ------------------------------ | ---------------------------------------------------- |
-| `mcp_servers` | array | `[]`    | n/a (nested; edit config file) | List of Model Context Protocol server configurations |
+| Setting       | Type  | Default | Environment variable                | Description                                          |
+| ------------- | ----- | ------- | ----------------------------------- | ---------------------------------------------------- |
+| `mcp_servers` | array | `[]`    | n/a (list/object; edit config file) | List of Model Context Protocol server configurations |
 
 ## Static Server
 
@@ -78,31 +78,31 @@ Static file server configuration for serving media assets
 
 Settings for artifact providers and preview generation
 
-| Setting     | Type   | Default | Environment variable           | Description                                                         |
-| ----------- | ------ | ------- | ------------------------------ | ------------------------------------------------------------------- |
-| `artifacts` | object | `{}`    | n/a (nested; edit config file) | Control how previews are generated for images and other media files |
+| Setting     | Type   | Default | Environment variable          | Description                                                         |
+| ----------- | ------ | ------- | ----------------------------- | ------------------------------------------------------------------- |
+| `artifacts` | object | `{}`    | `GTN_CONFIG_ARTIFACTS__<KEY>` | Control how previews are generated for images and other media files |
 
 ## Projects
 
 Project template configurations and registrations
 
-| Setting              | Type   | Default | Environment variable           | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| -------------------- | ------ | ------- | ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `project_file`       | string | `null`  | `GTN_CONFIG_PROJECT_FILE`      | Path to the project file (griptape-nodes-project.yml) to load initially when the engine starts. When set, overrides the default location of \<workspace_directory>/griptape-nodes-project.yml. If the specified path does not exist, falls back to the workspace default. The sentinel value '<system-defaults>' means the engine deliberately stays on system defaults and suppresses the workspace-default fallback (so a workspace griptape-nodes-project.yml is not auto-discovered); this is what the engine persists when it is intentionally on system defaults. |
-| `project_workspaces` | object | `{}`    | n/a (nested; edit config file) | Mapping of project identifiers to workspace directory overrides. A key may be either a project ID or a project file path: it is first matched against loaded project IDs, and if none match, treated as a project file path. When a project is loaded, if it matches a key here, the corresponding value is used as the workspace directory instead of the project-adjacent config or auto-default.                                                                                                                                                                     |
+| Setting              | Type   | Default | Environment variable                   | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| -------------------- | ------ | ------- | -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `project_file`       | string | `null`  | `GTN_CONFIG_PROJECT_FILE`              | Path to the project file (griptape-nodes-project.yml) to load initially when the engine starts. When set, overrides the default location of \<workspace_directory>/griptape-nodes-project.yml. If the specified path does not exist, falls back to the workspace default. The sentinel value '<system-defaults>' means the engine deliberately stays on system defaults and suppresses the workspace-default fallback (so a workspace griptape-nodes-project.yml is not auto-discovered); this is what the engine persists when it is intentionally on system defaults. |
+| `project_workspaces` | object | `{}`    | `GTN_CONFIG_PROJECT_WORKSPACES__<KEY>` | Mapping of project identifiers to workspace directory overrides. A key may be either a project ID or a project file path: it is first matched against loaded project IDs, and if none match, treated as a project file path. When a project is loaded, if it matches a key here, the corresponding value is used as the workspace directory instead of the project-adjacent config or auto-default.                                                                                                                                                                     |
 
 ## Agent
 
 Agent behavior and system prompt
 
-| Setting | Type   | Default         | Environment variable           | Description                                                   |
-| ------- | ------ | --------------- | ------------------------------ | ------------------------------------------------------------- |
-| `agent` | object | (nested object) | n/a (nested; edit config file) | Nested settings; edit the sub-keys directly in a config file. |
+| Setting | Type   | Default         | Environment variable              | Description                                                                                                                      |
+| ------- | ------ | --------------- | --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `agent` | object | (nested object) | `GTN_CONFIG_AGENT__SYSTEM_PROMPT` | Nested settings; the listed sub-keys can be set from the environment, and every sub-key can be edited directly in a config file. |
 
 ## Libraries
 
 Settings for library management and dependency installation
 
-| Setting   | Type   | Default         | Environment variable           | Description                                                   |
-| --------- | ------ | --------------- | ------------------------------ | ------------------------------------------------------------- |
-| `library` | object | (nested object) | n/a (nested; edit config file) | Nested settings; edit the sub-keys directly in a config file. |
+| Setting   | Type   | Default         | Environment variable                                                                                                                  | Description                                                                                                                      |
+| --------- | ------ | --------------- | ------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `library` | object | (nested object) | `GTN_CONFIG_LIBRARY__DEPENDENCY_INSTALL_BEHAVIOR`, `GTN_CONFIG_LIBRARY__LAZY_NODE_LOADING`, `GTN_CONFIG_LIBRARY__MINIMUM_RELEASE_AGE` | Nested settings; the listed sub-keys can be set from the environment, and every sub-key can be edited directly in a config file. |
