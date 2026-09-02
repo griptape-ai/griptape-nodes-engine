@@ -156,8 +156,26 @@ class IterationFailure:
     detail: str
 
 
+@dataclass(frozen=True)
+class IterationOutcome:
+    """What one parallel loop iteration did, as reported back by its task.
+
+    A bool would be enough to route the iteration, but not enough to explain it: the reason a
+    parallel iteration failed is only available inside the task that ran it, so the verdict and
+    the reason have to travel together or the reason is lost.
+    """
+
+    iteration_index: int
+    succeeded: bool
+    detail: str
+
+
 # How many distinct failure reasons a loop error message names before deferring to the log.
 MAX_REPORTED_ITERATION_FAILURES = 5
+
+# How many individual iteration numbers to name before switching to "(+N more)". Only reached when
+# the failed iterations are not a contiguous run, which is already summarised as "first-last".
+MAX_ENUMERATED_ITERATION_NUMBERS = 6
 
 # Results the engine produces while rebuilding a loop body into a transient flow. They describe
 # node copies the artist never placed, in a flow that is deleted before the run ends, so an editor
@@ -187,12 +205,19 @@ LOOP_EVENTS_TO_SUPPRESS = {
     DeserializeFlowFromCommandsResultFailure,
 }
 
-# NOTE: unlike LOOP_EVENTS_TO_SUPPRESS, this set is inert. Execution events are emitted through
+# NOTE: unlike LOOP_EVENTS_TO_SUPPRESS, every member of this set is inert, and that is checked by
+# test_execution_events_to_suppress_is_entirely_inert. Execution events are emitted through
 # put_event/aput_event, which never consult should_suppress_event -- only request results are
 # checked (engine.py). Left in place as the record of intent: the aim is to stop parallel
 # iterations from flooding the websocket with per-node execution traffic. Wiring put_event up to
 # suppression would also silence the node highlighting that EventTranslationContext exists to
 # provide, so it needs its own design rather than a one-line change.
+#
+# Keep it that way. StartLocalSubflowResultSuccess/Failure used to be listed here, and they are
+# ResultPayload subclasses, so once should_suppress_event started matching properly they were the
+# one pair that actually took effect -- silently dropping a parallel loop's per-iteration results
+# on the way to the editor. Adding a request result to this set is a live transport change wearing
+# the costume of a no-op; put it in LOOP_EVENTS_TO_SUPPRESS deliberately or leave it out.
 EXECUTION_EVENTS_TO_SUPPRESS = {
     CurrentControlNodeEvent,
     CurrentDataNodeEvent,
@@ -211,8 +236,6 @@ EXECUTION_EVENTS_TO_SUPPRESS = {
     AgentStreamEvent,
     AlterElementEvent,
     RemoveElementEvent,
-    StartLocalSubflowResultSuccess,
-    StartLocalSubflowResultFailure,
     ProgressEvent,
 }
 
@@ -392,14 +415,19 @@ class NodeExecutor(EngineScoped):
             f"Attempted to run all {total_iterations} iterations of loop '{loop_name}'. "
             f"Failed because {len(iteration_failures)} of them did not finish."
         )
-        detail_lines = NodeExecutor._format_iteration_failure_lines(iteration_failures)
+        detail_lines = NodeExecutor._format_iteration_failure_lines(
+            iteration_failures, total_iterations=total_iterations
+        )
         if not detail_lines:
             return summary
         return "\n".join([summary, *detail_lines])
 
     @staticmethod
     def _format_iteration_failure_lines(
-        iteration_failures: list[IterationFailure], *, max_lines: int = MAX_REPORTED_ITERATION_FAILURES
+        iteration_failures: list[IterationFailure],
+        *,
+        total_iterations: int | None = None,
+        max_lines: int = MAX_REPORTED_ITERATION_FAILURES,
     ) -> list[str]:
         """Render one indented line per distinct failure reason.
 
@@ -408,6 +436,9 @@ class NodeExecutor(EngineScoped):
         At most ``max_lines`` reasons are rendered so a long loop cannot produce an unreadable
         wall of text; the engine log has already recorded every iteration individually, so the
         tail line points there.
+
+        ``total_iterations`` is optional only because the parallel path logs these lines without a
+        summary above them; pass it whenever it is known so a wholly-failed loop can say so.
         """
         if not iteration_failures:
             return []
@@ -418,16 +449,38 @@ class NodeExecutor(EngineScoped):
 
         lines = []
         for detail, iteration_numbers in list(iterations_by_detail.items())[:max_lines]:
-            if len(iteration_numbers) == 1:
-                label = f"Iteration {iteration_numbers[0]}"
-            else:
-                label = f"Iterations {', '.join(str(number) for number in iteration_numbers)}"
+            label = NodeExecutor._describe_failed_iterations(iteration_numbers, total_iterations)
             lines.append(f"  {label}: {detail}")
 
         unreported_count = len(iterations_by_detail) - len(lines)
         if unreported_count > 0:
             lines.append(f"  ... and {unreported_count} more reason(s). See the engine log for every iteration.")
         return lines
+
+    @staticmethod
+    def _describe_failed_iterations(iteration_numbers: list[int], total_iterations: int | None) -> str:
+        """Name a group of failed iterations in a handful of characters, however many there are.
+
+        Capping the number of *reasons* is not enough on its own: a 500-iteration loop that fails
+        identically every time collapses to a single line, and enumerating all 500 numbers pushes
+        the reason -- the part worth reading -- kilobytes to the right.
+        """
+        sorted_numbers = sorted(iteration_numbers)
+        count = len(sorted_numbers)
+
+        if total_iterations is not None and count >= total_iterations:
+            return "Every iteration"
+        if count == 1:
+            return f"Iteration {sorted_numbers[0]}"
+
+        spans_a_contiguous_run = sorted_numbers[-1] - sorted_numbers[0] == count - 1
+        if spans_a_contiguous_run:
+            return f"Iterations {sorted_numbers[0]}-{sorted_numbers[-1]}"
+        if count <= MAX_ENUMERATED_ITERATION_NUMBERS:
+            return f"Iterations {', '.join(str(number) for number in sorted_numbers)}"
+
+        shown = ", ".join(str(number) for number in sorted_numbers[:MAX_ENUMERATED_ITERATION_NUMBERS])
+        return f"Iterations {shown} (+{count - MAX_ENUMERATED_ITERATION_NUMBERS} more)"
 
     @staticmethod
     def _silence_packaged_node_creation_broadcasts(
@@ -443,10 +496,19 @@ class NodeExecutor(EngineScoped):
         keeps the rebuild entirely inside the engine: in-process callers still get the full
         result, only the queued broadcast is skipped.
 
-        Set here rather than in the packaging handler on purpose. That handler also serves
-        workflow publishing, and generated workflow files are emitted by reflecting over each
-        create command's non-default fields (workflow_manager._generate_node_creation_code), so
-        flipping the flag there would bake a transport detail into saved artifacts.
+        Call this at the boundary that deserializes in-process, not at the one that packages.
+        Generated workflow files are emitted by reflecting over each create command's non-default
+        fields (workflow_manager._generate_node_creation_code), so a command carrying
+        broadcast_result=False writes that transport detail into the saved artifact. Packaging runs
+        before the execution-environment branch, and the private and cloud-publisher branches hand
+        the very same serialized_flow_commands to SaveWorkflowFileFromSerializedFlowRequest -- so
+        silencing at packaging time reaches a file on disk, and on the publisher branch a file in a
+        library. The local deserialization sites are the only ones that both need the flag and never
+        save; they also already own the EventSuppressionContext window that backs this up, which
+        puts the two halves of the fix in one place.
+
+        The mutation is in place and permanent for the lifetime of the package_result, which is safe
+        here only because these callers do not save it.
         """
         for serialized_node in package_result.serialized_flow_commands.serialized_node_commands:
             serialized_node.create_node_command.broadcast_result = False
@@ -945,8 +1007,6 @@ class NodeExecutor(EngineScoped):
             msg = f"Failed to package loop nodes for '{end_node.name}'. Error: {package_result.result_details}"
             raise TypeError(msg)
 
-        self._silence_packaged_node_creation_broadcasts(package_result)
-
         logger.info(
             "Successfully packaged %d nodes for loop execution from '%s' to '%s'",
             len(all_nodes),
@@ -1184,6 +1244,7 @@ class NodeExecutor(EngineScoped):
         context_manager = self.engine.context_manager
         event_manager = self.engine.event_manager
         deserialized_flows: list[tuple[int, str, dict[str, str]]] = []
+        self._silence_packaged_node_creation_broadcasts(package_result)
         try:
             with EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS):
                 deserialize_request = DeserializeFlowFromCommandsRequest(
@@ -1776,6 +1837,7 @@ class NodeExecutor(EngineScoped):
         """
         context_manager = self.engine.context_manager
         event_manager = self.engine.event_manager
+        self._silence_packaged_node_creation_broadcasts(package_result)
         with EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS):
             deserialize_request = DeserializeFlowFromCommandsRequest(
                 serialized_flow_commands=package_result.serialized_flow_commands
@@ -2232,8 +2294,6 @@ class NodeExecutor(EngineScoped):
         if not isinstance(package_result, PackageNodesAsSerializedFlowResultSuccess):
             msg = f"Failed to package {label} '{node.name}'. Error: {package_result.result_details}"
             raise TypeError(msg)
-
-        self._silence_packaged_node_creation_broadcasts(package_result)
 
         logger.info(
             "Successfully packaged %d nodes for %s '%s'",
@@ -3104,6 +3164,7 @@ class NodeExecutor(EngineScoped):
         deserialized_flows = []
         context_manager = self.engine.context_manager
         saved_context_flow = context_manager.get_current_flow() if context_manager.has_current_flow() else None
+        self._silence_packaged_node_creation_broadcasts(package_result)
 
         # Suppress events during deserialization to prevent sending them to websockets
         event_manager = self.engine.event_manager
@@ -3146,8 +3207,8 @@ class NodeExecutor(EngineScoped):
 
             async def run_single_iteration(
                 flow_name: str, iteration_index: int, start_node_name: str
-            ) -> tuple[int, bool]:
-                """Run a single iteration flow and return success status."""
+            ) -> IterationOutcome:
+                """Run a single iteration flow and report whether it finished, and why not."""
                 # Suppress execution events during parallel iteration to prevent flooding websockets
                 with EventSuppressionContext(event_manager, EXECUTION_EVENTS_TO_SUPPRESS):
                     start_subflow_request = StartLocalSubflowRequest(
@@ -3156,8 +3217,15 @@ class NodeExecutor(EngineScoped):
                         pickle_control_flow_result=False,
                     )
                     start_subflow_result = await self.engine.ahandle_request(start_subflow_request)
-                    success = isinstance(start_subflow_result, StartLocalSubflowResultSuccess)
-                    return iteration_index, success
+                    if isinstance(start_subflow_result, StartLocalSubflowResultSuccess):
+                        return IterationOutcome(iteration_index=iteration_index, succeeded=True, detail="")
+                    # Carry the reason out with the verdict. Narrowing this to a bool is what used to
+                    # leave the parallel path reporting a failure "without a reason" it had in hand.
+                    return IterationOutcome(
+                        iteration_index=iteration_index,
+                        succeeded=False,
+                        detail=str(start_subflow_result.result_details),
+                    )
 
             # Step 3: Set input values on start nodes for each iteration
             for iteration_index, _, node_name_mappings in deserialized_flows:
@@ -3239,16 +3307,15 @@ class NodeExecutor(EngineScoped):
                     failed_iteration_indices.append(idx)
                     iteration_failures.append(IterationFailure(iteration_index=idx, detail=str(result)))
                     continue
-                if isinstance(result, tuple):
-                    iteration_index, success = result
-                    if success:
-                        successful_iterations.append(iteration_index)
+                if isinstance(result, IterationOutcome):
+                    if result.succeeded:
+                        successful_iterations.append(result.iteration_index)
                     else:
-                        failed_iteration_indices.append(iteration_index)
+                        failed_iteration_indices.append(result.iteration_index)
                         iteration_failures.append(
                             IterationFailure(
-                                iteration_index=iteration_index,
-                                detail="The iteration reported failure without a reason.",
+                                iteration_index=result.iteration_index,
+                                detail=result.detail or "The iteration reported failure without a reason.",
                             )
                         )
 
@@ -3258,7 +3325,9 @@ class NodeExecutor(EngineScoped):
                     "iterations.\n%s",
                     len(failed_iteration_indices),
                     total_iterations,
-                    "\n".join(self._format_iteration_failure_lines(iteration_failures)),
+                    "\n".join(
+                        self._format_iteration_failure_lines(iteration_failures, total_iterations=total_iterations)
+                    ),
                 )
 
             # Step 6: Extract parameter values from iterations BEFORE cleanup

@@ -25,12 +25,14 @@ import threading
 
 import pytest
 
+from griptape_nodes.common.node_executor import EXECUTION_EVENTS_TO_SUPPRESS, LOOP_EVENTS_TO_SUPPRESS
 from griptape_nodes.retained_mode.events.base_events import (
     EventResultFailure,
     EventResultSuccess,
     ExecutionEvent,
     ExecutionGriptapeNodeEvent,
     GriptapeNodeEvent,
+    ResultPayload,
 )
 from griptape_nodes.retained_mode.events.execution_events import (
     CurrentControlNodeEvent,
@@ -256,3 +258,65 @@ class TestSuppressionIsScopedToItsCaller:
 
         with EventSuppressionContext(event_manager, {CreateNodeResultSuccess}):
             assert await nested_handler() is True
+
+
+class TestSuppressionSetReachability:
+    """Which of the executor's two suppression sets the matcher can actually reach.
+
+    The distinction is transport, not naming. ``ResultPayload`` subclasses are broadcast from
+    ``engine.ahandle_request``, which consults ``should_suppress_event`` before queueing -- so
+    listing one has a real effect. ``ExecutionPayload`` members are emitted through
+    ``put_event``/``aput_event``, which never consult it -- so listing one does nothing.
+
+    ``EXECUTION_EVENTS_TO_SUPPRESS`` documents itself as inert, and its own comment says to keep it
+    that way. It was not: two ``StartLocalSubflowResult`` types sat in it, and once the matcher was
+    repaired they became the one pair that took effect, dropping a parallel loop's per-iteration
+    results on the way to the editor. That is the class of mistake these tests catch -- a live
+    transport change added to a set everybody reads as a no-op.
+    """
+
+    def test_execution_events_to_suppress_is_entirely_inert(self) -> None:
+        live = sorted(
+            event_type.__name__ for event_type in EXECUTION_EVENTS_TO_SUPPRESS if issubclass(event_type, ResultPayload)
+        )
+        assert live == [], (
+            "EXECUTION_EVENTS_TO_SUPPRESS documents itself as having no effect, but these are "
+            f"request results, which suppression does reach: {live}. Either put them in "
+            "LOOP_EVENTS_TO_SUPPRESS deliberately, or leave them out."
+        )
+
+    def test_loop_events_to_suppress_is_entirely_live(self) -> None:
+        """The mirror assertion: a member that cannot be reached is documentation, not behaviour."""
+        inert = sorted(
+            event_type.__name__ for event_type in LOOP_EVENTS_TO_SUPPRESS if not issubclass(event_type, ResultPayload)
+        )
+        assert inert == [], (
+            "LOOP_EVENTS_TO_SUPPRESS is the set that is supposed to work, but these are not "
+            f"request results, so suppression never sees them: {inert}."
+        )
+
+    def test_a_loop_suppressed_type_is_matched_in_its_real_shape(self) -> None:
+        """Type membership is necessary but not sufficient -- match the shape the engine passes."""
+        event_manager = EventManager()
+        with EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS):
+            assert event_manager.should_suppress_event(_create_node_result_event()) is True
+            assert event_manager.should_suppress_event(_create_node_failure_event()) is True
+
+    @pytest.mark.asyncio
+    async def test_an_execution_event_is_queued_even_inside_its_own_suppression_window(self) -> None:
+        """Why the set is inert, demonstrated on the real transport rather than by type inspection.
+
+        ``put_event`` enqueues unconditionally. If that ever changes, this test fails and whoever
+        changed it has to decide what happens to the node highlighting the editor relies on.
+        """
+        event_manager = EventManager()
+        queue: asyncio.Queue = asyncio.Queue()
+        event_manager.initialize_queue(queue)
+
+        execution_event = ExecutionGriptapeNodeEvent(
+            wrapped_event=ExecutionEvent(payload=CurrentControlNodeEvent(node_name="Blur"))
+        )
+        with EventSuppressionContext(event_manager, EXECUTION_EVENTS_TO_SUPPRESS):
+            event_manager.put_event(execution_event)
+
+        assert queue.get_nowait() is execution_event

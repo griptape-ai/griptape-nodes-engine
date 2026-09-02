@@ -431,7 +431,38 @@ class TestFormatIterationFailureLines:
         """The common case is every iteration failing identically; say the reason once."""
         failures = [IterationFailure(iteration_index=index, detail="same reason") for index in range(3)]
         lines = NodeExecutor._format_iteration_failure_lines(failures)
-        assert lines == ["  Iterations 1, 2, 3: same reason"]
+        assert lines == ["  Iterations 1-3: same reason"]
+
+    def test_names_a_wholly_failed_loop_as_such(self) -> None:
+        """When nothing survived, saying so beats naming every iteration."""
+        failures = [IterationFailure(iteration_index=index, detail="same reason") for index in range(50)]
+        lines = NodeExecutor._format_iteration_failure_lines(failures, total_iterations=50)
+        assert lines == ["  Every iteration: same reason"]
+
+    def test_keeps_the_line_short_for_a_long_collapsed_run(self) -> None:
+        """Capping reasons is not enough: the iteration list inside one reason must be bounded too.
+
+        Without this, 500 iterations failing identically push the reason -- the part worth reading --
+        kilobytes to the right of where the artist starts reading.
+        """
+        iteration_count = 500
+        failures = [IterationFailure(iteration_index=index, detail="boom") for index in range(iteration_count)]
+        # No total_iterations, so the "every iteration" shortcut cannot apply and the run must
+        # still be summarised rather than enumerated.
+        lines = NodeExecutor._format_iteration_failure_lines(failures)
+        assert lines == ["  Iterations 1-500: boom"]
+
+    def test_truncates_a_scattered_iteration_list(self) -> None:
+        """A non-contiguous set has no range to collapse to, so the enumeration itself is capped."""
+        scattered = [1, 3, 5, 7, 9, 11, 13, 15, 17]
+        failures = [IterationFailure(iteration_index=index, detail="boom") for index in scattered]
+        lines = NodeExecutor._format_iteration_failure_lines(failures)
+        assert lines == ["  Iterations 2, 4, 6, 8, 10, 12 (+3 more): boom"]
+
+    def test_names_a_two_iteration_gap_without_a_range(self) -> None:
+        failures = [IterationFailure(iteration_index=index, detail="boom") for index in (0, 4)]
+        lines = NodeExecutor._format_iteration_failure_lines(failures)
+        assert lines == ["  Iterations 1, 5: boom"]
 
     def test_keeps_distinct_details_on_separate_lines(self) -> None:
         lines = NodeExecutor._format_iteration_failure_lines(_make_iteration_failures(["first", "second"]))
