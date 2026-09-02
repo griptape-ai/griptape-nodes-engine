@@ -36,6 +36,7 @@ from griptape_nodes.node_library.library_registry import (
     LibraryRegistry,
     LibraryRegistryError,
     LibrarySchema,
+    NodeDefinition,
     NodeMetadata,
     get_declared_models,
 )
@@ -69,6 +70,7 @@ from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileResultFailure,
     RegisterLibraryFromFileResultSuccess,
     UnloadLibraryFromRegistryRequest,
+    UnloadLibraryFromRegistryResultFailure,
     UnloadLibraryFromRegistryResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
@@ -2491,6 +2493,10 @@ class TestGetPortSummariesForAllLibrariesRequest:
         try:
             with (
                 patch.object(_LibraryManager, "_SCHEMA_PROBE_TIMEOUT_S", 1.0),
+                # Pinned because the real ceiling is derived from the host's CPU count. Two is what
+                # this test needs -- one leaked thread, then a retry -- and leaving it unpatched
+                # would make the retry below depend on the machine the suite runs on.
+                patch.object(_LibraryManager, "_PROBE_THREAD_LEAK_CEILING", 2),
                 patch.object(_LibraryManager, "_construct_probe_node", side_effect=block_one_node_type, autospec=True),
             ):
                 first = await library_manager.on_get_port_summaries_for_all_libraries_request(
@@ -2512,9 +2518,12 @@ class TestGetPortSummariesForAllLibrariesRequest:
 
         # ...and the retry probes that node type alone.
         real_construct = _LibraryManager._construct_probe_node
-        with patch.object(
-            _LibraryManager, "_construct_probe_node", side_effect=real_construct, autospec=True
-        ) as probe_spy:
+        with (
+            patch.object(_LibraryManager, "_PROBE_THREAD_LEAK_CEILING", 2),
+            patch.object(
+                _LibraryManager, "_construct_probe_node", side_effect=real_construct, autospec=True
+            ) as probe_spy,
+        ):
             second = await library_manager.on_get_port_summaries_for_all_libraries_request(
                 GetPortSummariesForAllLibrariesRequest()
             )
@@ -2612,6 +2621,10 @@ class TestGetPortSummariesForAllLibrariesRequest:
             with (
                 patch.object(_LibraryManager, "_SCHEMA_PROBE_TIMEOUT_S", 0.2),
                 patch.object(_LibraryManager, "_PORT_SUMMARY_TIMEOUT_BUDGET", 1),
+                # Pinned because the real ceiling is derived from the host's CPU count. This test
+                # spends one leaked thread on the blocking library and then requires a second
+                # request to still probe the healthy one, which a ceiling of 1 would forbid.
+                patch.object(_LibraryManager, "_PROBE_THREAD_LEAK_CEILING", 2),
                 patch.object(
                     _LibraryManager, "_construct_probe_node", side_effect=block_the_first_library, autospec=True
                 ),
@@ -2666,6 +2679,10 @@ class TestGetPortSummariesForAllLibrariesRequest:
             with (
                 patch.object(_LibraryManager, "_SCHEMA_PROBE_TIMEOUT_S", 0.2),
                 patch.object(_LibraryManager, "_PORT_SUMMARY_TIMEOUT_BUDGET", 1),
+                # Deliberately generous, and pinned rather than left to the host's CPU count: the
+                # library-level allowance must be what stops the second request, not the
+                # engine-wide ceiling, or this passes without testing the bound it names.
+                patch.object(_LibraryManager, "_PROBE_THREAD_LEAK_CEILING", 10),
                 patch.object(
                     _LibraryManager, "_construct_probe_node", side_effect=block_one_node_type, autospec=True
                 ) as probe_spy,
@@ -2753,6 +2770,110 @@ class TestGetPortSummariesForAllLibrariesRequest:
         # immediately.
         for library_name in (blocking_library, self._LIBRARY_NAME):
             assert not library_manager._library_to_port_summary_cache[library_name].pending_node_types()
+
+    @pytest.mark.asyncio
+    async def test_grants_a_retry_the_first_time_a_node_type_is_actually_probed(self, engine: Engine) -> None:
+        """The retry is owed to a node type's first timeout, which is not always its library's first pass.
+
+        A pass that runs out of allowance leaves node types unreached, so the pass that finally
+        reaches one is where its first timeout happens. Keying the retry on "the library's first
+        pass" would deny it to exactly the node types an earlier library's blocking nodes pushed
+        out of reach.
+        """
+        library_manager = engine.library_manager
+        allowance_eating_library = "port-summary-allowance-eating-library"
+        # Registered first, so the handler walks it first and spends the whole request allowance on
+        # it, leaving the library below unreached rather than probed.
+        self._register_probe_library(_PortSummaryProbe, _RaisingProbe, library_name=allowance_eating_library)
+        self._register_probe_library(_PortSummaryDataOnlyProbe)
+        late_node_type = _PortSummaryDataOnlyProbe.__name__
+        release_blocked_probes = threading.Event()
+        real_construct = _LibraryManager._construct_probe_node
+
+        def block_everything(
+            manager: _LibraryManager, library_name: str, node_type: str, *args: Any, **kwargs: Any
+        ) -> Any:
+            release_blocked_probes.wait(timeout=30)
+            return real_construct(manager, library_name, node_type, *args, **kwargs)
+
+        try:
+            with (
+                patch.object(_LibraryManager, "_SCHEMA_PROBE_TIMEOUT_S", 0.2),
+                # Two, so the first library eats the request allowance without any single library
+                # hitting its own allowance, which would drop pending node types instead.
+                patch.object(_LibraryManager, "_PORT_SUMMARY_TIMEOUT_BUDGET", 2),
+                # Generous and pinned: this test leaks three threads, and the engine-wide ceiling
+                # must not be what ends it.
+                patch.object(_LibraryManager, "_PROBE_THREAD_LEAK_CEILING", 10),
+                patch.object(_LibraryManager, "_construct_probe_node", side_effect=block_everything, autospec=True),
+            ):
+                await library_manager.on_get_port_summaries_for_all_libraries_request(
+                    GetPortSummariesForAllLibrariesRequest()
+                )
+                # Never attempted, so nothing is owed a retry yet -- it is owed a first attempt.
+                unreached_entry = library_manager._library_to_port_summary_cache[self._LIBRARY_NAME]
+                assert unreached_entry.unprobed_node_types == frozenset({late_node_type})
+                assert unreached_entry.retry_node_types == frozenset()
+
+                await library_manager.on_get_port_summaries_for_all_libraries_request(
+                    GetPortSummariesForAllLibrariesRequest()
+                )
+        finally:
+            release_blocked_probes.set()
+
+        # Probed for the first time on the second request, timed out, and earned its one retry.
+        probed_entry = library_manager._library_to_port_summary_cache[self._LIBRARY_NAME]
+        assert probed_entry.retry_node_types == frozenset({late_node_type})
+        assert probed_entry.unprobed_node_types == frozenset()
+        assert probed_entry.timeouts_spent == 1
+
+    @pytest.mark.asyncio
+    async def test_stops_probing_when_a_reload_closes_the_gate_mid_pass(self, engine: Engine) -> None:
+        """An in-flight request cannot be cancelled the way the warm pass can, so it has to notice.
+
+        Every entry point waits on the loading gate before starting, so a pass that finds it closed
+        was overtaken by a reload -- and the node classes it would resolve next belong to libraries
+        that reload is unloading, whose modules it would import straight back in.
+        """
+        library_manager = engine.library_manager
+        self._register_probe_library(_PortSummaryDataOnlyProbe, _PortSummaryProbe)
+        real_probe = library_manager._probe_node_type_port_summary
+
+        async def close_the_gate_after_the_first_probe(**kwargs: Any) -> Any:
+            outcome = await real_probe(**kwargs)
+            library_manager._close_libraries_loading_gate()
+            return outcome
+
+        with patch.object(
+            library_manager, "_probe_node_type_port_summary", side_effect=close_the_gate_after_the_first_probe
+        ) as probe_spy:
+            result = await library_manager.on_get_port_summaries_for_all_libraries_request(
+                GetPortSummariesForAllLibrariesRequest()
+            )
+
+        assert probe_spy.call_count == 1
+        # What it measured before the reload started is still served...
+        assert isinstance(result, GetPortSummariesForAllLibrariesResultSuccess)
+        assert set(result.library_name_to_port_summaries[self._LIBRARY_NAME]) == {_PortSummaryDataOnlyProbe.__name__}
+        # ...and the node type it stopped short of is owed a real attempt, not recorded as unrankable.
+        entry = library_manager._library_to_port_summary_cache[self._LIBRARY_NAME]
+        assert entry.unprobed_node_types == frozenset({_PortSummaryProbe.__name__})
+        assert entry.timeouts_spent == 0
+
+    def test_unloading_a_name_that_was_never_a_library_records_nothing_against_it(self, engine: Engine) -> None:
+        """The generation counter is keyed by library name and its entries are never removed.
+
+        Invalidating before checking the registry would let repeated requests for names that do not
+        exist grow that map for the life of the process.
+        """
+        library_manager = engine.library_manager
+
+        result = library_manager.unload_library_from_registry_request(
+            UnloadLibraryFromRegistryRequest(library_name="never-registered-library")
+        )
+
+        assert isinstance(result, UnloadLibraryFromRegistryResultFailure)
+        assert library_manager._library_to_port_summaries_generation == {}
 
     @pytest.mark.asyncio
     async def test_caches_a_pass_whose_only_gap_is_a_broken_node_type(self, engine: Engine) -> None:
@@ -2866,7 +2987,9 @@ class TestPortSummaryWarming:
         yield
         LibraryRegistry._clear()
 
-    def _register_probe_library(self, *node_classes: type[BaseNode]) -> None:
+    def _register_probe_library(
+        self, *node_classes: type[BaseNode], node_definitions: list[NodeDefinition] | None = None
+    ) -> None:
         schema = LibrarySchema(
             name=self._LIBRARY_NAME,
             library_schema_version=LibrarySchema.LATEST_SCHEMA_VERSION,
@@ -2878,7 +3001,9 @@ class TestPortSummaryWarming:
                 tags=[],
             ),
             categories=[],
-            nodes=[],
+            # Declared node types, as opposed to the classes registered below: the worker-stub path
+            # reads its metadata from here rather than from a Python class it cannot import.
+            nodes=node_definitions or [],
         )
         library = LibraryRegistry.generate_new_library(library_data=schema)
         for node_class in node_classes:
@@ -2951,13 +3076,15 @@ class TestPortSummaryWarming:
         library_manager = engine.library_manager
         self._register_probe_library(_PortSummaryDataOnlyProbe, _PortSummaryProbe)
         pass_reached_first_probe = asyncio.Event()
-        release_first_probe = asyncio.Event()
-        real_construct = _LibraryManager._construct_probe_node
+        # Deliberately never set: the pass has to come off the loop by being cancelled, so there is
+        # no path out of the probe below other than the cancellation this test is about.
+        never_release_first_probe = asyncio.Event()
 
-        async def block_on_first_probe(*args: Any, **kwargs: Any) -> Any:
+        async def block_on_first_probe(*_args: Any, **_kwargs: Any) -> Any:
             pass_reached_first_probe.set()
-            await release_first_probe.wait()
-            return real_construct(*args, **kwargs)
+            await never_release_first_probe.wait()
+            msg = "The warm pass was expected to be cancelled while suspended on this probe."
+            raise AssertionError(msg)
 
         # Patch the awaited probe rather than the threaded construction: this test is about the
         # coroutine being cancellable at an await point, which is what cancellation acts on.
@@ -2974,6 +3101,64 @@ class TestPortSummaryWarming:
         # Cancelled mid-library, so nothing was written back -- the next request recomputes rather
         # than serving a half-probed library as complete.
         assert self._LIBRARY_NAME not in library_manager._library_to_port_summary_cache
+
+    @pytest.mark.asyncio
+    async def test_a_waiting_request_takes_the_throttle_off_the_warm_pass(self, engine: Engine) -> None:
+        """The throttle is only a good trade while nothing is blocked on the pass.
+
+        Spacing probes out keeps the loop usable, paid for in wall-clock time. Once a request is in
+        flight that time comes out of an artist's drag -- the request either queues on the library's
+        lock or reaches it later in its own walk -- and on a large library the spacing alone would
+        add its node type count times the interval. That is the cost warming exists to remove.
+        """
+        library_manager = engine.library_manager
+        self._register_probe_library(_PortSummaryDataOnlyProbe)
+        warm_throttle = _LibraryManager._PORT_SUMMARY_WARM_THROTTLE_S
+        throttle_during_request: list[float] = []
+        real_probe = library_manager._probe_node_type_port_summary
+
+        async def record_the_throttle_a_warm_pass_would_use(**kwargs: Any) -> Any:
+            throttle_during_request.append(library_manager._effective_probe_throttle_s(warm_throttle))
+            return await real_probe(**kwargs)
+
+        with patch.object(
+            library_manager, "_probe_node_type_port_summary", side_effect=record_the_throttle_a_warm_pass_would_use
+        ):
+            await library_manager.on_get_port_summaries_for_all_libraries_request(
+                GetPortSummariesForAllLibrariesRequest()
+            )
+
+        assert throttle_during_request == [0.0]
+        # And back to spacing its probes out the moment nobody is waiting, which is what makes
+        # warming free for everything else on the loop.
+        assert library_manager._effective_probe_throttle_s(warm_throttle) == warm_throttle
+
+    @pytest.mark.asyncio
+    async def test_cancelling_does_not_propagate_a_pass_that_failed_on_its_way_out(self, engine: Engine) -> None:
+        """A reload calls this first, so anything raised here aborts the reload before it starts.
+
+        The warm pass is background work nothing waits on; a reload asks it to stop, not how it went.
+        Letting its failure through would mean a broken pass could block the reload that would have
+        replaced it.
+        """
+        library_manager = engine.library_manager
+
+        async def fail_while_stopping() -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                msg = "simulated failure while the warm pass was shutting down"
+                raise RuntimeError(msg) from None
+
+        task = asyncio.create_task(fail_while_stopping())
+        library_manager._port_summary_warm_task = task
+        # Let it reach the await, so the cancel below lands in the except above.
+        await asyncio.sleep(0)
+
+        await library_manager._cancel_port_summary_warm()
+
+        assert task.done()
+        assert library_manager._port_summary_warm_task is None
 
     @pytest.mark.asyncio
     async def test_cancelling_is_a_no_op_when_nothing_is_warming(self, engine: Engine) -> None:
@@ -3034,6 +3219,32 @@ class TestPortSummaryWarming:
             await library_manager.reload_libraries_request(ReloadAllLibrariesRequest())
 
         assert restarted == [True]
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_reload_does_not_restart_warming(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Cancellation means the caller is going away -- a shutdown, or a request being torn down.
+
+        This is the one way out of a reload that must not re-warm. Starting a background pass on the
+        way out would leave it resolving node classes over a half-dismantled registry, with nothing
+        holding a handle to stop it a second time.
+        """
+        library_manager = engine.library_manager
+        restarted: list[bool] = []
+
+        async def cancelled(_request: object) -> None:
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(library_manager, "_run_reload_libraries", cancelled)
+        monkeypatch.setattr(library_manager, "_start_port_summary_warm", lambda: restarted.append(True))
+
+        from griptape_nodes.retained_mode.events.library_events import ReloadAllLibrariesRequest
+
+        with pytest.raises(asyncio.CancelledError):
+            await library_manager.reload_libraries_request(ReloadAllLibrariesRequest())
+
+        assert restarted == []
 
     def test_does_not_warm_on_a_worker(self, engine: Engine) -> None:
         """A worker already constructs every node type to serialize its schemas."""
@@ -3111,9 +3322,30 @@ class TestPortSummaryWarming:
 
     @pytest.mark.asyncio
     async def test_worker_stub_registration_rewarms(self, engine: Engine) -> None:
-        """Registering worker stubs drops that library's summaries, and a worker can report late."""
+        """Registering worker stubs drops that library's summaries, and a worker can report late.
+
+        Both halves are asserted through the real registration path rather than a patched one,
+        because the restart is only worth anything if something was actually invalidated: a worker
+        reporting after the startup pass finished is otherwise the one case left permanently cold.
+        """
         library_manager = engine.library_manager
         library_manager._is_worker = False
+        stub_node_type = _PortSummaryDataOnlyProbe.__name__
+        # The stub class is built from the worker's reported schema, but its metadata comes from the
+        # library JSON, so the node has to be declared there or registration skips it.
+        self._register_probe_library(
+            node_definitions=[
+                NodeDefinition(
+                    class_name=stub_node_type,
+                    file_path="unused_on_the_orchestrator.py",
+                    metadata=NodeMetadata(
+                        category="test",
+                        description="worker-hosted node type",
+                        display_name=stub_node_type,
+                    ),
+                )
+            ]
+        )
         library_info = _LibraryManager.LibraryInfo(
             lifecycle_state=_LibraryManager.LibraryLifecycleState.WORKER_PENDING,
             fitness=_LibraryManager.LibraryFitness.NOT_EVALUATED,
@@ -3121,24 +3353,25 @@ class TestPortSummaryWarming:
             is_sandbox=False,
             library_name=self._LIBRARY_NAME,
         )
+        generation_before = library_manager._library_to_port_summaries_generation.get(self._LIBRARY_NAME, 0)
         restarted: list[bool] = []
 
         with (
             patch.object(library_manager, "get_library_info_by_library_name", return_value=library_info),
-            patch.object(library_manager, "_register_nodes_from_worker_schemas") as register_stubs,
             patch.object(library_manager, "_start_port_summary_warm", side_effect=lambda: restarted.append(True)),
         ):
             await library_manager._on_library_loaded_notification(
                 LibraryLoadedNotification(
                     library_name=self._LIBRARY_NAME,
                     fitness=_LibraryManager.LibraryFitness.GOOD,
-                    node_schemas=[
-                        WorkerNodeSchema(class_name=_PortSummaryDataOnlyProbe.__name__, parameters=[]),
-                    ],
+                    node_schemas=[WorkerNodeSchema(class_name=stub_node_type, parameters=[])],
                 )
             )
 
-        register_stubs.assert_called_once()
+        # The stub really was registered, so there really was something to invalidate...
+        assert stub_node_type in LibraryRegistry.get_library(self._LIBRARY_NAME).get_registered_nodes()
+        assert library_manager._library_to_port_summaries_generation[self._LIBRARY_NAME] > generation_before
+        # ...and the pass that would otherwise never cover this library was restarted.
         assert restarted == [True]
 
 
@@ -4951,6 +5184,9 @@ class TestLibraryManagerDuplicateEntryHygiene:
 
         with (
             patch.object(library_manager, "_library_file_path_to_info", entries),
+            # The handler checks the registry before touching anything, so the name has to be there
+            # even though the unregister call itself is stubbed out.
+            patch.object(LibraryRegistry, "list_libraries", return_value=["MyLib"]),
             patch.object(LibraryRegistry, "unregister_library"),
             patch.object(library_manager, "_unregister_all_stable_module_aliases_for_library"),
         ):
