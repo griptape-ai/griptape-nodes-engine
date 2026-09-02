@@ -501,6 +501,13 @@ class LibraryManager(EngineScoped):
         # orchestrator never learns it -- the worker reports that itself when a run is attempted.
         # None means nothing is known to be wrong.
         execution_unavailable_reason: str | None = None
+        # Declared execution modules, imported and keyed by their file stem. Populated only in a
+        # worker: the orchestrator deliberately never imports these, so it holds an empty dict
+        # and `get_execution_module` refuses there.
+        execution_modules: dict[str, ModuleType] = field(default_factory=dict)
+        # Resolved absolute paths of the declared execution modules, kept so the boundary check
+        # can run from the module loader, which fires lazily and has no access to the schema.
+        declared_execution_module_paths: set[Path] = field(default_factory=set)
         # The path string the user wrote in `libraries_to_register` before workspace
         # resolution / `~`-expansion / symlink-following. Surfaced to the GUI so the
         # settings panel can match library metadata back to its config row using the
@@ -3799,8 +3806,24 @@ class LibraryManager(EngineScoped):
         def load_module() -> ModuleType:
             module = cache.get("module")
             if module is None:
-                module = self._load_module_from_file(node_file_path, library_name)
+                # Checked around the import, the only moment a boundary violation is observable:
+                # node modules can load lazily, long after the library finished registering.
+                #
+                # Both outcomes matter. If the execution module imports cleanly the violation is
+                # SILENT, and the diff of sys.modules is the only evidence. If it does not -- the
+                # usual case, since its dependencies are absent here by design -- the node module
+                # fails with a bare ImportError naming a module the author did not write, and the
+                # traceback is where the evidence lives.
+                modules_before = set(sys.modules)
+                try:
+                    module = self._load_module_from_file(node_file_path, library_name)
+                except Exception as exc:
+                    self._check_execution_module_boundary(
+                        library_name, node_file_path, set(sys.modules) - modules_before, exc=exc
+                    )
+                    raise
                 cache["module"] = module
+                self._check_execution_module_boundary(library_name, node_file_path, set(sys.modules) - modules_before)
             return module
 
         return load_module
@@ -4988,6 +5011,182 @@ class LibraryManager(EngineScoped):
             library_info.problems.append(library_problem)
         return True
 
+    def _resolve_execution_module_paths(self, library_data: LibrarySchema, base_dir: Path) -> list[Path]:
+        """Expand the declared execution-module paths; a directory means every .py beneath it."""
+        resolved: list[Path] = []
+        for declared in library_data.execution_modules or []:
+            target = base_dir / declared
+            if target.is_dir():
+                resolved.extend(sorted(f for f in target.rglob("*.py") if f.name != "__init__.py"))
+            elif target.exists():
+                resolved.append(target)
+            else:
+                logger.warning(
+                    "Library '%s' declares execution module '%s', which does not exist at %s.",
+                    library_data.name,
+                    declared,
+                    target,
+                )
+        return resolved
+
+    def _load_execution_modules(self, library_data: LibrarySchema, base_dir: Path, library_info: LibraryInfo) -> None:
+        """Import a library's execution modules -- in a worker, and only there.
+
+        These modules exist so heavy imports have a home. They may import anything at module
+        scope, and the orchestrator's contract is that it never imports them: that is what keeps a
+        library's execution dependencies off the editing process's import path, without asking the
+        author to scatter deferred imports through node code and remember never to add one back.
+
+        A failure here does not fail the library. The nodes still load and stay editable; what is
+        lost is the ability to run them, recorded as the reason so the refusal can say why.
+        """
+        paths = self._resolve_execution_module_paths(library_data, base_dir)
+        library_info.declared_execution_module_paths = {path.resolve() for path in paths}
+        if not paths:
+            return
+        if not self._is_worker:
+            logger.debug(
+                "Library '%s' declares %d execution module(s); not importing them here, because "
+                "this process only edits.",
+                library_data.name,
+                len(paths),
+            )
+            return
+
+        for path in paths:
+            try:
+                module = self._load_module_from_file(path, library_data.name)
+            except Exception as exc:
+                library_info.execution_unavailable_reason = (
+                    f"its execution module '{path.name}' could not be imported ({exc})."
+                )
+                logger.exception(
+                    "Library '%s': execution module %s failed to import; the library stays editable but cannot run.",
+                    library_data.name,
+                    path,
+                )
+                return
+            library_info.execution_modules[path.stem] = module
+            logger.debug("Library '%s': imported execution module '%s'", library_data.name, path.stem)
+
+    def _check_execution_module_boundary(
+        self,
+        library_name: str,
+        node_file_path: Path,
+        newly_imported: set[str],
+        *,
+        exc: BaseException | None = None,
+    ) -> None:
+        """Whether importing a node module pulled an execution module in with it.
+
+        Checked by FILE LOCATION rather than by scanning the node module's own import statements.
+        A direct import is the easy case; the one that actually happens is transitive -- two node
+        modules import a shared helper, and the helper imports the heavy dependency. A source scan
+        of the node modules calls them both clean.
+
+        Both outcomes are covered. A clean import of the execution module makes the violation
+        silent, and sys.modules is the evidence. A failed one -- the usual case, because the
+        dependencies are absent here by design -- surfaces as an ImportError naming a module the
+        author did not write, and the traceback is the evidence.
+
+        Records a library problem naming the offending file and both fixes.
+        """
+        library_info = self.get_library_info_by_library_name(library_name)
+        if library_info is None or not library_info.declared_execution_module_paths:
+            return
+
+        offender = self._execution_module_in_traceback(library_info, exc) if exc is not None else None
+        if offender is None:
+            offender = self._execution_module_among(library_info, newly_imported)
+        if offender is None:
+            return
+
+        message = (
+            f"Node module '{node_file_path.name}' imports execution module '{offender.name}', "
+            "directly or through a helper. Execution modules carry this library's execution-time "
+            "dependencies, so importing one here puts them on the editing process's import path -- "
+            "which is what the edit/execution split exists to prevent. Either reach it from "
+            "process() with self.execution_module(...), or move the dependency it needs into "
+            "pip_dependencies if instantiating the node genuinely requires it."
+        )
+        library_info.problems.append(
+            LibraryDependencyProblem(dependency_name="execution module boundary", error_message=message)
+        )
+        if library_info.fitness is LibraryManager.LibraryFitness.GOOD:
+            library_info.fitness = LibraryManager.LibraryFitness.FLAWED
+        logger.error(message)
+
+    @staticmethod
+    def _execution_module_in_traceback(library_info: LibraryInfo, exc: BaseException) -> Path | None:
+        """The execution module a failed import passed through, if any.
+
+        The import raised before the module reached sys.modules, so its frames are the evidence.
+        The whole chain is walked, not just this exception: `_load_module_from_file` re-raises as
+        its own ImportError, so the frames that actually touched the execution module sit on the
+        `__cause__` rather than on what the caller catches.
+        """
+        seen: set[int] = set()
+        current: BaseException | None = exc
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            tb = current.__traceback__
+            while tb is not None:
+                try:
+                    frame_file = Path(tb.tb_frame.f_code.co_filename).resolve()
+                except (OSError, ValueError):
+                    frame_file = None
+                if frame_file is not None and frame_file in library_info.declared_execution_module_paths:
+                    return frame_file
+                tb = tb.tb_next
+            current = current.__cause__ or current.__context__
+        return None
+
+    @staticmethod
+    def _execution_module_among(library_info: LibraryInfo, module_names: set[str]) -> Path | None:
+        """The execution module that landed in sys.modules, if any -- the silent-success case."""
+        for module_name in module_names:
+            module = sys.modules.get(module_name)
+            module_file = getattr(module, "__file__", None)
+            if not module_file:
+                continue
+            try:
+                resolved = Path(module_file).resolve()
+            except (OSError, ValueError):
+                continue
+            if resolved in library_info.declared_execution_module_paths:
+                return resolved
+        return None
+
+    def get_execution_module(self, library_name: str, module_name: str) -> ModuleType:
+        """Return one of a library's execution modules, or explain why it is not available here.
+
+        The sanctioned way node code reaches execution-only code. A lookup rather than an import,
+        because the worker already imported it at library load; the orchestrator never did, and
+        says so rather than raising ImportError from a stack the node author did not write.
+        """
+        library_info = self.get_library_info_by_library_name(library_name)
+        if library_info is None:
+            msg = f"No library named '{library_name}' is registered, so its execution modules cannot be reached."
+            raise RuntimeError(msg)
+        if not self._is_worker:
+            msg = (
+                f"Execution module '{module_name}' of library '{library_name}' is not available in "
+                "this process. Execution modules are imported only where nodes execute, because "
+                "they carry the library's execution-time dependencies. Reach them from process(), "
+                "which runs there."
+            )
+            raise RuntimeError(msg)
+        module = library_info.execution_modules.get(module_name)
+        if module is None:
+            available = ", ".join(sorted(library_info.execution_modules)) or "none"
+            msg = (
+                f"Library '{library_name}' has no execution module named '{module_name}'. "
+                f"Declared and imported: {available}. Names come from the file stem of each entry "
+                "in the manifest's execution_modules."
+            )
+            raise RuntimeError(msg)
+        return module
+
     def _attempt_load_nodes_from_library(  # noqa: PLR0912, PLR0915, C901
         self,
         library_data: LibrarySchema,
@@ -5009,6 +5208,11 @@ class LibraryManager(EngineScoped):
                 with a deferred loader and their modules are imported on first use instead.
         """
         any_nodes_loaded_successfully = False
+
+        # Execution modules first: a worker that cannot import them cannot run this library's
+        # nodes, and finding that out now -- at library load, with the failure attached to the
+        # library -- beats finding out on the first execution of some node deep in a graph.
+        self._load_execution_modules(library_data, base_dir, library_info)
 
         # Check if library is in old XDG location
         old_xdg_libraries_path = xdg_data_home() / "griptape_nodes" / "libraries"
@@ -5065,7 +5269,6 @@ class LibraryManager(EngineScoped):
                 node_registered = self._register_node_eager(
                     node_definition, node_file_path, library, library_info, module_loaders
                 )
-
             if node_registered:
                 any_nodes_loaded_successfully = True
 

@@ -55,6 +55,8 @@ from griptape_nodes.traits.widget import Widget
 from griptape_nodes.utils import async_utils
 
 if TYPE_CHECKING:
+    from types import ModuleType
+
     from griptape_nodes.exe_types.core_types import NodeMessagePayload
     from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
     from griptape_nodes.retained_mode.engine import Engine
@@ -1296,6 +1298,31 @@ class BaseNode(ABC):
             msg = str(f"Parameter \"{param}\" was left blank for node '{node_name}'. {additional_msg}").strip()
             return ValueError(msg)
         return None
+
+    def execution_module(self, module_name: str) -> ModuleType:
+        """Return one of this library's execution modules.
+
+        The sanctioned way to reach execution-only code. An execution module is declared in the
+        library manifest and imported only where nodes execute, so it may import heavy
+        dependencies at module scope without making this node impossible to instantiate on a
+        machine that will never run it. Call this from `process`:
+
+            def process(self) -> None:
+                runner = self.execution_module("segmenter")
+                self.parameter_output_values["result"] = runner.segment(...)
+
+        Raises:
+            RuntimeError: If called where execution modules are not imported (the orchestrator),
+                or if the library declares no module by that name. Both messages say what to do.
+        """
+        library_name = self.metadata.get("library")
+        if not library_name:
+            msg = (
+                f"Node '{self.name}' has no library recorded in its metadata, so its execution "
+                "modules cannot be located."
+            )
+            raise RuntimeError(msg)
+        return self.engine.library_manager.get_execution_module(library_name, module_name)
 
     def get_config_value(self, service: str, value: str) -> str:
         warnings.warn(
