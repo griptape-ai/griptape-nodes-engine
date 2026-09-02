@@ -456,12 +456,18 @@ class NodeTypePortProbeOutcome(NamedTuple):
     leave it unranked, not rank it as connecting to nothing.
 
     `timed_out` separates the one gap worth another attempt from the ones that are stable until the
-    library reloads. It also tells the caller a thread was spent that cannot be reclaimed, which is
-    what the per-pass timeout budget counts.
+    library reloads. It is also what the per-pass and per-library timeout budgets count, both of
+    which are about the pass rather than about any thread.
+
+    `thread_lost` is the narrower fact that the engine gave up on a construction thread it will not
+    get back, and is what the engine-wide ceiling counts. Not the same as `timed_out`: a
+    construction that finishes inside the window between its deadline passing and the timeout being
+    raised is a timeout the pass must account for, but no thread was lost.
     """
 
     summary: NodePortSummary | None
     timed_out: bool
+    thread_lost: bool = False
 
 
 class LibraryGitOperationContext(NamedTuple):
@@ -740,13 +746,21 @@ class LibraryManager(EngineScoped):
         # through _port_summaries_lock_for, which discards the lot when the running loop changes.
         self._library_to_port_summaries_lock: dict[str, asyncio.Lock] = {}
         self._port_summaries_lock_loop: asyncio.AbstractEventLoop | None = None
-        # Probe threads this engine has leaked, for the life of the process. Counted here rather
+        # Probe threads this engine has given up on for good: one per timeout. Counted here rather
         # than only per library or per request because the pool the leaks come out of is shared
         # engine-wide: the per-library allowance resets on reload and the per-request one resets
         # every request, so N libraries over M requests can leak far past anything either bounds.
-        # This is the only counter that never resets, and _PROBE_THREAD_LEAK_CEILING is the only
-        # bound expressed in terms of the executor actually being drained.
-        self._port_summary_threads_leaked: int = 0
+        # This never decreases, and _PROBE_THREAD_LEAK_CEILING is the only bound expressed in terms
+        # of the executor actually being drained.
+        self._port_summary_timed_out_threads: int = 0
+        # The "worker finished" signal of every construction abandoned by a cancellation, kept until
+        # it fires. A timeout means the thread is gone for the life of the process, but a
+        # cancellation usually catches a perfectly healthy __init__ a few milliseconds in, and that
+        # thread is back in the pool almost immediately. Charging those permanently would walk the
+        # ceiling up on every reload -- each one cancels the warm pass, often mid-probe -- and
+        # silently disable connection ranking for the session. Read through
+        # _leaked_probe_thread_count, which drops the ones that have finished.
+        self._abandoned_probe_signals: list[threading.Event] = []
         # How many port summary requests are currently being answered. Non-zero means someone is
         # blocked on the machinery below, which is what tells the background warm pass to stop
         # spacing its probes out -- see _effective_probe_throttle_s.
@@ -756,6 +770,14 @@ class LibraryManager(EngineScoped):
         # one still running while a library is torn down would import that library's modules
         # back in. See _start_port_summary_warm.
         self._port_summary_warm_task: asyncio.Task[None] | None = None
+        # How many library rebuilds are currently refusing to let a warm pass start. Cancelling the
+        # pass in hand is not enough on its own: a reload takes several awaits to tear the registry
+        # down, and anything that starts a pass in that window -- a worker reporting its node schemas
+        # is the everyday case -- would begin resolving node classes for libraries about to be
+        # unloaded, which is the import the cancellation exists to prevent. Counted rather than
+        # flagged so nested or overlapping rebuilds cannot un-suppress each other, and each rebuild
+        # restarts warming as it decrements. See _start_port_summary_warm.
+        self._port_summary_warm_suppressed: int = 0
         # Whether the host that started this engine has anything that will ask for port summaries.
         # Set from AppInitializationComplete, which defaults it to True, so an engine that is never
         # told still behaves as if an editor is attached.
@@ -3497,6 +3519,14 @@ class LibraryManager(EngineScoped):
             )
             return
 
+        if self._port_summary_warm_suppressed > 0:
+            # A library rebuild is in progress and has already cancelled the pass it found. Starting
+            # another now would resolve node classes for libraries it is partway through unloading,
+            # putting their modules back into `sys.modules` behind it. The rebuild restarts warming
+            # on its way out, so whatever this caller invalidated is still covered.
+            logger.debug("Port summary warming deferred: a library rebuild is in progress and will restart it.")
+            return
+
         # Leave a pass already in flight alone rather than replacing it. Only one handle is kept --
         # a pass nothing holds a handle to is a pass a reload cannot cancel, which is the one thing
         # here that has to work -- so this cannot start a second one, and it should not cancel the
@@ -3566,8 +3596,9 @@ class LibraryManager(EngineScoped):
         pass between awaits could still resolve a node class -- importing a module belonging to a
         library being dismantled. Returns promptly even when the pass is inside a probe: the
         construction thread cannot be cancelled, but the coroutine awaiting it can. That abandons the
-        thread, so the probe path charges it to the engine-wide leak ceiling exactly as a timeout is
-        charged -- reloading repeatedly is not a free way past that bound.
+        thread, and the probe path holds it against the engine-wide ceiling for as long as it really
+        is held -- reloading repeatedly is not a free way past that bound, but nor does it spend it
+        (see `_leaked_probe_thread_count`).
 
         Clearing the handle before awaiting keeps a second caller from awaiting the same task.
         """
@@ -3584,13 +3615,16 @@ class LibraryManager(EngineScoped):
             # caller's task, so awaiting it raises the cancellation we just requested.
             pass
         except Exception as err:
-            # The pass had already failed for its own reasons and finished between the check above
-            # and the cancel, so awaiting it re-raises that. Callers use this to make an unload safe,
-            # not to find out how warming went, and letting it propagate would abort a reload over a
-            # background task that is already off the loop -- exactly what the reload would fix.
-            logger.warning(
-                "Port summary warming had already failed when it was stopped: %s: %s. Summaries will be recomputed "
-                "after this reload.",
+            # The pass answered the cancellation by failing instead -- a broken `finally` on its way
+            # out, say. (A pass that had already failed cannot arrive here: the check above skips a
+            # task that is `done()`.) Callers use this to make an unload safe, not to find out how
+            # warming went, and letting it propagate would abort a reload over a background task that
+            # is already off the loop -- exactly what the reload would fix. DEBUG rather than WARNING
+            # because `_on_port_summary_warm_done` has already logged this same exception for the
+            # operator; two warnings for one failure only invite chasing it twice.
+            logger.debug(
+                "Port summary warming raised while being stopped: %s: %s. Summaries will be recomputed after this "
+                "reload.",
                 type(err).__name__,
                 err,
             )
@@ -3610,13 +3644,29 @@ class LibraryManager(EngineScoped):
         Sweeps the library list repeatedly rather than once, because a library can be invalidated
         after this pass has already walked past it -- a worker reporting its node schemas is the
         everyday case. That is what lets those callers leave a running pass alone instead of
-        cancelling and restarting it. A sweep that finds every library warm ends the pass, so the
-        sweep cap only binds when something is invalidating in a loop.
+        cancelling and restarting it. A sweep that finds every library warm ends the pass, as does
+        one that finds the pass has nothing left to spend, so the sweep cap only binds when something
+        is invalidating in a loop.
         """
         await self._libraries_loading_complete.wait()
 
         allowance = ProbeTimeoutAllowance(remaining=self._PORT_SUMMARY_WARM_TIMEOUT_BUDGET)
         for sweep in range(self._PORT_SUMMARY_WARM_MAX_SWEEPS):
+            # Asked once per sweep, and about the pass rather than any library, so `timeouts_spent`
+            # is 0. Without this a pass that has spent its allowance -- or an engine holding its
+            # ceiling of probe threads -- would run every remaining sweep, each one taking every
+            # cold library's lock only to stop at its first node type, and then report that
+            # libraries kept changing. An operator would go looking for the wrong thing.
+            pass_stop_reason = self._probe_stop_reason(allowance=allowance, timeouts_spent=0)
+            if pass_stop_reason is not None:
+                logger.info(
+                    "Stopped warming port summaries after %d sweep(s): %s. Anything still uncomputed will be "
+                    "computed by the first request that needs it, which starts with a fresh allowance.",
+                    sweep,
+                    pass_stop_reason,
+                )
+                return
+
             cold_library_names = [
                 library_name
                 for library_name in LibraryRegistry.list_libraries()
@@ -3792,17 +3842,22 @@ class LibraryManager(EngineScoped):
         # node type would otherwise clear the grant and let the next timeout re-grant it.
         retried_node_types = already_retried_node_types | computation.timed_out_node_types
 
-        if self._port_summary_threads_leaked >= self._PROBE_THREAD_LEAK_CEILING:
+        # The permanently-lost threads specifically, not the live count `_probe_stop_reason` gates on.
+        # A pass can also have stopped because threads abandoned by a cancellation are still busy,
+        # and those come back: giving up on the node types they displaced would turn a reload into a
+        # permanent loss of ranking. Only timeouts are unrecoverable, so only timeouts end this
+        # library's probing for good.
+        if self._port_summary_timed_out_threads >= self._PROBE_THREAD_LEAK_CEILING:
             # No pass in this process will probe again, so carrying anything as pending would only
             # make every future request take the lock and run a pass that stops immediately.
             if computation.unprobed_node_types:
                 logger.warning(
-                    "Giving up on port summaries for %d node type(s) in library '%s': this engine has leaked %d "
-                    "probe thread(s), its lifetime ceiling. These go unranked in the Add Node menu until the "
-                    "engine restarts.",
+                    "Giving up on port summaries for %d node type(s) in library '%s': this engine has lost %d "
+                    "probe thread(s) to timeouts, its lifetime ceiling. These go unranked in the Add Node menu "
+                    "until the engine restarts.",
                     len(computation.unprobed_node_types),
                     library_name,
-                    self._port_summary_threads_leaked,
+                    self._port_summary_timed_out_threads,
                 )
             return PortSummaryCacheEntry(
                 summaries=summaries,
@@ -3959,9 +4014,11 @@ class LibraryManager(EngineScoped):
                 if outcome.timed_out:
                     timed_out_node_types.add(node_type)
                     allowance.remaining -= 1
-                    # Counted for the life of the process: this thread is never coming back, and
-                    # the two allowances above both reset.
-                    self._port_summary_threads_leaked += 1
+                    if outcome.thread_lost:
+                        # Counted for the life of the process: a construction still running past the
+                        # deadline is one nothing can interrupt, and the two allowances above both
+                        # reset. A timeout whose thread did come back is charged to neither.
+                        self._port_summary_timed_out_threads += 1
                 continue
 
             summaries[node_type] = outcome.summary
@@ -4029,10 +4086,11 @@ class LibraryManager(EngineScoped):
             # request, which will see the rebuilt registry.
             return "a library reload has started, so the node classes this pass would resolve are being replaced"
 
-        if self._port_summary_threads_leaked >= self._PROBE_THREAD_LEAK_CEILING:
+        threads_held = self._leaked_probe_thread_count()
+        if threads_held >= self._PROBE_THREAD_LEAK_CEILING:
             return (
-                f"this engine has leaked {self._port_summary_threads_leaked} probe thread(s), its lifetime ceiling. "
-                f"No further probing will be attempted in this process"
+                f"this engine is holding {threads_held} probe thread(s) it cannot reclaim, its ceiling. Probing "
+                f"resumes only if threads abandoned by a reload finish; the ones lost to timeouts never do"
             )
 
         if timeouts_spent >= self._PORT_SUMMARY_LIBRARY_TIMEOUT_BUDGET:
@@ -4045,6 +4103,25 @@ class LibraryManager(EngineScoped):
             return "this pass has spent its probe timeout allowance"
 
         return None
+
+    def _leaked_probe_thread_count(self) -> int:
+        """How many probe threads this engine is currently holding without being able to reclaim them.
+
+        Two kinds, counted together because the executor they come out of cannot tell them apart.
+
+        A timeout means the node's `__init__` is still running past the deadline, which for a
+        genuinely stuck node means for the life of the process, so it is charged permanently.
+
+        A cancellation is different, and treating it the same was a real bug: every library reload
+        cancels the warm pass, frequently mid-probe, and what it usually abandons is a healthy
+        `__init__` a few milliseconds in whose thread is back in the pool almost immediately. Charged
+        permanently against a ceiling of two or three, a couple of reloads would disable connection
+        ranking for the rest of the session. So an abandoned construction is kept as its own
+        "worker finished" signal and stops counting the moment it fires, making this a live measure
+        of threads actually held rather than a tally of times one was abandoned.
+        """
+        self._abandoned_probe_signals = [signal for signal in self._abandoned_probe_signals if not signal.is_set()]
+        return self._port_summary_timed_out_threads + len(self._abandoned_probe_signals)
 
     async def _probe_node_type_port_summary(  # noqa: PLR0911
         self, *, library: Library, library_name: str, node_type: str
@@ -4116,38 +4193,29 @@ class LibraryManager(EngineScoped):
             )
         except asyncio.CancelledError:
             # A reload stopping the warm pass mid-probe. The construction thread is not cancellable,
-            # so if it has not finished it is held exactly as a timeout would hold it, and the
-            # engine-wide ceiling has to hear about it: cancellation is not rare (every reload does
-            # it), and a ceiling that only counted timeouts would let repeated reloads drain the
-            # loop's executor without ever tripping. Not counted against the library or the pass --
-            # both are about to be discarded -- and not counted at all when the thread did finish,
-            # since charging a leak that did not happen would disable probing for the session.
+            # so while it runs on it holds a worker exactly as a timeout would, and the engine-wide
+            # ceiling has to hear about it: cancellation is not rare -- every reload does it -- and a
+            # ceiling that only counted timeouts would let repeated reloads drain the loop's executor
+            # without ever tripping. Handed over as the signal rather than as a count, though, because
+            # the usual abandoned construction is a healthy one that finishes moments later: see
+            # `_leaked_probe_thread_count`. Not charged to the library or the pass either way, both
+            # being about to be discarded.
             if not probe_finished.is_set():
-                self._port_summary_threads_leaked += 1
+                self._abandoned_probe_signals.append(probe_finished)
                 logger.warning(
                     "Port summary probing was stopped while constructing node type '%s' in library '%s'. Its thread "
-                    "cannot be cancelled, so it is leaked (%d so far); probing stops for this process after %d.",
+                    "cannot be cancelled, so it is held until that construction returns (%d thread(s) held now); "
+                    "probing pauses while %d are held.",
                     node_type,
                     library_name,
-                    self._port_summary_threads_leaked,
+                    self._leaked_probe_thread_count(),
                     self._PROBE_THREAD_LEAK_CEILING,
                 )
             raise
         except TimeoutError:
-            # asyncio.to_thread cannot be cancelled, so the thread is not reclaimed: it holds a
-            # worker of the loop's default executor until __init__ returns, which for a truly stuck
-            # node means for the life of the process. That is why the caller both bounds how many
-            # timeouts one pass will spend and gives this node type one retry rather than one per
-            # request.
-            logger.warning(
-                "Port summary probe for node type '%s' in library '%s' timed out after %.1fs; skipping it and "
-                "leaking the probe thread, which cannot be cancelled. The node's __init__ likely makes a "
-                "blocking call.",
-                node_type,
-                library_name,
-                self._SCHEMA_PROBE_TIMEOUT_S,
+            return self._timed_out_probe_outcome(
+                library_name=library_name, node_type=node_type, probe_finished=probe_finished
             )
-            return NodeTypePortProbeOutcome(summary=None, timed_out=True)
         except Exception:
             # _construct_probe_node already converts a raising __init__ into a result, so reaching
             # here means the failure was outside it -- the executor refusing work during interpreter
@@ -4186,6 +4254,40 @@ class LibraryManager(EngineScoped):
             return NodeTypePortProbeOutcome(summary=None, timed_out=False)
 
         return NodeTypePortProbeOutcome(summary=summary, timed_out=False)
+
+    def _timed_out_probe_outcome(
+        self, *, library_name: str, node_type: str, probe_finished: threading.Event
+    ) -> NodeTypePortProbeOutcome:
+        """Report a construction that missed its deadline, saying whether its thread went with it.
+
+        `asyncio.to_thread` cannot be cancelled, so a timed-out construction usually holds a worker
+        of the loop's default executor until `__init__` returns, which for a genuinely stuck node
+        means for the life of the process. That is why the caller both bounds how many timeouts one
+        pass will spend and grants a node type one retry rather than one per request.
+
+        Except when the construction landed in the window between its deadline passing and
+        `TimeoutError` being raised, in which case the worker is already back in the pool and only
+        the result was lost. Same question the cancellation branch asks, and the same answer: nothing
+        is charged to the engine-wide ceiling for a thread that is not held. Past the deadline the
+        engine has no basis to expect a *later* return, though, so a node that hands its thread back
+        at 10.5s is still charged -- conservative on purpose, and exactly the shape of node the
+        ceiling exists to stop paying for.
+        """
+        thread_lost = not probe_finished.is_set()
+        if thread_lost:
+            thread_note = " and leaking its probe thread, which cannot be cancelled"
+        else:
+            thread_note = ", though its probe thread finished in time to go back to the pool"
+
+        logger.warning(
+            "Port summary probe for node type '%s' in library '%s' timed out after %.1fs; skipping it%s. The node's "
+            "__init__ likely makes a blocking call.",
+            node_type,
+            library_name,
+            self._SCHEMA_PROBE_TIMEOUT_S,
+            thread_note,
+        )
+        return NodeTypePortProbeOutcome(summary=None, timed_out=True, thread_lost=thread_lost)
 
     def _invalidate_port_summaries(self, library_name: str) -> None:
         """Drop a library's cached port summaries after its node types change.
@@ -6689,10 +6791,13 @@ class LibraryManager(EngineScoped):
         return new_downloads
 
     async def reload_libraries_request(self, request: ReloadAllLibrariesRequest) -> ResultPayload:
-        # Stop any background port summary warming before anything is torn down. The pass resolves
-        # node classes, so one left running would import modules belonging to libraries this is
-        # about to unload -- reviving exactly what the reload exists to replace.
+        # Stop any background port summary warming before anything is torn down, and keep anything
+        # else from starting one until this is finished. The pass resolves node classes, so one left
+        # running -- or one begun in the several awaits it takes to tear the registry down -- would
+        # import modules belonging to libraries this is about to unload, reviving exactly what the
+        # reload exists to replace.
         await self._cancel_port_summary_warm()
+        self._port_summary_warm_suppressed += 1
 
         # Bracket the reload like on_app_initialization_complete so the heartbeat reports
         # is_initializing during a mid-session reload too. finally clears it even on failure.
@@ -6709,6 +6814,8 @@ class LibraryManager(EngineScoped):
             raise
         finally:
             self._is_initializing = False
+            # Lifted before the restart below, which would otherwise defer itself.
+            self._port_summary_warm_suppressed -= 1
 
             # Re-warm in finally, not on the success path: every way out of the reload leaves the
             # cache dropped, because the unloads either completed or were abandoned partway. A
@@ -7611,17 +7718,31 @@ class LibraryManager(EngineScoped):
             On failure: ResultPayloadFailure instance
         """
         await self._cancel_port_summary_warm()
+        self._port_summary_warm_suppressed += 1
+        restart_warming = True
         try:
             return await self._run_reload_library_after_git_operation(
                 library_name=library_name,
                 library_file_path=library_file_path,
                 failure_result_class=failure_result_class,
             )
+        except asyncio.CancelledError:
+            # The same exception `reload_libraries_request` makes: the caller is going away, so
+            # starting a background pass on the way out would leave it resolving node classes over a
+            # registry this abandoned partway through rebuilding, with nothing holding a handle to
+            # stop it a second time. Worse here than there, because this path never closes
+            # `_libraries_loading_complete`, so the pass has no gate to notice either.
+            restart_warming = False
+            raise
         finally:
+            # Lifted before the restart below, which would otherwise defer itself.
+            self._port_summary_warm_suppressed -= 1
+
             # In `finally`, not on the success path: a reload that failed partway has still dropped
             # this library's summaries, and leaving warming stopped would make every other library's
             # first connection drag pay the probe cost too.
-            self._start_port_summary_warm()
+            if restart_warming:
+                self._start_port_summary_warm()
 
     async def _run_reload_library_after_git_operation(
         self,
