@@ -289,3 +289,55 @@ class ListResourceInstancesByTypeResultSuccess(WorkflowNotAlteredMixin, ResultPa
 @PayloadRegistry.register
 class ListResourceInstancesByTypeResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Resource instances by type listing failed. Common causes: invalid resource type."""
+
+
+# Get Execution Device Events
+@dataclass
+@PayloadRegistry.register
+class GetExecutionDeviceRequest(RequestPayload):
+    """Ask which compute device a node should run on.
+
+    Use when: A node needs a device to place a model or tensor on, and does not want to import a
+    heavy framework to find out. Every library that wraps a model currently imports torch purely
+    to call `torch.cuda.is_available()`, which drags an execution-time dependency into whatever
+    process asks the question -- including the one that only edits.
+
+    The engine already knows: OSManager detects the machine's backends without torch (nvidia-smi
+    for CUDA, a platform check for MPS) and registers them as a compute resource.
+
+    Args:
+        preferred: Optional device to use if the machine has it, e.g. a user or config pin. When
+            it is unavailable the answer falls back to the normal preference order rather than
+            failing, so a workflow authored on one machine still runs on another.
+        required_by_library: Optional library name whose declared compute requirement narrows the
+            choice, so "needs cuda" and "run on cuda" stop being two statements kept in sync by
+            hand.
+
+    Results: GetExecutionDeviceResultSuccess (with the device and what is available) |
+        GetExecutionDeviceResultFailure (compute resources could not be read)
+    """
+
+    preferred: str | None = None
+    required_by_library: str | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class GetExecutionDeviceResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The device to run on, and the backends this machine actually has.
+
+    Args:
+        device: The chosen backend: "cuda", "mps" or "cpu".
+        available: Every backend detected on this machine, most capable first.
+        honored_preference: Whether `preferred` was available and used.
+    """
+
+    device: str
+    available: list[str]
+    honored_preference: bool = False
+
+
+@dataclass
+@PayloadRegistry.register
+class GetExecutionDeviceResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The device could not be determined. Common cause: no compute resource instance registered."""

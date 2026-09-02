@@ -56,6 +56,7 @@ from griptape_nodes.node_library.library_registry import (
     LibraryRegistry,
     LibraryRegistryError,
     LibrarySchema,
+    ModelAsset,
     NodeDefinition,
     NodeMetadata,
     WidgetDefinition,
@@ -185,6 +186,10 @@ from griptape_nodes.retained_mode.events.library_events import (
     UpdateLibraryResultFailure,
     UpdateLibraryResultSuccess,
     WidgetInfo,
+)
+from griptape_nodes.retained_mode.events.model_events import (
+    DownloadModelRequest,
+    DownloadModelResultSuccess,
 )
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.os_events import (
@@ -501,6 +506,9 @@ class LibraryManager(EngineScoped):
         # orchestrator never learns it -- the worker reports that itself when a run is attempted.
         # None means nothing is known to be wrong.
         execution_unavailable_reason: str | None = None
+        # Resources the library says it runs BETTER with and this machine lacks. Informational
+        # only: it never blocks loading or execution. None means nothing is known to be missing.
+        unmet_preferences: str | None = None
         # Declared execution modules, imported and keyed by their file stem. Populated only in a
         # worker: the orchestrator deliberately never imports these, so it holds an empty dict
         # and `get_execution_module` refuses there.
@@ -2502,6 +2510,25 @@ class LibraryManager(EngineScoped):
                         if library_data.metadata.resources is not None
                         else None
                     )
+                    preferred_requirements = (
+                        library_data.metadata.resources.preferred
+                        if library_data.metadata.resources is not None
+                        else None
+                    )
+                    if preferred_requirements is not None:
+                        # A preference is not a gate. It is recorded so the settings panel can
+                        # say "this runs better with a GPU" and so a slow run has an explanation,
+                        # and then execution proceeds either way.
+                        preferred_check = self._check_library_requirements(
+                            preferred_requirements, library_data.name, tier="preferred"
+                        )
+                        if preferred_check is not None:
+                            library_info.unmet_preferences = self._describe_unmet_requirements(preferred_check)
+                            logger.info(
+                                "Library '%s' runs better with resources this machine does not have: %s",
+                                library_data.name,
+                                library_info.unmet_preferences,
+                            )
                     if library_requirements is not None:
                         requirements_check_result = self._check_library_requirements(
                             library_requirements, library_data.name
@@ -3055,13 +3082,15 @@ class LibraryManager(EngineScoped):
         return f"it needs {wanted}, and this machine has {have}."
 
     def _check_library_requirements(
-        self, requirements: dict[str, Any], library_name: str
+        self, requirements: dict[str, Any], library_name: str, *, tier: str = "required"
     ) -> IncompatibleRequirementsProblem | None:
         """Check if the current system meets the library's resource requirements.
 
         Args:
             requirements: Dictionary of requirements in the format used by resource_instance.Requirements
             library_name: Name of the library being checked (for logging)
+            tier: Which declaration is being checked, "required" or "preferred". Only affects how
+                loudly an unmet result is logged: a preference is information, not a problem.
 
         Returns:
             IncompatibleRequirementsProblem if requirements are not met, None if they are met
@@ -3084,9 +3113,11 @@ class LibraryManager(EngineScoped):
 
             if isinstance(result, ListCompatibleResourceInstancesResultSuccess) and not result.instance_ids:
                 system_capabilities = self._get_system_capabilities()
-                logger.warning(
-                    "Library '%s' OS requirements not met. Required: %s, System: %s",
+                logger.log(
+                    logging.WARNING if tier == "required" else logging.INFO,
+                    "Library '%s' %s OS resources not met. Wanted: %s, System: %s",
                     library_name,
+                    tier,
                     os_requirements,
                     system_capabilities,
                 )
@@ -3105,9 +3136,11 @@ class LibraryManager(EngineScoped):
 
             if isinstance(result, ListCompatibleResourceInstancesResultSuccess) and not result.instance_ids:
                 system_capabilities = self._get_system_capabilities()
-                logger.warning(
-                    "Library '%s' compute requirements not met. Required: %s, System: %s",
+                logger.log(
+                    logging.WARNING if tier == "required" else logging.INFO,
+                    "Library '%s' %s compute resources not met. Wanted: %s, System: %s",
                     library_name,
+                    tier,
                     compute_requirements,
                     system_capabilities,
                 )
@@ -5094,7 +5127,9 @@ class LibraryManager(EngineScoped):
                 )
                 return
             library_info.execution_modules[path.stem] = module
-            logger.debug("Library '%s': imported execution module '%s'", library_data.name, path.stem)
+            # INFO, not debug: this is the record that a worker is ready to RUN this library, and
+            # the first thing to look for when it turns out it cannot.
+            logger.info("Library '%s': imported execution module '%s'", library_data.name, path.stem)
 
     def _check_execution_module_boundary(
         self,
@@ -5183,6 +5218,89 @@ class LibraryManager(EngineScoped):
             if resolved in library_info.declared_execution_module_paths:
                 return resolved
         return None
+
+    def get_model_asset(self, library_name: str, asset_id: str) -> Path:
+        """Return the local directory holding a declared model asset, fetching it if needed.
+
+        Weights are not dependencies, and they are not a library-load concern either. This resolves
+        on demand, in whichever process asks -- which is the one about to run the model -- and
+        caches under an engine-owned root so two libraries wanting the same revision share it and
+        neither has to invent a location.
+
+        Raises:
+            RuntimeError: If the library is unknown, declares no asset by that id, or the fetch
+                fails. Each message says which of those it was.
+        """
+        # Read through the registry rather than LibraryInfo: the registry holds the schema and
+        # resolves library-local declarations correctly in both the orchestrator and a worker,
+        # which is the same route get_declared_models takes.
+        try:
+            library = LibraryRegistry.get_library(library_name)
+        except KeyError as err:
+            msg = f"No library named '{library_name}' is registered, so its model assets cannot be resolved."
+            raise RuntimeError(msg) from err
+
+        declared = library.get_library_data().model_assets or {}
+        asset = declared.get(asset_id)
+        if asset is None:
+            available = ", ".join(sorted(declared)) or "none"
+            msg = (
+                f"Library '{library_name}' declares no model asset named '{asset_id}'. "
+                f"Declared: {available}. Add it to the manifest's model_assets."
+            )
+            raise RuntimeError(msg)
+
+        target = self._model_asset_path(library_name, asset_id, asset)
+        if target.exists() and any(target.iterdir()):
+            logger.debug("Model asset '%s' for library '%s' is already present at %s", asset_id, library_name, target)
+            return target
+
+        scheme, _, reference = asset.source.partition(":")
+        supported_schemes = ("hf",)
+        if scheme not in supported_schemes:
+            msg = (
+                f"Model asset '{asset_id}' of library '{library_name}' declares source "
+                f"'{asset.source}'. Supported schemes: {', '.join(supported_schemes)} "
+                "(e.g. 'hf:owner/repo')."
+            )
+            raise RuntimeError(msg)
+
+        logger.info(
+            "Fetching model asset '%s' for library '%s' from %s (revision %s)",
+            asset_id,
+            library_name,
+            reference,
+            asset.revision,
+        )
+        target.mkdir(parents=True, exist_ok=True)
+        result = self.engine.handle_request(
+            DownloadModelRequest(
+                model_id=reference,
+                local_dir=str(target),
+                revision=asset.revision,
+                allow_patterns=asset.files,
+            )
+        )
+        if not isinstance(result, DownloadModelResultSuccess):
+            msg = (
+                f"Attempted to fetch model asset '{asset_id}' for library '{library_name}' from "
+                f"{reference}. Failed with: {result.result_details}"
+            )
+            # isinstance here discriminates a result payload, the engine's universal idiom; the
+            # failure is a fetch failure, not a type error.
+            raise RuntimeError(msg)  # noqa: TRY004
+        return target
+
+    @staticmethod
+    def _model_asset_path(library_name: str, asset_id: str, asset: ModelAsset) -> Path:
+        """Where a model asset lives. Keyed by revision so a re-pin does not overwrite the old one.
+
+        Engine-owned rather than library-adjacent: a library directory can be read-only, can be
+        reinstalled underneath the weights, and is the wrong place for gigabytes that two libraries
+        might share.
+        """
+        safe_library = "".join(char if char.isalnum() or char in "-_" else "_" for char in library_name)
+        return xdg_data_home() / "griptape_nodes" / "model_assets" / safe_library / asset_id / asset.revision
 
     def get_execution_module(self, library_name: str, module_name: str) -> ModuleType:
         """Return one of a library's execution modules, or explain why it is not available here.

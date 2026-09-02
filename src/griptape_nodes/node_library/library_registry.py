@@ -88,16 +88,53 @@ class Dependencies(BaseModel):
     pip_install_flags: list[str] | None = None
 
 
+class ModelAsset(BaseModel):
+    """Weight files a library needs on disk, declared rather than installed.
+
+    Weights are not dependencies. Libraries have been acquiring them three ways -- bundled inside a
+    pip-installed source tree, downloaded by a library-load hook, or fetched ad hoc by node code --
+    and only the last is even in the right process. A declaration lets the engine own fetching,
+    cache location, revision pinning and the entitlement gate, and lets a node ask for a path.
+
+    Distinct from ``model_catalog``, which declares HOSTED models a node may invoke and the keys
+    and terms that govern them. This is about bytes on local disk.
+
+    Args:
+        source: Where the weights come from. ``hf:owner/repo`` is the only scheme today.
+        revision: Git revision to pin. Defaults to "main", but pinning is strongly preferred: an
+            unpinned asset means a workflow can produce different output next month.
+        files: Optional glob patterns to fetch instead of the whole repository, e.g.
+            ``["*.safetensors", "config.json"]``. Whole repositories are often much larger than
+            what a node actually loads.
+    """
+
+    source: str
+    revision: str = "main"
+    files: list[str] | None = None
+
+
 class ResourceRequirements(BaseModel):
     """Resource requirements for a library.
 
     Specifies what system resources (OS, compute backends) the library needs.
     Example: {"platform": (["linux", "windows"], "has_any"), "arch": "x86_64", "compute": (["cuda", "cpu"], "has_all")}
+
+    Two tiers, because "needs" and "prefers" are different claims and libraries were being made
+    to pick one of them:
+
+    - ``required``: without this the library cannot run. Execution refuses with the reason;
+      editing is unaffected.
+    - ``preferred``: it runs either way, better with this. Recorded and reported, never a gate.
+
+    Before the second tier existed, an author who wanted to say "this really wants a GPU" had to
+    choose between a hard gate and saying nothing. SAM3 chose the gate and declared cuda-only,
+    which is why it could not be edited on a laptop at all.
     """
 
     required: Requirements | None = None
+    preferred: Requirements | None = None
 
-    @field_validator("required", mode="before")
+    @field_validator("required", "preferred", mode="before")
     @classmethod
     def convert_lists_to_tuples(cls, v: Any) -> Any:
         """Convert list values to tuples for requirements loaded from JSON.
@@ -291,6 +328,9 @@ class LibrarySchema(BaseModel):
     is_default_library: bool | None = None
     advanced_library_path: str | None = None
     widgets: list[WidgetDefinition] | None = None
+    # Weight files this library needs on disk, keyed by the id node code asks for. Fetched on
+    # demand by whichever process runs the model -- never at library load.
+    model_assets: dict[str, ModelAsset] | None = None
     # Modules that only ever run where nodes execute. Paths relative to this manifest; a
     # directory means every `.py` beneath it.
     #
