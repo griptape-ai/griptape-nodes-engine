@@ -870,6 +870,8 @@ What this asks of your node:
     blocks past a 10-second timeout is omitted the same way, and it costs more than itself: a
     blocked probe holds a thread the engine cannot reclaim, so after a handful of them the engine
     stops probing that library at all and its remaining node types go unranked until it reloads.
+    Enough of them across every library and it stops probing for the rest of the session, because
+    at that point the leaked threads are a bigger problem than an unranked menu.
     This is the same constraint the worker-mode schema probe imposes — see
     [`__init__` runs during library load](node_isolation_with_workers.md#__init__-runs-during-library-load).
 - **Expect dynamic ports to be missing.** Only ports that exist right after construction are
@@ -886,6 +888,14 @@ next request, alone, and is then left out until the library reloads. Because eac
 costs the engine a thread for good, one request will only wait out a few of them; libraries it did
 not reach are probed on a later request instead, and a library that has spent the whole allowance is
 left as-is until it reloads.
+
+The pass normally runs in the background, right after libraries finish loading and again after a
+reload, so the menu is ready before anyone opens it. Worth knowing while authoring: **your
+`__init__` runs shortly after startup whether or not anyone creates your node**, so anything it does
+eagerly — an auth check, a model download, a directory it creates — happens then too. That is
+another reason to keep it cheap and offline. Setting `library.warm_port_summaries` to `false` in
+your config turns the background pass off; the summaries are then computed by the first request that
+needs them, which moves the cost back into the artist's first drag rather than removing it.
 
 ### Two-Image Processing Node Pattern
 

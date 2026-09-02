@@ -962,7 +962,13 @@ class GetPortSummariesForAllLibrariesRequest(RequestPayload):
     node's actual parameters. Container parameters are covered despite their children not
     existing yet, because a container knows its element type up front.
 
-    Results: GetPortSummariesForAllLibrariesResultSuccess | GetPortSummariesForAllLibrariesResultFailure
+    Always succeeds, so there is no failure result to handle. Every way a probe can fail is a
+    property of one node type -- an unimportable module, a raising `__init__`, one that blocks past
+    the timeout -- and the answer is to omit that node type, not to fail the request for every
+    other one. A caller that gets fewer node types than it expected reads that as "leave these
+    unranked".
+
+    Results: GetPortSummariesForAllLibrariesResultSuccess
     """
 
 
@@ -978,12 +984,6 @@ class GetPortSummariesForAllLibrariesResultSuccess(WorkflowNotAlteredMixin, Resu
     """
 
     library_name_to_port_summaries: dict[str, dict[str, NodePortSummary]]
-
-
-@dataclass
-@PayloadRegistry.register
-class GetPortSummariesForAllLibrariesResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
-    """Port summary retrieval failed. Common causes: registry not initialized, system error."""
 
 
 @dataclass

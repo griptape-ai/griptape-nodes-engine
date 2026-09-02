@@ -125,6 +125,14 @@ class AppInitializationComplete(AppPayload):
     # then serves the workspace itself, which is the path that goes away once every shipped
     # host provides a server (see the fallback in StaticFilesManager).
     static_server_base_url: str | None = None
+    # Whether anything in this process will ask what ports node types have. True for a host with an
+    # editor attached, which needs port summaries to rank node types mid-drag; False for a headless
+    # run (a CLI execution, a published workflow), which runs a fixed graph and never asks. The
+    # engine warms that cache in the background after libraries load, and warming means
+    # constructing every node type in every library -- worth doing ahead of an artist, wasted work
+    # competing with a workflow that is already running. Defaults to True so a host that says
+    # nothing keeps the interactive behavior.
+    warm_port_summaries: bool = True
 
 
 @dataclass

@@ -50,7 +50,9 @@ class LocalSessionWorkflowPublisher(LocalWorkflowPublisher, SubprocessWebSocketS
     async def __aenter__(self) -> Self:
         """Async context manager entry: initialize queue and start WebSocket connection."""
         GriptapeNodes.EventManager().initialize_queue()
-        await GriptapeNodes.EventManager().abroadcast_app_event(AppInitializationComplete())
+        # warm_port_summaries=False: a subprocess that packages a workflow for publishing. It never
+        # displays an Add Node menu, so nothing will read the summaries the warm pass would build.
+        await GriptapeNodes.EventManager().abroadcast_app_event(AppInitializationComplete(warm_port_summaries=False))
 
         logger.info("Setting up publishing session %s", self._session_id)
         GriptapeNodes.SessionManager().save_session(self._session_id)

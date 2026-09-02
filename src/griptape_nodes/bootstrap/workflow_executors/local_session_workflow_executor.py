@@ -60,7 +60,9 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
     async def __aenter__(self) -> Self:
         """Async context manager entry: initialize queue and broadcast app initialization."""
         GriptapeNodes.EventManager().initialize_queue()
-        await GriptapeNodes.EventManager().abroadcast_app_event(AppInitializationComplete())
+        # warm_port_summaries=False: a subprocess executing one workflow. The port summaries only
+        # answer "what can this connect to?" for an editor, and there is none here.
+        await GriptapeNodes.EventManager().abroadcast_app_event(AppInitializationComplete(warm_port_summaries=False))
 
         logger.info("Setting up session %s", self._session_id)
         GriptapeNodes.SessionManager().save_session(self._session_id)

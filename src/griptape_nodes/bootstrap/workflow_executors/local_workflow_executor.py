@@ -83,9 +83,14 @@ class LocalWorkflowExecutor(WorkflowExecutor):
         if self._project_file_path is not None:
             await self._load_project(self._project_file_path)
 
+        # warm_port_summaries=False: this process runs one already-built workflow and exits. Nobody
+        # here drags a connection, so probing every node type for its ports would only compete with
+        # the run for CPU.
         await GriptapeNodes.EventManager().abroadcast_app_event(
             AppInitializationComplete(
-                skip_library_loading=self._skip_library_loading, workflows_to_register=self._workflows_to_register
+                skip_library_loading=self._skip_library_loading,
+                workflows_to_register=self._workflows_to_register,
+                warm_port_summaries=False,
             )
         )
         return self
