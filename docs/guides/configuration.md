@@ -182,7 +182,7 @@ GTN_CONFIG_LIBRARY__LAZY_NODE_LOADING=false gtn
 GTN_CONFIG_AGENT__SYSTEM_PROMPT="Answer tersely." gtn
 ```
 
-A value is converted to the setting's declared type before it takes effect, so `false` for a boolean setting means `False` (not the truthy string `"false"`), and `30` for a number setting means the number `30`, not text.
+A value is converted to the setting's declared type before it takes effect, so `false` for a boolean setting means `False` (not the truthy string `"false"`), and `30` for a number setting means the number `30`, not text. That conversion does not reach an entry in a mapping-valued setting, such as `GTN_CONFIG_ARTIFACTS__SOME_KEY`: its value is typed to accept anything, so it arrives exactly as written, and a boolean or numeric mapping entry needs a config file instead.
 
 > **Two limits:**
 >

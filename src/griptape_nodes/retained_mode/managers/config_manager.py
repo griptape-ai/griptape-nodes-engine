@@ -3,7 +3,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 from pydantic import ValidationError
 from xdg_base_dirs import xdg_config_home
@@ -79,9 +79,18 @@ DEFAULT_LIBRARIES_ROOT_ENV_VAR = "GTN_DEFAULT_LIBRARIES_ROOT"
 ENV_VAR_PREFIX = "GTN_CONFIG_"
 ENV_VAR_PATH_SEPARATOR = "__"
 
+
+class EnvVarOverride(NamedTuple):
+    """One GTN_CONFIG_ variable, paired with the config key it resolves to."""
+
+    env_var_name: str
+    config_key: str
+    raw_value: str
+
+
 # Outcomes of coercing an environment variable that no real config value can collide with.
-_REJECTED_BY_SCHEMA = object()
-_ABSENT_FROM_SCHEMA = object()
+_REJECTED_BAD_VALUE = object()
+_REJECTED_UNKNOWN_KEY = object()
 
 
 class ConfigManager(EngineScoped):
@@ -128,9 +137,10 @@ class ConfigManager(EngineScoped):
         self._workspace_config_path: Path | None = None
         self._workspace_dir_override: str | None = None
         self._libraries_root_override: str | None = None
-        # (variable name, value) pairs already reported as invalid. The env layer is re-read on every
-        # load_configs() and on each read_env_config() call, so without this a single bad variable
-        # warns repeatedly for the life of the process.
+        # (variable name, value) pairs already reported as ignored. The env layer is re-read on
+        # every load_configs() and on each read_env_config() call, so without this a single bad
+        # variable warns repeatedly for the life of this manager. Other ConfigManagers built
+        # elsewhere in the process keep their own accounting.
         self._reported_invalid_env_vars: set[tuple[str, str]] = set()
         self.load_configs()
 
@@ -400,18 +410,55 @@ class ConfigManager(EngineScoped):
             Dictionary containing config values from environment variables
         """
         env_config: dict[str, Any] = {}
-        for key, value in os.environ.items():
-            if not key.startswith(ENV_VAR_PREFIX):
+        for override in self._collect_env_var_overrides():
+            coerced_value = self._coerce_env_var_value(override.config_key, override.raw_value)
+            if coerced_value is _REJECTED_BAD_VALUE:
+                self._report_ignored_env_var(
+                    override,
+                    f"'{override.raw_value}' is not a valid value for the '{override.config_key}' setting",
+                )
                 continue
-            config_key = key.removeprefix(ENV_VAR_PREFIX).lower().replace(ENV_VAR_PATH_SEPARATOR, ".")
-            coerced_value = self._coerce_env_var_value(config_key, value)
-            if coerced_value is _REJECTED_BY_SCHEMA:
-                self._report_invalid_env_var(key, value, config_key)
+            if coerced_value is _REJECTED_UNKNOWN_KEY:
+                self._report_ignored_env_var(override, f"there is no '{override.config_key}' setting")
                 continue
-            set_dot_value(env_config, config_key, coerced_value)
-            logger.debug("Loaded config from env var: %s -> %s", key, config_key)
+            set_dot_value(env_config, override.config_key, coerced_value)
+            logger.debug("Loaded config from env var: %s -> %s", override.env_var_name, override.config_key)
 
         return env_config
+
+    def _collect_env_var_overrides(self) -> list[EnvVarOverride]:
+        """Gather the GTN_CONFIG_ variables to apply, dropping paths that contradict each other.
+
+        Two variables conflict when one's key is a strict prefix of another's: exporting both
+        GTN_CONFIG_ARTIFACTS__IMAGE and GTN_CONFIG_ARTIFACTS__IMAGE__PREVIEW_FORMAT asks for
+        `artifacts.image` to be a value and a section at once. `set_dot_value` honors whichever
+        `os.environ` yields last, so the winner would depend on iteration order. The deeper path is
+        kept because it carries strictly more of what was asked for; the prefix is dropped.
+
+        Returns:
+            The overrides to apply, in environment order, minus the dropped prefixes.
+        """
+        overrides = []
+        for env_var_name, raw_value in os.environ.items():
+            if not env_var_name.startswith(ENV_VAR_PREFIX):
+                continue
+            config_key = env_var_name.removeprefix(ENV_VAR_PREFIX).lower().replace(ENV_VAR_PATH_SEPARATOR, ".")
+            overrides.append(EnvVarOverride(env_var_name=env_var_name, config_key=config_key, raw_value=raw_value))
+
+        applicable = []
+        for override in overrides:
+            deeper_keys = sorted(
+                other.config_key for other in overrides if other.config_key.startswith(f"{override.config_key}.")
+            )
+            if deeper_keys:
+                self._report_ignored_env_var(
+                    override,
+                    f"'{override.config_key}' is also the start of a longer path ({', '.join(deeper_keys)})",
+                )
+                continue
+            applicable.append(override)
+
+        return applicable
 
     def _coerce_env_var_value(self, config_key: str, raw_value: str) -> Any:
         """Coerce one environment variable's string to the type the Settings model declares for it.
@@ -421,49 +468,45 @@ class ConfigManager(EngineScoped):
         Settings (every field has a default, so a partial dict validates) both converts the value and
         contains the damage from a bad one to that key.
 
+        A key the schema does not declare survives validation but not the dump, because a nested
+        model ignores sub-keys it does not know. Free-form keys never reach that state: an entry in a
+        mapping-valued setting and a path riding Settings' `extra="allow"` are both retained through
+        the dump. So an absent key means the path names nothing, as `worker.heartbeat_timeout` does
+        by dropping the `_s`.
+
         Args:
             config_key: The dot-notation key the variable maps to.
             raw_value: The variable's string value.
 
         Returns:
-            The coerced value, the raw string when the key is outside the Settings schema, or
-            _REJECTED_BY_SCHEMA when the model rejects the value.
+            The coerced value, _REJECTED_BAD_VALUE when the model rejects the value, or
+            _REJECTED_UNKNOWN_KEY when the path names no setting.
         """
         candidate = set_dot_value({}, config_key, raw_value)
 
         try:
             validated = Settings.model_validate(candidate)
         except ValidationError:
-            return _REJECTED_BY_SCHEMA
+            return _REJECTED_BAD_VALUE
 
-        coerced_value = get_dot_value(validated.model_dump(), config_key, _ABSENT_FROM_SCHEMA)
-        if coerced_value is _ABSENT_FROM_SCHEMA:
-            # A sub-key of a nested model that the model does not declare; it validated only because
-            # the model ignores unknown sub-keys. Keep the string so the value still reaches
-            # anything reading the key directly.
-            return raw_value
+        return get_dot_value(validated.model_dump(), config_key, _REJECTED_UNKNOWN_KEY)
 
-        return coerced_value
-
-    def _report_invalid_env_var(self, env_var_name: str, raw_value: str, config_key: str) -> None:
-        """Warn once per variable and value that an environment override was ignored.
+    def _report_ignored_env_var(self, override: EnvVarOverride, reason: str) -> None:
+        """Warn that an environment override was ignored, once per variable and value.
 
         Args:
-            env_var_name: The full environment variable name.
-            raw_value: The value that failed validation.
-            config_key: The dot-notation setting the variable maps to.
+            override: The override being ignored.
+            reason: Why it was ignored, phrased to complete "Ignoring <var>: <reason>.".
         """
-        report_key = (env_var_name, raw_value)
+        report_key = (override.env_var_name, override.raw_value)
         if report_key in self._reported_invalid_env_vars:
             return
 
         self._reported_invalid_env_vars.add(report_key)
         logger.warning(
-            "Ignoring environment variable %s: '%s' is not a valid value for the '%s' setting. "
-            "Falling back to the configured value.",
-            env_var_name,
-            raw_value,
-            config_key,
+            "Ignoring environment variable %s: %s. Falling back to the configured value.",
+            override.env_var_name,
+            reason,
         )
 
     def _load_config_from_file(self, path: Path, label: str) -> dict:

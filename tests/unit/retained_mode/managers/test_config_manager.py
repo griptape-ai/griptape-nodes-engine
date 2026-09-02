@@ -134,10 +134,11 @@ class TestConfigManager:
     def test_invalid_env_var_does_not_reset_the_rest_of_the_config(self, isolate_user_config: Path) -> None:
         """A single bad env var must not wipe the merged config back to defaults.
 
-        Before per-key validation, an invalid GTN_CONFIG_ value flowed straight into
-        merged_config, and Settings.model_validate(merged_config) in load_configs rejected the
-        whole dict on any single bad field, resetting every other setting -- including the
-        user's own config file -- back to defaults.
+        `load_configs` calls `Settings.model_validate(merged_config)` on the whole merged dict, so
+        an invalid value anywhere in it would fail validation for the entire config, resetting
+        every setting, including the user's own config file, back to defaults. Validating each
+        `GTN_CONFIG_` variable against its own single-key delta before it is merged keeps one bad
+        variable's damage contained to that key instead.
         """
         isolate_user_config.write_text(json.dumps({"log_level": "ERROR"}), encoding="utf-8")
 
@@ -147,16 +148,23 @@ class TestConfigManager:
 
             assert manager.merged_config["log_level"] == "ERROR"
 
-    def test_load_config_from_env_vars_unknown_nested_key_keeps_raw_string(self) -> None:
-        """A sub-key the nested model doesn't declare keeps its raw string value.
+    def test_load_config_from_env_vars_unknown_nested_key_rejected(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A sub-key a declared nested model doesn't recognize is rejected, not kept as a raw string.
 
-        It validates only because Settings ignores unknown keys on a nested model, so the
-        loader falls back to the raw string rather than losing the value entirely.
+        `WorkerSettings` has no `heartbeat_timeout` field, only `heartbeat_timeout_s`, and being a
+        strict model it drops an unrecognized sub-key from `model_dump()` rather than keeping it.
+        That absence after validation is unambiguous: a free-form path, an entry in a
+        mapping-valued setting, or one riding Settings' own `extra="allow"`, is retained through
+        the dump instead, so an absent key here means the path names no real setting.
         """
         with patch.dict(os.environ, {"GTN_CONFIG_WORKER__BOGUS": "1"}, clear=True):
-            manager = ConfigManager()
-            env_config = manager._load_config_from_env_vars()
-            assert env_config == {"worker": {"bogus": "1"}}
+            with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+                manager = ConfigManager()
+                env_config = manager._load_config_from_env_vars()
+
+            assert env_config == {}
+            warnings = [record for record in caplog.records if "there is no" in record.message]
+            assert len(warnings) == 1
 
     def test_invalid_env_var_warning_logged_once_per_variable_and_value(self, caplog: pytest.LogCaptureFixture) -> None:
         """The same (variable, value) pair warns once even when the env layer is re-read.
@@ -166,8 +174,8 @@ class TestConfigManager:
         bad variable would re-warn every time.
         """
         with patch.dict(os.environ, {"GTN_CONFIG_MAX_NODES_IN_PARALLEL": "not-an-int"}, clear=True):
-            manager = ConfigManager()
             with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+                manager = ConfigManager()
                 manager._load_config_from_env_vars()
                 manager.read_env_config()
 
@@ -211,9 +219,9 @@ class TestConfigManager:
     def test_nested_env_var_does_not_clobber_sibling_defaults(self) -> None:
         """Setting one leaf under a parent must not blank out its siblings.
 
-        merge_dicts overlays a nested dict rather than replacing the parent wholesale, but that
-        property was previously unverified: with only heartbeat_timeout_s exported,
-        heartbeat_interval_s must still be WorkerSettings's own default.
+        `merge_dicts` overlays a nested dict onto the existing one rather than replacing the
+        parent wholesale, so with only `heartbeat_timeout_s` exported, `heartbeat_interval_s`
+        must still resolve to `WorkerSettings`'s own default.
         """
         with patch.dict(os.environ, {"GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S": "30"}, clear=True):
             manager = ConfigManager()
@@ -222,23 +230,29 @@ class TestConfigManager:
             assert manager.get_config_value("worker.heartbeat_timeout_s") == 30.0  # noqa: PLR2004
             assert manager.get_config_value("worker.heartbeat_interval_s") == 5.0  # noqa: PLR2004
 
-    def test_flat_and_nested_worker_env_vars_together_nested_wins(self) -> None:
-        """A flat GTN_CONFIG_WORKER cannot clobber a sibling GTN_CONFIG_WORKER__X, in either order.
+    def test_flat_and_nested_worker_env_vars_together_nested_wins(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A flat GTN_CONFIG_WORKER is dropped as a prefix of GTN_CONFIG_WORKER__X, in either order.
 
-        `worker` is a declared WorkerSettings-typed field, so a bare string always fails
-        Settings.model_validate({"worker": "<string>"}) and is dropped via _REJECTED_BY_SCHEMA;
-        the nested key must survive regardless of os.environ iteration order. Safe by
-        construction today, but unverified before this test, and a future `extra="allow"` on
-        WorkerSettings (or a scalar top-level `worker` alias) would break it silently.
+        `worker` is a strict prefix of `worker.heartbeat_timeout_s`, so exporting both asks for
+        `worker` to be a scalar value and a section at once. The prefix filter drops the shallower
+        key before either reaches validation, independent of `os.environ` iteration order, so the
+        deeper key always survives.
         """
         for env in (
             {"GTN_CONFIG_WORKER": "x", "GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S": "30"},
             {"GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S": "30", "GTN_CONFIG_WORKER": "x"},
         ):
+            caplog.clear()
             with patch.dict(os.environ, env, clear=True):
-                manager = ConfigManager()
-                env_config = manager._load_config_from_env_vars()
+                with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+                    manager = ConfigManager()
+                    env_config = manager._load_config_from_env_vars()
+
                 assert env_config == {"worker": {"heartbeat_timeout_s": 30.0}}
+                warnings = [
+                    record for record in caplog.records if "is also the start of a longer path" in record.message
+                ]
+                assert len(warnings) == 1
 
     def test_mapping_entry_settable_via_env(self) -> None:
         """An entry in a mapping-valued setting (not a nested model) can be set with `__<KEY>`.
@@ -266,13 +280,58 @@ class TestConfigManager:
             env_config = manager._load_config_from_env_vars()
             assert env_config == {"project_workspaces": {"myproject": "/studio/ws"}}
 
+    def test_overlapping_mapping_paths_resolve_identically_regardless_of_order(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Overlap under a mapping-valued parent is order-independent too, unlike a validation-based drop.
+
+        `artifacts` is `dict[str, Any]`, so neither `artifacts.image` nor
+        `artifacts.image.preview_format` is rejected by `Settings.model_validate` on its own: both
+        are free-form entries an `Any`-typed mapping accepts. Without the prefix filter, whichever
+        variable `os.environ` happened to yield last would silently win. The filter removes that
+        dependency by dropping the shallower path outright, with a warning naming the longer one.
+        """
+        for env in (
+            {"GTN_CONFIG_ARTIFACTS__IMAGE": "x", "GTN_CONFIG_ARTIFACTS__IMAGE__PREVIEW_FORMAT": "png"},
+            {"GTN_CONFIG_ARTIFACTS__IMAGE__PREVIEW_FORMAT": "png", "GTN_CONFIG_ARTIFACTS__IMAGE": "x"},
+        ):
+            caplog.clear()
+            with patch.dict(os.environ, env, clear=True):
+                with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+                    manager = ConfigManager()
+                    env_config = manager._load_config_from_env_vars()
+
+                assert env_config == {"artifacts": {"image": {"preview_format": "png"}}}
+                warnings = [
+                    record for record in caplog.records if "is also the start of a longer path" in record.message
+                ]
+                assert len(warnings) == 1
+
+    def test_free_form_path_kept_while_declared_model_typo_rejected(self) -> None:
+        """The same absent-after-validation check tells a mapping entry apart from a model typo.
+
+        `GTN_CONFIG_ARTIFACTS__SOME_KEY` (a `dict[str, Any]` entry) and `GTN_CONFIG_WORKER__BOGUS`
+        (an unrecognized `WorkerSettings` sub-key) both validate against `Settings`, since neither
+        is a fully unknown top-level key. Only the mapping entry survives `model_dump()`:
+        `WorkerSettings` is a strict model and drops `bogus`, while `artifacts` being typed
+        `dict[str, Any]` means Pydantic has nothing to drop.
+        """
+        with patch.dict(
+            os.environ,
+            {"GTN_CONFIG_ARTIFACTS__SOME_KEY": "1", "GTN_CONFIG_WORKER__BOGUS": "1"},
+            clear=True,
+        ):
+            manager = ConfigManager()
+            env_config = manager._load_config_from_env_vars()
+            assert env_config == {"artifacts": {"some_key": "1"}}
+
     def test_invalid_enum_value_silently_becomes_the_built_in_default(self, isolate_user_config: Path) -> None:
-        """Pins a known pre-existing wart, NOT desired behavior: do not read this as an endorsement.
+        """An invalid `log_level` resolves to INFO rather than falling back to the config files.
 
         `log_level` has a `mode="before"` validator that catches its own lookup failure and
-        returns LogLevel.INFO instead of raising, so an invalid GTN_CONFIG_LOG_LEVEL never trips
-        the reject-and-warn path the rest of this test class exercises for other settings. This
-        predates the nested-env-var work in this file and is being tracked, not fixed, here.
+        returns LogLevel.INFO instead of raising, so an invalid GTN_CONFIG_LOG_LEVEL never
+        reaches the reject-and-warn path this class exercises for other settings. Same for
+        workflow_execution_mode, thread_storage_backend, and library.dependency_install_behavior.
         """
         isolate_user_config.write_text(json.dumps({"log_level": "DEBUG"}), encoding="utf-8")
 
