@@ -1728,7 +1728,7 @@ class TestConfigProvenance:
 
     Ports the four scenarios reproduced against a live engine: a shadowed write reporting
     `applied=False`, a GUI write-back of the shown value still not becoming the truth,
-    provenance resolving to each of the five layers in turn, and a malformed layer surfacing
+    provenance resolving to each of the six layers in turn, and a malformed layer surfacing
     `parse_error` instead of only a log line.
     """
 
@@ -1814,6 +1814,73 @@ class TestConfigProvenance:
         assert source.env_var == "GTN_CONFIG_LOG_LEVEL"
         assert source.path is None
 
+    def test_value_source_runtime_pin_wins_over_config_files(self, tmp_path: Path, isolate_user_config: Path) -> None:
+        """A project's workspace pin owns `workspace_directory`, and no file holds it.
+
+        The pin is applied straight onto the merged config, so before it was a reportable
+        layer the UI showed this field as the user's to edit and a write to it silently did
+        nothing.
+        """
+        isolate_user_config.write_text(json.dumps({"workspace_directory": "/from/user"}), encoding="utf-8")
+        pinned_dir = tmp_path / "pinned_workspace"
+        pinned_dir.mkdir()
+
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.set_workspace_override(pinned_dir)
+            manager.load_configs()
+            source = manager.value_source("workspace_directory")
+
+            assert source.layer == "runtime"
+            assert source.path is None
+            assert source.env_var is None
+            # The reported owner is the one actually supplying the merged value.
+            assert manager.get_config_value("workspace_directory") == str(pinned_dir.resolve())
+
+    def test_value_source_env_wins_over_runtime_pin(self, tmp_path: Path) -> None:
+        """Env outranks the pin in `load_configs`, so it must outrank it in the report too."""
+        pinned_dir = tmp_path / "pinned_workspace"
+        pinned_dir.mkdir()
+
+        with patch.dict(os.environ, {"GTN_CONFIG_WORKSPACE_DIRECTORY": "/from/env"}, clear=True):
+            manager = ConfigManager()
+            manager.set_workspace_override(pinned_dir)
+            manager.load_configs()
+            source = manager.value_source("workspace_directory")
+
+        assert source.layer == "env"
+        assert source.env_var == "GTN_CONFIG_WORKSPACE_DIRECTORY"
+
+    def test_value_source_falls_back_to_files_when_pin_cleared(self, isolate_user_config: Path) -> None:
+        """Clearing the pin has to hand ownership back, or the field stays wrongly locked."""
+        isolate_user_config.write_text(json.dumps({"workspace_directory": "/from/user"}), encoding="utf-8")
+
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.set_workspace_override(Path.home())
+            manager.load_configs()
+            assert manager.value_source("workspace_directory").layer == "runtime"
+
+            manager.set_workspace_override(None)
+            manager.load_configs()
+            source = manager.value_source("workspace_directory")
+
+        assert source.layer == "user"
+        assert source.path == str(isolate_user_config)
+
+    def test_value_source_runtime_pin_does_not_claim_other_keys(self, tmp_path: Path) -> None:
+        """The pin supplies only `workspace_directory`; every other key must be unaffected."""
+        pinned_dir = tmp_path / "pinned_workspace"
+        pinned_dir.mkdir()
+
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.set_workspace_override(pinned_dir)
+            manager.load_configs()
+
+            assert manager.value_source("log_level").layer != "runtime"
+            assert manager.value_source("libraries_directory").layer != "runtime"
+
     # -- shadowed_by: only default/user are "not shadowed" --
 
     def test_shadowed_by_none_for_default(self) -> None:
@@ -1836,6 +1903,21 @@ class TestConfigProvenance:
 
         assert shadowed is not None
         assert shadowed.layer == "project"
+
+    def test_shadowed_by_returns_runtime_pin_source(self, tmp_path: Path) -> None:
+        """The pin is not writable, so it must read as shadowing rather than as the user's own."""
+        pinned_dir = tmp_path / "pinned_workspace"
+        pinned_dir.mkdir()
+
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.set_workspace_override(pinned_dir)
+            manager.load_configs()
+            shadowed = manager.shadowed_by("workspace_directory")
+
+        assert shadowed is not None
+        assert shadowed.layer == "runtime"
+        assert shadowed.path is None
 
     # -- category_sources: root-relative keys, dicts recursed, lists are one leaf --
 
@@ -1873,13 +1955,20 @@ class TestConfigProvenance:
         assert sources[LIBRARIES_TO_REGISTER_KEY].layer == "project"
         assert not any(k.startswith(f"{LIBRARIES_TO_REGISTER_KEY}.") for k in sources)
 
-    # -- config_layers: fixed five-layer stack, and a malformed layer surfaces parse_error --
+    # -- config_layers: fixed six-layer stack, and a malformed layer surfaces parse_error --
 
-    def test_config_layers_returns_five_entries_in_fixed_order(self) -> None:
+    def test_config_layers_returns_six_entries_in_fixed_order(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             layers = ConfigManager().config_layers()
 
-        assert [layer.layer for layer in layers] == ["default", "user", "project", "workspace", "env"]
+        assert [layer.layer for layer in layers] == [
+            "default",
+            "user",
+            "project",
+            "workspace",
+            "runtime",
+            "env",
+        ]
 
     def test_config_layers_project_absent_when_no_project_active(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
@@ -1927,6 +2016,29 @@ class TestConfigProvenance:
 
         assert layers["project"].parse_error is None
         assert layers["project"].values == {"log_level": "ERROR"}
+
+    def test_config_layers_runtime_reflects_workspace_pin(self, tmp_path: Path) -> None:
+        """The runtime layer is absent with empty values until a project pins a workspace."""
+        pinned_dir = tmp_path / "pinned_workspace"
+        pinned_dir.mkdir()
+
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.load_configs()
+            runtime = {layer.layer: layer for layer in manager.config_layers()}["runtime"]
+
+            assert runtime.present is False
+            assert runtime.values == {}
+            assert runtime.path is None
+            assert runtime.parse_error is None
+
+            manager.set_workspace_override(pinned_dir)
+            manager.load_configs()
+            runtime = {layer.layer: layer for layer in manager.config_layers()}["runtime"]
+
+        assert runtime.present is True
+        assert runtime.values == {"workspace_directory": str(pinned_dir.resolve())}
+        assert runtime.path is None
 
     def test_config_layers_env_present_reflects_gtn_config_vars(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
@@ -1991,6 +2103,36 @@ class TestConfigProvenance:
         # The write is not rejected -- it lands in the user layer, silently ignored.
         on_disk = json.loads(isolate_user_config.read_text())
         assert on_disk["libraries_directory"] == "/typed/by/user"
+
+    def test_set_config_value_request_reports_runtime_pin_as_shadowing(
+        self, tmp_path: Path, isolate_user_config: Path
+    ) -> None:
+        """A write to a pinned `workspace_directory` must report the pin, not unqualified success.
+
+        This is the case a settings UI cannot phrase without help: there is no file to send the
+        user to, so the payload has to name the pin as the owner.
+        """
+        pinned_dir = tmp_path / "pinned_workspace"
+        pinned_dir.mkdir()
+
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.set_workspace_override(pinned_dir)
+            manager.load_configs()
+            result = manager.on_handle_set_config_value_request(
+                SetConfigValueRequest(category_and_key="workspace_directory", value="/typed/by/user")
+            )
+
+        assert isinstance(result, SetConfigValueResultSuccess)
+        assert result.applied is False
+        assert result.effective_value == str(pinned_dir.resolve())
+        assert result.shadowed_by is not None
+        assert result.shadowed_by.layer == "runtime"
+        assert result.shadowed_by.path is None
+
+        # Same as any other shadowed write: it still reaches the user file.
+        on_disk = json.loads(isolate_user_config.read_text())
+        assert on_disk["workspace_directory"] == "/typed/by/user"
 
     def test_set_config_value_request_write_back_of_shadowed_value_stays_unapplied(self, tmp_path: Path) -> None:
         """Writing back exactly the value the merged config is showing does not make it 'yours'.
@@ -2065,12 +2207,19 @@ class TestConfigProvenance:
         assert LIBRARIES_TO_REGISTER_KEY in result.sources
         assert result.sources[LIBRARIES_TO_REGISTER_KEY].layer == "default"
 
-    def test_get_config_layers_request_handler_returns_five_layers(self) -> None:
+    def test_get_config_layers_request_handler_returns_six_layers(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             result = ConfigManager().on_handle_get_config_layers_request(GetConfigLayersRequest())
 
         assert isinstance(result, GetConfigLayersResultSuccess)
-        assert [layer.layer for layer in result.layers] == ["default", "user", "project", "workspace", "env"]
+        assert [layer.layer for layer in result.layers] == [
+            "default",
+            "user",
+            "project",
+            "workspace",
+            "runtime",
+            "env",
+        ]
 
     def test_set_config_category_request_non_empty_category_reports_shadowed(self, tmp_path: Path) -> None:
         self._write_layer_config(tmp_path, {"nuke": {"executable": "/from/project"}})

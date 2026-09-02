@@ -164,7 +164,7 @@ def _print_config_layers() -> None:
     Complements `_print_configuration` below, which only ever shows the merged (winning)
     blob. This shows WHICH layer set what -- the merged view alone cannot answer that, and
     a layer whose file exists but failed to parse otherwise only ever reaches a log line.
-    The `env` layer has no file to point at, so its own GTN_CONFIG_ key/value pairs are
+    The `env` and `runtime` layers have no file to point at, so their own contents are
     printed inline instead.
     """
     console.print("[bold]Config Layers (lowest to highest priority):[/bold]")
@@ -181,6 +181,9 @@ def _print_config_layers() -> None:
             if layer.layer == "env" and layer.values:
                 for key, value in layer.values.items():
                     console.print(f"    GTN_CONFIG_{key.upper()} = {value}")
+            if layer.layer == "runtime" and layer.values:
+                for key, value in layer.values.items():
+                    console.print(f"    {key} = {value}  [dim](pinned by the active project)[/dim]")
     except Exception as e:
         console.print(f"  [red]Error retrieving config layers: {e}[/red]")
     console.print()

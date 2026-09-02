@@ -17,17 +17,17 @@ from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 # between ConfigValueSource and ConfigLayer so a caller matching one against the other
 # (e.g. is this key's source among GetConfigLayersResultSuccess.layers) compares equal
 # strings.
-ConfigLayerName = Literal["default", "user", "project", "workspace", "env"]
+ConfigLayerName = Literal["default", "user", "project", "workspace", "runtime", "env"]
 
 
 class ConfigValueSource(BaseModel):
     """Identifies which config layer currently supplies a value's effective content.
 
     Only "default" and "user" are writable by `SetConfigValueRequest` /
-    `SetConfigCategoryRequest` today: a value sourced from "project", "workspace", or
-    "env" is a value a settings-editor write cannot change, because a higher-priority
-    layer keeps re-supplying its own value on every `load_configs()` remerge. See
-    `ConfigManager.shadowed_by`.
+    `SetConfigCategoryRequest` today: a value sourced from "project", "workspace",
+    "runtime", or "env" is a value a settings-editor write cannot change, because a
+    higher-priority layer keeps re-supplying its own value on every `load_configs()`
+    remerge. See `ConfigManager.shadowed_by`.
     """
 
     layer: ConfigLayerName
@@ -35,8 +35,11 @@ class ConfigValueSource(BaseModel):
         default=None,
         description=(
             "Absolute path to the config file backing this layer. None for 'default' "
-            "(no file backs the Settings model's own defaults) and for 'env' (see env_var "
-            "instead). May be None for 'project'/'workspace' too when no project is active."
+            "(no file backs the Settings model's own defaults), for 'env' (see env_var "
+            "instead) and for 'runtime' (a project activation pins the value in memory, "
+            "so no file holds it). May be None for 'project'/'workspace' too when no "
+            "project is active, though never in a `shadowed_by` result: a file layer can "
+            "only win a key if its file loaded."
         ),
     )
     env_var: str | None = Field(
@@ -59,12 +62,13 @@ class ConfigLayer(BaseModel):
     layer: ConfigLayerName
     path: str | None = Field(
         default=None,
-        description="Absolute path to this layer's config file. None for 'default' and 'env'.",
+        description="Absolute path to this layer's config file. None for 'default', 'runtime' and 'env'.",
     )
     present: bool = Field(
         description=(
             "Whether this layer currently has any effect: the file exists for a file layer, "
-            "or at least one GTN_CONFIG_ variable is set for 'env'. 'default' is always True."
+            "at least one GTN_CONFIG_ variable is set for 'env', or a project activation has "
+            "pinned a workspace for 'runtime'. 'default' is always True."
         )
     )
     parse_error: str | None = Field(
@@ -357,9 +361,10 @@ class GetConfigLayersResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess
 
     Args:
         layers: Every config layer, ordered lowest to highest priority. Always exactly
-            five entries, in this fixed order: default, user, project, workspace, env.
-            `project`/`workspace` report `path=None`, `present=False` when no project is
-            currently active.
+            six entries, in this fixed order: default, user, project, workspace, runtime,
+            env. `project`/`workspace` report `path=None`, `present=False` when no project
+            is currently active. `runtime` carries the active project's workspace pin and
+            never has a path.
     """
 
     layers: list[ConfigLayer]
