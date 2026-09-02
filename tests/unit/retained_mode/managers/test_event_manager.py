@@ -38,7 +38,11 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointFailure,
     CheckpointSubjectType,
 )
-from griptape_nodes.retained_mode.managers.event_manager import EventManager, ResultContext
+from griptape_nodes.retained_mode.managers.event_manager import (
+    EventManager,
+    ResultContext,
+    suppress_event_publication,
+)
 
 
 class TestEventManagerBroadcasting:
@@ -1944,3 +1948,70 @@ class TestExecutionEventSubscription:
         manager.put_event(ProgressEvent(value="x", node_name="n", parameter_name="output"))
 
         assert received == []
+
+
+class TestSuppressEventPublication:
+    """Exercise the block LibraryManager wraps its throwaway probe construction in.
+
+    The contract that matters is not just "events inside are dropped" but that the drop ends when
+    the block does. Suppression follows the context, and several asyncio primitives copy the
+    context out of the block, so getting the end wrong silences the editor rather than one probe.
+    """
+
+    @pytest.mark.asyncio
+    async def test_drops_events_published_inside_the_block_and_nothing_after(self) -> None:
+        manager = EventManager()
+        queue: asyncio.Queue = asyncio.Queue()
+        manager.initialize_queue(queue)
+
+        with suppress_event_publication():
+            manager.put_event("published while inspecting a throwaway object")
+            await manager.aput_event("the async path is suppressed too")
+        manager.put_event("published after the block")
+
+        assert queue.qsize() == 1
+        assert queue.get_nowait() == "published after the block"
+
+    @pytest.mark.asyncio
+    async def test_a_task_started_inside_the_block_publishes_again_once_it_returns(self) -> None:
+        """A copied context cannot be reset from here, so the block has to revoke itself.
+
+        `asyncio.create_task` snapshots the context at creation, so a task an inspected object's
+        `__init__` starts inherits the suppression. Resetting the ContextVar token on the way out
+        only touches this coroutine's context -- the task would keep the value it copied and drop
+        the editor's events for as long as it lived, which for a stray task is the whole process.
+        """
+        manager = EventManager()
+        queue: asyncio.Queue = asyncio.Queue()
+        manager.initialize_queue(queue)
+        block_exited = asyncio.Event()
+        reached_its_await = asyncio.Event()
+
+        async def publish_after_the_block_returns() -> None:
+            reached_its_await.set()
+            await block_exited.wait()
+            await manager.aput_event("published by a task the block started")
+
+        with suppress_event_publication():
+            stray_task = asyncio.create_task(publish_after_the_block_returns())
+            # Really running inside the block, not merely created there: the context copy this
+            # task carries was taken while suppression was live.
+            await reached_its_await.wait()
+        block_exited.set()
+        await stray_task
+
+        assert queue.get_nowait() == "published by a task the block started"
+
+    @pytest.mark.asyncio
+    async def test_a_nested_block_leaves_the_enclosing_one_suppressing(self) -> None:
+        """Probing is reentrant in principle -- an inspected object may inspect another one."""
+        manager = EventManager()
+        queue: asyncio.Queue = asyncio.Queue()
+        manager.initialize_queue(queue)
+
+        with suppress_event_publication():
+            with suppress_event_publication():
+                manager.put_event("inner")
+            manager.put_event("still inside the outer block")
+
+        assert queue.empty()

@@ -962,11 +962,12 @@ class GetPortSummariesForAllLibrariesRequest(RequestPayload):
     node's actual parameters. Container parameters are covered despite their children not
     existing yet, because a container knows its element type up front.
 
-    Always succeeds, so there is no failure result to handle. Every way a probe can fail is a
-    property of one node type -- an unimportable module, a raising `__init__`, one that blocks past
-    the timeout -- and the answer is to omit that node type, not to fail the request for every
-    other one. A caller that gets fewer node types than it expected reads that as "leave these
-    unranked".
+    Declares no failure result, because every way a probe can fail is a property of one node type --
+    an unimportable module, a raising `__init__`, one that blocks past the timeout -- and the answer
+    is to omit that node type, not to fail the request for every other one. A caller that gets fewer
+    node types than it expected reads that as "leave these unranked". A caller must still handle a
+    failure it did not ask for: as with any request, an unhandled exception inside the engine comes
+    back as `GenericResultFailure`.
 
     Results: GetPortSummariesForAllLibrariesResultSuccess
     """

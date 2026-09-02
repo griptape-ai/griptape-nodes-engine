@@ -325,10 +325,13 @@ class LibrarySettings(BaseModel):
             "once libraries have finished loading, so the editor's 'which node types accept this connection?' "
             "ranking is instant the first time it is needed. Computing a summary means constructing the node "
             "type, which imports its Python module, so this trades background work after startup for not "
-            "making the artist wait mid-drag. Set to False on a constrained machine, or while authoring, to "
-            "leave the cost where it was: paid on demand by the first request that needs ranking. Either way "
-            "the summaries are computed at most once per library per load. Has no effect on a dedicated "
-            "library worker, which already imports every node module to report its schemas."
+            "making the artist wait mid-drag. Note that it therefore imports every node module shortly "
+            "after startup even when 'lazy_node_loading' is True: lazy loading still keeps those imports "
+            "off the startup path, but it no longer avoids them altogether. Set to False on a constrained "
+            "machine, or while authoring, to leave the cost where it was: paid on demand by the first "
+            "request that needs ranking. Either way the summaries are computed at most once per library "
+            "per load. Has no effect on a dedicated library worker, which already imports every node "
+            "module to report its schemas."
         ),
     )
     minimum_release_age: float = Field(

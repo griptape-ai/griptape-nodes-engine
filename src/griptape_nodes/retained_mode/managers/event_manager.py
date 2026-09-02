@@ -83,9 +83,35 @@ _active_post_dispatch_hooks: ContextVar[tuple[tuple[type[RequestPayload], Any], 
 # for a hook that runs slower than requests arrive.
 POST_DISPATCH_HOOK_INFLIGHT_WARNING_THRESHOLD = 100
 
-_event_publication_suppressed: ContextVar[bool] = ContextVar(
-    "_event_manager_event_publication_suppressed", default=False
+
+class _EventSuppressionScope:
+    """One `suppress_event_publication` block, shared by every context copied out of it.
+
+    A plain `True` in the ContextVar cannot be taken back: `asyncio.create_task`, `loop.call_soon`,
+    and `run_coroutine_threadsafe` snapshot the context, and resetting the token afterwards only
+    touches the context the block ran in. Holding a mutable object instead means every copy points
+    at this one, so clearing `active` on the way out ends suppression in all of them at once and
+    scopes it to the block's actual duration.
+    """
+
+    __slots__ = ("active",)
+
+    def __init__(self) -> None:
+        self.active = True
+
+
+_event_publication_suppressed: ContextVar[_EventSuppressionScope | None] = ContextVar(
+    "_event_manager_event_publication_suppressed", default=None
 )
+
+
+def _is_event_publication_suppressed() -> bool:
+    """Whether the caller is running inside a live `suppress_event_publication` block."""
+    scope = _event_publication_suppressed.get()
+    if scope is None:
+        return False
+
+    return scope.active
 
 
 @contextmanager
@@ -104,9 +130,12 @@ def suppress_event_publication() -> Iterator[None]:
     dispatches to `_app_event_listeners` directly and is unaffected.
 
     Scope follows the context, not the call stack, which cuts both ways. A `threading.Thread` the
-    block starts gets a fresh context and does publish. But `asyncio.create_task`, `loop.call_soon`,
-    and `run_coroutine_threadsafe` all *copy* the current context, so anything the block schedules
-    onto the loop stays suppressed for that callback's whole life, well after the block exits.
+    block starts gets a fresh context and does publish. `asyncio.create_task`, `loop.call_soon`, and
+    `run_coroutine_threadsafe` all *copy* the current context, so a callback the block schedules is
+    suppressed too -- but only for as long as the block itself is running (see
+    `_EventSuppressionScope`). A callback that outlives the block publishes normally from the moment
+    the block returns, which is what stops an inspected object's stray `create_task` from silently
+    dropping the editor's events for the rest of the process.
 
     Deliberately not `EventSuppressionContext`, which reference-counts event types on the manager
     and is consulted at the send boundary. That is the wrong tool twice over here: probe
@@ -115,10 +144,15 @@ def suppress_event_publication() -> Iterator[None]:
     moment. A ContextVar is scoped to the block that set it, and `asyncio.to_thread` carries it
     into the worker via `copy_context()`.
     """
-    token = _event_publication_suppressed.set(True)
+    scope = _EventSuppressionScope()
+    token = _event_publication_suppressed.set(scope)
     try:
         yield
     finally:
+        # Both, and in this order. Clearing the flag ends suppression for every context copied out
+        # of this block, including ones this coroutine cannot reach; resetting the token restores
+        # whatever an enclosing block had set, so nesting still works.
+        scope.active = False
         _event_publication_suppressed.reset(token)
 
 
@@ -360,7 +394,7 @@ class EventManager(EngineScoped):
         Args:
             event: The event to publish to the queue
         """
-        if _event_publication_suppressed.get():
+        if _is_event_publication_suppressed():
             return
         if self._event_queue is None:
             return
@@ -386,7 +420,7 @@ class EventManager(EngineScoped):
         Args:
             event: The event to publish to the queue
         """
-        if _event_publication_suppressed.get():
+        if _is_event_publication_suppressed():
             return
         if self._event_queue is None:
             return

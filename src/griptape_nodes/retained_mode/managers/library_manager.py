@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import sysconfig
+import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -408,7 +409,7 @@ class PortSummaryComputation(NamedTuple):
 class PortSummaryCacheEntry(NamedTuple):
     """A library's cached port summaries plus the state deciding what a later pass still owes it.
 
-    Held as one value rather than parallel dicts because the four fields are only ever correct
+    Held as one value rather than parallel dicts because the five fields are only ever correct
     together: a summary map is complete exactly when nothing is pending, and `timeouts_spent` is
     what decides whether anything pending will actually be attempted.
     """
@@ -419,6 +420,12 @@ class PortSummaryCacheEntry(NamedTuple):
     retry_node_types: frozenset[str]
     # Node types no pass has attempted yet, carried until one does.
     unprobed_node_types: frozenset[str]
+    # Every node type whose one retry has been granted since this library loaded, whether or not the
+    # retry was ever taken. Accumulates for the life of the entry and is never treated as pending.
+    # Separate from `retry_node_types` because that set is what the *next* pass will retry, and a
+    # pass that stops early empties it without the retry having happened -- so using it alone as the
+    # record would hand the same node type a second and third retry.
+    retried_node_types: frozenset[str]
     # Probe timeouts this library has cost since it last loaded. Each one permanently holds a worker
     # of the loop's default executor, so this is the library's lifetime bill, not a per-pass count.
     timeouts_spent: int
@@ -897,8 +904,9 @@ class LibraryManager(EngineScoped):
             self._register_nodes_from_worker_schemas(notification.library_name, notification.node_schemas)
             # Registering those stubs dropped this library's cached summaries, and a worker can
             # report at any point -- including long after the startup warm pass finished. Without
-            # restarting the pass here, worker-hosted libraries would be the only ones left cold,
-            # so the artist pays the probe cost mid-drag for exactly those.
+            # this, worker-hosted libraries would be the only ones left cold, so the artist pays the
+            # probe cost mid-drag for exactly those. Ensures a pass exists rather than restarting
+            # one: several workers reporting in succession must not each cancel the last one's work.
             self._start_port_summary_warm()
         # Unblock any code awaiting this library's worker_ready event.
         if library_info.worker_ready is not None:
@@ -2285,6 +2293,27 @@ class LibraryManager(EngineScoped):
 
         return NodeProbeResult(node=probe_node, error_message="")
 
+    def _construct_probe_node_signalling_completion(
+        self,
+        library_name: str,
+        node_type: str,
+        node_class: type[BaseNode],
+        library_node_metadata: dict[str, Any],
+        finished: threading.Event,
+    ) -> NodeProbeResult:
+        """Construct a probe node and record, from inside the worker, that the thread is free again.
+
+        Exists because a caller that gave up on this construction cannot otherwise tell whether the
+        thread it started is still held: neither `asyncio.wait_for`'s timeout nor a cancellation
+        reaches into the worker, and both leave the task looking finished while `__init__` runs on.
+        `finished` is set even when construction fails, since a raising `__init__` returns its thread
+        just as a successful one does.
+        """
+        try:
+            return self._construct_probe_node(library_name, node_type, node_class, library_node_metadata)
+        finally:
+            finished.set()
+
     def list_categories_in_library_request(self, request: ListCategoriesInLibraryRequest) -> ResultPayload:
         # Does this library exist?
         try:
@@ -2805,21 +2834,32 @@ class LibraryManager(EngineScoped):
                         # in LibraryRegistry (for the editor and workflow loading); the worker
                         # process handles node loading and will report fitness via
                         # LibraryLoadedNotification once it finishes.
-                        if library_info.requires_worker and not self._is_worker:
-                            library_info.fitness = LibraryManager.LibraryFitness.NOT_EVALUATED
-                            library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.WORKER_PENDING
-                            self._library_file_path_to_info[file_path] = library_info
-                        else:
-                            # Attempt to load nodes from the library (modifies library_info in place).
-                            await asyncio.to_thread(
-                                self._attempt_load_nodes_from_library,
-                                library_data=library_data,
-                                library=library,
-                                base_dir=base_dir,
-                                library_info=library_info,
-                                lazy_loading=self._should_lazy_load_nodes(),
-                            )
-                            self._library_file_path_to_info[file_path] = library_info
+                        try:
+                            if library_info.requires_worker and not self._is_worker:
+                                library_info.fitness = LibraryManager.LibraryFitness.NOT_EVALUATED
+                                library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.WORKER_PENDING
+                                self._library_file_path_to_info[file_path] = library_info
+                            else:
+                                # Attempt to load nodes from the library (modifies library_info in place).
+                                await asyncio.to_thread(
+                                    self._attempt_load_nodes_from_library,
+                                    library_data=library_data,
+                                    library=library,
+                                    base_dir=base_dir,
+                                    library_info=library_info,
+                                    lazy_loading=self._should_lazy_load_nodes(),
+                                )
+                                self._library_file_path_to_info[file_path] = library_info
+                        finally:
+                            # Node types have just been registered into a library LibraryRegistry
+                            # published a few lines above, and the loading above awaited. A port
+                            # summary request landing in that window measured a library with no node
+                            # types (or only some of them), and nothing else invalidates afterwards,
+                            # so that empty result would be served for the rest of the process's
+                            # life. In `finally` because a load that raises partway leaves the
+                            # registry holding whichever node types it managed to add, which makes
+                            # the stale entry no less wrong.
+                            self._invalidate_port_summaries(library_data.name)
 
                         # On a worker process, broadcast the notification so app.py can relay it
                         # to the orchestrator over the transport layer. Include serialized node
@@ -2858,20 +2898,19 @@ class LibraryManager(EngineScoped):
                         )
 
                         # Discover real class names by importing files
-                        await self._attempt_generate_sandbox_library_from_schema(
-                            library_schema=metadata_result.library_schema,
-                            sandbox_directory=str(sandbox_directory),
-                            library_info=library_info,
-                        )
+                        try:
+                            await self._attempt_generate_sandbox_library_from_schema(
+                                library_schema=metadata_result.library_schema,
+                                sandbox_directory=str(sandbox_directory),
+                                library_info=library_info,
+                            )
+                        finally:
+                            # Same reason as the regular-library branch above: this both publishes
+                            # the library and registers its node types, with awaits in between, so
+                            # any port summaries cached during it describe a half-built library.
+                            self._invalidate_port_summaries(library_data.name)
                         # Function handles registration and updates library_info with problems
                         # lifecycle_state set to LOADED by _attempt_load_nodes_from_library
-
-                    # Node types have just been registered into a library that LibraryRegistry
-                    # published earlier in this method, and the loading above awaited. A port
-                    # summary request landing in that window measured a library with no node types
-                    # (or only some of them), and nothing invalidates afterwards, so that empty
-                    # result would be served for the rest of the process's life.
-                    self._invalidate_port_summaries(library_data.name)
 
                     # Exit loop after final phase
                     break
@@ -3400,7 +3439,7 @@ class LibraryManager(EngineScoped):
         """
         await self._libraries_loading_complete.wait()
 
-        allowance = ProbeTimeoutAllowance(remaining=self._PORT_SUMMARY_TIMEOUT_BUDGET)
+        allowance = ProbeTimeoutAllowance(remaining=self._PORT_SUMMARY_REQUEST_TIMEOUT_BUDGET)
         library_name_to_port_summaries: dict[str, dict[str, NodePortSummary]] = {}
         # Counted rather than flagged so concurrent requests do not un-register each other, and
         # decremented in `finally` so a cancelled request does not leave the warm pass unthrottled
@@ -3458,18 +3497,45 @@ class LibraryManager(EngineScoped):
             )
             return
 
-        # Replace a pass already in flight rather than running a second one alongside it. Two
-        # concurrent passes would still be correct -- the per-library lock and the generation
-        # counter see to that -- but only one handle is kept, and a pass nothing holds a handle to
-        # is a pass a reload cannot cancel, which is the one thing here that has to work.
-        # Restarting costs little: libraries the previous pass already finished are cache hits.
-        previous_task = self._port_summary_warm_task
-        if previous_task is not None and not previous_task.done():
-            previous_task.cancel()
+        # Leave a pass already in flight alone rather than replacing it. Only one handle is kept --
+        # a pass nothing holds a handle to is a pass a reload cannot cancel, which is the one thing
+        # here that has to work -- so this cannot start a second one, and it should not cancel the
+        # first either: the caller invalidating a library is usually a worker reporting its node
+        # schemas, and cancelling for that would throw away a large library's half-finished probing
+        # and leak the thread of whatever probe was in flight. The running pass re-sweeps the
+        # library list until nothing is cold, so it picks the invalidated library up by itself. A
+        # reload, which must stop the pass rather than let it keep resolving node classes, calls
+        # `_cancel_port_summary_warm` first and then reaches the line below.
+        if self._in_flight_port_summary_warm_task() is not None:
+            logger.debug("Port summary warming is already running; it will pick up any library that just changed.")
+            return
 
         task = asyncio.create_task(self._warm_port_summaries())
         self._port_summary_warm_task = task
         task.add_done_callback(self._on_port_summary_warm_done)
+
+    def _in_flight_port_summary_warm_task(self) -> asyncio.Task[None] | None:
+        """The warm pass running on *this* loop, if there is one, dropping a handle from a dead loop.
+
+        A manager outlives any one `asyncio.run()` call, and a task left over from a previous loop is
+        not a pass anything can wait for or cancel: `Task.cancel()` on one suspended in a closed loop
+        raises `RuntimeError` from the callback scheduling underneath it. `asyncio.run` cancels its
+        pending tasks on the way out, so such a handle is normally already `done()` -- but a host
+        driving the loop itself with `run_until_complete` and closing it has no such guarantee, which
+        is the same staleness `_port_summaries_lock_for` handles for its locks.
+        """
+        task = self._port_summary_warm_task
+        if task is None:
+            return None
+
+        if task.get_loop() is not asyncio.get_running_loop():
+            self._port_summary_warm_task = None
+            return None
+
+        if task.done():
+            return None
+
+        return task
 
     def _on_port_summary_warm_done(self, task: asyncio.Task[None]) -> None:
         """Clear the handle and surface anything the warm pass raised.
@@ -3499,17 +3565,15 @@ class LibraryManager(EngineScoped):
         Awaited rather than just cancelled because the caller is about to unload libraries, and a
         pass between awaits could still resolve a node class -- importing a module belonging to a
         library being dismantled. Returns promptly even when the pass is inside a probe: the
-        construction thread cannot be cancelled, but the coroutine awaiting it can, which is the
-        same leaked-thread trade the probe path already documents.
+        construction thread cannot be cancelled, but the coroutine awaiting it can. That abandons the
+        thread, so the probe path charges it to the engine-wide leak ceiling exactly as a timeout is
+        charged -- reloading repeatedly is not a free way past that bound.
 
         Clearing the handle before awaiting keeps a second caller from awaiting the same task.
         """
-        task = self._port_summary_warm_task
-        if task is None:
-            return
-
+        task = self._in_flight_port_summary_warm_task()
         self._port_summary_warm_task = None
-        if task.done():
+        if task is None:
             return
 
         task.cancel()
@@ -3542,23 +3606,61 @@ class LibraryManager(EngineScoped):
 
         Runs on its own timeout allowance, and throttled, both because it covers every library at
         once and because nothing is waiting on it.
+
+        Sweeps the library list repeatedly rather than once, because a library can be invalidated
+        after this pass has already walked past it -- a worker reporting its node schemas is the
+        everyday case. That is what lets those callers leave a running pass alone instead of
+        cancelling and restarting it. A sweep that finds every library warm ends the pass, so the
+        sweep cap only binds when something is invalidating in a loop.
         """
         await self._libraries_loading_complete.wait()
 
         allowance = ProbeTimeoutAllowance(remaining=self._PORT_SUMMARY_WARM_TIMEOUT_BUDGET)
-        library_names = LibraryRegistry.list_libraries()
-        node_type_count = 0
-        for library_name in library_names:
-            summaries = await self._get_port_summaries_for_library(
-                library_name, allowance, throttle_s=self._PORT_SUMMARY_WARM_THROTTLE_S
-            )
-            node_type_count += len(summaries)
+        for sweep in range(self._PORT_SUMMARY_WARM_MAX_SWEEPS):
+            cold_library_names = [
+                library_name
+                for library_name in LibraryRegistry.list_libraries()
+                if self._port_summaries_need_a_pass(library_name)
+            ]
+            if not cold_library_names:
+                warmed = self._library_to_port_summary_cache
+                node_type_count = sum(len(entry.summaries) for entry in warmed.values())
+                logger.info(
+                    "Warmed port summaries for %d node type(s) across %d librar(ies) in %d sweep(s); connection "
+                    "ranking is ready.",
+                    node_type_count,
+                    len(warmed),
+                    sweep,
+                )
+                return
 
+            for library_name in cold_library_names:
+                await self._get_port_summaries_for_library(
+                    library_name, allowance, throttle_s=self._PORT_SUMMARY_WARM_THROTTLE_S
+                )
+
+        # Only reachable while something keeps invalidating libraries as fast as this fills them in.
+        # Stopping is the right answer: the pass is not converging, and the on-demand path in
+        # `on_get_port_summaries_for_all_libraries_request` covers whatever is still cold.
         logger.info(
-            "Warmed port summaries for %d node type(s) across %d librar(ies); connection ranking is ready.",
-            node_type_count,
-            len(library_names),
+            "Stopped warming port summaries after %d sweep(s) because libraries kept changing. Anything still "
+            "uncomputed will be computed by the first request that needs it.",
+            self._PORT_SUMMARY_WARM_MAX_SWEEPS,
         )
+
+    def _port_summaries_need_a_pass(self, library_name: str) -> bool:
+        """Whether a probe pass over this library would do any work.
+
+        The same condition `_get_port_summaries_for_library` uses to decide a cache hit, so the warm
+        pass skips exactly the libraries a request would answer from cache. A library that has given
+        up on node types -- spent allowance, or the engine's leak ceiling -- has nothing pending and
+        counts as warm, which is what stops the warm sweep from retrying it forever.
+        """
+        entry = self._library_to_port_summary_cache.get(library_name)
+        if entry is None:
+            return True
+
+        return bool(entry.pending_node_types())
 
     async def _get_port_summaries_for_library(
         self, library_name: str, allowance: ProbeTimeoutAllowance, *, throttle_s: float
@@ -3577,8 +3679,8 @@ class LibraryManager(EngineScoped):
         pending until it gets one.
 
         Three bounds cap all of it, and `_probe_stop_reason` holds them alongside its reload check:
-        the caller's per-pass `allowance`, `_PORT_SUMMARY_TIMEOUT_BUDGET` per library per load, and
-        `_PROBE_THREAD_LEAK_CEILING` for the whole process. The last one is what actually protects
+        the caller's per-pass `allowance`, `_PORT_SUMMARY_LIBRARY_TIMEOUT_BUDGET` per library per
+        load, and `_PROBE_THREAD_LEAK_CEILING` for the whole process. The last one is what actually protects
         the engine: the first two reset (every request, and every reload), so neither bounds the
         running total. Each timeout burned a thread ``asyncio.to_thread`` cannot cancel, and
         continuing to pay would drain the loop's shared executor and eventually stall every other
@@ -3622,8 +3724,7 @@ class LibraryManager(EngineScoped):
                 )
                 summaries = {**entry.summaries, **computation.summaries}
                 timeouts_spent = entry.timeouts_spent + len(computation.timed_out_node_types)
-                # What this pass was retrying is exactly what has now had its one retry.
-                already_retried_node_types = entry.retry_node_types
+                already_retried_node_types = entry.retried_node_types
 
             # The pass above awaited, so the library may have been reloaded, unloaded, or had node
             # types registered into it in the meantime. Caching what we just measured would pin
@@ -3680,7 +3781,17 @@ class LibraryManager(EngineScoped):
 
         Separated from the pass itself because it is the whole termination argument in one place:
         each rule below is what stops some node type from being probed forever.
+
+        `already_retried_node_types` is every node type this library has already been granted its one
+        retry for, which is why it is carried on the entry rather than derived from the pass: the
+        grant and the retry can be separated by any number of passes that never reached the node
+        type.
         """
+        # Accumulated, not replaced. A node type's entitlement is spent the moment it is granted, so
+        # the record has to outlive the pass that granted it -- a pass that stops before reaching the
+        # node type would otherwise clear the grant and let the next timeout re-grant it.
+        retried_node_types = already_retried_node_types | computation.timed_out_node_types
+
         if self._port_summary_threads_leaked >= self._PROBE_THREAD_LEAK_CEILING:
             # No pass in this process will probe again, so carrying anything as pending would only
             # make every future request take the lock and run a pass that stops immediately.
@@ -3697,10 +3808,11 @@ class LibraryManager(EngineScoped):
                 summaries=summaries,
                 retry_node_types=frozenset(),
                 unprobed_node_types=frozenset(),
+                retried_node_types=retried_node_types,
                 timeouts_spent=timeouts_spent,
             )
 
-        if timeouts_spent >= self._PORT_SUMMARY_TIMEOUT_BUDGET:
+        if timeouts_spent >= self._PORT_SUMMARY_LIBRARY_TIMEOUT_BUDGET:
             # The library has spent its whole allowance of un-reclaimable threads. Everything still
             # pending is dropped -- including node types never attempted, which cannot be told apart
             # from the blocking ones without paying again.
@@ -3718,15 +3830,16 @@ class LibraryManager(EngineScoped):
                 summaries=summaries,
                 retry_node_types=frozenset(),
                 unprobed_node_types=frozenset(),
+                retried_node_types=retried_node_types,
                 timeouts_spent=timeouts_spent,
             )
 
         # One retry per node type per library load, granted the first time that node type's own probe
         # times out -- which is not the same as the first pass over the library. A pass that stopped
         # early leaves node types unreached, and the pass that finally reaches one is the pass where
-        # its first timeout can happen. Subtracting the set this pass was already retrying is what
-        # makes it exactly one: a node type that times out again while being retried is not
-        # re-recorded, so nothing cycles.
+        # its first timeout can happen. Subtracting everything already granted is what makes it
+        # exactly one: a node type that times out again, whether during its retry or on a pass long
+        # after, is not re-recorded, so nothing cycles.
         retry_node_types = computation.timed_out_node_types - already_retried_node_types
 
         # Node types never reached are always carried, and the two branches above are what stops
@@ -3740,6 +3853,7 @@ class LibraryManager(EngineScoped):
             summaries=summaries,
             retry_node_types=retry_node_types,
             unprobed_node_types=computation.unprobed_node_types,
+            retried_node_types=retried_node_types,
             timeouts_spent=timeouts_spent,
         )
 
@@ -3773,6 +3887,13 @@ class LibraryManager(EngineScoped):
         failed (see `PortSummaryComputation`). `timeouts_already_spent` is what this library has
         cost on earlier passes, and is required for the per-library bound to be enforced *during*
         a pass rather than only after it.
+
+        It also stops if the registry's `Library` for this name is replaced mid-pass, because every
+        probe resolves its node class *through* that object: holding the pre-replacement one would
+        import modules of a library that has just been unloaded, putting them back in `sys.modules`
+        after the unload cleared them. Whatever the pass measured is still returned -- the caller
+        compares generations and declines to cache it -- and the node types it had not reached stay
+        pending for a pass that will see the new object.
         """
         try:
             library = LibraryRegistry.get_library(library_name)
@@ -3820,6 +3941,16 @@ class LibraryManager(EngineScoped):
             # which is what actually leaves the loop usable while it works.
             await asyncio.sleep(self._effective_probe_throttle_s(throttle_s))
 
+            if not self._library_is_still_registered(library=library, library_name=library_name):
+                unprobed_node_types = node_types_to_probe[probe_index:]
+                logger.info(
+                    "Stopped probing library '%s' with %d node type(s) left: it was unloaded or replaced while this "
+                    "pass was running, so the node classes it would resolve are no longer the registered ones.",
+                    library_name,
+                    len(unprobed_node_types),
+                )
+                break
+
             outcome = await self._probe_node_type_port_summary(
                 library=library, library_name=library_name, node_type=node_type
             )
@@ -3848,6 +3979,21 @@ class LibraryManager(EngineScoped):
             timed_out_node_types=frozenset(timed_out_node_types),
             unprobed_node_types=frozenset(unprobed_node_types),
         )
+
+    def _library_is_still_registered(self, *, library: Library, library_name: str) -> bool:
+        """Whether the registry still holds this exact `Library` object under this name.
+
+        Identity, not just presence. A reload unregisters the name and registers a fresh `Library`
+        for it, so a name-only check passes while the object in hand is the pre-reload one -- and
+        resolving a node class through that object runs the old loader, importing the very modules
+        the reload exists to replace.
+        """
+        try:
+            registered_library = LibraryRegistry.get_library(library_name)
+        except KeyError:
+            return False
+
+        return registered_library is library
 
     def _effective_probe_throttle_s(self, throttle_s: float) -> float:
         """Drop a background pass's throttle for as long as an interactive request is waiting.
@@ -3889,8 +4035,11 @@ class LibraryManager(EngineScoped):
                 f"No further probing will be attempted in this process"
             )
 
-        if timeouts_spent >= self._PORT_SUMMARY_TIMEOUT_BUDGET:
-            return f"this library has spent its {self._PORT_SUMMARY_TIMEOUT_BUDGET}-timeout allowance for this load"
+        if timeouts_spent >= self._PORT_SUMMARY_LIBRARY_TIMEOUT_BUDGET:
+            return (
+                f"this library has spent its {self._PORT_SUMMARY_LIBRARY_TIMEOUT_BUDGET}-timeout allowance for this "
+                f"load"
+            )
 
         if allowance.remaining <= 0:
             return "this pass has spent its probe timeout allowance"
@@ -3949,17 +4098,41 @@ class LibraryManager(EngineScoped):
             )
             return NodeTypePortProbeOutcome(summary=None, timed_out=False)
 
+        # Set by the worker itself, so it is the one signal that distinguishes "this construction is
+        # still holding a thread" from "it finished and the worker went back to the pool". Neither
+        # the task nor the future can say: cancelling either leaves the thread running.
+        probe_finished = threading.Event()
         try:
             probe_result = await asyncio.wait_for(
                 asyncio.to_thread(
-                    self._construct_probe_node,
+                    self._construct_probe_node_signalling_completion,
                     library_name,
                     node_type,
                     resolution.node_class,
                     library_node_metadata,
+                    probe_finished,
                 ),
                 timeout=self._SCHEMA_PROBE_TIMEOUT_S,
             )
+        except asyncio.CancelledError:
+            # A reload stopping the warm pass mid-probe. The construction thread is not cancellable,
+            # so if it has not finished it is held exactly as a timeout would hold it, and the
+            # engine-wide ceiling has to hear about it: cancellation is not rare (every reload does
+            # it), and a ceiling that only counted timeouts would let repeated reloads drain the
+            # loop's executor without ever tripping. Not counted against the library or the pass --
+            # both are about to be discarded -- and not counted at all when the thread did finish,
+            # since charging a leak that did not happen would disable probing for the session.
+            if not probe_finished.is_set():
+                self._port_summary_threads_leaked += 1
+                logger.warning(
+                    "Port summary probing was stopped while constructing node type '%s' in library '%s'. Its thread "
+                    "cannot be cancelled, so it is leaked (%d so far); probing stops for this process after %d.",
+                    node_type,
+                    library_name,
+                    self._port_summary_threads_leaked,
+                    self._PROBE_THREAD_LEAK_CEILING,
+                )
+            raise
         except TimeoutError:
             # asyncio.to_thread cannot be cancelled, so the thread is not reclaimed: it holds a
             # worker of the loop's default executor until __init__ returns, which for a truly stuck
@@ -5926,23 +6099,33 @@ class LibraryManager(EngineScoped):
     # await init-time events (e.g. WorkflowManager._workflows_loading_complete),
     # so each probe runs in a worker thread with this ceiling.
     _SCHEMA_PROBE_TIMEOUT_S: float = 10.0
-    # How many probe timeouts the port summary machinery will pay for, counted two
-    # ways: per request across every library it touches, and per library across
-    # every request until that library reloads. Each timeout permanently costs a
-    # worker of the event loop's default executor -- asyncio.to_thread cannot
-    # cancel the thread it started -- so an unbounded count over a library of
-    # blocking nodes would starve every other to_thread caller in the engine.
-    # Leaving part of one library unranked until it reloads is the cheaper failure.
-    _PORT_SUMMARY_TIMEOUT_BUDGET: int = 4
-    # The same allowance for the background warm pass, which needs its own number because it
-    # covers every library rather than the one a caller asked about: given the interactive
-    # budget, a single library of blocking nodes would spend the whole thing and leave every
-    # other library cold, which is the one outcome that makes warming pointless.
+    # How many probe timeouts the port summary machinery will pay for. Each one permanently costs a
+    # worker of the event loop's default executor -- asyncio.to_thread cannot cancel the thread it
+    # started -- so an unbounded count over a library of blocking nodes would starve every other
+    # to_thread caller in the engine. Leaving part of one library unranked until it reloads is the
+    # cheaper failure. Three separate numbers because they bound three different things, and only
+    # keeping them apart lets a log line or a test say which one fired:
+    #
+    # Per interactive request, across every library it touches.
+    _PORT_SUMMARY_REQUEST_TIMEOUT_BUDGET: int = 4
+    # Per library, across every pass until that library reloads.
+    _PORT_SUMMARY_LIBRARY_TIMEOUT_BUDGET: int = 4
+    # Per background warm pass. Larger than the interactive budget because it covers every library
+    # rather than the one a caller asked about: at the interactive number, a single library of
+    # blocking nodes would spend the whole thing and leave every other library cold, which is the
+    # one outcome that makes warming pointless.
     _PORT_SUMMARY_WARM_TIMEOUT_BUDGET: int = 8
+    # How many times one warm pass will walk the library list looking for work. More than one
+    # because a library can be invalidated after the pass has already walked past it -- a worker
+    # reporting its node schemas is the everyday case -- and re-sweeping is what lets that caller
+    # leave the running pass alone instead of cancelling it and discarding a large library's
+    # half-finished probing. A sweep that finds nothing to do ends the pass, so this only caps a
+    # caller invalidating in a loop; anything still cold after it is computed on demand.
+    _PORT_SUMMARY_WARM_MAX_SWEEPS: int = 5
     # Hard engine-wide ceiling on leaked probe threads, and the only bound that is stated in
     # terms of the resource actually at stake. The two budgets above are per request and per
     # library-load, so neither bounds the total: three libraries of blocking nodes cost
-    # 3 * _PORT_SUMMARY_TIMEOUT_BUDGET threads, and a reload lets the bill start over. asyncio
+    # 3 * _PORT_SUMMARY_LIBRARY_TIMEOUT_BUDGET threads, and a reload lets the bill start over. asyncio
     # .to_thread hands work to the loop's *default* executor, which is
     # min(32, (os.cpu_count() or 1) + 4) wide -- 6 on a 2-core CI box -- and every other
     # to_thread caller in the engine (library loading, sandbox generation, worker schema
@@ -7408,7 +7591,15 @@ class LibraryManager(EngineScoped):
         *,
         failure_result_class: type[ResultPayloadFailure],
     ) -> str | ResultPayloadFailure:
-        """Reload library after git operation.
+        """Reload library after git operation, with the port summary warm pass held off.
+
+        Split from the reload itself for the same reason `reload_libraries_request` is: the pass
+        resolves node classes, so one still running while this unloads and re-registers the library
+        would import the pre-update modules back into `sys.modules` after the unload cleared them --
+        and it is the updated code the artist is waiting for. Unlike the full reload this does not
+        close `_libraries_loading_complete`, so an interactive request's pass can still be mid-flight
+        here; that one stops itself when it notices the registry no longer holds the `Library` it
+        started with (see `_compute_port_summaries_for_library`).
 
         Args:
             library_name: Name of the library to reload
@@ -7419,6 +7610,27 @@ class LibraryManager(EngineScoped):
             On success: new_version (str, may be "unknown")
             On failure: ResultPayloadFailure instance
         """
+        await self._cancel_port_summary_warm()
+        try:
+            return await self._run_reload_library_after_git_operation(
+                library_name=library_name,
+                library_file_path=library_file_path,
+                failure_result_class=failure_result_class,
+            )
+        finally:
+            # In `finally`, not on the success path: a reload that failed partway has still dropped
+            # this library's summaries, and leaving warming stopped would make every other library's
+            # first connection drag pay the probe cost too.
+            self._start_port_summary_warm()
+
+    async def _run_reload_library_after_git_operation(
+        self,
+        library_name: str,
+        library_file_path: str,
+        *,
+        failure_result_class: type[ResultPayloadFailure],
+    ) -> str | ResultPayloadFailure:
+        """Unload and re-register one library from disk. See the caller for the warming it brackets."""
         # Unload the library
         unload_result = self.engine.handle_request(UnloadLibraryFromRegistryRequest(library_name=library_name))
         if not unload_result.succeeded():

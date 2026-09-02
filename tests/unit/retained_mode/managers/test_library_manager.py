@@ -1864,7 +1864,11 @@ class _DescribeNodeTypeProbe(BaseNode):
 def _empty_port_summary_cache_entry() -> PortSummaryCacheEntry:
     """A complete-but-empty cache entry, standing in for a port summary request that already ran."""
     return PortSummaryCacheEntry(
-        summaries={}, retry_node_types=frozenset(), unprobed_node_types=frozenset(), timeouts_spent=0
+        summaries={},
+        retry_node_types=frozenset(),
+        unprobed_node_types=frozenset(),
+        retried_node_types=frozenset(),
+        timeouts_spent=0,
     )
 
 
@@ -2620,7 +2624,11 @@ class TestGetPortSummariesForAllLibrariesRequest:
         try:
             with (
                 patch.object(_LibraryManager, "_SCHEMA_PROBE_TIMEOUT_S", 0.2),
-                patch.object(_LibraryManager, "_PORT_SUMMARY_TIMEOUT_BUDGET", 1),
+                # One of each: the request bound is what leaves the healthy library unreached, and
+                # the library bound is what stops the second request re-spending the whole allowance
+                # on the blocking library before it gets there.
+                patch.object(_LibraryManager, "_PORT_SUMMARY_REQUEST_TIMEOUT_BUDGET", 1),
+                patch.object(_LibraryManager, "_PORT_SUMMARY_LIBRARY_TIMEOUT_BUDGET", 1),
                 # Pinned because the real ceiling is derived from the host's CPU count. This test
                 # spends one leaked thread on the blocking library and then requires a second
                 # request to still probe the healthy one, which a ceiling of 1 would forbid.
@@ -2678,7 +2686,7 @@ class TestGetPortSummariesForAllLibrariesRequest:
         try:
             with (
                 patch.object(_LibraryManager, "_SCHEMA_PROBE_TIMEOUT_S", 0.2),
-                patch.object(_LibraryManager, "_PORT_SUMMARY_TIMEOUT_BUDGET", 1),
+                patch.object(_LibraryManager, "_PORT_SUMMARY_LIBRARY_TIMEOUT_BUDGET", 1),
                 # Deliberately generous, and pinned rather than left to the host's CPU count: the
                 # library-level allowance must be what stops the second request, not the
                 # engine-wide ceiling, or this passes without testing the bound it names.
@@ -2742,7 +2750,7 @@ class TestGetPortSummariesForAllLibrariesRequest:
                 patch.object(_LibraryManager, "_PROBE_THREAD_LEAK_CEILING", 1),
                 # Deliberately generous: the library-level allowance must not be what stops this,
                 # or the test would pass without the engine-wide ceiling existing.
-                patch.object(_LibraryManager, "_PORT_SUMMARY_TIMEOUT_BUDGET", 10),
+                patch.object(_LibraryManager, "_PORT_SUMMARY_LIBRARY_TIMEOUT_BUDGET", 10),
                 patch.object(
                     _LibraryManager, "_construct_probe_node", side_effect=block_the_first_library, autospec=True
                 ) as probe_spy,
@@ -2799,9 +2807,12 @@ class TestGetPortSummariesForAllLibrariesRequest:
         try:
             with (
                 patch.object(_LibraryManager, "_SCHEMA_PROBE_TIMEOUT_S", 0.2),
-                # Two, so the first library eats the request allowance without any single library
-                # hitting its own allowance, which would drop pending node types instead.
-                patch.object(_LibraryManager, "_PORT_SUMMARY_TIMEOUT_BUDGET", 2),
+                # Two each: the first library's two node types both time out, which is exactly the
+                # request allowance, so the library below is left unreached rather than probed. The
+                # library bound has to match rather than be lower, or the first library would stop on
+                # its own allowance and the request would arrive at the second one with budget left.
+                patch.object(_LibraryManager, "_PORT_SUMMARY_REQUEST_TIMEOUT_BUDGET", 2),
+                patch.object(_LibraryManager, "_PORT_SUMMARY_LIBRARY_TIMEOUT_BUDGET", 2),
                 # Generous and pinned: this test leaks three threads, and the engine-wide ceiling
                 # must not be what ends it.
                 patch.object(_LibraryManager, "_PROBE_THREAD_LEAK_CEILING", 10),
@@ -2826,6 +2837,111 @@ class TestGetPortSummariesForAllLibrariesRequest:
         assert probed_entry.retry_node_types == frozenset({late_node_type})
         assert probed_entry.unprobed_node_types == frozenset()
         assert probed_entry.timeouts_spent == 1
+
+    @pytest.mark.asyncio
+    async def test_does_not_re_grant_a_retry_a_pass_stopped_short_of_taking(self, engine: Engine) -> None:
+        """The record of which node types have had their retry must outlive the pass that granted it.
+
+        A grant is spent the moment it is made, but the pass holding it can stop before reaching the
+        node type -- out of allowance, or because a reload closed the gate. Reading "already
+        retried" off what the *next* pass will retry loses the grant along with that pass, so the
+        same permanently blocking node type earns a fresh retry after every timeout and is probed
+        again and again, leaking a thread each time.
+        """
+        library_manager = engine.library_manager
+        self._register_probe_library(_PortSummaryProbe)
+        blocking_node_type = _PortSummaryProbe.__name__
+        release_blocked_probes = threading.Event()
+        real_construct = _LibraryManager._construct_probe_node
+
+        def block_everything(
+            manager: _LibraryManager, library_name: str, node_type: str, *args: Any, **kwargs: Any
+        ) -> Any:
+            release_blocked_probes.wait(timeout=30)
+            return real_construct(manager, library_name, node_type, *args, **kwargs)
+
+        try:
+            with (
+                patch.object(_LibraryManager, "_SCHEMA_PROBE_TIMEOUT_S", 0.2),
+                # Both generous and pinned: the retry accounting has to be what ends this, not a
+                # cost bound quietly dropping the node type from the pending set.
+                patch.object(_LibraryManager, "_PORT_SUMMARY_LIBRARY_TIMEOUT_BUDGET", 10),
+                patch.object(_LibraryManager, "_PROBE_THREAD_LEAK_CEILING", 10),
+                patch.object(
+                    _LibraryManager, "_construct_probe_node", side_effect=block_everything, autospec=True
+                ) as probe_spy,
+            ):
+                # First pass: the node type's first timeout, which is what earns it its one retry.
+                await library_manager._get_port_summaries_for_library(
+                    self._LIBRARY_NAME, ProbeTimeoutAllowance(remaining=4), throttle_s=0.0
+                )
+                assert library_manager._library_to_port_summary_cache[self._LIBRARY_NAME].retry_node_types == frozenset(
+                    {blocking_node_type}
+                )
+
+                # Second pass stops before reaching it, which is exactly what empties
+                # `retry_node_types` without the retry having been taken.
+                library_manager._close_libraries_loading_gate()
+                await library_manager._get_port_summaries_for_library(
+                    self._LIBRARY_NAME, ProbeTimeoutAllowance(remaining=4), throttle_s=0.0
+                )
+                stopped_short = library_manager._library_to_port_summary_cache[self._LIBRARY_NAME]
+                assert stopped_short.retry_node_types == frozenset()
+                assert stopped_short.unprobed_node_types == frozenset({blocking_node_type})
+                library_manager._libraries_loading_complete.set()
+
+                # Third pass takes the retry and times out again. Nothing further is owed.
+                await library_manager._get_port_summaries_for_library(
+                    self._LIBRARY_NAME, ProbeTimeoutAllowance(remaining=4), throttle_s=0.0
+                )
+        finally:
+            release_blocked_probes.set()
+
+        entry = library_manager._library_to_port_summary_cache[self._LIBRARY_NAME]
+        assert entry.retried_node_types == frozenset({blocking_node_type})
+        assert not entry.pending_node_types()
+        # Two attempts across three passes: the first probe and its single retry, not one per pass
+        # that happens to reach it.
+        expected_probe_count = 2
+        assert probe_spy.call_count == expected_probe_count
+
+    @pytest.mark.asyncio
+    async def test_stops_probing_when_the_library_it_started_on_is_replaced(self, engine: Engine) -> None:
+        """Every probe resolves its node class through the `Library` the pass picked up at the start.
+
+        A git update unloads and re-registers one library without closing the loading gate, so a
+        pass already walking that library keeps a handle to the pre-update object. Resolving through
+        it runs the old loader and imports the pre-update modules straight back into `sys.modules`,
+        undoing the unload the artist is waiting on.
+        """
+        library_manager = engine.library_manager
+        self._register_probe_library(_PortSummaryDataOnlyProbe, _PortSummaryProbe)
+        real_probe = library_manager._probe_node_type_port_summary
+
+        async def replace_the_library_after_the_first_probe(**kwargs: Any) -> Any:
+            outcome = await real_probe(**kwargs)
+            # What a git update does: same name, a different Library object behind it.
+            LibraryRegistry.unregister_library(self._LIBRARY_NAME, event_manager=engine.event_manager)
+            self._register_probe_library(_PortSummaryDataOnlyProbe, _PortSummaryProbe)
+            return outcome
+
+        with patch.object(
+            library_manager, "_probe_node_type_port_summary", side_effect=replace_the_library_after_the_first_probe
+        ) as probe_spy:
+            result = await library_manager.on_get_port_summaries_for_all_libraries_request(
+                GetPortSummariesForAllLibrariesRequest()
+            )
+
+        assert probe_spy.call_count == 1
+        # Present in the registry under the same name throughout, so a name-only check would have
+        # carried on probing through the stale object.
+        assert LibraryRegistry.get_library(self._LIBRARY_NAME) is not None
+        assert isinstance(result, GetPortSummariesForAllLibrariesResultSuccess)
+        assert set(result.library_name_to_port_summaries[self._LIBRARY_NAME]) == {_PortSummaryDataOnlyProbe.__name__}
+        # Owed a real attempt against the new object, and charged nothing: no probe timed out.
+        entry = library_manager._library_to_port_summary_cache[self._LIBRARY_NAME]
+        assert entry.unprobed_node_types == frozenset({_PortSummaryProbe.__name__})
+        assert entry.timeouts_spent == 0
 
     @pytest.mark.asyncio
     async def test_stops_probing_when_a_reload_closes_the_gate_mid_pass(self, engine: Engine) -> None:
@@ -3101,6 +3217,152 @@ class TestPortSummaryWarming:
         # Cancelled mid-library, so nothing was written back -- the next request recomputes rather
         # than serving a half-probed library as complete.
         assert self._LIBRARY_NAME not in library_manager._library_to_port_summary_cache
+        # No construction thread was ever started here, so the engine-wide ceiling hears nothing.
+        # Cancelling *inside* a construction is the case that charges it.
+        assert library_manager._port_summary_threads_leaked == 0
+
+    @pytest.mark.asyncio
+    async def test_cancelling_mid_construction_charges_the_thread_it_abandons(self, engine: Engine) -> None:
+        """`asyncio.to_thread` cannot cancel its worker, so stopping the pass abandons one.
+
+        The thread goes on running the node's `__init__` with nobody waiting for it -- the same
+        unreclaimable worker a timeout costs -- so it has to come out of the same engine-wide
+        ceiling. Charging only timeouts would let a reload loop abandon a worker per reload while
+        the count meant to bound them stayed at zero, and draining the loop's executor stalls far
+        more than the Add Node menu.
+        """
+        library_manager = engine.library_manager
+        self._register_probe_library(_PortSummaryDataOnlyProbe)
+        probe_entered_the_thread = threading.Event()
+        release_the_thread = threading.Event()
+        real_construct = _LibraryManager._construct_probe_node
+
+        def block_inside_the_worker(
+            manager: _LibraryManager, library_name: str, node_type: str, *args: Any, **kwargs: Any
+        ) -> Any:
+            probe_entered_the_thread.set()
+            release_the_thread.wait(timeout=30)
+            return real_construct(manager, library_name, node_type, *args, **kwargs)
+
+        try:
+            with patch.object(
+                _LibraryManager, "_construct_probe_node", side_effect=block_inside_the_worker, autospec=True
+            ):
+                library_manager._start_port_summary_warm()
+                warm_task = library_manager._port_summary_warm_task
+                assert warm_task is not None
+                # Waited off the loop: the worker cannot report in until the loop has handed the
+                # construction a thread, and the loop is what this test then cancels.
+                await asyncio.to_thread(probe_entered_the_thread.wait, 30)
+
+                await library_manager._cancel_port_summary_warm()
+        finally:
+            # Only so the test does not really strand a worker for the rest of the session; the
+            # charge above is made while the thread is still blocked, which is the real case.
+            release_the_thread.set()
+
+        assert warm_task.cancelled()
+        assert library_manager._port_summary_threads_leaked == 1
+
+    @pytest.mark.asyncio
+    async def test_cancelling_after_the_construction_finished_charges_nothing(self, engine: Engine) -> None:
+        """A thread that went back to the pool is not a leaked thread.
+
+        Cancellation cannot ask `asyncio.to_thread` whether its worker is still there -- cancelling
+        the task or the future leaves the thread running either way -- so the worker records for
+        itself that it finished. Charging every cancellation instead would walk the engine-wide
+        ceiling up on every reload and permanently stop probing on a healthy engine.
+        """
+        library_manager = engine.library_manager
+        self._register_probe_library(_PortSummaryDataOnlyProbe)
+        library = LibraryRegistry.get_library(self._LIBRARY_NAME)
+        construction_returned = asyncio.Event()
+
+        async def construct_then_hang(func: Callable[..., Any], *args: Any) -> Any:
+            # The construction really completes, including the signal the worker sets on its way
+            # out, and the cancellation below lands on the await that follows it -- the window
+            # where a timeout and a finished thread are indistinguishable from the loop's side.
+            func(*args)
+            construction_returned.set()
+            await asyncio.Event().wait()
+
+        with patch.object(asyncio, "to_thread", new=construct_then_hang):
+            probe_task = asyncio.create_task(
+                library_manager._probe_node_type_port_summary(
+                    library=library,
+                    library_name=self._LIBRARY_NAME,
+                    node_type=_PortSummaryDataOnlyProbe.__name__,
+                )
+            )
+            await construction_returned.wait()
+            probe_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await probe_task
+
+        assert library_manager._port_summary_threads_leaked == 0
+
+    @pytest.mark.asyncio
+    async def test_a_warm_handle_left_by_a_previous_event_loop_is_discarded(self, engine: Engine) -> None:
+        """The manager outlives any one loop, and a task suspended in a closed one cannot be cancelled.
+
+        `Task.cancel()` on such a handle raises from the loop underneath it, so a reload would blow
+        up before it unloaded anything; treating it as in-flight instead would leave the new loop
+        never warming at all. Either way the handle has to be forgotten rather than acted on.
+        """
+        library_manager = engine.library_manager
+        previous_loop = asyncio.new_event_loop()
+        stale_task = MagicMock()
+        stale_task.get_loop.return_value = previous_loop
+
+        try:
+            library_manager._port_summary_warm_task = stale_task
+            in_flight = library_manager._in_flight_port_summary_warm_task()
+
+            library_manager._port_summary_warm_task = stale_task
+            await library_manager._cancel_port_summary_warm()
+        finally:
+            previous_loop.close()
+
+        assert in_flight is None
+        assert library_manager._port_summary_warm_task is None
+        stale_task.cancel.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_git_reload_stops_warming_around_the_library_swap(self, engine: Engine) -> None:
+        """This path re-registers one library without closing the loading gate, so it must bracket too.
+
+        Warming resolves node classes, and the git update has just replaced the files behind them.
+        A pass left running across the swap imports the pre-update modules back into `sys.modules`
+        after the unload cleared them -- and restarting has to happen even when the reload failed,
+        since the library's summaries were dropped either way.
+        """
+        library_manager = engine.library_manager
+        call_order: list[str] = []
+
+        async def record_cancel() -> None:
+            call_order.append("cancel")
+
+        def fail_the_unload(_request: object) -> Any:
+            # Stands in for the first thing the reload does after cancelling. Failing it
+            # short-circuits the rest of the reload, which this test does not exercise.
+            call_order.append("unload")
+            failure = MagicMock()
+            failure.succeeded.return_value = False
+            return failure
+
+        with (
+            patch.object(library_manager, "_cancel_port_summary_warm", side_effect=record_cancel),
+            patch.object(library_manager, "_start_port_summary_warm", side_effect=lambda: call_order.append("restart")),
+            patch.object(engine, "handle_request", side_effect=fail_the_unload),
+        ):
+            result = await library_manager._reload_library_after_git_operation(
+                library_name="updated-library",
+                library_file_path="/libs/updated-library/griptape_nodes_library.json",
+                failure_result_class=RegisterLibraryFromFileResultFailure,
+            )
+
+        assert isinstance(result, RegisterLibraryFromFileResultFailure)
+        assert call_order == ["cancel", "unload", "restart"]
 
     @pytest.mark.asyncio
     async def test_a_waiting_request_takes_the_throttle_off_the_warm_pass(self, engine: Engine) -> None:
@@ -3291,11 +3553,16 @@ class TestPortSummaryWarming:
         assert library_manager._warm_port_summaries_requested is False
 
     @pytest.mark.asyncio
-    async def test_starting_again_replaces_the_pass_in_flight(self, engine: Engine) -> None:
-        """Two passes would leave one with no handle, and a pass nothing holds cannot be cancelled."""
+    async def test_starting_again_keeps_the_pass_in_flight(self, engine: Engine) -> None:
+        """Only one handle is kept, so a second pass could not be cancelled -- and neither is started.
+
+        Cancelling the first instead would be worse than not starting a second: the caller is
+        normally a worker reporting its node schemas, and that would discard a large library's
+        half-finished probing and leak the thread of whatever probe was in flight.
+        """
         library_manager = engine.library_manager
         self._register_probe_library(_PortSummaryDataOnlyProbe)
-        # Nothing has loaded in this test, so the gate holds both passes at their first await.
+        # Nothing has loaded in this test, so the gate holds the pass at its first await.
         library_manager._libraries_loading_complete.clear()
         try:
             library_manager._start_port_summary_warm()
@@ -3307,18 +3574,68 @@ class TestPortSummaryWarming:
             library_manager._libraries_loading_complete.set()
 
         assert first_task is not None
-        assert second_task is not None
-        assert second_task is not first_task
-        # The replacement owns the handle straight away, and the cancelled pass's done callback must
-        # not claim it back -- that is what makes the surviving pass cancellable by a later reload.
-        assert library_manager._port_summary_warm_task is second_task
+        assert second_task is first_task
 
-        await asyncio.gather(first_task, second_task, return_exceptions=True)
+        await asyncio.gather(first_task, return_exceptions=True)
 
-        assert first_task.cancelled()
-        assert not second_task.cancelled()
-        # Cleared by the surviving pass's own callback, now that there is nothing left to cancel.
+        assert not first_task.cancelled()
+        # Cleared by the pass's own callback, now that there is nothing left to cancel.
         assert library_manager._port_summary_warm_task is None
+
+    @pytest.mark.asyncio
+    async def test_a_running_pass_picks_up_a_library_invalidated_behind_it(self, engine: Engine) -> None:
+        """Re-sweeping is what lets a caller leave the running pass alone instead of restarting it.
+
+        A worker reporting its node schemas invalidates a library that this pass may already have
+        walked past. Nothing else would warm it, and the pass has to be the one to notice, because
+        cancelling and restarting is exactly the cost the sweep exists to avoid.
+        """
+        library_manager = engine.library_manager
+        self._register_probe_library(_PortSummaryDataOnlyProbe)
+        invalidated_once = False
+        real_get = library_manager._get_port_summaries_for_library
+
+        async def invalidate_behind_the_first_pass(*args: Any, **kwargs: Any) -> Any:
+            nonlocal invalidated_once
+            summaries = await real_get(*args, **kwargs)
+            if not invalidated_once:
+                invalidated_once = True
+                library_manager._invalidate_port_summaries(self._LIBRARY_NAME)
+            return summaries
+
+        with patch.object(
+            library_manager, "_get_port_summaries_for_library", side_effect=invalidate_behind_the_first_pass
+        ) as get_spy:
+            await library_manager._warm_port_summaries()
+
+        # Twice: once for the sweep whose work was invalidated, once for the sweep that noticed.
+        expected_pass_count = 2
+        assert get_spy.call_count == expected_pass_count
+        assert set(library_manager._library_to_port_summary_cache[self._LIBRARY_NAME].summaries) == {
+            _PortSummaryDataOnlyProbe.__name__
+        }
+
+    @pytest.mark.asyncio
+    async def test_warming_stops_after_its_sweep_cap_when_libraries_keep_changing(self, engine: Engine) -> None:
+        """Something invalidating in a loop must not keep the pass alive for the life of the process."""
+        library_manager = engine.library_manager
+        self._register_probe_library(_PortSummaryDataOnlyProbe)
+        real_get = library_manager._get_port_summaries_for_library
+
+        async def always_invalidate(*args: Any, **kwargs: Any) -> Any:
+            summaries = await real_get(*args, **kwargs)
+            library_manager._invalidate_port_summaries(self._LIBRARY_NAME)
+            return summaries
+
+        sweep_cap = 3
+        with (
+            patch.object(_LibraryManager, "_PORT_SUMMARY_WARM_MAX_SWEEPS", sweep_cap),
+            patch.object(library_manager, "_get_port_summaries_for_library", side_effect=always_invalidate) as get_spy,
+        ):
+            await library_manager._warm_port_summaries()
+
+        # One pass per sweep and then it gives up, rather than sweeping forever.
+        assert get_spy.call_count == sweep_cap
 
     @pytest.mark.asyncio
     async def test_worker_stub_registration_rewarms(self, engine: Engine) -> None:
@@ -3392,17 +3709,19 @@ class TestPortSummaryInvalidationOnLibraryLoad:
         yield
         LibraryRegistry._clear()
 
-    @pytest.mark.parametrize("library_kind", ["regular", "sandbox"])
-    @pytest.mark.asyncio
-    async def test_final_lifecycle_phase_drops_cached_port_summaries(
-        self, engine: Engine, tmp_path: Path, library_kind: str
-    ) -> None:
-        """Both branches of the final phase reach the invalidation, sandbox and regular alike."""
-        is_sandbox = library_kind == "sandbox"
-        library_manager = engine.library_manager
-        library_json = tmp_path / "griptape_nodes_library.json"
-        library_json.write_text("{}")
-        file_path = str(library_json)
+    async def _run_final_lifecycle_phase(
+        self,
+        library_manager: _LibraryManager,
+        file_path: str,
+        *,
+        is_sandbox: bool,
+        node_load_failure: Exception | None = None,
+    ) -> Any:
+        """Drive the final lifecycle phase for one library, stubbing everything but the invalidation.
+
+        `node_load_failure` is raised by the node loading each branch does -- the one step of the
+        phase that can fail after the library has already been published to the registry.
+        """
         schema = LibrarySchema(
             name=self._LIBRARY_NAME,
             library_schema_version=LibrarySchema.LATEST_SCHEMA_VERSION,
@@ -3416,12 +3735,6 @@ class TestPortSummaryInvalidationOnLibraryLoad:
             categories=[],
             nodes=[],
         )
-
-        # Stand in for a port summary request that landed while the library was published but
-        # empty, which is exactly the state the invalidation exists to discard.
-        library_manager._library_to_port_summary_cache[self._LIBRARY_NAME] = _empty_port_summary_cache_entry()
-        generation_before = library_manager._library_to_port_summaries_generation.get(self._LIBRARY_NAME, 0)
-
         library_info = _LibraryManager.LibraryInfo(
             lifecycle_state=_LibraryManager.LibraryLifecycleState.DEPENDENCIES_INSTALLED,
             fitness=_LibraryManager.LibraryFitness.NOT_EVALUATED,
@@ -3445,16 +3758,68 @@ class TestPortSummaryInvalidationOnLibraryLoad:
                 ),
             ),
             patch.object(library_manager, "_add_library_paths_to_sys_path", new=AsyncMock()),
-            patch.object(library_manager, "_attempt_load_nodes_from_library"),
-            patch.object(library_manager, "_attempt_generate_sandbox_library_from_schema", new=AsyncMock()),
+            patch.object(library_manager, "_attempt_load_nodes_from_library", side_effect=node_load_failure),
+            patch.object(
+                library_manager,
+                "_attempt_generate_sandbox_library_from_schema",
+                new=AsyncMock(side_effect=node_load_failure),
+            ),
         ):
-            result = await library_manager._progress_library_through_lifecycle(
+            return await library_manager._progress_library_through_lifecycle(
                 library_info, file_path, RegisterLibraryFromFileRequest(file_path=file_path)
             )
+
+    @pytest.mark.parametrize("library_kind", ["regular", "sandbox"])
+    @pytest.mark.asyncio
+    async def test_final_lifecycle_phase_drops_cached_port_summaries(
+        self, engine: Engine, tmp_path: Path, library_kind: str
+    ) -> None:
+        """Both branches of the final phase reach the invalidation, sandbox and regular alike."""
+        library_manager = engine.library_manager
+        library_json = tmp_path / "griptape_nodes_library.json"
+        library_json.write_text("{}")
+
+        # Stand in for a port summary request that landed while the library was published but
+        # empty, which is exactly the state the invalidation exists to discard.
+        library_manager._library_to_port_summary_cache[self._LIBRARY_NAME] = _empty_port_summary_cache_entry()
+        generation_before = library_manager._library_to_port_summaries_generation.get(self._LIBRARY_NAME, 0)
+
+        result = await self._run_final_lifecycle_phase(
+            library_manager, str(library_json), is_sandbox=library_kind == "sandbox"
+        )
 
         assert result is None
         assert self._LIBRARY_NAME not in library_manager._library_to_port_summary_cache
         # The generation bump is what lets a probe pass already in flight discard its stale result.
+        assert library_manager._library_to_port_summaries_generation[self._LIBRARY_NAME] > generation_before
+
+    @pytest.mark.parametrize("library_kind", ["regular", "sandbox"])
+    @pytest.mark.asyncio
+    async def test_drops_cached_port_summaries_even_when_node_loading_raises(
+        self, engine: Engine, tmp_path: Path, library_kind: str
+    ) -> None:
+        """A load that blew up partway is exactly when the stale entry is worst.
+
+        The library is already published, whichever node types the load managed to register are in
+        it, and no later step will invalidate -- so an entry cached mid-load would describe this
+        library for the rest of the session. Invalidating only on the way out of a clean load would
+        make a raising node module permanently unrankable in the Add Node menu.
+        """
+        library_manager = engine.library_manager
+        library_json = tmp_path / "griptape_nodes_library.json"
+        library_json.write_text("{}")
+        library_manager._library_to_port_summary_cache[self._LIBRARY_NAME] = _empty_port_summary_cache_entry()
+        generation_before = library_manager._library_to_port_summaries_generation.get(self._LIBRARY_NAME, 0)
+
+        with pytest.raises(RuntimeError, match="a node module blew up on import"):
+            await self._run_final_lifecycle_phase(
+                library_manager,
+                str(library_json),
+                is_sandbox=library_kind == "sandbox",
+                node_load_failure=RuntimeError("a node module blew up on import"),
+            )
+
+        assert self._LIBRARY_NAME not in library_manager._library_to_port_summary_cache
         assert library_manager._library_to_port_summaries_generation[self._LIBRARY_NAME] > generation_before
 
 
