@@ -1,6 +1,6 @@
 [project]
 name = "griptape-nodes-engine"
-version = "0.99.0"
+version = "0.100.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12.0, <3.14"
@@ -19,11 +19,10 @@ dependencies = [
   "packaging>=25.0",
   "python-multipart>=0.0.20",
   "json-repair>=0.46.1",
-  # servers/mcp.py targets the 1.x low-level server API. Migrating is not just a rewrite:
-  # pydantic-ai-slim reaches mcp through fastmcp-slim[client]<4, and every fastmcp-slim release
-  # under that cap requires mcp<2.0, so asking for 2.x makes the resolve unsatisfiable.
-  # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/5218
-  "mcp>=1.10.1,<2",
+  # 2.x is required, not just preferred: servers/mcp.py uses the constructor-registered
+  # on_list_tools/on_call_tool handlers that replaced the 1.x decorators. Ceiling is deliberate
+  # so a 3.0 release cannot silently kill the MCP server thread again (see issue 5216).
+  "mcp>=2.0,<3",
   "binaryornot>=0.4.4",
   "pillow>=11.3.0",
   "static-ffmpeg>=3.0",

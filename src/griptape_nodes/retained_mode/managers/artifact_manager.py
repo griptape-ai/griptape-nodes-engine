@@ -140,7 +140,10 @@ class PreviewMetadata(BaseModel):
         preview_generator_parameters: Parameters supplied to preview generator
     """
 
-    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.1.0"
+    # Raising this is the only thing that invalidates previews already on disk, since the sidecar
+    # records a generator's parameters but nothing about how it encoded. Raise it when a generator's
+    # output changes; every media type's previews then rebuild once.
+    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.2.0"
 
     version: str
     source_macro_path: str

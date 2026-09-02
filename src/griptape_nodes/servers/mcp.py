@@ -9,9 +9,14 @@ from typing import Any
 
 import uvicorn
 from fastapi import FastAPI
+from mcp.server.context import ServerRequestContext
 from mcp.server.lowlevel import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.types import (
+    CallToolRequestParams,
+    CallToolResult,
+    ListToolsResult,
+    PaginatedRequestParams,
     TextContent,
     Tool,
 )
@@ -172,9 +177,11 @@ EVENT_REQUEST_BATCH_DESCRIPTION = (
     "    single tool call ({ok, details, ...payload fields}). Failures appear as\n"
     "    {ok: false, details: ...} in their slot rather than aborting the rest of the batch.\n"
 )
+# Timeout applied to a single (non-batch) tool call.
+_SINGLE_REQUEST_TIMEOUT_MS = 30000
 # Per-inner-request timeout used when the caller does not pass timeout_ms. Mirrors the timeout the
-# single-request path applies (see call_tool below) so a batch of one behaves identically.
-_BATCH_PER_REQUEST_TIMEOUT_MS = 30000
+# single-request path applies so a batch of one behaves identically.
+_BATCH_PER_REQUEST_TIMEOUT_MS = _SINGLE_REQUEST_TIMEOUT_MS
 # Hard ceiling for an auto-computed batch timeout. Long enough to accommodate a large build phase
 # without letting a runaway batch hold the connection open indefinitely.
 _BATCH_MAX_AUTO_TIMEOUT_MS = 300000
@@ -413,6 +420,53 @@ async def _dispatch_to_engine(request_payload: RequestPayload, timeout_ms: int |
     return await asyncio.shield(response_future)
 
 
+async def list_tools(_ctx: ServerRequestContext[Any], _params: PaginatedRequestParams | None) -> ListToolsResult:
+    """Advertise one tool per supported request event, plus the synthetic batch envelope."""
+    single_tools = [
+        Tool(name=event.__name__, description=event.__doc__, input_schema=TypeAdapter(event).json_schema())
+        for event in SUPPORTED_REQUEST_EVENTS.values()
+    ]
+    batch_tool = Tool(
+        name=EVENT_REQUEST_BATCH_TOOL_NAME,
+        description=EVENT_REQUEST_BATCH_DESCRIPTION,
+        input_schema=_event_request_batch_input_schema(),
+    )
+    return ListToolsResult(tools=[*single_tools, batch_tool])
+
+
+async def call_tool(_ctx: ServerRequestContext[Any], params: CallToolRequestParams) -> CallToolResult:
+    """Validate a tool call, dispatch it onto the engine loop, and return the trimmed response.
+
+    Argument validation, unsupported tool names, and dispatch timeouts all raise, and every raise
+    is reported as a tool-level error result rather than a JSON-RPC protocol error. Clients can
+    read the message and retry with corrected arguments, which a protocol error does not allow.
+    """
+    try:
+        payload = await _call_tool_payload(params.name, params.arguments or {})
+    except Exception as exc:
+        return CallToolResult(content=[TextContent(text=str(exc))], is_error=True)
+    return CallToolResult(content=[TextContent(text=payload)])
+
+
+async def _call_tool_payload(name: str, arguments: dict[str, Any]) -> str:
+    """Dispatch one tool call and return its JSON text payload."""
+    if name == EVENT_REQUEST_BATCH_TOOL_NAME:
+        pairs = _build_batch_pairs(arguments.get("requests"))
+        timeout_ms = _resolve_batch_timeout_ms(arguments.get("timeout_ms"), len(pairs))
+        raw_results = await _dispatch_batch_to_engine(pairs, timeout_ms)
+        mcp_server_logger.debug("Got %d batch results", len(raw_results))
+        return json.dumps(_trim_batch_results(raw_results))
+
+    if name not in SUPPORTED_REQUEST_EVENTS:
+        msg = f"Unsupported tool: {name}"
+        raise ValueError(msg)
+
+    request_payload = SUPPORTED_REQUEST_EVENTS[name](**arguments)
+    result = await _dispatch_to_engine(request_payload, timeout_ms=_SINGLE_REQUEST_TIMEOUT_MS)
+    mcp_server_logger.debug("Got result: %s", result)
+    return json.dumps(_trim_response(result))
+
+
 async def _dispatch_batch_to_engine(pairs: list[tuple[str, dict[str, Any]]], timeout_ms: int) -> list[Any]:
     """Dispatch a batch of (request_type, payload) pairs concurrently onto the engine loop.
 
@@ -435,39 +489,7 @@ def start_mcp_server(sock: socket.socket) -> None:
     bound_host, bound_port = sock.getsockname()[:2]
     mcp_server_logger.info("MCP server listening at http://%s:%d/mcp/", bound_host, bound_port)
 
-    app = Server("mcp-gtn")
-
-    @app.list_tools()
-    async def list_tools() -> list[Tool]:
-        single_tools = [
-            Tool(name=event.__name__, description=event.__doc__, inputSchema=TypeAdapter(event).json_schema())
-            for (name, event) in SUPPORTED_REQUEST_EVENTS.items()
-        ]
-        batch_tool = Tool(
-            name=EVENT_REQUEST_BATCH_TOOL_NAME,
-            description=EVENT_REQUEST_BATCH_DESCRIPTION,
-            inputSchema=_event_request_batch_input_schema(),
-        )
-        return [*single_tools, batch_tool]
-
-    @app.call_tool()
-    async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-        if name == EVENT_REQUEST_BATCH_TOOL_NAME:
-            pairs = _build_batch_pairs(arguments.get("requests"))
-            timeout_ms = _resolve_batch_timeout_ms(arguments.get("timeout_ms"), len(pairs))
-            raw_results = await _dispatch_batch_to_engine(pairs, timeout_ms)
-            mcp_server_logger.debug("Got %d batch results", len(raw_results))
-            return [TextContent(type="text", text=json.dumps(_trim_batch_results(raw_results)))]
-
-        if name not in SUPPORTED_REQUEST_EVENTS:
-            msg = f"Unsupported tool: {name}"
-            raise ValueError(msg)
-
-        request_payload = SUPPORTED_REQUEST_EVENTS[name](**arguments)
-        result = await _dispatch_to_engine(request_payload, timeout_ms=30000)
-        mcp_server_logger.debug("Got result: %s", result)
-
-        return [TextContent(type="text", text=json.dumps(_trim_response(result)))]
+    app = Server("mcp-gtn", on_list_tools=list_tools, on_call_tool=call_tool)
 
     # Create the session manager with our app and event store
     session_manager = StreamableHTTPSessionManager(
