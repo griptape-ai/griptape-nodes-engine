@@ -9754,6 +9754,57 @@ class TestSnapshotLibraryConfig:
         assert before != after
 
 
+class TestReloadAfterProjectSwitch:
+    """What a switch rebuilds, and what it must not rebuild twice."""
+
+    @staticmethod
+    def _pm() -> ProjectManager:
+        pm = ProjectManager(Mock(), Mock(), Mock())
+        engine = MagicMock()
+        engine.ahandle_request = AsyncMock(return_value=Mock())
+        engine.workflow_manager.refresh_workflow_registry = AsyncMock(return_value=None)
+        engine.library_manager.rekey_workflows_for_all_libraries = AsyncMock(return_value=None)
+        pm._engine = engine
+        return pm
+
+    @pytest.mark.asyncio
+    async def test_a_workspace_only_switch_re_derives_library_workflow_keys(self) -> None:
+        """The rescan spares library-owned entries, so their keys still name the old workspace.
+
+        Nothing else rebuilds them on this path: libraries did not reload, so the workflows a
+        library contributed would keep pointing at files under the workspace that was left.
+        """
+        pm = self._pm()
+
+        result = await pm._reload_after_project_switch("proj", workspace_changed=True, library_config_changed=False)
+
+        assert result is None
+        cast("AsyncMock", pm.engine.workflow_manager.refresh_workflow_registry).assert_awaited_once()
+        cast("AsyncMock", pm.engine.library_manager.rekey_workflows_for_all_libraries).assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_library_reload_already_rebuilt_the_keys(self) -> None:
+        """Unloading and loading each library derives its keys against the workspace as it is now.
+
+        Re-deriving them again would be wasted work on the slowest path there is.
+        """
+        pm = self._pm()
+
+        await pm._reload_after_project_switch("proj", workspace_changed=True, library_config_changed=True)
+
+        cast("AsyncMock", pm.engine.library_manager.rekey_workflows_for_all_libraries).assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_unchanged_workspace_leaves_the_registry_alone(self) -> None:
+        """Keys are derived from the workspace, so a switch that keeps it keeps them valid."""
+        pm = self._pm()
+
+        await pm._reload_after_project_switch("proj", workspace_changed=False, library_config_changed=False)
+
+        cast("AsyncMock", pm.engine.workflow_manager.refresh_workflow_registry).assert_not_awaited()
+        cast("AsyncMock", pm.engine.library_manager.rekey_workflows_for_all_libraries).assert_not_awaited()
+
+
 class TestActivateWorkspaceProject:
     """`on_activate_workspace_project_request`: the app's boot-time pre-activation seam."""
 

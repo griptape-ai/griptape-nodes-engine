@@ -661,3 +661,60 @@ class TestLibraryWorkflowsSurviveAWorkspaceRescan:
             await workflow_manager.refresh_workflow_registry(workflows_to_register=[])
 
             assert list(WorkflowRegistry._workflows) == [registry_key]
+
+
+class TestRekeyWorkflowsForAllLibraries:
+    """Surviving the rescan is only half of it: the surviving key has to still resolve."""
+
+    @pytest.mark.asyncio
+    async def test_moving_the_workspace_re_derives_the_key(self, engine: Engine, tmp_path: Path) -> None:
+        """A project switch that leaves library config alone does not reload libraries.
+
+        So nothing rebuilds their keys, and a key derived against the old workspace resolves
+        against the new one to a file that is not there.
+        """
+        library_manager = engine.library_manager
+        config_manager = engine.config_manager
+        first_workspace = tmp_path / "first_workspace"
+        library_dir = first_workspace / "libraries" / "test_lib"
+        library_dir.mkdir(parents=True)
+        (library_dir / "example.py").write_text(_workflow_header(), encoding="utf-8")
+        library_info = _library_info(library_dir / "griptape_nodes_library.json")
+
+        with (
+            patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.get_library", return_value=_library(["example.py"])),
+            patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.list_libraries", return_value=[LIBRARY_NAME]),
+            patch.dict(library_manager._library_file_path_to_info, {library_info.library_path: library_info}),
+            patch.dict(WorkflowRegistry._workflows, {}, clear=True),
+            patch.object(type(config_manager), "workspace_path", first_workspace),
+        ):
+            await library_manager.register_workflows_for_all_libraries()
+            assert list(WorkflowRegistry._workflows) == ["libraries/test_lib/example"]
+
+            # The library does not move, so it is now outside the workspace and its key is
+            # absolute rather than workspace-relative.
+            with patch.object(type(config_manager), "workspace_path", tmp_path / "second_workspace"):
+                await library_manager.rekey_workflows_for_all_libraries()
+
+                # Exactly one, not the new key beside the stale one: registering alone would
+                # skip the key already there and add the re-derived one next to it.
+                assert list(WorkflowRegistry._workflows) == [(library_dir / "example").as_posix()]
+
+    @pytest.mark.asyncio
+    async def test_skips_a_library_this_engine_never_registered(self, engine: Engine) -> None:
+        """Same reason as the register side: `LibraryRegistry` is process-global."""
+        library_manager = engine.library_manager
+        register_one = AsyncMock(return_value=None)
+        other_engines_workflow = MagicMock(library_name="AnotherEnginesLib")
+
+        with (
+            patch.dict(library_manager._library_file_path_to_info, {}, clear=True),
+            patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.list_libraries", return_value=["AnotherEnginesLib"]),
+            patch.dict(WorkflowRegistry._workflows, {"theirs/example": other_engines_workflow}, clear=True),
+            patch.object(library_manager, "register_workflows_for_library", register_one),
+        ):
+            await library_manager.rekey_workflows_for_all_libraries()
+
+            assert list(WorkflowRegistry._workflows) == ["theirs/example"]
+
+        register_one.assert_not_awaited()

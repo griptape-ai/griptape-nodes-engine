@@ -4399,6 +4399,29 @@ class LibraryManager(EngineScoped):
                 continue
             await self.register_workflows_for_library(library_info)
 
+    async def rekey_workflows_for_all_libraries(self) -> None:
+        """Re-derive every library-owned registry key against the current workspace.
+
+        A registry key is workspace-relative while the file sits inside the workspace and
+        absolute otherwise, and libraries live under the workspace by default. So when the
+        workspace moves, a library's entries keep their old spelling and resolve against the
+        new workspace, pointing at nothing. A library reload rebuilds them as a side effect of
+        unloading and loading each library, but a workspace-only project switch does not reload
+        libraries, which is the case this covers.
+
+        Removal first, then registration: registering alone skips a key already in the registry
+        and adds the newly-derived one beside it, leaving the workflow registered twice with the
+        stale copy resolving nowhere.
+        """
+        for library_name in LibraryRegistry.list_libraries():
+            library_info = self.get_library_info_by_library_name(library_name)
+            if library_info is None:
+                # Another engine's library in this process -- see register_workflows_for_all_libraries.
+                logger.debug("Library '%s' is not known to this engine; skipping its workflows.", library_name)
+                continue
+            self._unregister_workflows_for_library(library_name)
+            await self.register_workflows_for_library(library_info)
+
     async def register_workflows_for_library(self, library_info: LibraryManager.LibraryInfo) -> None:
         """Register the workflows one library declares, owned by that library.
 
