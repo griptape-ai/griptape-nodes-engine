@@ -1881,6 +1881,56 @@ class TestConfigProvenance:
             assert manager.value_source("log_level").layer != "runtime"
             assert manager.value_source("libraries_directory").layer != "runtime"
 
+    def test_value_source_config_supplied_pin_leaves_ownership_with_the_config_layer(
+        self, tmp_path: Path, isolate_user_config: Path
+    ) -> None:
+        """An ordinary activation re-pins the user layer's own value, which changes no ownership.
+
+        `decide_workspace` branch 5 reads `workspace_directory` out of the user config and pins
+        it back. Reporting that as the runtime layer locks a headline setting on every project
+        open and points the user at a layer with no file to open, even though editing the user
+        config still decides what the next activation pins.
+        """
+        isolate_user_config.write_text(json.dumps({"workspace_directory": "/from/user"}), encoding="utf-8")
+        pinned_dir = tmp_path / "pinned_workspace"
+        pinned_dir.mkdir()
+
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.set_workspace_override(pinned_dir, supplied_by_config=True)
+            manager.load_configs()
+            source = manager.value_source("workspace_directory")
+
+            assert source.layer == "user"
+            assert source.path == str(isolate_user_config)
+            assert manager.shadowed_by("workspace_directory") is None
+
+            # A pin with no config origin is still its own layer.
+            manager.set_workspace_override(pinned_dir)
+            manager.load_configs()
+
+        assert manager.value_source("workspace_directory").layer == "runtime"
+
+    def test_value_source_uses_key_paths_so_a_dotted_leaf_resolves(self, tmp_path: Path) -> None:
+        """`project_workspaces` is keyed by project file paths, so its leaf names contain dots.
+
+        Joining those into a dot string and re-splitting addresses a nesting level no layer
+        holds, which reported the leaf as unowned and let a locked field render editable.
+        """
+        dotted_key = "/home/me/projects/my-thing/griptape-nodes-project.yml"
+        self._write_layer_config(tmp_path, {"project_workspaces": {dotted_key: "/from/project"}})
+
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.load_project_config(tmp_path)
+
+            assert manager._value_source_at(("project_workspaces", dotted_key)).layer == "project"
+            assert manager._shadowed_by_at(("project_workspaces", dotted_key)) is not None
+
+            sources = manager.category_sources("project_workspaces")
+
+        assert sources[f"project_workspaces.{dotted_key}"].layer == "project"
+
     # -- shadowed_by: only default/user are "not shadowed" --
 
     def test_shadowed_by_none_for_default(self) -> None:
@@ -2273,6 +2323,140 @@ class TestConfigProvenance:
         assert result.shadowed_by is None
         assert result.effective_value == accepted_value
         assert json.loads(isolate_user_config.read_text())["max_nodes_in_parallel"] == accepted_value
+
+    def test_set_config_value_request_dotted_leaf_write_that_landed_reports_applied(
+        self, isolate_user_config: Path
+    ) -> None:
+        """A `project_workspaces` write is keyed by file paths, and it does take effect.
+
+        Judging its leaves on a re-split dot string looked for a nesting level no layer holds,
+        so a write that landed correctly reported failure and quoted the mapping back as
+        rejected.
+        """
+        mapping = {"/home/me/projects/my-thing/griptape-nodes-project.yml": "/home/me/ws"}
+
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            result = manager.on_handle_set_config_value_request(
+                SetConfigValueRequest(category_and_key="project_workspaces", value=mapping)
+            )
+
+            assert manager.get_config_value("project_workspaces") == mapping
+
+        assert isinstance(result, SetConfigValueResultSuccess)
+        assert result.applied is True
+        assert result.shadowed_by is None
+        assert json.loads(isolate_user_config.read_text())["project_workspaces"] == mapping
+
+    def test_get_config_value_request_dotted_leaf_owned_by_project_is_not_editable(
+        self, tmp_path: Path, isolate_user_config: Path
+    ) -> None:
+        """A locked field must not render editable because its leaf name contains dots."""
+        dotted_key = "/home/me/projects/my-thing/griptape-nodes-project.yml"
+        self._write_layer_config(tmp_path, {"project_workspaces": {dotted_key: "/from/project"}})
+
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.load_project_config(tmp_path)
+            read = manager.on_handle_get_config_value_request(
+                GetConfigValueRequest(category_and_key="project_workspaces")
+            )
+            write = manager.on_handle_set_config_value_request(
+                SetConfigValueRequest(category_and_key="project_workspaces", value={dotted_key: "/mine"})
+            )
+
+        assert isinstance(read, GetConfigValueResultSuccess)
+        assert read.source.layer == "project"
+        assert read.editable is False
+
+        # Read and write agree, which is the property the leaf walk exists to hold.
+        assert isinstance(write, SetConfigValueResultSuccess)
+        assert write.applied is False
+        assert write.shadowed_by is not None
+        assert write.shadowed_by.layer == "project"
+
+        # Still stored, like any other shadowed write.
+        assert json.loads(isolate_user_config.read_text())["project_workspaces"] == {dotted_key: "/mine"}
+
+    def test_set_config_category_request_empty_contents_reports_applied(self, isolate_user_config: Path) -> None:
+        """An empty delta writes nothing, so it cannot have failed to take effect.
+
+        `merge_dicts` leaves the category alone and the merged value is correct, but comparing
+        `{}` against the merged category made every empty write report the value as rejected and
+        quote a value the caller never sent.
+        """
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            result = manager.on_handle_set_config_category_request(
+                SetConfigCategoryRequest(category="worker", contents={})
+            )
+
+        assert isinstance(result, SetConfigCategoryResultSuccess)
+        assert result.applied is True
+        assert result.shadowed_by is None
+        assert "NOTE" not in str(result.result_details)
+
+        # An empty delta writes no leaves, so the category never appears in the user layer.
+        assert json.loads(isolate_user_config.read_text()).get("worker") in (None, {})
+
+    def test_set_config_category_request_empty_contents_still_reports_a_shadowing_layer(
+        self, tmp_path: Path, isolate_user_config: Path
+    ) -> None:
+        """Writing nothing into a category a higher layer owns is still a write that layer outranks.
+
+        The two leaf walks deliberately read an empty dict differently: nothing can have
+        diverged, but the category is still not the user's to set.
+        """
+        self._write_layer_config(tmp_path, {"worker": {"heartbeat_timeout_s": 99.0}})
+
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.load_project_config(tmp_path)
+            result = manager.on_handle_set_config_category_request(
+                SetConfigCategoryRequest(category="worker", contents={})
+            )
+
+        assert isinstance(result, SetConfigCategoryResultSuccess)
+        assert result.applied is False
+        assert result.shadowed_by is not None
+        assert result.shadowed_by.layer == "project"
+
+        # Nothing was written, so the shadowing verdict is about ownership rather than a value.
+        assert json.loads(isolate_user_config.read_text()).get("worker") in (None, {})
+
+    def test_set_config_value_request_config_supplied_pin_explains_next_activation(
+        self, tmp_path: Path, isolate_user_config: Path
+    ) -> None:
+        """A pinned workspace write is deferred, not rejected, and the note has to say so.
+
+        The pin still wins the current merge, so `applied` is False. Attributing that to
+        validation would tell the user their value was refused when it was actually saved and
+        will be used on the next project open.
+        """
+        user_ws = tmp_path / "user_workspace"
+        user_ws.mkdir()
+        isolate_user_config.write_text(json.dumps({"workspace_directory": str(user_ws)}), encoding="utf-8")
+        pinned_dir = tmp_path / "pinned_workspace"
+        pinned_dir.mkdir()
+        typed_ws = tmp_path / "typed_workspace"
+
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.set_workspace_override(pinned_dir, supplied_by_config=True)
+            manager.load_configs()
+            result = manager.on_handle_set_config_value_request(
+                SetConfigValueRequest(category_and_key="workspace_directory", value=str(typed_ws))
+            )
+
+        assert isinstance(result, SetConfigValueResultSuccess)
+        assert result.applied is False
+        # No layer is at fault: the user layer is still the owner, it is just not in effect yet.
+        assert result.shadowed_by is None
+        assert "pins its workspace" in str(result.result_details)
+        assert "not one this setting accepts" not in str(result.result_details)
+
+        # The write is what the next activation derives its pin from.
+        assert json.loads(isolate_user_config.read_text())["workspace_directory"] == str(typed_ws)
 
     def test_get_config_category_request_sources_keyed_by_full_root_relative_path(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
