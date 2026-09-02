@@ -73,8 +73,16 @@ USER_CONFIG_PATH = xdg_config_home() / "griptape_nodes" / "griptape_nodes_config
 
 # Sentinel distinguishing "this layer's dict has no entry for this key" from "this layer's
 # dict has an entry whose value happens to be None" (e.g. `project_file: str | None`).
-# get_dot_value's own `default` parameter can't do this job: `None` is also its default.
+# A plain `None` default can't do this job: `None` is also a legitimate stored value.
 _KEY_NOT_IN_LAYER = object()
+
+# Why a write that reached disk is not the value now in effect.
+#   shadowed -- a higher-priority config layer also defines the key and keeps winning the merge
+#   pinned   -- the active project's workspace pin restates the value it was given on every
+#               remerge, so the write decides what the NEXT activation pins, not what is in
+#               effect now
+#   rejected -- the merged result failed Settings validation, so load_configs discarded it
+_UnappliedReason = Literal["shadowed", "pinned", "rejected"]
 
 # The only layers a settings write can control. `set_config_value` writes the user config
 # file, and "default" means nothing has overridden the Settings model, so a key sourced
@@ -125,19 +133,17 @@ class LoadedConfigFile(NamedTuple):
 class ConfigWriteOutcome(NamedTuple):
     """Whether a completed user-layer write is the value now in effect.
 
-    A write always lands in the user config file; whether it takes effect depends on two
-    separate things. A higher-priority layer may also define one of the keys it wrote, and
-    the merged result may have failed `Settings` validation, in which case `load_configs`
-    discards the whole merge. `unapplied_key` names the first key that did not take effect,
-    which for a category write is a leaf under it rather than the category itself.
-    `shadowed_by` is set only for the first cause; validation leaves it None. See
-    `ConfigManager._write_outcome`.
+    A write always lands in the user config file; whether it takes effect depends on more than
+    where it landed. `unapplied_key` names the first key that did not take effect, which for a
+    category write is a leaf under it rather than the category itself, and `reason` says why.
+    `shadowed_by` is set only for `reason == "shadowed"`. See `ConfigManager._write_outcome`.
     """
 
     applied: bool
     effective_value: Any
     unapplied_key: str | None
     shadowed_by: ConfigValueSource | None
+    reason: _UnappliedReason | None = None
 
 
 class _ShadowedLeaf(NamedTuple):
@@ -148,14 +154,15 @@ class _ShadowedLeaf(NamedTuple):
 
 
 class _UnappliedLeaf(NamedTuple):
-    """One written key whose value is not the one now in effect, and the layer to blame if any.
+    """One written key whose value is not the one now in effect, and why.
 
-    `source` is None when no layer is responsible, meaning the merged config failed
-    `Settings` validation and was discarded.
+    `source` is set only when `reason` is "shadowed"; the other reasons name no layer, because
+    no config layer is responsible for them.
     """
 
     key: str
-    source: ConfigValueSource | None
+    reason: _UnappliedReason
+    source: ConfigValueSource | None = None
 
 
 class _LayerProbe(NamedTuple):
@@ -211,6 +218,11 @@ class ConfigManager(EngineScoped):
         self._project_config_path: Path | None = None
         self._workspace_config_path: Path | None = None
         self._workspace_dir_override: str | None = None
+        # Whether the active workspace pin merely restates a value the config stack already
+        # supplies (see set_workspace_override). Such a pin is not its own layer: the file the
+        # value came from is the editable owner, and reporting "runtime" would lock a field the
+        # user can in fact change.
+        self._workspace_pin_supplied_by_config: bool = False
         self._libraries_root_override: str | None = None
         # (variable name, value) pairs already reported as ignored. The env layer is re-read on
         # every load_configs() and on each read_env_config() call, so without this a single bad
@@ -274,7 +286,7 @@ class ConfigManager(EngineScoped):
         """
         self._workspace_path = str(Path(path).expanduser().resolve())
 
-    def set_workspace_override(self, path: Path | None) -> None:
+    def set_workspace_override(self, path: Path | None, *, supplied_by_config: bool = False) -> None:
         """Set a runtime workspace directory override.
 
         This override takes precedence over config-file-based workspace_directory
@@ -287,12 +299,22 @@ class ConfigManager(EngineScoped):
 
         Args:
             path: The workspace directory override, or None to clear it.
+            supplied_by_config: True when `path` is the value a config layer already supplies,
+                which `ProjectManager` does on an ordinary activation by reading
+                `workspace_directory` out of the user (or default) layer and pinning it back.
+                Such a pin changes nothing about who owns the setting, so `value_source` keeps
+                reporting the file layer and a write to `workspace_directory` keeps applying.
+                Leave False for a pin whose value has no config-layer origin: a project
+                template's `workspace_dir`, a `project_workspaces` mapping, or an inherited
+                ancestor workspace. Those are reported as the "runtime" layer.
         """
         if path is None:
             self._workspace_dir_override = None
+            self._workspace_pin_supplied_by_config = False
         else:
             resolved = str(Path(path).expanduser().resolve())
             self._workspace_dir_override = resolved
+            self._workspace_pin_supplied_by_config = supplied_by_config
             self._workspace_path = resolved
 
     def set_libraries_root_override(self, path: Path | None) -> None:
@@ -444,6 +466,7 @@ class ConfigManager(EngineScoped):
         load_configs()/load_project_config()/load_workspace_config() right after.
         """
         self._workspace_dir_override = None
+        self._workspace_pin_supplied_by_config = False
         self._libraries_root_override = None
         self._project_config_path = None
         self._workspace_config_path = None
@@ -493,16 +516,48 @@ class ConfigManager(EngineScoped):
 
         Args:
             key: Dot-notation key, e.g. "libraries_directory" or
-                "app_events.on_app_initialization_complete.libraries_to_register".
+                "app_events.on_app_initialization_complete.libraries_to_register". Split on
+                ".", so a key whose own name contains a dot cannot be addressed this way; the
+                leaf walks use `_value_source_at` with an explicit path instead.
+        """
+        return self._value_source_at(tuple(key.split(".")))
+
+    def _value_source_at(self, path: tuple[str, ...]) -> ConfigValueSource:
+        """`value_source` for an already-split key path.
+
+        Takes the path as segments rather than a dot string so a segment may itself contain
+        dots. `project_workspaces` is keyed by project file paths, so joining its keys into a
+        dot string and re-splitting them addresses a nesting level that exists in no layer.
+
+        Args:
+            path: Key segments from the config root, e.g. ("nuke", "port").
         """
         for probe in self._layer_probes():
-            if get_dot_value(probe.values, key, _KEY_NOT_IN_LAYER) is _KEY_NOT_IN_LAYER:
+            if self._layer_value_at(probe.values, path) is _KEY_NOT_IN_LAYER:
                 continue
             if probe.layer == "env":
-                return ConfigValueSource(layer=probe.layer, env_var=f"GTN_CONFIG_{key.upper()}")
-            path = str(probe.path) if probe.path is not None else None
-            return ConfigValueSource(layer=probe.layer, path=path)
+                return ConfigValueSource(layer=probe.layer, env_var=f"GTN_CONFIG_{'_'.join(path).upper()}")
+            layer_path = str(probe.path) if probe.path is not None else None
+            return ConfigValueSource(layer=probe.layer, path=layer_path)
         return ConfigValueSource(layer="default")
+
+    def _layer_value_at(self, values: dict, path: tuple[str, ...]) -> Any:
+        """Return the value at `path` in one layer's own dict, or `_KEY_NOT_IN_LAYER`.
+
+        Descends by successive dict lookups instead of `get_dot_value`, so a segment
+        containing a dot is looked up verbatim. Distinguishes "absent" from "present and
+        None", which is what makes provenance correct for an optional setting.
+
+        Args:
+            values: One layer's own parsed contents.
+            path: Key segments from the config root.
+        """
+        current: Any = values
+        for segment in path:
+            if not isinstance(current, dict) or segment not in current:
+                return _KEY_NOT_IN_LAYER
+            current = current[segment]
+        return current
 
     def _layer_probes(self) -> list[_LayerProbe]:
         """Return the file/env/runtime layers to check for a key, HIGHEST priority first.
@@ -527,12 +582,16 @@ class ConfigManager(EngineScoped):
         """Return the runtime layer's own contents: the active project's workspace pin, if any.
 
         `set_workspace_override` records this in memory during project activation (from a
-        `project_workspaces` mapping, parent-chain inheritance, or the global default), and
-        `load_configs` applies it straight onto `merged_config` above the config files and
-        below env. No file holds it, so a settings write cannot reach it -- which is why it
-        has to be a reportable layer rather than an unexplained loss.
+        project template's `workspace_dir`, a `project_workspaces` mapping, or an inherited
+        ancestor workspace), and `load_configs` applies it straight onto `merged_config` above
+        the config files and below env. No file holds it, so a settings write cannot reach it --
+        which is why it has to be a reportable layer rather than an unexplained loss.
+
+        Empty when the pin merely restates what a config layer already supplies, which is what
+        an ordinary activation does. That pin is not a distinct owner: the user's own config
+        supplied the value and a write to it still decides what the next activation pins.
         """
-        if self._workspace_dir_override is None:
+        if self._workspace_dir_override is None or self._workspace_pin_supplied_by_config:
             return {}
         return {"workspace_directory": self._workspace_dir_override}
 
@@ -549,7 +608,11 @@ class ConfigManager(EngineScoped):
         Args:
             key: Dot-notation key, same as `value_source`.
         """
-        source = self.value_source(key)
+        return self._shadowed_by_at(tuple(key.split(".")))
+
+    def _shadowed_by_at(self, path: tuple[str, ...]) -> ConfigValueSource | None:
+        """`shadowed_by` for an already-split key path. See `_value_source_at`."""
+        source = self._value_source_at(path)
         if source.layer in _WRITABLE_LAYERS:
             return None
         return source
@@ -567,29 +630,34 @@ class ConfigManager(EngineScoped):
         other non-dict) value is one leaf entry -- a list is never split into per-item
         entries, since whichever layer set the entire list is the source for all of it.
 
+        A leaf whose own name contains a dot (`project_workspaces` is keyed by project file
+        paths) gets the right source, because provenance is resolved from the key path rather
+        than from the joined string. Its returned key is still ambiguous to a caller
+        re-splitting on ".", which is inherent to a dot-keyed return shape.
+
         Args:
             category: Dot-notation category, or None/"" for the whole merged config.
         """
         if category is None or category == "":
             contents: Any = self.merged_config
-            prefix = ""
+            root: tuple[str, ...] = ()
         else:
             contents = self.get_config_value(category, should_load_env_var_if_detected=False)
-            prefix = category
+            root = tuple(category.split("."))
 
         sources: dict[str, ConfigValueSource] = {}
         if isinstance(contents, dict):
-            self._collect_leaf_sources(contents, prefix, sources)
+            self._collect_leaf_sources(contents, root, sources)
         return sources
 
-    def _collect_leaf_sources(self, node: dict, prefix: str, out: dict[str, ConfigValueSource]) -> None:
+    def _collect_leaf_sources(self, node: dict, path: tuple[str, ...], out: dict[str, ConfigValueSource]) -> None:
         """Recursion helper for `category_sources`. Mutates `out` in place."""
         for key, value in node.items():
-            full_key = f"{prefix}.{key}" if prefix else key
+            leaf_path = (*path, key)
             if isinstance(value, dict):
-                self._collect_leaf_sources(value, full_key, out)
+                self._collect_leaf_sources(value, leaf_path, out)
             else:
-                out[full_key] = self.value_source(full_key)
+                out[".".join(leaf_path)] = self._value_source_at(leaf_path)
 
     def config_layers(self) -> list[ConfigLayer]:
         """Return every config layer in isolation, lowest to highest priority.
@@ -1032,6 +1100,7 @@ class ConfigManager(EngineScoped):
             )
         )
         self._workspace_dir_override = None
+        self._workspace_pin_supplied_by_config = False
         self._libraries_root_override = None
         self.load_configs()
 
@@ -1433,13 +1502,19 @@ class ConfigManager(EngineScoped):
         """Report whether a just-completed user-layer write is the value now in effect.
 
         Called by the `Set*` handlers once the write is known to have reached disk. A write
-        lands in the user layer but can still fail to take effect two ways, and both are
-        checked because neither implies the other:
+        lands in the user layer but can still fail to take effect three ways, checked in this
+        order because the earlier ones are the more specific explanation:
 
         1. A higher-priority layer (project, workspace, runtime, env) also defines what was
            written and keeps winning the merge. `shadowed_by` names it.
-        2. The merged result failed `Settings` validation, so `load_configs` discarded it and
-           fell back to defaults. No layer is at fault, so `shadowed_by` stays None.
+        2. The open project pins `workspace_directory` to the value the config stack supplied
+           it, so every remerge restores that value. The write decides what the next activation
+           pins rather than what is in effect now.
+        3. The merged result failed `Settings` validation, so `load_configs` discarded it and
+           fell back to defaults.
+
+        Only the first names a layer; `reason` distinguishes all three so the note can say
+        something true about each.
 
         Ownership is judged before values are compared, because writing the value a higher
         layer already holds is still not a write that took effect: the user's copy is inert and
@@ -1468,6 +1543,7 @@ class ConfigManager(EngineScoped):
             effective_value=effective_value,
             unapplied_key=unapplied_leaf.key,
             shadowed_by=unapplied_leaf.source,
+            reason=unapplied_leaf.reason,
         )
 
     def _first_unapplied_leaf(self, key: str, value: Any) -> _UnappliedLeaf | None:
@@ -1480,22 +1556,48 @@ class ConfigManager(EngineScoped):
             key: Dot-notation key `value` was written to.
             value: The written value, descended into when it is a dict.
         """
-        shadowed_leaf = self._first_shadowed_leaf(key, value)
-        if shadowed_leaf is not None:
-            return _UnappliedLeaf(key=shadowed_leaf.key, source=shadowed_leaf.source)
+        root = tuple(key.split("."))
 
-        diverged_key = self._first_diverged_leaf(key, value)
-        if diverged_key is not None:
-            return _UnappliedLeaf(key=diverged_key, source=None)
+        shadowed_leaf = self._first_shadowed_leaf_at(root, value)
+        if shadowed_leaf is not None:
+            return _UnappliedLeaf(key=shadowed_leaf.key, reason="shadowed", source=shadowed_leaf.source)
+
+        diverged_path = self._first_diverged_leaf_at(root, value)
+        if diverged_path is not None:
+            reason: _UnappliedReason = "pinned" if self._is_pinned_by_workspace_override(diverged_path) else "rejected"
+            return _UnappliedLeaf(key=".".join(diverged_path), reason=reason)
 
         return None
+
+    def _is_pinned_by_workspace_override(self, path: tuple[str, ...]) -> bool:
+        """Whether the runtime workspace pin is what keeps `path` from taking effect.
+
+        Only `workspace_directory` can be pinned, and only a config-supplied pin reaches here: a
+        pin with no config-layer origin is reported as the "runtime" layer and so is caught as
+        shadowing before divergence is ever checked.
+
+        Args:
+            path: Key segments of the leaf whose merged value diverged.
+        """
+        return path == ("workspace_directory",) and self._workspace_dir_override is not None
 
     def _first_shadowed_leaf(self, key: str, value: Any) -> _ShadowedLeaf | None:
         """Return the first written key a higher-priority layer shadows, or None if none is.
 
-        A dict `value` is descended into so each leaf is judged on its own dot path, matching
-        the leaf-level granularity `category_sources` reports on the read side. A non-dict
-        value -- and an empty dict, which names no leaves -- is one leaf: `key` itself.
+        Args:
+            key: Dot-notation key `value` was written to.
+            value: The written value.
+        """
+        return self._first_shadowed_leaf_at(tuple(key.split(".")), value)
+
+    def _first_shadowed_leaf_at(self, path: tuple[str, ...], value: Any) -> _ShadowedLeaf | None:
+        """`_first_shadowed_leaf` for an already-split key path.
+
+        A dict `value` is descended into so each leaf is judged on its own path, matching the
+        leaf-level granularity `category_sources` reports on the read side. A non-dict value --
+        and an empty dict, which names no leaves -- is one leaf: `path` itself. Descending
+        extends the path by a segment rather than joining into a dot string, so a leaf whose
+        own name contains a dot is still probed at the level it actually sits on.
 
         Also used by the read path to decide whether a whole category is editable, where
         `value` is the category's current contents rather than something being written.
@@ -1505,43 +1607,50 @@ class ConfigManager(EngineScoped):
         partial, so this stops at the first rather than collecting all of them.
 
         Args:
-            key: Dot-notation key `value` was written to.
+            path: Key segments `value` was written to.
             value: The written value.
         """
         if not isinstance(value, dict) or not value:
-            shadowed = self.shadowed_by(key)
+            shadowed = self._shadowed_by_at(path)
             if shadowed is None:
                 return None
-            return _ShadowedLeaf(key=key, source=shadowed)
+            return _ShadowedLeaf(key=".".join(path), source=shadowed)
 
         for leaf_name, leaf_value in value.items():
-            shadowed_leaf = self._first_shadowed_leaf(f"{key}.{leaf_name}", leaf_value)
+            shadowed_leaf = self._first_shadowed_leaf_at((*path, leaf_name), leaf_value)
             if shadowed_leaf is not None:
                 return shadowed_leaf
         return None
 
-    def _first_diverged_leaf(self, key: str, value: Any) -> str | None:
-        """Return the first written leaf whose merged value differs from what was written.
+    def _first_diverged_leaf_at(self, path: tuple[str, ...], value: Any) -> tuple[str, ...] | None:
+        """Return the path of the first written leaf whose merged value differs from what was written.
 
-        Catches the write no layer shadows but that still did not land, meaning
-        `Settings` validation rejected the merged result and `load_configs` fell back to
-        defaults. Reads each leaf back on its own rather than comparing whole dicts, because a
-        category's merged value legitimately holds keys the caller never wrote.
+        Catches the write no layer shadows but that still did not land, meaning `Settings`
+        validation rejected the merged result and `load_configs` fell back to defaults. Reads
+        each leaf back on its own rather than comparing whole dicts, because a category's
+        merged value legitimately holds keys the caller never wrote.
+
+        An empty dict returns None: a write that names no leaves cannot have diverged, and
+        `merge_dicts` leaves the category untouched. `_first_shadowed_leaf_at` treats the same
+        input as one leaf, because writing nothing into a category a higher layer owns is still
+        a write that layer outranks.
 
         Args:
-            key: Dot-notation key `value` was written to.
+            path: Key segments `value` was written to.
             value: The written value, descended into when it is a dict.
         """
-        if not isinstance(value, dict) or not value:
-            effective = self.get_config_value(key, should_load_env_var_if_detected=False)
-            if effective == value:
+        if isinstance(value, dict) and not value:
+            return None
+
+        if not isinstance(value, dict):
+            if self._layer_value_at(self.merged_config, path) == value:
                 return None
-            return key
+            return path
 
         for leaf_name, leaf_value in value.items():
-            diverged_key = self._first_diverged_leaf(f"{key}.{leaf_name}", leaf_value)
-            if diverged_key is not None:
-                return diverged_key
+            diverged_path = self._first_diverged_leaf_at((*path, leaf_name), leaf_value)
+            if diverged_path is not None:
+                return diverged_path
         return None
 
     def _append_shadow_note(self, result_details: str, outcome: ConfigWriteOutcome) -> str:
@@ -1559,12 +1668,22 @@ class ConfigManager(EngineScoped):
         if outcome.applied:
             return result_details
 
-        if outcome.shadowed_by is None:
+        if outcome.reason == "pinned":
+            return (
+                f"{result_details} NOTE: '{outcome.unapplied_key}' is still "
+                f"'{outcome.effective_value}' because the open project pins its workspace. The "
+                "new value is saved and takes effect the next time a project is opened."
+            )
+
+        if outcome.reason == "rejected":
             return (
                 f"{result_details} NOTE: '{outcome.unapplied_key}' is still "
                 f"'{outcome.effective_value}'. The value was saved but is not one this setting "
                 "accepts, so the engine kept the previous configuration."
             )
+
+        if outcome.shadowed_by is None:
+            return result_details
 
         location = outcome.shadowed_by.path or outcome.shadowed_by.env_var or "an unknown source"
         return (
