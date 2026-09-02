@@ -78,8 +78,8 @@ _KEY_NOT_IN_LAYER = object()
 
 # The only layers a settings write can control. `set_config_value` writes the user config
 # file, and "default" means nothing has overridden the Settings model, so a key sourced
-# from either is a key the user owns. Any other winning layer (project, workspace, env)
-# re-supplies its own value on every load_configs(), making a user-layer write invisible.
+# from either is a key the user owns. Any other winning layer (project, workspace, runtime,
+# env) re-supplies its own value on every load_configs(), making a user-layer write invisible.
 _WRITABLE_LAYERS: frozenset[ConfigLayerName] = frozenset({"default", "user"})
 
 # Environment variable the engine PUBLISHES (it is never read as config input) carrying the absolute
@@ -160,7 +160,9 @@ class ConfigManager(EngineScoped):
     2. User global configuration from ~/.config/griptape_nodes/griptape_nodes_config.json
     3. Project-adjacent configuration from <project_dir>/griptape_nodes_config.json
     4. Workspace configuration from <workspace_dir>/griptape_nodes_config.json
-    5. Environment variables with GTN_CONFIG_ prefix (highest priority)
+    5. Runtime workspace pin from the active project (workspace_directory only; see
+       set_workspace_override)
+    6. Environment variables with GTN_CONFIG_ prefix (highest priority)
 
     Environment variables starting with GTN_CONFIG_ are converted to config keys by removing the prefix
     and converting to lowercase (e.g., GTN_CONFIG_FOO=bar becomes {"foo": "bar"}), with a double
@@ -467,21 +469,13 @@ class ConfigManager(EngineScoped):
     def value_source(self, key: str) -> ConfigValueSource:
         """Return which config layer currently supplies `key`'s effective value.
 
-        Walks the same five layers `load_configs` merges, in the same priority order
-        (env highest, then workspace, project, user, default lowest), and returns the
-        first (highest-priority) layer whose own dict contains `key` at all. That layer
-        WINS the merge for `key` regardless of what any lower layer's value is, so it is
-        reported as the source even if, say, the project layer's value happens to equal
+        Walks the same layers `load_configs` merges, in the same priority order (env
+        highest, then the runtime workspace pin, workspace, project, user, default lowest),
+        and returns the first (highest-priority) layer whose own dict contains `key` at all.
+        That layer WINS the merge for `key` regardless of what any lower layer's value is, so
+        it is reported as the source even if, say, the project layer's value happens to equal
         the user layer's. Every key resolves to at least "default", since
         `Settings().model_dump()` always populates `default_config`.
-
-        Blind to the runtime `_workspace_dir_override` set by `set_workspace_override` (a
-        project's own `workspace_dir` pin, applied directly onto `merged_config` in
-        `load_configs`, not one of the five layers this method inspects): for
-        `workspace_directory` specifically, while an override is active and no env var
-        overrides it, this reports whichever file/default layer would otherwise apply,
-        which can differ from the override actually in effect. `shadowed_by` inherits the
-        same gap. Every other key is unaffected.
 
         Args:
             key: Dot-notation key, e.g. "libraries_directory" or
@@ -497,26 +491,44 @@ class ConfigManager(EngineScoped):
         return ConfigValueSource(layer="default")
 
     def _layer_probes(self) -> list[_LayerProbe]:
-        """Return the file/env layers to check for a key, HIGHEST priority first.
+        """Return the file/env/runtime layers to check for a key, HIGHEST priority first.
 
         The reverse of `load_configs`' merge order, minus "default", which every key falls
         back to and which has no dict of its own to probe. Kept as one ordered list so
         `value_source` cannot drift out of step with the merge it is describing.
+
+        The runtime pin is expressed as a one-key dict rather than a special case, so it is
+        probed by the same `get_dot_value` walk as a file layer. It supplies only
+        `workspace_directory`, and only while a project activation holds it.
         """
         return [
             _LayerProbe(layer="env", values=self.env_config, path=None),
+            _LayerProbe(layer="runtime", values=self._runtime_pin_values(), path=None),
             _LayerProbe(layer="workspace", values=self.workspace_config, path=self._workspace_config_path),
             _LayerProbe(layer="project", values=self.project_config, path=self._project_config_path),
             _LayerProbe(layer="user", values=self.user_config, path=USER_CONFIG_PATH),
         ]
+
+    def _runtime_pin_values(self) -> dict[str, Any]:
+        """Return the runtime layer's own contents: the active project's workspace pin, if any.
+
+        `set_workspace_override` records this in memory during project activation (from a
+        `project_workspaces` mapping, parent-chain inheritance, or the global default), and
+        `load_configs` applies it straight onto `merged_config` above the config files and
+        below env. No file holds it, so a settings write cannot reach it -- which is why it
+        has to be a reportable layer rather than an unexplained loss.
+        """
+        if self._workspace_dir_override is None:
+            return {}
+        return {"workspace_directory": self._workspace_dir_override}
 
     def shadowed_by(self, key: str) -> ConfigValueSource | None:
         """Return the layer shadowing `key` from the user's own edits, or None if not shadowed.
 
         "Not shadowed" means `value_source(key)` is "default" or "user" -- the two layers a
         `set_config_value` write can actually control. Any other winning layer (project,
-        workspace, env) means a user-layer write to `key` is currently invisible: it lands
-        on disk (see `set_config_value`) but the merged config still reports the higher
+        workspace, runtime, env) means a user-layer write to `key` is currently invisible: it
+        lands on disk (see `set_config_value`) but the merged config still reports the higher
         layer's value on every subsequent `load_configs()`. This is what makes
         `SetConfigValueRequest` report success for a write that has no visible effect.
 
@@ -572,8 +584,8 @@ class ConfigManager(EngineScoped):
         contents, not merged with any other layer -- this is what lets a caller see which
         layer a key came from, and whether a layer's file exists but failed to parse
         (`parse_error`), e.g. for `gtn self info` or a support/environment report. Always
-        exactly five entries, in this fixed order: default, user, project, workspace, env.
-        `project`/`workspace` report `path=None`, `present=False` when no project is
+        exactly six entries, in this fixed order: default, user, project, workspace, runtime,
+        env. `project`/`workspace` report `path=None`, `present=False` when no project is
         currently active (`_project_config_path`/`_workspace_config_path` unset).
 
         `present` means "this layer contributes to the merge", not merely "its file
@@ -582,8 +594,12 @@ class ConfigManager(EngineScoped):
         it once, as `project`. The `workspace` entry then keeps its `path` (so a caller can
         see which file it would have been) but reports `present=False` with empty `values`,
         matching the skip rather than implying the file is applied twice.
+
+        `runtime` is the one layer no file backs: it carries the active project's workspace
+        pin, so its `path` is always None and its `values` hold at most `workspace_directory`.
         """
         workspace_config_path = self._workspace_layer_path()
+        runtime_pin_values = self._runtime_pin_values()
         return [
             ConfigLayer(
                 layer="default",
@@ -612,6 +628,13 @@ class ConfigManager(EngineScoped):
                 present=workspace_config_path is not None and workspace_config_path.exists(),
                 parse_error=self._layer_parse_errors.get("workspace"),
                 values=self.workspace_config,
+            ),
+            ConfigLayer(
+                layer="runtime",
+                path=None,
+                present=bool(runtime_pin_values),
+                parse_error=None,
+                values=runtime_pin_values,
             ),
             ConfigLayer(
                 layer="env",
