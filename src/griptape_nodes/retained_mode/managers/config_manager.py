@@ -420,8 +420,9 @@ class ConfigManager(EngineScoped):
     def _collect_env_var_overrides(self) -> list[EnvVarOverride]:
         """Resolve the GTN_CONFIG_ variables to apply, reporting each one ignored along the way.
 
-        Three things get a variable ignored: a name with an empty path segment, a value the
-        setting's type rejects, and a path that is a strict prefix of another surviving path.
+        Four things get a variable ignored: a name with an empty path segment, a value the
+        setting's type rejects, a path that names no setting, and a path that is a strict prefix
+        of another surviving path.
 
         The prefix case is last because it only has to separate overrides that are each valid on
         their own. Exporting both GTN_CONFIG_ARTIFACTS__IMAGE and

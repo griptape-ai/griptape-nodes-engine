@@ -260,8 +260,9 @@ class TestConfigManager:
 
         Overlap is only a real conflict when both paths are individually valid, so a variable that
         fails validation must be dropped before overlap is judged. `agent.system_prompt` is a `str`
-        with no sub-keys, and a stray trailing separator produces the same shape, so both of these
-        would otherwise silently take a correct neighbour down with them.
+        with no sub-keys, so `…__OOPS` is rejected for its value and must not take its own prefix
+        down with it. The trailing-separator case is rejected earlier still, at the split, and is
+        kept here to pin that neither route reaches the prefix filter.
         """
         cases = [
             (
