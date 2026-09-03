@@ -676,16 +676,29 @@ class TestCurrentWorkflowChangedNotification:
         context_manager.pop_workflow()
 
     def test_rekey_workflow_notifies_when_the_current_workflow_is_the_one_rekeyed(self, engine: Engine) -> None:
-        """The first save of a scratch workflow changes its key, and clients hear the new one."""
+        """The first save of a scratch workflow changes its key, and clients hear the new one.
+
+        Also pins the ordering the whole method exists for: the name and the retained path are
+        both in place *before* the notification goes out, captured from inside the send rather
+        than after the call. A client that reacts to this event by resolving `workflow_dir` must
+        not be able to catch the entry holding the location it had before the save.
+        """
         context_manager = engine.context_manager
         context_manager.push_workflow(workflow_name="unsaved:abc-123")
 
-        with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
+        state_when_sent: dict[str, str | None] = {}
+
+        def capture_state_at_send(_event: object) -> None:
+            state_when_sent["name"] = context_manager.get_current_workflow_name()
+            state_when_sent["file_path"] = context_manager.get_current_workflow_file_path()
+
+        with patch.object(engine.event_manager, "put_event", Mock(side_effect=capture_state_at_send)) as put_event:
             context_manager.rekey_workflow(
                 old_name="unsaved:abc-123", new_name="my_flow", new_file_path="/workspace/my_flow.py"
             )
 
         assert self._notified_workflow_names(put_event) == ["my_flow"]
+        assert state_when_sent == {"name": "my_flow", "file_path": "/workspace/my_flow.py"}
         assert context_manager.get_current_workflow_name() == "my_flow"
         # The retained path moves with the key; `workflow_dir` answers from it.
         assert context_manager.get_current_workflow_file_path() == "/workspace/my_flow.py"
@@ -724,30 +737,46 @@ class TestCurrentWorkflowChangedNotification:
 
         context_manager.pop_workflow()
 
-    def test_a_switch_that_could_not_be_sent_is_still_owed(self, engine: Engine) -> None:
-        """An enqueue that fails leaves the transition unsent, so the next one re-sends it.
+    def test_a_switch_that_could_not_be_sent_does_not_break_the_switch(self, engine: Engine) -> None:
+        """An enqueue that fails costs the notification and nothing else.
 
         `put_event` hands cross-thread events to the engine's event loop, which can be gone by
-        the time a context mutation runs. If the dedupe field were advanced before that call, the
-        workflow whose event was lost would be the one workflow clients are never told about --
-        every later notification would compare against a name that never left the engine.
+        the time a context mutation runs. Letting that reach the caller would be worse than the
+        lost event: `pop_workflow` runs inside ClearAllObjectState's teardown, whose failure
+        result aborts the open that asked for the wipe -- so a missing broadcast would fail an
+        open that had already succeeded.
         """
         context_manager = engine.context_manager
 
-        with (
-            patch.object(engine.event_manager, "put_event", Mock(side_effect=RuntimeError("event loop is gone"))),
-            pytest.raises(RuntimeError),
-        ):
+        with patch.object(engine.event_manager, "put_event", Mock(side_effect=RuntimeError("event loop is gone"))):
             context_manager.push_workflow(workflow_name="never_announced")
 
         # The push itself landed; only the announcement was lost.
         assert context_manager.get_current_workflow_name() == "never_announced"
 
+        context_manager.pop_workflow()
+
+    def test_a_switch_that_could_not_be_sent_is_still_owed(self, engine: Engine) -> None:
+        """A lost notification is re-sent by the next one rather than deduped into silence.
+
+        If the dedupe field were advanced before the send, the workflow whose event was lost
+        would be the one workflow clients are never told about: every later notification would
+        compare against a name that never left the engine.
+        """
+        context_manager = engine.context_manager
+
+        with patch.object(engine.event_manager, "put_event", Mock(side_effect=RuntimeError("event loop is gone"))):
+            context_manager.push_workflow(workflow_name="announced_late")
+
+        # Re-entering the workflow is what RunWorkflowFromRegistry does when it is already open,
+        # and it is a real change as far as clients are concerned -- they were never told the
+        # first time.
         with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
-            context_manager.set_current_workflow_name("never_announced")
+            context_manager.push_workflow(workflow_name="announced_late")
 
-        assert self._notified_workflow_names(put_event) == ["never_announced"]
+        assert self._notified_workflow_names(put_event) == ["announced_late"]
 
+        context_manager.pop_workflow()
         context_manager.pop_workflow()
 
 

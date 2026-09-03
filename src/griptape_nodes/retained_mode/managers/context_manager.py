@@ -976,12 +976,31 @@ class ContextManager(EngineScoped):
         if workflow_name == self._last_notified_workflow_name:
             return
 
-        # Record what clients were told only once the enqueue has returned, so that if it raises
-        # -- `put_event` hands cross-thread events to the engine's loop, which can be gone -- the
-        # field stays behind and the next notify re-sends this transition instead of deduping it
-        # into silence. A pre-queue drop is not that case: `put_event` returns normally, so the
-        # field advances and the mirror stays faithful, which is what the comment in `__init__`
-        # is about. Safe against re-entrancy: `put_event` dispatches only to execution listeners,
-        # which ignore an AppEvent.
-        self.engine.event_manager.put_event(AppEvent(payload=CurrentWorkflowChanged(workflow_name=workflow_name)))
+        # Emitted on `self.engine`'s bus, which is the bus whose `assign_manager_to_request_type`
+        # calls in `__init__` routed the requests that get us here -- `Engine` hands both from the
+        # same place. A manager built bare for a test, with an event manager but no engine, would
+        # answer requests on one and announce on whatever `current_engine()` returns.
+        #
+        # A notification that cannot be sent must not fail the mutation that triggered it.
+        # `put_event` hands cross-thread events to the engine's event loop, which raises if that
+        # loop has closed -- and `pop_workflow` runs inside ClearAllObjectState's teardown, which
+        # turns any exception into a failure result. That would report a wipe that in fact
+        # finished, and abort the open that asked for it, because a broadcast went missing.
+        #
+        # Recording what clients were told only after a clean send is what keeps the missed
+        # transition owed: the next notify compares against the older name and re-sends it rather
+        # than deduping it into silence. A pre-queue drop is not that case -- `put_event` returns
+        # normally, so the field advances and the mirror stays faithful, which is what the comment
+        # in `__init__` is about. Safe against re-entrancy: `put_event` dispatches only to
+        # execution listeners, which ignore an AppEvent.
+        try:
+            self.engine.event_manager.put_event(AppEvent(payload=CurrentWorkflowChanged(workflow_name=workflow_name)))
+        except RuntimeError as e:
+            logger.warning(
+                "Could not tell clients the current workflow is now '%s'; they will be told on the next change: %s",
+                workflow_name,
+                e,
+            )
+            return
+
         self._last_notified_workflow_name = workflow_name
