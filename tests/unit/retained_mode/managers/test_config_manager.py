@@ -1725,13 +1725,7 @@ class TestProvisioningPreviewMatchesActivation:
     platform.system() == "Windows", reason="xdg_base_dirs cannot find XDG_CONFIG_HOME on Windows on GitHub Actions"
 )
 class TestConfigProvenance:
-    """Provenance across value_source, shadowed_by, category_sources, config_layers, and handlers.
-
-    Ports the four scenarios reproduced against a live engine: a shadowed write reporting
-    `applied=False`, a GUI write-back of the shown value still not becoming the truth,
-    provenance resolving to each of the six layers in turn, and a malformed layer surfacing
-    `parse_error` instead of only a log line.
-    """
+    """Provenance across value_source, shadowed_by, category_sources, config_layers, and handlers."""
 
     @staticmethod
     def _write_layer_config(directory: Path, contents: dict | str) -> Path:
@@ -1818,9 +1812,9 @@ class TestConfigProvenance:
     def test_value_source_runtime_pin_wins_over_config_files(self, tmp_path: Path, isolate_user_config: Path) -> None:
         """A project's workspace pin owns `workspace_directory`, and no file holds it.
 
-        The pin is applied straight onto the merged config, so before it was a reportable
-        layer the UI showed this field as the user's to edit and a write to it silently did
-        nothing.
+        The pin is applied straight onto the merged config, so nothing but the runtime layer can
+        report it. Attributing it to the user's file shows the field as theirs to edit while a
+        write to it does nothing.
         """
         isolate_user_config.write_text(json.dumps({"workspace_directory": "/from/user"}), encoding="utf-8")
         pinned_dir = tmp_path / "pinned_workspace"
@@ -1916,7 +1910,7 @@ class TestConfigProvenance:
         """`project_workspaces` is keyed by project file paths, so its leaf names contain dots.
 
         Joining those into a dot string and re-splitting addresses a nesting level no layer
-        holds, which reported the leaf as unowned and let a locked field render editable.
+        holds, reporting the leaf as unowned and rendering a locked field as editable.
         """
         dotted_key = "/home/me/projects/my-thing/griptape-nodes-project.yml"
         self._write_layer_config(tmp_path, {"project_workspaces": {dotted_key: "/from/project"}})

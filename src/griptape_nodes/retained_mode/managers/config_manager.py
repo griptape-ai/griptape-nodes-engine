@@ -72,15 +72,13 @@ logger = logging.getLogger("griptape_nodes")
 
 USER_CONFIG_PATH = xdg_config_home() / "griptape_nodes" / "griptape_nodes_config.json"
 
-# Sentinel distinguishing "this layer's dict has no entry for this key" from "this layer's
-# dict has an entry whose value happens to be None" (e.g. `project_file: str | None`).
-# A plain `None` default can't do this job: `None` is also a legitimate stored value.
+# Distinguishes "this layer's dict has no entry for this key" from "this layer's dict has an
+# entry whose value happens to be None" (e.g. `project_file: str | None`).
 _KEY_NOT_IN_LAYER = object()
 
-# The only layers a settings write can control. `set_config_value` writes the user config
-# file, and "default" means nothing has overridden the Settings model, so a key sourced
-# from either is a key the user owns. Any other winning layer (project, workspace, runtime,
-# env) re-supplies its own value on every load_configs(), making a user-layer write invisible.
+# The only layers a settings write can control: `set_config_value` writes the user config file,
+# and "default" means nothing has overridden the Settings model. Any other winning layer
+# re-supplies its own value on every load_configs(), making a user-layer write invisible.
 _WRITABLE_LAYERS: frozenset[ConfigLayerName] = frozenset({"default", "user"})
 
 # Environment variable the engine PUBLISHES (it is never read as config input) carrying the absolute
@@ -114,9 +112,8 @@ _REJECTED_UNKNOWN_KEY = object()
 class LoadedConfigFile(NamedTuple):
     """One config file's parsed contents plus why it failed to parse, if it did.
 
-    `contents` is `{}` when the file is missing or unparsable. `parse_error` is None
-    unless the file exists and failed to parse, so a caller can tell "no such file"
-    apart from "file is broken" without stat-ing the path a second time.
+    `contents` is `{}` when the file is missing or unparsable. `parse_error` is None unless the
+    file exists and failed to parse, telling "no such file" apart from "file is broken".
     """
 
     contents: dict
@@ -126,12 +123,11 @@ class LoadedConfigFile(NamedTuple):
 class ConfigWriteOutcome(NamedTuple):
     """Whether a completed user-layer write is the value now in effect.
 
-    A write always lands in the user config file; whether it takes effect depends on more than
-    where it landed. `written_path` is the key the caller wrote, held as segments because every
-    comparison against it is a parent/child test that a joined string cannot express; `written_key`
-    is the display view. `unapplied_key` names the first key under it that did not take effect,
-    which for a category write is a leaf rather than the category itself. `reason` says why, and
-    `shadowed_by` is set only for `reason == "shadowed"`. See `ConfigManager._write_outcome`.
+    `written_path` is the key the caller wrote, held as segments because every comparison
+    against it is a parent/child test a joined string cannot express. `unapplied_key` names the
+    first key under it that did not take effect, which for a category write is a leaf rather
+    than the category itself. `shadowed_by` is set only for `reason == "shadowed"`. See
+    `ConfigManager._write_outcome`.
     """
 
     applied: bool
@@ -157,8 +153,7 @@ class _ShadowedLeaf(NamedTuple):
 class _UnappliedLeaf(NamedTuple):
     """One written key whose value is not the one now in effect, and why.
 
-    `source` is set only when `reason` is "shadowed"; the other reasons name no layer, because
-    no config layer is responsible for them.
+    `source` is set only when `reason` is "shadowed"; the other reasons name no layer.
     """
 
     key: str
@@ -169,16 +164,15 @@ class _UnappliedLeaf(NamedTuple):
 class _MergedConfigRejection(NamedTuple):
     """The keys that made the merged config fail `Settings` validation.
 
-    Recorded by `load_configs` when it discards the merge and falls back to defaults, which is
-    otherwise visible only as a log line. Held so a write's outcome can name the setting that is
-    actually broken: it is frequently NOT the key the user just wrote, and without it the only
-    honest thing a message can say is that something somewhere is wrong.
+    Recorded by `load_configs` when it discards the merge and falls back to defaults, so a
+    write's outcome can name the setting that is actually broken. That is frequently NOT the
+    key the user just wrote.
 
-    Stored as segment paths rather than dot strings because the comparisons done against them are
-    parent/child tests, and a joined string cannot express that boundary: `project_workspaces` is
-    keyed by project file paths, so `project_workspaces./srv/site` is a textual dot-prefix of
-    `project_workspaces./srv/site.com/x.yml` while being an unrelated sibling. `keys` is the
-    display view.
+    Held as segment paths rather than dot strings because comparisons against them are
+    parent/child tests, and a joined string cannot express that boundary:
+    `project_workspaces` is keyed by project file paths, so `project_workspaces./srv/site` is a
+    textual dot-prefix of `project_workspaces./srv/site.com/x.yml` while being an unrelated
+    sibling. `keys` is the display view.
     """
 
     paths: tuple[tuple[str, ...], ...]
@@ -192,25 +186,20 @@ class _MergedConfigRejection(NamedTuple):
 def _offending_paths(error: ValidationError, validated: dict) -> tuple[tuple[str, ...], ...]:
     """Segment paths of the config keys a `Settings` validation error blames, most specific first.
 
-    Pydantic reports each error's location as a tuple of path segments, but interleaves segments
-    that are not config keys: the union member it tried (`secrets_to_register.dict[str,str]`) and
-    the list index it was at (`mcp_servers.0.name`). Each is handled differently because they mean
-    different things.
+    Pydantic's error locations interleave segments that are not config keys: the union member it
+    tried (`secrets_to_register.dict[str,str]`) and the list index it was at (`mcp_servers.0.name`).
+    A member tag names no key and does not descend, so it is skipped and the segment behind it
+    still matched, keeping the `HF_TOKEN` leaf that identifies what to fix. An index means the
+    failure is inside a list element, which is not separately assignable, so the walk stops and
+    reports the list itself.
 
-    A member tag names no key and does not descend, so it is skipped and the segment behind it is
-    still matched: a bad value under the dict member of `secrets_to_register` keeps its `HF_TOKEN`
-    leaf, which is the segment that identifies what to fix. An index means the failure is inside a
-    list element, which is not separately assignable, so the walk stops and reports the list itself.
+    Walking the validated dict rather than filtering by segment shape keeps a genuinely dot-keyed
+    leaf intact: `project_workspaces` keys are present in the dict, so they survive while
+    `list[str]` does not.
 
-    Walking the validated dict rather than filtering by segment shape is what keeps a genuinely
-    dot-keyed leaf intact: `project_workspaces` is keyed by project file paths, and those segments
-    are present in the dict, so they survive while `list[str]` does not.
-
-    A path that is a proper prefix of another is dropped, which collapses a union's
-    one-error-per-member onto the specific leaf rather than their common ancestor. The comparison is
-    per segment, so two dot-keyed siblings are not mistaken for parent and child. A `loc` that
-    matches nothing contributes no path, covering whole-model failures that name nothing a user
-    could fix.
+    A path that is a proper prefix of another is dropped, collapsing a union's one-error-per-member
+    onto the specific leaf. The comparison is per segment, so two dot-keyed siblings are not
+    mistaken for parent and child. A `loc` that matches nothing contributes no path.
 
     Args:
         error: The validation error raised by `Settings.model_validate`.
@@ -289,8 +278,7 @@ class ConfigManager(EngineScoped):
         self._workspace_dir_override: str | None = None
         # Whether the active workspace pin merely restates a value the config stack already
         # supplies (see set_workspace_override). Such a pin is not its own layer: the file the
-        # value came from is the editable owner, and reporting "runtime" would lock a field the
-        # user can in fact change.
+        # value came from is the editable owner.
         self._workspace_pin_supplied_by_config: bool = False
         # Set by load_configs when the merged result fails Settings validation and the whole merge
         # is discarded. None means the live merge is valid.
@@ -301,13 +289,11 @@ class ConfigManager(EngineScoped):
         # variable warns repeatedly for the life of this manager. Other ConfigManagers built
         # elsewhere in the process keep their own accounting.
         self._reported_invalid_env_vars: set[tuple[str, str]] = set()
-        # Parse error for the most recent load of each file layer, keyed by layer name and
-        # set by load_configs() via _load_file_layer. None means either the file doesn't
-        # exist or it parsed fine; config_layers() distinguishes those two cases with
-        # `present`. Deliberately left alone by compute_project_provisioning_config /
-        # compute_system_defaults_provisioning_config's own _load_config_from_file calls,
-        # which preview some other project's config and would otherwise clobber the live
-        # layer's error with a preview's.
+        # Parse error for the most recent load of each file layer, set by load_configs via
+        # _load_file_layer. None means the file either doesn't exist or parsed fine;
+        # config_layers() distinguishes those with `present`. Deliberately left alone by the
+        # compute_*_provisioning_config previews, which read some other project's config and
+        # would otherwise clobber the live layer's error.
         self._layer_parse_errors: dict[ConfigLayerName, str | None] = {}
         self.load_configs()
 
@@ -376,9 +362,9 @@ class ConfigManager(EngineScoped):
                 `workspace_directory` out of the user (or default) layer and pinning it back.
                 Such a pin changes nothing about who owns the setting, so `value_source` keeps
                 reporting the file layer and a write to `workspace_directory` keeps applying.
-                Leave False for a pin whose value has no config-layer origin: a project
-                template's `workspace_dir`, a `project_workspaces` mapping, or an inherited
-                ancestor workspace. Those are reported as the "runtime" layer.
+                Leave False for a pin with no config-layer origin: a project template's
+                `workspace_dir`, a `project_workspaces` mapping, or an inherited ancestor
+                workspace. Those are reported as the "runtime" layer.
         """
         if path is None:
             self._workspace_dir_override = None
@@ -578,13 +564,10 @@ class ConfigManager(EngineScoped):
     def value_source(self, key: str) -> ConfigValueSource:
         """Return which config layer currently supplies `key`'s effective value.
 
-        Walks the same layers `load_configs` merges, in the same priority order (env
-        highest, then the runtime workspace pin, workspace, project, user, default lowest),
-        and returns the first (highest-priority) layer whose own dict contains `key` at all.
-        That layer wins the merge for `key` whatever any lower layer holds, so it is reported
-        as the source even if, say, the project layer's value happens to equal the user
-        layer's. Every key resolves to at least "default", since
-        `Settings().model_dump()` always populates `default_config`.
+        Walks the layers `load_configs` merges, highest priority first, and returns the first
+        one whose own dict contains `key` at all. That layer wins the merge whatever any lower
+        layer holds, so it is reported even when its value happens to equal a lower layer's.
+        Every key resolves to at least "default".
 
         Args:
             key: Dot-notation key, e.g. "libraries_directory" or
@@ -597,9 +580,9 @@ class ConfigManager(EngineScoped):
     def _value_source_at(self, path: tuple[str, ...]) -> ConfigValueSource:
         """`value_source` for an already-split key path.
 
-        Takes the path as segments rather than a dot string so a segment may itself contain
-        dots. `project_workspaces` is keyed by project file paths, so joining its keys into a
-        dot string and re-splitting them addresses a nesting level that exists in no layer.
+        Takes segments rather than a dot string so a segment may itself contain dots.
+        `project_workspaces` is keyed by project file paths, so joining its keys into a dot
+        string and re-splitting them addresses a nesting level that exists in no layer.
 
         Args:
             path: Key segments from the config root, e.g. ("nuke", "port").
@@ -616,9 +599,9 @@ class ConfigManager(EngineScoped):
     def _layer_value_at(self, values: dict, path: tuple[str, ...]) -> Any:
         """Return the value at `path` in one layer's own dict, or `_KEY_NOT_IN_LAYER`.
 
-        Descends by successive dict lookups instead of `get_dot_value`, so a segment
-        containing a dot is looked up verbatim. Distinguishes "absent" from "present and
-        None", which is what makes provenance correct for an optional setting.
+        Descends by successive dict lookups instead of `get_dot_value`, so a segment containing
+        a dot is looked up verbatim. Distinguishes "absent" from "present and None", which is
+        what makes provenance correct for an optional setting.
 
         Args:
             values: One layer's own parsed contents.
@@ -634,13 +617,12 @@ class ConfigManager(EngineScoped):
     def _layer_probes(self) -> list[_LayerProbe]:
         """Return the file/env/runtime layers to check for a key, HIGHEST priority first.
 
-        The reverse of `load_configs`' merge order, minus "default", which every key falls
-        back to and which has no dict of its own to probe. Kept as one ordered list so
-        `value_source` cannot drift out of step with the merge it is describing.
+        The reverse of `load_configs`' merge order, minus "default", which every key falls back
+        to and which has no dict of its own to probe. Kept as one ordered list so `value_source`
+        cannot drift out of step with the merge it describes.
 
-        The runtime pin is expressed as a one-key dict rather than a special case, so it is
-        probed by the same `get_dot_value` walk as a file layer. It supplies only
-        `workspace_directory`, and only while a project activation holds it.
+        The runtime pin is expressed as a one-key dict rather than a special case, so the same
+        walk probes it as a file layer.
         """
         return [
             _LayerProbe(layer="env", values=self.env_config, path=None),
@@ -655,13 +637,12 @@ class ConfigManager(EngineScoped):
 
         `set_workspace_override` records this in memory during project activation (from a
         project template's `workspace_dir`, a `project_workspaces` mapping, or an inherited
-        ancestor workspace), and `load_configs` applies it straight onto `merged_config` above
-        the config files and below env. No file holds it, so a settings write cannot reach it --
-        which is why it has to be a reportable layer rather than an unexplained loss.
+        ancestor workspace), and `load_configs` applies it onto `merged_config` above the config
+        files and below env. No file holds it, so a settings write cannot reach it.
 
-        Empty when the pin merely restates what a config layer already supplies, which is what
-        an ordinary activation does. That pin is not a distinct owner: the user's own config
-        supplied the value and a write to it still decides what the next activation pins.
+        Empty when the pin merely restates what a config layer already supplies, as an ordinary
+        activation does. That pin is not a distinct owner: a write to the config layer still
+        decides what the next activation pins.
         """
         if self._workspace_dir_override is None or self._workspace_pin_supplied_by_config:
             return {}
@@ -670,12 +651,9 @@ class ConfigManager(EngineScoped):
     def shadowed_by(self, key: str) -> ConfigValueSource | None:
         """Return the layer shadowing `key` from the user's own edits, or None if not shadowed.
 
-        "Not shadowed" means `value_source(key)` is "default" or "user" -- the two layers a
-        `set_config_value` write can actually control. Any other winning layer (project,
-        workspace, runtime, env) means a user-layer write to `key` is currently invisible: it
-        lands on disk (see `set_config_value`) but the merged config still reports the higher
-        layer's value on every subsequent `load_configs()`. This is what makes
-        `SetConfigValueRequest` report success for a write that has no visible effect.
+        "Not shadowed" means `value_source(key)` is "default" or "user", the two layers a
+        `set_config_value` write can control. Any other winning layer means a user-layer write
+        to `key` lands on disk but the merged config keeps reporting the higher layer's value.
 
         Args:
             key: Dot-notation key, same as `value_source`.
@@ -694,18 +672,16 @@ class ConfigManager(EngineScoped):
 
         Keys are relative to the CONFIG ROOT, not to `category`: requesting
         "app_events.on_app_initialization_complete" returns keys like
-        "app_events.on_app_initialization_complete.libraries_to_register", not just
-        "libraries_to_register", so a caller can look a key up the same way regardless of
-        which category it was fetched through.
+        "app_events.on_app_initialization_complete.libraries_to_register".
 
-        A dict value is treated as a sub-category and is recursed into. A list (or any
-        other non-dict) value is one leaf entry -- a list is never split into per-item
-        entries, since whichever layer set the entire list is the source for all of it.
+        A dict value is treated as a sub-category and recursed into. A list (or any other
+        non-dict) value is one leaf entry, never split per item, since whichever layer set the
+        entire list is the source for all of it.
 
         A leaf whose own name contains a dot (`project_workspaces` is keyed by project file
         paths) gets the right source, because provenance is resolved from the key path rather
-        than from the joined string. Its returned key is still ambiguous to a caller
-        re-splitting on ".", which is inherent to a dot-keyed return shape.
+        than the joined string. Its returned key is still ambiguous to a caller re-splitting on
+        ".", which is inherent to a dot-keyed return shape.
 
         Args:
             category: Dot-notation category, or None/"" for the whole merged config.
@@ -734,23 +710,19 @@ class ConfigManager(EngineScoped):
     def config_layers(self) -> list[ConfigLayer]:
         """Return every config layer in isolation, lowest to highest priority.
 
-        Unlike `merged_config`, each returned layer's `values` is that layer's own parsed
-        contents, not merged with any other layer -- this is what lets a caller see which
-        layer a key came from, and whether a layer's file exists but failed to parse
-        (`parse_error`), e.g. for `gtn self info` or a support/environment report. Always
-        exactly six entries, in this fixed order: default, user, project, workspace, runtime,
-        env. `project`/`workspace` report `path=None`, `present=False` when no project is
-        currently active (`_project_config_path`/`_workspace_config_path` unset).
+        Unlike `merged_config`, each layer's `values` is that layer's own parsed contents,
+        letting a caller see which layer a key came from and whether a layer's file failed to
+        parse (`parse_error`). Always exactly six entries: default, user, project, workspace,
+        runtime, env. `project`/`workspace` report `path=None`, `present=False` when no project
+        is active.
 
-        `present` means "this layer contributes to the merge", not merely "its file
-        exists". That distinction matters for one real case: when the workspace dir is the
-        project dir, both layers name the same file and `load_configs` deliberately loads
-        it once, as `project`. The `workspace` entry then keeps its `path` (so a caller can
-        see which file it would have been) but reports `present=False` with empty `values`,
-        matching the skip rather than implying the file is applied twice.
+        `present` means "this layer contributes to the merge", not merely "its file exists".
+        When the workspace dir is the project dir, both layers name the same file and
+        `load_configs` loads it once, as `project`. The `workspace` entry then keeps its `path`
+        but reports `present=False` with empty `values`.
 
-        `runtime` is the one layer no file backs: it carries the active project's workspace
-        pin, so its `path` is always None and its `values` hold at most `workspace_directory`.
+        `runtime` is the one layer no file backs: it carries the active project's workspace pin,
+        so its `path` is always None and its `values` hold at most `workspace_directory`.
         """
         workspace_config_path = self._workspace_layer_path()
         runtime_pin_values = self._runtime_pin_values()
@@ -802,10 +774,10 @@ class ConfigManager(EngineScoped):
     def _workspace_layer_path(self) -> Path | None:
         """Return the file the workspace layer loads, or None when it contributes nothing.
 
-        None means either no workspace is resolved, or the workspace dir is the project dir,
-        so both layers name the same file. `load_configs` loads that file once, as `project`,
-        and this is the single place that decides so, keeping the load and `config_layers`'
-        `present` report from disagreeing about whether the workspace layer applies.
+        None means either no workspace is resolved, or the workspace dir is the project dir, so
+        both layers name the same file. `load_configs` loads that file once, as `project`, and
+        this is the single place that decides so, keeping the load and `config_layers`' `present`
+        report from disagreeing.
         """
         if self._workspace_config_path == self._project_config_path:
             return None
@@ -954,9 +926,8 @@ class ConfigManager(EngineScoped):
     def _load_config_from_file(self, path: Path, label: str) -> LoadedConfigFile:
         """Read and parse a JSON config file.
 
-        A parse failure is logged at ERROR and also returned as `parse_error`, which lets a
-        caller (currently only `_load_file_layer`, for the three live layers) attribute the
-        failure to a specific layer for `config_layers()`.
+        A parse failure is logged at ERROR and also returned as `parse_error`, letting
+        `_load_file_layer` attribute the failure to a specific layer for `config_layers()`.
         """
         if not path.exists():
             logger.debug("No %s config file loaded", label)
@@ -971,10 +942,10 @@ class ConfigManager(EngineScoped):
     def _load_file_layer(self, layer: ConfigLayerName, path: Path | None, label: str) -> dict:
         """Load one file-backed config layer and record its parse error under `layer`.
 
-        A None `path` means the layer has nothing to contribute -- no project is active, or
-        a workspace layer that resolves to the project's own file. That is not an error: the
-        layer loads empty and its recorded parse error is cleared, so a layer that failed to
-        parse for a previously active project cannot linger past the switch.
+        A None `path` means the layer has nothing to contribute: no project is active, or a
+        workspace layer that resolves to the project's own file. That is not an error, and the
+        recorded parse error is cleared so one from a previously active project cannot linger
+        past the switch.
 
         Args:
             layer: Which layer this is, used as the parse-error key `config_layers()` reads.
@@ -1417,10 +1388,8 @@ class ConfigManager(EngineScoped):
                 )
                 self._event_manager.broadcast_app_event(event)
 
-            # A full-config replacement has no single dot-key to check for shadowing: it
-            # rewrites the whole user layer at once. applied/effective_value/shadowed_by
-            # are only meaningful for a single key (see the non-empty-category branch
-            # below), so they are left at their neutral defaults here.
+            # A full-config replacement has no single dot-key to check for shadowing: it rewrites
+            # the whole user layer at once, so the outcome fields stay at their neutral defaults.
             return SetConfigCategoryResultSuccess(result_details=result_details)
 
         write_succeeded = self.set_config_value(key=request.category, value=request.contents)
@@ -1576,29 +1545,22 @@ class ConfigManager(EngineScoped):
     def _write_outcome(self, key: str, value: Any) -> ConfigWriteOutcome:
         """Report whether a just-completed user-layer write is the value now in effect.
 
-        Called by the `Set*` handlers once the write is known to have reached disk. A write
-        lands in the user layer but can still fail to take effect three ways, checked in this
-        order because the earlier ones are the more specific explanation:
+        Called by the `Set*` handlers once the write is known to have reached disk. A write can
+        still fail to take effect three ways, checked in this order because the earlier ones are
+        the more specific explanation:
 
-        1. A higher-priority layer (project, workspace, runtime, env) also defines what was
-           written and keeps winning the merge. `shadowed_by` names it.
-        2. The open project pins `workspace_directory` to the value the config stack supplied
-           it, so every remerge restores that value. The write decides what the next activation
-           pins rather than what is in effect now.
-        3. The merged result failed `Settings` validation, so `load_configs` discarded it and
-           fell back to defaults.
+        1. A higher-priority layer also defines what was written and keeps winning the merge.
+        2. The open project pins `workspace_directory` to the value the config stack supplied it,
+           so every remerge restores that value and the write applies on the next activation.
+        3. The merged result failed `Settings` validation, so `load_configs` discarded it.
 
-        Only the first names a layer; `reason` distinguishes all three so the note can say
-        something true about each.
+        Ownership is judged before values are compared, because writing the value a higher layer
+        already holds is still not a write that took effect: the user's copy is inert and the next
+        remerge keeps reporting the other layer's.
 
-        Ownership is judged before values are compared, because writing the value a higher
-        layer already holds is still not a write that took effect: the user's copy is inert and
-        the next remerge keeps reporting the other layer's. Comparing values alone would call
-        that success.
-
-        Judged on the keys the caller actually wrote, which for a dict `value` means its
-        leaves rather than `key` itself -- writing `{"port": 8080}` to category "nuke" is
-        unaffected by a project layer that defines only "nuke.executable".
+        Judged on the keys the caller actually wrote, which for a dict `value` means its leaves
+        rather than `key` itself: writing `{"port": 8080}` to category "nuke" is unaffected by a
+        project layer that defines only "nuke.executable".
 
         Reads the value back without env-var `$`-expansion, matching how the handlers read
         `old_value`, so the reported value is the raw stored one rather than a resolved secret.
@@ -1656,9 +1618,9 @@ class ConfigManager(EngineScoped):
         explains none of them while it holds: `load_configs` replaced the merge with defaults, so
         the pin is not in `merged_config` at all. Deciding pin-versus-discard by comparing the
         merged value against the pin cannot separate the two, since branch 5 derives the pin from
-        the `default` layer whenever the user config has no `workspace_directory` -- the ordinary
-        state after a `gtn init` without `--workspace-directory` -- and a discarded merge IS the
-        default layer, so the two compare equal.
+        the `default` layer whenever the user config has no `workspace_directory` (the ordinary
+        state after a `gtn init` without `--workspace-directory`), and a discarded merge IS the
+        default layer.
 
         Args:
             path: Key segments of the leaf whose merged value diverged.
@@ -1676,12 +1638,11 @@ class ConfigManager(EngineScoped):
 
         Only `workspace_directory` can be pinned, and only a config-supplied pin can reach here:
         a pin with no config origin is reported as the "runtime" layer, so it is caught as
-        shadowing before divergence is ever checked. Both preconditions are asserted rather than
+        shadowing before divergence is checked. Both preconditions are checked rather than
         assumed, so this stays correct if the caller order changes.
 
         No value comparison is needed: the caller has already excluded a discarded merge, and
-        while the merge stands `load_configs` assigns the pin over the merged value, so a held
-        config-supplied pin is necessarily the value in effect.
+        while the merge stands `load_configs` assigns the pin over the merged value.
 
         Args:
             path: Key segments of the leaf whose merged value diverged.
@@ -1703,17 +1664,16 @@ class ConfigManager(EngineScoped):
         """`_first_shadowed_leaf` for an already-split key path.
 
         A dict `value` is descended into so each leaf is judged on its own path, matching the
-        leaf-level granularity `category_sources` reports on the read side. A non-dict value --
-        and an empty dict, which names no leaves -- is one leaf: `path` itself. Descending
-        extends the path by a segment rather than joining into a dot string, so a leaf whose
-        own name contains a dot is still probed at the level it actually sits on.
+        granularity `category_sources` reports on the read side. A non-dict value, and an empty
+        dict, is one leaf: `path` itself. Descending extends the path by a segment rather than
+        joining into a dot string, so a leaf whose own name contains a dot is still probed at the
+        level it sits on.
 
-        Also used by the read path to decide whether a whole category is editable, where
-        `value` is the category's current contents rather than something being written.
+        Also used by the read path to decide whether a whole category is editable, where `value`
+        is the category's current contents rather than something being written.
 
-        "First" is in the caller's own key order, so the reported key is the one nearest the
-        top of what they wrote. One shadowed leaf is enough to make the write's outcome
-        partial, so this stops at the first rather than collecting all of them.
+        "First" is in the caller's own key order. One shadowed leaf is enough to make the write's
+        outcome partial, so this stops there rather than collecting all of them.
 
         Args:
             path: Key segments `value` was written to.
@@ -1735,14 +1695,14 @@ class ConfigManager(EngineScoped):
         """Return the path of the first written leaf whose merged value differs from what was written.
 
         Catches the write no layer shadows but that still did not land, meaning `Settings`
-        validation rejected the merged result and `load_configs` fell back to defaults. Reads
-        each leaf back on its own rather than comparing whole dicts, because a category's
-        merged value legitimately holds keys the caller never wrote.
+        validation rejected the merged result and `load_configs` fell back to defaults. Reads each
+        leaf back on its own rather than comparing whole dicts, because a category's merged value
+        legitimately holds keys the caller never wrote.
 
-        An empty dict returns None: a write that names no leaves cannot have diverged, and
-        `merge_dicts` leaves the category untouched. `_first_shadowed_leaf_at` treats the same
-        input as one leaf, because writing nothing into a category a higher layer owns is still
-        a write that layer outranks.
+        An empty dict returns None: `merge_dicts` leaves the category untouched, so a write that
+        names no leaves cannot have diverged. `_first_shadowed_leaf_at` treats the same input as
+        one leaf, because writing nothing into a category a higher layer owns is still a write
+        that layer outranks.
 
         Args:
             path: Key segments `value` was written to.
@@ -1765,10 +1725,9 @@ class ConfigManager(EngineScoped):
     def _append_shadow_note(self, result_details: str, outcome: ConfigWriteOutcome) -> str:
         """Return `result_details` with an explanation appended when the write did not take effect.
 
-        Returned unchanged when the write applied. Otherwise the message a user sees (in a
-        toast, a log, a CLI response) names the key that did not change and says why, instead
-        of reporting a bare success. Naming the key matters for a category write, where the
-        rest of the category may well have taken effect.
+        Returned unchanged when the write applied. Otherwise the message names the key that did
+        not change and says why, instead of reporting a bare success. Naming the key matters for a
+        category write, where the rest of the category may well have taken effect.
 
         Args:
             result_details: The success message describing the write.
@@ -1795,9 +1754,9 @@ class ConfigManager(EngineScoped):
                 "until that layer does."
             )
 
-        # Defensive tail: every reason above is accounted for, so this is unreachable today. It
-        # still says the write did not land, because a future reason arriving here silently
-        # unexplained would be the same bare success this reporting exists to remove.
+        # Defensive tail: every reason above is accounted for, so this is unreachable today. A
+        # future reason arriving here still says the write did not land, rather than the bare
+        # success this reporting exists to remove.
         return (
             f"{result_details} NOTE: '{outcome.unapplied_key}' is still "
             f"'{outcome.effective_value}'. The value was saved but did not take effect, for a "
@@ -1807,18 +1766,19 @@ class ConfigManager(EngineScoped):
     def _rejection_note(self, result_details: str, outcome: ConfigWriteOutcome) -> str:
         """Explain a write that reached disk while the merged config was failing validation.
 
-        The broken setting is frequently NOT one the caller touched: a single invalid value anywhere
-        makes `load_configs` discard the entire merge, so an unrelated write reads back as
-        unapplied. Blaming the written value there sends the user to re-type a value that was fine.
+        The broken setting is frequently NOT one the caller touched: a single invalid value
+        anywhere makes `load_configs` discard the entire merge, so an unrelated write reads back
+        as unapplied. Blaming the written value there sends the user to re-type a value that was
+        fine.
 
-        Ownership is judged by comparing segment paths, not joined strings: `written_path` must be a
-        prefix of the rejection's path segment for segment. A dot-keyed leaf makes the string test
-        wrong in both directions -- `project_workspaces./srv/site` is a textual dot-prefix of
-        `project_workspaces./srv/site.com/x.yml` while being an unrelated sibling.
+        Ownership is judged by comparing segment paths, not joined strings: `written_path` must be
+        a prefix of the rejection's path segment for segment. A dot-keyed leaf makes the string
+        test wrong in both directions, since `project_workspaces./srv/site` is a textual
+        dot-prefix of `project_workspaces./srv/site.com/x.yml` while being an unrelated sibling.
 
-        Ownership covers `written_path` and everything under it, not just `unapplied_key`. A
-        category write covers all its leaves, so a bad leaf inside it is the caller's own even when
-        the first leaf reported unapplied is a valid sibling.
+        Ownership covers `written_path` and everything under it, not just `unapplied_key`: a
+        category write covers all its leaves, so a bad leaf inside it is the caller's own even
+        when the first leaf reported unapplied is a valid sibling.
 
         When the caller's own write is broken and something else is too, only the caller's is
         named: it is the actionable half, and the next attempt surfaces the rest.
@@ -1880,9 +1840,8 @@ class ConfigManager(EngineScoped):
             )
             return SetConfigValueResultFailure(result_details=result_details)
 
-        # The write landed in the user layer; whether it's actually the value now in
-        # effect depends on whether a higher-priority layer (project/workspace/env) also
-        # defines what was written.
+        # The write landed in the user layer; whether it is the value now in effect depends on
+        # whether a higher-priority layer also defines what was written.
         outcome = self._write_outcome(request.category_and_key, request.value)
 
         # For container types, indicate the change with a diff
