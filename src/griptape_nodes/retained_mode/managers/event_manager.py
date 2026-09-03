@@ -1490,6 +1490,13 @@ class EventSuppressionContext:
     the block, not to the manager as a whole -- see ``_suppressed_event_types`` for why that
     distinction is load-bearing. Nesting composes: the previous value is restored on exit, so an
     inner block adding a type does not unsuppress what an outer block was already hiding.
+
+    One instance may be entered more than once, whether nested in itself or reused for a later
+    block. Tokens are therefore kept on a stack rather than in a single field: with one field, a
+    second ``__enter__`` overwrites the outer block's token, and the outer ``__exit__`` has nothing
+    left to restore -- so the suppressed set stays in place for the rest of the context. Nothing
+    would report it, and it fails in the harmful direction: over-broadcasting is cosmetic, a
+    permanently dark event stream desyncs the editor.
     """
 
     events_to_suppress: set[type]
@@ -1497,11 +1504,11 @@ class EventSuppressionContext:
     def __init__(self, manager: EventManager, events_to_suppress: set[type]):
         self.manager = manager
         self.events_to_suppress = events_to_suppress
-        self._token: contextvars.Token[frozenset[type]] | None = None
+        self._tokens: list[contextvars.Token[frozenset[type]]] = []
 
     def __enter__(self) -> None:
         currently_suppressed = _suppressed_event_types.get()
-        self._token = _suppressed_event_types.set(currently_suppressed | frozenset(self.events_to_suppress))
+        self._tokens.append(_suppressed_event_types.set(currently_suppressed | frozenset(self.events_to_suppress)))
 
     def __exit__(
         self,
@@ -1509,11 +1516,10 @@ class EventSuppressionContext:
         exc_value: BaseException | None,
         exc_traceback: types.TracebackType | None,
     ) -> None:
-        if self._token is None:
+        if not self._tokens:
             return
 
-        _suppressed_event_types.reset(self._token)
-        self._token = None
+        _suppressed_event_types.reset(self._tokens.pop())
 
 
 class EventTranslationContext:

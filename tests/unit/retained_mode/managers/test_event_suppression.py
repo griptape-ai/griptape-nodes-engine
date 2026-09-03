@@ -172,6 +172,50 @@ class TestSuppressionWindowLifetime:
             assert event_manager.should_suppress_event(_create_node_result_event()) is True
             assert event_manager.should_suppress_event(parameter_event) is False
 
+    def test_one_context_can_be_reused_for_a_later_block(self) -> None:
+        """Nothing stops a caller from holding a context and entering it twice in sequence."""
+        event_manager = EventManager()
+        suppression = EventSuppressionContext(event_manager, {CreateNodeResultSuccess})
+
+        with suppression:
+            assert event_manager.should_suppress_event(_create_node_result_event()) is True
+        assert event_manager.should_suppress_event(_create_node_result_event()) is False
+
+        with suppression:
+            assert event_manager.should_suppress_event(_create_node_result_event()) is True
+        assert event_manager.should_suppress_event(_create_node_result_event()) is False
+
+    def test_one_context_nested_in_itself_releases_on_the_outermost_exit(self) -> None:
+        """The failure mode a single token field has: the outer block loses its restore point.
+
+        With one token, the inner ``__enter__`` overwrites it and the outer ``__exit__`` has
+        nothing to reset -- so the type stays suppressed for the rest of the context, with nothing
+        to report it.
+        """
+        event_manager = EventManager()
+        suppression = EventSuppressionContext(event_manager, {CreateNodeResultSuccess})
+
+        with suppression:
+            with suppression:
+                assert event_manager.should_suppress_event(_create_node_result_event()) is True
+            assert event_manager.should_suppress_event(_create_node_result_event()) is True
+
+        assert event_manager.should_suppress_event(_create_node_result_event()) is False
+
+    def test_one_context_nested_in_itself_releases_when_the_inner_block_raises(self) -> None:
+        event_manager = EventManager()
+        suppression = EventSuppressionContext(event_manager, {CreateNodeResultSuccess})
+
+        def fail_inside_the_inner_window() -> None:
+            with suppression, suppression:
+                msg = "iteration failed"
+                raise RuntimeError(msg)
+
+        with pytest.raises(RuntimeError, match="iteration failed"):
+            fail_inside_the_inner_window()
+
+        assert event_manager.should_suppress_event(_create_node_result_event()) is False
+
     def test_clear_event_suppression_releases_everything(self) -> None:
         event_manager = EventManager()
         with EventSuppressionContext(event_manager, {CreateNodeResultSuccess}):
@@ -268,11 +312,10 @@ class TestSuppressionSetReachability:
     listing one has a real effect. ``ExecutionPayload`` members are emitted through
     ``put_event``/``aput_event``, which never consult it -- so listing one does nothing.
 
-    ``EXECUTION_EVENTS_TO_SUPPRESS`` documents itself as inert, and its own comment says to keep it
-    that way. It was not: two ``StartLocalSubflowResult`` types sat in it, and once the matcher was
-    repaired they became the one pair that took effect, dropping a parallel loop's per-iteration
-    results on the way to the editor. That is the class of mistake these tests catch -- a live
-    transport change added to a set everybody reads as a no-op.
+    So the mistake these tests catch is a request result added to ``EXECUTION_EVENTS_TO_SUPPRESS``:
+    a live transport change in a set everybody reads as a no-op, which would silently drop a
+    parallel loop's per-iteration results on the way to the editor. The mirror mistake -- an
+    execution payload in ``LOOP_EVENTS_TO_SUPPRESS`` -- is documentation posing as behaviour.
     """
 
     def test_execution_events_to_suppress_is_entirely_inert(self) -> None:

@@ -439,6 +439,13 @@ class TestFormatIterationFailureLines:
         lines = NodeExecutor._format_iteration_failure_lines(failures, total_iterations=50)
         assert lines == ["  Every iteration: same reason"]
 
+    def test_names_the_iteration_when_the_loop_had_only_one(self) -> None:
+        """A one-item loop satisfies both "every iteration" and "one iteration"; the number wins."""
+        lines = NodeExecutor._format_iteration_failure_lines(
+            [IterationFailure(iteration_index=0, detail="boom")], total_iterations=1
+        )
+        assert lines == ["  Iteration 1: boom"]
+
     def test_keeps_the_line_short_for_a_long_collapsed_run(self) -> None:
         """Capping reasons is not enough: the iteration list inside one reason must be bounded too.
 
@@ -476,6 +483,24 @@ class TestFormatIterationFailureLines:
         assert len(lines) == max_lines + 1  # the capped reasons, plus the tail line
         assert f"... and {reason_count - max_lines} more reason(s)" in lines[-1]
         assert "engine log" in lines[-1]
+
+    def test_tail_line_counts_the_iterations_behind_the_omitted_reasons(self) -> None:
+        """The lines above the tail are phrased in iterations, so the tail has to be too.
+
+        A reason count alone reads as an iteration count: here one omitted reason covers 95 of the
+        100 iterations, and "and 1 more reason(s)" undersells the loop's failure by two orders of
+        magnitude.
+        """
+        max_lines = 5
+        failures = [IterationFailure(iteration_index=index, detail=f"reason {index}") for index in range(max_lines)]
+        failures += [
+            IterationFailure(iteration_index=max_lines + index, detail="the reason that got cut") for index in range(95)
+        ]
+
+        lines = NodeExecutor._format_iteration_failure_lines(failures, total_iterations=100, max_lines=max_lines)
+
+        assert len(lines) == max_lines + 1
+        assert "1 more reason(s) affecting 95 iteration(s)" in lines[-1]
 
     def test_does_not_add_a_tail_line_when_everything_fits(self) -> None:
         failures = _make_iteration_failures(["a", "b", "c"])

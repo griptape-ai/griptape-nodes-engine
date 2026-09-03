@@ -205,19 +205,16 @@ LOOP_EVENTS_TO_SUPPRESS = {
     DeserializeFlowFromCommandsResultFailure,
 }
 
-# NOTE: unlike LOOP_EVENTS_TO_SUPPRESS, every member of this set is inert, and that is checked by
-# test_execution_events_to_suppress_is_entirely_inert. Execution events are emitted through
-# put_event/aput_event, which never consult should_suppress_event -- only request results are
-# checked (engine.py). Left in place as the record of intent: the aim is to stop parallel
-# iterations from flooding the websocket with per-node execution traffic. Wiring put_event up to
-# suppression would also silence the node highlighting that EventTranslationContext exists to
-# provide, so it needs its own design rather than a one-line change.
+# NOTE: every member of this set is inert, and test_execution_events_to_suppress_is_entirely_inert
+# checks that it stays that way. Execution events are emitted through put_event/aput_event, which
+# never consult should_suppress_event -- only request results are checked (engine.py). The set is
+# kept as the record of intent: the aim is to stop parallel iterations from flooding the websocket
+# with per-node execution traffic. Wiring put_event up to suppression would also silence the node
+# highlighting that EventTranslationContext exists to provide, so it needs its own design rather
+# than a one-line change.
 #
-# Keep it that way. StartLocalSubflowResultSuccess/Failure used to be listed here, and they are
-# ResultPayload subclasses, so once should_suppress_event started matching properly they were the
-# one pair that actually took effect -- silently dropping a parallel loop's per-iteration results
-# on the way to the editor. Adding a request result to this set is a live transport change wearing
-# the costume of a no-op; put it in LOOP_EVENTS_TO_SUPPRESS deliberately or leave it out.
+# Only ExecutionPayload members belong here. A ResultPayload in this set is a live transport change
+# wearing the costume of a no-op: put it in LOOP_EVENTS_TO_SUPPRESS deliberately, or leave it out.
 EXECUTION_EVENTS_TO_SUPPRESS = {
     CurrentControlNodeEvent,
     CurrentDataNodeEvent,
@@ -447,14 +444,23 @@ class NodeExecutor(EngineScoped):
         for iteration_failure in iteration_failures:
             iterations_by_detail.setdefault(iteration_failure.detail, []).append(iteration_failure.iteration_index + 1)
 
+        reported = list(iterations_by_detail.items())[:max_lines]
+        unreported = list(iterations_by_detail.items())[max_lines:]
+
         lines = []
-        for detail, iteration_numbers in list(iterations_by_detail.items())[:max_lines]:
+        for detail, iteration_numbers in reported:
             label = NodeExecutor._describe_failed_iterations(iteration_numbers, total_iterations)
             lines.append(f"  {label}: {detail}")
 
-        unreported_count = len(iterations_by_detail) - len(lines)
-        if unreported_count > 0:
-            lines.append(f"  ... and {unreported_count} more reason(s). See the engine log for every iteration.")
+        if unreported:
+            # Count the iterations behind the omitted reasons, not just the reasons: the lines above
+            # are phrased in iterations, so a bare reason count reads as one and can undersell the
+            # tail by two orders of magnitude.
+            unreported_iterations = sum(len(iteration_numbers) for _, iteration_numbers in unreported)
+            lines.append(
+                f"  ... and {len(unreported)} more reason(s) affecting {unreported_iterations} iteration(s). "
+                f"See the engine log for every iteration."
+            )
         return lines
 
     @staticmethod
@@ -468,10 +474,12 @@ class NodeExecutor(EngineScoped):
         sorted_numbers = sorted(iteration_numbers)
         count = len(sorted_numbers)
 
-        if total_iterations is not None and count >= total_iterations:
-            return "Every iteration"
+        # Naming the single iteration comes first: "Every iteration" is only more informative than
+        # a number when there is more than one, and a one-item loop satisfies both tests.
         if count == 1:
             return f"Iteration {sorted_numbers[0]}"
+        if total_iterations is not None and count >= total_iterations:
+            return "Every iteration"
 
         spans_a_contiguous_run = sorted_numbers[-1] - sorted_numbers[0] == count - 1
         if spans_a_contiguous_run:
@@ -3219,8 +3227,8 @@ class NodeExecutor(EngineScoped):
                     start_subflow_result = await self.engine.ahandle_request(start_subflow_request)
                     if isinstance(start_subflow_result, StartLocalSubflowResultSuccess):
                         return IterationOutcome(iteration_index=iteration_index, succeeded=True, detail="")
-                    # Carry the reason out with the verdict. Narrowing this to a bool is what used to
-                    # leave the parallel path reporting a failure "without a reason" it had in hand.
+                    # The reason travels out with the verdict: this closure is the only place that
+                    # holds it, so anything narrower than IterationOutcome loses it for good.
                     return IterationOutcome(
                         iteration_index=iteration_index,
                         succeeded=False,
