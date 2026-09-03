@@ -23,6 +23,7 @@ dead run. The fixture streams while it is parked so a test can watch that.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -187,6 +188,19 @@ def _open_gate(gate_file: Path) -> None:
     gate_file.write_text("open")
 
 
+async def _drain_cancelled_run(run: asyncio.Task) -> None:
+    """Let a cancelled run settle, without caring what it settles into.
+
+    A cancelled run may return a result, raise, or never resolve the node it was working on -- all
+    three are acceptable, so none of them is asserted on. The wedge these tests exist to catch is
+    caught by the caller's `check_for_existing_running_flow()` assertion instead; the bounded wait
+    is only here so a wedged run fails the suite instead of hanging it.
+    """
+    with contextlib.suppress(TimeoutError, asyncio.CancelledError):
+        await asyncio.wait_for(asyncio.shield(run), timeout=_RUN_TIMEOUT_SECONDS)
+    run.cancel()
+
+
 # ---------------------------------------------------------------------------------------------
 # Unresolved work is lost -> cancelling the run is the correct outcome.
 #
@@ -221,11 +235,7 @@ async def test_deleting_the_running_node_cancels_the_run(
 
     # Open the gate so a run that ignored the cancel still terminates instead of hanging the suite.
     _open_gate(gate_file)
-    with pytest.raises(asyncio.TimeoutError):
-        # A cancelled run may never return a result for the node it was resolving; that is fine.
-        # What is not fine is the flow still claiming to be running, asserted below.
-        await asyncio.wait_for(asyncio.shield(run), timeout=_RUN_TIMEOUT_SECONDS)
-    run.cancel()
+    await _drain_cancelled_run(run)
 
     assert cancellations, "Deleting the running node cancelled the run but never told the editor."
     assert engine.flow_manager.check_for_existing_running_flow() is False, (
@@ -261,9 +271,7 @@ async def test_deleting_an_unresolved_upstream_cancels_the_run(
     await _delete_node(engine, flow_name, "Upstream")
 
     _open_gate(upstream_gate)
-    with pytest.raises(asyncio.TimeoutError):
-        await asyncio.wait_for(asyncio.shield(run), timeout=_RUN_TIMEOUT_SECONDS)
-    run.cancel()
+    await _drain_cancelled_run(run)
 
     assert cancellations, "Deleting an unresolved upstream cancelled the run but never told the editor."
     assert engine.flow_manager.check_for_existing_running_flow() is False, (
@@ -309,9 +317,7 @@ async def test_deleting_an_unresolved_node_from_a_control_chain_ends_the_run(
     await _delete_node(engine, flow_name, "Middle")
 
     _open_gate(middle_gate)
-    with pytest.raises(asyncio.TimeoutError):
-        await asyncio.wait_for(asyncio.shield(run), timeout=_RUN_TIMEOUT_SECONDS)
-    run.cancel()
+    await _drain_cancelled_run(run)
 
     assert engine.flow_manager.check_for_existing_running_flow() is False, (
         "The control chain was truncated by the deletion and the run never terminated."

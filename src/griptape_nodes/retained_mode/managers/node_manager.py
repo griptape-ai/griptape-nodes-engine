@@ -1219,7 +1219,7 @@ class NodeManager(EngineScoped):
             node_group_name=request.node_group_name,
         )
 
-    def cancel_conditionally(
+    async def cancel_conditionally(
         self, parent_flow: ControlFlow, parent_flow_name: str, node: BaseNode
     ) -> ResultPayload | None:
         """Conditionally cancels a parent flow if it's currently executing nodes are connected to the specified node.
@@ -1227,6 +1227,12 @@ class NodeManager(EngineScoped):
         This method checks if the parent flow is running, and if so, determines whether the currently
         executing or resolving node is connected to the specified node. If a connection exists, the parent
         flow is cancelled to prevent operations on the deleted node.
+
+        The cancel is awaited rather than dispatched synchronously. `on_cancel_flow_request` is an async
+        handler that gathers the running node tasks, and those tasks belong to the engine's event loop.
+        Dispatching it from sync code bridges it onto a side loop instead, where the gather cannot bind to
+        the tasks it is waiting on -- so the cancel raised "attached to a different loop" and every delete
+        during a run was refused.
 
         Args:
             parent_flow: The control flow object that may need to be cancelled.
@@ -1252,7 +1258,7 @@ class NodeManager(EngineScoped):
                 for control_node_name in control_node_names:
                     control_node = self.engine.object_manager.get_object_by_name(control_node_name)
                     if control_node in connected_nodes:
-                        result = self.engine.handle_request(CancelFlowRequest(flow_name=parent_flow_name))
+                        result = await self.engine.ahandle_request(CancelFlowRequest(flow_name=parent_flow_name))
                         cancelled = True
                         if result.failed():
                             details = f"Attempted to delete a Node '{node.name}'. Failed because running flow could not cancel."
@@ -1261,7 +1267,7 @@ class NodeManager(EngineScoped):
                 for resolving_node_name in resolving_node_names:
                     resolving_node = self.engine.object_manager.get_object_by_name(resolving_node_name)
                     if resolving_node in connected_nodes:
-                        result = self.engine.handle_request(CancelFlowRequest(flow_name=parent_flow_name))
+                        result = await self.engine.ahandle_request(CancelFlowRequest(flow_name=parent_flow_name))
                         if result.failed():
                             details = f"Attempted to delete a Node '{node.name}'. Failed because running flow could not cancel."
                             return DeleteNodeResultFailure(result_details=details)
@@ -1270,7 +1276,7 @@ class NodeManager(EngineScoped):
             parent_flow.clear_execution_queue()
         return None
 
-    def on_delete_node_request(self, request: DeleteNodeRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915 (Complex logic, lots of edge cases)
+    async def on_delete_node_request(self, request: DeleteNodeRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915 (Complex logic, lots of edge cases)
         node_name = request.node_name
         node = None
         if node_name is None:
@@ -1297,7 +1303,7 @@ class NodeManager(EngineScoped):
                 details = f"Attempted to delete a Node '{node_name}'. Error: {err}"
                 return DeleteNodeResultFailure(result_details=details)
 
-            cancel_result = self.cancel_conditionally(parent_flow, parent_flow_name, node)
+            cancel_result = await self.cancel_conditionally(parent_flow, parent_flow_name, node)
             if cancel_result is not None:
                 return cancel_result
 
@@ -5353,7 +5359,7 @@ class NodeManager(EngineScoped):
             result_details=details,
         )
 
-    def on_reset_node_to_defaults_request(self, request: ResetNodeToDefaultsRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
+    async def on_reset_node_to_defaults_request(self, request: ResetNodeToDefaultsRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
         """Reset a node to its default state while preserving connections where possible."""
         node_name = request.node_name
         node = None
@@ -5462,7 +5468,7 @@ class NodeManager(EngineScoped):
 
         # FAILURE CHECK: Delete source node
         delete_request = DeleteNodeRequest(node_name=node_name)
-        delete_result = self.on_delete_node_request(delete_request)
+        delete_result = await self.on_delete_node_request(delete_request)
         if not isinstance(delete_result, DeleteNodeResultSuccess):
             details = f"Attempted to reset Node '{node_name}'. Failed to delete original node."
             return ResetNodeToDefaultsResultFailure(result_details=details)
