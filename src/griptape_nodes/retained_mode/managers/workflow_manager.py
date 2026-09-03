@@ -3662,7 +3662,6 @@ class WorkflowManager(EngineScoped):
             )
         )
 
-        # `await build_workflow()` constructs the graph before the executor runs;
         # build_workflow() is the async function emitted by _generate_workflow_file_content
         # that contains all graph-building requests.
         await_main_call = ast.Expr(
@@ -3675,13 +3674,17 @@ class WorkflowManager(EngineScoped):
             )
         )
 
+        # Build the graph inside the executor's context manager. Entering it activates
+        # the project passed via --project-file-path, and only then is a bundle's own
+        # griptape_nodes_config.json read, which is what registers the bundle's required
+        # node libraries.
+        with_stmt.body = [await_main_call, ensure_context_call, *with_stmt.body]
+
         # === Generate async aexecute_workflow function ===
         async_func_def = ast.AsyncFunctionDef(
             name="aexecute_workflow",
             args=args,
             body=[
-                await_main_call,
-                ensure_context_call,
                 executor_assign,
                 with_stmt,
                 return_stmt,
@@ -4281,10 +4284,12 @@ class WorkflowManager(EngineScoped):
         # Emit `await GriptapeNodes.ahandle_request(RegisterLibraryFromFileRequest(...))` once
         # per declared library so build_workflow() registers its own dependencies before any
         # CreateNodeRequest runs. Without this, running the workflow file as a standalone script
-        # (uv run workflow.py) would have no libraries registered when nodes are created, since
-        # LocalWorkflowExecutor's __aenter__ runs after build_workflow() and is gated by
-        # skip_library_loading=True. perform_discovery_if_not_found=True lets the registration
-        # find the library JSON via the engine's normal config-driven discovery path.
+        # (uv run workflow.py) would have no libraries registered when nodes are created:
+        # LocalWorkflowExecutor is constructed with skip_library_loading=True, so app
+        # initialization deliberately loads none. perform_discovery_if_not_found=True lets the
+        # registration find the library JSON via the engine's normal config-driven discovery
+        # path, which resolves against the bundle's own config layer -- activated by entering
+        # the executor's context manager, which build_workflow() now runs inside.
         if library_names:
             import_recorder.add_from_import(
                 "griptape_nodes.retained_mode.events.library_events", "RegisterLibraryFromFileRequest"
