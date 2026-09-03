@@ -7,7 +7,10 @@ down with it.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
+from websockets.exceptions import InvalidHandshake
 
 from griptape_nodes.common.diagnostics.health import (
     CLOUD_API_KEY_NAME,
@@ -213,6 +216,35 @@ class TestLibraryCheck:
         assert "No Fitness At All" in result.summary
 
     @pytest.mark.asyncio
+    async def test_a_library_that_was_turned_off_is_not_a_problem_to_report(self) -> None:
+        """A disabled library is never loaded, so it never becomes GOOD.
+
+        Reported as one that did not load cleanly, it sends someone to fix a library they
+        turned off deliberately -- and it downgrades an otherwise healthy engine to a
+        warning, which is the state people stop reading.
+        """
+        libraries = [
+            LibraryDiagnostics(name="In Use", fitness="GOOD"),
+            LibraryDiagnostics(name="Turned Off", fitness="NOT_EVALUATED", enabled=False),
+        ]
+
+        result = await LibraryCheck().run(_check_context(libraries=libraries))
+
+        assert result.status is HealthStatus.PASS
+        assert "Turned Off" not in result.summary
+
+    @pytest.mark.asyncio
+    async def test_every_library_turned_off_says_that_rather_than_that_there_are_none(self) -> None:
+        """Two different things to fix: install libraries, or turn the ones there back on."""
+        libraries = [LibraryDiagnostics(name="Turned Off", fitness="NOT_EVALUATED", enabled=False)]
+
+        result = await LibraryCheck().run(_check_context(libraries=libraries))
+
+        assert result.status is HealthStatus.WARN
+        assert "turned off" in result.summary
+        assert result.remedy is not None
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("fitness", list(LibraryManager.LibraryFitness))
     async def test_only_a_good_library_reads_as_an_all_clear(self, fitness: LibraryManager.LibraryFitness) -> None:
         """Every fitness the engine can report, and only GOOD is allowed to pass.
@@ -254,6 +286,34 @@ class TestSecretsCheck:
         assert result.status is HealthStatus.WARN
         assert "DECLARED_AND_MISSING" in result.summary
         assert "UNDECLARED_AND_MISSING" not in result.summary
+
+    @pytest.mark.asyncio
+    async def test_the_all_clear_counts_only_the_secrets_something_asked_for(self) -> None:
+        """The report lists every key it found, and most of them nothing is expecting.
+
+        Counting those made the all-clear claim to have checked keys it never looked at --
+        "every one of the 14 expected secrets has a value" on an engine where one library
+        declared one key and the rest of the environment happened to hold thirteen.
+        """
+        secrets = [
+            SecretDiagnostics(name="DECLARED", is_set=True, declared_in_config=True),
+            SecretDiagnostics(name="JUST_LYING_AROUND", is_set=True, declared_in_config=False),
+        ]
+
+        result = await SecretsCheck().run(_check_context(secrets=secrets))
+
+        assert result.status is HealthStatus.PASS
+        assert "1 expected secrets" in result.summary
+
+    @pytest.mark.asyncio
+    async def test_no_secrets_expected_at_all_says_so_rather_than_counting_to_zero(self) -> None:
+        """`every one of the 0 expected secrets` reads like something went wrong."""
+        secrets = [SecretDiagnostics(name="JUST_LYING_AROUND", is_set=True, declared_in_config=False)]
+
+        result = await SecretsCheck().run(_check_context(secrets=secrets))
+
+        assert result.status is HealthStatus.PASS
+        assert "No secrets are expected" in result.summary
 
     @pytest.mark.asyncio
     async def test_summarizes_a_long_list_rather_than_printing_all_of_it(self) -> None:
@@ -354,6 +414,51 @@ class TestCloudConnectionCheck:
 
         assert result.status is HealthStatus.FAIL
         assert "no route to host" in result.summary
+
+    @pytest.mark.asyncio
+    async def test_a_connection_that_never_answers_is_reported_as_a_timeout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A distinct verdict from "could not be reached", and easily lost.
+
+        `TimeoutError` is a subclass of `OSError`, so moving the `OSError` branch above it
+        compiles, passes every other test here, and turns "a firewall is swallowing this"
+        into "check your network connection" -- the wrong thing to go and look at. The
+        timeout is shortened rather than waited out; what is being pinned is which branch
+        catches it.
+        """
+        check = CloudConnectionCheck()
+
+        async def never_answer(_url: str, _headers: dict[str, str]) -> None:
+            await asyncio.sleep(30)
+
+        monkeypatch.setattr(check, "_connect_and_disconnect", never_answer)
+        monkeypatch.setattr(check, "_CONNECTION_TIMEOUT", 0.01)
+
+        result = await check.run(_check_context())
+
+        assert result.status is HealthStatus.FAIL
+        assert "timed out" in result.summary
+        assert result.remedy is not None
+        assert "firewall" in result.remedy
+
+    @pytest.mark.asyncio
+    async def test_a_rejected_handshake_is_reported_as_a_bad_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The server answered, so the network is fine and the key is what to go and change."""
+        check = CloudConnectionCheck()
+
+        async def reject(_url: str, _headers: dict[str, str]) -> None:
+            msg = "server rejected WebSocket connection: HTTP 401"
+            raise InvalidHandshake(msg)
+
+        monkeypatch.setattr(check, "_connect_and_disconnect", reject)
+
+        result = await check.run(_check_context())
+
+        assert result.status is HealthStatus.FAIL
+        assert "HTTP 401" in result.summary
+        assert result.remedy is not None
+        assert CLOUD_API_KEY_NAME in result.remedy
 
     @pytest.mark.asyncio
     async def test_passes_when_the_connection_opens(self, monkeypatch: pytest.MonkeyPatch) -> None:
