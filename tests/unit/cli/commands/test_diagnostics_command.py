@@ -161,11 +161,16 @@ class TestRequestBuiltFromFlags:
         assert request.normalize_identity is False
         assert request.include_logs is True
 
-    def test_writes_to_the_requested_path_rather_than_uploading(self) -> None:
-        """An output path is what keeps the bundle on this machine; None uploads it."""
-        request = _run(_success(), output=Path("/tmp/somewhere")).collect_request()  # noqa: S108
+    def test_writes_to_the_requested_path_rather_than_uploading(self, tmp_path: Path) -> None:
+        """An output path is what keeps the bundle on this machine; None uploads it.
 
-        assert request.output_path == "/tmp/somewhere"  # noqa: S108
+        Compared against `tmp_path` rather than a literal because the command hands the
+        request a string: spelled `/tmp/somewhere`, the expected value would be written with
+        the other platform's separator on Windows.
+        """
+        request = _run(_success(), output=tmp_path).collect_request()
+
+        assert request.output_path == str(tmp_path)
 
     def test_the_default_output_is_the_current_directory(self) -> None:
         """Never None: None hands the bundle to static files, which can leave the machine."""

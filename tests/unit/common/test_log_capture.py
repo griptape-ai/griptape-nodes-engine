@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -228,12 +229,57 @@ class TestSessionLogBuffer:
         assert buffer.lines() == []
 
 
+class TestDefaultLogDirectory:
+    """Where logs go when nobody chose, which is nearly every engine.
+
+    Worth its own class for one reason: this is called from ``ConfigManager.__init__``, so a
+    machine it cannot answer for is a machine the engine will not start on at all.
+    """
+
+    @staticmethod
+    def _no_home() -> Path:
+        """Stand in for ``xdg_data_home`` on a machine with no home directory to find."""
+        msg = "Could not determine home directory."
+        raise RuntimeError(msg)
+
+    def test_a_machine_with_no_home_directory_still_gets_somewhere_to_log(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The default location sits under the user's data directory, so it needs a home.
+
+        A Windows service account, or a container run without `USERPROFILE`, has none, and
+        the standard library raises rather than returning a guess -- which came out of
+        `ConfigManager.__init__` and stopped the engine starting.
+        """
+        monkeypatch.setattr(log_capture, "xdg_data_home", self._no_home)
+
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            directory = default_log_directory()
+
+        assert directory == Path(tempfile.gettempdir()) / "griptape_nodes" / "logs"
+        # Said out loud, because the operating system empties this directory when it likes.
+        assert "no home directory" in caplog.text
+
+    def test_the_setting_is_still_read_when_there_is_no_home_directory(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A configured absolute path needs no home directory, and is used unchanged."""
+        monkeypatch.setattr(log_capture, "xdg_data_home", self._no_home)
+
+        assert resolve_log_directory(str(tmp_path)) == tmp_path
+
+
 class TestResolveLogDirectory:
     def test_an_empty_setting_means_the_default_location(self) -> None:
         assert resolve_log_directory("") == default_log_directory()
 
-    def test_an_absolute_path_is_used_as_given(self) -> None:
-        assert resolve_log_directory("/var/log/griptape") == Path("/var/log/griptape")
+    def test_an_absolute_path_is_used_as_given(self, tmp_path: Path) -> None:
+        """``tmp_path`` rather than a literal, which has to be absolute on both platforms.
+
+        A POSIX path like `/var/log/griptape` has no drive letter, so Windows reads it as
+        relative and the fallback below is what a test asserting on it really exercises.
+        """
+        assert resolve_log_directory(str(tmp_path)) == tmp_path
 
     def test_a_tilde_is_expanded(self) -> None:
         assert resolve_log_directory("~/engine-logs") == Path.home() / "engine-logs"
