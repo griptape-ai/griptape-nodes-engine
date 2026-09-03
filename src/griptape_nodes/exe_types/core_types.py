@@ -1868,6 +1868,53 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         """
         return bool(self._validators)
 
+    def value_callback_names(self, owner: BaseNode | None) -> dict[str, list[str]]:
+        """Return the directly-attached converters and validators as method names.
+
+        Each list is all-or-nothing. Converters chain, so restoring a subset would run a
+        different pipeline than the one that was saved while looking like it worked; a list
+        holding anything unnameable is omitted entirely and reported instead. Keys are
+        absent rather than empty when there is nothing to record.
+        """
+        names: dict[str, list[str]] = {}
+        for key, callbacks in (("converters", self._converters), ("validators", self._validators)):
+            if not callbacks:
+                continue
+            resolved = [name_callback(callback, owner) for callback in callbacks]
+            if any(name is None for name in resolved):
+                continue
+            names[key] = [name for name in resolved if name is not None]
+        return names
+
+    def unnameable_value_callbacks(self, owner: BaseNode | None) -> dict[str, int]:
+        """Return how many directly-attached converters and validators cannot be named.
+
+        Counts rather than names them: an unnameable callback is a lambda or a closure, so
+        there is no useful name to print.
+        """
+        unnameable: dict[str, int] = {}
+        for key, callbacks in (("converters", self._converters), ("validators", self._validators)):
+            count = sum(1 for callback in callbacks if name_callback(callback, owner) is None)
+            if count:
+                unnameable[key] = count
+        return unnameable
+
+    def apply_value_callback_names(self, names: dict[str, list[str]], owner: BaseNode | None) -> None:
+        """Re-bind saved converter and validator names to ``owner``'s methods.
+
+        A callback already attached is skipped, so a converter the node's ``__init__``
+        declared is not added a second time when a saved name repeats it.
+        """
+        for key, target in (("converters", self._converters), ("validators", self._validators)):
+            attached = {name_callback(callback, owner) for callback in target}
+            for method_name in names.get(key, []):
+                if method_name in attached:
+                    continue
+                described_as = f"the '{method_name}' {key[:-1]} of parameter '{self.name}'"
+                callback = resolve_callback(method_name, owner, described_as=described_as)
+                if callback is not None:
+                    target.append(callback)
+
     @property
     def has_traits(self) -> bool:
         """Any Trait child is attached.
@@ -2261,6 +2308,9 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         other_dict["ui_options"] = other.authored_ui_options()
         self_dict["traits"] = self.trait_states()
         other_dict["traits"] = other.trait_states()
+        # Converters and validators are code, compared by the method names they resolve to.
+        self_dict["value_callbacks"] = self.value_callback_names(self.get_node())
+        other_dict["value_callbacks"] = other.value_callback_names(other.get_node())
         self_dict.pop("next", None)
         self_dict.pop("prev", None)
         self_dict.pop("element_id", None)

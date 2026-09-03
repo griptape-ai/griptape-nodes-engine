@@ -1925,6 +1925,8 @@ class NodeManager(EngineScoped):
         # a method on the owning node, which the parameter can only reach once it has one.
         if request.traits:
             NodeManager._apply_trait_callbacks(new_param, request.traits)
+        if request.value_callbacks:
+            new_param.apply_value_callback_names(request.value_callbacks, node)
 
         details = f"Successfully added Parameter '{final_param_name}' to Node '{node_name}'."
         log_level = logging.DEBUG
@@ -2284,6 +2286,8 @@ class NodeManager(EngineScoped):
                 # callbacks can both be restored here.
                 NodeManager._apply_trait_states(parameter, request.traits)
                 NodeManager._apply_trait_callbacks(parameter, request.traits)
+            if request.value_callbacks is not None:
+                parameter.apply_value_callback_names(request.value_callbacks, parameter.get_node())
         if request.ui_options is not None and hasattr(parameter, "ui_options"):
             parameter.ui_options = request.ui_options  # type: ignore[attr-defined]
 
@@ -3725,6 +3729,7 @@ class NodeManager(EngineScoped):
                     # the trait regenerates its own on load.
                     param_dict["ui_options"] = parameter.authored_ui_options()
                     param_dict["traits"] = parameter.trait_states()
+                    param_dict["value_callbacks"] = parameter.value_callback_names(node)
                     NodeManager._report_unsaveable_callbacks(parameter)
                     add_param_request = AddParameterToNodeRequest.create(**param_dict)
                     element_modification_commands.append(add_param_request)
@@ -3746,6 +3751,7 @@ class NodeManager(EngineScoped):
                     param_dict["initial_setup"] = True
                     param_dict["ui_options"] = parameter.authored_ui_options()
                     param_dict["traits"] = parameter.trait_states()
+                    param_dict["value_callbacks"] = parameter.value_callback_names(node)
                     add_param_request = AddParameterToNodeRequest.create(**param_dict)
                     element_modification_commands.append(add_param_request)
                 else:
@@ -4344,24 +4350,25 @@ class NodeManager(EngineScoped):
         """Warn about callbacks on this parameter that saving cannot record.
 
         Called while serializing a run-time parameter, which is the moment the loss
-        happens: a lambda or closure has no method name to write down, so the control comes
-        back inert. A declared parameter is exempt because its node's ``__init__`` rebuilds
-        the callback on load.
+        happens: a lambda or closure has no method name to write down, so the behavior comes
+        back missing. A declared parameter is exempt because its node's ``__init__`` rebuilds
+        its callbacks on load.
         """
         owner = parameter.get_node()
         rule = RULES["callback-cannot-be-saved"]
+        locations: list[str] = []
         for trait in parameter.find_elements_by_type(Trait):
             unnameable = trait.unnameable_callbacks(owner)
-            if not unnameable:
-                continue
-            STRICT_MODE.report(
-                rule_id=rule.rule_id,
-                message=rule.render(
-                    parameter_name=parameter.name,
-                    trait_name=type(trait).__name__,
-                    callback_names=", ".join(unnameable),
-                ),
-            )
+            if unnameable:
+                locations.append(f"{', '.join(unnameable)} on the '{type(trait).__name__}' control")
+        for kind, count in parameter.unnameable_value_callbacks(owner).items():
+            locations.append(f"{count} {kind[:-1] if count == 1 else kind}")
+        if not locations:
+            return
+        STRICT_MODE.report(
+            rule_id=rule.rule_id,
+            message=rule.render(parameter_name=parameter.name, location="; ".join(locations)),
+        )
 
     @staticmethod
     def _apply_trait_states(parameter: Parameter, trait_states: list[dict[str, Any]]) -> None:
