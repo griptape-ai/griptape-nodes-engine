@@ -458,10 +458,10 @@ class TestSupportedRequestEventsExposesOpeningAWorkflow:
     """
 
     def test_run_workflow_from_registry_is_exposed(self) -> None:
+        """Membership is the whole contract: `list_tools` advertises exactly this mapping.
+
+        `TestListTools.test_advertises_every_request_event_plus_the_batch_envelope` asserts the
+        tool names equal `SUPPORTED_REQUEST_EVENTS` plus the batch envelope, so being in here is
+        being offered to the agent.
+        """
         assert SUPPORTED_REQUEST_EVENTS["RunWorkflowFromRegistryRequest"] is RunWorkflowFromRegistryRequest
-
-    @pytest.mark.asyncio
-    async def test_it_is_offered_as_a_tool(self) -> None:
-        result = await list_tools(_NO_CONTEXT, None)
-
-        assert "RunWorkflowFromRegistryRequest" in {tool.name for tool in result.tools}

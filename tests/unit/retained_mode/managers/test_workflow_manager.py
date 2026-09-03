@@ -1231,18 +1231,21 @@ class TestWorkflowManager:
         )
         assert captured["save_display_name"] == "My Name"
 
-    def test_rename_of_the_open_workflow_moves_its_key_and_path_together(self, engine: Engine) -> None:
-        """Renaming the workflow in context repoints it and tells clients its new key, once.
+    def test_rename_bookkeeping_moves_the_open_workflows_key_and_path_together(self, engine: Engine) -> None:
+        """A rename that leaves the context standing repoints it and reports the new key, once.
 
-        The key an editor addresses this workflow by changes here, so a client that never hears
-        about it keeps sending requests against a name the registry has dropped. The retained
-        path has to travel in the same breath: it is what `workflow_dir` answers with, and it
-        would otherwise name the file the rename just moved away from.
-
-        Drives the rename with its delete step mocked out, which is what isolates the
-        bookkeeping. Against the real delete handler the rename tears the context down instead
-        (it deletes the old entry while that entry is the one in context) -- that is pinned by
+        Drives `on_rename_workflow_request` with its delete step mocked out, which isolates the
+        bookkeeping at the end of the handler. That is the real shape of a Save As of an
+        unregistered workflow and of a rename that resolves to the key it already had -- the
+        renames that skip the delete. An ordinary rename of a registered, open workflow does not
+        get here at all: the delete drops the entry that is in context, and the real delete
+        handler tears the context down, which is pinned by
         `test_delete_active_workflow_clears_context_stack`.
+
+        What this pins is the bookkeeping itself: the key an editor addresses the workflow by
+        changes, so a client that never hears about it keeps sending requests against a name the
+        registry has dropped, and the retained path has to travel in the same breath because it is
+        what `workflow_dir` answers with.
         """
         context_manager = engine.context_manager
         context_manager.push_workflow(workflow_name="my_workflow")

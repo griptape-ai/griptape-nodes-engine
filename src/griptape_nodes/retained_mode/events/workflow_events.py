@@ -102,14 +102,16 @@ class RunWorkflowFromRegistryRequest(RequestPayload):
     work an artist has in front of them right now in the editor, which cannot be
     recovered. Save first (SaveWorkflowRequest) if that matters.
 
-    The engine emits a CurrentWorkflowChanged app event naming the workflow that ended up in
-    context, on both the success and the failure path (a failure after the switch reverts to
-    an empty engine and reports None). It fires when the context switches, which is before
-    the file is replayed, so it announces which workflow is opening rather than that the
-    nodes have arrived. A request rejected before the switch -- unknown registry key, or an
-    unsaved workflow -- leaves the Current Context untouched and emits nothing; the one
-    exception is a clean slate that itself fails, which leaves the engine partially cleared
-    and reports whatever the clearing left behind.
+    The engine emits CurrentWorkflowChanged app events as the context moves, and the last one
+    is always the truth. With run_with_clean_slate=True -- the ordinary open -- there are two:
+    None from the wipe, then the workflow that was opened. Treat that None as "mid-switch",
+    not as "the artist closed everything". A failure after the switch adds a third, None
+    again, because the failed open reverts to an empty engine. Each fires when the context
+    moves, which is before the file is replayed, so they announce which workflow is opening
+    rather than that its nodes have arrived. A request rejected before the switch -- unknown
+    registry key, or an unsaved workflow -- leaves the Current Context untouched and emits
+    nothing; the one exception is a clean slate that itself fails, which leaves the engine
+    partially cleared and reports whatever the clearing left behind.
 
     Opening a large workflow can take a while: it resolves node libraries and replays the
     whole file. A client-side timeout does NOT cancel the open, so do not retry on one --

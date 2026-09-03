@@ -390,9 +390,14 @@ a file, so on its own it would leave you holding a workflow name and none of its
 
 Either way the engine broadcasts a `CurrentWorkflowChanged` app event carrying the
 `workflow_name` now in context (`None` when the engine has none), so every attached
-editor follows along when an agent switches workflows out from under it. It says which
-workflow, not that the workflow is loaded: an open switches the context first and replays
-the file afterwards, so the nodes arrive behind the event.
+editor follows along when an agent switches workflows out from under it. Two things to
+know about it:
+
+- **The last one is the truth.** A clean-slate open emits `None` from the wipe and then
+    the opened workflow, so a `None` in the middle of an open means "mid-switch", not
+    "everything closed".
+- **It says which workflow, not that the workflow is loaded.** An open switches the
+    context first and replays the file afterwards, so the nodes arrive behind the event.
 
 ### Agents cannot be interrupted mid-run
 

@@ -183,6 +183,11 @@ class CurrentWorkflowChanged(AppPayload):
     behind it as ordinary creation events. A client that repopulates a canvas on this event
     should expect to fill it from those, not from a graph that is already complete.
 
+    Where one operation moves the context more than once, every move is reported and the last
+    one is the truth. An ordinary open is two: None while the engine is wiped, then the
+    workflow that was opened. A None in the middle of a switch is not the artist closing
+    their work.
+
     Unlike SetWorkflowContextSuccess it is not the result of a request, so a client observes
     it even when it was not the one that asked -- a second editor attached to the same
     engine, or an agent driving the engine over MCP. Most of these switches happen deep
@@ -192,7 +197,9 @@ class CurrentWorkflowChanged(AppPayload):
         workflow_name: Registry key of the workflow now in context, or None when the
             engine has no current workflow (the state right after ClearAllObjectState,
             and the state a failed open reverts to). A workflow that has never been
-            saved reports its "unsaved:<uuid>" key.
+            saved reports its "unsaved:<uuid>" key. Deliberately has no default: None
+            means "nothing is open", so a field that never arrived must not be able to
+            deserialize into it.
     """
 
-    workflow_name: str | None = None
+    workflow_name: str | None

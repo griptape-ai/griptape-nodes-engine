@@ -1421,13 +1421,20 @@ class WorkflowManager(EngineScoped):
                     "Failed while attempting to remove the original file name from the registry."
                 )
 
-        # If the renamed workflow is the current context, update the context name so the
-        # heartbeat and other callers reflect the new registry key immediately. The retained
-        # path moves with it: rename keeps the directory, so `workflow_dir` is unaffected, but
-        # the path itself would otherwise name a file that no longer exists. Both land in one
-        # `rekey_workflow` call so the CurrentWorkflowChanged it emits describes an entry that is
-        # already wholly renamed -- setting the name first would announce the switch while the
-        # retained path still named the old file, and that path is what `workflow_dir` answers with.
+        # If the renamed workflow is still the current context, repoint it so the heartbeat and
+        # other callers reflect the new registry key immediately. The retained path moves with it:
+        # rename keeps the directory, so `workflow_dir` is unaffected, but the path itself would
+        # otherwise name a file that no longer exists. Both land in one `rekey_workflow` call so
+        # the CurrentWorkflowChanged it emits describes an entry that is already wholly renamed --
+        # setting the name first would announce the switch while the retained path still named the
+        # old file, and that path is what `workflow_dir` answers with.
+        #
+        # "Still" is load-bearing: renaming a registered workflow that is open does not reach here.
+        # The delete above drops the old registry entry while that entry is the one in context, and
+        # `on_delete_workflows_request` tears the context down for exactly that case -- so what
+        # clients hear from an ordinary rename is the teardown, not a new key. This branch serves
+        # the renames that skip the delete: a Save As of an unregistered workflow, and a rename
+        # that resolves to the key it already had.
         context_manager = self.engine.context_manager
         if context_manager.has_current_workflow() and context_manager.get_current_workflow_name() == old_workflow_name:
             context_manager.rekey_workflow(
