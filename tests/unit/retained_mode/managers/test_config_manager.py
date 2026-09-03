@@ -2458,6 +2458,80 @@ class TestConfigProvenance:
         # The write is what the next activation derives its pin from.
         assert json.loads(isolate_user_config.read_text())["workspace_directory"] == str(typed_ws)
 
+    def test_set_config_value_request_pin_held_but_merge_discarded_reports_rejected(
+        self, tmp_path: Path, isolate_user_config: Path
+    ) -> None:
+        """A held pin is not evidence the pin is why a write did not land.
+
+        When an unrelated key fails `Settings` validation, `load_configs` discards the merge and
+        the pin is not in `merged_config` at all. Attributing the divergence to the pin promises
+        the value takes effect on the next project open, when in truth it never does until the
+        invalid value is corrected.
+        """
+        user_ws = tmp_path / "user_workspace"
+        user_ws.mkdir()
+        isolate_user_config.write_text(
+            json.dumps({"workspace_directory": str(user_ws), "max_nodes_in_parallel": "not-an-int"}),
+            encoding="utf-8",
+        )
+        pinned_dir = tmp_path / "pinned_workspace"
+        pinned_dir.mkdir()
+        typed_ws = tmp_path / "typed_workspace"
+
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.set_workspace_override(pinned_dir, supplied_by_config=True)
+            manager.load_configs()
+            # Precondition: the invalid sibling key really did discard the whole merge.
+            assert manager.merged_config is manager.default_config
+
+            result = manager.on_handle_set_config_value_request(
+                SetConfigValueRequest(category_and_key="workspace_directory", value=str(typed_ws))
+            )
+
+        assert isinstance(result, SetConfigValueResultSuccess)
+        assert result.applied is False
+        assert result.reason == "rejected"
+        assert "pins its workspace" not in str(result.result_details)
+
+    def test_set_config_value_request_reason_distinguishes_all_three_causes(
+        self, tmp_path: Path, isolate_user_config: Path
+    ) -> None:
+        """`reason` is on the payload so a caller need not infer intent from a null `shadowed_by`.
+
+        A null `shadowed_by` cannot tell a deferred write from a refused one, and those want
+        opposite messages: one says "saved, applies next time", the other says "fix the value".
+        """
+        self._write_layer_config(tmp_path, {"log_level": "ERROR"})
+
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.load_project_config(tmp_path)
+
+            shadowed = manager.on_handle_set_config_value_request(
+                SetConfigValueRequest(category_and_key="log_level", value="INFO")
+            )
+            applied = manager.on_handle_set_config_value_request(
+                SetConfigValueRequest(category_and_key="max_nodes_in_parallel", value=7)
+            )
+            rejected = manager.on_handle_set_config_value_request(
+                SetConfigValueRequest(category_and_key="max_nodes_in_parallel", value="not-an-int")
+            )
+
+        assert isinstance(shadowed, SetConfigValueResultSuccess)
+        assert shadowed.reason == "shadowed"
+        assert shadowed.shadowed_by is not None
+
+        assert isinstance(applied, SetConfigValueResultSuccess)
+        assert applied.applied is True
+        assert applied.reason is None
+
+        assert isinstance(rejected, SetConfigValueResultSuccess)
+        assert rejected.reason == "rejected"
+        assert rejected.shadowed_by is None
+
+        assert json.loads(isolate_user_config.read_text())["max_nodes_in_parallel"] == "not-an-int"
+
     def test_get_config_category_request_sources_keyed_by_full_root_relative_path(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             result = ConfigManager().on_handle_get_config_category_request(
