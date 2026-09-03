@@ -11,6 +11,7 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, NamedTuple
 from urllib.parse import unquote, urlparse
 
+import httpx
 from dotenv import dotenv_values
 
 from griptape_nodes.common.diagnostics.bundle import DiagnosticsBundle, DiagnosticsBundleManifest
@@ -224,6 +225,19 @@ class DiagnosticsManager(EngineScoped):
         self, request: CollectDiagnosticsRequest
     ) -> CollectDiagnosticsResultSuccess | CollectDiagnosticsResultFailure:
         """Build a diagnostics bundle and return a link to download it."""
+        # A file name is joined onto the requested output directory, and onto the static
+        # files directory when there is no output path. Anything with a directory in it --
+        # `../../.ssh/config`, or an absolute path -- would be written somewhere the caller
+        # was never told about, so it is refused before any of the bundle is assembled.
+        if request.file_name is not None and Path(request.file_name).name != request.file_name:
+            details = (
+                f"Attempted to collect a diagnostics bundle named '{request.file_name}'. "
+                "Failed because that is a path rather than a file name. Give a name with no folders in "
+                "it, and use the output path to choose where the bundle goes."
+            )
+            logger.error(details)
+            return CollectDiagnosticsResultFailure(result_details=details)
+
         redactor = Redactor(
             secret_values=self._known_secret_values(),
             normalize_identity=request.normalize_identity,
@@ -353,7 +367,11 @@ class DiagnosticsManager(EngineScoped):
                 ExistingFilePolicy.CREATE_NEW,
                 skip_metadata_injection=True,
             )
-        except (OSError, RuntimeError) as err:
+        # `httpx.HTTPError` because the static files manager writes through the configured
+        # storage driver, and the cloud one uploads the bundle and then asks for a download
+        # URL over HTTP. A refused connection or a timeout on either call is a failure this
+        # request has to report, not an exception for the caller to discover.
+        except (OSError, RuntimeError, httpx.HTTPError) as err:
             details = (
                 f"Attempted to save the diagnostics bundle as '{file_name}'. "
                 f"Failed because it could not be written: {err}"
@@ -796,7 +814,15 @@ class DiagnosticsManager(EngineScoped):
         directories = self._log_directories()
 
         files: list[LogFileDiagnostics] = []
+        # Canonicalized to match the files found below. They come from the directories
+        # `_log_directories` returns, which are canonical, while the sink recorded whatever
+        # spelling it was handed. A log directory under `/var` on macOS is the same file
+        # spelled two ways, and comparing the spellings marked no file as the active one.
+        active_file = None
         current_file = active_log_file()
+        if current_file is not None:
+            active_file = canonicalize_for_identity(current_file)
+
         for directory in directories:
             for path in find_log_files(directory):
                 try:
@@ -811,7 +837,7 @@ class DiagnosticsManager(EngineScoped):
                         name=path.name,
                         size_bytes=stat.st_size,
                         modified_at=datetime.fromtimestamp(stat.st_mtime, tz=UTC).isoformat(),
-                        is_active=current_file is not None and path == current_file,
+                        is_active=active_file is not None and canonicalize_for_identity(path) == active_file,
                     )
                 )
 

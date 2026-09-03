@@ -216,14 +216,27 @@ class LibraryCheck(HealthCheck):
     _HEALTHY_FITNESS = frozenset({"GOOD"})
 
     async def run(self, context: HealthCheckContext) -> HealthCheckResult:
-        libraries = context.report.libraries
+        registered = context.report.libraries
 
-        if not libraries:
+        if not registered:
             return HealthCheckResult(
                 name=self.name,
                 status=HealthStatus.WARN,
                 summary="No libraries are registered, so no nodes are available.",
                 remedy="Run 'gtn libraries sync' to install the default libraries.",
+            )
+
+        # Only the ones the engine was asked to load. A disabled library is never evaluated,
+        # so its fitness is whatever it was left at -- reported as a library that did not
+        # load cleanly, it sends someone to fix a library they turned off on purpose.
+        libraries = [library for library in registered if library.enabled]
+
+        if not libraries:
+            return HealthCheckResult(
+                name=self.name,
+                status=HealthStatus.WARN,
+                summary=f"All {len(registered)} registered libraries are turned off, so no nodes are available.",
+                remedy="Turn one back on in the Libraries panel, or in the 'libraries_to_register' setting.",
             )
 
         broken = [library.name for library in libraries if library.fitness in self._BROKEN_FITNESS]
@@ -258,7 +271,7 @@ class LibraryCheck(HealthCheck):
         return HealthCheckResult(
             name=self.name,
             status=HealthStatus.PASS,
-            summary=f"All {len(libraries)} registered libraries loaded cleanly.",
+            summary=f"All {len(libraries)} enabled libraries loaded cleanly.",
         )
 
 
@@ -427,14 +440,24 @@ class SecretsCheck(HealthCheck):
     _MAX_NAMES_LISTED = 5
 
     async def run(self, context: HealthCheckContext) -> HealthCheckResult:
-        secrets = context.report.secrets
-        missing = [secret.name for secret in secrets if secret.declared_in_config and not secret.is_set]
+        # Only the declared ones are this check's business. The report also lists every key
+        # it found in the environment and the `.env` files, and counting those made the
+        # all-clear claim to have checked keys nothing is expecting.
+        expected = [secret for secret in context.report.secrets if secret.declared_in_config]
+        missing = [secret.name for secret in expected if not secret.is_set]
+
+        if not expected:
+            return HealthCheckResult(
+                name=self.name,
+                status=HealthStatus.PASS,
+                summary="No secrets are expected, so none can be missing.",
+            )
 
         if not missing:
             return HealthCheckResult(
                 name=self.name,
                 status=HealthStatus.PASS,
-                summary=f"Every one of the {len(secrets)} expected secrets has a value.",
+                summary=f"Every one of the {len(expected)} expected secrets has a value.",
             )
 
         listed = ", ".join(missing[: self._MAX_NAMES_LISTED])
