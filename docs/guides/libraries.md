@@ -153,17 +153,34 @@ pin `torch==2.4.1`; library B can pin `torch==2.0.0`. Both are
 installed into separate `.venv` directories, and each library uses
 its own when its nodes run.
 
-This holds whether a library runs **Shared** or **Isolated** (see
-[Process isolation](#process-isolation-the-isolated-mode)): the
-`.venv` lives on disk next to the library's manifest either way.
-The difference is only which process loads those packages — the
-main engine process for Shared libraries, the library's own process
-for Isolated ones. From the artist's perspective the dependency
-isolation is the same.
+The `.venv` lives on disk next to the library's manifest whether
+the library runs **Shared** or **Isolated** (see
+[Process isolation](#process-isolation-the-isolated-mode)). What
+differs is which process loads those packages — the main engine
+process for Shared libraries, the library's own process for
+Isolated ones.
 
 **You can install incompatibly-pinned libraries together without
 pip resolution conflicts.** This is the most important guarantee on
 this page.
+
+!!! warning "Install isolation, not import isolation, for Shared libraries"
+
+    The guarantee above is about *installing*. At **import** time,
+    every Shared library loads in the one engine process and they
+    share a single import path, so for a package two libraries have
+    in common the one that loads first wins — the second library
+    gets the first library's version regardless of its own pin. If
+    the versions are incompatible, the second library's nodes fail
+    to import and appear as placeholders in the editor.
+
+    Two libraries pinning different `torch` versions is therefore
+    safe to *install*, and only actually safe to *run* if at least
+    one of them is **Isolated**. This mostly bites media generation
+    libraries, which share `diffusers`, `transformers`,
+    `tokenizers`, `torch`, and `torchvision`. Running the heavier
+    one Isolated is the fix — see
+    [Two libraries installed together, and one of them shows placeholder nodes](../troubleshooting.md#two-libraries-installed-together-and-one-of-them-shows-placeholder-nodes).
 
 ### Process isolation: the Isolated mode
 
@@ -235,6 +252,11 @@ library failed to load. The editor swaps in a placeholder so your
 workflow file isn't corrupted. Check the **Errors** filter in the
 **Libraries** panel for the underlying load error; once you fix it,
 reopening the workflow uses the real node again.
+
+If the error names a third-party package (`diffusers`,
+`transformers`, `tokenizers`, `torch`) rather than the library
+itself, and you have more than one media library installed, see
+[Two libraries installed together, and one of them shows placeholder nodes](../troubleshooting.md#two-libraries-installed-together-and-one-of-them-shows-placeholder-nodes).
 
 ### Looking for the raw error text
 
