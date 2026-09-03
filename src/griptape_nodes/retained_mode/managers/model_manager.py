@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -98,6 +99,8 @@ class DownloadParams:
 
 _DOWNLOAD_PROGRESS_EMIT_INTERVAL = 1.0  # seconds between stdout progress events
 _PROGRESS_PIPE_ENV_VAR = "GRIPTAPE_NODES_PROGRESS_PIPE"  # set by parent to enable JSON stdout emission
+_STATUS_READ_ATTEMPTS = 5  # tries before giving up on a status file a writer is holding
+_STATUS_READ_RETRY_DELAY = 0.05  # seconds to wait out that writer between tries
 
 
 def _create_progress_tracker(model_id: str) -> type[tqdm]:  # noqa: C901
@@ -228,6 +231,95 @@ def _create_progress_tracker(model_id: str) -> type[tqdm]:  # noqa: C901
             sys.stdout.flush()
 
     return BoundModelDownloadTracker
+
+
+def _load_status_file(status_file: Path) -> dict | None:
+    """Read a download status file, waiting out a write in progress.
+
+    Status files are written under an exclusive lock (`ModelManager._write_download_status`
+    -> `File.write_text` -> os_manager's portalocker write), and that write truncates the
+    file before it takes the lock. Windows byte-range locks are mandatory, so a reader that
+    lands inside the lock opens the file and then fails on the locked range with
+    `PermissionError: [Errno 13] Permission denied`; one that lands in the truncate window
+    sees an empty file instead. The lock is held per handle, so the writing process is no
+    more exempt than any other reader.
+
+    griptape-ai/griptape-nodes-engine#5373 answered this for the startup scan by taking the
+    worker's reader away. This is the reader that has to stay: the editor asks what is
+    downloading while something is downloading. Both windows are milliseconds wide, but a
+    download rewrites its status file every second and again the moment it completes, so that
+    poll lands in them regularly -- reporting it is what turned a finished download into
+    "Failed to get download status: [Errno 13] Permission denied". Retrying reads the value
+    the writer was in the middle of committing instead.
+
+    Args:
+        status_file: Path to the status file to read.
+
+    Returns:
+        dict | None: The parsed status data, or None if the file is missing, is still
+            unreadable after every attempt, or does not hold a status record.
+    """
+    read_error: OSError | ValueError | None = None
+
+    for attempt in range(_STATUS_READ_ATTEMPTS):
+        try:
+            with status_file.open(encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return None
+        # PermissionError is the held lock; the other two are a half-written file.
+        except (PermissionError, UnicodeDecodeError, json.JSONDecodeError) as e:
+            read_error = e
+            if attempt < _STATUS_READ_ATTEMPTS - 1:
+                time.sleep(_STATUS_READ_RETRY_DELAY)
+        else:
+            if not isinstance(data, dict):
+                logger.warning("Status file '%s' does not contain a download record; ignoring it", status_file)
+                return None
+            return data
+
+    logger.warning(
+        "Could not read status file '%s' after %d attempts: %s", status_file, _STATUS_READ_ATTEMPTS, read_error
+    )
+    return None
+
+
+def _build_download_status(data: dict) -> ModelDownloadStatus | None:
+    """Build a ModelDownloadStatus from the contents of a status file.
+
+    Args:
+        data: Parsed status file data.
+
+    Returns:
+        ModelDownloadStatus | None: The status, or None if required fields are missing.
+    """
+    missing_fields = [field for field in ("model_id", "status", "started_at", "updated_at") if field not in data]
+    if missing_fields:
+        logger.warning("Skipping a download record missing required fields: %s", ", ".join(missing_fields))
+        return None
+
+    # Get byte counts from status file
+    total_bytes = data.get("total_bytes", 0)
+    downloaded_bytes = data.get("downloaded_bytes", 0)
+
+    # For simplified tracking, failed_bytes is calculated
+    failed_bytes = 0
+    if data["status"] == "failed":
+        failed_bytes = total_bytes - downloaded_bytes
+
+    return ModelDownloadStatus(
+        model_id=data["model_id"],
+        status=data["status"],
+        started_at=data["started_at"],
+        updated_at=data["updated_at"],
+        total_bytes=total_bytes,
+        completed_bytes=downloaded_bytes,
+        failed_bytes=failed_bytes,
+        completed_at=data.get("completed_at"),
+        local_path=data.get("local_path"),
+        failed_at=data.get("failed_at"),
+        error_message=data.get("error_message"),
+    )
 
 
 class ModelManager(EngineScoped):
@@ -1002,39 +1094,11 @@ class ModelManager(EngineScoped):
         """
         status_file = self._get_status_file_path(model_id)
 
-        if not status_file.exists():
+        data = _load_status_file(status_file)
+        if data is None:
             return None
 
-        try:
-            with status_file.open(encoding="utf-8") as f:
-                data = json.load(f)
-
-            # Get byte counts from status file
-            total_bytes = data.get("total_bytes", 0)
-            downloaded_bytes = data.get("downloaded_bytes", 0)
-
-            # For simplified tracking, failed_bytes is calculated
-            failed_bytes = 0
-            if data.get("status") == "failed":
-                failed_bytes = total_bytes - downloaded_bytes
-
-            return ModelDownloadStatus(
-                model_id=data["model_id"],
-                status=data["status"],
-                started_at=data["started_at"],
-                updated_at=data["updated_at"],
-                total_bytes=total_bytes,
-                completed_bytes=downloaded_bytes,
-                failed_bytes=failed_bytes,
-                completed_at=data.get("completed_at"),
-                local_path=data.get("local_path"),
-                failed_at=data.get("failed_at"),
-                error_message=data.get("error_message"),
-            )
-
-        except (json.JSONDecodeError, KeyError) as e:
-            logger.warning("Failed to read status file for model '%s': %s", model_id, e)
-            return None
+        return _build_download_status(data)
 
     def _list_all_download_statuses(self) -> list[ModelDownloadStatus]:
         """List all model download statuses from status files.
@@ -1049,19 +1113,16 @@ class ModelManager(EngineScoped):
 
         statuses = []
         for status_file in status_dir.glob("*.json"):
-            try:
-                with status_file.open(encoding="utf-8") as f:
-                    data = json.load(f)
-
-                model_id = data.get("model_id", "")
-                if model_id:
-                    status = self._read_model_download_status(model_id)
-                    if status:
-                        statuses.append(status)
-
-            except (json.JSONDecodeError, KeyError) as e:
-                logger.warning("Failed to read status file '%s': %s", status_file, e)
+            # Build from what this file holds rather than re-reading it through
+            # _read_model_download_status: the second read only doubles the odds of
+            # landing on a writer holding the lock.
+            data = _load_status_file(status_file)
+            if data is None:
                 continue
+
+            status = _build_download_status(data)
+            if status is not None:
+                statuses.append(status)
 
         return statuses
 
@@ -1078,19 +1139,15 @@ class ModelManager(EngineScoped):
 
         unfinished_models = []
         for status_file in status_dir.glob("*.json"):
-            try:
-                with status_file.open(encoding="utf-8") as f:
-                    data = json.load(f)
-
-                status = data.get("status", "")
-                model_id = data.get("model_id", "")
-
-                if model_id and status in ("downloading", "failed"):
-                    unfinished_models.append(model_id)
-
-            except (json.JSONDecodeError, KeyError) as e:
-                logger.warning("Failed to read status file '%s': %s", status_file, e)
+            data = _load_status_file(status_file)
+            if data is None:
                 continue
+
+            status = data.get("status", "")
+            model_id = data.get("model_id", "")
+
+            if model_id and status in ("downloading", "failed"):
+                unfinished_models.append(model_id)
 
         return unfinished_models
 
