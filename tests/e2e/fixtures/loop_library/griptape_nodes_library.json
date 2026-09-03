@@ -1,0 +1,71 @@
+{
+  "name": "Griptape Nodes Library",
+  "library_schema_version": "0.7.0",
+  "metadata": {
+    "author": "Test Fixture",
+    "description": "Minimal library used by loop-body packaging tests",
+    "library_version": "0.1.0",
+    "engine_version": "0.0.0",
+    "tags": ["test"],
+    "dependencies": {
+      "pip_dependencies": []
+    }
+  },
+  "categories": [
+    {
+      "test": {
+        "title": "test",
+        "description": "Test nodes",
+        "color": "border-gray-500",
+        "icon": "Folder"
+      }
+    }
+  ],
+  "nodes": [
+    {
+      "class_name": "StartFlow",
+      "file_path": "loop_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Entry node for a packaged flow",
+        "display_name": "Start Flow"
+      }
+    },
+    {
+      "class_name": "EndFlow",
+      "file_path": "loop_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Exit node for a packaged flow",
+        "display_name": "End Flow"
+      }
+    },
+    {
+      "class_name": "LoopBodyNode",
+      "file_path": "loop_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Copies its `text` input to its `result` output",
+        "display_name": "Loop Body"
+      }
+    },
+    {
+      "class_name": "LoopStartNode",
+      "file_path": "loop_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Iterative start node over a fixed list",
+        "display_name": "Loop Start"
+      }
+    },
+    {
+      "class_name": "LoopEndNode",
+      "file_path": "loop_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Iterative end node",
+        "display_name": "Loop End"
+      }
+    }
+  ]
+}
