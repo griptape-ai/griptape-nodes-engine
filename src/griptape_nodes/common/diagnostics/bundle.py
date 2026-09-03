@@ -23,11 +23,12 @@ redaction counts cover the whole bundle rather than the report alone.
 
 from __future__ import annotations
 
+import io
 import shutil
 import tempfile
 import zipfile
 from pathlib import Path
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING, NamedTuple, Self
 
 from pydantic import BaseModel, Field
 
@@ -37,7 +38,7 @@ from griptape_nodes.common.diagnostics.report import (
 )
 
 if TYPE_CHECKING:
-    from griptape_nodes.common.diagnostics.health import HealthReport
+    from griptape_nodes.common.diagnostics.health import HealthCheckResult, HealthReport
     from griptape_nodes.common.diagnostics.redaction import Redactor
     from griptape_nodes.common.diagnostics.report import DiagnosticsReport
 
@@ -60,6 +61,35 @@ WORKFLOW_DIRECTORY_NAME = "workflow"
 DEFAULT_MAX_LOG_BYTES = 20 * 1024 * 1024
 
 TRUNCATION_NOTICE = "... earlier lines in this file were left out to keep the bundle small ...\n"
+
+_BYTES_PER_MEGABYTE = 1024 * 1024
+
+
+def _format_size(num_bytes: int) -> str:
+    """Return a byte count in the unit that reads sensibly for it.
+
+    A budget of a few hundred bytes rendered as "0 MB" reads as a bug in the message
+    rather than as a very small budget.
+    """
+    if num_bytes < _BYTES_PER_MEGABYTE:
+        return f"{num_bytes} bytes"
+    return f"{num_bytes // _BYTES_PER_MEGABYTE} MB"
+
+
+class LogTail(NamedTuple):
+    """The end of a log file, and whether reading it left anything out.
+
+    Attributes:
+        text: The decoded tail, with a partial first line already dropped.
+        bytes_read: How much of the file was read, for charging against the budget.
+        truncated: Whether the file was longer than what was read. Decided from the size
+            seen while reading, so a file that grew between being listed and being read is
+            still reported as shortened.
+    """
+
+    text: str
+    bytes_read: int
+    truncated: bool
 
 
 class BundleEntry(BaseModel):
@@ -162,24 +192,31 @@ class DiagnosticsBundle:
         remaining = self._max_log_bytes
 
         for path in log_files:
-            try:
-                size = path.stat().st_size
-            except OSError as err:
-                warnings.append(f"Log file '{path.name}' could not be read and is not in this bundle: {err}")
+            staged_path = f"{LOGS_DIRECTORY_NAME}/{path.name}"
+
+            if any(entry.path == staged_path for entry in self._entries):
+                # Two log files from different directories can share a name. Staging both
+                # under one name would keep whichever was written last while the manifest
+                # claimed both were here.
+                warnings.append(
+                    f"Log file '{path.name}' was left out because another log file with the same name is "
+                    "already in this bundle."
+                )
                 continue
 
             if remaining <= 0:
                 warnings.append(
                     f"Log file '{path.name}' was left out because the bundle already holds "
-                    f"{self._max_log_bytes // (1024 * 1024)} MB of logs."
+                    f"{_format_size(self._max_log_bytes)} of logs."
                 )
                 continue
 
-            text = self._read_log_tail(path, remaining, warnings)
-            if text is None:
+            tail = self._read_log_tail(path, remaining, warnings)
+            if tail is None:
                 continue
 
-            if size > remaining:
+            text = tail.text
+            if tail.truncated:
                 warnings.append(
                     f"Only the most recent part of log file '{path.name}' is in this bundle; "
                     "earlier lines were left out to keep the bundle small."
@@ -187,13 +224,13 @@ class DiagnosticsBundle:
                 text = TRUNCATION_NOTICE + text
 
             self._write(
-                f"{LOGS_DIRECTORY_NAME}/{path.name}",
+                staged_path,
                 self._redactor.redact_text(text),
                 "An engine log file from the log directory.",
             )
             # Charged for what was actually copied, so a truncated file spends the rest of
             # the budget rather than borrowing against it.
-            remaining -= min(size, remaining)
+            remaining -= tail.bytes_read
 
     def add_workflow(self, workflow_path: Path, warnings: list[str]) -> None:
         """Copy the saved file of the workflow that was open, redacted.
@@ -231,10 +268,17 @@ class DiagnosticsBundle:
 
         Redacted on the way in: a check that failed may be quoting an error message from
         the network stack, and that message is not the engine's own text.
+
+        Field by field, before serializing. Redacting the finished JSON instead would miss
+        any secret whose own text has to be escaped to live in a JSON string, since the
+        escaped spelling is not what the redactor is looking for.
         """
+        redacted = health.model_copy(
+            update={"results": [self._redact_health_result(result) for result in health.results]}
+        )
         self._write(
             HEALTH_FILE_NAME,
-            self._redactor.redact_text(health.model_dump_json(indent=2)) + "\n",
+            redacted.model_dump_json(indent=2) + "\n",
             "What the health checks found, and what to do about each problem.",
         )
 
@@ -258,7 +302,15 @@ class DiagnosticsBundle:
 
         Call last: the redaction counts are read from the redactor here, so everything
         else has to be staged first for them to be complete.
+
+        The warnings are redacted here, not trusted. Most of them quote an ``OSError``,
+        and the text of one of those carries the absolute path it failed on -- which is
+        how the home directory would otherwise reach a bundle that promises it does not.
         """
+        # Redacted before the counts are read, so a removal made here is one the manifest
+        # reports rather than one it hides.
+        redacted_warnings = [self._redactor.redact_text(warning) for warning in dict.fromkeys(warnings)]
+
         manifest = DiagnosticsBundleManifest(
             generated_at=generated_at,
             engine_version=engine_version,
@@ -268,7 +320,7 @@ class DiagnosticsBundle:
                 counts=self._redactor.counts(),
             ),
             entries=sorted(self._entries, key=lambda entry: entry.path),
-            warnings=list(dict.fromkeys(warnings)),
+            warnings=redacted_warnings,
         )
 
         # Written directly rather than through _write: the manifest lists the bundle's
@@ -278,20 +330,30 @@ class DiagnosticsBundle:
         return manifest
 
     def to_zip_bytes(self) -> bytes:
-        """Zip the staged files and return the archive as bytes."""
-        archive_path = self._staging_dir.parent / f"{self._staging_dir.name}.zip"
-        try:
-            with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-                for path in sorted(self._staging_dir.rglob("*")):
-                    if path.is_file():
-                        archive.write(path, path.relative_to(self._staging_dir).as_posix())
-            return archive_path.read_bytes()
-        finally:
-            archive_path.unlink(missing_ok=True)
+        """Zip the staged files and return the archive as bytes.
+
+        Built in memory. A bundle is handed back to the caller as bytes either way, so
+        writing it to a predictably named file in the shared temporary directory first
+        would add a place for it to be read or redirected and buy nothing.
+        """
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for path in sorted(self._staging_dir.rglob("*")):
+                if path.is_file():
+                    archive.write(path, path.relative_to(self._staging_dir).as_posix())
+        return buffer.getvalue()
 
     def cleanup(self) -> None:
         """Remove the staging directory."""
         shutil.rmtree(self._staging_dir, ignore_errors=True)
+
+    def _redact_health_result(self, result: HealthCheckResult) -> HealthCheckResult:
+        """Return a check result with its free text redacted."""
+        remedy = result.remedy
+        if remedy is not None:
+            remedy = self._redactor.redact_text(remedy)
+
+        return result.model_copy(update={"summary": self._redactor.redact_text(result.summary), "remedy": remedy})
 
     def _write(self, relative_path: str, text: str, description: str) -> None:
         """Write one staged file and record it as an entry."""
@@ -300,12 +362,16 @@ class DiagnosticsBundle:
         path.write_text(text, encoding="utf-8")
         self._entries.append(BundleEntry(path=relative_path, size_bytes=path.stat().st_size, description=description))
 
-    def _read_log_tail(self, path: Path, max_bytes: int, warnings: list[str]) -> str | None:
-        """Return the last ``max_bytes`` of a log file as text, or None when it cannot be read.
+    def _read_log_tail(self, path: Path, max_bytes: int, warnings: list[str]) -> LogTail | None:
+        """Return the last ``max_bytes`` of a log file, or None when it cannot be read.
 
         The tail rather than the head, because the most recent lines are the ones that
         describe whatever went wrong. Reading binary and decoding with replacement keeps a
         log written by a library in an unexpected encoding from failing the whole bundle.
+
+        Whether anything was left out is decided here rather than by the caller, from the
+        size seen at the moment of reading. The engine keeps logging while its own bundle
+        is being built, so a size read beforehand can already be out of date.
         """
         try:
             with path.open("rb") as handle:
@@ -324,7 +390,8 @@ class DiagnosticsBundle:
             _, newline, remainder = text.partition("\n")
             if newline:
                 text = remainder
-        return text
+
+        return LogTail(text=text, bytes_read=len(raw), truncated=start > 0)
 
     def _readme_text(self) -> str:
         """Return the bundle's README."""

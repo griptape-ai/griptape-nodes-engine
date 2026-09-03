@@ -93,6 +93,34 @@ class TestSensitiveConfigKeys:
 
         assert "sk-ant-abcdefghijkl" not in redacted["notes"]
 
+    def test_keeps_the_secret_names_a_library_asked_the_engine_to_look_for(self) -> None:
+        """`secrets_to_register` holds names, not values, and the names are the whole signal."""
+        config = {"secrets_to_register": {"OPENAI_API_KEY": None, "HF_TOKEN": None}}
+        redactor = Redactor(normalize_identity=False)
+
+        redacted = redactor.redact_config(config)
+
+        assert sorted(redacted["secrets_to_register"]) == ["HF_TOKEN", "OPENAI_API_KEY"]
+        assert redactor.total_redactions() == 0
+
+    def test_normalizes_a_home_directory_hiding_in_a_dict_key(self) -> None:
+        """A library is free to key a settings subtree by absolute path."""
+        config = {str(Path.home() / "projects"): {"enabled": True}}
+        redactor = Redactor()
+
+        redacted = redactor.redact_config(config)
+
+        assert list(redacted) == ["~/projects"]
+        assert redactor.counts() == {RedactionReason.HOME_DIRECTORY: 1}
+
+    def test_a_redacted_key_still_masks_its_own_value(self) -> None:
+        """Sensitivity is decided on the original key, so rewriting it cannot unmask the value."""
+        config = {f"{Path.home()}_api_key": "sk-realvalue"}
+
+        redacted = Redactor().redact_config(config)
+
+        assert redacted == {"~_api_key": REDACTED}
+
 
 class TestKnownSecretValues:
     def test_removes_a_known_secret_from_free_text(self) -> None:
@@ -149,6 +177,25 @@ class TestKnownSecretValues:
         assert "a.b+c(d)e*f" not in redactor.redact_text("key a.b+c(d)e*f used")
         assert redactor.redact_text("axbxcxdxexf") == "axbxcxdxexf"
 
+    def test_removes_a_known_secret_used_as_a_bearer_token(self) -> None:
+        """The bearer rule runs first, so the exact match must not be what saves this one."""
+        known_value = "s3cr3t-value-12345"
+        redactor = Redactor(secret_values=[known_value], normalize_identity=False)
+
+        redacted = redactor.redact_text(f"Authorization: Bearer {known_value}")
+
+        assert known_value not in redacted
+        assert redacted == f"Authorization: Bearer {REDACTED}"
+
+    def test_removes_a_known_secret_used_as_a_url_query_parameter(self) -> None:
+        known_value = "s3cr3t-value-12345"
+        redactor = Redactor(secret_values=[known_value], normalize_identity=False)
+
+        redacted = redactor.redact_text(f"GET https://api.example.com/v1/things?api_key={known_value}&limit=10")
+
+        assert known_value not in redacted
+        assert "limit=10" in redacted
+
 
 class TestCredentialPatterns:
     @pytest.mark.parametrize(
@@ -191,6 +238,30 @@ class TestCredentialPatterns:
         assert "abcdefghijklmnopqrst" not in redacted
         assert scheme in redacted
         assert redactor.counts() == {RedactionReason.BEARER_TOKEN: 1}
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Bearer credentials required",
+            "Basic authentication is not supported",
+            "use bearer tokens here",
+        ],
+    )
+    def test_leaves_prose_after_bearer_or_basic_alone(self, text: str) -> None:
+        """The value class matches ordinary letters, so a low threshold redacts English."""
+        redactor = Redactor(normalize_identity=False)
+
+        assert redactor.redact_text(text) == text
+        assert redactor.total_redactions() == 0
+
+    def test_counts_one_credential_once(self) -> None:
+        """A rule that reran over an already-redacted value inflated the count."""
+        redactor = Redactor(normalize_identity=False)
+        url = "https://bucket.s3.amazonaws.com/f.png?X-Amz-Credential=AKIAIOSFODNN7EXAMPLE"
+
+        redactor.redact_text(url)
+
+        assert redactor.counts() == {RedactionReason.SIGNED_URL_PARAMETER: 1}
 
     def test_removes_the_signature_from_a_presigned_url(self) -> None:
         """A presigned URL in a log is a working credential until it expires."""

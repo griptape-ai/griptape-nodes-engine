@@ -7,8 +7,9 @@ import os
 import platform
 import sys
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, NamedTuple
+from urllib.parse import unquote, urlparse
 
 from dotenv import dotenv_values
 
@@ -37,9 +38,10 @@ from griptape_nodes.common.diagnostics.report import (
     SecretDiagnostics,
     SessionDiagnostics,
 )
-from griptape_nodes.common.log_capture import active_log_file, find_log_files, resolve_log_directory, session_log_lines
+from griptape_nodes.common.log_capture import active_log_file, find_log_files, session_log_lines
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_types import BaseNode
+from griptape_nodes.files.path_utils import canonicalize_for_io
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import (
     GetEngineVersionRequest,
@@ -74,7 +76,6 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 from griptape_nodes.retained_mode.managers.config_manager import USER_CONFIG_PATH
 from griptape_nodes.retained_mode.managers.secrets_manager import ENV_VAR_PATH
 from griptape_nodes.retained_mode.managers.settings import (
-    LOG_DIRECTORY_KEY,
     LOG_RETENTION_DAYS_KEY,
     LOG_TO_FILE_KEY,
     SECRETS_TO_REGISTER_KEY,
@@ -228,7 +229,10 @@ class DiagnosticsManager(EngineScoped):
                 generated_at=report.generated_at,
                 engine_version=report.engine.engine_version,
                 identity_normalized=request.normalize_identity,
-                warnings=warnings,
+                # The report's copy, which is already redacted and deduplicated. The
+                # bundle redacts warnings itself as well, and handing it the raw list
+                # would have the same removals counted twice.
+                warnings=report.collection_warnings,
             )
 
             try:
@@ -289,8 +293,14 @@ class DiagnosticsManager(EngineScoped):
 
         Kept out of the async caller because it touches the filesystem to tell a
         directory from a file name.
+
+        Canonicalized here even though ``WriteFileRequest`` would do it again, because a
+        relative path has to be anchored before the directory test below and the write
+        can agree on what it means. Left relative, ``-o .`` is tested against the working
+        directory and then written relative to the workspace, so the bundle lands
+        somewhere the user was not told about.
         """
-        destination = Path(output_path)
+        destination = canonicalize_for_io(output_path)
         if destination.is_dir():
             return destination / file_name
         return destination
@@ -318,13 +328,29 @@ class DiagnosticsManager(EngineScoped):
             logger.error(details)
             return CollectDiagnosticsResultFailure(result_details=details)
 
+        written_name = self._file_name_from_url(url, fallback=file_name)
+
         return CollectDiagnosticsResultSuccess(
-            file_name=file_name,
+            file_name=written_name,
             size_bytes=len(data),
             manifest=manifest,
             url=url,
-            result_details=self._bundle_success_details(file_name, manifest, url),
+            result_details=self._bundle_success_details(written_name, manifest, url),
         )
+
+    def _file_name_from_url(self, url: str, fallback: str) -> str:
+        """Return the file name a download URL points at, or ``fallback`` when it has none.
+
+        Needed because the static files manager hands back a URL rather than the name it
+        wrote, and the name it wrote is not always the name it was given: bundles are
+        saved with ``CREATE_NEW``, so an existing one is kept and this one becomes
+        ``..._1.zip``. Reporting the requested name would point support at the older
+        bundle.
+        """
+        path = PurePosixPath(unquote(urlparse(url).path))
+        if not path.name:
+            return fallback
+        return path.name
 
     def _bundle_success_details(self, file_name: str, manifest: DiagnosticsBundleManifest, location: str) -> str:
         """Describe a collected bundle, including how much of it was hidden."""
@@ -367,7 +393,12 @@ class DiagnosticsManager(EngineScoped):
         # Both set last: the counts have to cover everything above, and a warning can be
         # raised by any section. Deduplicated because one unresolvable path can be hit by
         # more than one section, and a repeated warning reads as more than one problem.
-        report.collection_warnings = list(dict.fromkeys(warnings))
+        #
+        # Redacted like anything else, and before the counts are read. Most of these
+        # warnings quote an OSError, whose text carries the absolute path it failed on --
+        # which is how the home directory would otherwise reach a report that promises it
+        # has been replaced with `~`.
+        report.collection_warnings = [redactor.redact_text(warning) for warning in dict.fromkeys(warnings)]
         report.redaction = self._redaction_summary(redactor, normalize_identity=normalize_identity)
         return report
 
@@ -385,11 +416,24 @@ class DiagnosticsManager(EngineScoped):
         The Griptape Cloud key is passed in so the connection check can actually connect.
         It is used to open a socket and never written to the health report.
         """
-        context = HealthCheckContext(
-            report=report,
-            cloud_api_key=self.engine.secrets_manager.get_secret(CLOUD_API_KEY_NAME, should_error_on_not_found=False),
-        )
+        context = HealthCheckContext(report=report, cloud_api_key=self._cloud_api_key())
         return await run_health_checks(context)
+
+    def _cloud_api_key(self) -> str | None:
+        """Return the Griptape Cloud key for the connection check, or None when it cannot be read.
+
+        Reading a secret resolves the workspace, so a workspace that has gone missing
+        raises here. That is exactly the situation these checks exist to report, so it
+        must cost the connection check rather than the whole run.
+        """
+        try:
+            return self.engine.secrets_manager.get_secret(CLOUD_API_KEY_NAME, should_error_on_not_found=False)
+        except OSError:
+            logger.warning(
+                "Could not read the Griptape Cloud API key while running health checks.",
+                exc_info=True,
+            )
+            return None
 
     def _stage_logs(self, bundle: DiagnosticsBundle, warnings: list[str]) -> None:
         """Add this session's log and the log files on disk to a bundle."""
@@ -402,8 +446,7 @@ class DiagnosticsManager(EngineScoped):
                 "Any log files from earlier sessions are still included."
             )
 
-        log_directory = self._configured_log_directory(self.engine.config_manager)
-        log_files = find_log_files(log_directory)
+        log_files = find_log_files(self.engine.config_manager.log_directory)
         if not log_files:
             warnings.append(
                 "No engine log files were found. Log files are only written when the "
@@ -452,10 +495,10 @@ class DiagnosticsManager(EngineScoped):
         install_source, commit_id = get_install_source()
 
         return EngineDiagnostics(
-            engine_id=self._resolve_engine_id(),
-            engine_name=self._resolve_engine_name(),
+            engine_id=self.engine.engine_identity_manager.engine_id,
+            engine_name=self.engine.engine_identity_manager.engine_name,
             engine_version=await self._resolve_engine_version(),
-            session_id=self._resolve_session_id(),
+            session_id=self.engine.session_manager.active_session_id,
             python_version=sys.version,
             python_executable=redactor.redact_path(sys.executable),
             process_id=os.getpid(),
@@ -497,8 +540,6 @@ class DiagnosticsManager(EngineScoped):
 
     def _build_paths_section(self, redactor: Redactor, warnings: list[str]) -> PathDiagnostics:
         """List where the engine reads and writes, noting which of those do not exist."""
-        config_manager = self.engine.config_manager
-
         candidates: dict[str, Path | None] = {
             "workspace_directory": self._workspace_path(),
             "config_directory": USER_CONFIG_PATH.parent,
@@ -507,7 +548,7 @@ class DiagnosticsManager(EngineScoped):
             "workspace_env_file": self._workspace_env_path(warnings),
             "libraries_directory": self._resolved_path_setting("libraries_directory", warnings),
             "static_files_directory": self._resolved_path_setting("static_files_directory", warnings),
-            "log_directory": self._configured_log_directory(config_manager),
+            "log_directory": self.engine.config_manager.log_directory,
         }
 
         missing = [redactor.redact_path(path) for path in candidates.values() if path is not None and not path.exists()]
@@ -648,7 +689,7 @@ class DiagnosticsManager(EngineScoped):
                     registered_path=(
                         redactor.redact_path(lib_info.registered_path) if lib_info.registered_path else None
                     ),
-                    problems=self._collated_problems(library_manager, lib_info, redactor),
+                    problems=self._collated_problems(lib_info, redactor),
                 )
             )
 
@@ -678,7 +719,7 @@ class DiagnosticsManager(EngineScoped):
     def _build_logs_section(self, redactor: Redactor, warnings: list[str]) -> LogDiagnostics:
         """Report how logging is configured and which log files exist."""
         config_manager = self.engine.config_manager
-        log_directory = self._configured_log_directory(config_manager)
+        log_directory = config_manager.log_directory
 
         files: list[LogFileDiagnostics] = []
         current_file = active_log_file()
@@ -841,9 +882,9 @@ class DiagnosticsManager(EngineScoped):
         # dotenv reports a bare `FOO` (no `=`) as None. Treat it as declared-but-empty.
         return {name: value or "" for name, value in values.items()}
 
-    def _collated_problems(self, library_manager: Any, lib_info: Any, redactor: Redactor) -> str | None:
+    def _collated_problems(self, lib_info: Any, redactor: Redactor) -> str | None:
         """Return a library's problems as the engine already formats them, redacted."""
-        collated = library_manager.collate_problems_for_lib_info(lib_info)
+        collated = self.engine.library_manager.collate_problems_for_lib_info(lib_info)
         if collated is None:
             return None
         return redactor.redact_text(collated)
@@ -879,35 +920,6 @@ class DiagnosticsManager(EngineScoped):
         if configured_path.is_absolute():
             return configured_path
         return workspace / configured_path
-
-    def _configured_log_directory(self, config_manager: Any) -> Path:
-        """Return the directory engine logs are written to."""
-        configured = config_manager.get_config_value(LOG_DIRECTORY_KEY, default="", cast_type=str)
-        return resolve_log_directory(configured)
-
-    def _resolve_engine_id(self) -> str | None:
-        """Resolve the engine's identifier, or None when it cannot be determined."""
-        try:
-            return self.engine.engine_identity_manager.engine_id
-        except Exception:
-            logger.warning("Could not resolve engine id for the diagnostics report.", exc_info=True)
-            return None
-
-    def _resolve_engine_name(self) -> str | None:
-        """Resolve the engine's name, or None when it cannot be determined."""
-        try:
-            return self.engine.engine_identity_manager.engine_name
-        except Exception:
-            logger.warning("Could not resolve engine name for the diagnostics report.", exc_info=True)
-            return None
-
-    def _resolve_session_id(self) -> str | None:
-        """Resolve the active session id, or None when no session is active."""
-        try:
-            return self.engine.session_manager.active_session_id
-        except Exception:
-            logger.warning("Could not resolve the active session id for the diagnostics report.", exc_info=True)
-            return None
 
     async def _resolve_engine_version(self) -> str | None:
         """Resolve the engine version string, or None when it cannot be determined."""

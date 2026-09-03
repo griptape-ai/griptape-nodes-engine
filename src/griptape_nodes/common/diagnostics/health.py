@@ -144,14 +144,12 @@ class CloudConnectionCheck(HealthCheck):
                 remedy=f"Run 'gtn init' to set your API key, or set {CLOUD_API_KEY_NAME} in your environment.",
             )
 
-        # Same environment override the engine's own connection honors, so this checks
-        # the API the engine would actually talk to rather than always production.
-        base_url = os.getenv("GRIPTAPE_NODES_API_BASE_URL", self._DEFAULT_API_BASE_URL)
-        url = urljoin(base_url.replace("http", "ws"), self._WEBSOCKET_PATH)
         headers = {"Authorization": f"Bearer {context.cloud_api_key}"}
 
         try:
-            await asyncio.wait_for(self._connect_and_disconnect(url, headers), timeout=self._CONNECTION_TIMEOUT)
+            await asyncio.wait_for(
+                self._connect_and_disconnect(self._websocket_url(), headers), timeout=self._CONNECTION_TIMEOUT
+            )
         except TimeoutError:
             return HealthCheckResult(
                 name=self.name,
@@ -179,6 +177,16 @@ class CloudConnectionCheck(HealthCheck):
             status=HealthStatus.PASS,
             summary="Connected to Griptape Cloud.",
         )
+
+    def _websocket_url(self) -> str:
+        """Return the events endpoint this engine's connection would actually use.
+
+        Honors the same ``GRIPTAPE_NODES_API_BASE_URL`` override the engine's own client
+        reads, so a check run against a staging API reports on staging rather than always
+        reporting on production.
+        """
+        base_url = os.getenv("GRIPTAPE_NODES_API_BASE_URL", self._DEFAULT_API_BASE_URL)
+        return urljoin(base_url.replace("http", "ws"), self._WEBSOCKET_PATH)
 
     async def _connect_and_disconnect(self, url: str, headers: dict[str, str]) -> None:
         async with connect(url, additional_headers=headers):
@@ -341,6 +349,31 @@ class LogCaptureCheck(HealthCheck):
 
     async def run(self, context: HealthCheckContext) -> HealthCheckResult:
         logs = context.report.logs
+        session_recorded = logs.session_buffer_lines > 0
+
+        if not session_recorded and not logs.log_to_file:
+            # Nothing is being kept anywhere, which makes the next bundle from this engine
+            # empty of the one thing a bundle is collected for.
+            return HealthCheckResult(
+                name=self.name,
+                status=HealthStatus.FAIL,
+                summary="Nothing this engine logs is being kept, so a diagnostics bundle will contain no logs.",
+                remedy=(
+                    "Set 'logging.session_log_buffer_lines' to a number above zero, and turn on the "
+                    "'logging.log_to_file' setting so logs survive a restart."
+                ),
+            )
+
+        if not session_recorded:
+            return HealthCheckResult(
+                name=self.name,
+                status=HealthStatus.WARN,
+                summary="This session is not being recorded, so a bundle collected now holds only earlier log files.",
+                remedy=(
+                    "Set 'logging.session_log_buffer_lines' to a number above zero to record the session a "
+                    "bundle is collected from."
+                ),
+            )
 
         if not logs.log_to_file:
             return HealthCheckResult(
@@ -435,9 +468,11 @@ async def run_health_checks(
     """
     results: list[HealthCheckResult] = []
     for check_class in checks:
-        check = check_class()
         try:
-            results.append(await check.run(context))
+            # Construction is inside the guard as well as the call. A check is free to do
+            # its setup in __init__, and one that fails there would otherwise take down
+            # every check after it.
+            results.append(await check_class().run(context))
         except Exception as err:
             results.append(
                 HealthCheckResult(

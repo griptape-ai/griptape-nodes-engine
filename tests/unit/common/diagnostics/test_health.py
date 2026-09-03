@@ -55,6 +55,7 @@ def _report(**overrides: object) -> DiagnosticsReport:
         "logs": LogDiagnostics(
             log_to_file=True,
             log_directory="~/logs",
+            session_buffer_lines=5000,
             files=[LogFileDiagnostics(name="engine-1.log", size_bytes=10, modified_at="2026-01-01T00:00:00+00:00")],
         ),
     }
@@ -221,7 +222,9 @@ class TestLogCaptureCheck:
 
     @pytest.mark.asyncio
     async def test_warns_when_file_logging_is_off(self) -> None:
-        result = await LogCaptureCheck().run(_check_context(logs=LogDiagnostics(log_to_file=False)))
+        logs = LogDiagnostics(log_to_file=False, session_buffer_lines=5000)
+
+        result = await LogCaptureCheck().run(_check_context(logs=logs))
 
         assert result.status is HealthStatus.WARN
         assert result.remedy is not None
@@ -229,11 +232,36 @@ class TestLogCaptureCheck:
     @pytest.mark.asyncio
     async def test_warns_when_logging_is_on_but_nothing_was_written(self) -> None:
         """The signal that the log directory cannot be written to."""
-        logs = LogDiagnostics(log_to_file=True, log_directory="~/logs", files=[])
+        logs = LogDiagnostics(log_to_file=True, log_directory="~/logs", session_buffer_lines=5000, files=[])
 
         result = await LogCaptureCheck().run(_check_context(logs=logs))
 
         assert result.status is HealthStatus.WARN
+
+    @pytest.mark.asyncio
+    async def test_warns_when_the_session_buffer_is_disabled(self) -> None:
+        """Log files exist, but the session that is about to be bundled is not being kept."""
+        logs = LogDiagnostics(
+            log_to_file=True,
+            log_directory="~/logs",
+            session_buffer_lines=0,
+            files=[LogFileDiagnostics(name="engine-1.log", size_bytes=10, modified_at="2026-01-01T00:00:00+00:00")],
+        )
+
+        result = await LogCaptureCheck().run(_check_context(logs=logs))
+
+        assert result.status is HealthStatus.WARN
+        assert "not being recorded" in result.summary
+
+    @pytest.mark.asyncio
+    async def test_fails_when_nothing_is_being_kept_anywhere(self) -> None:
+        """No buffer and no files means the next bundle carries no logs at all."""
+        logs = LogDiagnostics(log_to_file=False, session_buffer_lines=0)
+
+        result = await LogCaptureCheck().run(_check_context(logs=logs))
+
+        assert result.status is HealthStatus.FAIL
+        assert result.remedy is not None
 
 
 class TestCloudConnectionCheck:
@@ -272,6 +300,17 @@ class TestCloudConnectionCheck:
 
         assert result.status is HealthStatus.PASS
 
+    def test_uses_the_production_events_endpoint_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("GRIPTAPE_NODES_API_BASE_URL", raising=False)
+
+        assert CloudConnectionCheck()._websocket_url() == "wss://api.nodes.griptape.ai/ws/engines/events?version=v2"
+
+    def test_honors_the_api_base_url_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A check run against staging must report on staging, not on production."""
+        monkeypatch.setenv("GRIPTAPE_NODES_API_BASE_URL", "https://custom.example.com")
+
+        assert CloudConnectionCheck()._websocket_url() == "wss://custom.example.com/ws/engines/events?version=v2"
+
 
 class _ExplodingCheck(HealthCheck):
     name = "Exploding Check"
@@ -279,6 +318,17 @@ class _ExplodingCheck(HealthCheck):
     async def run(self, _context: HealthCheckContext) -> HealthCheckResult:
         msg = "this check is itself broken"
         raise RuntimeError(msg)
+
+
+class _UnconstructableCheck(HealthCheck):
+    name = "Unconstructable Check"
+
+    def __init__(self) -> None:
+        msg = "this check cannot even be built"
+        raise RuntimeError(msg)
+
+    async def run(self, _context: HealthCheckContext) -> HealthCheckResult:
+        return HealthCheckResult(name=self.name, status=HealthStatus.PASS, summary="never reached")
 
 
 class _PassingCheck(HealthCheck):
@@ -296,6 +346,16 @@ class TestRunHealthChecks:
         assert [result.name for result in report.results] == ["Exploding Check", "Passing Check"]
         assert report.results[0].status is HealthStatus.FAIL
         assert "this check is itself broken" in report.results[0].summary
+        assert report.results[1].status is HealthStatus.PASS
+
+    @pytest.mark.asyncio
+    async def test_a_check_that_cannot_be_constructed_does_not_stop_the_others(self) -> None:
+        """A check is free to do its setup in __init__, so that has to be guarded too."""
+        report = await run_health_checks(_check_context(), checks=(_UnconstructableCheck, _PassingCheck))
+
+        assert [result.name for result in report.results] == ["Unconstructable Check", "Passing Check"]
+        assert report.results[0].status is HealthStatus.FAIL
+        assert "this check cannot even be built" in report.results[0].summary
         assert report.results[1].status is HealthStatus.PASS
 
     @pytest.mark.asyncio

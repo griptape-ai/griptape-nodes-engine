@@ -372,7 +372,7 @@ class LoggingSettings(BaseModel):
     session_log_buffer_lines: int = Field(
         category=LOGGING,
         default=5000,
-        description="How many of the most recent log lines the engine keeps in memory for the current session. These are always captured at full DEBUG detail regardless of log_level, so a problem report includes the details even if you had not turned up logging beforehand. Set to 0 to disable, which means a problem report can only include whatever reached the log files.",
+        description="How many of the most recent log lines the engine keeps in memory for the current session, so a problem report includes what just happened without you having to reproduce it. These lines carry whatever log_level allows, so raise log_level to DEBUG before reproducing a problem if you need debug detail in the report. Set to 0 to disable, which means a problem report can only include whatever reached the log files.",
     )
 
 

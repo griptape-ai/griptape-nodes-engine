@@ -14,6 +14,8 @@ hidden from them.
 
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 # Schema version for the report envelope. Bump when the shape changes so consumers
@@ -156,7 +158,7 @@ class ConfigDiagnostics(BaseModel):
 
     files: list[ConfigFileDiagnostics] = Field(default_factory=list)
     environment_overrides: list[str] = Field(default_factory=list)
-    merged: dict = Field(default_factory=dict)
+    merged: dict[str, Any] = Field(default_factory=dict)
 
 
 class SecretDiagnostics(BaseModel):

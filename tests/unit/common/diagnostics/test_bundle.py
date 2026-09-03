@@ -204,6 +204,57 @@ class TestLogFiles:
 
             assert f"{LOGS_DIRECTORY_NAME}/engine-1.log" in _entry_paths(bundle)
 
+    def test_a_file_exactly_at_the_budget_is_kept_whole(self, tmp_path: Path) -> None:
+        """Off by one here would stamp a truncation notice on a complete file."""
+        log_file = tmp_path / "engine-1.log"
+        log_file.write_text("x" * 200, encoding="utf-8")
+        warnings: list[str] = []
+
+        with DiagnosticsBundle(_redactor(), max_log_bytes=200) as bundle:
+            bundle.add_log_files([log_file], warnings)
+
+            contents = _read(bundle, f"{LOGS_DIRECTORY_NAME}/engine-1.log")
+
+        assert contents == "x" * 200
+        assert warnings == []
+
+    def test_a_second_log_with_the_same_name_is_reported_rather_than_overwriting_the_first(
+        self, tmp_path: Path
+    ) -> None:
+        """Two log directories can hold the same file name; one staged path can hold one file."""
+        first_dir = tmp_path / "current"
+        second_dir = tmp_path / "older"
+        first_dir.mkdir()
+        second_dir.mkdir()
+        first = first_dir / "engine-1.log"
+        second = second_dir / "engine-1.log"
+        first.write_text("from the current directory\n", encoding="utf-8")
+        second.write_text("from the older directory\n", encoding="utf-8")
+        warnings: list[str] = []
+
+        with DiagnosticsBundle(_redactor()) as bundle:
+            bundle.add_log_files([first, second], warnings)
+
+            staged = _entry_paths(bundle)
+            contents = _read(bundle, f"{LOGS_DIRECTORY_NAME}/engine-1.log")
+
+        assert staged == [f"{LOGS_DIRECTORY_NAME}/engine-1.log"]
+        assert contents == "from the current directory\n"
+        assert any("same name" in warning for warning in warnings)
+
+    def test_a_small_budget_is_stated_in_bytes_rather_than_as_zero_megabytes(self, tmp_path: Path) -> None:
+        """A budget rendered as `0 MB` reads as a bug in the message, not as a very small budget."""
+        first = tmp_path / "engine-1.log"
+        second = tmp_path / "engine-2.log"
+        first.write_text("x" * 200, encoding="utf-8")
+        second.write_text("y" * 200, encoding="utf-8")
+        warnings: list[str] = []
+
+        with DiagnosticsBundle(_redactor(), max_log_bytes=200) as bundle:
+            bundle.add_log_files([first, second], warnings)
+
+        assert any("200 bytes of logs" in warning for warning in warnings)
+
 
 class TestWorkflow:
     def test_copies_the_saved_workflow(self, tmp_path: Path) -> None:
@@ -322,6 +373,21 @@ class TestManifest:
             manifest = _manifest(bundle, ["a problem", "a problem", "another problem"])
 
         assert manifest.warnings == ["a problem", "another problem"]
+
+    def test_scrubs_a_secret_out_of_a_warning(self) -> None:
+        """Most warnings quote an OSError, and its text carries whatever it failed on."""
+        with DiagnosticsBundle(_redactor((_SECRET,))) as bundle:
+            manifest = _manifest(bundle, [f"could not read the file at {_SECRET}"])
+
+        assert _SECRET not in manifest.warnings[0]
+        assert REDACTED in manifest.warnings[0]
+
+    def test_counts_a_redaction_made_in_a_warning(self) -> None:
+        """The warnings are redacted before the counts are read, so the removal is visible."""
+        with DiagnosticsBundle(_redactor((_SECRET,))) as bundle:
+            manifest = _manifest(bundle, [f"could not read the file at {_SECRET}"])
+
+        assert manifest.redaction.total == 1
 
     def test_records_the_versions_that_produced_the_bundle(self) -> None:
         with DiagnosticsBundle(_redactor()) as bundle:

@@ -294,4 +294,4 @@ GTN_CONFIG_LOG_LEVEL=DEBUG gtn
 
 !!! tip
 
-    Even when the log level is `INFO`, the engine keeps the most recent 5,000 log lines in memory at full `DEBUG` detail, and a diagnostics bundle includes them as `logs/session.log`. So if a problem just happened, making a bundle now captures detail the log files never wrote down. `logging.session_log_buffer_lines` controls how many lines are kept.
+    The engine keeps the most recent 5,000 log lines in memory, and a diagnostics bundle includes them as `logs/session.log`. So if a problem just happened, making a bundle now captures it even if log files are turned off. Those lines carry whatever the log level allows, so set the log level to `DEBUG` before reproducing the problem if you need debug detail in the bundle. `logging.session_log_buffer_lines` controls how many lines are kept.
