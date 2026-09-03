@@ -842,6 +842,41 @@ class TestRouteToWorker:
         assert result["result"]["parameter_output_values"] == {"out": 99}
         worker_manager._tx.send_message.assert_called_once()  # type: ignore[union-attr]
 
+    @pytest.mark.asyncio
+    async def test_evicted_worker_raises_rather_than_cancelling(self, worker_manager: WorkerManager) -> None:
+        """A worker evicted mid-request must surface as an error, not a bare cancellation.
+
+        Eviction cancels the pending future. Left as CancelledError it is indistinguishable from
+        the artist pressing stop, and the resolution machine reaps those silently as CANCELED --
+        no NodeErrorEvent, only an unnamed INFO line, so the node comes back UNRESOLVED with
+        nothing anywhere saying why.
+        """
+        assert isinstance(worker_manager._tx.request_client, _FakeRequestClient)
+        fake_rc = worker_manager._tx.request_client
+        event_request = EventRequest(request=ExecuteNodeRequest(node_name="MyNode", parameter_values={}))
+
+        async def evict_mid_flight() -> None:
+            await asyncio.sleep(0)
+            await fake_rc.cancel_requests_by_tag(_ENGINE)
+
+        asyncio.create_task(evict_mid_flight())  # noqa: RUF006
+
+        with pytest.raises(RuntimeError, match="stopped responding and was shut down"):
+            await worker_manager.route_to_worker(event_request, _ENGINE, _WORKER_REQUEST_TOPIC)
+
+    @pytest.mark.asyncio
+    async def test_flow_cancellation_still_cancels(self, worker_manager: WorkerManager) -> None:
+        """Cancelling the awaiting task must still raise CancelledError, so stop stays stop."""
+        assert isinstance(worker_manager._tx.request_client, _FakeRequestClient)
+        event_request = EventRequest(request=ExecuteNodeRequest(node_name="MyNode", parameter_values={}))
+
+        task = asyncio.create_task(worker_manager.route_to_worker(event_request, _ENGINE, _WORKER_REQUEST_TOPIC))
+        await asyncio.sleep(0)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
 
 class TestGetTopicsToSubscribe:
     def test_orchestrator_includes_base_request_topic(self, worker_manager: WorkerManager) -> None:

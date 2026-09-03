@@ -435,7 +435,25 @@ class WorkerManager(EngineScoped):
         # workers and cancels their in-flight requests via
         # RequestClient.cancel_requests_by_tag, so a dead worker still surfaces
         # to the caller without a per-request ceiling.
-        return await future
+        try:
+            return await future
+        except asyncio.CancelledError:
+            # Eviction cancels this future from underneath the awaiting task. A bare
+            # CancelledError is indistinguishable from the artist pressing stop, and the
+            # resolution machine reaps those as CANCELED: it emits no NodeErrorEvent and logs
+            # only an unnamed line, so the node is given back as UNRESOLVED with nothing
+            # anywhere saying why. Only a cancellation aimed at THIS task is the flow
+            # cancelling; anything else means the future died under us, which for this future
+            # means the worker is gone.
+            task = asyncio.current_task()
+            if task is not None and task.cancelling() > 0:
+                raise
+            msg = (
+                f"Attempted to run a node in the separate process for worker '{worker_engine_id}'. "
+                "Failed because that process stopped responding and was shut down before it "
+                "returned a result. Editing the node still works and your workflow keeps it."
+            )
+            raise RuntimeError(msg) from None
 
     def _orchestrator_static_server_base_url(self) -> str | None:
         """The base URL this engine serves the workspace on, when it has resolved one.
