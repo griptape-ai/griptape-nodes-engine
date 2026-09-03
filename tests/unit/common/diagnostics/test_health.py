@@ -16,14 +16,17 @@ from griptape_nodes.common.diagnostics.health import (
     HealthCheck,
     HealthCheckContext,
     HealthCheckResult,
+    HealthReport,
     HealthStatus,
     LibraryCheck,
     LogCaptureCheck,
     SecretsCheck,
     WorkspaceCheck,
+    redact_health_report,
     run_health_checks,
     worst_status,
 )
+from griptape_nodes.common.diagnostics.redaction import RedactionReason, Redactor
 from griptape_nodes.common.diagnostics.report import (
     DiagnosticsReport,
     EngineDiagnostics,
@@ -34,6 +37,7 @@ from griptape_nodes.common.diagnostics.report import (
     PathDiagnostics,
     SecretDiagnostics,
 )
+from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 
 
 def _report(**overrides: object) -> DiagnosticsReport:
@@ -64,6 +68,12 @@ def _report(**overrides: object) -> DiagnosticsReport:
 
 def _check_context(**overrides: object) -> HealthCheckContext:
     return HealthCheckContext(report=_report(**overrides), cloud_api_key="test-key")
+
+
+def _health_report(*results: HealthCheckResult) -> HealthReport:
+    """Build a health report around given results, taking the overall status from them."""
+    checks = list(results)
+    return HealthReport(generated_at="2026-01-01T00:00:00+00:00", status=worst_status(checks), results=checks)
 
 
 class TestWorkspaceCheck:
@@ -180,6 +190,48 @@ class TestLibraryCheck:
 
         assert result.status is HealthStatus.WARN
         assert "Partly Broken" in result.summary
+
+    @pytest.mark.asyncio
+    async def test_warns_on_a_library_whose_state_it_cannot_interpret(self) -> None:
+        """A fitness this check has never heard of must not read as a clean load.
+
+        `NOT_EVALUATED` is one the engine really sets, and a value a newer engine invents
+        lands here too. Either way the library the report is being collected about is the
+        one nobody can say anything about.
+        """
+        libraries = [
+            LibraryDiagnostics(name="Never Evaluated", fitness="NOT_EVALUATED"),
+            LibraryDiagnostics(name="From The Future", fitness="SOMETHING_NEW"),
+            LibraryDiagnostics(name="No Fitness At All", fitness=None),
+        ]
+
+        result = await LibraryCheck().run(_check_context(libraries=libraries))
+
+        assert result.status is HealthStatus.WARN
+        assert "Never Evaluated" in result.summary
+        assert "From The Future" in result.summary
+        assert "No Fitness At All" in result.summary
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("fitness", list(LibraryManager.LibraryFitness))
+    async def test_only_a_good_library_reads_as_an_all_clear(self, fitness: LibraryManager.LibraryFitness) -> None:
+        """Every fitness the engine can report, and only GOOD is allowed to pass.
+
+        The check compares strings so a verdict stays readable from a bundle written by a
+        different engine version, which means a new `LibraryFitness` member compiles fine
+        and would otherwise be discovered by a user whose broken library reported an
+        all-clear. Driven off the enum so adding a member fails here first.
+        """
+        libraries = [LibraryDiagnostics(name="Under Test", fitness=fitness.value)]
+
+        result = await LibraryCheck().run(_check_context(libraries=libraries))
+
+        if fitness is LibraryManager.LibraryFitness.GOOD:
+            assert result.status is HealthStatus.PASS
+            return
+
+        assert result.status is not HealthStatus.PASS
+        assert "Under Test" in result.summary
 
 
 class TestSecretsCheck:
@@ -391,3 +443,50 @@ class TestWorstStatus:
         ]
 
         assert worst_status(results) is HealthStatus.FAIL
+
+
+class TestRedactHealthReport:
+    """A verdict is mostly quoted from an already-clean report, but a failed check writes its own.
+
+    That text can be an exception from the network stack or an OS error carrying the path it
+    failed on, so it is redacted here rather than by whoever writes the report out -- the
+    terminal a user pastes into a ticket needs it as much as a bundle does.
+    """
+
+    def test_removes_a_secret_a_failing_check_quoted(self) -> None:
+        report = _health_report(
+            HealthCheckResult(
+                name="Cloud",
+                status=HealthStatus.FAIL,
+                summary="rejected the key sk-abcdefgh12345678",
+                remedy="set it again with sk-abcdefgh12345678",
+            )
+        )
+        redactor = Redactor(normalize_identity=False)
+
+        redacted = redact_health_report(report, redactor)
+
+        assert "sk-abcdefgh12345678" not in redacted.results[0].summary
+        assert redacted.results[0].remedy is not None
+        assert "sk-abcdefgh12345678" not in redacted.results[0].remedy
+        assert redactor.counts() == {RedactionReason.API_KEY_PATTERN: 2}
+
+    def test_leaves_the_original_report_alone(self) -> None:
+        """The caller keeps holding the report it built, and the checks run against it."""
+        report = _health_report(
+            HealthCheckResult(name="Cloud", status=HealthStatus.FAIL, summary="key sk-abcdefgh12345678 refused")
+        )
+
+        redact_health_report(report, Redactor(normalize_identity=False))
+
+        assert report.results[0].summary == "key sk-abcdefgh12345678 refused"
+
+    def test_keeps_a_result_with_nothing_to_suggest(self) -> None:
+        """A remedy of None must stay None rather than becoming the string "None"."""
+        report = _health_report(HealthCheckResult(name="Workspace", status=HealthStatus.PASS, summary="fine"))
+
+        redacted = redact_health_report(report, Redactor(normalize_identity=False))
+
+        assert redacted.results[0].remedy is None
+        assert redacted.results[0].name == "Workspace"
+        assert redacted.status is HealthStatus.PASS

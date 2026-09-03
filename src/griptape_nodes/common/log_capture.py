@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from collections import deque
 from logging.handlers import RotatingFileHandler
@@ -147,6 +148,10 @@ class _CaptureState:
 
 _state = _CaptureState()
 
+# Serializes reconfiguration. The state above is process-wide, so two engines configuring
+# themselves at once are writing to the same handlers.
+_configuration_lock = threading.Lock()
+
 
 def default_log_directory() -> Path:
     """Return the directory engine logs are written to when none is configured."""
@@ -207,14 +212,19 @@ def configure_diagnostic_logging(
         retention_days: Delete log files older than this many days. Zero or less
             keeps them forever.
     """
-    _configure_buffer(buffer_lines)
+    # Held across the whole body. Two engines in one process load their configs on their
+    # own threads, and the sinks they are installing are shared: interleaved, one call can
+    # detach a handler the other has already replaced, leaking an open file, or both can
+    # install a handler and split one session's log across two files.
+    with _configuration_lock:
+        _configure_buffer(buffer_lines)
 
-    if not log_to_file:
-        _remove_file_handler()
-        return
+        if not log_to_file:
+            _remove_file_handler()
+            return
 
-    directory = log_directory if log_directory is not None else default_log_directory()
-    _configure_file_handler(directory, retention_days)
+        directory = log_directory if log_directory is not None else default_log_directory()
+        _configure_file_handler(directory, retention_days)
 
 
 def session_log_lines() -> list[str]:
@@ -366,12 +376,17 @@ def _configure_file_handler(directory: Path, retention_days: int) -> None:
     prune_log_files(directory, retention_days, protected_name=file_name)
 
     try:
+        # Opened now rather than on the first record (`delay=True`). A directory that
+        # exists but cannot be written to is a real setup -- a log directory pointed at a
+        # read-only volume, or one owned by another user -- and deferring the open moves
+        # that failure out of this guard and into the first log call, where it surfaces as
+        # a handler error on stderr while `active_log_file()` goes on naming a file that
+        # will never exist.
         handler = RotatingFileHandler(
             target_path,
             maxBytes=MAX_LOG_FILE_BYTES,
             backupCount=LOG_FILE_BACKUP_COUNT,
             encoding="utf-8",
-            delay=True,
         )
     except OSError:
         logger.warning(

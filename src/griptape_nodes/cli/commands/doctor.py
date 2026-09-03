@@ -68,13 +68,20 @@ def _print_health_report(health: HealthReport) -> None:
     console.print(table)
 
     remedies = [check for check in health.results if check.remedy is not None]
-    if not remedies:
-        console.print("[bold green]Everything checks out.[/bold green]")
+    if remedies:
+        console.print()
+        console.print("[bold]What to do:[/bold]")
+        for check in remedies:
+            # Padded rather than prefixed with spaces, so a remedy long enough to wrap stays
+            # indented under its own check name instead of starting again at the left margin.
+            console.print(Padding(Text(f"{check.name}: {check.remedy}"), (0, 0, 0, 2)))
         return
 
-    console.print()
-    console.print("[bold]What to do:[/bold]")
-    for check in remedies:
-        # Padded rather than prefixed with spaces, so a remedy long enough to wrap stays
-        # indented under its own check name instead of starting again at the left margin.
-        console.print(Padding(Text(f"{check.name}: {check.remedy}"), (0, 0, 0, 2)))
+    # No remedy is not the same as no problem: a check that could not run reports a failure
+    # with nothing to suggest. The all-clear is decided on the overall status, so it can
+    # never be printed underneath a red FAIL row.
+    if health.status is not HealthStatus.PASS:
+        console.print("[bold yellow]Some checks did not pass. What they found is in the table above.[/bold yellow]")
+        return
+
+    console.print("[bold green]Everything checks out.[/bold green]")

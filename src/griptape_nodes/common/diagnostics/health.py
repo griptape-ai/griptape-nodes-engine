@@ -31,6 +31,7 @@ from websockets.asyncio.client import connect
 from websockets.exceptions import InvalidHandshake
 
 if TYPE_CHECKING:
+    from griptape_nodes.common.diagnostics.redaction import Redactor
     from griptape_nodes.common.diagnostics.report import DiagnosticsReport
 
 # Schema version for the health report. Bump when the shape changes so a support tool
@@ -203,7 +204,12 @@ class LibraryCheck(HealthCheck):
     name: ClassVar[str] = "Libraries"
 
     _BROKEN_FITNESS = frozenset({"UNUSABLE", "MISSING"})
-    _DEGRADED_FITNESS = frozenset({"FLAWED"})
+    # The only fitness that means "loaded cleanly". Stated as what passes rather than as
+    # what fails, so anything else -- `NOT_EVALUATED`, or a value a newer engine added
+    # that this reader has never heard of -- is reported instead of falling through to an
+    # all-clear. A library whose state cannot be interpreted is exactly the one the report
+    # is being collected about.
+    _HEALTHY_FITNESS = frozenset({"GOOD"})
 
     async def run(self, context: HealthCheckContext) -> HealthCheckResult:
         libraries = context.report.libraries
@@ -217,7 +223,11 @@ class LibraryCheck(HealthCheck):
             )
 
         broken = [library.name for library in libraries if library.fitness in self._BROKEN_FITNESS]
-        degraded = [library.name for library in libraries if library.fitness in self._DEGRADED_FITNESS]
+        degraded = [
+            library.name
+            for library in libraries
+            if library.fitness not in self._BROKEN_FITNESS and library.fitness not in self._HEALTHY_FITNESS
+        ]
 
         if broken:
             return HealthCheckResult(
@@ -235,7 +245,7 @@ class LibraryCheck(HealthCheck):
                 name=self.name,
                 status=HealthStatus.WARN,
                 summary=(
-                    f"{len(degraded)} of {len(libraries)} libraries loaded with problems: {', '.join(degraded)}. "
+                    f"{len(degraded)} of {len(libraries)} libraries did not load cleanly: {', '.join(degraded)}. "
                     "Some of their nodes may be missing."
                 ),
                 remedy="Open the Libraries panel to see which nodes are affected.",
@@ -495,3 +505,36 @@ def worst_status(results: list[HealthCheckResult]) -> HealthStatus:
     if not results:
         return HealthStatus.PASS
     return max((result.status for result in results), key=lambda status: _STATUS_SEVERITY[status])
+
+
+def redact_health_report(health: HealthReport, redactor: Redactor) -> HealthReport:
+    """Return a copy of a health report with the checks' free text redacted.
+
+    A check that failed is often quoting an error message from somewhere else -- the
+    network stack, a library, an OS error carrying the path it failed on -- and none of
+    that text is the engine's own. It is redacted here rather than by whoever writes the
+    report out, because every destination needs it: the terminal a user pastes into a
+    ticket as readily as the ``doctor.json`` in a bundle.
+
+    Field by field, before serializing. Redacting finished JSON instead would miss any
+    secret whose text has to be escaped to live in a JSON string, since the escaped
+    spelling is not what the redactor is looking for.
+
+    Args:
+        health: The report to redact.
+        redactor: Applied to each result's summary and remedy. Its counts advance, so pass
+            the same one used for the rest of a bundle.
+
+    Returns:
+        A copy of the report. The original is left alone.
+    """
+    return health.model_copy(update={"results": [_redact_health_result(result, redactor) for result in health.results]})
+
+
+def _redact_health_result(result: HealthCheckResult, redactor: Redactor) -> HealthCheckResult:
+    """Return a check result with its free text redacted."""
+    remedy = result.remedy
+    if remedy is not None:
+        remedy = redactor.redact_text(remedy)
+
+    return result.model_copy(update={"summary": redactor.redact_text(result.summary), "remedy": remedy})

@@ -285,6 +285,48 @@ class TestWorkflow:
 
         assert any("gone.py" in warning for warning in warnings)
 
+    def test_a_users_name_in_the_file_name_does_not_reach_the_archive(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A workflow's file name is the user's own words, and often their own name.
+
+        The manifest's entry list and the archive's directory are the one part of a bundle
+        nothing else redacts: neither is written through `redact_text`.
+        """
+        monkeypatch.setattr("getpass.getuser", lambda: "samantha")
+        workflow = tmp_path / "samantha-final.py"
+        workflow.write_text("# a workflow\n", encoding="utf-8")
+
+        with DiagnosticsBundle(Redactor()) as bundle:
+            bundle.add_workflow(workflow, [])
+
+            staged = _entry_paths(bundle)
+            with zipfile.ZipFile(io.BytesIO(bundle.to_zip_bytes())) as archive:
+                names = archive.namelist()
+
+        assert staged == [f"{WORKFLOW_DIRECTORY_NAME}/user-final.py"]
+        assert f"{WORKFLOW_DIRECTORY_NAME}/user-final.py" in names
+
+    def test_the_replacement_stays_a_legal_file_name_on_windows(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`<user>` extracts fine here and not at all on the machine reading the bundle.
+
+        Angle brackets are legal on POSIX and illegal in a Windows file name, so leaving
+        them in would make a bundle that only some of the people who need it can open.
+        """
+        monkeypatch.setattr("getpass.getuser", lambda: "samantha")
+        workflow = tmp_path / "samantha-final.py"
+        workflow.write_text("# a workflow\n", encoding="utf-8")
+
+        with DiagnosticsBundle(Redactor()) as bundle:
+            bundle.add_workflow(workflow, [])
+
+            staged_path = _entry_paths(bundle)[0]
+
+        assert "<" not in staged_path
+        assert ">" not in staged_path
+
 
 class TestReportAndHealth:
     def test_writes_the_report_as_json(self) -> None:
@@ -396,6 +438,21 @@ class TestManifest:
         assert manifest.engine_version == "0.1.0"
         assert manifest.schema_version
         assert manifest.report_schema_version
+
+    def test_a_manifest_that_never_stated_normalization_does_not_claim_it(self) -> None:
+        """The field is a claim about what was removed, so its default has to fail closed.
+
+        An older bundle, or one round-tripped through a support tool that dropped the field,
+        would otherwise assert that the home directory and username had been taken out when
+        nothing checked.
+        """
+        assert DiagnosticsBundleManifest(generated_at=_GENERATED_AT).redaction.identity_normalized is False
+        assert (
+            DiagnosticsBundleManifest.model_validate_json(
+                json.dumps({"generated_at": _GENERATED_AT, "redaction": {"total": 3}})
+            ).redaction.identity_normalized
+            is False
+        )
 
 
 class TestZipAndCleanup:
