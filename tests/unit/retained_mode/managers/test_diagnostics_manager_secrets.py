@@ -1,0 +1,326 @@
+"""Tests for the secrets section of the diagnostics report.
+
+Two separate promises are kept here.
+
+The first is a hard guarantee: this section reports *which* secrets exist and *where*,
+never what they are. Values are read, because there is no way to know whether a key is
+set without reading it, but every one is reduced to a boolean before it can reach the
+report. `test_no_secret_value_reaches_the_report` is the assertion that matters.
+
+The second is usefulness. "My API key is set, so why does it say unauthorized?" is
+usually shadowing: a stale key exported in a shell, or a key blanked in the workspace
+`.env` covering a working one in the global file. So the section reports every source a
+key was found in, in the order the engine searches them, and which one actually won.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import TYPE_CHECKING, cast
+from unittest.mock import Mock
+
+import pytest
+
+from griptape_nodes.retained_mode.managers import diagnostics_manager as diagnostics_manager_module
+from griptape_nodes.retained_mode.managers.diagnostics_manager import DiagnosticsManager
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from griptape_nodes.common.diagnostics.report import SecretDiagnostics
+    from griptape_nodes.retained_mode.engine import Engine
+
+# The name of a secret, which is exactly what this section is allowed to report.
+_SECRET_NAME = "GTN_TEST_DIAGNOSTICS_KEY"  # noqa: S105
+_OTHER_NAME = "GTN_TEST_DIAGNOSTICS_OTHER"
+
+_OS_VALUE = "value-from-the-shell"
+_WORKSPACE_VALUE = "value-from-the-workspace-file"
+_GLOBAL_VALUE = "value-from-the-global-file"
+
+_ENVIRONMENT = "environment variable"
+_WORKSPACE = "workspace .env"
+_GLOBAL = "global .env"
+
+
+class _ExplodingSecretsManager:
+    """A secrets manager whose workspace cannot be resolved."""
+
+    @property
+    def workspace_env_path(self) -> Path:
+        msg = "the workspace directory could not be resolved"
+        raise OSError(msg)
+
+
+class _Layout:
+    """The three places the engine looks for a secret, wired up for one test."""
+
+    def __init__(self, manager: DiagnosticsManager, engine: Mock) -> None:
+        self.manager = manager
+        # Kept as the Mock rather than reached through `manager.engine`, which is typed as
+        # a real Engine and so cannot be reconfigured mid-test.
+        self.engine = engine
+
+    def declare(self, *names: str) -> None:
+        """Say which secrets the config asks the engine to register."""
+        self.engine.config_manager.get_config_value.return_value = dict.fromkeys(names, "")
+
+    def entries(self) -> list[SecretDiagnostics]:
+        return self.manager._build_secrets_section([])
+
+    def entry(self, name: str = _SECRET_NAME) -> SecretDiagnostics:
+        matches = [entry for entry in self.entries() if entry.name == name]
+        assert len(matches) == 1, f"expected exactly one entry for {name}, got {matches}"
+        return matches[0]
+
+
+@pytest.fixture
+def layout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Layout:
+    """A manager whose three secret sources are all empty files under tmp_path.
+
+    Each test fills in only the sources it cares about, so a test that reports the wrong
+    source fails rather than accidentally agreeing with the machine it runs on.
+    """
+    global_env = tmp_path / "global.env"
+    workspace_env = tmp_path / "workspace.env"
+    monkeypatch.setattr(diagnostics_manager_module, "ENV_VAR_PATH", global_env)
+    monkeypatch.delenv(_SECRET_NAME, raising=False)
+    monkeypatch.delenv(_OTHER_NAME, raising=False)
+
+    engine = Mock()
+    engine.config_manager.get_config_value.return_value = {}
+    engine.secrets_manager.workspace_env_path = workspace_env
+
+    manager = DiagnosticsManager(Mock(), engine=cast("Engine", engine))
+    return _Layout(manager, engine)
+
+
+def _write_env(path: Path, **values: str) -> None:
+    path.write_text("".join(f"{name}={value}\n" for name, value in values.items()), encoding="utf-8")
+
+
+class TestPrecedence:
+    def test_a_secret_found_only_in_the_global_file(self, layout: _Layout, tmp_path: Path) -> None:
+        _write_env(tmp_path / "global.env", **{_SECRET_NAME: _GLOBAL_VALUE})
+
+        entry = layout.entry()
+
+        assert entry.is_set is True
+        assert entry.effective_source == _GLOBAL
+        assert entry.sources == [_GLOBAL]
+
+    def test_the_workspace_file_beats_the_global_one(self, layout: _Layout, tmp_path: Path) -> None:
+        _write_env(tmp_path / "global.env", **{_SECRET_NAME: _GLOBAL_VALUE})
+        _write_env(tmp_path / "workspace.env", **{_SECRET_NAME: _WORKSPACE_VALUE})
+
+        entry = layout.entry()
+
+        assert entry.effective_source == _WORKSPACE
+        # Both are listed, highest priority first, so the reader can see the one that lost.
+        assert entry.sources == [_WORKSPACE, _GLOBAL]
+
+    def test_an_environment_variable_beats_both_files(
+        self, layout: _Layout, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _write_env(tmp_path / "global.env", **{_SECRET_NAME: _GLOBAL_VALUE})
+        _write_env(tmp_path / "workspace.env", **{_SECRET_NAME: _WORKSPACE_VALUE})
+        monkeypatch.setenv(_SECRET_NAME, _OS_VALUE)
+
+        entry = layout.entry()
+
+        assert entry.effective_source == _ENVIRONMENT
+        assert entry.sources == [_ENVIRONMENT, _WORKSPACE, _GLOBAL]
+
+    def test_sources_are_listed_in_the_order_the_engine_searches_them(
+        self, layout: _Layout, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The list is read top to bottom as "this is what won, and this is what it beat"."""
+        _write_env(tmp_path / "global.env", **{_SECRET_NAME: _GLOBAL_VALUE})
+        monkeypatch.setenv(_SECRET_NAME, _OS_VALUE)
+
+        entry = layout.entry()
+
+        assert entry.sources == [_ENVIRONMENT, _GLOBAL]
+
+
+class TestShadowing:
+    def test_an_environment_variable_matching_the_files_is_not_a_separate_source(
+        self, layout: _Layout, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An environment variable equal to the file value is not reported separately.
+
+        The engine copies every `.env` entry into the environment at startup, so mere
+        presence there means nothing. Reporting it would put "environment variable" on
+        every key and bury the one case that matters.
+        """
+        _write_env(tmp_path / "global.env", **{_SECRET_NAME: _GLOBAL_VALUE})
+        monkeypatch.setenv(_SECRET_NAME, _GLOBAL_VALUE)
+
+        entry = layout.entry()
+
+        assert entry.sources == [_GLOBAL]
+        assert entry.effective_source == _GLOBAL
+
+    def test_an_environment_variable_differing_from_the_files_is_reported(
+        self, layout: _Layout, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An environment variable that disagrees with the files is reported and wins.
+
+        This is the whole reason the comparison exists: a stale shell export beating the
+        `.env` file the user has been editing, which is invisible from the file alone.
+        """
+        _write_env(tmp_path / "global.env", **{_SECRET_NAME: _GLOBAL_VALUE})
+        monkeypatch.setenv(_SECRET_NAME, "something-else-entirely")
+
+        entry = layout.entry()
+
+        assert entry.effective_source == _ENVIRONMENT
+
+    def test_a_key_blanked_in_the_workspace_file_shadows_a_working_global_one(
+        self, layout: _Layout, tmp_path: Path
+    ) -> None:
+        """Reported as not set, because it is not: the empty workspace value wins outright.
+
+        Saying "set, in the global file" here would send someone to look at a file whose
+        value is never used.
+        """
+        _write_env(tmp_path / "global.env", **{_SECRET_NAME: _GLOBAL_VALUE})
+        _write_env(tmp_path / "workspace.env", **{_SECRET_NAME: ""})
+
+        entry = layout.entry()
+
+        assert entry.is_set is False
+        assert entry.effective_source is None
+        # Still listed under both, so the global value is visible as the thing being shadowed.
+        assert entry.sources == [_WORKSPACE, _GLOBAL]
+
+    def test_a_bare_name_with_no_value_counts_as_declared_but_empty(self, layout: _Layout, tmp_path: Path) -> None:
+        """`FOO` on a line of its own is how a `.env` reads when someone deleted the value."""
+        (tmp_path / "global.env").write_text(f"{_SECRET_NAME}\n", encoding="utf-8")
+
+        entry = layout.entry()
+
+        assert entry.is_set is False
+        assert entry.sources == [_GLOBAL]
+
+
+class TestDeclaredSecrets:
+    def test_a_declared_secret_that_was_never_filled_in_is_still_listed(self, layout: _Layout) -> None:
+        """Usually the answer to "why does this library say no key".
+
+        A key missing from the list entirely would look like a bug in the report rather
+        than a key nobody has set.
+        """
+        layout.declare(_SECRET_NAME)
+
+        entry = layout.entry()
+
+        assert entry.is_set is False
+        assert entry.sources == []
+        assert entry.effective_source is None
+        assert entry.declared_in_config is True
+
+    def test_a_secret_set_but_not_declared_is_marked_as_undeclared(self, layout: _Layout, tmp_path: Path) -> None:
+        """A key the libraries never ask for: set, but nothing will read it."""
+        _write_env(tmp_path / "global.env", **{_SECRET_NAME: _GLOBAL_VALUE})
+
+        entry = layout.entry()
+
+        assert entry.is_set is True
+        assert entry.declared_in_config is False
+
+    def test_a_declared_secret_that_is_set_is_marked_as_both(self, layout: _Layout, tmp_path: Path) -> None:
+        layout.declare(_SECRET_NAME)
+        _write_env(tmp_path / "global.env", **{_SECRET_NAME: _GLOBAL_VALUE})
+
+        entry = layout.entry()
+
+        assert entry.is_set is True
+        assert entry.declared_in_config is True
+
+    def test_a_declared_secret_set_only_in_the_environment_is_reported(
+        self, layout: _Layout, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Nothing in any file, so the key is only a candidate because the config declared it."""
+        layout.declare(_SECRET_NAME)
+        monkeypatch.setenv(_SECRET_NAME, _OS_VALUE)
+
+        entry = layout.entry()
+
+        assert entry.is_set is True
+        assert entry.effective_source == _ENVIRONMENT
+
+    def test_entries_are_sorted_by_name(self, layout: _Layout, tmp_path: Path) -> None:
+        layout.declare(_OTHER_NAME)
+        _write_env(tmp_path / "global.env", **{_SECRET_NAME: _GLOBAL_VALUE})
+
+        names = [entry.name for entry in layout.entries()]
+
+        assert names == sorted(names)
+        assert {_SECRET_NAME, _OTHER_NAME} <= set(names)
+
+
+class TestNoValuesEscape:
+    def test_no_secret_value_reaches_the_report(
+        self, layout: _Layout, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The guarantee behind this whole section, checked against the serialized output.
+
+        Every source is filled with a different value so a leak from any one of them
+        fails this test rather than the other two masking it.
+        """
+        layout.declare(_SECRET_NAME)
+        _write_env(tmp_path / "global.env", **{_SECRET_NAME: _GLOBAL_VALUE})
+        _write_env(tmp_path / "workspace.env", **{_SECRET_NAME: _WORKSPACE_VALUE})
+        monkeypatch.setenv(_SECRET_NAME, _OS_VALUE)
+
+        entries = layout.entries()
+
+        serialized = json.dumps([entry.model_dump() for entry in entries])
+        assert _OS_VALUE not in serialized
+        assert _WORKSPACE_VALUE not in serialized
+        assert _GLOBAL_VALUE not in serialized
+        # The name is the diagnostic signal and is not a secret, so it has to survive.
+        assert _SECRET_NAME in serialized
+
+
+class TestUnreadableSources:
+    def test_a_missing_env_file_is_not_an_error(self, layout: _Layout) -> None:
+        """Neither file has to exist; plenty of engines are configured entirely by environment."""
+        assert layout.entries() == []
+
+    def test_an_unresolvable_workspace_path_is_reported_and_the_rest_still_collected(
+        self, layout: _Layout, tmp_path: Path
+    ) -> None:
+        """A workspace that cannot be resolved is often why a report is being collected."""
+        _write_env(tmp_path / "global.env", **{_SECRET_NAME: _GLOBAL_VALUE})
+        layout.engine.secrets_manager = _ExplodingSecretsManager()
+        warnings: list[str] = []
+
+        entries = layout.manager._build_secrets_section(warnings)
+
+        assert [entry.name for entry in entries] == [_SECRET_NAME]
+        assert any("workspace .env path" in warning for warning in warnings)
+
+
+class TestKnownSecretValues:
+    def test_returns_the_values_so_they_can_be_scrubbed_from_logs(self, layout: _Layout) -> None:
+        """Only non-empty values, so an unset key does not become a match-everything pattern.
+
+        The engine is the only thing that knows these, which makes it the only thing that
+        can find one a library logged verbatim.
+        """
+        layout.engine.secrets_manager._read_merged_env_files.return_value = {
+            _SECRET_NAME: _GLOBAL_VALUE,
+            _OTHER_NAME: "",
+        }
+
+        values = layout.manager._known_secret_values()
+
+        assert values == [_GLOBAL_VALUE]
+
+    def test_an_unreadable_env_file_costs_thoroughness_not_the_report(self, layout: _Layout) -> None:
+        """Pattern-based redaction still applies, so this degrades rather than fails."""
+        layout.engine.secrets_manager._read_merged_env_files.side_effect = OSError("permission denied")
+
+        assert layout.manager._known_secret_values() == []

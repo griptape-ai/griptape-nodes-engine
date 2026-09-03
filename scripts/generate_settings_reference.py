@@ -12,6 +12,11 @@ config_manager._load_config_from_env_vars parses. A mapping-valued setting (`typ
 with `additionalProperties`, e.g. artifacts, project_workspaces) gets a `__<KEY>` template,
 since any individual entry can be set that way. Arrays get "n/a": there is no string form
 the Settings model accepts for a list.
+
+Nested settings are also expanded one level, so `logging.log_to_file` gets a row of its own
+next to its parent, carrying the `GTN_CONFIG_LOGGING__LOG_TO_FILE` form of its env var. One
+level is where the keys people look up live; anything deeper is still reachable from the
+environment and is listed in its parent's env var column rather than growing the table.
 """
 
 import json
@@ -52,12 +57,63 @@ def generate() -> None:
     defs = schema.get("$defs", {})
     dumped_defaults = Settings().model_dump()
 
-    rows = [_build_row(name, prop, defs, dumped_defaults) for name, prop in properties.items()]
+    rows = _build_rows(properties, defs, dumped_defaults)
     markdown = _render_markdown(rows)
     # Match the repo's `make check` formatter (mdformat with the gfm plugin) so the
     # committed file is byte-identical to what the format check expects.
     formatted = mdformat.text(markdown, extensions=["gfm"])
     OUTPUT_PATH.write_text(formatted, encoding="utf-8")
+
+
+def _build_rows(properties: dict, defs: dict, dumped_defaults: dict) -> list[SettingRow]:
+    """Build a row per top-level setting, each followed by the sub-keys of its nested model."""
+    rows: list[SettingRow] = []
+    for name, prop in properties.items():
+        row = _build_row(name, prop, defs, dumped_defaults)
+        rows.append(row)
+        rows.extend(_build_child_rows(name, prop, defs, dumped_defaults, parent=row))
+    return rows
+
+
+def _build_child_rows(
+    name: str, prop: dict, defs: dict, dumped_defaults: dict, *, parent: SettingRow
+) -> list[SettingRow]:
+    """Build a row per sub-key of a nested model, or nothing when the setting is not one."""
+    ref = _extract_ref(prop)
+    if ref is None:
+        return []
+
+    child_properties = defs.get(ref, {}).get("properties", {})
+    if not child_properties:
+        return []
+
+    child_defaults = dumped_defaults.get(name)
+    if not isinstance(child_defaults, dict):
+        child_defaults = {}
+
+    rows = []
+    for child_name, child_prop in child_properties.items():
+        child = _build_row(child_name, child_prop, defs, child_defaults)
+        rows.append(
+            SettingRow(
+                name=f"{name}.{child_name}",
+                type_label=child.type_label,
+                default_label=child.default_label,
+                # Named from the path rather than from the sub-key alone: a sub-key is set
+                # from the environment as `GTN_CONFIG_<PARENT>__<CHILD>`, and the same
+                # resolver the top-level rows use then spells the mapping and deeper-model
+                # forms the same way it does there.
+                env_var_label=_resolve_env_var_label(
+                    f"{name}__{child_name}", child_prop, defs, is_nested=_is_nested(child_prop, defs)
+                ),
+                description=child.description,
+                # Grouped with its parent rather than under its own category, so the
+                # sub-keys of one setting stay together in the table.
+                category_name=parent.category_name,
+                category_description=parent.category_description,
+            )
+        )
+    return rows
 
 
 def _build_row(name: str, prop: dict, defs: dict, dumped_defaults: dict) -> SettingRow:
@@ -191,6 +247,10 @@ def _resolve_default_label(name: str, dumped_defaults: dict, *, is_nested: bool)
 
     default_value = dumped_defaults.get(name)
 
+    if isinstance(default_value, list) and default_value:
+        # Some of these hold twenty-odd entries, which would swamp the table.
+        return f"(list of {len(default_value)} values)"
+
     if is_nested and default_value not in ([], {}):
         return "(nested object)"
 
@@ -233,6 +293,9 @@ def _resolve_description(prop: dict, defs: dict, *, is_nested: bool) -> str:
         return description
     if not is_nested:
         return ""
+
+    if prop.get("type") == "array":
+        return "A list of values; edit it in a config file."
 
     if _is_mapping(prop):
         return (

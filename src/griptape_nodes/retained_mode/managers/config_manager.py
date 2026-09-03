@@ -8,6 +8,7 @@ from typing import Any, Literal, NamedTuple
 from pydantic import ValidationError
 from xdg_base_dirs import xdg_config_home
 
+from griptape_nodes.common.log_capture import configure_diagnostic_logging, resolve_log_directory
 from griptape_nodes.files.path_utils import resolve_workspace_path
 from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.retained_mode.engine import Engine, EngineScoped
@@ -56,6 +57,10 @@ from griptape_nodes.retained_mode.managers.settings import (
     DEFAULT_LIBRARIES_DIRECTORY,
     DISCOVERY_MAX_DEPTH_KEY,
     LIBRARIES_DIRECTORY_KEY,
+    LOG_DIRECTORY_KEY,
+    LOG_RETENTION_DAYS_KEY,
+    LOG_TO_FILE_KEY,
+    SESSION_LOG_BUFFER_LINES_KEY,
     WORKFLOWS_TO_REGISTER_KEY,
     Settings,
 )
@@ -92,6 +97,13 @@ class EnvVarOverride(NamedTuple):
 # Outcomes of coercing an environment variable that no real config value can collide with.
 _REJECTED_BAD_VALUE = object()
 _REJECTED_UNKNOWN_KEY = object()
+
+
+class ConfigFileLayer(NamedTuple):
+    """One config file in the precedence chain, and which layer it supplies."""
+
+    path: Path
+    layer: str
 
 
 class ConfigManager(EngineScoped):
@@ -150,6 +162,7 @@ class ConfigManager(EngineScoped):
         self._publish_default_libraries_root()
 
         self._set_log_level(self.merged_config.get("log_level", logging.INFO))
+        self._configure_log_capture()
 
         # Store event manager reference for broadcasting config change events
         self._event_manager = event_manager
@@ -382,6 +395,28 @@ class ConfigManager(EngineScoped):
             possible_config_files.append(self._workspace_config_path)
 
         return [config_file for config_file in possible_config_files if config_file.exists()]
+
+    @property
+    def config_file_layers(self) -> list[ConfigFileLayer]:
+        """Get every config file the engine would read, in ascending order of priority.
+
+        Unlike ``config_files``, a file that does not exist is still listed. A setting
+        that appears not to apply is usually either overridden by a later layer or read
+        from a file the user did not realize was missing, and both answers need the full
+        chain to be visible.
+
+        Returns:
+            The candidate config files, each labeled with the layer it supplies.
+        """
+        layers = [ConfigFileLayer(path=USER_CONFIG_PATH, layer="user")]
+
+        if self._project_config_path is not None:
+            layers.append(ConfigFileLayer(path=self._project_config_path, layer="project"))
+
+        if self._workspace_config_path is not None:
+            layers.append(ConfigFileLayer(path=self._workspace_config_path, layer="workspace"))
+
+        return layers
 
     @property
     def discovery_max_depth(self) -> int:
@@ -903,6 +938,11 @@ class ConfigManager(EngineScoped):
         self.load_configs()
         logger.debug("Config value '%s' set to '%s'", key, value)
 
+        # Reapplied from the reloaded merged config rather than from `value`, because the
+        # log sinks are configured from several related settings at once.
+        if key.split(".", maxsplit=1)[0] == "logging":
+            self._configure_log_capture()
+
         # Broadcast a domain event on success only. Listeners (in production:
         # WorkerManager) take it from here -- this manager has no knowledge of
         # who consumes the event. Failed writes are logged inside
@@ -1051,6 +1091,7 @@ class ConfigManager(EngineScoped):
         try:
             self.reset_user_config()
             self._set_log_level(str(self.merged_config["log_level"]))
+            self._configure_log_capture()
 
             result_details = "Successfully reset user configuration."
             # Reset is a full replacement; emit the same shape of ConfigChanged
@@ -1345,3 +1386,19 @@ class ConfigManager(EngineScoped):
         except (ValueError, AttributeError):
             logger.error("Invalid log level %s. Defaulting to INFO.", level)
             logger.setLevel(logging.INFO)
+
+    def _configure_log_capture(self) -> None:
+        """Install or update the log sinks a problem report is built from.
+
+        Like ``_set_log_level``, this reaches the process-wide ``griptape_nodes``
+        logger, so the last engine constructed in a process wins. That is the
+        existing behavior for log level and the same reasoning applies: there is
+        one logger, so there is one answer to where its output goes.
+        """
+        configured_directory = self.get_config_value(LOG_DIRECTORY_KEY, default="", cast_type=str)
+        configure_diagnostic_logging(
+            buffer_lines=self.get_config_value(SESSION_LOG_BUFFER_LINES_KEY, default=5000, cast_type=int),
+            log_to_file=self.get_config_value(LOG_TO_FILE_KEY, default=True, cast_type=bool),
+            log_directory=resolve_log_directory(configured_directory),
+            retention_days=self.get_config_value(LOG_RETENTION_DAYS_KEY, default=7, cast_type=int),
+        )
