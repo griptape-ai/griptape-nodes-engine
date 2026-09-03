@@ -735,15 +735,20 @@ class UIOptionsMixin:
 
     def update_ui_options_key(self, key: str, value: Any) -> None:
         """Update a single UI option key."""
-        ui_options = self.ui_options
-        ui_options[key] = value
-        self.ui_options = ui_options
+        self.update_ui_options({key: value})
 
     def update_ui_options(self, updates: dict[str, Any]) -> None:
-        """Update multiple UI options at once."""
-        ui_options = self.ui_options
-        ui_options.update(updates)
-        self.ui_options = ui_options
+        """Update multiple UI options at once.
+
+        Reads from ``_ui_options`` rather than the ``ui_options`` getter. On ``Parameter``
+        that getter is a merge of trait-derived options with stored ones, so writing it
+        back would copy every trait's rendered options into stored state, permanently
+        detaching them from the trait that owns them. Assignment still goes through the
+        setter so the update event is emitted.
+        """
+        stored = dict(self._ui_options)  # type: ignore[attr-defined]
+        stored.update(updates)
+        self.ui_options = stored  # type: ignore[attr-defined]
 
 
 class ParameterMessage(BaseNodeElement, UIOptionsMixin):
@@ -1880,12 +1885,26 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
 
     @property
     def ui_options(self) -> dict:
-        ui_options = {}
-        traits = self.find_elements_by_type(Trait)
-        for trait in traits:
+        """Stored UI options overlaid with the options each attached trait renders.
+
+        Traits win over stored values: a trait is live code and its options are derived
+        from its current state, while a stored value may be a copy saved before that state
+        changed. The result is a flat dict because that is what the editor consumes; only
+        ``_ui_options`` is ever persisted (see ``authored_ui_options``).
+        """
+        ui_options = dict(self._ui_options)
+        for trait in self.find_elements_by_type(Trait):
             ui_options = ui_options | trait.ui_options_for_trait()
-        ui_options = ui_options | self._ui_options
         return ui_options
+
+    def authored_ui_options(self) -> dict:
+        """Return only the UI options set on this parameter, with no trait-derived keys.
+
+        This is the save view. Persisting the merged ``ui_options`` would write each
+        trait's rendered options into the file, and reloading that file would place them in
+        stored state, so the saved copy would shadow the trait from then on.
+        """
+        return dict(self._ui_options)
 
     @ui_options.setter
     @BaseNodeElement.emits_update_on_write

@@ -11,6 +11,9 @@ class AddParameterButton(Trait):
 
     def __init__(self) -> None:
         super().__init__(element_id="AddParameterButton")
+        # Assigned here because this class declares its own __init__, so the dataclass field
+        # default above never runs and ui_options_for_trait would raise on a missing attribute.
+        self.type = "AddParameter"
         self.add_child(Button(label="AddParameter"))
 
     @classmethod
