@@ -96,6 +96,16 @@ def _register_unsaved_workflow(key: str, name: str) -> None:
     WorkflowRegistry.generate_new_workflow(registry_key=key, metadata=metadata, file_path=None)
 
 
+def _notified_workflow_names(put_event: Mock) -> list[str | None]:
+    """The workflow_name off every CurrentWorkflowChanged put on the queue, in order."""
+    names: list[str | None] = []
+    for put_call in put_event.call_args_list:
+        event = put_call.args[0]
+        if isinstance(event, AppEvent) and isinstance(event.payload, CurrentWorkflowChanged):
+            names.append(event.payload.workflow_name)
+    return names
+
+
 class TestWorkflowManager:
     """Test WorkflowManager functionality including parameter serialization."""
 
@@ -792,6 +802,7 @@ class TestWorkflowManager:
                         "extract_workflow_shape",
                         side_effect=ValueError("no shape"),
                     ),
+                    patch.object(engine.event_manager, "put_event", Mock()) as put_event,
                 ):
                     result = asyncio.run(
                         workflow_manager.on_save_workflow_request(SaveWorkflowRequest(file_name=saved_key))
@@ -812,6 +823,13 @@ class TestWorkflowManager:
                 # prefers this over a registry lookup, and the lookup is what goes stale on the
                 # next project switch.
                 assert context_manager.get_current_workflow_file_path() == str(saved_full_path)
+
+                # The key an editor has to address this workflow by just changed out from under
+                # it, and the key it held is now gone from the registry. Anyone still holding
+                # "unsaved:abc-123" -- a second editor, an MCP agent that cached it -- would send
+                # requests against a workflow that no longer exists, so the switch has to be on
+                # the wire like every other one.
+                assert _notified_workflow_names(put_event) == [saved_key]
             finally:
                 if context_manager.has_current_workflow():
                     context_manager.pop_workflow()
@@ -4855,16 +4873,6 @@ class TestRunWorkflowFromRegistryNotifiesContextChange:
     """
 
     @staticmethod
-    def _notified_workflow_names(put_event: Mock) -> list[str | None]:
-        """The workflow_name off every CurrentWorkflowChanged put on the queue, in order."""
-        names: list[str | None] = []
-        for put_call in put_event.call_args_list:
-            event = put_call.args[0]
-            if isinstance(event, AppEvent) and isinstance(event.payload, CurrentWorkflowChanged):
-                names.append(event.payload.workflow_name)
-        return names
-
-    @staticmethod
     def _saved_workflow(key: str) -> Mock:
         """A registry entry backed by a file. `run_workflow` is mocked, so the file is never read."""
         workflow = Mock(spec=Workflow)
@@ -4901,7 +4909,7 @@ class TestRunWorkflowFromRegistryNotifiesContextChange:
 
         assert isinstance(result, RunWorkflowFromRegistryResultSuccess)
         # The clean slate empties the context before the open fills it, and clients hear both.
-        assert self._notified_workflow_names(put_event) == [None, "opened"]
+        assert _notified_workflow_names(put_event) == [None, "opened"]
         assert context_manager.get_current_workflow_name() == "opened"
 
         context_manager.pop_workflow()
@@ -4924,7 +4932,7 @@ class TestRunWorkflowFromRegistryNotifiesContextChange:
             )
 
         assert isinstance(result, RunWorkflowFromRegistryResultSuccess)
-        assert self._notified_workflow_names(put_event) == ["opened_bare"]
+        assert _notified_workflow_names(put_event) == ["opened_bare"]
         assert context_manager.get_current_workflow_name() == "opened_bare"
 
         context_manager.pop_workflow()
@@ -4950,7 +4958,7 @@ class TestRunWorkflowFromRegistryNotifiesContextChange:
 
         assert isinstance(result, RunWorkflowFromRegistryResultFailure)
         # Pushed hopefully, then reverted by the failure teardown -- and the last word is the truth.
-        assert self._notified_workflow_names(put_event)[-1] is None
+        assert _notified_workflow_names(put_event)[-1] is None
         assert not context_manager.has_current_workflow()
 
     @pytest.mark.asyncio
@@ -4970,7 +4978,7 @@ class TestRunWorkflowFromRegistryNotifiesContextChange:
                 )
 
             assert isinstance(result, RunWorkflowFromRegistryResultFailure)
-            assert self._notified_workflow_names(put_event) == []
+            assert _notified_workflow_names(put_event) == []
             assert context_manager.get_current_workflow_name() == "stays_open"
 
             context_manager.pop_workflow()

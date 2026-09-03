@@ -373,9 +373,14 @@ editor is attached there always is one, because a blank canvas is itself an
 - **To open a saved workflow**, send `RunWorkflowFromRegistryRequest(workflow_name=...)`.
     That is the request that actually opens one: it replays the saved `.py`, rebuilding the
     workflow's nodes, connections, and values, and leaves it in the Current Context. It
-    does not require an empty context, and by default (`run_with_clean_slate=True`) it
-    discards what was open first. It does NOT run the workflow — follow with
+    does not require an empty context. It does NOT run the workflow — follow with
     `StartFlowRequest` for that.
+
+    **This is destructive by default.** `run_with_clean_slate` defaults to `True`, which
+    wipes the engine before opening — throwing away unsaved changes in the workflow the
+    artist may have open in front of them, with no undo. Save first
+    (`SaveWorkflowRequest`), or ask, before opening something on a live engine.
+
 - **To close what's open without opening anything**, send
     `ClearAllObjectStateRequest(i_know_what_im_doing=True)`. This wipes EVERYTHING
     (nodes, flows, connections, workflow) and leaves the engine with no current workflow.
@@ -400,7 +405,7 @@ flow keeps running in the engine until it finishes or errors. A subsequent
 | --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Bootstrap a workflow + flow from cold                           | `EnsureWorkflowAndFlowRequest`                                                                                                                            |
 | List the saved workflows (for their registry keys)              | `ListAllWorkflowsRequest`                                                                                                                                 |
-| Open a saved workflow (replacing what's open)                   | `RunWorkflowFromRegistryRequest(workflow_name=...)` — loads its nodes; does not run it                                                                    |
+| Open a saved workflow (replacing what's open)                   | `RunWorkflowFromRegistryRequest(workflow_name=...)` — loads its nodes; does not run it; discards unsaved work by default                                  |
 | Fan N requests out in one round trip                            | `EventRequestBatch` (synthetic; pre-name nodes that later slots reference)                                                                                |
 | Discover libraries / node types                                 | `ListRegisteredLibrariesRequest`, `ListNodeTypesInLibraryRequest`, `ListCategoriesInLibraryRequest`                                                       |
 | Inspect a node type's parameters                                | `DescribeNodeTypeRequest`                                                                                                                                 |

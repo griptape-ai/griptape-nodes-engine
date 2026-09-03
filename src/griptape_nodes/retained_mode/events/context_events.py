@@ -165,10 +165,15 @@ class EnsureWorkflowAndFlowResultFailure(ResultPayloadFailure):
 class CurrentWorkflowChanged(AppPayload):
     """Current workflow switched notification.
 
-    Emitted by ContextManager whenever the workflow at the top of the context stack
-    changes: opening a saved workflow, starting a scratch one, clearing all object
-    state, deleting the workflow that was open, or renaming/moving it so its registry
-    key changes.
+    Emitted by ContextManager whenever the workflow it reports as current changes:
+    opening a saved workflow, starting a scratch one, saving a scratch one for the first
+    time (which rekeys it from "unsaved:<uuid>" to the key derived from its new path),
+    moving it to another directory, clearing all object state, or deleting it.
+
+    Renaming the workflow that is open reports None rather than the new key, because the
+    rename deletes the old registry entry while it is still the one in context, and that
+    delete tears the context down. That is the engine's actual state afterwards, not a
+    reporting quirk.
 
     This is the authoritative "you are now looking at a different workflow" signal, and
     the one a client should drive its title and canvas state from. Unlike

@@ -97,18 +97,31 @@ class RunWorkflowFromRegistryRequest(RequestPayload):
     StartFlowRequest afterwards to do that. It also cannot open an unsaved workflow,
     because there is no file to replay.
 
-    Whether it succeeds or fails, the engine emits a CurrentWorkflowChanged app event
-    naming the workflow that ended up in context (or None, if the failed open left the
-    engine empty). The one silent case is re-opening the workflow that is already current
-    with run_with_clean_slate=False, where the answer never changed.
+    DESTRUCTIVE BY DEFAULT. With run_with_clean_slate=True this first wipes the engine,
+    which throws away unsaved changes in whatever workflow is currently open -- including
+    work an artist has in front of them right now in the editor, which cannot be
+    recovered. Save first (SaveWorkflowRequest) if that matters.
+
+    Once the open begins, the engine emits a CurrentWorkflowChanged app event naming the
+    workflow that ended up in context, on both the success and the failure path (a failed
+    open reverts to an empty engine and reports None). A request rejected before the open
+    begins -- unknown registry key, or an unsaved workflow -- leaves the Current Context
+    untouched and emits nothing.
+
+    Opening a large workflow can take a while: it resolves node libraries and replays the
+    whole file. A client-side timeout does NOT cancel the open, so do not retry on one --
+    a retry's clean slate lands partway through the first attempt and leaves a half-built
+    graph. Poll GetWorkflowContextRequest instead.
 
     Args:
-        workflow_name: Registry key of the workflow to open, as returned by
-            ListAllWorkflowsRequest. Not the display name.
+        workflow_name: Registry key of the workflow to open. These are the keys of the
+            dict returned by ListAllWorkflowsRequest, not the display name inside each
+            entry's metadata.
         run_with_clean_slate: Whether to discard everything currently in the engine before
             opening (default: True). True is the normal "open this workflow" behavior.
             False loads the workflow's objects alongside whatever is already there and
-            replaces the Current Context, which is rarely what you want.
+            nests it on top of the existing Current Context rather than replacing it, so
+            the workflow underneath stays on the stack. Rarely what you want.
 
     Results: RunWorkflowFromRegistryResultSuccess | RunWorkflowFromRegistryResultFailure (workflow not found, workflow unsaved, execution error)
     """
