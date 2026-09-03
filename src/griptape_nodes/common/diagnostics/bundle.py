@@ -327,7 +327,7 @@ class DiagnosticsBundle:
         # Written directly rather than through _write: the manifest lists the bundle's
         # files, and listing itself would make its own recorded size wrong.
         path = self._staging_dir / MANIFEST_FILE_NAME
-        path.write_text(manifest.model_dump_json(indent=2) + "\n", encoding="utf-8")
+        path.write_text(manifest.model_dump_json(indent=2) + "\n", encoding="utf-8", newline="")
         return manifest
 
     def to_zip_bytes(self) -> bytes:
@@ -362,10 +362,17 @@ class DiagnosticsBundle:
         return self._redactor.redact_text(name).replace("<", "").replace(">", "")
 
     def _write(self, relative_path: str, text: str, description: str) -> None:
-        """Write one staged file and record it as an entry."""
+        r"""Write one staged file and record it as an entry.
+
+        ``newline=""`` because the default translates every ``\\n`` to the platform's line
+        ending on the way out. On Windows that rewrites the log lines this bundle copied
+        verbatim: a line that already ended ``\\r\\n`` in the source file is written
+        ``\\r\\r\\n``, and every file in a bundle collected on Windows differs from the file
+        it was copied from.
+        """
         path = self._staging_dir / relative_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8")
+        path.write_text(text, encoding="utf-8", newline="")
         self._entries.append(BundleEntry(path=relative_path, size_bytes=path.stat().st_size, description=description))
 
     def _read_log_tail(self, path: Path, max_bytes: int, warnings: list[str]) -> LogTail | None:
@@ -400,13 +407,8 @@ class DiagnosticsBundle:
         return LogTail(text=text, bytes_read=len(raw), truncated=start > 0)
 
     def _readme_text(self) -> str:
-        """Return the bundle's README."""
-        health_line = ""
-        if any(entry.path == HEALTH_FILE_NAME for entry in self._entries):
-            health_line = (
-                f"- `{HEALTH_FILE_NAME}` -- read this second. The engine's own verdict on its setup: what\n"
-                "  is wrong, and what to do about each one.\n"
-            )
+        """Return the bundle's README, listing only the files that are really in it."""
+        file_list = "\n".join(self._readme_file_lines())
 
         return f"""# Griptape Nodes diagnostics bundle
 
@@ -415,15 +417,7 @@ did on one machine. It was created by the engine itself, and it is safe to share
 
 ## What is in here
 
-- `{MANIFEST_FILE_NAME}` -- start here. Lists every file, and says how many values were
-  hidden and why.
-{health_line}- `{REPORT_FILE_NAME}` -- which version of the engine was running, on what kind of
-  machine, with which settings, and how every library and project fared when it loaded.
-- `{LOGS_DIRECTORY_NAME}/{SESSION_LOG_FILE_NAME}` -- everything the engine logged from
-  the moment it started until this bundle was made.
-- `{LOGS_DIRECTORY_NAME}/` -- the log files kept on disk, newest first. Useful when the
-  problem happened in an earlier session.
-- `{WORKFLOW_DIRECTORY_NAME}/` -- the workflow that was open, if it had been saved.
+{file_list}
 
 ## What was taken out
 
@@ -444,3 +438,58 @@ Logs only contain what the engine was set to record. If `log_level` was `INFO`, 
 detail was never written down and is not recoverable after the fact. To capture it, set
 the log level to `DEBUG`, reproduce the problem, and make a new bundle.
 """
+
+    def _readme_file_lines(self) -> list[str]:
+        """Describe each file in the bundle, in reading order, skipping the absent ones.
+
+        Every section of a bundle is optional. Health checks are switched off by a request
+        flag, logs and the workflow the same way, and each of them is also skipped when
+        there was nothing to collect -- no log files on disk, an unsaved workflow. A guide
+        listing a file that is not here sends its reader hunting for it and, worse, reads
+        as though a bundle came back empty-handed when it never included that part at all.
+        """
+        lines = [
+            f"- `{MANIFEST_FILE_NAME}` -- start here. Lists every file, and says how many values were",
+            "  hidden and why.",
+        ]
+
+        if self._has_entry(HEALTH_FILE_NAME):
+            lines += [
+                f"- `{HEALTH_FILE_NAME}` -- read this second. The engine's own verdict on its setup: what",
+                "  is wrong, and what to do about each one.",
+            ]
+
+        if self._has_entry(REPORT_FILE_NAME):
+            lines += [
+                f"- `{REPORT_FILE_NAME}` -- which version of the engine was running, on what kind of",
+                "  machine, with which settings, and how every library and project fared when it loaded.",
+            ]
+
+        session_log_path = f"{LOGS_DIRECTORY_NAME}/{SESSION_LOG_FILE_NAME}"
+        if self._has_entry(session_log_path):
+            lines += [
+                f"- `{session_log_path}` -- everything the engine logged from",
+                "  the moment it started until this bundle was made.",
+            ]
+
+        # The session log lives in the same directory, so this asks whether anything else
+        # does: the files rotation left on disk from earlier runs.
+        if self._has_entry_in(LOGS_DIRECTORY_NAME, excluding=session_log_path):
+            lines += [
+                f"- `{LOGS_DIRECTORY_NAME}/` -- the log files kept on disk, newest first. Useful when the",
+                "  problem happened in an earlier session.",
+            ]
+
+        if self._has_entry_in(WORKFLOW_DIRECTORY_NAME):
+            lines.append(f"- `{WORKFLOW_DIRECTORY_NAME}/` -- the workflow that was open, as it was last saved.")
+
+        return lines
+
+    def _has_entry(self, path: str) -> bool:
+        """Whether one exact file was staged."""
+        return any(entry.path == path for entry in self._entries)
+
+    def _has_entry_in(self, directory: str, *, excluding: str | None = None) -> bool:
+        """Whether any file was staged inside a directory of the bundle."""
+        prefix = f"{directory}/"
+        return any(entry.path.startswith(prefix) and entry.path != excluding for entry in self._entries)

@@ -72,6 +72,7 @@ class RedactionReason(StrEnum):
     API_KEY_PATTERN = "api_key_pattern"
     BEARER_TOKEN = "bearer_token"  # noqa: S105 - a reason name, not a credential
     SIGNED_URL_PARAMETER = "signed_url_parameter"
+    URL_CREDENTIALS = "url_credentials"
     HOME_DIRECTORY = "home_directory"
     USERNAME = "username"
 
@@ -130,11 +131,29 @@ _SIGNED_URL_PATTERN = TextPattern(
     rf"\1{REDACTED}",
 )
 
+# A password in a URL's userinfo (`scheme://user:password@host`). This is the ordinary way
+# to point `libraries_to_download[].git_url` or an `MCPServerConfig.url` at a private
+# server, and neither key name matches SENSITIVE_KEY_PATTERN, so without this rule a live
+# personal access token is written into the config section verbatim. Only tokens carrying a
+# vendor prefix (`ghp_`, `sk-`) were caught, and GitLab's `glpat-`, Bitbucket app passwords,
+# and plain passwords carry none.
+#
+# The user is kept and only the password dropped, the way git itself reports these: an
+# `oauth2:` or `x-access-token:` prefix tells support which auth scheme was in use and is
+# not itself a credential. The single-component form (`scheme://token@host`) is deliberately
+# left alone, because its overwhelmingly common spelling is `ssh://git@github.com` and
+# redacting that would replace an identifier nobody needs hidden in every URL in a bundle.
+_URL_CREDENTIALS_PATTERN = TextPattern(
+    RedactionReason.URL_CREDENTIALS,
+    re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^/\s:@]+):[^/\s@]+@"),
+    rf"\1:{REDACTED}@",
+)
+
 # Rules that consume a whole value up to a delimiter. These run before every other rule:
 # their value classes stop at `<`, so an earlier rule that inserted `<redacted>` into the
 # middle of the value would truncate the match and leave the tail of a live credential
 # behind. Running them first also means one credential is counted once rather than twice.
-DELIMITED_VALUE_PATTERNS = [_BEARER_PATTERN, _SIGNED_URL_PATTERN]
+DELIMITED_VALUE_PATTERNS = [_BEARER_PATTERN, _SIGNED_URL_PATTERN, _URL_CREDENTIALS_PATTERN]
 
 # What may follow a home directory for it to really be one. Without this, a home of
 # `/Users/sam` rewrites a sibling's `/Users/samantha/x` to `~antha/x`: nothing leaks, but

@@ -196,3 +196,24 @@ class TestCloudApiKey:
 
         assert key is None
         assert "Griptape Cloud API key" in caplog.text
+
+    def test_an_env_file_in_another_encoding_costs_one_check_not_the_whole_run(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Reading a secret parses both `.env` files, and `dotenv` decodes them as UTF-8.
+
+        A hand-edited file saved in another encoding raises `UnicodeDecodeError` -- a
+        `ValueError`, not an `OSError` -- so caught as only the latter, one badly saved file
+        took down the whole collection that was going to report it.
+        """
+        engine = Mock()
+        engine.secrets_manager.get_secret.side_effect = UnicodeDecodeError(
+            "utf-8", b"a-value-\xe9", 8, 9, "invalid continuation byte"
+        )
+        manager = DiagnosticsManager(Mock(), engine=cast("Engine", engine))
+
+        with caplog.at_level("WARNING", logger="griptape_nodes"):
+            key = manager._cloud_api_key()
+
+        assert key is None
+        assert "Griptape Cloud API key" in caplog.text

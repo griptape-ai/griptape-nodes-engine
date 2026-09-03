@@ -318,10 +318,25 @@ class TestLogCaptureCheck:
 
 class TestCloudConnectionCheck:
     @pytest.mark.asyncio
-    async def test_fails_without_an_api_key_and_never_touches_the_network(self) -> None:
+    async def test_fails_without_an_api_key_and_never_touches_the_network(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The no-key answer is decided before a socket is opened.
+
+        The connect call is replaced with one that fails the test, so the second half of the
+        name is enforced rather than asserted in prose. Without this, a check that dialled
+        Griptape Cloud with an empty Authorization header and reported the refusal would
+        still produce a FAIL naming the key, and pass.
+        """
+        check = CloudConnectionCheck()
+
+        async def refuse_to_be_called(_url: str, _headers: dict[str, str]) -> None:
+            pytest.fail("the connection check opened a socket with no API key to authenticate with")
+
+        monkeypatch.setattr(check, "_connect_and_disconnect", refuse_to_be_called)
         context = HealthCheckContext(report=_report(), cloud_api_key=None)
 
-        result = await CloudConnectionCheck().run(context)
+        result = await check.run(context)
 
         assert result.status is HealthStatus.FAIL
         assert CLOUD_API_KEY_NAME in result.summary

@@ -405,10 +405,17 @@ class TestIdentityNormalization:
         assert redactor.counts()[RedactionReason.USERNAME] == 1
 
     def test_ignores_a_username_too_short_to_search_for(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """A two-character username appears inside ordinary words."""
-        monkeypatch.setattr("getpass.getuser", lambda: "al")
+        """A two-character username is left alone even where it stands as its own word.
 
-        assert Redactor().redact_text("the alpha value") == "the alpha value"
+        The username appears in the text as a whole word on purpose. Word-boundary matching
+        would spare `alpha` whatever the length threshold did, so a text of only `alpha`
+        would pass with the threshold removed and prove nothing about it.
+        """
+        monkeypatch.setattr("getpass.getuser", lambda: "al")
+        redactor = Redactor()
+
+        assert redactor.redact_text("al ran the alpha value") == "al ran the alpha value"
+        assert RedactionReason.USERNAME not in redactor.counts()
 
     def test_matches_a_username_only_on_word_boundaries(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr("getpass.getuser", lambda: "sam")

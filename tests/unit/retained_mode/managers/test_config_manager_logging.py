@@ -130,6 +130,36 @@ class TestApplyLoggingSettings:
 
         assert configure.call_count == 0
 
+    def test_settings_that_could_not_be_installed_are_applied_again_on_the_next_load(
+        self, manager: ConfigManager, tmp_path: Path
+    ) -> None:
+        """Nothing is remembered as applied until the sinks asked for are really installed.
+
+        The reasons a log file fails to open are the temporary kind -- a volume not mounted
+        yet, a directory someone is about to fix the permissions on. Remembered as done, the
+        no-op check above would then skip every later load, and the engine would go the rest
+        of its life without writing a log file.
+        """
+        with patch(_CONFIGURE, return_value=False) as failed:
+            manager.set_config_value("logging.log_directory", str(tmp_path))
+        assert failed.call_count == 1
+
+        with patch(_CONFIGURE, return_value=True) as retried:
+            manager.load_configs()
+
+        assert retried.call_count == 1
+        assert retried.call_args.kwargs["log_directory"] == tmp_path
+
+    def test_settings_that_were_installed_are_not_applied_again(self, manager: ConfigManager, tmp_path: Path) -> None:
+        """The contrast to the retry above: a successful apply is what the no-op check remembers."""
+        with patch(_CONFIGURE, return_value=True):
+            manager.set_config_value("logging.log_directory", str(tmp_path))
+
+        with patch(_CONFIGURE) as configure:
+            manager.load_configs()
+
+        assert configure.call_count == 0
+
     def test_writing_the_log_level_still_reaches_the_shared_logger(self) -> None:
         """`set_config_value` no longer sets it directly; the reload at the end of it does."""
         manager = ConfigManager()

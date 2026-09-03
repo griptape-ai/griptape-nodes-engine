@@ -173,7 +173,21 @@ def resolve_log_directory(configured_directory: str) -> Path:
     if not configured_directory:
         return default_directory
 
-    configured_path = Path(configured_directory).expanduser()
+    # FAILURE CASE: `~someone-else/logs` cannot be expanded when that account does not
+    # exist on this machine, and `~/logs` cannot be expanded when the process has no home
+    # directory at all (a service account, some containers). `expanduser` raises rather than
+    # leaving the `~` in place, and this runs from `ConfigManager.__init__`, so a typo in one
+    # setting would stop the engine from starting.
+    try:
+        configured_path = Path(configured_directory).expanduser()
+    except RuntimeError:
+        logger.warning(
+            "The 'logging.log_directory' setting is '%s', whose leading '~' could not be expanded to a "
+            "home directory on this machine. Using the default location '%s' instead.",
+            configured_directory,
+            default_directory,
+        )
+        return default_directory
 
     # FAILURE CASE: a relative value resolves against the process working directory,
     # which is not stable for the engine's lifetime. Logs would land wherever the
@@ -198,7 +212,7 @@ def configure_diagnostic_logging(
     log_to_file: bool = True,
     log_directory: Path | None = None,
     retention_days: int = DEFAULT_RETENTION_DAYS,
-) -> None:
+) -> bool:
     """Install or update the diagnostic log sinks on the ``griptape_nodes`` logger.
 
     Safe to call repeatedly: the ring buffer is resized in place so nothing
@@ -211,6 +225,13 @@ def configure_diagnostic_logging(
         log_directory: Directory for the log file. None means the default.
         retention_days: Delete log files older than this many days. Zero or less
             keeps them forever.
+
+    Returns:
+        Whether the sinks now installed are the ones that were asked for. False means
+        file logging was requested and the directory could not be created or the file
+        could not be opened, both of which are logged as warnings here. Callers that
+        remember what they applied must not remember a False: the condition is usually
+        temporary, and the next call is the only chance to pick the setting up again.
     """
     # Held across the whole body. Two engines in one process load their configs on their
     # own threads, and the sinks they are installing are shared: interleaved, one call can
@@ -221,10 +242,10 @@ def configure_diagnostic_logging(
 
         if not log_to_file:
             _remove_file_handler()
-            return
+            return True
 
         directory = log_directory if log_directory is not None else default_log_directory()
-        _configure_file_handler(directory, retention_days)
+        return _configure_file_handler(directory, retention_days)
 
 
 def session_log_lines() -> list[str]:
@@ -353,15 +374,19 @@ def _configure_buffer(buffer_lines: int) -> None:
     _state.buffer.resize(buffer_lines)
 
 
-def _configure_file_handler(directory: Path, retention_days: int) -> None:
-    """Point the rotating file sink at ``directory``, replacing any existing one."""
+def _configure_file_handler(directory: Path, retention_days: int) -> bool:
+    """Point the rotating file sink at ``directory``, replacing any existing one.
+
+    Returns whether the sink is now writing into ``directory``. A failure leaves any
+    handler already installed alone, so logging keeps working, just somewhere else.
+    """
     file_name = _log_file_name()
     target_path = directory / file_name
     if _state.file_handler is not None and _state.file_path == target_path:
         # Already writing exactly there. Re-pruning is still worth doing: a
         # retention change is one of the reasons to be called again.
         prune_log_files(directory, retention_days, protected_name=file_name)
-        return
+        return True
 
     try:
         directory.mkdir(parents=True, exist_ok=True)
@@ -371,7 +396,7 @@ def _configure_file_handler(directory: Path, retention_days: int) -> None:
             directory,
             exc_info=True,
         )
-        return
+        return False
 
     prune_log_files(directory, retention_days, protected_name=file_name)
 
@@ -394,7 +419,7 @@ def _configure_file_handler(directory: Path, retention_days: int) -> None:
             target_path,
             exc_info=True,
         )
-        return
+        return False
 
     handler.setLevel(logging.DEBUG)
     handler.setFormatter(DiagnosticFormatter())
@@ -403,6 +428,7 @@ def _configure_file_handler(directory: Path, retention_days: int) -> None:
     logger.addHandler(handler)
     _state.file_handler = handler
     _state.file_path = target_path
+    return True
 
 
 def _remove_file_handler() -> None:
