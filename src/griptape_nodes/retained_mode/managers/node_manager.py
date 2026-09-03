@@ -40,6 +40,7 @@ from griptape_nodes.exe_types.core_types import (
     ParameterMode,
     ParameterType,
     ParameterTypeBuiltin,
+    Trait,
 )
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_groups import NodeGroupMembershipError, SubflowNodeGroup
@@ -239,6 +240,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointSubjectType,
 )
 from griptape_nodes.retained_mode.retained_mode import RetainedMode
+from griptape_nodes.traits.trait_registry import TraitRegistry
 from griptape_nodes.utils.exception_utils import readable_exception_message
 
 logger = logging.getLogger("griptape_nodes")
@@ -1900,6 +1902,10 @@ class NodeManager(EngineScoped):
             settable=request.settable,
             allow_variable_substitution=request.allow_variable_substitution,
         )
+        # Rebuild traits from saved state so their converters, validators,
+        # and ui_options come back with the class.
+        if request.traits:
+            NodeManager._apply_trait_states(new_param, request.traits)
         try:
             with sanctioned_parameter_mutation():
                 if request.parent_container_name and request.initial_setup:
@@ -2267,6 +2273,8 @@ class NodeManager(EngineScoped):
                 parameter.tooltip_as_property = request.tooltip_as_property
             if request.tooltip_as_output is not None:
                 parameter.tooltip_as_output = request.tooltip_as_output
+            if request.traits is not None:
+                NodeManager._apply_trait_states(parameter, request.traits)
         if request.ui_options is not None and hasattr(parameter, "ui_options"):
             parameter.ui_options = request.ui_options  # type: ignore[attr-defined]
 
@@ -3703,6 +3711,11 @@ class NodeManager(EngineScoped):
                     # Always serialize user-defined parameters regardless of node type
                     param_dict = parameter.to_dict()
                     param_dict["initial_setup"] = True
+                    # Trait identity and state travel separately from the
+                    # scalar fields, and only options authored on the parameter are saved --
+                    # the trait regenerates its own on load.
+                    param_dict["ui_options"] = parameter.authored_ui_options()
+                    param_dict["traits"] = parameter.trait_states()
                     add_param_request = AddParameterToNodeRequest.create(**param_dict)
                     element_modification_commands.append(add_param_request)
                 elif isinstance(node, ErrorProxyNode):
@@ -3721,6 +3734,8 @@ class NodeManager(EngineScoped):
                     # Normal node with no reference - treat all parameters as needing serialization
                     param_dict = parameter.to_dict()
                     param_dict["initial_setup"] = True
+                    param_dict["ui_options"] = parameter.authored_ui_options()
+                    param_dict["traits"] = parameter.trait_states()
                     add_param_request = AddParameterToNodeRequest.create(**param_dict)
                     element_modification_commands.append(add_param_request)
                 else:
@@ -4313,6 +4328,37 @@ class NodeManager(EngineScoped):
             result.node_names,
             result_details=f"Successfully duplicated {len(serialize_result.node_names_serialized)} nodes.",
         )
+
+    @staticmethod
+    def _apply_trait_states(parameter: Parameter, trait_states: list[dict[str, Any]]) -> None:
+        """Restore saved trait state onto a parameter.
+
+        A trait the node's ``__init__`` already built is updated in place rather than
+        replaced, so whatever the constructor attached to that instance survives. A trait
+        with no counterpart on the parameter is built fresh. An unresolvable trait name is
+        logged and skipped: the parameter loses that trait's behavior, which is worth
+        saying out loud rather than failing the whole load.
+        """
+        existing_by_class = {type(trait).__name__: trait for trait in parameter.find_elements_by_type(Trait)}
+        for entry in trait_states:
+            trait_name = entry.get("trait_name")
+            if trait_name is None:
+                continue
+            state = entry.get("trait_state", {})
+            existing = existing_by_class.get(trait_name)
+            if existing is not None:
+                existing.apply_state(state)
+                continue
+            trait_class = TraitRegistry.resolve(trait_name)
+            if trait_class is None:
+                logger.warning(
+                    "Parameter '%s' was saved with the '%s' trait, but no trait by that name is registered. "
+                    "The parameter will load without it. Check that the library providing it is installed.",
+                    parameter.name,
+                    trait_name,
+                )
+                continue
+            parameter.add_trait(trait_class.from_state(state))
 
     @staticmethod
     def _manage_alter_details(parameter: Parameter, base_node_obj: BaseNode) -> dict:
