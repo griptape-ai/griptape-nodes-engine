@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, ClassVar
+from typing import Any, ClassVar
 
-if TYPE_CHECKING:
-    from griptape_nodes.exe_types.core_types import Trait
+from griptape_nodes.exe_types.core_types import Trait
 
 
 # This should probably register upon creation
@@ -31,3 +30,32 @@ class TraitRegistry:
     @classmethod
     def register_trait_from_json(cls) -> None:
         pass
+
+    # Resolve a saved trait_name back to its class. Walking __subclasses__
+    # finds any trait whose module has been imported, which covers the traits a loaded
+    # library brought in. Two libraries shipping the same class name are indistinguishable
+    # here; keying registration by library would fix that.
+    @classmethod
+    def resolve(cls, trait_name: str) -> type[Trait] | None:
+        def walk(klass: type[Trait]) -> type[Trait] | None:
+            for subclass in klass.__subclasses__():
+                if subclass.__name__ == trait_name:
+                    return subclass
+                found = walk(subclass)
+                if found is not None:
+                    return found
+            return None
+
+        return walk(Trait)
+
+    @classmethod
+    def traits_from_states(cls, states: list[dict[str, Any]]) -> list[Trait]:
+        """Rebuild traits from serialized state, skipping any whose class cannot be found."""
+        traits: list[Trait] = []
+        for state in states:
+            trait_name = state.get("trait_name")
+            trait_class = cls.resolve(trait_name) if trait_name is not None else None
+            if trait_class is None:
+                continue
+            traits.append(trait_class.from_state(state.get("trait_state", {})))
+        return traits

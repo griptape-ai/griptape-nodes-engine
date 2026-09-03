@@ -1,12 +1,14 @@
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 
 from griptape_nodes.exe_types.core_types import Trait
 
 
 @dataclass(eq=False)
 class Clamp(Trait):
+    STATE_ALIASES: ClassVar[dict[str, str]] = {"min_val": "min", "max_val": "max"}
+
     min: Any = 0
     max: Any = 10
     element_id: str = field(default_factory=lambda: "ClampTrait")

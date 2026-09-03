@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 import uuid
 import warnings
@@ -1761,6 +1762,18 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
 
         return our_dict
 
+    def trait_states(self) -> list[dict[str, Any]]:
+        """Return trait identity plus the state needed to rebuild each one.
+
+        Deliberately not folded into ``to_dict()``: that dict is also the
+        GUI event payload, and trait state is save-only. ``children`` already carries trait
+        dicts, but they hold rendered ui_options rather than constructor arguments.
+        """
+        return [
+            {"trait_name": type(trait).__name__, "trait_state": trait.to_state()}
+            for trait in self.find_elements_by_type(Trait)
+        ]
+
     def to_event(self, node: BaseNode) -> dict:
         event_dict = self.to_dict()
         event_data = super().to_event(node)
@@ -2228,6 +2241,13 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
     def equals(self, other: Parameter) -> dict:
         self_dict = self.to_dict().copy()
         other_dict = other.to_dict().copy()
+        # Compare the save view of UI options, not the merged one. Trait-derived keys belong
+        # to the trait, and are carried between the two parameters by ``traits`` below;
+        # diffing them here would emit them as stored options on the parameter instead.
+        self_dict["ui_options"] = self.authored_ui_options()
+        other_dict["ui_options"] = other.authored_ui_options()
+        self_dict["traits"] = self.trait_states()
+        other_dict["traits"] = other.trait_states()
         self_dict.pop("next", None)
         self_dict.pop("prev", None)
         self_dict.pop("element_id", None)
@@ -3153,6 +3173,15 @@ class ParameterDictionary(ParameterContainer):
 
 @dataclass(eq=False)
 class Trait(ABC, BaseNodeElement):
+    # Maps an ``__init__`` parameter name to the attribute that holds its
+    # value, for traits whose constructor arguments are spelled differently from their
+    # fields (``Slider(min_val=...)`` stores ``self.min``). Empty means the two agree.
+    STATE_ALIASES: ClassVar[dict[str, str]] = {}
+
+    # ``__init__`` parameters that are behavior, not state, and so are never saved
+    # (``Button(on_click=...)``).
+    STATE_EXCLUDE: ClassVar[frozenset[str]] = frozenset()
+
     def __hash__(self) -> int:
         # Use a unique, immutable attribute for hashing
         return hash(self.element_id)
@@ -3168,6 +3197,81 @@ class Trait(ABC, BaseNodeElement):
         updated["trait_name"] = self.__class__.__name__
         updated["trait_display_options"] = self.display_options_for_trait()
         return updated
+
+    def to_state(self) -> dict[str, Any]:
+        """Return the constructor arguments that reproduce this trait.
+
+        Derived from ``__init__``'s signature rather than the dataclass fields, so
+        restoring goes back through the real constructor and keeps whatever invariants
+        it enforces. Callable values are omitted: a bound closure cannot be written to
+        a file, and naming it is a separate concern from carrying trait state.
+        """
+        state: dict[str, Any] = {}
+        for name in self._state_parameter_names():
+            attribute_name = self.STATE_ALIASES.get(name, name)
+            if not hasattr(self, attribute_name):
+                msg = (
+                    f"Trait '{type(self).__name__}' takes '{name}' but stores no matching attribute. "
+                    f"Declare STATE_ALIASES = {{'{name}': '<attribute>'}} so its value can be saved."
+                )
+                raise AttributeError(msg)
+            value = getattr(self, attribute_name)
+            if callable(value):
+                continue
+            state[name] = value
+        return state
+
+    @classmethod
+    def from_state(cls, state: dict[str, Any]) -> Self:
+        """Rebuild a trait from ``to_state`` output by calling the real constructor."""
+        return cls(**state)
+
+    def apply_state(self, state: dict[str, Any]) -> None:
+        """Overwrite this trait's state in place.
+
+        Used when restoring a parameter the node's ``__init__`` already built: the trait
+        instance is kept and only its state is replaced, so anything the constructor
+        attached to it (a button's on_click, for one) is preserved. Rebuilding a fresh
+        instance from state would drop that.
+        """
+        for name, value in state.items():
+            setattr(self, self.STATE_ALIASES.get(name, name), value)
+
+    @classmethod
+    def _state_parameter_names(cls) -> list[str]:
+        """Return the trait's own ``__init__`` parameter names, minus variadics.
+
+        Walks only as far as the nearest ``__init__`` a Trait subclass hand-writes. A trait
+        with no constructor of its own (``Compare``) has no state; without this stop the
+        walk reaches the ``@dataclass``-generated ``__init__``, which takes
+        ``BaseNodeElement``'s inherited fields and would report engine internals such as
+        ``_children`` and ``_parent`` as trait state.
+        """
+        initializer = None
+        for klass in cls.__mro__:
+            if klass in (Trait, BaseNodeElement):
+                break
+            candidate = klass.__dict__.get("__init__")
+            if candidate is None:
+                continue
+            # A @dataclass-generated __init__ is exec'd from a synthetic filename, so it
+            # carries no author intent about what counts as trait state.
+            if candidate.__code__.co_filename == "<string>":
+                continue
+            initializer = candidate
+            break
+        if initializer is None:
+            return []
+
+        parameters = inspect.signature(initializer).parameters
+        return [
+            name
+            for name, parameter in parameters.items()
+            if name != "self"
+            and name not in cls.STATE_EXCLUDE
+            and parameter.kind is not inspect.Parameter.VAR_POSITIONAL
+            and parameter.kind is not inspect.Parameter.VAR_KEYWORD
+        ]
 
     @classmethod
     @abstractmethod

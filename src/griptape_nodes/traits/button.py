@@ -1,6 +1,6 @@
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal, get_args
+from typing import TYPE_CHECKING, ClassVar, Literal, get_args
 
 from griptape_nodes.exe_types.core_types import NodeMessagePayload, NodeMessageResult, Trait
 
@@ -82,6 +82,9 @@ class SetButtonStatusMessagePayload(NodeMessagePayload):
 
 @dataclass(eq=False)
 class Button(Trait):
+    # The two callbacks are behavior, not state, so they are never saved.
+    STATE_EXCLUDE: ClassVar[frozenset[str]] = frozenset({"on_click", "get_button_state"})
+
     # Specific callback types for better type safety and clarity
     type OnClickCallback = Callable[[Button, ButtonDetailsMessagePayload], NodeMessageResult | None]
     type GetButtonStateCallback = Callable[[Button, ButtonDetailsMessagePayload], NodeMessageResult | None]
