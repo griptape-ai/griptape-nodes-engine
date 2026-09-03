@@ -96,6 +96,24 @@ RULES: dict[str, StrictModeRule] = {
         # for an ergonomics warning.
         worker_escalation=False,
     ),
+    "callback-cannot-be-saved": StrictModeRule(
+        rule_id="callback-cannot-be-saved",
+        default_severity=StrictModeSeverity.WARNING,
+        correctness=False,
+        description=(
+            "A control on a run-time parameter was given a callback that "
+            "cannot be written to a saved workflow. Saving records a method "
+            "name on the owning node, and a lambda or closure has no name to "
+            "resolve, so the control loads without its behavior."
+        ),
+        remediation_template=(
+            "Parameter '{parameter_name}' gives the '{trait_name}' control a "
+            "callback for {callback_names} that cannot be saved. Pass a method "
+            "of the node (self.my_handler) rather than a lambda or a local "
+            "function, so the saved workflow can find it again on load."
+        ),
+        worker_escalation=False,
+    ),
     "parameter-mutation-during-aprocess": StrictModeRule(
         rule_id="parameter-mutation-during-aprocess",
         default_severity=StrictModeSeverity.WARNING,
