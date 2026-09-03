@@ -39,6 +39,13 @@ REDACTED_USER = "<user>"
 # an API key to a server.
 SENSITIVE_KEY_NAMES = frozenset({"env", "headers"})
 
+# Keys whose values are the *names* of secrets rather than secrets. `secrets_to_register`
+# is a list of variable names a library wants the engine to look for, and the report
+# publishes those names elsewhere by design. Masking them would replace the one piece of
+# diagnostic signal the setting carries, and would inflate the redaction count with
+# removals of things that were never secret.
+KEY_NAMES_HOLDING_SECRET_NAMES = frozenset({"secrets_to_register"})
+
 # Substring match, not whole-word: `api_key`, `openai_api_key`, and `keys` must all
 # match. Over-matching (`keyboard`, `monkey`) costs a hidden value in a report and is
 # the right way to be wrong.
@@ -88,45 +95,44 @@ _API_KEY_PATTERNS = [
     TextPattern(RedactionReason.API_KEY_PATTERN, re.compile(r"\bhf_[A-Za-z0-9]{8,}"), f"hf_{REDACTED}"),
 ]
 
+# A `bearer`/`basic` token shorter than this is left alone. The value class below matches
+# ordinary letters, so a low threshold redacts English prose: "Bearer credentials
+# required" and "Basic authentication is not supported" would both be counted as hidden
+# credentials. Real bearer tokens are far longer than this, and a genuinely short opaque
+# value is still covered by the known-secret and query-parameter rules.
+MIN_BEARER_TOKEN_LENGTH = 16
+
 # `Bearer <token>` in a logged header dump or an HTTP error.
 _BEARER_PATTERN = TextPattern(
     RedactionReason.BEARER_TOKEN,
-    re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._\-+/=]{8,}"),
+    re.compile(rf"(?i)\b(bearer|basic)\s+[A-Za-z0-9._\-+/=]{{{MIN_BEARER_TOKEN_LENGTH},}}"),
     rf"\1 {REDACTED}",
 )
 
-# Query-string parameters that grant access on their own. A presigned URL in a log is a
-# working credential for as long as it has not expired, so the parameter names are kept
-# and the values dropped.
-_SIGNED_URL_PARAMETER_NAMES = [
-    "x-amz-signature",
-    "x-amz-credential",
-    "x-amz-security-token",
-    "x-goog-signature",
-    "x-goog-credential",
-    "awsaccesskeyid",
-    "signature",
-    "sig",
-    "token",
-    "access_token",
-    "refresh_token",
-    "id_token",
-    "api_key",
-    "apikey",
-    "key",
-    "password",
-    "code",
-]
+# Query-string parameter names whose value grants access on its own. A presigned URL in a
+# log is a working credential for as long as it has not expired, so the parameter names
+# are kept and the values dropped.
+#
+# A name pattern rather than a fixed list of names, so it stays in step with
+# SENSITIVE_KEY_PATTERN and covers a vendor parameter nobody thought to enumerate:
+# `X-Amz-Signature`, `x-goog-credential`, `AWSAccessKeyId`, and `client_secret` all match.
+# `sig` and `auth` are included as their own words because the URL spellings are
+# abbreviated where config keys are not.
+_SIGNED_URL_PARAMETER_WORDS = "key|token|secret|password|credential|auth|sig|code"
 
 _SIGNED_URL_PATTERN = TextPattern(
     RedactionReason.SIGNED_URL_PARAMETER,
-    re.compile(
-        r"(?i)([?&](?:" + "|".join(re.escape(name) for name in _SIGNED_URL_PARAMETER_NAMES) + r")=)[^&\s\"'<>]+",
-    ),
+    re.compile(rf"(?i)([?&][^=&\s]*(?:{_SIGNED_URL_PARAMETER_WORDS})[^=&\s]*=)[^&\s\"'<>]+"),
     rf"\1{REDACTED}",
 )
 
-GENERIC_TEXT_PATTERNS = [*_API_KEY_PATTERNS, _BEARER_PATTERN, _SIGNED_URL_PATTERN]
+# Rules that consume a whole value up to a delimiter. These run before every other rule:
+# their value classes stop at `<`, so an earlier rule that inserted `<redacted>` into the
+# middle of the value would truncate the match and leave the tail of a live credential
+# behind. Running them first also means one credential is counted once rather than twice.
+DELIMITED_VALUE_PATTERNS = [_BEARER_PATTERN, _SIGNED_URL_PATTERN]
+
+GENERIC_TEXT_PATTERNS = [*DELIMITED_VALUE_PATTERNS, *_API_KEY_PATTERNS]
 
 
 class Redactor:
@@ -152,12 +158,16 @@ class Redactor:
         if normalize_identity:
             identity_patterns = self._build_identity_patterns()
 
-        # Known secrets first: a raw credential must be gone before the generic patterns
-        # get a chance to rewrite part of it into something the exact-match would miss.
+        # Order matters, and every rule that inserts `<redacted>` constrains what can run
+        # after it. Delimiter-anchored rules go first because their value classes stop at
+        # `<`: a token that had already been partly replaced would truncate their match and
+        # leave its tail behind. Known secrets go next, before the shape-matching patterns
+        # get a chance to rewrite part of one into something the exact match would miss.
         # Identity last, so a home path inside an already-redacted value is moot.
         self._patterns = [
+            *DELIMITED_VALUE_PATTERNS,
             *self._build_secret_patterns(secret_values),
-            *GENERIC_TEXT_PATTERNS,
+            *_API_KEY_PATTERNS,
             *identity_patterns,
         ]
 
@@ -198,8 +208,13 @@ class Redactor:
             return self._mask(value)
 
         if isinstance(value, dict):
+            # Keys are redacted as well as values. A library is free to add a settings
+            # subtree keyed by absolute path, and a key is as good a place for a home
+            # directory to hide as a value is. Sensitivity is decided on the original key,
+            # so redacting it cannot change whether its value is masked.
             return {
-                entry_key: self._redact_config_value(entry, key=str(entry_key)) for entry_key, entry in value.items()
+                self._redact_key(entry_key): self._redact_config_value(entry, key=str(entry_key))
+                for entry_key, entry in value.items()
             }
 
         if isinstance(value, list):
@@ -236,9 +251,21 @@ class Redactor:
         self._counts[RedactionReason.CONFIG_KEY] += 1
         return REDACTED
 
+    def _redact_key(self, key: Any) -> Any:
+        """Return a dict key with identifiers removed, leaving non-string keys as they are."""
+        if isinstance(key, str):
+            return self.redact_text(key)
+        return key
+
     @staticmethod
     def _is_sensitive_key(key: str) -> bool:
         lowered = key.lower()
+
+        # Checked first: `secrets_to_register` matches `secret` below, and its values are
+        # names rather than credentials.
+        if lowered in KEY_NAMES_HOLDING_SECRET_NAMES:
+            return False
+
         if lowered in SENSITIVE_KEY_NAMES:
             return True
         return SENSITIVE_KEY_PATTERN.search(lowered) is not None
@@ -283,8 +310,9 @@ class Redactor:
         """Return every spelling of the home directory that could appear in text.
 
         Windows paths reach logs with both separators depending on whether pathlib or a
-        string built them, so both are matched. Longest first, so the more specific
-        spelling wins when one is a prefix of another.
+        string built them, so both are matched, plus the doubled-backslash spelling a
+        Windows path takes once something has been through JSON. Longest first, so the more
+        specific spelling wins when one is a prefix of another.
         """
         try:
             home = Path.home()
@@ -295,7 +323,7 @@ class Redactor:
             return []
 
         home_string = str(home)
-        spellings = {home_string, home_string.replace("\\", "/")}
+        spellings = {home_string, home_string.replace("\\", "/"), home_string.replace("\\", "\\\\")}
         return sorted(spellings, key=len, reverse=True)
 
     @staticmethod

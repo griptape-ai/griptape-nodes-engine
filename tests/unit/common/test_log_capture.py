@@ -191,6 +191,34 @@ class TestSessionLogBuffer:
         assert len(handled) == 1
         assert buffer.lines() == []
 
+    def test_a_missing_mapping_key_does_not_raise_out_of_whatever_logged_it(self) -> None:
+        """Dict-style formatting raises KeyError, which is neither TypeError nor ValueError."""
+        buffer = SessionLogBuffer(10)
+        handled: list[logging.LogRecord] = []
+        buffer.handleError = handled.append  # type: ignore[method-assign]
+
+        buffer.emit(_record("%(missing)s happened", args=({"present": 1},)))
+
+        assert len(handled) == 1
+        assert buffer.lines() == []
+
+    def test_a_logged_object_whose_str_raises_does_not_raise_out_of_the_log_call(self) -> None:
+        """Anything at all can go wrong rendering a logged value, so anything at all is caught."""
+
+        class Unprintable:
+            def __str__(self) -> str:
+                msg = "this object refuses to be rendered"
+                raise RuntimeError(msg)
+
+        buffer = SessionLogBuffer(10)
+        handled: list[logging.LogRecord] = []
+        buffer.handleError = handled.append  # type: ignore[method-assign]
+
+        buffer.emit(_record("state is %s", args=(Unprintable(),)))
+
+        assert len(handled) == 1
+        assert buffer.lines() == []
+
 
 class TestResolveLogDirectory:
     def test_an_empty_setting_means_the_default_location(self) -> None:
@@ -331,6 +359,28 @@ class TestFindLogFiles:
         """A collection must not fail just because nothing has ever been logged."""
         assert find_log_files(tmp_path / "never-created") == []
 
+    def test_a_file_rotation_removed_mid_scan_costs_one_entry_not_the_whole_list(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """This runs while an engine is logging, and during engine construction."""
+        kept = _write_log(tmp_path, f"{LOG_FILE_PREFIX}kept.log")
+        vanishing = _write_log(tmp_path, f"{LOG_FILE_PREFIX}vanishing.log")
+
+        real_stat = Path.stat
+        seen: list[str] = []
+
+        def stat_then_vanish(self: Path, **kwargs: object) -> os.stat_result:
+            # Survives being listed, and is gone by the time its age is read.
+            if self.name == vanishing.name:
+                seen.append(self.name)
+                if len(seen) > 1:
+                    raise FileNotFoundError(self)
+            return real_stat(self, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(Path, "stat", stat_then_vanish)
+
+        assert find_log_files(tmp_path) == [kept]
+
 
 class TestPruneLogFiles:
     def test_deletes_files_past_the_retention_window(self, tmp_path: Path) -> None:
@@ -361,3 +411,41 @@ class TestPruneLogFiles:
 
     def test_a_missing_directory_is_not_an_error(self, tmp_path: Path) -> None:
         assert prune_log_files(tmp_path / "never-created", retention_days=7) == 0
+
+    def test_keeps_the_file_the_sink_is_about_to_open(self, tmp_path: Path) -> None:
+        """The sink prunes before opening, so its own target has to survive the sweep."""
+        target = _write_log(tmp_path, f"{LOG_FILE_PREFIX}target.log", age_days=400)
+        other = _write_log(tmp_path, f"{LOG_FILE_PREFIX}other.log", age_days=400)
+
+        assert prune_log_files(tmp_path, retention_days=7, protected_name=target.name) == 1
+        assert target.exists()
+        assert not other.exists()
+
+    @pytest.mark.usefixtures("isolated_capture")
+    def test_never_deletes_the_log_this_process_is_writing(self, tmp_path: Path) -> None:
+        """An engine running longer than the retention window still owns its own log file."""
+        configure_diagnostic_logging(log_directory=tmp_path, retention_days=0)
+        log_capture.logger.info("this session is still going")
+        active = active_log_file()
+        assert active is not None
+        aged = time.time() - (30 * _SECONDS_PER_DAY)
+        os.utime(active, (aged, aged))
+
+        assert prune_log_files(tmp_path, retention_days=7) == 0
+        assert active.exists()
+
+    @pytest.mark.usefixtures("isolated_capture")
+    def test_reconfiguring_does_not_prune_away_the_log_already_open(self, tmp_path: Path) -> None:
+        """The regression: a long-running engine's own re-prune deleting the file it is writing."""
+        configure_diagnostic_logging(log_directory=tmp_path, retention_days=7)
+        active = active_log_file()
+        assert active is not None
+        log_capture.logger.info("earlier in this session")
+        aged = time.time() - (30 * _SECONDS_PER_DAY)
+        os.utime(active, (aged, aged))
+
+        configure_diagnostic_logging(log_directory=tmp_path, retention_days=7)
+
+        assert active_log_file() == active
+        assert active.exists()
+        assert "earlier in this session" in active.read_text(encoding="utf-8")

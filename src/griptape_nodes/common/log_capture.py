@@ -27,6 +27,7 @@ import time
 from collections import deque
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import NamedTuple
 
 from xdg_base_dirs import xdg_data_home
 
@@ -100,21 +101,37 @@ class SessionLogBuffer(logging.Handler):
 
     def lines(self) -> list[str]:
         """Return the retained lines, oldest first."""
-        return list(self._lines)
+        # Taken under the handler's own lock, the one ``logging.Handler.handle`` holds
+        # while ``emit`` runs. A bundle is collected on one thread while every other
+        # thread in the engine is still logging into this deque.
+        self.acquire()
+        try:
+            return list(self._lines)
+        finally:
+            self.release()
 
     def resize(self, capacity: int) -> None:
         """Change the retained line count, keeping the most recent lines."""
         if capacity == self.capacity:
             return
-        self._lines = deque(self._lines, maxlen=capacity)
+
+        # Same lock, for a stronger reason: the deque is replaced rather than mutated,
+        # so a line emitted mid-swap would land in the deque about to be discarded.
+        self.acquire()
+        try:
+            self._lines = deque(self._lines, maxlen=capacity)
+        finally:
+            self.release()
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
             self._lines.append(self.format(record))
-        except (TypeError, ValueError):
-            # A record whose args do not match its format string would otherwise
-            # raise out of whatever code called logger.*(), turning a bad log
-            # call into a failed operation.
+        except Exception:
+            # Anything at all, because anything at all can go wrong in formatting: args
+            # that do not match the format string, a mapping missing a `%(name)s` key, a
+            # `__str__` on a logged object that raises. Whatever it is, it would come out
+            # of the `logger.*()` call that made it and turn a bad log line into a failed
+            # operation. `logging.StreamHandler.emit` catches everything for this reason.
             self.handleError(record)
 
 
@@ -215,6 +232,18 @@ def active_log_file() -> Path | None:
     return _state.file_path
 
 
+class _LogFileAge(NamedTuple):
+    """A log file and its modification time, measured once so sorting cannot fail.
+
+    Attributes:
+        modified_at: Modification time in seconds since the epoch.
+        path: The log file.
+    """
+
+    modified_at: float
+    path: Path
+
+
 def find_log_files(directory: Path | None = None) -> list[Path]:
     """Return every engine log file in a directory, newest first.
 
@@ -232,22 +261,58 @@ def find_log_files(directory: Path | None = None) -> list[Path]:
         logger.warning("Could not list log files in '%s'.", search_dir, exc_info=True)
         return []
 
-    return sorted(matches, key=lambda path: path.stat().st_mtime, reverse=True)
+    # Ages are read here rather than inside the sort key, so a file that rotation renamed
+    # or removed between being listed and being measured costs one entry instead of
+    # raising out of the sort. This runs while an engine is logging, and it runs during
+    # engine construction, where an exception would stop the engine from starting.
+    aged: list[_LogFileAge] = []
+    for path in matches:
+        try:
+            aged.append(_LogFileAge(modified_at=path.stat().st_mtime, path=path))
+        except OSError:
+            logger.debug("Could not read the age of log file '%s'; leaving it out.", path, exc_info=True)
+
+    return [entry.path for entry in sorted(aged, key=lambda entry: entry.modified_at, reverse=True)]
 
 
-def prune_log_files(directory: Path, retention_days: int) -> int:
+def prune_log_files(directory: Path, retention_days: int, *, protected_name: str | None = None) -> int:
     """Delete engine log files older than the retention window.
 
-    Returns the number of files deleted. Zero or fewer retention days keeps
-    everything. The file the process is currently writing is never old enough
-    to be caught, because writing refreshes its modification time.
+    The file this process is writing is never deleted, and neither is
+    ``protected_name``. Age alone is not enough to keep them: an engine that has been
+    running longer than the retention window has a log file whose modification time
+    falls outside it, and on POSIX deleting a file another process holds open silently
+    discards the rest of that engine's session while it keeps writing.
+
+    A file open in a *different* process cannot be recognized from here, so a second
+    engine's current log is still at risk once it ages out. Names carry the start time
+    and pid, so the window for that is the whole retention period rather than a race.
+
+    Args:
+        directory: Directory to prune.
+        retention_days: Delete files older than this many days. Zero or fewer keeps
+            everything.
+        protected_name: A file name in ``directory`` to keep whatever its age. Passed by
+            the file sink for the log it is about to open.
+
+    Returns:
+        The number of files deleted.
     """
     if retention_days <= 0:
         return 0
 
+    # Compared by name, not by path: a name identifies a file uniquely within the one
+    # directory being pruned, and two spellings of the same directory would not compare
+    # equal as paths.
+    active = active_log_file()
+    protected = {name for name in (protected_name, active.name if active is not None else None) if name is not None}
+
     cutoff = time.time() - (retention_days * _SECONDS_PER_DAY)
     deleted = 0
     for path in find_log_files(directory):
+        if path.name in protected:
+            continue
+
         try:
             if path.stat().st_mtime >= cutoff:
                 continue
@@ -280,11 +345,12 @@ def _configure_buffer(buffer_lines: int) -> None:
 
 def _configure_file_handler(directory: Path, retention_days: int) -> None:
     """Point the rotating file sink at ``directory``, replacing any existing one."""
-    target_path = directory / _log_file_name()
+    file_name = _log_file_name()
+    target_path = directory / file_name
     if _state.file_handler is not None and _state.file_path == target_path:
         # Already writing exactly there. Re-pruning is still worth doing: a
         # retention change is one of the reasons to be called again.
-        prune_log_files(directory, retention_days)
+        prune_log_files(directory, retention_days, protected_name=file_name)
         return
 
     try:
@@ -297,7 +363,7 @@ def _configure_file_handler(directory: Path, retention_days: int) -> None:
         )
         return
 
-    prune_log_files(directory, retention_days)
+    prune_log_files(directory, retention_days, protected_name=file_name)
 
     try:
         handler = RotatingFileHandler(
