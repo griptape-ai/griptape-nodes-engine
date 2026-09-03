@@ -2604,28 +2604,59 @@ class TestConfigProvenance:
         assert "is a different setting" not in str(own.result_details)
 
     @pytest.mark.parametrize(
-        ("key", "invalid_value"),
+        ("key", "invalid_value", "expected_blamed_key"),
         [
             # Scalar: `loc` is already the key path.
-            ("max_nodes_in_parallel", "not-an-int"),
-            # Union: pydantic appends the member it tried, once per member.
-            ("app_events.on_app_initialization_complete.secrets_to_register", 12345),
+            ("max_nodes_in_parallel", "not-an-int", "max_nodes_in_parallel"),
+            # Union, scalar written to the field: the member tag is the last segment.
+            (
+                "app_events.on_app_initialization_complete.secrets_to_register",
+                12345,
+                "app_events.on_app_initialization_complete.secrets_to_register",
+            ),
+            # Union, failure INSIDE the chosen member: the tag sits mid-path, and the leaf behind
+            # it is the segment that identifies what to fix.
+            (
+                "app_events.on_app_initialization_complete.secrets_to_register",
+                {"HF_TOKEN": None},
+                "app_events.on_app_initialization_complete.secrets_to_register.HF_TOKEN",
+            ),
+            # Same, with a valid sibling, so only the one bad leaf may be blamed.
+            (
+                "app_events.on_app_initialization_complete.secrets_to_register",
+                {"GOOD_TOKEN": "value", "HF_TOKEN": None},
+                "app_events.on_app_initialization_complete.secrets_to_register.HF_TOKEN",
+            ),
+            # Bad element under the list member: an index is not separately assignable, so the
+            # list itself is the right answer.
+            (
+                "app_events.on_app_initialization_complete.secrets_to_register",
+                ["ok", 123],
+                "app_events.on_app_initialization_complete.secrets_to_register",
+            ),
             # List of a union: appends the index AND the member.
-            ("app_events.on_app_initialization_complete.libraries_to_register", [12345]),
+            (
+                "app_events.on_app_initialization_complete.libraries_to_register",
+                [12345],
+                "app_events.on_app_initialization_complete.libraries_to_register",
+            ),
             # List of models: appends the index and the failing sub-field.
-            ("mcp_servers", [{"name": 5}]),
+            ("mcp_servers", [{"name": 5}], "mcp_servers"),
         ],
     )
     def test_rejection_names_the_assignable_key_for_every_field_shape(
-        self, key: str, invalid_value: Any, isolate_user_config: Path
+        self, key: str, invalid_value: Any, expected_blamed_key: str, isolate_user_config: Path
     ) -> None:
-        """The named key has to be one the user can actually assign to.
+        """The named key has to be one the user can assign to, and the most specific such key.
 
-        Pydantic's `loc` is only a config path for a scalar field. For a union it appends the
-        member it tried (`...secrets_to_register.list[str]`) and for a list the index
-        (`mcp_servers.0.name`), so joining the whole tuple invents keys that exist nowhere. Worse,
-        the invented key never matches the key just written, so a user writing an invalid value to
-        one of these fields was told the fault lay in some other setting.
+        Pydantic's `loc` is only a config path for a scalar field. A union interleaves the member
+        it tried and a list interleaves the index, so joining the whole tuple invents keys that
+        exist nowhere, while stopping at the first non-key throws away a real leaf sitting behind
+        a member tag. Either way the named key stops covering the key just written, and the user
+        is sent hunting for a second broken setting that does not exist.
+
+        Parametrised over where the failure sits as well as over the field shape: those two axes
+        fail differently, and holding either fixed hides the other.
         """
         with patch.dict(os.environ, {}, clear=True):
             manager = ConfigManager()
@@ -2634,10 +2665,11 @@ class TestConfigProvenance:
             )
 
             assert manager._merged_config_rejection is not None
-            # Exactly the written key, deduplicated across the union members tried.
-            assert manager._merged_config_rejection.keys == (key,)
+            # Exactly one key: deduplicated across the union members tried, with the common
+            # ancestor dropped in favour of the specific leaf.
+            assert manager._merged_config_rejection.keys == (expected_blamed_key,)
 
-        # So the note blames the write itself rather than sending the user hunting.
+        # The blamed key covers what was written, so the note owns the fault instead of deflecting.
         assert isinstance(result, SetConfigValueResultSuccess)
         assert result.reason == "rejected"
         assert "is not one this setting accepts" in str(result.result_details)
@@ -2645,6 +2677,23 @@ class TestConfigProvenance:
 
         # Stored despite being invalid, which is why the merge keeps failing until it is fixed.
         assert key.split(".", maxsplit=1)[0] in json.loads(isolate_user_config.read_text())
+
+    def test_rejection_reports_each_independently_broken_key(self, isolate_user_config: Path) -> None:
+        """Prefix-dropping must collapse a union's duplicates without merging unrelated keys."""
+        secrets_key = "app_events.on_app_initialization_complete.secrets_to_register"
+
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.set_config_value("max_nodes_in_parallel", "not-an-int")
+            manager.set_config_value(secrets_key, {"HF_TOKEN": None})
+
+            assert manager._merged_config_rejection is not None
+            assert set(manager._merged_config_rejection.keys) == {
+                "max_nodes_in_parallel",
+                f"{secrets_key}.HF_TOKEN",
+            }
+
+        assert json.loads(isolate_user_config.read_text())["max_nodes_in_parallel"] == "not-an-int"
 
     def test_rejection_keeps_a_dot_keyed_leaf_intact(self, isolate_user_config: Path) -> None:
         """Truncating `loc` must not truncate a segment that genuinely is a key.
