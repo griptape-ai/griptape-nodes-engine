@@ -7,6 +7,7 @@ import logging
 import pickle
 import re
 import sys
+import tempfile
 from collections import defaultdict
 from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import UTC, datetime
@@ -28,10 +29,22 @@ from griptape_nodes.common.macro_parser import MacroSyntaxError, MacroVariables,
 from griptape_nodes.common.project_templates.situation import BuiltInSituation, SituationFilePolicy
 from griptape_nodes.exe_types.core_types import ParameterTypeBuiltin
 from griptape_nodes.exe_types.flow import ControlFlow
+from griptape_nodes.exe_types.live_subflow_node import (
+    IS_LIVE_KEY,
+    IS_LOCALLY_OVERRIDDEN_KEY,
+    IS_LOCKED_KEY,
+    LIVE_PATH_KEY,
+    LIVE_VERSION_KEY,
+    LiveSubflowNode,
+)
 from griptape_nodes.exe_types.node_types import BaseNode, EndNode, StartNode
 from griptape_nodes.exe_types.subflow_node import SubflowNode
 from griptape_nodes.exe_types.subflow_node import _get_flow_or_none as _get_subflow_or_none
-from griptape_nodes.exe_types.workflow_node import SUBFLOW_NAME_KEY
+from griptape_nodes.exe_types.workflow_node import (
+    SUBFLOW_NAME_KEY,
+    WorkflowNodeDefinitionError,
+    build_workflow_node_class,
+)
 from griptape_nodes.files.file import File, FileLoadError, FileWriteError
 from griptape_nodes.files.path_utils import (
     FilenameParts,
@@ -40,6 +53,7 @@ from griptape_nodes.files.path_utils import (
     resolve_workspace_path,
 )
 from griptape_nodes.files.project_file import SITUATION_TO_FILE_POLICY, ProjectFileDestination
+from griptape_nodes.node_library.library_registry import LibraryRegistry, NodeMetadata
 from griptape_nodes.node_library.workflow_registry import (
     Workflow,
     WorkflowMetadata,
@@ -82,6 +96,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     SetFlowMetadataResultSuccess,
 )
 from griptape_nodes.retained_mode.events.library_events import (
+    GetAllInfoForLibraryRequest,
     GetLibraryMetadataRequest,
     GetLibraryMetadataResultSuccess,
     ListRegisteredLibrariesRequest,
@@ -127,6 +142,9 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     ConvertNodesToSubflowRequest,
     ConvertNodesToSubflowResultFailure,
     ConvertNodesToSubflowResultSuccess,
+    CreateEditableCopyOfLiveSubflowRequest,
+    CreateEditableCopyOfLiveSubflowResultFailure,
+    CreateEditableCopyOfLiveSubflowResultSuccess,
     CreateWorkflowFromTemplateRequest,
     CreateWorkflowFromTemplateResultFailure,
     CreateWorkflowFromTemplateResultSuccess,
@@ -136,6 +154,9 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     ExportFlowAsLibraryNodeRequest,
     ExportFlowAsLibraryNodeResultFailure,
     ExportFlowAsLibraryNodeResultSuccess,
+    ExportSubflowAsLockedRequest,
+    ExportSubflowAsLockedResultFailure,
+    ExportSubflowAsLockedResultSuccess,
     GetPublishOptionsRequest,
     GetPublishOptionsResultFailure,
     GetPublishOptionsResultSuccess,
@@ -169,6 +190,15 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     LoadWorkflowMetadata,
     LoadWorkflowMetadataResultFailure,
     LoadWorkflowMetadataResultSuccess,
+    LockLiveSubflowToVersionRequest,
+    LockLiveSubflowToVersionResultFailure,
+    LockLiveSubflowToVersionResultSuccess,
+    MakeEditableCopyOfSubflowNodeRequest,
+    MakeEditableCopyOfSubflowNodeResultFailure,
+    MakeEditableCopyOfSubflowNodeResultSuccess,
+    MakeLiveSubflowEditableRequest,
+    MakeLiveSubflowEditableResultFailure,
+    MakeLiveSubflowEditableResultSuccess,
     MergeWorkflowBranchRequest,
     MergeWorkflowBranchResultFailure,
     MergeWorkflowBranchResultSuccess,
@@ -178,6 +208,9 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     OpenNodeInnerCanvasRequest,
     OpenNodeInnerCanvasResultFailure,
     OpenNodeInnerCanvasResultSuccess,
+    PublishLiveSubflowRequest,
+    PublishLiveSubflowResultFailure,
+    PublishLiveSubflowResultSuccess,
     PublishWorkflowRegisteredEventData,
     PublishWorkflowRequest,
     PublishWorkflowResultFailure,
@@ -226,6 +259,9 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     SyncInnerFlowSurfaceRequest,
     SyncInnerFlowSurfaceResultFailure,
     SyncInnerFlowSurfaceResultSuccess,
+    UpdateLiveSubflowToLatestRequest,
+    UpdateLiveSubflowToLatestResultFailure,
+    UpdateLiveSubflowToLatestResultSuccess,
     WorkflowDependencyInfo,
     WorkflowDependencyStatus,
     WorkflowInfoSummary,
@@ -598,6 +634,34 @@ class WorkflowManager(EngineScoped):
         event_manager.assign_manager_to_request_type(
             ExportFlowAsLibraryNodeRequest,
             self.on_export_flow_as_library_node_request,
+        )
+        event_manager.assign_manager_to_request_type(
+            ExportSubflowAsLockedRequest,
+            self.on_export_subflow_as_locked_request,
+        )
+        event_manager.assign_manager_to_request_type(
+            MakeEditableCopyOfSubflowNodeRequest,
+            self.on_make_editable_copy_of_subflow_node_request,
+        )
+        event_manager.assign_manager_to_request_type(
+            PublishLiveSubflowRequest,
+            self.on_publish_live_subflow_request,
+        )
+        event_manager.assign_manager_to_request_type(
+            UpdateLiveSubflowToLatestRequest,
+            self.on_update_live_subflow_to_latest_request,
+        )
+        event_manager.assign_manager_to_request_type(
+            LockLiveSubflowToVersionRequest,
+            self.on_lock_live_subflow_to_version_request,
+        )
+        event_manager.assign_manager_to_request_type(
+            MakeLiveSubflowEditableRequest,
+            self.on_make_live_subflow_editable_request,
+        )
+        event_manager.assign_manager_to_request_type(
+            CreateEditableCopyOfLiveSubflowRequest,
+            self.on_create_editable_copy_of_live_subflow_request,
         )
 
     def has_current_referenced_workflow(self) -> bool:
@@ -7431,7 +7495,16 @@ class WorkflowManager(EngineScoped):
             library_data = {}
 
         library_data.setdefault("name", "Exported Subflows")
+        library_data.setdefault("library_schema_version", "0.11.0")
         library_data.setdefault("version", "0.1.0")
+        library_data.setdefault("metadata", {
+            "author": "User",
+            "description": "Subflows exported from the canvas.",
+            "library_version": "0.1.0",
+            "engine_version": "0.1.0",
+            "tags": ["subflow"],
+        })
+        library_data.setdefault("categories", [{"subflows": {"title": "Subflows", "description": "Exported subflow nodes", "color": "border-blue-500", "icon": "Layers"}}])
         library_data.setdefault("nodes", [])
         workflow_nodes: list = library_data.setdefault("workflow_nodes", [])
 
@@ -7441,6 +7514,7 @@ class WorkflowManager(EngineScoped):
             "metadata": {
                 "category": "subflows",
                 "display_name": node_type_name,
+                "description": node_type_name,
             },
         }
 
@@ -7454,6 +7528,899 @@ class WorkflowManager(EngineScoped):
         library_data["workflow_nodes"] = workflow_nodes
         library_json_path.parent.mkdir(parents=True, exist_ok=True)
         library_json_path.write_text(json.dumps(library_data, indent=2), encoding="utf-8")
+
+    # ------------------------------------------------------------------
+    # Subflow Node: Export as Locked
+    # ------------------------------------------------------------------
+
+    async def on_export_subflow_as_locked_request(self, request: ExportSubflowAsLockedRequest) -> ResultPayload:  # noqa: PLR0911
+        node = self.engine.object_manager.attempt_get_object_by_name_as_type(request.node_name, BaseNode)
+        if node is None:
+            details = f"Attempted to export '{request.node_name}' as a locked subflow. Failed because the node was not found."
+            return ExportSubflowAsLockedResultFailure(result_details=details)
+        if not isinstance(node, SubflowNode):
+            details = (
+                f"Attempted to export '{request.node_name}' as a locked subflow. "
+                "Failed because the node is not a SubflowNode."
+            )
+            return ExportSubflowAsLockedResultFailure(result_details=details)
+
+        child_flow_name = node.metadata.get(SUBFLOW_NAME_KEY)
+        if child_flow_name is None or _get_subflow_or_none(child_flow_name) is None:
+            details = (
+                f"Attempted to export '{request.node_name}' as a locked subflow. "
+                "Failed because the node has no inner canvas. "
+                "Open the node to build the inner flow first."
+            )
+            return ExportSubflowAsLockedResultFailure(result_details=details)
+
+        try:
+            shape_dict = self.extract_workflow_shape(workflow_name=request.node_name, flow_name=child_flow_name)
+        except ValueError as err:
+            details = (
+                f"Attempted to export '{request.node_name}' as a locked subflow. "
+                f"Failed because the inner canvas has no Start Flow or End Flow nodes: {err}. "
+                "Add Start Flow and End Flow nodes before exporting."
+            )
+            return ExportSubflowAsLockedResultFailure(result_details=details)
+
+        workflow_shape = WorkflowShape(inputs=shape_dict["input"], outputs=shape_dict["output"])
+        serialized_result = await self.engine.ahandle_request(
+            SerializeFlowToCommandsRequest(flow_name=child_flow_name, include_create_flow_command=True)
+        )
+        if not isinstance(serialized_result, SerializeFlowToCommandsResultSuccess):
+            details = f"Attempted to export '{request.node_name}' as a locked subflow. Failed because the inner canvas could not be serialized."
+            return ExportSubflowAsLockedResultFailure(result_details=details)
+
+        serialized_commands = serialized_result.serialized_flow_commands
+        if isinstance(serialized_commands.flow_initialization_command, CreateFlowRequest):
+            serialized_commands.flow_initialization_command = CreateFlowRequest(
+                parent_flow_name=None,
+                flow_name=serialized_commands.flow_initialization_command.flow_name,
+                set_as_new_context=serialized_commands.flow_initialization_command.set_as_new_context,
+                metadata=serialized_commands.flow_initialization_command.metadata,
+            )
+
+        node_type_name = request.node_type_name or request.node_name
+        if request.destination_folder is None:
+            destination_folder = self.engine.config_manager.resolved_libraries_root / "exported_subflows"
+        else:
+            destination_folder = Path(request.destination_folder)
+        py_file_path = destination_folder / f"{node_type_name}.py"
+
+        try:
+            workflow_metadata = self._generate_workflow_metadata_from_commands(
+                serialized_flow_commands=serialized_commands,
+                file_name=node_type_name,
+                creation_date=datetime.now(tz=UTC),
+                display_name=node_type_name,
+                workflow_shape=workflow_shape,
+            )
+        except Exception as err:
+            details = f"Attempted to export '{request.node_name}' as a locked subflow. Failed during metadata generation: {err}"
+            return ExportSubflowAsLockedResultFailure(result_details=details)
+
+        workflow_metadata.is_locked = True
+
+        try:
+            final_code_output = self._generate_workflow_file_content(
+                serialized_flow_commands=serialized_commands,
+                workflow_metadata=workflow_metadata,
+            )
+        except Exception as err:
+            details = f"Attempted to export '{request.node_name}' as a locked subflow. Failed during file content generation: {err}"
+            return ExportSubflowAsLockedResultFailure(result_details=details)
+
+        library_json_path = destination_folder / "griptape_nodes_library.json"
+        self._write_locked_subflow_package(
+            destination_folder=destination_folder,
+            py_file_path=py_file_path,
+            final_code_output=final_code_output,
+            library_json_path=library_json_path,
+            node_type_name=node_type_name,
+        )
+
+        await self.engine.ahandle_request(RegisterLibraryFromFileRequest(file_path=str(library_json_path)))
+        self._hot_register_workflow_node(
+            library_name="Exported Subflows",
+            node_type_name=node_type_name,
+            py_file_path=py_file_path,
+            category="subflows",
+            description=node_type_name,
+            display_name=node_type_name,
+        )
+        self.engine.handle_request(GetAllInfoForLibraryRequest(library="Exported Subflows"))
+
+        self._place_exported_node_on_canvas(
+            original_node=node,
+            node_type=node_type_name,
+            library_name="Exported Subflows",
+        )
+
+        details = f"Exported '{request.node_name}' as locked subflow '{node_type_name}' to '{py_file_path}'."
+        return ExportSubflowAsLockedResultSuccess(
+            file_path=str(py_file_path),
+            library_json_path=str(library_json_path),
+            result_details=ResultDetails(message=details, level=logging.INFO),
+        )
+
+    @staticmethod
+    def _write_locked_subflow_package(
+        destination_folder: Path,
+        py_file_path: Path,
+        final_code_output: str,
+        library_json_path: Path,
+        node_type_name: str,
+    ) -> None:
+        destination_folder.mkdir(parents=True, exist_ok=True)
+        py_file_path.write_text(final_code_output, encoding="utf-8")
+        WorkflowManager._upsert_locked_subflow_library_json(
+            library_json_path=library_json_path,
+            node_type_name=node_type_name,
+            py_file_name=py_file_path.name,
+        )
+
+    @staticmethod
+    def _upsert_locked_subflow_library_json(
+        library_json_path: Path,
+        node_type_name: str,
+        py_file_name: str,
+    ) -> None:
+        existing_workflow_nodes: list = []
+        if library_json_path.exists():
+            try:
+                old_data = json.loads(library_json_path.read_text(encoding="utf-8"))
+                existing_workflow_nodes = old_data.get("workflow_nodes") or []
+            except (OSError, json.JSONDecodeError):
+                pass
+
+        new_entry = {
+            "node_type": node_type_name,
+            "workflow_path": py_file_name,
+            "metadata": {
+                "category": "subflows",
+                "description": node_type_name,
+                "display_name": node_type_name,
+            },
+        }
+
+        workflow_nodes = [e for e in existing_workflow_nodes if e.get("node_type") != node_type_name]
+        workflow_nodes.append(new_entry)
+
+        library_data = {
+            "name": "Exported Subflows",
+            "library_schema_version": "0.11.0",
+            "metadata": {
+                "author": "User",
+                "description": "Subflows exported from the canvas.",
+                "library_version": "0.1.0",
+                "engine_version": "0.1.0",
+                "tags": ["subflow"],
+            },
+            "categories": [
+                {
+                    "subflows": {
+                        "title": "Subflows",
+                        "description": "Exported subflow nodes",
+                        "color": "border-blue-500",
+                        "icon": "Layers",
+                    }
+                }
+            ],
+            "nodes": [],
+            "workflow_nodes": workflow_nodes,
+        }
+
+        library_json_path.parent.mkdir(parents=True, exist_ok=True)
+        library_json_path.write_text(json.dumps(library_data, indent=2), encoding="utf-8")
+
+    # ------------------------------------------------------------------
+    # Subflow Node / Live Subflow Node: shared inner-flow clone helper
+    # ------------------------------------------------------------------
+
+    async def _clone_inner_flow_into_new_subflow_node(  # noqa: C901, PLR0911
+        self,
+        source_node: SubflowNode,
+        new_node_type: str,
+    ) -> tuple[str, str] | str:
+        """Clone the source node's inner flow into a new node of new_node_type.
+
+        Returns (new_node_name, created_flow_name) on success, or an error
+        message string on failure.
+        """
+        child_flow_name = source_node.metadata.get(SUBFLOW_NAME_KEY)
+        if child_flow_name is None or _get_subflow_or_none(child_flow_name) is None:
+            return (
+                f"Failed because '{source_node.name}' has no inner canvas. "
+                "Open the node to build the inner flow first."
+            )
+
+        serialized_result = await self.engine.ahandle_request(
+            SerializeFlowToCommandsRequest(flow_name=child_flow_name, include_create_flow_command=True)
+        )
+        if not isinstance(serialized_result, SerializeFlowToCommandsResultSuccess):
+            return "Failed because the inner canvas could not be serialized."
+
+        serialized_commands = serialized_result.serialized_flow_commands
+        if isinstance(serialized_commands.flow_initialization_command, ImportWorkflowAsReferencedSubFlowRequest):
+            serialized_commands.flow_initialization_command = CreateFlowRequest(
+                flow_name=child_flow_name,
+                parent_flow_name=None,
+                set_as_new_context=False,
+                metadata=serialized_commands.flow_initialization_command.imported_flow_metadata,
+            )
+        elif isinstance(serialized_commands.flow_initialization_command, CreateFlowRequest):
+            serialized_commands.flow_initialization_command.parent_flow_name = None
+
+        try:
+            workflow_metadata = self._generate_workflow_metadata_from_commands(
+                serialized_flow_commands=serialized_commands,
+                file_name=f"_tmp_{source_node.name}_copy",
+                creation_date=datetime.now(tz=UTC),
+            )
+        except Exception as err:
+            return f"Failed during metadata generation: {err}"
+
+        try:
+            final_code_output = self._generate_workflow_file_content(
+                serialized_flow_commands=serialized_commands,
+                workflow_metadata=workflow_metadata,
+            )
+        except Exception as err:
+            return f"Failed during file content generation: {err}"
+
+        tmp_dir = Path(tempfile.mkdtemp(prefix="gtn_subflow_copy_"))
+        tmp_py = tmp_dir / f"_tmp_{source_node.name}_copy.py"
+        tmp_py.write_text(final_code_output, encoding="utf-8")
+        tmp_name = str(tmp_py)
+
+        register_result = self.engine.handle_request(
+            RegisterWorkflowRequest(metadata=workflow_metadata, file_name=tmp_name)
+        )
+        if not isinstance(register_result, RegisterWorkflowResultSuccess):
+            return "Failed because the temporary workflow could not be registered."
+
+        flow_result = self.engine.handle_request(GetFlowForNodeRequest(node_name=source_node.name))
+        if not isinstance(flow_result, GetFlowForNodeResultSuccess):
+            WorkflowRegistry.delete_workflow_by_name(tmp_name)
+            return f"Failed because the parent flow could not be found: {flow_result.result_details}"
+        parent_flow_name = flow_result.flow_name
+
+        create_node_result = self.engine.handle_request(
+            CreateNodeRequest(
+                node_type=new_node_type,
+                override_parent_flow_name=parent_flow_name,
+                create_error_proxy_on_failure=False,
+            )
+        )
+        if not isinstance(create_node_result, CreateNodeResultSuccess):
+            WorkflowRegistry.delete_workflow_by_name(tmp_name)
+            return f"Failed to create the new {new_node_type}: {create_node_result.result_details}"
+        new_node_name = create_node_result.node_name
+
+        import_result = await self.engine.ahandle_request(
+            ImportWorkflowAsReferencedSubFlowRequest(
+                workflow_name=tmp_name,
+                flow_name=parent_flow_name,
+                track_as_referenced=False,
+            )
+        )
+        WorkflowRegistry.delete_workflow_by_name(tmp_name)
+
+        if not isinstance(import_result, ImportWorkflowAsReferencedSubFlowResultSuccess):
+            return f"Failed because the inner flow could not be imported: {import_result.result_details}"
+
+        created_flow_name = import_result.created_flow_name
+        new_node = self.engine.object_manager.attempt_get_object_by_name_as_type(new_node_name, SubflowNode)
+        if new_node is None:
+            return f"Failed because the newly created {new_node_type} '{new_node_name}' could not be found after creation."
+
+        new_node.metadata[SUBFLOW_NAME_KEY] = created_flow_name
+        new_node.metadata.pop(IS_LOCKED_KEY, None)
+        new_node.metadata.pop(IS_LIVE_KEY, None)
+        new_node.metadata.pop(LIVE_VERSION_KEY, None)
+        new_node.metadata.pop(LIVE_PATH_KEY, None)
+        new_node.metadata.pop(IS_LOCALLY_OVERRIDDEN_KEY, None)
+
+        sync_result = self.engine.handle_request(SyncInnerFlowSurfaceRequest(node_name=new_node_name))
+        if not isinstance(sync_result, SyncInnerFlowSurfaceResultSuccess):
+            logger.warning(
+                "Created editable copy '%s' but surface sync failed: %s",
+                new_node_name,
+                sync_result.result_details,
+            )
+
+        return new_node_name, created_flow_name
+
+    # ------------------------------------------------------------------
+    # Subflow Node: Make Editable Copy
+    # ------------------------------------------------------------------
+
+    async def on_make_editable_copy_of_subflow_node_request(
+        self, request: MakeEditableCopyOfSubflowNodeRequest
+    ) -> ResultPayload:
+        node = self.engine.object_manager.attempt_get_object_by_name_as_type(request.node_name, BaseNode)
+        if node is None:
+            details = f"Attempted to make an editable copy of '{request.node_name}'. Failed because the node was not found."
+            return MakeEditableCopyOfSubflowNodeResultFailure(result_details=details)
+        if not isinstance(node, SubflowNode):
+            details = (
+                f"Attempted to make an editable copy of '{request.node_name}'. "
+                "Failed because the node is not a SubflowNode."
+            )
+            return MakeEditableCopyOfSubflowNodeResultFailure(result_details=details)
+
+        result = await self._clone_inner_flow_into_new_subflow_node(node, "SubflowNode")
+        if isinstance(result, str):
+            details = f"Attempted to make an editable copy of '{request.node_name}'. {result}"
+            return MakeEditableCopyOfSubflowNodeResultFailure(result_details=details)
+
+        new_node_name, _ = result
+        details = f"Created editable copy '{new_node_name}' from '{request.node_name}'."
+        return MakeEditableCopyOfSubflowNodeResultSuccess(
+            new_node_name=new_node_name,
+            result_details=ResultDetails(message=details, level=logging.INFO),
+        )
+
+    # ------------------------------------------------------------------
+    # Live Subflow Node: Publish with version
+    # ------------------------------------------------------------------
+
+    async def on_publish_live_subflow_request(self, request: PublishLiveSubflowRequest) -> ResultPayload:  # noqa: PLR0911
+        node = self.engine.object_manager.attempt_get_object_by_name_as_type(request.node_name, BaseNode)
+        if node is None:
+            details = f"Attempted to publish Live Subflow '{request.node_name}'. Failed because the node was not found."
+            return PublishLiveSubflowResultFailure(result_details=details)
+        if not isinstance(node, LiveSubflowNode):
+            details = (
+                f"Attempted to publish '{request.node_name}' as a Live Subflow. "
+                "Failed because the node is not a LiveSubflowNode."
+            )
+            return PublishLiveSubflowResultFailure(result_details=details)
+
+        child_flow_name = node.metadata.get(SUBFLOW_NAME_KEY)
+        if child_flow_name is None or _get_subflow_or_none(child_flow_name) is None:
+            details = (
+                f"Attempted to publish Live Subflow '{request.node_name}'. "
+                "Failed because the node has no inner canvas. "
+                "Open the node to build the inner flow first."
+            )
+            return PublishLiveSubflowResultFailure(result_details=details)
+
+        try:
+            shape_dict = self.extract_workflow_shape(workflow_name=request.node_name, flow_name=child_flow_name)
+        except ValueError as err:
+            details = (
+                f"Attempted to publish Live Subflow '{request.node_name}'. "
+                f"Failed because the inner canvas has no Start Flow or End Flow nodes: {err}. "
+                "Add Start Flow and End Flow nodes before publishing."
+            )
+            return PublishLiveSubflowResultFailure(result_details=details)
+
+        workflow_shape = WorkflowShape(inputs=shape_dict["input"], outputs=shape_dict["output"])
+        serialized_result = await self.engine.ahandle_request(
+            SerializeFlowToCommandsRequest(flow_name=child_flow_name, include_create_flow_command=True)
+        )
+        if not isinstance(serialized_result, SerializeFlowToCommandsResultSuccess):
+            details = f"Attempted to publish Live Subflow '{request.node_name}'. Failed because the inner canvas could not be serialized."
+            return PublishLiveSubflowResultFailure(result_details=details)
+
+        serialized_commands = serialized_result.serialized_flow_commands
+        if isinstance(serialized_commands.flow_initialization_command, CreateFlowRequest):
+            serialized_commands.flow_initialization_command = CreateFlowRequest(
+                parent_flow_name=None,
+                flow_name=serialized_commands.flow_initialization_command.flow_name,
+                set_as_new_context=serialized_commands.flow_initialization_command.set_as_new_context,
+                metadata=serialized_commands.flow_initialization_command.metadata,
+            )
+
+        node_type_name = request.node_type_name or request.node_name
+        safe_version = request.version.replace(".", "_")
+        versioned_name = f"{node_type_name}_v{safe_version}"
+        if request.destination_folder is None:
+            destination_folder = self.engine.config_manager.resolved_libraries_root / "live_subflows"
+        else:
+            destination_folder = Path(request.destination_folder)
+        py_file_path = destination_folder / f"{versioned_name}.py"
+
+        try:
+            workflow_metadata = self._generate_workflow_metadata_from_commands(
+                serialized_flow_commands=serialized_commands,
+                file_name=versioned_name,
+                creation_date=datetime.now(tz=UTC),
+                display_name=versioned_name,
+                workflow_shape=workflow_shape,
+            )
+        except Exception as err:
+            details = f"Attempted to publish Live Subflow '{request.node_name}'. Failed during metadata generation: {err}"
+            return PublishLiveSubflowResultFailure(result_details=details)
+
+        workflow_metadata.is_live = True
+        workflow_metadata.is_locked = True
+        workflow_metadata.live_version = request.version
+        workflow_metadata.live_path = str(py_file_path)
+
+        try:
+            final_code_output = self._generate_workflow_file_content(
+                serialized_flow_commands=serialized_commands,
+                workflow_metadata=workflow_metadata,
+            )
+        except Exception as err:
+            details = f"Attempted to publish Live Subflow '{request.node_name}'. Failed during file content generation: {err}"
+            return PublishLiveSubflowResultFailure(result_details=details)
+
+        library_json_path = destination_folder / "griptape_nodes_library.json"
+        self._write_live_subflow_package(
+            destination_folder=destination_folder,
+            py_file_path=py_file_path,
+            final_code_output=final_code_output,
+            library_json_path=library_json_path,
+            node_type_name=node_type_name,
+            versioned_name=versioned_name,
+            version=request.version,
+        )
+
+        node.metadata[LIVE_VERSION_KEY] = request.version
+        node.metadata[LIVE_PATH_KEY] = str(py_file_path)
+        node.metadata.pop(IS_LOCALLY_OVERRIDDEN_KEY, None)
+
+        await self.engine.ahandle_request(RegisterLibraryFromFileRequest(file_path=str(library_json_path)))
+        self._hot_register_workflow_node(
+            library_name="Live Subflows",
+            node_type_name=versioned_name,
+            py_file_path=py_file_path,
+            category="live_subflows",
+            description=f"{node_type_name} v{request.version}",
+            display_name=f"{node_type_name} v{request.version}",
+        )
+        self.engine.handle_request(GetAllInfoForLibraryRequest(library="Live Subflows"))
+
+        self._place_exported_node_on_canvas(
+            original_node=node,
+            node_type=versioned_name,
+            library_name="Live Subflows",
+        )
+
+        details = f"Published Live Subflow '{request.node_name}' as '{versioned_name}' v{request.version} to '{py_file_path}'."
+        return PublishLiveSubflowResultSuccess(
+            file_path=str(py_file_path),
+            library_json_path=str(library_json_path),
+            live_version=request.version,
+            live_path=str(py_file_path),
+            result_details=ResultDetails(message=details, level=logging.INFO),
+        )
+
+    def _place_exported_node_on_canvas(
+        self,
+        original_node: BaseNode,
+        node_type: str,
+        library_name: str,
+    ) -> None:
+        """Place an instance of the exported/published node type next to the original node.
+
+        Silently skips placement if the parent flow cannot be determined.
+        """
+        flow_result = self.engine.handle_request(GetFlowForNodeRequest(node_name=original_node.name))
+        if not isinstance(flow_result, GetFlowForNodeResultSuccess):
+            return
+        original_pos = original_node.metadata.get("position", {})
+        if isinstance(original_pos, dict):
+            x = original_pos.get("x", 0) + 800
+            y = original_pos.get("y", 0)
+        else:
+            x, y = 800, 0
+        self.engine.handle_request(
+            CreateNodeRequest(
+                node_type=node_type,
+                specific_library_name=library_name,
+                override_parent_flow_name=flow_result.flow_name,
+                metadata={"position": {"x": x, "y": y}},
+                create_error_proxy_on_failure=False,
+            )
+        )
+
+    def _hot_register_workflow_node(  # noqa: PLR0913, PLR0917
+        self,
+        library_name: str,
+        node_type_name: str,
+        py_file_path: Path,
+        category: str,
+        description: str,
+        display_name: str,
+    ) -> None:
+        """Register or replace a single workflow node in an already-loaded library.
+
+        RegisterLibraryFromFileRequest is idempotent — it skips re-loading when the library
+        is already in the registry. This method bypasses that guard and directly upserts the
+        node class into the live Library object, so a re-export in the same session takes
+        effect immediately without requiring an engine restart.
+        """
+        try:
+            library = LibraryRegistry.get_library(name=library_name)
+        except KeyError:
+            return
+        try:
+            workflow_metadata = read_workflow_metadata(py_file_path)
+            node_class = build_workflow_node_class(
+                node_type=node_type_name,
+                workflow_file_path=py_file_path,
+                workflow_metadata=workflow_metadata,
+            )
+        except (WorkflowMetadataError, WorkflowNodeDefinitionError):
+            return
+        node_metadata = NodeMetadata(
+            category=category,
+            description=description,
+            display_name=display_name,
+        )
+        library.register_new_node_type(node_class, metadata=node_metadata)
+
+    @staticmethod
+    def _write_live_subflow_package(  # noqa: PLR0913, PLR0917
+        destination_folder: Path,
+        py_file_path: Path,
+        final_code_output: str,
+        library_json_path: Path,
+        node_type_name: str,
+        versioned_name: str,
+        version: str,
+    ) -> None:
+        destination_folder.mkdir(parents=True, exist_ok=True)
+        py_file_path.write_text(final_code_output, encoding="utf-8")
+        WorkflowManager._upsert_live_subflow_library_json(
+            library_json_path=library_json_path,
+            node_type_name=node_type_name,
+            versioned_name=versioned_name,
+            py_file_name=py_file_path.name,
+            version=version,
+        )
+
+    @staticmethod
+    def _upsert_live_subflow_library_json(
+        library_json_path: Path,
+        node_type_name: str,
+        versioned_name: str,
+        py_file_name: str,
+        version: str,
+    ) -> None:
+        existing_workflow_nodes: list = []
+        if library_json_path.exists():
+            try:
+                old_data = json.loads(library_json_path.read_text(encoding="utf-8"))
+                existing_workflow_nodes = old_data.get("workflow_nodes") or []
+            except (OSError, json.JSONDecodeError):
+                pass
+
+        new_entry = {
+            "node_type": versioned_name,
+            "workflow_path": py_file_name,
+            "metadata": {
+                "category": "live_subflows",
+                "description": f"{node_type_name} v{version}",
+                "display_name": f"{node_type_name} v{version}",
+            },
+        }
+
+        workflow_nodes = [e for e in existing_workflow_nodes if e.get("node_type") != versioned_name]
+        workflow_nodes.append(new_entry)
+
+        library_data = {
+            "name": "Live Subflows",
+            "library_schema_version": "0.11.0",
+            "metadata": {
+                "author": "User",
+                "description": "Live subflows published from the canvas.",
+                "library_version": "0.1.0",
+                "engine_version": "0.1.0",
+                "tags": ["subflow", "live"],
+            },
+            "categories": [
+                {
+                    "live_subflows": {
+                        "title": "Live Subflows",
+                        "description": "Published live subflow nodes",
+                        "color": "border-purple-500",
+                        "icon": "Layers",
+                    }
+                }
+            ],
+            "nodes": [],
+            "workflow_nodes": workflow_nodes,
+        }
+
+        library_json_path.parent.mkdir(parents=True, exist_ok=True)
+        library_json_path.write_text(json.dumps(library_data, indent=2), encoding="utf-8")
+
+    # ------------------------------------------------------------------
+    # Live Subflow Node: Update to latest version
+    # ------------------------------------------------------------------
+
+    def on_update_live_subflow_to_latest_request(
+        self, request: UpdateLiveSubflowToLatestRequest
+    ) -> ResultPayload:
+        node = self.engine.object_manager.attempt_get_object_by_name_as_type(request.node_name, BaseNode)
+        if node is None:
+            details = f"Attempted to update '{request.node_name}' to the latest version. Failed because the node was not found."
+            return UpdateLiveSubflowToLatestResultFailure(result_details=details)
+        if not isinstance(node, LiveSubflowNode):
+            details = (
+                f"Attempted to update '{request.node_name}' to the latest version. "
+                "Failed because the node is not a LiveSubflowNode."
+            )
+            return UpdateLiveSubflowToLatestResultFailure(result_details=details)
+
+        live_path = node.metadata.get(LIVE_PATH_KEY)
+        if live_path is None:
+            details = (
+                f"Attempted to update '{request.node_name}' to the latest version. "
+                "Failed because the node has no live_path. Publish the node first."
+            )
+            return UpdateLiveSubflowToLatestResultFailure(result_details=details)
+
+        current_file = Path(live_path)
+        search_dir = current_file.parent
+        base_name = self._extract_live_subflow_base_name(current_file.stem)
+        latest_file, latest_version = self._find_latest_live_subflow_version(search_dir, base_name)
+
+        if latest_file is None:
+            details = (
+                f"Attempted to update '{request.node_name}' to the latest version. "
+                f"Failed because no versioned files for '{base_name}' were found in '{search_dir}'."
+            )
+            return UpdateLiveSubflowToLatestResultFailure(result_details=details)
+
+        node.metadata[LIVE_VERSION_KEY] = latest_version
+        node.metadata[LIVE_PATH_KEY] = str(latest_file)
+        node.metadata[IS_LOCKED_KEY] = True
+        node.metadata.pop(IS_LOCALLY_OVERRIDDEN_KEY, None)
+
+        details = f"Updated '{request.node_name}' to latest version '{latest_version}' from '{latest_file}'."
+        return UpdateLiveSubflowToLatestResultSuccess(
+            live_version=latest_version,
+            live_path=str(latest_file),
+            result_details=ResultDetails(message=details, level=logging.INFO),
+        )
+
+    # ------------------------------------------------------------------
+    # Live Subflow Node: Lock to specific version
+    # ------------------------------------------------------------------
+
+    def on_lock_live_subflow_to_version_request(
+        self, request: LockLiveSubflowToVersionRequest
+    ) -> ResultPayload:
+        node = self.engine.object_manager.attempt_get_object_by_name_as_type(request.node_name, BaseNode)
+        if node is None:
+            details = f"Attempted to lock '{request.node_name}' to version '{request.version}'. Failed because the node was not found."
+            return LockLiveSubflowToVersionResultFailure(result_details=details)
+        if not isinstance(node, LiveSubflowNode):
+            details = (
+                f"Attempted to lock '{request.node_name}' to version '{request.version}'. "
+                "Failed because the node is not a LiveSubflowNode."
+            )
+            return LockLiveSubflowToVersionResultFailure(result_details=details)
+
+        live_path = node.metadata.get(LIVE_PATH_KEY)
+        if live_path is None:
+            details = (
+                f"Attempted to lock '{request.node_name}' to version '{request.version}'. "
+                "Failed because the node has no live_path. Publish the node first."
+            )
+            return LockLiveSubflowToVersionResultFailure(result_details=details)
+
+        current_file = Path(live_path)
+        search_dir = current_file.parent
+        base_name = self._extract_live_subflow_base_name(current_file.stem)
+        safe_version = request.version.replace(".", "_")
+        target_file = search_dir / f"{base_name}_v{safe_version}.py"
+
+        if not target_file.exists():
+            details = (
+                f"Attempted to lock '{request.node_name}' to version '{request.version}'. "
+                f"Failed because the file '{target_file}' does not exist."
+            )
+            return LockLiveSubflowToVersionResultFailure(result_details=details)
+
+        node.metadata[LIVE_VERSION_KEY] = request.version
+        node.metadata[LIVE_PATH_KEY] = str(target_file)
+        node.metadata[IS_LOCKED_KEY] = True
+        node.metadata.pop(IS_LOCALLY_OVERRIDDEN_KEY, None)
+
+        details = f"Locked '{request.node_name}' to version '{request.version}' at '{target_file}'."
+        return LockLiveSubflowToVersionResultSuccess(
+            live_version=request.version,
+            live_path=str(target_file),
+            result_details=ResultDetails(message=details, level=logging.INFO),
+        )
+
+    # ------------------------------------------------------------------
+    # Live Subflow Node: Make Editable (local override)
+    # ------------------------------------------------------------------
+
+    async def on_make_live_subflow_editable_request(  # noqa: PLR0911
+        self, request: MakeLiveSubflowEditableRequest
+    ) -> ResultPayload:
+        node = self.engine.object_manager.attempt_get_object_by_name_as_type(request.node_name, BaseNode)
+        if node is None:
+            details = f"Attempted to make '{request.node_name}' editable. Failed because the node was not found."
+            return MakeLiveSubflowEditableResultFailure(result_details=details)
+        if not isinstance(node, LiveSubflowNode):
+            details = (
+                f"Attempted to make '{request.node_name}' editable. "
+                "Failed because the node is not a LiveSubflowNode."
+            )
+            return MakeLiveSubflowEditableResultFailure(result_details=details)
+
+        child_flow_name = node.metadata.get(SUBFLOW_NAME_KEY)
+        if child_flow_name is not None and _get_subflow_or_none(child_flow_name) is not None:
+            node.metadata[IS_LOCALLY_OVERRIDDEN_KEY] = True
+            node.metadata.pop(IS_LOCKED_KEY, None)
+            details = f"'{request.node_name}' is now editable. Inner canvas '{child_flow_name}' is open for local changes."
+            return MakeLiveSubflowEditableResultSuccess(
+                node_name=request.node_name,
+                child_flow_name=child_flow_name,
+                result_details=ResultDetails(message=details, level=logging.INFO),
+            )
+
+        live_path = node.metadata.get(LIVE_PATH_KEY)
+        if live_path is None:
+            details = (
+                f"Attempted to make '{request.node_name}' editable. "
+                "Failed because the node has no inner canvas and no live_path. "
+                "Publish the node first, or open the inner canvas manually."
+            )
+            return MakeLiveSubflowEditableResultFailure(result_details=details)
+
+        live_file = Path(live_path)
+        if not self._path_exists(live_file):
+            details = (
+                f"Attempted to make '{request.node_name}' editable. "
+                f"Failed because the live file '{live_path}' does not exist."
+            )
+            return MakeLiveSubflowEditableResultFailure(result_details=details)
+
+        live_version = node.metadata.get(LIVE_VERSION_KEY, "unknown")
+        try:
+            workflow_metadata = self._load_workflow_metadata_from_file(str(live_file))
+        except Exception as err:
+            details = f"Attempted to make '{request.node_name}' editable. Failed because the live file could not be read: {err}"
+            return MakeLiveSubflowEditableResultFailure(result_details=details)
+
+        register_result = self.engine.handle_request(
+            RegisterWorkflowRequest(metadata=workflow_metadata, file_name=str(live_file))
+        )
+        if not isinstance(register_result, RegisterWorkflowResultSuccess):
+            details = f"Attempted to make '{request.node_name}' editable. Failed because the live file could not be registered."
+            return MakeLiveSubflowEditableResultFailure(result_details=details)
+
+        flow_result = self.engine.handle_request(GetFlowForNodeRequest(node_name=request.node_name))
+        if not isinstance(flow_result, GetFlowForNodeResultSuccess):
+            WorkflowRegistry.delete_workflow_by_name(str(live_file))
+            details = f"Attempted to make '{request.node_name}' editable. Failed because the parent flow could not be found: {flow_result.result_details}"
+            return MakeLiveSubflowEditableResultFailure(result_details=details)
+        parent_flow_name = flow_result.flow_name
+
+        import_result = await self.engine.ahandle_request(
+            ImportWorkflowAsReferencedSubFlowRequest(
+                workflow_name=str(live_file),
+                flow_name=parent_flow_name,
+                track_as_referenced=False,
+            )
+        )
+        WorkflowRegistry.delete_workflow_by_name(str(live_file))
+
+        if not isinstance(import_result, ImportWorkflowAsReferencedSubFlowResultSuccess):
+            details = f"Attempted to make '{request.node_name}' editable. Failed because the live file could not be imported: {import_result.result_details}"
+            return MakeLiveSubflowEditableResultFailure(result_details=details)
+
+        new_child_flow_name = import_result.created_flow_name
+        node.metadata[SUBFLOW_NAME_KEY] = new_child_flow_name
+        node.metadata[IS_LOCALLY_OVERRIDDEN_KEY] = True
+        node.metadata.pop(IS_LOCKED_KEY, None)
+
+        details = f"'{request.node_name}' is now editable (local override of v{live_version}). Inner canvas '{new_child_flow_name}' loaded from '{live_path}'."
+        return MakeLiveSubflowEditableResultSuccess(
+            node_name=request.node_name,
+            child_flow_name=new_child_flow_name,
+            result_details=ResultDetails(message=details, level=logging.INFO),
+        )
+
+    def _load_workflow_metadata_from_file(self, file_path: str) -> WorkflowMetadata:
+        """Load and return WorkflowMetadata from a workflow .py file's TOML header."""
+        load_result = self.engine.handle_request(LoadWorkflowMetadata(file_name=file_path))
+        if not isinstance(load_result, LoadWorkflowMetadataResultSuccess):
+            msg = f"Could not load metadata from '{file_path}': {load_result.result_details}"
+            raise TypeError(msg)
+        return load_result.metadata
+
+    @staticmethod
+    def _path_exists(path: Path) -> bool:
+        return path.exists()
+
+    # ------------------------------------------------------------------
+    # Live Subflow Node: Create Editable Copy (plain SubflowNode)
+    # ------------------------------------------------------------------
+
+    async def on_create_editable_copy_of_live_subflow_request(
+        self, request: CreateEditableCopyOfLiveSubflowRequest
+    ) -> ResultPayload:
+        node = self.engine.object_manager.attempt_get_object_by_name_as_type(request.node_name, BaseNode)
+        if node is None:
+            details = f"Attempted to create an editable copy of '{request.node_name}'. Failed because the node was not found."
+            return CreateEditableCopyOfLiveSubflowResultFailure(result_details=details)
+        if not isinstance(node, LiveSubflowNode):
+            details = (
+                f"Attempted to create an editable copy of '{request.node_name}'. "
+                "Failed because the node is not a LiveSubflowNode."
+            )
+            return CreateEditableCopyOfLiveSubflowResultFailure(result_details=details)
+
+        child_flow_name = node.metadata.get(SUBFLOW_NAME_KEY)
+        if child_flow_name is None or _get_subflow_or_none(child_flow_name) is None:
+            live_path = node.metadata.get(LIVE_PATH_KEY)
+            if live_path is None:
+                details = (
+                    f"Attempted to create an editable copy of '{request.node_name}'. "
+                    "Failed because the node has no inner canvas and no live_path."
+                )
+                return CreateEditableCopyOfLiveSubflowResultFailure(result_details=details)
+
+            make_editable_result = await self.engine.ahandle_request(
+                MakeLiveSubflowEditableRequest(node_name=request.node_name)
+            )
+            if not isinstance(make_editable_result, MakeLiveSubflowEditableResultSuccess):
+                details = f"Attempted to create an editable copy of '{request.node_name}'. Failed to load inner canvas: {make_editable_result.result_details}"
+                return CreateEditableCopyOfLiveSubflowResultFailure(result_details=details)
+
+        result = await self._clone_inner_flow_into_new_subflow_node(node, "SubflowNode")
+        if isinstance(result, str):
+            details = f"Attempted to create an editable copy of '{request.node_name}'. {result}"
+            return CreateEditableCopyOfLiveSubflowResultFailure(result_details=details)
+
+        new_node_name, _ = result
+        details = f"Created editable SubflowNode copy '{new_node_name}' from Live Subflow '{request.node_name}'."
+        return CreateEditableCopyOfLiveSubflowResultSuccess(
+            new_node_name=new_node_name,
+            result_details=ResultDetails(message=details, level=logging.INFO),
+        )
+
+    # ------------------------------------------------------------------
+    # Version file helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_live_subflow_base_name(file_stem: str) -> str:
+        """Strip the _vX_Y suffix from a versioned live subflow file stem.
+
+        Example: "my_subflow_v1_0" -> "my_subflow"
+        """
+        return re.sub(r"_v\d+(?:_\d+)*$", "", file_stem)
+
+    @staticmethod
+    def _find_latest_live_subflow_version(
+        search_dir: Path, base_name: str
+    ) -> tuple[Path | None, str]:
+        """Find the highest-versioned .py file matching {base_name}_vX_Y.py.
+
+        Returns (path, version_string) or (None, "") if none found.
+        """
+        pattern = re.compile(rf"^{re.escape(base_name)}_v(\d+(?:_\d+)*)\.py$")
+        best_file: Path | None = None
+        best_parts: list[int] = []
+        best_version: str = ""
+
+        for candidate in search_dir.iterdir():
+            if not candidate.is_file():
+                continue
+            match = pattern.match(candidate.name)
+            if match is None:
+                continue
+            parts = [int(x) for x in match.group(1).split("_")]
+            if parts > best_parts:
+                best_parts = parts
+                best_file = candidate
+                best_version = ".".join(str(x) for x in parts)
+
+        return best_file, best_version
 
 
 class ASTContainer:

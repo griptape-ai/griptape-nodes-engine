@@ -126,6 +126,11 @@ class WorkflowMetadata(BaseModel):
     last_modified_date: datetime | None = Field(default=None)
     branched_from: str | None = Field(default=None)
     workflow_shape: WorkflowShape | None = Field(default=None)
+    is_locked: bool | None = None
+    is_live: bool | None = None
+    live_version: str | None = None
+    live_path: str | None = None
+    is_locally_overridden: bool | None = None
 
     @field_serializer("node_types_used")
     def serialize_node_types_used(self, node_types_used: set[LibraryNameAndNodeType]) -> list[list[str]]:

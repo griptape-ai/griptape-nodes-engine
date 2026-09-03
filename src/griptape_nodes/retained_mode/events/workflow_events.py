@@ -1464,3 +1464,351 @@ class ConvertNodesToSubflowResultFailure(ResultPayloadFailure):
     Common causes: empty node list, nodes not found, nodes in different flows,
     SubflowNode or inner flow creation failed.
     """
+
+
+# ---------------------------------------------------------------------------
+# Subflow Node: Export as Locked
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+@PayloadRegistry.register
+class ExportSubflowAsLockedRequest(RequestPayload):
+    """Export a SubflowNode's inner flow as a locked, portable library node.
+
+    Serializes the inner child flow to a .py file and writes a
+    griptape_nodes_library.json alongside it. The exported workflow metadata
+    carries is_locked: true so the frontend renders the Lock icon when the
+    resulting node type is placed on a canvas.
+
+    Args:
+        node_name: Name of the SubflowNode whose inner canvas to export.
+        destination_folder: Absolute path of the folder to write the package into.
+            Defaults to <libraries_root>/exported_subflows/ when None.
+        node_type_name: Name for the exported node type. Defaults to node_name.
+
+    Results: ExportSubflowAsLockedResultSuccess | ExportSubflowAsLockedResultFailure
+    """
+
+    node_name: str
+    destination_folder: str | None = None
+    node_type_name: str | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class ExportSubflowAsLockedResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """SubflowNode exported as a locked library node successfully.
+
+    Args:
+        file_path: Absolute path to the written .py workflow file.
+        library_json_path: Path to the library JSON that now references this node type.
+    """
+
+    file_path: str
+    library_json_path: str
+
+
+@dataclass
+@PayloadRegistry.register
+class ExportSubflowAsLockedResultFailure(ResultPayloadFailure):
+    """SubflowNode could not be exported as a locked node.
+
+    Common causes: node not found, node is not a SubflowNode, no inner canvas,
+    no Start/End Flow nodes, file write error.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Subflow Node: Make Editable Copy
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+@PayloadRegistry.register
+class MakeEditableCopyOfSubflowNodeRequest(RequestPayload):
+    """Duplicate a SubflowNode's inner flow into a new unlocked SubflowNode.
+
+    Creates a new SubflowNode on the canvas with a cloned copy of the source
+    node's inner flow. The new node has no is_locked / is_live flags, making
+    it fully editable. The source node is left unchanged.
+
+    Args:
+        node_name: Name of the source SubflowNode to copy from.
+
+    Results: MakeEditableCopyOfSubflowNodeResultSuccess | MakeEditableCopyOfSubflowNodeResultFailure
+    """
+
+    node_name: str
+
+
+@dataclass
+@PayloadRegistry.register
+class MakeEditableCopyOfSubflowNodeResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
+    """Editable copy of SubflowNode created successfully.
+
+    Args:
+        new_node_name: Name of the newly placed, unlocked SubflowNode.
+    """
+
+    new_node_name: str
+
+
+@dataclass
+@PayloadRegistry.register
+class MakeEditableCopyOfSubflowNodeResultFailure(ResultPayloadFailure):
+    """Editable copy of SubflowNode could not be created.
+
+    Common causes: source node not found, node is not a SubflowNode,
+    no inner canvas, serialization or import failure.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Live Subflow Node: Publish with version
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+@PayloadRegistry.register
+class PublishLiveSubflowRequest(RequestPayload):
+    """Publish a LiveSubflowNode's inner flow with a version number.
+
+    Serializes the inner child flow to a versioned .py file and writes or
+    updates a griptape_nodes_library.json. The exported metadata carries
+    is_live: true, is_locked: true, live_version, and live_path. The source
+    node's metadata is updated to reflect the published state.
+
+    Args:
+        node_name: Name of the LiveSubflowNode to publish.
+        version: Version string for this release (e.g. "1.0").
+        destination_folder: Absolute path of the folder to write the package into.
+            Defaults to <libraries_root>/live_subflows/ when None.
+        node_type_name: Name for the published node type. Defaults to node_name.
+
+    Results: PublishLiveSubflowResultSuccess | PublishLiveSubflowResultFailure
+    """
+
+    node_name: str
+    version: str
+    destination_folder: str | None = None
+    node_type_name: str | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class PublishLiveSubflowResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
+    """LiveSubflowNode published successfully.
+
+    Args:
+        file_path: Absolute path to the written versioned .py file.
+        library_json_path: Path to the library JSON that now references this node type.
+        live_version: The version string that was published.
+        live_path: Absolute path to the versioned file (same as file_path).
+    """
+
+    file_path: str
+    library_json_path: str
+    live_version: str
+    live_path: str
+
+
+@dataclass
+@PayloadRegistry.register
+class PublishLiveSubflowResultFailure(ResultPayloadFailure):
+    """LiveSubflowNode could not be published.
+
+    Common causes: node not found, node is not a LiveSubflowNode, no inner canvas,
+    no Start/End Flow nodes, file write error, invalid version string.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Live Subflow Node: Update to latest version
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+@PayloadRegistry.register
+class UpdateLiveSubflowToLatestRequest(RequestPayload):
+    """Update a placed LiveSubflowNode to the latest published version.
+
+    Scans the directory of the node's live_path for the highest-versioned file
+    matching the same base name. Updates live_version and live_path in the node's
+    metadata. The inner canvas (if open) is reloaded from the new file.
+
+    Args:
+        node_name: Name of the LiveSubflowNode to update.
+
+    Results: UpdateLiveSubflowToLatestResultSuccess | UpdateLiveSubflowToLatestResultFailure
+    """
+
+    node_name: str
+
+
+@dataclass
+@PayloadRegistry.register
+class UpdateLiveSubflowToLatestResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
+    """LiveSubflowNode updated to the latest version successfully.
+
+    Args:
+        live_version: The new (latest) version string.
+        live_path: Absolute path to the latest versioned file.
+    """
+
+    live_version: str
+    live_path: str
+
+
+@dataclass
+@PayloadRegistry.register
+class UpdateLiveSubflowToLatestResultFailure(ResultPayloadFailure):
+    """LiveSubflowNode could not be updated to the latest version.
+
+    Common causes: node not found, node has no live_path, no versioned files
+    found in the live directory, file load error.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Live Subflow Node: Lock to specific version
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+@PayloadRegistry.register
+class LockLiveSubflowToVersionRequest(RequestPayload):
+    """Freeze a placed LiveSubflowNode to a specific published version.
+
+    Locates the versioned file in the same directory as live_path and updates
+    the node's metadata so it always runs from that version. Sets is_locked: true
+    and clears is_locally_overridden.
+
+    Args:
+        node_name: Name of the LiveSubflowNode to freeze.
+        version: The version string to lock to (e.g. "1.0").
+
+    Results: LockLiveSubflowToVersionResultSuccess | LockLiveSubflowToVersionResultFailure
+    """
+
+    node_name: str
+    version: str
+
+
+@dataclass
+@PayloadRegistry.register
+class LockLiveSubflowToVersionResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
+    """LiveSubflowNode locked to the requested version successfully.
+
+    Args:
+        live_version: The version string the node is now locked to.
+        live_path: Absolute path to the locked versioned file.
+    """
+
+    live_version: str
+    live_path: str
+
+
+@dataclass
+@PayloadRegistry.register
+class LockLiveSubflowToVersionResultFailure(ResultPayloadFailure):
+    """LiveSubflowNode could not be locked to the requested version.
+
+    Common causes: node not found, node has no live_path, versioned file for
+    the requested version not found in the live directory.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Live Subflow Node: Make Editable (local override)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+@PayloadRegistry.register
+class MakeLiveSubflowEditableRequest(RequestPayload):
+    """Allow local editing of a locked LiveSubflowNode without saving to the live file.
+
+    Sets is_locally_overridden: true on the node, clearing is_locked so the inner
+    canvas becomes accessible. If the node has no inner canvas yet, one is created
+    from the live_path file. Changes made to the inner canvas are treated as a local
+    override and will not be pushed to the live file unless the user explicitly
+    re-publishes.
+
+    Args:
+        node_name: Name of the LiveSubflowNode to make editable.
+
+    Results: MakeLiveSubflowEditableResultSuccess | MakeLiveSubflowEditableResultFailure
+    """
+
+    node_name: str
+
+
+@dataclass
+@PayloadRegistry.register
+class MakeLiveSubflowEditableResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
+    """LiveSubflowNode made editable successfully.
+
+    Args:
+        node_name: Name of the node (unchanged).
+        child_flow_name: Name of the inner child flow now open for editing.
+    """
+
+    node_name: str
+    child_flow_name: str
+
+
+@dataclass
+@PayloadRegistry.register
+class MakeLiveSubflowEditableResultFailure(ResultPayloadFailure):
+    """LiveSubflowNode could not be made editable.
+
+    Common causes: node not found, node is not a LiveSubflowNode, no live_path
+    and no existing inner canvas, file load failure.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Live Subflow Node: Create Editable Copy (plain SubflowNode)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+@PayloadRegistry.register
+class CreateEditableCopyOfLiveSubflowRequest(RequestPayload):
+    """Duplicate a LiveSubflowNode's inner flow into a new plain, unlocked SubflowNode.
+
+    Creates a new SubflowNode (not a LiveSubflowNode) on the canvas with a
+    cloned copy of the source node's inner flow. The new node carries no
+    is_live, is_locked, live_version, or live_path metadata, making it a
+    fully independent editable copy. The source node is left unchanged.
+
+    Args:
+        node_name: Name of the source LiveSubflowNode to copy from.
+
+    Results: CreateEditableCopyOfLiveSubflowResultSuccess | CreateEditableCopyOfLiveSubflowResultFailure
+    """
+
+    node_name: str
+
+
+@dataclass
+@PayloadRegistry.register
+class CreateEditableCopyOfLiveSubflowResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
+    """Editable copy of LiveSubflowNode created as a plain SubflowNode successfully.
+
+    Args:
+        new_node_name: Name of the newly placed, unlocked SubflowNode.
+    """
+
+    new_node_name: str
+
+
+@dataclass
+@PayloadRegistry.register
+class CreateEditableCopyOfLiveSubflowResultFailure(ResultPayloadFailure):
+    """Editable copy of LiveSubflowNode could not be created.
+
+    Common causes: source node not found, node is not a LiveSubflowNode,
+    no inner canvas and no live_path, serialization or import failure.
+    """

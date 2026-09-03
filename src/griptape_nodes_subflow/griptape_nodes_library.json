@@ -27,7 +27,21 @@
         "description": "A reusable subflow node. Open its inner canvas to build a workflow, promote parameters to the surface, and export as a package.",
         "display_name": "Subflow Node",
         "icon": "Layers",
-        "tags": ["subflow", "macro", "workflow", "execution"]
+        "tags": ["subflow", "macro", "workflow", "execution"],
+        "subflow_node": true
+      }
+    },
+    {
+      "class_name": "LiveSubflowNode",
+      "file_path": "live_subflow_node_entry.py",
+      "metadata": {
+        "category": "execution_flow",
+        "description": "A versioned live subflow node. Build the inner canvas, publish with a version number, and share via the sidebar. Supports local overrides and version pinning.",
+        "display_name": "Live Subflow Node",
+        "icon": "Layers",
+        "tags": ["subflow", "live", "versioned", "workflow", "execution"],
+        "subflow_node": true,
+        "is_live": true
       }
     }
   ]
