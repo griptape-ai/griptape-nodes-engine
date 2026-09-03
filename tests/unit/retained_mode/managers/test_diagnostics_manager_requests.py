@@ -60,9 +60,13 @@ if TYPE_CHECKING:
 # S105 reads any name ending in KEY as a credential; this is the key's name, not its value.
 _SECRET_NAME = "GTN_TEST_DIAGNOSTICS_KEY"  # noqa: S105
 
-# Long enough to be searched for in free text, and distinctive enough that finding it
-# anywhere in a bundle is unambiguous rather than a coincidence of the machine it ran on.
-_SECRET_VALUE = "gtn-test-secret-value-4b17e9c0"  # noqa: S105
+# A canary, not a credential: a made-up value planted where a real key would be, long
+# enough to be searched for in free text and distinctive enough that finding it anywhere in
+# a bundle is unambiguous rather than a coincidence of the machine it ran on. Named for what
+# it is rather than as a secret, because a value with `secret` in its name flowing into a
+# `logger.warning` below is read as a credential being logged in the clear -- by a reader,
+# and by the security scanner that runs on every pull request.
+_CANARY_VALUE = "gtn-test-canary-value-4b17e9c0"
 
 # Stands in for the real Griptape Cloud key so the connection check has something to
 # authenticate with. Never sent anywhere: every test that runs the checks replaces the
@@ -73,16 +77,16 @@ _HOST_UNIDENTIFIABLE = "the platform could not be identified"
 
 
 @pytest.fixture
-def declared_secret(engine: Engine, monkeypatch: pytest.MonkeyPatch) -> str:
-    """Give the engine one secret it knows about, and return its value.
+def declared_canary(engine: Engine, monkeypatch: pytest.MonkeyPatch) -> str:
+    """Give the engine one secret it knows about, and return the canary set as its value.
 
     Declared in the config so the report has a name to report, and set in the environment
     so there is a real value for the redactor to find in text. Both halves are needed: the
     report lists names it was told to expect, and it scrubs values it was able to read.
     """
     engine.config_manager.set_config_value(SECRETS_TO_REGISTER_KEY, [_SECRET_NAME])
-    monkeypatch.setenv(_SECRET_NAME, _SECRET_VALUE)
-    return _SECRET_VALUE
+    monkeypatch.setenv(_SECRET_NAME, _CANARY_VALUE)
+    return _CANARY_VALUE
 
 
 @pytest.fixture
@@ -258,7 +262,7 @@ class TestReport:
 
     @pytest.mark.asyncio
     async def test_a_secret_is_reported_by_name_and_by_where_it_came_from(
-        self, engine: Engine, declared_secret: str
+        self, engine: Engine, declared_canary: str
     ) -> None:
         """Which keys are set, and which source won, is the whole diagnostic signal here."""
         report = await _report(engine)
@@ -267,7 +271,7 @@ class TestReport:
         assert entry.is_set is True
         assert entry.declared_in_config is True
         assert entry.effective_source == "environment variable"
-        assert declared_secret not in report.model_dump_json()
+        assert declared_canary not in report.model_dump_json()
 
     @pytest.mark.asyncio
     async def test_a_default_value_written_into_the_settings_is_hidden(self, engine: Engine) -> None:
@@ -277,13 +281,13 @@ class TestReport:
         so a report that published the setting verbatim would publish live keys. The names
         stay, because which secrets an installation expects is a thing support needs.
         """
-        engine.config_manager.set_config_value(SECRETS_TO_REGISTER_KEY, {_SECRET_NAME: _SECRET_VALUE})
+        engine.config_manager.set_config_value(SECRETS_TO_REGISTER_KEY, {_SECRET_NAME: _CANARY_VALUE})
 
         report = await _report(engine)
 
         serialized = report.model_dump_json()
         assert _SECRET_NAME in serialized
-        assert _SECRET_VALUE not in serialized
+        assert _CANARY_VALUE not in serialized
         assert REDACTED in serialized
 
     @pytest.mark.asyncio
@@ -423,7 +427,7 @@ class TestBundle:
 
     @pytest.mark.asyncio
     async def test_a_secret_the_engine_logged_is_not_in_the_bundle(
-        self, engine: Engine, tmp_path: Path, declared_secret: str
+        self, engine: Engine, tmp_path: Path, declared_canary: str
     ) -> None:
         """The promise a bundle cannot break, over the whole path from log line to zip.
 
@@ -432,7 +436,7 @@ class TestBundle:
         back out again. Asserted over every file in the archive rather than the one it was
         planted in, because staging copies text into more than one of them.
         """
-        logging.getLogger(LOGGER_NAME).warning("Request rejected while authenticating with %s", declared_secret)
+        logging.getLogger(LOGGER_NAME).warning("Request rejected while authenticating with %s", declared_canary)
 
         result = await _collect(engine, tmp_path)
 
@@ -440,7 +444,7 @@ class TestBundle:
         session_log = members[f"{LOGS_DIRECTORY_NAME}/{SESSION_LOG_FILE_NAME}"]
         assert "authenticating with" in session_log, "the line was never captured, so nothing was redacted"
         assert REDACTED in session_log
-        assert [name for name, text in members.items() if declared_secret in text] == []
+        assert [name for name, text in members.items() if declared_canary in text] == []
         assert result.manifest.redaction.counts[RedactionReason.KNOWN_SECRET_VALUE] >= 1
 
     @pytest.mark.asyncio
