@@ -12,11 +12,13 @@ a missing workspace is exactly the thing these checks are collected to report.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING, Self, cast
 from unittest.mock import Mock, patch
 
 import pytest
 
+from griptape_nodes.files.path_utils import strip_windows_long_path_prefix
 from griptape_nodes.retained_mode.events.diagnostics_events import (
     CollectDiagnosticsRequest,
     CollectDiagnosticsResultFailure,
@@ -25,7 +27,6 @@ from griptape_nodes.retained_mode.managers.diagnostics_manager import Diagnostic
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from pathlib import Path
 
     from griptape_nodes.retained_mode.engine import Engine
 
@@ -59,16 +60,33 @@ def manager() -> DiagnosticsManager:
     return DiagnosticsManager(Mock(), engine=cast("Engine", Mock()))
 
 
-class TestResolveBundleDestination:
-    def test_a_directory_gets_the_generated_file_name(self, manager: DiagnosticsManager, tmp_path: Path) -> None:
-        resolved = manager._resolve_bundle_destination(str(tmp_path), _BUNDLE_NAME)
+def _destination(manager: DiagnosticsManager, output_path: str) -> Path:
+    """Return the file a requested output path resolves to, spelled as a user would see it.
 
-        assert resolved == tmp_path / _BUNDLE_NAME
+    The long-path prefix Windows I/O wants is not part of what is being asserted, and it
+    changes a path's anchor rather than only its spelling -- so with it left on, an equality
+    against `tmp_path / name` fails for the file it is naming.
+    """
+    return Path(strip_windows_long_path_prefix(manager._resolve_bundle_destination(output_path, _BUNDLE_NAME)))
+
+
+class TestResolveBundleDestination:
+    r"""Which file the bundle is written as, compared as a file rather than as a spelling.
+
+    The destination is resolved for the OS, so on Windows it carries the ``\\?\``
+    long-path prefix that ``canonicalize_for_io`` applies -- the same file, spelled the way
+    the filesystem API wants it. `_destination` strips it before comparing, which is what
+    the manager itself does before a path reaches a result or a message. Compared with the
+    prefix left on, every assertion here fails on Windows over a path that is correct.
+    """
+
+    def test_a_directory_gets_the_generated_file_name(self, manager: DiagnosticsManager, tmp_path: Path) -> None:
+        assert _destination(manager, str(tmp_path)) == tmp_path / _BUNDLE_NAME
 
     def test_a_file_name_is_used_as_given(self, manager: DiagnosticsManager, tmp_path: Path) -> None:
         requested = tmp_path / "for-the-bug-report.zip"
 
-        assert manager._resolve_bundle_destination(str(requested), _BUNDLE_NAME) == requested
+        assert _destination(manager, str(requested)) == requested
 
     def test_a_relative_directory_is_anchored_to_the_working_directory(
         self, manager: DiagnosticsManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -80,7 +98,7 @@ class TestResolveBundleDestination:
         """
         monkeypatch.chdir(tmp_path)
 
-        resolved = manager._resolve_bundle_destination(".", _BUNDLE_NAME)
+        resolved = _destination(manager, ".")
 
         assert resolved.is_absolute()
         assert resolved == tmp_path / _BUNDLE_NAME
@@ -90,9 +108,7 @@ class TestResolveBundleDestination:
     ) -> None:
         monkeypatch.chdir(tmp_path)
 
-        resolved = manager._resolve_bundle_destination("bundle.zip", _BUNDLE_NAME)
-
-        assert resolved == tmp_path / "bundle.zip"
+        assert _destination(manager, "bundle.zip") == tmp_path / "bundle.zip"
 
     def test_a_tilde_is_expanded(self, manager: DiagnosticsManager) -> None:
         resolved = manager._resolve_bundle_destination("~/bundle.zip", _BUNDLE_NAME)
