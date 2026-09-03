@@ -7,15 +7,16 @@ verdict it prints under the table agrees with the table.
 
 from __future__ import annotations
 
+import io
 from unittest.mock import AsyncMock, patch
 
-import pytest
 import typer
 from rich.console import Console
 
 from griptape_nodes.cli.commands.doctor import _print_health_report, doctor_command
 from griptape_nodes.common.diagnostics.health import HealthCheckResult, HealthReport, HealthStatus
 from griptape_nodes.retained_mode.events.diagnostics_events import (
+    RunHealthChecksRequest,
     RunHealthChecksResultFailure,
     RunHealthChecksResultSuccess,
 )
@@ -64,63 +65,94 @@ def _success(status: HealthStatus) -> RunHealthChecksResultSuccess:
     return RunHealthChecksResultSuccess(health=_health_report(status), result_details="ran")
 
 
+class _Run:
+    """One invocation of the command, with the requests it made and the text it printed.
+
+    Attributes:
+        requests: Every request the command dispatched, in order.
+        printed: Everything it printed, as the text a user would see.
+        exit_code: The code the command exited with, or None when it returned normally.
+            None is the zero exit: Typer takes a normal return as success and only a
+            `typer.Exit` carries a code, so "exits zero" is asserted as the absence of one.
+    """
+
+    def __init__(self, requests: list[object], printed: str, exit_code: int | None) -> None:
+        self.requests = requests
+        self.printed = printed
+        self.exit_code = exit_code
+
+    def request_type_names(self) -> list[str]:
+        return [type(request).__name__ for request in self.requests]
+
+
+def _run(result: object) -> _Run:
+    """Invoke the command with a stubbed engine and capture what it did.
+
+    Printed into a string buffer rather than a Mock console, so a test can assert the
+    command got as far as printing its verdict instead of only that it did not raise.
+    """
+    console = Console(
+        file=io.StringIO(), record=True, width=_WIDE_ENOUGH_NOT_TO_WRAP, no_color=True, legacy_windows=False
+    )
+
+    def dispatch(request: object, **_kwargs: object) -> object:
+        # Answered by request type rather than by call order: a positional list of answers
+        # silently hands the library load's answer to the health checks the day the command
+        # dispatches one more request.
+        if isinstance(request, RunHealthChecksRequest):
+            return result
+        return None
+
+    exit_code: int | None = None
+    with (
+        patch(f"{_MODULE}.GriptapeNodes.ahandle_request", new_callable=AsyncMock) as handle,
+        patch(f"{_MODULE}.console", console),
+    ):
+        handle.side_effect = dispatch
+        try:
+            doctor_command()
+        except typer.Exit as exit_request:
+            exit_code = exit_request.exit_code
+        requests = [call.args[0] for call in handle.call_args_list]
+
+    return _Run(requests, console.export_text(), exit_code)
+
+
 class TestDoctorCommand:
     def test_exits_zero_when_every_check_passes(self) -> None:
-        """A clean bill of health is a zero exit."""
-        with (
-            patch(f"{_MODULE}.GriptapeNodes.ahandle_request", new_callable=AsyncMock) as handle,
-            patch(f"{_MODULE}.console"),
-        ):
-            handle.side_effect = [None, _success(HealthStatus.PASS)]
-            doctor_command()
+        """A clean bill of health is a zero exit, with the verdict still printed."""
+        run = _run(_success(HealthStatus.PASS))
+
+        assert run.exit_code is None
+        assert _ALL_CLEAR in run.printed
 
     def test_exits_zero_when_a_check_only_warns(self) -> None:
         """A warning is something to fix eventually, so scripts calling this must not break."""
-        with (
-            patch(f"{_MODULE}.GriptapeNodes.ahandle_request", new_callable=AsyncMock) as handle,
-            patch(f"{_MODULE}.console"),
-        ):
-            handle.side_effect = [None, _success(HealthStatus.WARN)]
-            doctor_command()
+        run = _run(_success(HealthStatus.WARN))
+
+        assert run.exit_code is None
+        # Printed rather than only exited over: a warning nobody is shown is a warning
+        # nobody acts on.
+        assert "Test Check: what to do" in run.printed
 
     def test_exits_one_when_a_check_fails(self) -> None:
         """A failing check exits nonzero, which is what the documented script usage relies on."""
-        with (
-            patch(f"{_MODULE}.GriptapeNodes.ahandle_request", new_callable=AsyncMock) as handle,
-            patch(f"{_MODULE}.console"),
-        ):
-            handle.side_effect = [None, _success(HealthStatus.FAIL)]
+        run = _run(_success(HealthStatus.FAIL))
 
-            with pytest.raises(typer.Exit) as exc_info:
-                doctor_command()
-
-        assert exc_info.value.exit_code == 1
+        assert run.exit_code == 1
 
     def test_exits_one_when_the_checks_could_not_run(self) -> None:
         """A request that fails outright is reported rather than crashing the command."""
-        with (
-            patch(f"{_MODULE}.GriptapeNodes.ahandle_request", new_callable=AsyncMock) as handle,
-            patch(f"{_MODULE}.console"),
-        ):
-            handle.side_effect = [None, RunHealthChecksResultFailure(result_details="no report")]
+        run = _run(RunHealthChecksResultFailure(result_details="no report"))
 
-            with pytest.raises(typer.Exit) as exc_info:
-                doctor_command()
-
-        assert exc_info.value.exit_code == 1
+        assert run.exit_code == 1
+        assert "no report" in run.printed
 
     def test_loads_libraries_before_checking(self) -> None:
         """Libraries are loaded first, or the library check would report none registered."""
-        with (
-            patch(f"{_MODULE}.GriptapeNodes.ahandle_request", new_callable=AsyncMock) as handle,
-            patch(f"{_MODULE}.console"),
-        ):
-            handle.side_effect = [None, _success(HealthStatus.PASS)]
-            doctor_command()
+        run = _run(_success(HealthStatus.PASS))
 
-        requests = [call.args[0] for call in handle.call_args_list]
-        assert type(requests[0]).__name__ == "LoadLibrariesRequest"
-        assert type(requests[1]).__name__ == "RunHealthChecksRequest"
+        assert run.request_type_names() == ["LoadLibrariesRequest", "RunHealthChecksRequest"]
 
 
 class TestPrintedVerdict:

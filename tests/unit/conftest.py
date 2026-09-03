@@ -21,9 +21,23 @@ from griptape_nodes.retained_mode.engine import Engine, current_engine, reset_ro
 _session_log_home = tempfile.TemporaryDirectory(prefix="griptape-nodes-test-log-home-")
 _session_log_home_patch = patch.object(log_capture, "xdg_data_home", lambda: Path(_session_log_home.name))
 
-# Deliberately the real one, computed from the unpatched `xdg_data_home`, so a test can
-# check the suite against it. Read, never written.
-_real_log_directory = xdg_data_home() / "griptape_nodes" / "logs"
+
+def _real_log_directory() -> Path | None:
+    """The developer's real engine log directory, or None on a machine that has no home.
+
+    Deliberately the real one, computed from the unpatched ``xdg_data_home``, so the guard
+    below can check the suite against it. Read, never written.
+
+    Worked out on demand rather than at import time because ``xdg_data_home`` raises when
+    there is no home directory to find -- a Windows service account has none -- and at
+    import that failure takes down collection of every test in the suite rather than
+    skipping the one guard that needs it.
+    """
+    try:
+        return xdg_data_home() / "griptape_nodes" / "logs"
+    except RuntimeError:
+        return None
+
 
 # Only this process's own log files are the suite's to answer for. A developer running the
 # engine while the suite runs has that engine writing into the same directory, and counting
@@ -36,7 +50,9 @@ _own_names_in_real_log_directory: set[str] = set()
 
 def pytest_configure() -> None:
     """Point engine logging at a temporary directory before any test module is imported."""
-    _own_names_in_real_log_directory.update(path.name for path in _real_log_directory.glob(_own_log_file_glob))
+    real_log_directory = _real_log_directory()
+    if real_log_directory is not None:
+        _own_names_in_real_log_directory.update(path.name for path in real_log_directory.glob(_own_log_file_glob))
     _session_log_home_patch.start()
 
 
@@ -60,7 +76,11 @@ def own_log_files_in_real_log_directory() -> list[str]:
     was pointed at, and pointing it at one creates a file of this process's own there
     first, so anything the suite deleted it is also listed here for having created.
     """
-    current = {path.name for path in _real_log_directory.glob(_own_log_file_glob)}
+    real_log_directory = _real_log_directory()
+    if real_log_directory is None:
+        return []
+
+    current = {path.name for path in real_log_directory.glob(_own_log_file_glob)}
     return sorted(current - _own_names_in_real_log_directory)
 
 

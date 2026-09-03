@@ -571,6 +571,22 @@ class TestFindLogFiles:
 
         assert find_log_files(tmp_path) == [kept]
 
+    def test_a_directory_that_refuses_to_be_listed_is_empty_rather_than_an_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A log directory on a network share or another user's folder can refuse the listing.
+
+        This runs during engine construction, so an `OSError` escaping it stops the engine
+        from starting over housekeeping it does not need to succeed at.
+        """
+
+        def refuse(self: Path, *_args: object, **_kwargs: object) -> Iterator[Path]:
+            raise PermissionError(self)
+
+        monkeypatch.setattr(Path, "glob", refuse)
+
+        assert find_log_files(tmp_path) == []
+
 
 class TestPruneLogFiles:
     def test_deletes_files_past_the_retention_window(self, tmp_path: Path) -> None:
@@ -601,6 +617,25 @@ class TestPruneLogFiles:
 
     def test_a_missing_directory_is_not_an_error(self, tmp_path: Path) -> None:
         assert prune_log_files(tmp_path / "never-created", retention_days=7) == 0
+
+    def test_a_file_that_will_not_delete_is_left_behind_rather_than_raising(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """On Windows a file another engine holds open cannot be deleted at all.
+
+        Reported as nothing deleted rather than as a failure: pruning happens on the way to
+        opening a log file, and an engine that will not start because it could not tidy up
+        is a worse outcome than a directory with an extra file in it.
+        """
+        aged = _write_log(tmp_path, f"{LOG_FILE_PREFIX}aged.log", age_days=10)
+
+        def refuse(self: Path, **_kwargs: object) -> None:
+            raise PermissionError(self)
+
+        monkeypatch.setattr(Path, "unlink", refuse)
+
+        assert prune_log_files(tmp_path, retention_days=7) == 0
+        assert aged.exists()
 
     def test_keeps_the_file_the_sink_is_about_to_open(self, tmp_path: Path) -> None:
         """The sink prunes before opening, so its own target has to survive the sweep."""

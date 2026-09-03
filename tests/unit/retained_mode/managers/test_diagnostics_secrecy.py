@@ -15,6 +15,7 @@ bundle for a leaking one.
 from __future__ import annotations
 
 import io
+import json
 import zipfile
 from typing import TYPE_CHECKING, cast
 from unittest.mock import Mock
@@ -22,7 +23,7 @@ from unittest.mock import Mock
 import pytest
 
 from griptape_nodes.common.diagnostics.bundle import DiagnosticsBundle
-from griptape_nodes.common.diagnostics.redaction import REDACTED, Redactor
+from griptape_nodes.common.diagnostics.redaction import REDACTED, RedactionReason, Redactor
 from griptape_nodes.common.diagnostics.report import DiagnosticsReport, EngineDiagnostics, HostDiagnostics
 from griptape_nodes.retained_mode.managers.diagnostics_manager import DiagnosticsManager
 
@@ -147,11 +148,16 @@ class TestNoSecretValueIsInABundle:
         assert "connecting with" in session_log
 
     def test_the_manifest_counts_what_was_removed(self, bundle: _Bundle) -> None:
-        """'0 hidden' against '5 hidden' is how absent is told apart from redacted."""
-        manifest = bundle.members["manifest.json"]
+        """'0 hidden' against '5 hidden' is how absent is told apart from redacted.
 
-        assert '"total": 0' not in manifest
-        assert '"known_secret_value"' in manifest
+        Read as JSON rather than searched as text: `"total": 0` is one particular spelling,
+        so an indent width away from the manifest's own, the search finds nothing and the
+        test passes for a bundle that counted nothing.
+        """
+        redaction = json.loads(bundle.members["manifest.json"])["redaction"]
+
+        assert redaction["total"] > 0
+        assert redaction["counts"][RedactionReason.KNOWN_SECRET_VALUE] >= 1
 
     def test_a_credential_named_setting_keeps_its_key_and_loses_its_value(self, bundle: _Bundle) -> None:
         """Which settings are filled in is the diagnostic signal; the values never are."""
