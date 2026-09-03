@@ -1062,7 +1062,7 @@ class LibraryManager(EngineScoped):
 
             for dep in lib_deps:
                 repo_name = extract_repo_name_from_url(dep.url)
-                dep_info = self.get_library_info_by_library_name(repo_name)
+                dep_info = self._library_info_for_repo_name(repo_name)
                 if dep_info is None:
                     logger.warning(
                         "Library dependency '%s' (resolved as '%s') is not registered; skipping",
@@ -1083,6 +1083,65 @@ class LibraryManager(EngineScoped):
                     queue.append(lib_nav)
 
         return list(resolved.values())
+
+    def _expand_targets_with_library_dependencies(self, target_library_names: list[str]) -> list[str]:
+        """Add each target library's declared library dependencies, transitively.
+
+        Reads declarations from the discovered manifests rather than from LibraryRegistry, so this
+        is usable before anything has loaded. A dependency that cannot be resolved to a discovered
+        library is left out and logged: declarations are `required: false` in practice, and a
+        worker that refused to start because an optional companion library was absent would be a
+        worse failure than the feature that companion powers being unavailable.
+        """
+        expanded = list(dict.fromkeys(target_library_names))
+        queue = list(expanded)
+        while queue:
+            library_name = queue.pop(0)
+            info = self.get_library_info_by_library_name(library_name)
+            if info is None:
+                continue
+            metadata_result = self.load_library_metadata_from_file_request(
+                LoadLibraryMetadataFromFileRequest(file_path=info.library_path)
+            )
+            if isinstance(metadata_result, LoadLibraryMetadataFromFileResultFailure):
+                continue
+            declarations = metadata_result.library_schema.metadata.declarations or []
+            for dep in declarations:
+                if not isinstance(dep, LibraryDependencyDeclaration):
+                    continue
+                repo_name = extract_repo_name_from_url(normalize_github_url(parse_git_url_with_ref(dep.url).url))
+                dep_info = self._library_info_for_repo_name(repo_name)
+                if dep_info is None or dep_info.library_name is None:
+                    logger.info(
+                        "Library '%s' declares a dependency on '%s', which is not installed here; "
+                        "features that need it will be unavailable in this process.",
+                        library_name,
+                        repo_name,
+                    )
+                    continue
+                if dep_info.library_name not in expanded:
+                    expanded.append(dep_info.library_name)
+                    queue.append(dep_info.library_name)
+        return expanded
+
+    def _library_info_for_repo_name(self, repo_name: str) -> LibraryInfo | None:
+        """Resolve a library-dependency URL's repo name to a discovered library.
+
+        A dependency declaration carries a git URL, so the only name it yields is the REPOSITORY
+        name. That is not the library's name: `griptape-nodes-library-openexr` publishes itself as
+        `OpenEXR Library`. Matching the repo name against library names therefore missed every
+        library that does not happen to name itself after its repo -- silently, since a miss only
+        warns and skips. Provisioning installs each download under a repo-name directory, so the
+        path is where the repo name actually appears; the lifecycle's own dependency check already
+        matches this way.
+        """
+        by_name = self.get_library_info_by_library_name(repo_name)
+        if by_name is not None:
+            return by_name
+        for info in self._library_file_path_to_info.values():
+            if repo_name in Path(info.library_path).parts:
+                return info
+        return None
 
     def collate_problems_for_lib_info(self, lib_info: LibraryInfo) -> str | None:
         """Return a collated display string for a LibraryInfo's problems, or None if there are none."""
@@ -3987,6 +4046,15 @@ class LibraryManager(EngineScoped):
             if isinstance(discover_result, DiscoverLibrariesResultFailure):
                 logger.error("Failed to discover libraries: %s", discover_result.result_details)
                 return reconcile_failures
+
+            # A worker is told which library it serves, but that library's declared library
+            # dependencies are part of what it needs to run: CorridorKey's OCIO path reaches into
+            # the OpenEXR library, which loaded on the orchestrator and was absent from the worker,
+            # so the feature failed only under worker execution. Runs directly after discovery,
+            # which is what populates the info map it reads -- resolve_transitive_library_deps
+            # cannot serve here because it reads LibraryRegistry and nothing is loaded yet.
+            if target_library_names is not None:
+                target_library_names = self._expand_targets_with_library_dependencies(target_library_names)
 
             # Build list of library paths to load
             libraries_to_load = []
