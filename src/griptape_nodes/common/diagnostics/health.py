@@ -124,7 +124,8 @@ class HealthCheck(ABC):
     name: ClassVar[str]
 
     @abstractmethod
-    async def run(self, context: HealthCheckContext) -> HealthCheckResult: ...
+    async def run(self, context: HealthCheckContext) -> HealthCheckResult:
+        raise NotImplementedError
 
 
 class CloudConnectionCheck(HealthCheck):
