@@ -632,9 +632,13 @@ class ContextManager(EngineScoped):
 
         Walks the whole stack rather than just the top entry, which is what the in-place stack
         walk this replaced did. Callers only ever rekey the current workflow, so the top entry
-        matches and a notification always follows; the walk is there so a buried duplicate of the
-        same key cannot be left holding a name the registry has dropped. No entry matching is
-        therefore not expected, and is quietly treated as nothing to do.
+        matches; the walk is there so a buried duplicate of the same key cannot be left holding a
+        name the registry has dropped. No entry matching is therefore not expected, and is quietly
+        treated as nothing to do.
+
+        A notification follows unless the key did not actually move -- a rename whose new name
+        sanitizes back to the current key repoints the path here and is deduped into silence by
+        `_notify_current_workflow_changed`, because the payload carries the key and nothing else.
 
         Args:
             old_name: The registry key the context currently holds.
@@ -996,9 +1000,14 @@ class ContextManager(EngineScoped):
         try:
             self.engine.event_manager.put_event(AppEvent(payload=CurrentWorkflowChanged(workflow_name=workflow_name)))
         except RuntimeError as e:
+            if workflow_name is None:
+                switched_to = "no workflow is open any more"
+            else:
+                switched_to = f"the open workflow is now '{workflow_name}'"
             logger.warning(
-                "Could not tell clients the current workflow is now '%s'; they will be told on the next change: %s",
-                workflow_name,
+                "Attempted to tell connected editors that %s. They will be told at the next switch, "
+                "if the engine is still running to make one. Failed due to: %s",
+                switched_to,
                 e,
             )
             return

@@ -393,9 +393,11 @@ Either way the engine broadcasts a `CurrentWorkflowChanged` app event carrying t
 editor follows along when an agent switches workflows out from under it. Two things to
 know about it:
 
-- **The last one is the truth.** A clean-slate open emits `None` from the wipe and then
-    the opened workflow, so a `None` in the middle of an open means "mid-switch", not
-    "everything closed".
+- **The last one is the truth.** A clean-slate open of a workflow while another one is open
+    emits `None` from the wipe and then the opened workflow, so a `None` in the middle of an
+    open means "mid-switch", not "everything closed". Opening on an engine with nothing open
+    emits just the one event, so wait for the workflow you asked for rather than for a
+    particular number of events.
 - **It says which workflow, not that the workflow is loaded.** An open switches the
     context first and replays the file afterwards, so the nodes arrive behind the event.
 

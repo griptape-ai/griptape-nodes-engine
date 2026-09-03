@@ -170,11 +170,13 @@ class CurrentWorkflowChanged(AppPayload):
     time (which rekeys it from "unsaved:<uuid>" to the key derived from its new path),
     moving it to another directory, clearing all object state, or deleting it.
 
-    Renaming a workflow while it is the one open is the exception worth knowing about: the
-    rename deletes the old registry entry while that entry is still in context, and the
+    Renaming a saved workflow while it is the one open is the exception worth knowing about:
+    the rename deletes the old registry entry while that entry is still in context, and the
     delete tears the context down. So this reports what the teardown left behind -- None on
     a single-workflow stack, or the key of whatever was underneath it -- rather than the new
-    name. That is the engine's actual state afterwards, not a reporting quirk.
+    name. That is the engine's actual state afterwards, not a reporting quirk. Renaming an
+    open workflow that has never been saved goes the other way: the save inside the rename
+    rekeys the context first, so what arrives is the new key.
 
     This is the authoritative "you are now looking at a different workflow" signal, and the
     one a client should drive its title from. It answers which workflow, not whether that
@@ -184,9 +186,11 @@ class CurrentWorkflowChanged(AppPayload):
     should expect to fill it from those, not from a graph that is already complete.
 
     Where one operation moves the context more than once, every move is reported and the last
-    one is the truth. An ordinary open is two: None while the engine is wiped, then the
-    workflow that was opened. A None in the middle of a switch is not the artist closing
-    their work.
+    one is the truth. An ordinary open of a workflow while another one is open is two: None
+    while the engine is wiped, then the workflow that was opened. A None in the middle of a
+    switch is not the artist closing their work. Opening on an engine with nothing open is a
+    single event, since there was no workflow to wipe -- how many arrive depends on where the
+    engine started, so a client should react to each one rather than count them.
 
     Unlike SetWorkflowContextSuccess it is not the result of a request, so a client observes
     it even when it was not the one that asked -- a second editor attached to the same

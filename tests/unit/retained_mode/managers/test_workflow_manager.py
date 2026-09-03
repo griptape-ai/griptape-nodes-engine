@@ -1236,10 +1236,11 @@ class TestWorkflowManager:
 
         Drives `on_rename_workflow_request` with its delete step mocked out, which isolates the
         bookkeeping at the end of the handler. That is the real shape of a Save As of an
-        unregistered workflow and of a rename that resolves to the key it already had -- the
-        renames that skip the delete. An ordinary rename of a registered, open workflow does not
-        get here at all: the delete drops the entry that is in context, and the real delete
-        handler tears the context down, which is pinned by
+        unregistered workflow: the key moves, so clients hear about it. The other delete-skipping
+        rename -- one that resolves to the key it already had -- is
+        `test_rename_to_the_same_key_moves_the_path_and_stays_quiet` below. An ordinary rename of a
+        registered, open workflow does not get here at all: the delete drops the entry that is in
+        context, and the real delete handler tears the context down, which is pinned by
         `test_delete_active_workflow_clears_context_stack`.
 
         What this pins is the bookkeeping itself: the key an editor addresses the workflow by
@@ -1266,6 +1267,39 @@ class TestWorkflowManager:
             assert context_manager.get_current_workflow_name() == "my_workflow_renamed"
             assert context_manager.get_current_workflow_file_path() == "/workspace/my_workflow_renamed.py"
             assert _notified_workflow_names(put_event) == ["my_workflow_renamed"]
+        finally:
+            if context_manager.has_current_workflow():
+                context_manager.pop_workflow()
+
+    def test_rename_to_the_same_key_moves_the_path_and_stays_quiet(self, engine: Engine) -> None:
+        """Renaming to a name that sanitizes back to the current key tells clients nothing.
+
+        The display name an artist typed can change while the file name -- and so the registry key
+        -- does not. The bookkeeping still runs and still repoints the retained path, because that
+        is what `workflow_dir` answers with, but the key clients address the workflow by has not
+        moved, so `CurrentWorkflowChanged` dedupes into silence. Pinned so a rename never starts
+        waking every attached editor for a switch that did not happen.
+        """
+        context_manager = engine.context_manager
+        context_manager.push_workflow(workflow_name="my_workflow")
+        context_manager.set_current_workflow_file_path("/workspace/my_workflow.py")
+
+        try:
+            with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
+                self._run_rename(
+                    engine.workflow_manager,
+                    self._RenameScenario(
+                        workflow_name="my_workflow",
+                        requested_name="My Workflow",
+                        source_file_path="my_workflow.py",
+                        save_file_path="/workspace/my_workflow.py",
+                        save_workflow_name="my_workflow",
+                    ),
+                )
+
+            assert context_manager.get_current_workflow_name() == "my_workflow"
+            assert context_manager.get_current_workflow_file_path() == "/workspace/my_workflow.py"
+            assert _notified_workflow_names(put_event) == []
         finally:
             if context_manager.has_current_workflow():
                 context_manager.pop_workflow()

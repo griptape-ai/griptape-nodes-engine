@@ -1429,12 +1429,16 @@ class WorkflowManager(EngineScoped):
         # setting the name first would announce the switch while the retained path still named the
         # old file, and that path is what `workflow_dir` answers with.
         #
-        # "Still" is load-bearing: renaming a registered workflow that is open does not reach here.
-        # The delete above drops the old registry entry while that entry is the one in context, and
-        # `on_delete_workflows_request` tears the context down for exactly that case -- so what
-        # clients hear from an ordinary rename is the teardown, not a new key. This branch serves
-        # the renames that skip the delete: a Save As of an unregistered workflow, and a rename
-        # that resolves to the key it already had.
+        # "Still" is load-bearing: renaming a registered workflow that is open normally does not
+        # reach here. The delete above drops the old registry entry while that entry is the one in
+        # context, and `on_delete_workflows_request` tears the context down for exactly that case
+        # -- so what clients hear from an ordinary rename is the teardown, not a new key. This
+        # branch serves the renames that skip the delete: a Save As of an unregistered workflow,
+        # and a rename that resolves to the key it already had (which rekeys the retained path and
+        # is deduped into silence, since the key clients hold has not moved). It also catches the
+        # one open-and-registered case the teardown does not finish: the same key stacked twice by
+        # a `run_with_clean_slate=False` open, where popping one entry leaves the duplicate
+        # underneath still naming the workflow the delete just dropped.
         context_manager = self.engine.context_manager
         if context_manager.has_current_workflow() and context_manager.get_current_workflow_name() == old_workflow_name:
             context_manager.rekey_workflow(

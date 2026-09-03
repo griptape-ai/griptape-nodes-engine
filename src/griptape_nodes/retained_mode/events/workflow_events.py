@@ -103,10 +103,12 @@ class RunWorkflowFromRegistryRequest(RequestPayload):
     recovered. Save first (SaveWorkflowRequest) if that matters.
 
     The engine emits CurrentWorkflowChanged app events as the context moves, and the last one
-    is always the truth. With run_with_clean_slate=True -- the ordinary open -- there are two:
-    None from the wipe, then the workflow that was opened. Treat that None as "mid-switch",
-    not as "the artist closed everything". A failure after the switch adds a third, None
-    again, because the failed open reverts to an empty engine. Each fires when the context
+    is always the truth. Wait for the workflow you asked for, not for a fixed number of events:
+    with run_with_clean_slate=True -- the ordinary open -- there are two when a workflow was
+    already open (None from the wipe, then the workflow that was opened) and only one when the
+    engine had nothing open, because there is nothing to wipe. Treat that None as "mid-switch",
+    not as "the artist closed everything". A failure after the switch adds a trailing None,
+    because the failed open reverts to an empty engine. Each fires when the context
     moves, which is before the file is replayed, so they announce which workflow is opening
     rather than that its nodes have arrived. A request rejected before the switch -- unknown
     registry key, or an unsaved workflow -- leaves the Current Context untouched and emits
