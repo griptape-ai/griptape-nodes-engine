@@ -447,16 +447,23 @@ class ConfigManager(EngineScoped):
                 # is a perfectly good key under a mapping or an undeclared tree, so it would
                 # validate, apply garbage at the highest-priority layer, and count as a longer path
                 # that discards its own correct prefix.
-                self._report_ignored_env_var(env_var_name, raw_value, "its name has an empty path segment")
+                self._report_ignored_env_var(
+                    env_var_name, raw_value, "its name has an empty path segment, so the configured value stands"
+                )
                 continue
             value = self._coerce_env_var_value(config_key, raw_value)
             if value is _REJECTED_BAD_VALUE:
                 self._report_ignored_env_var(
-                    env_var_name, raw_value, f"'{raw_value}' is not a valid value for the '{config_key}' setting"
+                    env_var_name,
+                    raw_value,
+                    f"'{raw_value}' is not a valid value for the '{config_key}' setting, "
+                    "so the configured value stands",
                 )
                 continue
             if value is _REJECTED_UNKNOWN_KEY:
-                self._report_ignored_env_var(env_var_name, raw_value, f"there is no '{config_key}' setting")
+                self._report_ignored_env_var(
+                    env_var_name, raw_value, f"there is no '{config_key}' setting, so it sets nothing"
+                )
                 continue
             coerced.append(
                 EnvVarOverride(env_var_name=env_var_name, config_key=config_key, raw_value=raw_value, value=value)
@@ -471,7 +478,8 @@ class ConfigManager(EngineScoped):
                 self._report_ignored_env_var(
                     override.env_var_name,
                     override.raw_value,
-                    f"'{override.config_key}' is also the start of a longer path ({', '.join(deeper_keys)})",
+                    f"'{override.config_key}' is also the start of a longer path "
+                    f"({', '.join(deeper_keys)}), which still applies",
                 )
                 continue
             applicable.append(override)
@@ -515,18 +523,17 @@ class ConfigManager(EngineScoped):
         Args:
             env_var_name: The full environment variable name.
             raw_value: The value it carried.
-            reason: Why it was ignored, phrased to complete "Ignoring <var>: <reason>.".
+            reason: Why it was ignored and what happens instead, phrased to complete
+                "Ignoring <var>: <reason>.". The consequence differs per reason, so it belongs
+                here rather than in a shared closing sentence: a dropped prefix is not falling
+                back to anything, since the longer path that displaced it still writes underneath.
         """
         report_key = (env_var_name, raw_value)
         if report_key in self._reported_invalid_env_vars:
             return
 
         self._reported_invalid_env_vars.add(report_key)
-        logger.warning(
-            "Ignoring environment variable %s: %s. Falling back to the configured value.",
-            env_var_name,
-            reason,
-        )
+        logger.warning("Ignoring environment variable %s: %s.", env_var_name, reason)
 
     def _load_config_from_file(self, path: Path, label: str) -> dict:
         """Read and parse a JSON config file. Returns empty dict if missing or unparsable."""
