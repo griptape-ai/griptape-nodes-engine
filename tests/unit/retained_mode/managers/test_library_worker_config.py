@@ -351,3 +351,52 @@ class TestExecuteWaitsForTheWorkerLibraryLoad:
         assert info.lifecycle_state is LibraryManager.LibraryLifecycleState.LOADED, (
             "an exec-deps library must stay editable through an eviction"
         )
+
+
+class TestOnWorkerEvicted:
+    """What an evicted worker leaves behind, per library kind.
+
+    An exec-dependencies library loaded real node classes on the orchestrator before its worker
+    ever spawned, so losing the worker must cost EXECUTION and nothing else: still LOADED, still
+    editable, with a reason the next run can report. A legacy worker-mode library has only stubs
+    until its worker confirms, so losing the worker is a load failure. Neither was covered, and
+    the difference is the whole point of the split.
+    """
+
+    def _info(self, *, requires_worker: bool, lifecycle: LibraryManager.LibraryLifecycleState) -> Any:
+        return LibraryManager.LibraryInfo(
+            lifecycle_state=lifecycle,
+            fitness=LibraryManager.LibraryFitness.GOOD,
+            library_path="/some/path.json",
+            is_sandbox=False,
+            library_name="Lib",
+            requires_worker=requires_worker,
+            executes_in_worker=True,
+        )
+
+    def test_exec_deps_library_stays_loaded_and_records_why(self) -> None:
+        manager = _make_library_manager()
+        info = self._info(requires_worker=False, lifecycle=LibraryManager.LibraryLifecycleState.LOADED)
+        manager._library_file_path_to_info["/some/path.json"] = info
+
+        manager.on_worker_evicted("worker-1", "Lib")
+
+        assert info.lifecycle_state is LibraryManager.LibraryLifecycleState.LOADED
+        assert info.fitness is LibraryManager.LibraryFitness.GOOD
+        assert info.execution_unavailable_reason is not None
+        assert "stopped responding" in info.execution_unavailable_reason
+
+    def test_legacy_worker_pending_library_becomes_failure(self) -> None:
+        manager = _make_library_manager()
+        info = self._info(requires_worker=True, lifecycle=LibraryManager.LibraryLifecycleState.WORKER_PENDING)
+        manager._library_file_path_to_info["/some/path.json"] = info
+
+        manager.on_worker_evicted("worker-1", "Lib")
+
+        assert info.lifecycle_state is LibraryManager.LibraryLifecycleState.FAILURE
+        assert info.fitness is LibraryManager.LibraryFitness.UNUSABLE
+
+    def test_unknown_library_name_is_a_no_op(self) -> None:
+        manager = _make_library_manager()
+        manager.on_worker_evicted("worker-1", "Never Registered")
+        manager.on_worker_evicted("worker-1", None)
