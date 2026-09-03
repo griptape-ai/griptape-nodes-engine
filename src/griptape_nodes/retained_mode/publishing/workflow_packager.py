@@ -177,7 +177,7 @@ class WorkflowPackager:
         default exclusions.
         """
         if ignore_patterns is None:
-            ignore_patterns = [".venv", "__pycache__", ".git"]
+            ignore_patterns = [".venv", ".venv-exec", "__pycache__", ".git"]
         result = GriptapeNodes.handle_request(
             CopyTreeRequest(
                 source_path=str(source_path),
