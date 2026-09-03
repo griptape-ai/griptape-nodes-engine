@@ -602,11 +602,12 @@ class TestCurrentWorkflowChangedNotification:
         context_manager.pop_workflow()
 
     def test_set_current_workflow_name_notifies(self, engine: Engine) -> None:
-        """Rekeying the open workflow through this primitive reports its new registry key.
+        """Renaming the open workflow through this primitive reports its new registry key.
 
-        Drives the primitive, not a handler. Move is the caller that reaches it
-        (`on_move_workflow_request`); the handler-level behavior of rename and first-save is
-        pinned in test_workflow_manager.py, because those two do not come through here.
+        This is the name-only primitive; every handler that renames a workflow also moves the
+        file behind it and so goes through `rekey_workflow` instead (pinned below, and at the
+        handler level in test_workflow_manager.py). Kept notifying because a name change on its
+        own is still a change clients have to hear about.
         """
         context_manager = engine.context_manager
         context_manager.push_workflow(workflow_name="before_rename")
@@ -720,6 +721,32 @@ class TestCurrentWorkflowChangedNotification:
 
         assert self._notified_workflow_names(put_event) == []
         assert context_manager.get_current_workflow_name() == "untouched_workflow"
+
+        context_manager.pop_workflow()
+
+    def test_a_switch_that_could_not_be_sent_is_still_owed(self, engine: Engine) -> None:
+        """An enqueue that fails leaves the transition unsent, so the next one re-sends it.
+
+        `put_event` hands cross-thread events to the engine's event loop, which can be gone by
+        the time a context mutation runs. If the dedupe field were advanced before that call, the
+        workflow whose event was lost would be the one workflow clients are never told about --
+        every later notification would compare against a name that never left the engine.
+        """
+        context_manager = engine.context_manager
+
+        with (
+            patch.object(engine.event_manager, "put_event", Mock(side_effect=RuntimeError("event loop is gone"))),
+            pytest.raises(RuntimeError),
+        ):
+            context_manager.push_workflow(workflow_name="never_announced")
+
+        # The push itself landed; only the announcement was lost.
+        assert context_manager.get_current_workflow_name() == "never_announced"
+
+        with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
+            context_manager.set_current_workflow_name("never_announced")
+
+        assert self._notified_workflow_names(put_event) == ["never_announced"]
 
         context_manager.pop_workflow()
 

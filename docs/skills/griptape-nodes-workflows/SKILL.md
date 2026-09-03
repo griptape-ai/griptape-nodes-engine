@@ -390,7 +390,9 @@ a file, so on its own it would leave you holding a workflow name and none of its
 
 Either way the engine broadcasts a `CurrentWorkflowChanged` app event carrying the
 `workflow_name` now in context (`None` when the engine has none), so every attached
-editor follows along when an agent switches workflows out from under it.
+editor follows along when an agent switches workflows out from under it. It says which
+workflow, not that the workflow is loaded: an open switches the context first and replays
+the file afterwards, so the nodes arrive behind the event.
 
 ### Agents cannot be interrupted mid-run
 
