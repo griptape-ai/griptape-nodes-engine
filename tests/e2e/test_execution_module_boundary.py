@@ -347,6 +347,11 @@ class TestAllThreeMechanismsTogether:
         )
         target.mkdir(parents=True, exist_ok=True)
         (target / "model.safetensors").write_text("weights")
+        # The completion marker is what makes the cache authoritative. Files alone do not qualify:
+        # the directory is created before a download starts, so a partial fetch leaves those too.
+        # Without it the engine attempts a real fetch, which is exactly the network call standing in
+        # here avoids.
+        (target / ".griptape-nodes-complete").touch()
 
         node = LibraryRegistry.create_node(node_type="BoundaryNode", name="all_three", specific_library_name=LIBRARY)
         current_engine().object_manager.add_object_by_name("all_three", node)

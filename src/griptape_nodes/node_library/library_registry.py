@@ -119,22 +119,16 @@ class ResourceRequirements(BaseModel):
     Specifies what system resources (OS, compute backends) the library needs.
     Example: {"platform": (["linux", "windows"], "has_any"), "arch": "x86_64", "compute": (["cuda", "cpu"], "has_all")}
 
-    Two tiers, because "needs" and "prefers" are different claims and libraries were being made
-    to pick one of them:
+    ``required``: without this the library cannot run. Execution refuses with the reason, and
+    editing is unaffected -- SAM3 declares cuda-only and is still fully editable on a laptop.
 
-    - ``required``: without this the library cannot run. Execution refuses with the reason;
-      editing is unaffected.
-    - ``preferred``: it runs either way, better with this. Recorded and reported, never a gate.
-
-    Before the second tier existed, an author who wanted to say "this really wants a GPU" had to
-    choose between a hard gate and saying nothing. SAM3 chose the gate and declared cuda-only,
-    which is why it could not be edited on a laptop at all.
+    There is deliberately no advisory tier. One was added and removed: nothing consumed it, so an
+    author who moved a declaration to it gave up the gate and gained nothing an artist could see.
     """
 
     required: Requirements | None = None
-    preferred: Requirements | None = None
 
-    @field_validator("required", "preferred", mode="before")
+    @field_validator("required", mode="before")
     @classmethod
     def convert_lists_to_tuples(cls, v: Any) -> Any:
         """Convert list values to tuples for requirements loaded from JSON.

@@ -309,16 +309,11 @@ class GetExecutionDeviceRequest(RequestPayload):
         preferred: Optional device to use if the machine has it, e.g. a user or config pin. When
             it is unavailable the answer falls back to the normal preference order rather than
             failing, so a workflow authored on one machine still runs on another.
-        required_by_library: Optional library name whose declared compute requirement narrows the
-            choice, so "needs cuda" and "run on cuda" stop being two statements kept in sync by
-            hand.
-
     Results: GetExecutionDeviceResultSuccess (with the device and what is available) |
         GetExecutionDeviceResultFailure (compute resources could not be read)
     """
 
     preferred: str | None = None
-    required_by_library: str | None = None
 
 
 @dataclass
@@ -328,7 +323,8 @@ class GetExecutionDeviceResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucc
 
     Args:
         device: The chosen backend: "cuda", "mps" or "cpu".
-        available: Every backend detected on this machine, most capable first.
+        available: Every backend detected on this machine, in detection order -- cpu first,
+            then any accelerator. NOT ranked; use `device` for what to run on.
         honored_preference: Whether `preferred` was available and used.
     """
 

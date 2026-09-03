@@ -506,9 +506,6 @@ class LibraryManager(EngineScoped):
         # orchestrator never learns it -- the worker reports that itself when a run is attempted.
         # None means nothing is known to be wrong.
         execution_unavailable_reason: str | None = None
-        # Resources the library says it runs BETTER with and this machine lacks. Informational
-        # only: it never blocks loading or execution. None means nothing is known to be missing.
-        unmet_preferences: str | None = None
         # Declared execution modules, imported and keyed by their file stem. Populated only in a
         # worker: the orchestrator deliberately never imports these, so it holds an empty dict
         # and `get_execution_module` refuses there.
@@ -2510,25 +2507,6 @@ class LibraryManager(EngineScoped):
                         if library_data.metadata.resources is not None
                         else None
                     )
-                    preferred_requirements = (
-                        library_data.metadata.resources.preferred
-                        if library_data.metadata.resources is not None
-                        else None
-                    )
-                    if preferred_requirements is not None:
-                        # A preference is not a gate. It is recorded so the settings panel can
-                        # say "this runs better with a GPU" and so a slow run has an explanation,
-                        # and then execution proceeds either way.
-                        preferred_check = self._check_library_requirements(
-                            preferred_requirements, library_data.name, tier="preferred"
-                        )
-                        if preferred_check is not None:
-                            library_info.unmet_preferences = self._describe_unmet_requirements(preferred_check)
-                            logger.info(
-                                "Library '%s' runs better with resources this machine does not have: %s",
-                                library_data.name,
-                                library_info.unmet_preferences,
-                            )
                     if library_requirements is not None:
                         requirements_check_result = self._check_library_requirements(
                             library_requirements, library_data.name
@@ -3082,15 +3060,13 @@ class LibraryManager(EngineScoped):
         return f"it needs {wanted}, and this machine has {have}."
 
     def _check_library_requirements(
-        self, requirements: dict[str, Any], library_name: str, *, tier: str = "required"
+        self, requirements: dict[str, Any], library_name: str
     ) -> IncompatibleRequirementsProblem | None:
         """Check if the current system meets the library's resource requirements.
 
         Args:
             requirements: Dictionary of requirements in the format used by resource_instance.Requirements
             library_name: Name of the library being checked (for logging)
-            tier: Which declaration is being checked, "required" or "preferred". Only affects how
-                loudly an unmet result is logged: a preference is information, not a problem.
 
         Returns:
             IncompatibleRequirementsProblem if requirements are not met, None if they are met
@@ -3113,11 +3089,9 @@ class LibraryManager(EngineScoped):
 
             if isinstance(result, ListCompatibleResourceInstancesResultSuccess) and not result.instance_ids:
                 system_capabilities = self._get_system_capabilities()
-                logger.log(
-                    logging.WARNING if tier == "required" else logging.INFO,
-                    "Library '%s' %s OS resources not met. Wanted: %s, System: %s",
+                logger.warning(
+                    "Library '%s' required OS resources not met. Wanted: %s, System: %s",
                     library_name,
-                    tier,
                     os_requirements,
                     system_capabilities,
                 )
@@ -3136,11 +3110,9 @@ class LibraryManager(EngineScoped):
 
             if isinstance(result, ListCompatibleResourceInstancesResultSuccess) and not result.instance_ids:
                 system_capabilities = self._get_system_capabilities()
-                logger.log(
-                    logging.WARNING if tier == "required" else logging.INFO,
-                    "Library '%s' %s compute resources not met. Wanted: %s, System: %s",
+                logger.warning(
+                    "Library '%s' required compute resources not met. Wanted: %s, System: %s",
                     library_name,
-                    tier,
                     compute_requirements,
                     system_capabilities,
                 )
@@ -5251,7 +5223,14 @@ class LibraryManager(EngineScoped):
             raise RuntimeError(msg)
 
         target = self._model_asset_path(library_name, asset_id, asset)
-        if target.exists() and any(target.iterdir()):
+        # A marker written only after a fetch succeeds, rather than "the directory has something in
+        # it". The directory is created before the download starts, so an interrupted fetch -- a
+        # dropped connection, a cancelled run, a rate limit part-way through a repo -- leaves
+        # partial weights behind. Treating those as present handed back a truncated model from every
+        # later call, failing in a way that points at the model rather than the cache, with nothing
+        # but manual deletion to recover.
+        complete_marker = target / ".griptape-nodes-complete"
+        if complete_marker.exists():
             logger.debug("Model asset '%s' for library '%s' is already present at %s", asset_id, library_name, target)
             return target
 
@@ -5289,6 +5268,7 @@ class LibraryManager(EngineScoped):
             # isinstance here discriminates a result payload, the engine's universal idiom; the
             # failure is a fetch failure, not a type error.
             raise RuntimeError(msg)  # noqa: TRY004
+        complete_marker.touch()
         return target
 
     @staticmethod

@@ -63,7 +63,6 @@ def _register(  # noqa: PLR0913 (a test-library builder; each knob is one manife
     exec_dependencies: list[str] | None = None,
     edit_dependencies: list[str] | None = None,
     required_resources: dict[str, object] | None = None,
-    preferred_resources: dict[str, object] | None = None,
 ) -> str:
     """Register a fixture library, optionally declaring execution dependencies."""
     library_dir = tmp_path / name.replace(" ", "_")
@@ -85,12 +84,10 @@ def _register(  # noqa: PLR0913 (a test-library builder; each knob is one manife
             build_wheel(wheel_dir, dep, "1.0.0")
         dependencies["pip_install_flags"] = offline_install_flags(wheel_dir)
     schema["metadata"]["dependencies"] = dependencies
-    if required_resources is not None or preferred_resources is not None:
+    if required_resources is not None:
         resources: dict[str, object] = {}
         if required_resources is not None:
             resources["required"] = required_resources
-        if preferred_resources is not None:
-            resources["preferred"] = preferred_resources
         schema["metadata"]["resources"] = resources
     library_json = library_dir / "griptape_nodes_library.json"
     library_json.write_text(json.dumps(schema, indent=2))
@@ -440,57 +437,27 @@ class TestUnmetResourcesCostExecutionNotLoading:
         assert info.fitness is LibraryManager.LibraryFitness.GOOD
 
 
-class TestPreferredResourcesAreInformationNotGates:
-    """Needing a resource and preferring one are different claims, and libraries had to pick.
+class TestUnmetRequirementCostsExecutionNotEditing:
+    """A resource this machine lacks must not stop the library loading.
 
-    Before the second tier existed an author who wanted to say "this really wants a GPU" chose
-    between a hard gate and silence. SAM3 chose the gate and declared cuda-only, which is why it
-    could not be edited on a laptop at all.
+    SAM3 declares cuda-only, and refusing to register it took editing away from every machine that
+    was only ever going to edit -- placeholder nodes reading "Library not found" on a laptop. The
+    requirement now gates the run instead, so the refusal arrives when someone presses run.
     """
 
     IMPOSSIBLE_COMPUTE: ClassVar[dict[str, object]] = {"compute": [["definitely-not-a-real-backend"], "has_any"]}
 
-    def test_an_unmet_preference_does_not_gate_anything(self, tmp_path: Path) -> None:
-        library_json = _register(
-            tmp_path,
-            fixture_dir=BEHAVIOR_FIXTURE,
-            node_file="behavior_preservation_node.py",
-            name="Prefers The Impossible",
-            preferred_resources=self.IMPOSSIBLE_COMPUTE,
-        )
-
-        info = _library_info(library_json)
-        assert info.fitness is LibraryManager.LibraryFitness.GOOD, "a preference must not change fitness"
-        assert info.execution_unavailable_reason is None, "a preference must not block execution"
-        assert info.unmet_preferences is not None, "but it should be recorded"
-        assert "definitely-not-a-real-backend" in info.unmet_preferences
-
-    def test_a_met_preference_records_nothing(self, tmp_path: Path) -> None:
-        library_json = _register(
-            tmp_path,
-            fixture_dir=BEHAVIOR_FIXTURE,
-            node_file="behavior_preservation_node.py",
-            name="Prefers The Possible",
-            preferred_resources={"compute": [["cpu"], "has_any"]},
-        )
-
-        info = _library_info(library_json)
-        assert info.unmet_preferences is None
-        assert info.fitness is LibraryManager.LibraryFitness.GOOD
-
-    def test_execution_still_refuses_for_an_unmet_REQUIREMENT(self, tmp_path: Path) -> None:
-        """The tiers are independent: adding a preference does not soften a requirement."""
+    def test_execution_refuses_for_an_unmet_requirement(self, tmp_path: Path) -> None:
         _register(
             tmp_path,
             fixture_dir=BEHAVIOR_FIXTURE,
             node_file="behavior_preservation_node.py",
-            name="Requires And Prefers",
+            name="Requires The Impossible",
             required_resources=self.IMPOSSIBLE_COMPUTE,
-            preferred_resources={"compute": [["cpu"], "has_any"]},
         )
 
         with pytest.raises(RuntimeError, match="definitely-not-a-real-backend"):
-            current_engine().library_manager.get_worker_for_library("Requires And Prefers")
+            current_engine().library_manager.get_worker_for_library("Requires The Impossible")
 
 
 class TestUnshippableOutputGuardrail:

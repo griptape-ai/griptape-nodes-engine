@@ -1331,7 +1331,12 @@ class BaseNode(ABC):
 
     @property
     def available_compute(self) -> list[str]:
-        """Every compute backend this machine has, most capable first.
+        """Every compute backend this machine has, in detection order.
+
+        Cpu first, then any accelerator found. NOT ranked: `available_compute[0]` is "cpu" even on
+        a machine with a GPU. Use
+        `execution_device` to get the device to actually run on; this list answers "what
+        exists here", which is a different question.
 
         For a node that wants to decide for itself rather than take `execution_device`.
         """

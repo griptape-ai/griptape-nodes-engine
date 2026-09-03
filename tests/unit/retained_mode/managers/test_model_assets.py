@@ -19,7 +19,7 @@ from unittest.mock import patch
 import pytest
 
 import griptape_nodes.retained_mode.managers.library_manager as library_manager_module
-from griptape_nodes.node_library.library_registry import LibrarySchema
+from griptape_nodes.node_library.library_registry import LibrarySchema, ModelAsset
 from griptape_nodes.retained_mode.engine import current_engine
 from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileRequest,
@@ -141,8 +141,6 @@ class TestResolvingAnAsset:
         manager = current_engine().library_manager
         schema = manager  # readability: the helper below is a static method on the manager
 
-        from griptape_nodes.node_library.library_registry import ModelAsset
-
         first = schema._model_asset_path(library, "weights", ModelAsset(source="hf:owner/repo", revision="abc123"))
         second = schema._model_asset_path(library, "weights", ModelAsset(source="hf:owner/repo", revision="def456"))
 
@@ -154,16 +152,42 @@ class TestResolvingAnAsset:
         library = _register(tmp_path, {"weights": {"source": "hf:owner/repo", "revision": "abc123"}}, "cached")
         manager = current_engine().library_manager
 
-        from griptape_nodes.node_library.library_registry import ModelAsset
-
         target = manager._model_asset_path(library, "weights", ModelAsset(source="hf:owner/repo", revision="abc123"))
         target.mkdir(parents=True, exist_ok=True)
         (target / "model.safetensors").write_text("already here")
+        # The completion marker is what "already present" means. Files alone do not qualify: the
+        # directory is created before the download starts, so a partial fetch also leaves files.
+        (target / ".griptape-nodes-complete").touch()
 
         with patch.object(current_engine(), "handle_request", side_effect=AssertionError("must not fetch")):
             path = manager.get_model_asset(library, "weights")
 
         assert path == target
+
+    def test_a_partial_download_is_refetched_rather_than_served(self, tmp_path: Path) -> None:
+        """Weights on disk without the marker are the shape an interrupted fetch leaves behind.
+
+        Serving them handed back a truncated model that failed in a way pointing at the model
+        rather than the cache, and nothing short of deleting the directory by hand recovered.
+        """
+        library = _register(tmp_path, {"weights": {"source": "hf:owner/repo", "revision": "abc123"}}, "partial")
+        manager = current_engine().library_manager
+
+        target = manager._model_asset_path(library, "weights", ModelAsset(source="hf:owner/repo", revision="abc123"))
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "model.safetensors.incomplete").write_text("half a file")
+
+        fetched: list[str] = []
+
+        def _record(request: object) -> object:
+            fetched.append(type(request).__name__)
+            return DownloadModelResultSuccess(model_id="owner/repo", result_details="ok")
+
+        with patch.object(current_engine(), "handle_request", side_effect=_record):
+            manager.get_model_asset(library, "weights")
+
+        assert fetched == ["DownloadModelRequest"], "a partial download must be refetched"
+        assert (target / ".griptape-nodes-complete").exists(), "a successful fetch must mark completion"
 
 
 class TestHonestFailures:
