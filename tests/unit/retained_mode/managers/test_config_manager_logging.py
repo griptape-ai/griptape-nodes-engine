@@ -15,11 +15,13 @@ from __future__ import annotations
 import json
 import logging
 import platform
+import tempfile
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
 
+from griptape_nodes.common import log_capture
 from griptape_nodes.common.log_capture import default_log_directory
 from griptape_nodes.retained_mode.events.config_events import (
     SetConfigCategoryRequest,
@@ -70,6 +72,29 @@ class TestLogDirectory:
         manager.set_config_value("logging.log_directory", "logs")
 
         assert manager.log_directory == default_log_directory()
+
+    def test_a_machine_with_no_home_directory_still_builds_a_manager(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Applying the logging settings is part of building one, so this refused to start.
+
+        The default log location sits under the user's data directory, and finding that means
+        finding their home directory. A Windows service account has no `USERPROFILE` and no
+        home directory to find, and the standard library raises rather than guessing -- so
+        the `RuntimeError` came out of `ConfigManager()` itself and took the engine with it.
+        """
+
+        def no_home() -> Path:
+            msg = "Could not determine home directory."
+            raise RuntimeError(msg)
+
+        # Pointed inside `tmp_path` so the fallback's own log file is cleaned up with it.
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        monkeypatch.setattr(log_capture, "xdg_data_home", no_home)
+
+        manager = ConfigManager()
+
+        assert manager.log_directory == tmp_path / "griptape_nodes" / "logs"
 
 
 @_skip_on_windows

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
+import tempfile
 import threading
 import time
 from collections import deque
@@ -154,8 +155,29 @@ _configuration_lock = threading.Lock()
 
 
 def default_log_directory() -> Path:
-    """Return the directory engine logs are written to when none is configured."""
-    return xdg_data_home() / "griptape_nodes" / "logs"
+    """Return the directory engine logs are written to when none is configured.
+
+    Never raises. This is reached from ``ConfigManager.__init__``, so a machine this cannot
+    answer for would otherwise be a machine the engine refuses to start on.
+    """
+    # FAILURE CASE: the default location lives under the user's data directory, and finding
+    # that means finding their home directory. A Windows service account or a container run
+    # without `USERPROFILE` set has none, and the standard library raises rather than
+    # returning a guess. Logs go to the temporary directory instead, which is the one place
+    # every platform can be asked for without knowing who is logged in.
+    try:
+        data_home = xdg_data_home()
+    except RuntimeError:
+        fallback = Path(tempfile.gettempdir()) / "griptape_nodes" / "logs"
+        logger.warning(
+            "This machine has no home directory to keep engine logs in, so they are being written to '%s' "
+            "instead. Files there are removed by the operating system from time to time. Set "
+            "'logging.log_directory' to an absolute path to choose somewhere they will be kept.",
+            fallback,
+        )
+        return fallback
+
+    return data_home / "griptape_nodes" / "logs"
 
 
 def resolve_log_directory(configured_directory: str) -> Path:

@@ -98,6 +98,18 @@ def _read_bytes(bundle: DiagnosticsBundle, path: str) -> bytes:
         return archive.read(path)
 
 
+def _write_source_log(path: Path, text: str) -> Path:
+    r"""Write a log file for the bundle to copy, with the line endings given and no others.
+
+    Bytes rather than ``write_text``, which translates every ``\n`` to the platform's line
+    ending. Log files are copied into a bundle byte for byte, so a source written that way
+    is a different file on Windows than on POSIX -- both the content a test then asserts on
+    and, since the budget is counted in bytes, how much of it fits.
+    """
+    path.write_bytes(text.encode("utf-8"))
+    return path
+
+
 class TestSessionLog:
     def test_writes_the_captured_lines(self) -> None:
         with DiagnosticsBundle(_redactor()) as bundle:
@@ -127,8 +139,7 @@ class TestSessionLog:
 
 class TestLogFiles:
     def test_copies_log_files_from_disk(self, tmp_path: Path) -> None:
-        log_file = tmp_path / "engine-1.log"
-        log_file.write_text("from an earlier session\n", encoding="utf-8")
+        log_file = _write_source_log(tmp_path / "engine-1.log", "from an earlier session\n")
         warnings: list[str] = []
 
         with DiagnosticsBundle(_redactor()) as bundle:
@@ -139,8 +150,7 @@ class TestLogFiles:
         assert warnings == []
 
     def test_scrubs_credentials_out_of_a_copied_file(self, tmp_path: Path) -> None:
-        log_file = tmp_path / "engine-1.log"
-        log_file.write_text("token sk-abcdefghijklmnop used\n", encoding="utf-8")
+        log_file = _write_source_log(tmp_path / "engine-1.log", "token sk-abcdefghijklmnop used\n")
 
         with DiagnosticsBundle(_redactor()) as bundle:
             bundle.add_log_files([log_file], [])
@@ -151,8 +161,7 @@ class TestLogFiles:
 
     def test_keeps_the_end_of_a_file_that_exceeds_the_budget(self, tmp_path: Path) -> None:
         """The most recent lines are the ones describing whatever went wrong."""
-        log_file = tmp_path / "engine-1.log"
-        log_file.write_text("".join(f"line-{index}\n" for index in range(500)), encoding="utf-8")
+        log_file = _write_source_log(tmp_path / "engine-1.log", "".join(f"line-{index}\n" for index in range(500)))
         warnings: list[str] = []
 
         with DiagnosticsBundle(_redactor(), max_log_bytes=200) as bundle:
@@ -167,8 +176,7 @@ class TestLogFiles:
 
     def test_drops_a_partial_first_line_rather_than_emitting_a_fragment(self, tmp_path: Path) -> None:
         """Seeking by byte lands mid-line, and a fragment reads like a real record."""
-        log_file = tmp_path / "engine-1.log"
-        log_file.write_text("".join(f"line-{index:04d}\n" for index in range(100)), encoding="utf-8")
+        log_file = _write_source_log(tmp_path / "engine-1.log", "".join(f"line-{index:04d}\n" for index in range(100)))
 
         with DiagnosticsBundle(_redactor(), max_log_bytes=95) as bundle:
             bundle.add_log_files([log_file], [])
@@ -207,8 +215,7 @@ class TestLogFiles:
         assert any("not-there.log" in warning for warning in warnings)
 
     def test_one_unreadable_file_does_not_stop_the_others(self, tmp_path: Path) -> None:
-        readable = tmp_path / "engine-1.log"
-        readable.write_text("kept\n", encoding="utf-8")
+        readable = _write_source_log(tmp_path / "engine-1.log", "kept\n")
 
         with DiagnosticsBundle(_redactor()) as bundle:
             bundle.add_log_files([tmp_path / "gone.log", readable], [])
@@ -239,8 +246,8 @@ class TestLogFiles:
         second_dir.mkdir()
         first = first_dir / "engine-1.log"
         second = second_dir / "engine-1.log"
-        first.write_text("from the current directory\n", encoding="utf-8")
-        second.write_text("from the older directory\n", encoding="utf-8")
+        _write_source_log(first, "from the current directory\n")
+        _write_source_log(second, "from the older directory\n")
         warnings: list[str] = []
 
         with DiagnosticsBundle(_redactor()) as bundle:
@@ -457,8 +464,7 @@ class TestReadme:
             assert _LOGS_DIRECTORY_LINE not in _read(bundle, README_FILE_NAME)
 
     def test_points_at_the_log_directory_once_a_file_from_disk_is_here(self, tmp_path: Path) -> None:
-        log_file = tmp_path / "engine-1.log"
-        log_file.write_text("from an earlier session\n", encoding="utf-8")
+        log_file = _write_source_log(tmp_path / "engine-1.log", "from an earlier session\n")
 
         with DiagnosticsBundle(_redactor()) as bundle:
             bundle.add_log_files([log_file], [])

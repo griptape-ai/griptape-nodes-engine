@@ -12,6 +12,7 @@ counted under a reason.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -154,7 +155,8 @@ class TestSensitiveConfigKeys:
 
         redacted = redactor.redact_config(config)
 
-        assert list(redacted) == ["~/projects"]
+        # Only the home directory is replaced, so what follows keeps this platform's separator.
+        assert list(redacted) == [f"~{os.sep}projects"]
         assert redactor.counts() == {RedactionReason.HOME_DIRECTORY: 1}
 
     def test_a_redacted_key_still_masks_its_own_value(self) -> None:
@@ -172,8 +174,9 @@ class TestSensitiveConfigKeys:
 
         redacted = redactor.redact_config(config)
 
-        assert list(redacted["headers"]) == ["~/cert.pem"]
-        assert redacted["headers"]["~/cert.pem"] == REDACTED
+        normalized_key = f"~{os.sep}cert.pem"
+        assert list(redacted["headers"]) == [normalized_key]
+        assert redacted["headers"][normalized_key] == REDACTED
 
 
 class TestKnownSecretValues:
@@ -367,20 +370,29 @@ class TestIdentityNormalization:
 
         assert home not in redactor.redact_text(f"saved to {home}/workspace")
 
-    def test_leaves_another_users_home_directory_recognizable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_leaves_another_users_home_directory_recognizable(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
         """`/Users/sam` matching inside `/Users/samantha` rewrote a colleague's path to `~antha`.
 
         Nothing leaks either way, but the result reads as this user's own home when it is
         somebody else's, and a shared-machine path is exactly what support is looking at.
+
+        Both paths are built under `tmp_path` rather than written out, so the separator is
+        this platform's. Spelled `/Users/sam`, the home directory would not appear in the
+        text at all on Windows and nothing would be replaced either way.
         """
-        monkeypatch.setattr(Path, "home", lambda: Path("/Users/sam"))
+        home = tmp_path / "sam"
+        # A colleague's home, sharing the first three characters of this user's.
+        neighbor_file = tmp_path / "samantha" / "workspace" / "thing.py"
+        monkeypatch.setattr(Path, "home", lambda: home)
         monkeypatch.setattr("getpass.getuser", lambda: "unrelated-name")
         redactor = Redactor()
 
-        redacted = redactor.redact_text("read /Users/samantha/workspace/thing.py and /Users/sam/notes.txt")
+        redacted = redactor.redact_text(f"read {neighbor_file} and {home / 'notes.txt'}")
 
-        assert "/Users/samantha/workspace/thing.py" in redacted
-        assert "~/notes.txt" in redacted
+        assert str(neighbor_file) in redacted
+        assert f"~{os.sep}notes.txt" in redacted
         assert redactor.counts() == {RedactionReason.HOME_DIRECTORY: 1}
 
     def test_redact_path_accepts_a_path_object(self) -> None:
