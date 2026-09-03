@@ -127,13 +127,15 @@ class ConfigWriteOutcome(NamedTuple):
     """Whether a completed user-layer write is the value now in effect.
 
     A write always lands in the user config file; whether it takes effect depends on more than
-    where it landed. `unapplied_key` names the first key that did not take effect, which for a
-    category write is a leaf under it rather than the category itself, and `reason` says why.
-    `shadowed_by` is set only for `reason == "shadowed"`. See `ConfigManager._write_outcome`.
+    where it landed. `written_key` is the key the caller wrote, and `unapplied_key` names the first
+    key under it that did not take effect, which for a category write is a leaf rather than the
+    category itself. `reason` says why, and `shadowed_by` is set only for `reason == "shadowed"`.
+    See `ConfigManager._write_outcome`.
     """
 
     applied: bool
     effective_value: Any
+    written_key: str
     unapplied_key: str | None
     shadowed_by: ConfigValueSource | None
     reason: ConfigWriteUnappliedReason | None = None
@@ -171,22 +173,26 @@ class _MergedConfigRejection(NamedTuple):
 
 
 def _offending_keys(error: ValidationError, validated: dict) -> tuple[str, ...]:
-    """Dot paths of the config keys a `Settings` validation error blames, in report order.
+    """Dot paths of the config keys a `Settings` validation error blames, most specific first.
 
-    Pydantic reports each error's location as a tuple of path segments, but appends the union
-    member it tried and the list index it was at, neither of which is a config key:
-    `secrets_to_register` (`list[str] | dict[str, str]`) reports
-    `(..., "secrets_to_register", "list[str]")`, and `mcp_servers` reports `("mcp_servers", 0,
-    "name")`. Each `loc` is therefore truncated at the first segment `validated` does not hold,
-    which yields the key a user can actually go and correct.
+    Pydantic reports each error's location as a tuple of path segments, but interleaves segments
+    that are not config keys: the union member it tried (`secrets_to_register.dict[str,str]`) and
+    the list index it was at (`mcp_servers.0.name`). Each is handled differently because they mean
+    different things.
+
+    A member tag names no key and does not descend, so it is skipped and the segment behind it is
+    still matched: a bad value under the dict member of `secrets_to_register` keeps its
+    `HF_TOKEN` leaf, which is the segment that identifies what to fix. An index means the failure
+    is inside a list element, which is not separately assignable, so the walk stops and reports
+    the list itself.
 
     Walking the validated dict rather than filtering by segment shape is what keeps a genuinely
     dot-keyed leaf intact: `project_workspaces` is keyed by project file paths, and those segments
     are present in the dict, so they survive while `list[str]` does not.
 
-    Results are deduplicated because one bad value under a union reports once per member tried.
-    A `loc` whose first segment is already absent contributes nothing, which covers the
-    whole-model failures that name no key at all.
+    A key that is a strict prefix of another is dropped, which collapses a union's one-error-per-
+    member into the specific leaf rather than their common ancestor. A `loc` that matches nothing
+    contributes no key, covering whole-model failures that name nothing a user could fix.
 
     Args:
         error: The validation error raised by `Settings.model_validate`.
@@ -197,13 +203,17 @@ def _offending_keys(error: ValidationError, validated: dict) -> tuple[str, ...]:
         node: Any = validated
         segments: list[str] = []
         for segment in detail.get("loc") or ():
-            if not isinstance(node, dict) or segment not in node:
+            if not isinstance(node, dict):
                 break
+            if segment not in node:
+                continue
             segments.append(str(segment))
             node = node[segment]
         if segments:
             keys.append(".".join(segments))
-    return tuple(dict.fromkeys(keys))
+
+    deduped = dict.fromkeys(keys)
+    return tuple(key for key in deduped if not any(other.startswith(f"{key}.") for other in deduped))
 
 
 class _LayerProbe(NamedTuple):
@@ -1583,11 +1593,16 @@ class ConfigManager(EngineScoped):
         unapplied_leaf = self._first_unapplied_leaf(key, value)
         if unapplied_leaf is None:
             return ConfigWriteOutcome(
-                applied=True, effective_value=effective_value, unapplied_key=None, shadowed_by=None
+                applied=True,
+                effective_value=effective_value,
+                written_key=key,
+                unapplied_key=None,
+                shadowed_by=None,
             )
         return ConfigWriteOutcome(
             applied=False,
             effective_value=effective_value,
+            written_key=key,
             unapplied_key=unapplied_leaf.key,
             shadowed_by=unapplied_leaf.source,
             reason=unapplied_leaf.reason,
@@ -1773,9 +1788,16 @@ class ConfigManager(EngineScoped):
     def _rejection_note(self, result_details: str, outcome: ConfigWriteOutcome) -> str:
         """Explain a write that reached disk while the merged config was failing validation.
 
-        The broken setting is frequently NOT the one just written: one invalid value anywhere
+        The broken setting is frequently NOT one the caller touched: a single invalid value anywhere
         makes `load_configs` discard the entire merge, so an unrelated write reads back as
-        unapplied. Blaming the written value sends the user to re-type a value that was fine.
+        unapplied. Blaming the written value there sends the user to re-type a value that was fine.
+
+        Ownership is judged against `written_key` and everything under it, not against
+        `unapplied_key`. A category write covers all its leaves, so a bad leaf inside it is the
+        caller's own even when the first leaf reported unapplied is a valid sibling.
+
+        When the caller's own write is broken and something else is too, only the caller's is
+        named: it is the actionable half, and the next attempt surfaces the rest.
 
         Says the merge fell back to built-in defaults rather than that the previous configuration
         was kept, because that is what happens: every other user, project and workspace setting
@@ -1788,13 +1810,17 @@ class ConfigManager(EngineScoped):
         rejection = self._merged_config_rejection
         if rejection is None:
             return (
-                f"{result_details} NOTE: '{outcome.unapplied_key}' is still "
+                f"{result_details} NOTE: '{outcome.written_key}' is still "
                 f"'{outcome.effective_value}'. The value was saved but did not take effect, for a "
                 "reason the engine did not record."
             )
 
-        if outcome.unapplied_key in rejection.keys:
-            blame = f"The value saved for '{outcome.unapplied_key}' is not one this setting accepts"
+        own_keys = [
+            key for key in rejection.keys if key == outcome.written_key or key.startswith(f"{outcome.written_key}.")
+        ]
+        if own_keys:
+            named = ", ".join(f"'{key}'" for key in own_keys)
+            blame = f"The value saved for {named} is not one this setting accepts"
         elif rejection.keys:
             named = ", ".join(f"'{key}'" for key in rejection.keys)
             blame = f"The value saved for {named} is not valid, which is a different setting"
@@ -1802,7 +1828,7 @@ class ConfigManager(EngineScoped):
             blame = "The saved configuration is not valid"
 
         return (
-            f"{result_details} NOTE: '{outcome.unapplied_key}' is still "
+            f"{result_details} NOTE: '{outcome.written_key}' is still "
             f"'{outcome.effective_value}'. {blame}, so the engine could not apply the "
             "configuration and fell back to built-in defaults for every setting until it is fixed."
         )
