@@ -136,6 +136,7 @@ class ConfigWriteOutcome(NamedTuple):
     applied: bool
     effective_value: Any
     written_key: str
+    written_path: tuple[str, ...]
     unapplied_key: str | None
     shadowed_by: ConfigValueSource | None
     reason: ConfigWriteUnappliedReason | None = None
@@ -167,13 +168,24 @@ class _MergedConfigRejection(NamedTuple):
     otherwise visible only as a log line. Held so a write's outcome can name the setting that is
     actually broken: it is frequently NOT the key the user just wrote, and without it the only
     honest thing a message can say is that something somewhere is wrong.
+
+    Stored as segment paths rather than dot strings because the comparisons done against them are
+    parent/child tests, and a joined string cannot express that boundary: `project_workspaces` is
+    keyed by project file paths, so `project_workspaces./srv/site` is a textual dot-prefix of
+    `project_workspaces./srv/site.com/x.yml` while being an unrelated sibling. `keys` is the
+    display view.
     """
 
-    keys: tuple[str, ...]
+    paths: tuple[tuple[str, ...], ...]
+
+    @property
+    def keys(self) -> tuple[str, ...]:
+        """The offending paths as dot-notation keys, for messages."""
+        return tuple(".".join(path) for path in self.paths)
 
 
-def _offending_keys(error: ValidationError, validated: dict) -> tuple[str, ...]:
-    """Dot paths of the config keys a `Settings` validation error blames, most specific first.
+def _offending_paths(error: ValidationError, validated: dict) -> tuple[tuple[str, ...], ...]:
+    """Segment paths of the config keys a `Settings` validation error blames, most specific first.
 
     Pydantic reports each error's location as a tuple of path segments, but interleaves segments
     that are not config keys: the union member it tried (`secrets_to_register.dict[str,str]`) and
@@ -181,24 +193,25 @@ def _offending_keys(error: ValidationError, validated: dict) -> tuple[str, ...]:
     different things.
 
     A member tag names no key and does not descend, so it is skipped and the segment behind it is
-    still matched: a bad value under the dict member of `secrets_to_register` keeps its
-    `HF_TOKEN` leaf, which is the segment that identifies what to fix. An index means the failure
-    is inside a list element, which is not separately assignable, so the walk stops and reports
-    the list itself.
+    still matched: a bad value under the dict member of `secrets_to_register` keeps its `HF_TOKEN`
+    leaf, which is the segment that identifies what to fix. An index means the failure is inside a
+    list element, which is not separately assignable, so the walk stops and reports the list itself.
 
     Walking the validated dict rather than filtering by segment shape is what keeps a genuinely
     dot-keyed leaf intact: `project_workspaces` is keyed by project file paths, and those segments
     are present in the dict, so they survive while `list[str]` does not.
 
-    A key that is a strict prefix of another is dropped, which collapses a union's one-error-per-
-    member into the specific leaf rather than their common ancestor. A `loc` that matches nothing
-    contributes no key, covering whole-model failures that name nothing a user could fix.
+    A path that is a proper prefix of another is dropped, which collapses a union's
+    one-error-per-member onto the specific leaf rather than their common ancestor. The comparison is
+    per segment, so two dot-keyed siblings are not mistaken for parent and child. A `loc` that
+    matches nothing contributes no path, covering whole-model failures that name nothing a user
+    could fix.
 
     Args:
         error: The validation error raised by `Settings.model_validate`.
         validated: The dict that was validated, used as the reference for which segments are keys.
     """
-    keys = []
+    paths: list[tuple[str, ...]] = []
     for detail in error.errors():
         node: Any = validated
         segments: list[str] = []
@@ -210,10 +223,10 @@ def _offending_keys(error: ValidationError, validated: dict) -> tuple[str, ...]:
             segments.append(str(segment))
             node = node[segment]
         if segments:
-            keys.append(".".join(segments))
+            paths.append(tuple(segments))
 
-    deduped = dict.fromkeys(keys)
-    return tuple(key for key in deduped if not any(other.startswith(f"{key}.") for other in deduped))
+    deduped = dict.fromkeys(paths)
+    return tuple(path for path in deduped if not any(other[: len(path)] == path for other in deduped if other != path))
 
 
 class _LayerProbe(NamedTuple):
@@ -1019,7 +1032,7 @@ class ConfigManager(EngineScoped):
         except ValidationError as e:
             logger.error("Error validating config file: %s", e)
             self.merged_config = self.default_config
-            self._merged_config_rejection = _MergedConfigRejection(keys=_offending_keys(e, merged_config))
+            self._merged_config_rejection = _MergedConfigRejection(paths=_offending_paths(e, merged_config))
 
     def load_project_config(self, project_dir: Path) -> None:
         """Load the project-adjacent config from the given project directory and remerge all configs.
@@ -1590,12 +1603,14 @@ class ConfigManager(EngineScoped):
             value: The value written to `key`, descended into when it is a dict.
         """
         effective_value = self.get_config_value(key, should_load_env_var_if_detected=False)
+        written_path = tuple(key.split("."))
         unapplied_leaf = self._first_unapplied_leaf(key, value)
         if unapplied_leaf is None:
             return ConfigWriteOutcome(
                 applied=True,
                 effective_value=effective_value,
                 written_key=key,
+                written_path=written_path,
                 unapplied_key=None,
                 shadowed_by=None,
             )
@@ -1603,6 +1618,7 @@ class ConfigManager(EngineScoped):
             applied=False,
             effective_value=effective_value,
             written_key=key,
+            written_path=written_path,
             unapplied_key=unapplied_leaf.key,
             shadowed_by=unapplied_leaf.source,
             reason=unapplied_leaf.reason,
@@ -1792,9 +1808,14 @@ class ConfigManager(EngineScoped):
         makes `load_configs` discard the entire merge, so an unrelated write reads back as
         unapplied. Blaming the written value there sends the user to re-type a value that was fine.
 
-        Ownership is judged against `written_key` and everything under it, not against
-        `unapplied_key`. A category write covers all its leaves, so a bad leaf inside it is the
-        caller's own even when the first leaf reported unapplied is a valid sibling.
+        Ownership is judged by comparing segment paths, not joined strings: `written_path` must be a
+        prefix of the rejection's path segment for segment. A dot-keyed leaf makes the string test
+        wrong in both directions -- `project_workspaces./srv/site` is a textual dot-prefix of
+        `project_workspaces./srv/site.com/x.yml` while being an unrelated sibling.
+
+        Ownership covers `written_path` and everything under it, not just `unapplied_key`. A
+        category write covers all its leaves, so a bad leaf inside it is the caller's own even when
+        the first leaf reported unapplied is a valid sibling.
 
         When the caller's own write is broken and something else is too, only the caller's is
         named: it is the actionable half, and the next attempt surfaces the rest.
@@ -1816,12 +1837,12 @@ class ConfigManager(EngineScoped):
             )
 
         own_keys = [
-            key for key in rejection.keys if key == outcome.written_key or key.startswith(f"{outcome.written_key}.")
+            ".".join(path) for path in rejection.paths if path[: len(outcome.written_path)] == outcome.written_path
         ]
         if own_keys:
             named = ", ".join(f"'{key}'" for key in own_keys)
             blame = f"The value saved for {named} is not one this setting accepts"
-        elif rejection.keys:
+        elif rejection.paths:
             named = ", ".join(f"'{key}'" for key in rejection.keys)
             blame = f"The value saved for {named} is not valid, which is a different setting"
         else:
