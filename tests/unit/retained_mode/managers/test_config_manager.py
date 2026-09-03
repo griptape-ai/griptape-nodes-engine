@@ -286,13 +286,42 @@ class TestConfigManager:
                 ]
                 assert prefix_warnings == []
 
+    def test_empty_path_segment_is_rejected(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A separator that produces an empty path segment is ignored rather than applied.
+
+        An empty segment is a legitimate key under a mapping or an undeclared tree, so validation
+        accepts it. Left alone it would write garbage at the highest-priority layer, masking the
+        config file underneath, and count as a longer path that discards its own correct prefix.
+        A lone one has no prefix to discard and so would apply silently.
+        """
+        preview_format = "GTN_CONFIG_ARTIFACTS__IMAGE__PREVIEW_GENERATION__PREVIEW_FORMAT"
+        cases = [
+            ({f"{preview_format}__": "jpg"}, {}),
+            (
+                {preview_format: "png", f"{preview_format}__": "jpg"},
+                {"artifacts": {"image": {"preview_generation": {"preview_format": "png"}}}},
+            ),
+            ({"GTN_CONFIG_ARTIFACTS____IMAGE": "y"}, {}),
+            ({"GTN_CONFIG_": "x"}, {}),
+            ({"GTN_CONFIG_NODES__FOO__BAR__": "b"}, {}),
+        ]
+        for env, want in cases:
+            caplog.clear()
+            with patch.dict(os.environ, env, clear=True):
+                with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+                    manager = ConfigManager()
+                    env_config = manager._load_config_from_env_vars()
+
+                assert env_config == want
+                assert any("has an empty path segment" in record.message for record in caplog.records)
+
     def test_mapping_entry_settable_via_env(self) -> None:
         """An entry in a mapping-valued setting (not a nested model) can be set with `__<KEY>`.
 
         `artifacts` is `dict[str, Any]`, not a Settings sub-model, so this exercises a different
-        path than the worker/agent/library tests above: the key is not declared anywhere in the
-        schema, and the value survives only because Settings ignores unknown keys within a
-        mapping the way it does within a nested model.
+        path than the worker/agent/library tests above: `Any` gives Pydantic nothing to drop, so
+        an undeclared key survives `model_dump()` instead of being rejected the way an undeclared
+        sub-key on a nested model is.
         """
         with patch.dict(os.environ, {"GTN_CONFIG_ARTIFACTS__SOME_KEY": "1"}, clear=True):
             manager = ConfigManager()

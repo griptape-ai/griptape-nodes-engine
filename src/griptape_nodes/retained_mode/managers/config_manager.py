@@ -420,8 +420,8 @@ class ConfigManager(EngineScoped):
     def _collect_env_var_overrides(self) -> list[EnvVarOverride]:
         """Resolve the GTN_CONFIG_ variables to apply, reporting each one ignored along the way.
 
-        Three things get a variable ignored: a value the setting's type rejects, a path that names no
-        setting, and a path that is a strict prefix of another surviving path.
+        Three things get a variable ignored: a name with an empty path segment, a value the
+        setting's type rejects, and a path that is a strict prefix of another surviving path.
 
         The prefix case is last because it only has to separate overrides that are each valid on
         their own. Exporting both GTN_CONFIG_ARTIFACTS__IMAGE and
@@ -430,8 +430,8 @@ class ConfigManager(EngineScoped):
         `set_dot_value` would otherwise honor whichever `os.environ` yielded last. The deeper path
         wins because it carries strictly more of what was asked for. An override that fails
         validation is not competing for anything, so it must be dropped before the tie is broken;
-        judging overlap first would let a typo like GTN_CONFIG_AGENT__SYSTEM_PROMPT__OOPS, or a
-        stray trailing separator, take a correct neighbour down with it.
+        judging overlap first would let a typo like GTN_CONFIG_AGENT__SYSTEM_PROMPT__OOPS take a
+        correct neighbour down with it.
 
         Returns:
             The overrides to apply, in environment order.
@@ -441,21 +441,25 @@ class ConfigManager(EngineScoped):
             if not env_var_name.startswith(ENV_VAR_PREFIX):
                 continue
             config_key = env_var_name.removeprefix(ENV_VAR_PREFIX).lower().replace(ENV_VAR_PATH_SEPARATOR, ".")
-            override = EnvVarOverride(
-                env_var_name=env_var_name,
-                config_key=config_key,
-                raw_value=raw_value,
-                value=self._coerce_env_var_value(config_key, raw_value),
-            )
-            if override.value is _REJECTED_BAD_VALUE:
+            if "" in config_key.split("."):
+                # A trailing, doubled, or leading separator. Nothing rejects it later: an empty key
+                # is a perfectly good key under a mapping or an undeclared tree, so it would
+                # validate, apply garbage at the highest-priority layer, and count as a longer path
+                # that discards its own correct prefix.
+                self._report_ignored_env_var(env_var_name, raw_value, "its name has an empty path segment")
+                continue
+            value = self._coerce_env_var_value(config_key, raw_value)
+            if value is _REJECTED_BAD_VALUE:
                 self._report_ignored_env_var(
-                    override, f"'{raw_value}' is not a valid value for the '{config_key}' setting"
+                    env_var_name, raw_value, f"'{raw_value}' is not a valid value for the '{config_key}' setting"
                 )
                 continue
-            if override.value is _REJECTED_UNKNOWN_KEY:
-                self._report_ignored_env_var(override, f"there is no '{config_key}' setting")
+            if value is _REJECTED_UNKNOWN_KEY:
+                self._report_ignored_env_var(env_var_name, raw_value, f"there is no '{config_key}' setting")
                 continue
-            coerced.append(override)
+            coerced.append(
+                EnvVarOverride(env_var_name=env_var_name, config_key=config_key, raw_value=raw_value, value=value)
+            )
 
         applicable = []
         for override in coerced:
@@ -464,7 +468,8 @@ class ConfigManager(EngineScoped):
             )
             if deeper_keys:
                 self._report_ignored_env_var(
-                    override,
+                    override.env_var_name,
+                    override.raw_value,
                     f"'{override.config_key}' is also the start of a longer path ({', '.join(deeper_keys)})",
                 )
                 continue
@@ -503,21 +508,22 @@ class ConfigManager(EngineScoped):
 
         return get_dot_value(validated.model_dump(), config_key, _REJECTED_UNKNOWN_KEY)
 
-    def _report_ignored_env_var(self, override: EnvVarOverride, reason: str) -> None:
+    def _report_ignored_env_var(self, env_var_name: str, raw_value: str, reason: str) -> None:
         """Warn that an environment override was ignored, once per variable and value.
 
         Args:
-            override: The override being ignored.
+            env_var_name: The full environment variable name.
+            raw_value: The value it carried.
             reason: Why it was ignored, phrased to complete "Ignoring <var>: <reason>.".
         """
-        report_key = (override.env_var_name, override.raw_value)
+        report_key = (env_var_name, raw_value)
         if report_key in self._reported_invalid_env_vars:
             return
 
         self._reported_invalid_env_vars.add(report_key)
         logger.warning(
             "Ignoring environment variable %s: %s. Falling back to the configured value.",
-            override.env_var_name,
+            env_var_name,
             reason,
         )
 
