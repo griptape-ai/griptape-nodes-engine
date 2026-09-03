@@ -38,6 +38,11 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     AddParameterToNodeRequest,
     SetParameterValueRequest,
 )
+from griptape_nodes.retained_mode.events.project_events import (
+    AttemptMapAbsolutePathToProjectRequest,
+    GetPathForMacroRequest,
+    GetSituationRequest,
+)
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 
 if TYPE_CHECKING:
@@ -191,6 +196,18 @@ class TestInstallRemoteHandlersSwap:
         """
         assert ActivateProjectRequest in LOCAL_ONLY_REQUEST_TYPES
         assert ReloadAllLibrariesRequest in LOCAL_ONLY_REQUEST_TYPES
+
+    def test_per_file_project_reads_stay_local(self) -> None:
+        """Three project-template reads on the per-saved-file path must not forward.
+
+        Each is a pure read of a project the worker has already adopted, and each sits on the path
+        taken for every file written, so forwarding them charged a round trip per file. The
+        write-side one is easy to miss because it runs after the write rather than before it.
+        """
+        for request_type in (GetSituationRequest, GetPathForMacroRequest, AttemptMapAbsolutePathToProjectRequest):
+            assert request_type in LOCAL_ONLY_REQUEST_TYPES, (
+                f"{request_type.__name__} must be answered by the worker, not forwarded"
+            )
 
     def test_unregistered_types_are_skipped_without_error(self) -> None:
         """Nothing to swap is not a bootstrap failure: only registered types are touched.

@@ -51,7 +51,10 @@ from griptape_nodes.retained_mode.events.library_events import ReloadAllLibrarie
 from griptape_nodes.retained_mode.events.parameter_events import MigrateParameterRequest
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.events.project_events import (
+    AttemptMapAbsolutePathToProjectRequest,
     GetCurrentProjectRequest,
+    GetPathForMacroRequest,
+    GetSituationRequest,
     SetCurrentProjectRequest,
 )
 from griptape_nodes.retained_mode.events.resource_events import (
@@ -338,6 +341,20 @@ LOCAL_ONLY_REQUEST_TYPES: frozenset[type[RequestPayload]] = frozenset(
         # the first attribute access fails. In a worker that meant every sidecar write logged
         # "'dict' object has no attribute 'project_base_dir'" and silently wrote nothing.
         GetCurrentProjectRequest,
+        # The same argument, for the reads that resolve a path against that project. All three are
+        # pure template reads carrying serializable payloads, and all three sit on the per-file
+        # write path, so forwarding them costs a round trip per saved file.
+        # GetPathForMacroResultFailure also declares `missing_variables: set[str] | None`, the same
+        # shape cattrs cannot round-trip that broke the os_events forwards.
+        #
+        # AttemptMapAbsolutePathToProjectRequest is the write-side counterpart and hid longest:
+        # every file written through a ProjectFileDestination asks whether its absolute path maps
+        # back into the project so the caller can store a portable macro reference instead. It sits
+        # AFTER the write rather than before it, which is the only reason it read as a different
+        # case; its handler is a pure read of the same project template.
+        GetSituationRequest,
+        GetPathForMacroRequest,
+        AttemptMapAbsolutePathToProjectRequest,
         # Two requests carry a live Python object in a field, and both were local under the
         # allowlist this exclusion list replaces -- the flip is what started forwarding them.
         # `_registers_a_python_class` does not catch either: it matches a `type[...]` annotation,
