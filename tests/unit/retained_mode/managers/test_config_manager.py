@@ -2695,6 +2695,55 @@ class TestConfigProvenance:
 
         assert json.loads(isolate_user_config.read_text())["max_nodes_in_parallel"] == "not-an-int"
 
+    def test_rejection_keeps_dot_keyed_siblings_separate(self, isolate_user_config: Path) -> None:
+        """Two broken dot-keyed siblings must both be named, not collapsed into one.
+
+        `project_workspaces` is keyed by project file paths, so `project_workspaces./srv/site` is a
+        textual dot-prefix of `project_workspaces./srv/site.com/...` while being an unrelated
+        sibling. Dropping prefixes by string comparison hid one of the two, and the user would fix
+        the named key, get the same rejection, and have no pointer to the other.
+        """
+        plain = "/srv/site"
+        dotted = "/srv/site.com/griptape-nodes-project.yml"
+
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.on_handle_set_config_value_request(
+                SetConfigValueRequest(category_and_key="project_workspaces", value={plain: 1, dotted: 2})
+            )
+
+            assert manager._merged_config_rejection is not None
+            assert set(manager._merged_config_rejection.keys) == {
+                f"project_workspaces.{plain}",
+                f"project_workspaces.{dotted}",
+            }
+
+        assert json.loads(isolate_user_config.read_text())["project_workspaces"] == {plain: 1, dotted: 2}
+
+    def test_rejection_note_does_not_claim_a_dot_prefixed_foreign_key(self, isolate_user_config: Path) -> None:
+        """A write must not own a broken key that merely shares its text plus a dot.
+
+        Writing a valid value to `project_workspaces./srv/site` while
+        `project_workspaces./srv/site.com/...` is broken has to read as someone else's fault. The
+        string test claimed it, telling the user the value they just wrote was refused when it was
+        the one valid thing in the file.
+        """
+        plain = "/srv/site"
+        dotted = "/srv/site.com/griptape-nodes-project.yml"
+        isolate_user_config.write_text(json.dumps({"project_workspaces": {dotted: 2}}), encoding="utf-8")
+
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.load_configs()
+            result = manager.on_handle_set_config_value_request(
+                SetConfigValueRequest(category_and_key=f"project_workspaces.{plain}", value="/valid/ws")
+            )
+
+        assert isinstance(result, SetConfigValueResultSuccess)
+        assert result.reason == "rejected"
+        assert "is a different setting" in str(result.result_details)
+        assert "is not one this setting accepts" not in str(result.result_details)
+
     def test_rejection_keeps_a_dot_keyed_leaf_intact(self, isolate_user_config: Path) -> None:
         """Truncating `loc` must not truncate a segment that genuinely is a key.
 
