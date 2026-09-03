@@ -170,15 +170,21 @@ class CurrentWorkflowChanged(AppPayload):
     time (which rekeys it from "unsaved:<uuid>" to the key derived from its new path),
     moving it to another directory, clearing all object state, or deleting it.
 
-    Renaming the workflow that is open reports None rather than the new key, because the
-    rename deletes the old registry entry while it is still the one in context, and that
-    delete tears the context down. That is the engine's actual state afterwards, not a
-    reporting quirk.
+    Renaming a workflow while it is the one open is the exception worth knowing about: the
+    rename deletes the old registry entry while that entry is still in context, and the
+    delete tears the context down. So this reports what the teardown left behind -- None on
+    a single-workflow stack, or the key of whatever was underneath it -- rather than the new
+    name. That is the engine's actual state afterwards, not a reporting quirk.
 
-    This is the authoritative "you are now looking at a different workflow" signal, and
-    the one a client should drive its title and canvas state from. Unlike
-    SetWorkflowContextSuccess it is not the result of a request, so a client observes it
-    even when it was not the one that asked -- a second editor attached to the same
+    This is the authoritative "you are now looking at a different workflow" signal, and the
+    one a client should drive its title from. It answers which workflow, not whether that
+    workflow's contents have finished loading: RunWorkflowFromRegistry switches the context
+    before it replays the saved file, so this arrives first and the workflow's nodes follow
+    behind it as ordinary creation events. A client that repopulates a canvas on this event
+    should expect to fill it from those, not from a graph that is already complete.
+
+    Unlike SetWorkflowContextSuccess it is not the result of a request, so a client observes
+    it even when it was not the one that asked -- a second editor attached to the same
     engine, or an agent driving the engine over MCP. Most of these switches happen deep
     inside another request, where no result event names the new workflow at all.
 

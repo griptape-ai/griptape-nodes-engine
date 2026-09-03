@@ -628,16 +628,20 @@ class TestWorkflowManager:
             patch.object(config_mgr, "delete_user_workflow"),
             patch.object(context_mgr, "has_current_workflow", return_value=True),
             patch.object(context_mgr, "get_current_workflow_name", return_value="my_workflow"),
-            patch.object(context_mgr, "set_current_workflow_name") as mock_set_name,
-            patch.object(context_mgr, "set_current_workflow_file_path") as mock_set_file_path,
+            patch.object(context_mgr, "rekey_workflow") as mock_rekey_context,
         ):
             result = workflow_manager.on_move_workflow_request(request)
 
         assert isinstance(result, MoveWorkflowResultSuccess)
-        mock_set_name.assert_called_once_with("subdir/my_workflow")
-        # The retained path travels with the key: `workflow_dir` reads it in preference to the
-        # registry, so a rekey without a repoint leaves the builtin on the pre-move directory.
-        mock_set_file_path.assert_called_once_with(str(config_mgr.workspace_path / "subdir" / "my_workflow.py"))
+        # Key and retained path move in one call. The path travels with the key because
+        # `workflow_dir` reads it in preference to the registry, so a rekey without a repoint
+        # leaves the builtin on the pre-move directory; and it has to land in the same call
+        # because that call is what tells clients the workflow switched.
+        mock_rekey_context.assert_called_once_with(
+            old_name="my_workflow",
+            new_name="subdir/my_workflow",
+            new_file_path=str(config_mgr.workspace_path / "subdir" / "my_workflow.py"),
+        )
 
     def test_on_move_workflow_request_does_not_update_context_for_other_workflow(self, engine: Engine) -> None:
         workflow_manager = engine.workflow_manager
@@ -658,12 +662,12 @@ class TestWorkflowManager:
             patch.object(config_mgr, "delete_user_workflow"),
             patch.object(context_mgr, "has_current_workflow", return_value=True),
             patch.object(context_mgr, "get_current_workflow_name", return_value="other_workflow"),
-            patch.object(context_mgr, "set_current_workflow_name") as mock_set_name,
+            patch.object(context_mgr, "rekey_workflow") as mock_rekey_context,
         ):
             result = workflow_manager.on_move_workflow_request(request)
 
         assert isinstance(result, MoveWorkflowResultSuccess)
-        mock_set_name.assert_not_called()
+        mock_rekey_context.assert_not_called()
 
     def test_on_move_workflow_request_updates_context_file_path_for_current_workflow(
         self, engine: Engine, tmp_path: Path
@@ -703,15 +707,21 @@ class TestWorkflowManager:
                 )
                 context_manager.push_workflow(workflow_name="my_workflow")
                 try:
-                    result = workflow_manager.on_move_workflow_request(
-                        MoveWorkflowRequest(workflow_name="my_workflow", target_directory="subdir")
-                    )
+                    with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
+                        result = workflow_manager.on_move_workflow_request(
+                            MoveWorkflowRequest(workflow_name="my_workflow", target_directory="subdir")
+                        )
 
                     assert isinstance(result, MoveWorkflowResultSuccess)
                     assert context_manager.get_current_workflow_name() == "subdir/my_workflow"
                     assert context_manager.get_current_workflow_file_path() == str(
                         workspace / "subdir" / "my_workflow.py"
                     )
+
+                    # A move renames the workflow as far as every other request is concerned, so
+                    # clients hear about it -- exactly once, from the single rekey that moves the
+                    # key and the retained path together.
+                    assert _notified_workflow_names(put_event) == ["subdir/my_workflow"]
                 finally:
                     context_manager.pop_workflow()
         finally:
@@ -1221,6 +1231,42 @@ class TestWorkflowManager:
         )
         assert captured["save_display_name"] == "My Name"
 
+    def test_rename_of_the_open_workflow_moves_its_key_and_path_together(self, engine: Engine) -> None:
+        """Renaming the workflow in context repoints it and tells clients its new key, once.
+
+        The key an editor addresses this workflow by changes here, so a client that never hears
+        about it keeps sending requests against a name the registry has dropped. The retained
+        path has to travel in the same breath: it is what `workflow_dir` answers with, and it
+        would otherwise name the file the rename just moved away from.
+
+        Drives the rename with its delete step mocked out, which is what isolates the
+        bookkeeping. Against the real delete handler the rename tears the context down instead
+        (it deletes the old entry while that entry is the one in context) -- that is pinned by
+        `test_delete_active_workflow_clears_context_stack`.
+        """
+        context_manager = engine.context_manager
+        context_manager.push_workflow(workflow_name="my_workflow")
+
+        try:
+            with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
+                self._run_rename(
+                    engine.workflow_manager,
+                    self._RenameScenario(
+                        workflow_name="my_workflow",
+                        requested_name="my_workflow_renamed",
+                        source_file_path="my_workflow.py",
+                        save_file_path="/workspace/my_workflow_renamed.py",
+                        save_workflow_name="my_workflow_renamed",
+                    ),
+                )
+
+            assert context_manager.get_current_workflow_name() == "my_workflow_renamed"
+            assert context_manager.get_current_workflow_file_path() == "/workspace/my_workflow_renamed.py"
+            assert _notified_workflow_names(put_event) == ["my_workflow_renamed"]
+        finally:
+            if context_manager.has_current_workflow():
+                context_manager.pop_workflow()
+
     @pytest.mark.parametrize(
         "non_override_behavior",
         [
@@ -1487,13 +1533,19 @@ class TestWorkflowManager:
             assert object_manager.has_object_with_name(flow_name)
 
             try:
-                result = asyncio.run(
-                    workflow_manager.on_delete_workflows_request(DeleteWorkflowRequest(name=workflow_key))
-                )
+                with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
+                    result = asyncio.run(
+                        workflow_manager.on_delete_workflows_request(DeleteWorkflowRequest(name=workflow_key))
+                    )
 
                 assert isinstance(result, DeleteWorkflowResultSuccess)
                 # Context stack is fully torn down.
                 assert not context_manager.has_current_workflow()
+                # ...and every client is told, once, that nothing is open. This is also the
+                # mechanism behind renaming the open workflow reporting no workflow: the rename
+                # deletes the old registry entry while it is the one in context, and this is that
+                # delete. A client left on the old title would be pointing at a dead key.
+                assert _notified_workflow_names(put_event) == [None]
                 # Child flow was deleted too; no orphans left in the ObjectManager.
                 assert not object_manager.has_object_with_name(flow_name)
                 assert not object_manager.get_filtered_subset(type=ControlFlow)
@@ -1522,14 +1574,18 @@ class TestWorkflowManager:
             context_manager.push_workflow(workflow_name=active_key)
 
             try:
-                result = asyncio.run(
-                    workflow_manager.on_delete_workflows_request(DeleteWorkflowRequest(name=other_key))
-                )
+                with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
+                    result = asyncio.run(
+                        workflow_manager.on_delete_workflows_request(DeleteWorkflowRequest(name=other_key))
+                    )
 
                 assert isinstance(result, DeleteWorkflowResultSuccess)
                 # The active workflow is still active.
                 assert context_manager.has_current_workflow()
                 assert context_manager.get_current_workflow_name() == active_key
+                # Nothing switched, so nobody is told anything -- an editor that reloaded its
+                # canvas here would be reloading it for no reason.
+                assert _notified_workflow_names(put_event) == []
                 # Only the non-active workflow was removed.
                 assert other_key not in WorkflowRegistry._workflows
                 assert active_key in WorkflowRegistry._workflows
@@ -4957,8 +5013,11 @@ class TestRunWorkflowFromRegistryNotifiesContextChange:
             )
 
         assert isinstance(result, RunWorkflowFromRegistryResultFailure)
-        # Pushed hopefully, then reverted by the failure teardown -- and the last word is the truth.
-        assert _notified_workflow_names(put_event)[-1] is None
+        # Pushed hopefully, then reverted by the failure teardown. Both go out, in that order, and
+        # the last word is the truth: a client that acted on the first is corrected by the second
+        # rather than being left showing a workflow the engine no longer has. The clean slate at
+        # the top of the open is silent here because the context started empty.
+        assert _notified_workflow_names(put_event) == ["open_fails", None]
         assert not context_manager.has_current_workflow()
 
     @pytest.mark.asyncio

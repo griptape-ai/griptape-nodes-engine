@@ -102,16 +102,22 @@ class RunWorkflowFromRegistryRequest(RequestPayload):
     work an artist has in front of them right now in the editor, which cannot be
     recovered. Save first (SaveWorkflowRequest) if that matters.
 
-    Once the open begins, the engine emits a CurrentWorkflowChanged app event naming the
-    workflow that ended up in context, on both the success and the failure path (a failed
-    open reverts to an empty engine and reports None). A request rejected before the open
-    begins -- unknown registry key, or an unsaved workflow -- leaves the Current Context
-    untouched and emits nothing.
+    The engine emits a CurrentWorkflowChanged app event naming the workflow that ended up in
+    context, on both the success and the failure path (a failure after the switch reverts to
+    an empty engine and reports None). It fires when the context switches, which is before
+    the file is replayed, so it announces which workflow is opening rather than that the
+    nodes have arrived. A request rejected before the switch -- unknown registry key, or an
+    unsaved workflow -- leaves the Current Context untouched and emits nothing; the one
+    exception is a clean slate that itself fails, which leaves the engine partially cleared
+    and reports whatever the clearing left behind.
 
     Opening a large workflow can take a while: it resolves node libraries and replays the
     whole file. A client-side timeout does NOT cancel the open, so do not retry on one --
     a retry's clean slate lands partway through the first attempt and leaves a half-built
-    graph. Poll GetWorkflowContextRequest instead.
+    graph. The engine runs the open to completion regardless, so wait and then read the graph
+    back (ListNodesInFlowRequest against the current flow). GetWorkflowContextRequest is not a
+    readiness check: it reports the new workflow from the moment the switch happens, so it
+    answers the same way whether the replay has finished or not.
 
     Args:
         workflow_name: Registry key of the workflow to open. These are the keys of the
