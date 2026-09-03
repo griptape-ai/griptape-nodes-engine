@@ -19,6 +19,7 @@ from griptape_nodes.common.diagnostics.health import (
     HealthCheckContext,
     HealthReport,
     HealthStatus,
+    redact_health_report,
     run_health_checks,
 )
 from griptape_nodes.common.diagnostics.redaction import Redactor
@@ -41,7 +42,7 @@ from griptape_nodes.common.diagnostics.report import (
 from griptape_nodes.common.log_capture import active_log_file, find_log_files, session_log_lines
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_types import BaseNode
-from griptape_nodes.files.path_utils import canonicalize_for_io
+from griptape_nodes.files.path_utils import canonicalize_for_io, strip_windows_long_path_prefix
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import (
     GetEngineVersionRequest,
@@ -181,7 +182,10 @@ class DiagnosticsManager(EngineScoped):
             logger.error(details)
             return RunHealthChecksResultFailure(result_details=details)
 
-        health = await self._run_health_checks(report)
+        # Redacted like the bundle's copy. Most of a verdict is quoted from the report,
+        # which is already clean, but a check that failed writes its own text and that text
+        # can be an exception from the network stack or the OS.
+        health = redact_health_report(await self._run_health_checks(report), redactor)
         failed = [result.name for result in health.results if result.status is HealthStatus.FAIL]
         warned = [result.name for result in health.results if result.status is HealthStatus.WARN]
 
@@ -203,46 +207,47 @@ class DiagnosticsManager(EngineScoped):
         )
         warnings: list[str] = []
 
-        with DiagnosticsBundle(redactor) as bundle:
-            # Logs and the workflow are staged before the report so the redaction counts
-            # the manifest reports cover every file, not just the report.
-            if request.include_logs:
-                self._stage_logs(bundle, warnings)
-            if request.include_current_workflow:
-                self._stage_current_workflow(bundle, warnings)
+        # Every part of assembly is inside the guard, not only the zip. Staging writes files
+        # to a temporary directory, and a temporary directory that is full or unwritable
+        # fails on the first file rather than at the end. A handler that let that OSError
+        # out would reach the user as raw exception text instead of a result they can act on.
+        try:
+            with DiagnosticsBundle(redactor) as bundle:
+                # Logs and the workflow are staged before the report so the redaction counts
+                # the manifest reports cover every file, not just the report.
+                if request.include_logs:
+                    self._stage_logs(bundle, warnings)
+                if request.include_current_workflow:
+                    self._stage_current_workflow(bundle, warnings)
 
-            report = await self._build_report(redactor, warnings, normalize_identity=request.normalize_identity)
-            if report is None:
-                details = "Attempted to collect a diagnostics bundle. Failed because the engine's host could not be identified."
-                logger.error(details)
-                return CollectDiagnosticsResultFailure(result_details=details)
+                report = await self._build_report(redactor, warnings, normalize_identity=request.normalize_identity)
+                if report is None:
+                    details = "Attempted to collect a diagnostics bundle. Failed because the engine's host could not be identified."
+                    logger.error(details)
+                    return CollectDiagnosticsResultFailure(result_details=details)
 
-            if request.include_health_checks:
-                bundle.add_health_report(await self._run_health_checks(report))
-                # The health checks are read out of the report but staged after it, so the
-                # report's own count is restated here to cover them too.
-                report.redaction = self._redaction_summary(redactor, normalize_identity=request.normalize_identity)
+                if request.include_health_checks:
+                    bundle.add_health_report(await self._run_health_checks(report))
+                    # The health checks are read out of the report but staged after it, so
+                    # the report's own count is restated here to cover them too.
+                    report.redaction = self._redaction_summary(redactor, normalize_identity=request.normalize_identity)
 
-            bundle.add_report(report)
-            bundle.add_readme()
-            manifest = bundle.write_manifest(
-                generated_at=report.generated_at,
-                engine_version=report.engine.engine_version,
-                identity_normalized=request.normalize_identity,
-                # The report's copy, which is already redacted and deduplicated. The
-                # bundle redacts warnings itself as well, and handing it the raw list
-                # would have the same removals counted twice.
-                warnings=report.collection_warnings,
-            )
-
-            try:
-                data = bundle.to_zip_bytes()
-            except OSError as err:
-                details = (
-                    f"Attempted to collect a diagnostics bundle. Failed because the bundle could not be written: {err}"
+                bundle.add_report(report)
+                bundle.add_readme()
+                manifest = bundle.write_manifest(
+                    generated_at=report.generated_at,
+                    engine_version=report.engine.engine_version,
+                    identity_normalized=request.normalize_identity,
+                    # The report's copy, which is already redacted and deduplicated. The
+                    # bundle redacts warnings itself as well, and handing it the raw list
+                    # would have the same removals counted twice.
+                    warnings=report.collection_warnings,
                 )
-                logger.error(details)
-                return CollectDiagnosticsResultFailure(result_details=details)
+                data = bundle.to_zip_bytes()
+        except OSError as err:
+            details = f"Attempted to collect a diagnostics bundle. Failed because it could not be assembled: {err}"
+            logger.error(details)
+            return CollectDiagnosticsResultFailure(result_details=details)
 
         file_name = request.file_name or self._default_bundle_file_name(report)
         if request.output_path is not None:
@@ -252,11 +257,15 @@ class DiagnosticsManager(EngineScoped):
     async def _write_bundle_to_path(
         self, output_path: str, file_name: str, data: bytes, manifest: DiagnosticsBundleManifest
     ) -> CollectDiagnosticsResultSuccess | CollectDiagnosticsResultFailure:
-        """Write a bundle to a path on the engine's machine.
+        r"""Write a bundle to a path on the engine's machine.
 
         A directory takes the generated file name; anything else is treated as the file
         name to write. An existing file is never overwritten, because a bundle is
         evidence and the one already there may be the one someone is waiting for.
+
+        Every path that reaches the user has the Windows long-path prefix taken off it.
+        Canonicalizing for I/O adds ``\\?\`` on Windows, and a user told their bundle is at
+        ``\\?\C:\Users\sam\bundle.zip`` cannot paste that anywhere useful.
         """
         destination = self._resolve_bundle_destination(output_path, file_name)
 
@@ -273,19 +282,20 @@ class DiagnosticsManager(EngineScoped):
         )
         if not isinstance(result, WriteFileResultSuccess):
             details = (
-                f"Attempted to write the diagnostics bundle to '{destination}'. "
+                f"Attempted to write the diagnostics bundle to '{strip_windows_long_path_prefix(destination)}'. "
                 f"Failed because the file could not be written: {result.result_details}"
             )
             logger.error(details)
             return CollectDiagnosticsResultFailure(result_details=details)
 
-        written_path = Path(result.final_file_path)
+        written_path = strip_windows_long_path_prefix(result.final_file_path)
+        written_name = Path(written_path).name
         return CollectDiagnosticsResultSuccess(
-            file_name=written_path.name,
+            file_name=written_name,
             size_bytes=len(data),
             manifest=manifest,
-            path=str(written_path),
-            result_details=self._bundle_success_details(written_path.name, manifest, str(written_path)),
+            path=written_path,
+            result_details=self._bundle_success_details(written_name, manifest, written_path),
         )
 
     def _resolve_bundle_destination(self, output_path: str, file_name: str) -> Path:
@@ -382,7 +392,7 @@ class DiagnosticsManager(EngineScoped):
             engine=engine_section,
             host=host_section,
             paths=self._build_paths_section(redactor, warnings),
-            config=self._build_config_section(redactor, warnings),
+            config=self._build_config_section(redactor),
             secrets=self._build_secrets_section(warnings),
             libraries=self._build_libraries_section(redactor, warnings),
             projects=await self._build_projects_section(redactor, warnings),
@@ -569,7 +579,7 @@ class DiagnosticsManager(EngineScoped):
             return None
         return os.access(workspace, os.W_OK)
 
-    def _build_config_section(self, redactor: Redactor, warnings: list[str]) -> ConfigDiagnostics:
+    def _build_config_section(self, redactor: Redactor) -> ConfigDiagnostics:
         """Report the merged settings, the files behind them, and the env vars overriding them."""
         config_manager = self.engine.config_manager
 
@@ -591,17 +601,10 @@ class DiagnosticsManager(EngineScoped):
                 )
             )
 
-        merged: dict = {}
-        try:
-            merged = config_manager.merged_config
-        except Exception as err:
-            warnings.append(f"The merged configuration could not be read: {err}")
-            logger.warning("Could not read the merged configuration for the diagnostics report.", exc_info=True)
-
         return ConfigDiagnostics(
             files=files,
             environment_overrides=sorted(name for name in os.environ if name.startswith(CONFIG_ENV_VAR_PREFIX)),
-            merged=redactor.redact_config(merged),
+            merged=redactor.redact_config(config_manager.merged_config),
         )
 
     def _build_secrets_section(self, warnings: list[str]) -> list[SecretDiagnostics]:
@@ -611,11 +614,7 @@ class DiagnosticsManager(EngineScoped):
         value, only from its key name and whether a value is present. That is the whole
         guarantee, so it is enforced by never reading the value into the report at all.
         """
-        declared_names = set(
-            normalize_secrets_to_register(
-                self.engine.config_manager.get_config_value(SECRETS_TO_REGISTER_KEY, default={})
-            )
-        )
+        declared_names = self._declared_secret_names()
         layers_by_source = self._collect_secret_layers(declared_names, warnings)
 
         # Highest priority first, matching the order SecretsManager.get_secret searches.
@@ -820,10 +819,33 @@ class DiagnosticsManager(EngineScoped):
         These are used to build search patterns and are never written anywhere. The
         engine is the only thing that knows them, which makes it the only thing that can
         scrub them out of a log line a library wrote.
+
+        Both places a value can live are read: the ``.env`` files, and the environment for
+        the names the engine expects to find. A key exported in a shell or set by a
+        container never appears in a ``.env`` file, and it is the same credential -- so
+        reading only the files would scrub the keys of a user who stores them the usual way
+        and miss the keys of one who does not.
+
+        Only names the engine already knows about are looked up in the environment. Taking
+        every variable would add hundreds of ordinary values -- ``PATH``, ``HOME``,
+        ``TERM`` -- and each one becomes another search-and-replace over every log line in
+        the bundle.
         """
+        file_values = self._env_file_secret_values()
+        expected_names = set(file_values) | self._declared_secret_names()
+
+        # A set because the engine copies .env entries into the environment at startup, so
+        # most values are found twice, and one search pattern per value is enough. Sorted so
+        # a report built twice from the same state redacts in the same order.
+        values = {value for value in file_values.values() if value}
+        values.update(value for name in expected_names if (value := os.environ.get(name)))
+        return sorted(values)
+
+    def _env_file_secret_values(self) -> dict[str, str]:
+        """Return the merged ``.env`` contents, or an empty mapping when they cannot be read."""
         try:
-            merged = self.engine.secrets_manager._read_merged_env_files()
-        except OSError:
+            return self.engine.secrets_manager._read_merged_env_files()
+        except (OSError, UnicodeDecodeError):
             # An unreadable .env file means less thorough scrubbing, not a failed report.
             # The generic credential patterns still apply.
             logger.warning(
@@ -831,8 +853,12 @@ class DiagnosticsManager(EngineScoped):
                 "scrubbed from log text; pattern-based redaction still applies.",
                 exc_info=True,
             )
-            return []
-        return [value for value in merged.values() if value]
+            return {}
+
+    def _declared_secret_names(self) -> set[str]:
+        """Return the secret key names the config asks the engine to register."""
+        declared = self.engine.config_manager.get_config_value(SECRETS_TO_REGISTER_KEY, default={})
+        return set(normalize_secrets_to_register(declared))
 
     def _collect_secret_layers(self, declared_names: set[str], warnings: list[str]) -> SecretLayers:
         """Return, per source, which secret keys are present and whether each has a value.
@@ -874,7 +900,9 @@ class DiagnosticsManager(EngineScoped):
 
         try:
             values = dotenv_values(path)
-        except OSError as err:
+        except (OSError, UnicodeDecodeError) as err:
+            # dotenv decodes as UTF-8, so a file saved in another encoding raises rather
+            # than reading as mojibake. That is a real state for a hand-edited `.env`.
             warnings.append(f"Secrets file '{path.name}' could not be read: {err}")
             logger.warning("Could not read secrets file '%s' for the diagnostics report.", path, exc_info=True)
             return {}
@@ -906,8 +934,20 @@ class DiagnosticsManager(EngineScoped):
             return None
 
     def _resolved_path_setting(self, key: str, warnings: list[str]) -> Path | None:
-        """Resolve a workspace-relative directory setting to an absolute path."""
-        configured = self.engine.config_manager.get_config_value(key, default=None)
+        """Resolve a workspace-relative directory setting to an absolute path.
+
+        The read is guarded because a setting written as ``$SOME_VAR`` is resolved through
+        the secrets manager, which resolves the workspace to find the ``.env`` beside it --
+        and a workspace that has gone missing is one of the things this report is collected
+        to explain.
+        """
+        try:
+            configured = self.engine.config_manager.get_config_value(key, default=None)
+        except OSError as err:
+            warnings.append(f"The '{key}' setting could not be read: {err}")
+            logger.warning("Could not read the '%s' setting for the diagnostics report.", key, exc_info=True)
+            return None
+
         if configured is None:
             return None
 

@@ -35,7 +35,24 @@ class TestSensitiveConfigKeys:
 
     @pytest.mark.parametrize(
         "key",
-        ["api_key", "API_KEY", "token", "refresh_token", "secret", "password", "credential", "Authorization", "keys"],
+        [
+            "api_key",
+            "API_KEY",
+            "token",
+            "refresh_token",
+            "secret",
+            "password",
+            "passwd",
+            "pwd",
+            "credential",
+            "Authorization",
+            "basic_auth",
+            "cookie",
+            "session_cookie",
+            "X-Amz-Signature",
+            "bearer",
+            "keys",
+        ],
     )
     def test_matches_credential_key_names_as_substrings_and_ignores_case(self, key: str) -> None:
         redacted = Redactor(normalize_identity=False).redact_config({key: "value-to-hide"})
@@ -103,6 +120,33 @@ class TestSensitiveConfigKeys:
         assert sorted(redacted["secrets_to_register"]) == ["HF_TOKEN", "OPENAI_API_KEY"]
         assert redactor.total_redactions() == 0
 
+    def test_removes_a_default_value_sitting_beside_a_declared_secret_name(self) -> None:
+        """A default value beside a declared name is a real credential, not documentation.
+
+        The mapping form of `secrets_to_register` carries values as well as names, and
+        `SecretsManager.register_all_secrets` writes one as a secret. The names stay,
+        because they are the setting's whole diagnostic signal; the values cannot.
+        """
+        config = {"secrets_to_register": {"OPENAI_API_KEY": "sk-realvalue", "HF_TOKEN": ""}}
+        redactor = Redactor(normalize_identity=False)
+
+        redacted = redactor.redact_config(config)
+
+        assert redacted["secrets_to_register"]["OPENAI_API_KEY"] == REDACTED
+        # Declared but never filled in, which is different from hidden.
+        assert redacted["secrets_to_register"]["HF_TOKEN"] == ""
+        assert redactor.counts() == {RedactionReason.CONFIG_KEY: 1}
+
+    def test_keeps_the_secret_names_a_library_declared_as_a_list(self) -> None:
+        """The list form holds names only, so nothing in it is removed."""
+        config = {"secrets_to_register": ["OPENAI_API_KEY", "HF_TOKEN"]}
+        redactor = Redactor(normalize_identity=False)
+
+        redacted = redactor.redact_config(config)
+
+        assert redacted["secrets_to_register"] == ["OPENAI_API_KEY", "HF_TOKEN"]
+        assert redactor.total_redactions() == 0
+
     def test_normalizes_a_home_directory_hiding_in_a_dict_key(self) -> None:
         """A library is free to key a settings subtree by absolute path."""
         config = {str(Path.home() / "projects"): {"enabled": True}}
@@ -120,6 +164,16 @@ class TestSensitiveConfigKeys:
         redacted = Redactor().redact_config(config)
 
         assert redacted == {"~_api_key": REDACTED}
+
+    def test_normalizes_a_home_directory_hiding_in_a_key_inside_a_masked_subtree(self) -> None:
+        """Masking a subtree drops its values, which is no reason to stop reading its keys."""
+        config = {"headers": {str(Path.home() / "cert.pem"): "realvalue"}}
+        redactor = Redactor()
+
+        redacted = redactor.redact_config(config)
+
+        assert list(redacted["headers"]) == ["~/cert.pem"]
+        assert redacted["headers"]["~/cert.pem"] == REDACTED
 
 
 class TestKnownSecretValues:
@@ -186,6 +240,9 @@ class TestKnownSecretValues:
 
         assert known_value not in redacted
         assert redacted == f"Authorization: Bearer {REDACTED}"
+        # The reason, not just the outcome: either ordering removes the value, but only the
+        # documented one counts it once, under the rule that actually consumed it.
+        assert redactor.counts() == {RedactionReason.BEARER_TOKEN: 1}
 
     def test_removes_a_known_secret_used_as_a_url_query_parameter(self) -> None:
         known_value = "s3cr3t-value-12345"
@@ -309,6 +366,22 @@ class TestIdentityNormalization:
         home = str(Path.home()).replace("\\", "/")
 
         assert home not in redactor.redact_text(f"saved to {home}/workspace")
+
+    def test_leaves_another_users_home_directory_recognizable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """`/Users/sam` matching inside `/Users/samantha` rewrote a colleague's path to `~antha`.
+
+        Nothing leaks either way, but the result reads as this user's own home when it is
+        somebody else's, and a shared-machine path is exactly what support is looking at.
+        """
+        monkeypatch.setattr(Path, "home", lambda: Path("/Users/sam"))
+        monkeypatch.setattr("getpass.getuser", lambda: "unrelated-name")
+        redactor = Redactor()
+
+        redacted = redactor.redact_text("read /Users/samantha/workspace/thing.py and /Users/sam/notes.txt")
+
+        assert "/Users/samantha/workspace/thing.py" in redacted
+        assert "~/notes.txt" in redacted
+        assert redactor.counts() == {RedactionReason.HOME_DIRECTORY: 1}
 
     def test_redact_path_accepts_a_path_object(self) -> None:
         redacted = Redactor().redact_path(Path.home() / "workspace")

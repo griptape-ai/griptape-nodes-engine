@@ -236,8 +236,16 @@ class ConfigManager(EngineScoped):
         Resolved from the ``logging.log_directory`` setting, empty meaning the default
         location. Exposed as a property so a report of where logs go and the sink that
         puts them there cannot disagree.
+
+        Read with secret expansion off. A value beginning with ``$`` would otherwise be
+        looked up through the secrets manager, and this property is read while the
+        ``ConfigManager`` is being constructed -- before the engine has a secrets manager to
+        ask. A log directory written as ``$LOG_DIR`` would take the engine down at startup,
+        with no log to say why. A leading ``$`` is treated as part of the directory name.
         """
-        return resolve_log_directory(self.get_config_value(LOG_DIRECTORY_KEY, default="", cast_type=str))
+        return resolve_log_directory(
+            self.get_config_value(LOG_DIRECTORY_KEY, default="", cast_type=str, should_load_env_var_if_detected=False)
+        )
 
     def set_workspace_override(self, path: Path | None) -> None:
         """Set a runtime workspace directory override.
@@ -672,10 +680,11 @@ class ConfigManager(EngineScoped):
             logger.error("Error validating config file: %s", e)
             self.merged_config = self.default_config
 
-        # Last, from whatever config actually survived above. Any layer can carry a
-        # logging setting -- a project or workspace file, or an environment variable --
-        # so applying these only when the user config is written would leave the engine
-        # logging somewhere other than where it reports it is.
+        # Last, from whatever config actually survived above. Any config file can carry a
+        # logging setting -- the user, project, or workspace file -- so applying these only
+        # when the user config is written would leave the engine logging somewhere other
+        # than where it reports it is. `GTN_CONFIG_LOG_LEVEL` reaches this too; the settings
+        # nested under `logging.` do not, because the env layer is a flat mapping.
         self._apply_logging_settings()
 
     def load_project_config(self, project_dir: Path) -> None:

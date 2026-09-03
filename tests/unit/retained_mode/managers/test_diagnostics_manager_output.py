@@ -12,19 +12,45 @@ a missing workspace is exactly the thing these checks are collected to report.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
-from unittest.mock import Mock
+from typing import TYPE_CHECKING, Self, cast
+from unittest.mock import Mock, patch
 
 import pytest
 
+from griptape_nodes.retained_mode.events.diagnostics_events import (
+    CollectDiagnosticsRequest,
+    CollectDiagnosticsResultFailure,
+)
 from griptape_nodes.retained_mode.managers.diagnostics_manager import DiagnosticsManager
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
     from griptape_nodes.retained_mode.engine import Engine
 
+_MODULE = "griptape_nodes.retained_mode.managers.diagnostics_manager"
 _BUNDLE_NAME = "griptape-nodes-diagnostics-0.1.0-20260101.zip"
+_DISK_FULL = "No space left on device"
+
+
+class _UnwritableBundle:
+    """A bundle whose staging directory cannot be written to, so every stage fails."""
+
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        pass
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        return None
+
+    def __getattr__(self, _name: str) -> Callable[..., None]:
+        def fail(*_args: object, **_kwargs: object) -> None:
+            raise OSError(_DISK_FULL)
+
+        return fail
 
 
 @pytest.fixture
@@ -95,6 +121,58 @@ class TestFileNameFromUrl:
     def test_falls_back_when_the_url_points_at_no_file(self, manager: DiagnosticsManager) -> None:
         """A URL shape nobody expected must not make the success message empty."""
         assert manager._file_name_from_url("https://static.example.com/", fallback=_BUNDLE_NAME) == _BUNDLE_NAME
+
+
+class TestCollectFailsCleanly:
+    """A handler returns a failure result; it never lets an exception out.
+
+    Staging writes real files to a temporary directory, and a temporary directory that is
+    full or unwritable fails on the very first one. Guarding only the zip left that
+    `OSError` to reach the user as raw exception text with no bundle and no explanation.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_staging_directory_that_cannot_be_written_to_returns_a_failure(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        engine = Mock()
+        engine.config_manager.log_directory = tmp_path
+        manager = DiagnosticsManager(Mock(), engine=cast("Engine", engine))
+        request = CollectDiagnosticsRequest(
+            include_current_workflow=False, include_health_checks=False, output_path=str(tmp_path)
+        )
+
+        with (
+            patch.object(DiagnosticsManager, "_known_secret_values", return_value=[]),
+            patch(f"{_MODULE}.session_log_lines", return_value=["a line worth keeping"]),
+            patch(f"{_MODULE}.DiagnosticsBundle", _UnwritableBundle),
+            caplog.at_level("ERROR", logger="griptape_nodes"),
+        ):
+            result = await manager.on_collect_diagnostics_request(request)
+
+        assert isinstance(result, CollectDiagnosticsResultFailure)
+        assert _DISK_FULL in str(result.result_details)
+        assert _DISK_FULL in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_the_failure_says_what_was_being_attempted(self, tmp_path: Path) -> None:
+        """Read by someone who is already troubleshooting something else."""
+        engine = Mock()
+        engine.config_manager.log_directory = tmp_path
+        manager = DiagnosticsManager(Mock(), engine=cast("Engine", engine))
+        request = CollectDiagnosticsRequest(
+            include_current_workflow=False, include_health_checks=False, output_path=str(tmp_path)
+        )
+
+        with (
+            patch.object(DiagnosticsManager, "_known_secret_values", return_value=[]),
+            patch(f"{_MODULE}.session_log_lines", return_value=["a line worth keeping"]),
+            patch(f"{_MODULE}.DiagnosticsBundle", _UnwritableBundle),
+        ):
+            result = await manager.on_collect_diagnostics_request(request)
+
+        assert isinstance(result, CollectDiagnosticsResultFailure)
+        assert "Attempted to collect a diagnostics bundle" in str(result.result_details)
 
 
 class TestCloudApiKey:

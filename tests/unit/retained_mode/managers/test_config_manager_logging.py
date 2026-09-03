@@ -1,10 +1,10 @@
 """Tests for how a config load reaches the shared logger and its diagnostic sinks.
 
-Logging is configured from several related settings at once, and any layer can supply one
-of them — a project file, a workspace file, or a `GTN_CONFIG_` environment variable. So the
-sinks are applied at the end of every load rather than by whichever caller happened to
-write a setting; a load that skipped it left the engine logging somewhere other than where
-`report.json` said it did.
+Logging is configured from several related settings at once, and any config file can supply
+one of them — the user file, a project file, or a workspace file. So the sinks are applied
+at the end of every load rather than by whichever caller happened to write a setting; a
+load that skipped it left the engine logging somewhere other than where `report.json` said
+it did.
 
 The other half is that re-applying is not free. Every config write reloads, and each apply
 re-scans the log directory for files to age out, so an unrelated write must be a no-op.
@@ -84,17 +84,20 @@ class TestApplyLoggingSettings:
         assert configure.call_count == 1
         assert configure.call_args.kwargs["log_directory"] == first_load.log_directory
 
-    def test_a_reload_applies_a_setting_no_caller_wrote(
-        self, manager: ConfigManager, isolate_user_config: Path, tmp_path: Path
-    ) -> None:
-        """A project or workspace file, or an environment variable, can supply one of these."""
-        isolate_user_config.write_text(json.dumps({"logging": {"log_directory": str(tmp_path)}}), encoding="utf-8")
+    def test_a_reload_applies_a_setting_no_caller_wrote(self, manager: ConfigManager, tmp_path: Path) -> None:
+        """A workspace file can supply one of these, with no call to `set_config_value` at all."""
+        workspace_directory = tmp_path / "workspace"
+        log_directory = tmp_path / "logs"
+        workspace_directory.mkdir()
+        (workspace_directory / "griptape_nodes_config.json").write_text(
+            json.dumps({"logging": {"log_directory": str(log_directory)}}), encoding="utf-8"
+        )
 
         with patch(_CONFIGURE) as configure:
-            manager.load_configs()
+            manager.load_workspace_config(workspace_directory)
 
         assert configure.call_count == 1
-        assert configure.call_args.kwargs["log_directory"] == tmp_path
+        assert configure.call_args.kwargs["log_directory"] == log_directory
 
     def test_a_write_that_changes_nothing_relevant_does_not_reconfigure(self, manager: ConfigManager) -> None:
         """Every write reloads, and every apply re-scans the log directory for aged-out files."""

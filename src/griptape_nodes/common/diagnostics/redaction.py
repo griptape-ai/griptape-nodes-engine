@@ -39,17 +39,21 @@ REDACTED_USER = "<user>"
 # an API key to a server.
 SENSITIVE_KEY_NAMES = frozenset({"env", "headers"})
 
-# Keys whose values are the *names* of secrets rather than secrets. `secrets_to_register`
-# is a list of variable names a library wants the engine to look for, and the report
-# publishes those names elsewhere by design. Masking them would replace the one piece of
-# diagnostic signal the setting carries, and would inflate the redaction count with
-# removals of things that were never secret.
-KEY_NAMES_HOLDING_SECRET_NAMES = frozenset({"secrets_to_register"})
+# Keys that declare which secrets the engine should look for. Handled as a special case
+# rather than masked wholesale, because the two shapes this setting accepts are not equally
+# safe: a list holds variable *names*, which the report publishes elsewhere by design and
+# which are the only diagnostic signal the setting carries, while a mapping holds names
+# *and default values*, and a default value is a real credential --
+# `SecretsManager.register_all_secrets` writes it as one.
+KEY_NAMES_DECLARING_SECRETS = frozenset({"secrets_to_register"})
 
 # Substring match, not whole-word: `api_key`, `openai_api_key`, and `keys` must all
-# match. Over-matching (`keyboard`, `monkey`) costs a hidden value in a report and is
-# the right way to be wrong.
-SENSITIVE_KEY_PATTERN = re.compile(r"(?i)(key|token|secret|password|credential|authorization)")
+# match. `auth` covers `authorization` as well as the bare and prefixed spellings
+# (`basic_auth`, `auth_header`). Over-matching (`keyboard`, `monkey`, `author`) costs a
+# hidden value in a report and is the right way to be wrong.
+SENSITIVE_KEY_PATTERN = re.compile(
+    r"(?i)(key|token|secret|password|passwd|pwd|credential|auth|cookie|signature|bearer)"
+)
 
 # A known secret shorter than this is not searched for in free text. Someone whose
 # secret value is `1`, `true`, or `dev` would otherwise have every occurrence of that
@@ -132,7 +136,11 @@ _SIGNED_URL_PATTERN = TextPattern(
 # behind. Running them first also means one credential is counted once rather than twice.
 DELIMITED_VALUE_PATTERNS = [_BEARER_PATTERN, _SIGNED_URL_PATTERN]
 
-GENERIC_TEXT_PATTERNS = [*DELIMITED_VALUE_PATTERNS, *_API_KEY_PATTERNS]
+# What may follow a home directory for it to really be one. Without this, a home of
+# `/Users/sam` rewrites a sibling's `/Users/samantha/x` to `~antha/x`: nothing leaks, but
+# the result reads as this user's home when it is somebody else's. `_` is allowed because
+# a config key can be built by appending to a path (`/Users/sam_api_key`).
+_HOME_DIRECTORY_BOUNDARY = r"""(?=[/\\_.,;:!?*|'")\]}>\s]|$)"""
 
 
 class Redactor:
@@ -204,6 +212,11 @@ class Redactor:
         return sum(self._counts.values())
 
     def _redact_config_value(self, value: Any, key: str | None) -> Any:
+        # Checked before the name heuristic: `secrets_to_register` matches `secret` below,
+        # but only half of what it can hold is actually a credential.
+        if key is not None and key.lower() in KEY_NAMES_DECLARING_SECRETS:
+            return self._redact_declared_secrets(value)
+
         if key is not None and self._is_sensitive_key(key):
             return self._mask(value)
 
@@ -227,6 +240,19 @@ class Redactor:
 
         return value
 
+    def _redact_declared_secrets(self, value: Any) -> Any:
+        """Keep the secret names a library declared, and drop any default values beside them.
+
+        ``secrets_to_register`` is either a list of names or a mapping of name to default
+        value. The names are the whole diagnostic signal and are not themselves secret. A
+        default value in the mapping form is a credential, though: the engine writes it as
+        one, so it is masked like any other.
+        """
+        if isinstance(value, dict):
+            return self._mask(value)
+
+        return self._redact_config_value(value, key=None)
+
     def _mask(self, value: Any) -> Any:
         """Replace a credential value, keeping as much non-secret shape as is safe."""
         # An unset value is not a secret, and "this is unset" is often the answer support
@@ -242,8 +268,11 @@ class Redactor:
         # is a common cause of the failures this report is collected to explain.
         if isinstance(value, dict):
             # Names kept, values dropped: knowing which variables are set is the
-            # diagnostic signal, and the names are not themselves secret.
-            return {entry_key: self._mask(entry) for entry_key, entry in value.items()}
+            # diagnostic signal, and the names are not themselves secret. The names still
+            # go through key redaction, because a credential-named mapping is free to be
+            # keyed by absolute path and a home directory hides there as readily as
+            # anywhere else.
+            return {self._redact_key(entry_key): self._mask(entry) for entry_key, entry in value.items()}
 
         if isinstance(value, list):
             return [self._mask(item) for item in value]
@@ -260,11 +289,6 @@ class Redactor:
     @staticmethod
     def _is_sensitive_key(key: str) -> bool:
         lowered = key.lower()
-
-        # Checked first: `secrets_to_register` matches `secret` below, and its values are
-        # names rather than credentials.
-        if lowered in KEY_NAMES_HOLDING_SECRET_NAMES:
-            return False
 
         if lowered in SENSITIVE_KEY_NAMES:
             return True
@@ -287,7 +311,11 @@ class Redactor:
     def _build_identity_patterns() -> list[TextPattern]:
         """Build patterns replacing the home directory with ``~`` and the username with ``<user>``."""
         patterns = [
-            TextPattern(RedactionReason.HOME_DIRECTORY, re.compile(re.escape(spelling), re.IGNORECASE), "~")
+            TextPattern(
+                RedactionReason.HOME_DIRECTORY,
+                re.compile(re.escape(spelling) + _HOME_DIRECTORY_BOUNDARY, re.IGNORECASE),
+                "~",
+            )
             for spelling in Redactor._home_directory_spellings()
         ]
 

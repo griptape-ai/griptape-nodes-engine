@@ -32,13 +32,14 @@ from typing import TYPE_CHECKING, NamedTuple, Self
 
 from pydantic import BaseModel, Field
 
+from griptape_nodes.common.diagnostics.health import redact_health_report
 from griptape_nodes.common.diagnostics.report import (
     DIAGNOSTICS_REPORT_SCHEMA_VERSION,
     RedactionSummary,
 )
 
 if TYPE_CHECKING:
-    from griptape_nodes.common.diagnostics.health import HealthCheckResult, HealthReport
+    from griptape_nodes.common.diagnostics.health import HealthReport
     from griptape_nodes.common.diagnostics.redaction import Redactor
     from griptape_nodes.common.diagnostics.report import DiagnosticsReport
 
@@ -143,7 +144,12 @@ class DiagnosticsBundle:
             bundle.add_health_report(health)
             bundle.add_report(report)
             bundle.add_readme()
-            manifest = bundle.write_manifest(generated_at, engine_version, warnings)
+            manifest = bundle.write_manifest(
+                generated_at=generated_at,
+                engine_version=engine_version,
+                identity_normalized=True,
+                warnings=warnings,
+            )
             data = bundle.to_zip_bytes()
 
     Add the files that carry free text before building the report, so the redaction
@@ -247,7 +253,7 @@ class DiagnosticsBundle:
             return
 
         self._write(
-            f"{WORKFLOW_DIRECTORY_NAME}/{workflow_path.name}",
+            f"{WORKFLOW_DIRECTORY_NAME}/{self._staged_file_name(workflow_path.name)}",
             self._redactor.redact_text(text),
             "The workflow that was open, as it was last saved. Unsaved edits are not included.",
         )
@@ -264,18 +270,13 @@ class DiagnosticsBundle:
         )
 
     def add_health_report(self, health: HealthReport) -> None:
-        """Write the health checks' verdicts.
+        """Write the health checks' verdicts, redacted.
 
-        Redacted on the way in: a check that failed may be quoting an error message from
-        the network stack, and that message is not the engine's own text.
-
-        Field by field, before serializing. Redacting the finished JSON instead would miss
-        any secret whose own text has to be escaped to live in a JSON string, since the
-        escaped spelling is not what the redactor is looking for.
+        A check that failed may be quoting an error message from the network stack, and
+        that message is not the engine's own text. Shared with the handler that returns a
+        health report to the editor, so both destinations remove the same things.
         """
-        redacted = health.model_copy(
-            update={"results": [self._redact_health_result(result) for result in health.results]}
-        )
+        redacted = redact_health_report(health, self._redactor)
         self._write(
             HEALTH_FILE_NAME,
             redacted.model_dump_json(indent=2) + "\n",
@@ -347,13 +348,18 @@ class DiagnosticsBundle:
         """Remove the staging directory."""
         shutil.rmtree(self._staging_dir, ignore_errors=True)
 
-    def _redact_health_result(self, result: HealthCheckResult) -> HealthCheckResult:
-        """Return a check result with its free text redacted."""
-        remedy = result.remedy
-        if remedy is not None:
-            remedy = self._redactor.redact_text(remedy)
+    def _staged_file_name(self, name: str) -> str:
+        """Return a file name safe to put in the archive, with identifiers removed.
 
-        return result.model_copy(update={"summary": self._redactor.redact_text(result.summary), "remedy": remedy})
+        A workflow's file name is chosen by the user, so it carries whatever they put in it
+        -- often their own name. That name would otherwise reach the manifest and the
+        archive's entry list, which is the one place in a bundle nothing else redacts.
+
+        The angle brackets of ``<user>`` are taken back out. They are legal on POSIX and
+        illegal in a Windows file name, so leaving them in would make a bundle that
+        extracts here fail to extract on the machine reading it.
+        """
+        return self._redactor.redact_text(name).replace("<", "").replace(">", "")
 
     def _write(self, relative_path: str, text: str, description: str) -> None:
         """Write one staged file and record it as an entry."""

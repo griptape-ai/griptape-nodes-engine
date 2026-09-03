@@ -234,7 +234,7 @@ A **diagnostics bundle** is one zip file holding:
 | `logs/*.log`       | The log files kept on disk, newest first, for problems that happened in an earlier session                                     |
 | `report.json`      | Which engine version was running, on what machine, with which settings, and how every library and project fared when it loaded |
 | `doctor.json`      | The [`doctor`](reference/command_line_interface.md#doctor) health checks: what is wrong and what to do about each one          |
-| `workflow/`        | The workflow that was open, as it was last saved                                                                               |
+| `workflow/`        | The workflow that was open, as it was last saved. Only when the editor made the bundle                                         |
 | `manifest.json`    | Every file above, and a count of everything that was removed for safety                                                        |
 | `README.md`        | A plain-language guide to all of it                                                                                            |
 
@@ -243,6 +243,8 @@ To make one:
 ```bash
 gtn diagnostics collect
 ```
+
+A bundle made this way has no `workflow/` folder: the command starts an engine of its own, and that engine has no workflow open. To include the workflow you are working on, make the bundle from the editor instead.
 
 That writes `griptape-nodes-diagnostics-<version>-<timestamp>.zip` into the current directory. To put it somewhere easier to find:
 

@@ -87,8 +87,11 @@ class CollectDiagnosticsRequest(RequestPayload):
     redacts the report: no secret values, credential-shaped settings removed, home
     directory and username normalized, and every removal counted in the manifest.
 
-    The bundle is written as a file. Nothing is sent anywhere; where it goes next is
-    the user's decision.
+    The bundle is written as a file, and where it goes next is the user's decision.
+    Where the file lands depends on `output_path`: a path keeps the bundle on the engine's
+    machine and nothing leaves it, while None hands the bundle to the engine's static files
+    manager, which uploads it to Griptape Cloud when the engine is configured to store
+    static files there. Pass an `output_path` for a bundle that must not leave the machine.
 
     Args:
         include_logs: Include the engine's log files and this session's log. Turn off

@@ -28,13 +28,16 @@ class RedactionSummary(BaseModel):
 
     Attributes:
         identity_normalized: Whether the home directory was replaced with ``~`` and
-            the username with ``<user>``.
+            the username with ``<user>``. Defaults to False rather than True because it
+            is a claim about what was removed: a summary that arrived without the field
+            -- an older bundle, or a support tool round-tripping one -- must not assert
+            normalization that nothing checked.
         total: Total number of values removed.
         counts: Number of values removed per reason (see ``RedactionReason``).
             A reason that never fired is omitted.
     """
 
-    identity_normalized: bool = True
+    identity_normalized: bool = False
     total: int = 0
     counts: dict[str, int] = Field(default_factory=dict)
 

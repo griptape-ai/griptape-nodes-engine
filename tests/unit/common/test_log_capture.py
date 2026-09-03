@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
+from xdg_base_dirs import xdg_data_home
 
 from griptape_nodes.common import log_capture
 from griptape_nodes.common.log_capture import (
@@ -35,7 +36,16 @@ from griptape_nodes.common.log_capture import (
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+    from tests.unit.conftest import RealLogDirectoryChanges
+
 _SECONDS_PER_DAY = 86400
+
+# Directory permissions are not enforced against root, and `chmod` does not restrict writes
+# to a directory on Windows, so a test relying on either would pass for the wrong reason.
+_needs_posix_permissions = pytest.mark.skipif(
+    sys.platform == "win32" or os.geteuid() == 0,
+    reason="directory write permissions are not enforced for root or on Windows",
+)
 
 
 @pytest.fixture
@@ -239,6 +249,32 @@ class TestResolveLogDirectory:
         assert "absolute path" in caplog.text
 
 
+class TestSuiteIsolation:
+    """The developer's own log directory is not the suite's to write in, or to prune.
+
+    ``log_to_file`` is on by default and the sinks are process-global, so this is on by
+    accident rather than on purpose: nothing in a test has to ask for file logging to get
+    it. Deleting a week-old file is the half that loses something, and it happens without a
+    single assertion noticing.
+    """
+
+    def test_nothing_this_run_added_to_the_real_log_directory(
+        self, real_log_directory_changes: RealLogDirectoryChanges
+    ) -> None:
+        """Collection alone used to be enough, which is earlier than any fixture can reach."""
+        assert real_log_directory_changes.added == []
+
+    def test_nothing_this_run_deleted_from_the_real_log_directory(
+        self, real_log_directory_changes: RealLogDirectoryChanges
+    ) -> None:
+        """Retention pruning runs on every configuration, and a deleted log cannot come back."""
+        assert real_log_directory_changes.removed == []
+
+    def test_the_default_log_directory_is_somewhere_temporary(self) -> None:
+        """The check the two above cannot make: they only see the leaks that already happened."""
+        assert xdg_data_home() not in default_log_directory().parents
+
+
 @pytest.mark.usefixtures("isolated_capture")
 class TestConfigureDiagnosticLogging:
     def test_captures_this_session_without_anyone_turning_a_setting_on(self) -> None:
@@ -312,10 +348,15 @@ class TestConfigureDiagnosticLogging:
         assert active is not None
         assert active.parent == second
 
-    def test_an_unwritable_directory_does_not_stop_the_engine(
+    def test_a_directory_that_cannot_be_created_does_not_stop_the_engine(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Logging is a diagnostic aid; failing to open a file must never fail a startup."""
+        """Logging is a diagnostic aid; failing to open a file must never fail a startup.
+
+        This is the `mkdir` guard specifically -- the parent is a regular file, so the
+        directory can never be made. Asserted on the message that guard writes, since the
+        one below it says something very similar about a different failure.
+        """
         blocked = tmp_path / "blocked"
         blocked.write_text("not a directory", encoding="utf-8")
 
@@ -323,7 +364,45 @@ class TestConfigureDiagnosticLogging:
             configure_diagnostic_logging(log_directory=blocked / "logs", retention_days=0)
 
         assert active_log_file() is None
-        assert "will not be written to file" in caplog.text
+        assert "Could not create the engine log directory" in caplog.text
+
+    @_needs_posix_permissions
+    def test_a_directory_that_cannot_be_written_to_does_not_stop_the_engine(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The directory exists, so `mkdir` succeeds and only opening the file can fail.
+
+        A log directory on a read-only volume, or one owned by another user, is a real
+        setup. The file is opened while this guard is in scope rather than on the first
+        record, so the failure is reported here instead of surfacing much later as a
+        handler error on stderr.
+        """
+        read_only = tmp_path / "read-only"
+        read_only.mkdir(mode=0o500)
+
+        try:
+            with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+                configure_diagnostic_logging(log_directory=read_only, retention_days=0)
+        finally:
+            # Restored so tmp_path can be torn down.
+            read_only.chmod(0o700)
+
+        # The point of opening eagerly: nothing goes on naming a file that will never exist.
+        assert active_log_file() is None
+        assert "Could not open the engine log file" in caplog.text
+
+    @_needs_posix_permissions
+    def test_the_buffer_still_works_when_the_directory_cannot_be_written_to(self, tmp_path: Path) -> None:
+        read_only = tmp_path / "read-only"
+        read_only.mkdir(mode=0o500)
+
+        try:
+            configure_diagnostic_logging(log_directory=read_only, retention_days=0)
+            log_capture.logger.info("still captured")
+        finally:
+            read_only.chmod(0o700)
+
+        assert any("still captured" in line for line in session_log_lines())
 
     def test_the_buffer_still_works_when_the_file_could_not_be_opened(self, tmp_path: Path) -> None:
         blocked = tmp_path / "blocked"
