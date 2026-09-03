@@ -51,12 +51,14 @@ def _isolate_import_state() -> Iterator[None]:
     """
     original_path = list(sys.path)
     original_is_worker = current_engine().library_manager._is_worker
+    original_targets = current_engine().library_manager._target_library_names
     fixture_modules = (EXEC_DEP, "execution", "execution.runner", "leak_helper")
     for name in fixture_modules:
         sys.modules.pop(name, None)
     yield
     sys.path[:] = original_path
     current_engine().library_manager._is_worker = original_is_worker
+    current_engine().library_manager._target_library_names = original_targets
     for name in fixture_modules:
         sys.modules.pop(name, None)
 
@@ -164,6 +166,50 @@ class TestAWorkerImportsThemEagerly:
             node_type="BoundaryNode", name="still_editable", specific_library_name=LIBRARY
         )
         assert node.get_parameter_by_name("reported_version") is not None
+
+    def test_reaching_a_module_that_failed_to_import_reports_the_import_failure(self, tmp_path: Path) -> None:
+        """Not "no module by that name", which sends the author hunting for a manifest typo."""
+        current_engine().library_manager._is_worker = True
+        library_dir = tmp_path / "execution_module_library"
+        shutil.copytree(FIXTURE, library_dir)
+        (library_dir / "execution" / "runner.py").write_text("import a_module_that_does_not_exist\n")
+        manifest_path = library_dir / "griptape_nodes_library.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["library_schema_version"] = LibrarySchema.LATEST_SCHEMA_VERSION
+        manifest["metadata"]["engine_version"] = engine_version
+        manifest_path.write_text(json.dumps(manifest, indent=2))
+        current_engine().handle_request(RegisterLibraryFromFileRequest(file_path=str(manifest_path)))
+        node = LibraryRegistry.create_node(node_type="BoundaryNode", name="asks", specific_library_name=LIBRARY)
+
+        with pytest.raises(RuntimeError) as excinfo:
+            node.execution_module("runner")
+
+        message = str(excinfo.value)
+        assert "runner.py" in message, "the recorded import failure must reach the caller"
+        assert "no execution module named" not in message, "a typo is not the problem here"
+
+    def test_a_library_this_worker_does_not_serve_is_left_alone(self, tmp_path: Path) -> None:
+        """A worker also loads its library's DEPENDENCIES, which have no execution environment here.
+
+        Importing their execution modules would either fail with a traceback for a perfectly
+        healthy library, or succeed against this worker's pins -- silently binding someone else's
+        heavy imports to them.
+        """
+        library_manager = current_engine().library_manager
+        library_manager._is_worker = True
+        library_manager._target_library_names = ["Some Other Library"]
+
+        manifest_path = _register(tmp_path)
+
+        info = _library_info(manifest_path)
+        assert info.execution_modules == {}, "a worker imported an execution module it does not serve"
+        # The discriminating assertion. Without the gate the import is ATTEMPTED and fails, because
+        # this library got no execution environment here -- so the modules are empty either way,
+        # and only the absence of a recorded reason says they were left alone rather than broken.
+        assert info.execution_unavailable_reason is None, (
+            "a library this worker does not serve was reported as unrunnable"
+        )
+        assert info.declared_execution_module_paths, "the declaration is still recorded, for the boundary check"
 
 
 class TestTheBoundaryIsEnforced:

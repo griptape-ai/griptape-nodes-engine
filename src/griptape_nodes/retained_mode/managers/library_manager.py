@@ -5044,10 +5044,15 @@ class LibraryManager(EngineScoped):
         library_info.declared_execution_module_paths = {path.resolve() for path in paths}
         if not paths:
             return
-        if not self._is_worker:
+        # Gated on running THIS library's nodes, not merely on being a worker. A worker also loads
+        # the libraries its own library declares as dependencies, and those get no execution
+        # environment of their own here -- so importing their execution modules would either fail
+        # with a traceback for a perfectly healthy library, or succeed by resolving against this
+        # library's pins, silently binding someone else's heavy imports to them.
+        if not (self._is_worker and self._is_one_of_my_target_libraries(library_data.name)):
             logger.debug(
                 "Library '%s' declares %d execution module(s); not importing them here, because "
-                "this process only edits.",
+                "this process does not run that library's nodes.",
                 library_data.name,
                 len(paths),
             )
@@ -5178,6 +5183,17 @@ class LibraryManager(EngineScoped):
             raise RuntimeError(msg)
         module = library_info.execution_modules.get(module_name)
         if module is None:
+            # An import failure during library load recorded WHY and then stopped importing the
+            # rest, so the "no module by that name" wording below sends the author hunting for a
+            # manifest typo when the real cause is an exception the worker already logged. The
+            # reason is worker-local, so this is the only place it can reach whoever called.
+            if library_info.execution_unavailable_reason:
+                msg = (
+                    f"Execution module '{module_name}' of library '{library_name}' is not "
+                    f"available: {library_info.execution_unavailable_reason} The full traceback is "
+                    "in this worker's log."
+                )
+                raise RuntimeError(msg)
             available = ", ".join(sorted(library_info.execution_modules)) or "none"
             msg = (
                 f"Library '{library_name}' has no execution module named '{module_name}'. "
