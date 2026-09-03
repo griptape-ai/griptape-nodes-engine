@@ -170,24 +170,40 @@ class _MergedConfigRejection(NamedTuple):
     keys: tuple[str, ...]
 
 
-def _offending_keys(error: ValidationError) -> tuple[str, ...]:
+def _offending_keys(error: ValidationError, validated: dict) -> tuple[str, ...]:
     """Dot paths of the config keys a `Settings` validation error blames, in report order.
 
-    Pydantic reports each error's location as a tuple of path segments; joining them yields the
-    same dot notation the config API takes, so the key can be shown to a user or fed back into
-    `GetConfigValueRequest`. Errors with an empty location (whole-model failures) are skipped,
-    since they name no key a user could go and fix.
+    Pydantic reports each error's location as a tuple of path segments, but appends the union
+    member it tried and the list index it was at, neither of which is a config key:
+    `secrets_to_register` (`list[str] | dict[str, str]`) reports
+    `(..., "secrets_to_register", "list[str]")`, and `mcp_servers` reports `("mcp_servers", 0,
+    "name")`. Each `loc` is therefore truncated at the first segment `validated` does not hold,
+    which yields the key a user can actually go and correct.
+
+    Walking the validated dict rather than filtering by segment shape is what keeps a genuinely
+    dot-keyed leaf intact: `project_workspaces` is keyed by project file paths, and those segments
+    are present in the dict, so they survive while `list[str]` does not.
+
+    Results are deduplicated because one bad value under a union reports once per member tried.
+    A `loc` whose first segment is already absent contributes nothing, which covers the
+    whole-model failures that name no key at all.
 
     Args:
         error: The validation error raised by `Settings.model_validate`.
+        validated: The dict that was validated, used as the reference for which segments are keys.
     """
     keys = []
     for detail in error.errors():
-        location = detail.get("loc") or ()
-        if not location:
-            continue
-        keys.append(".".join(str(segment) for segment in location))
-    return tuple(keys)
+        node: Any = validated
+        segments: list[str] = []
+        for segment in detail.get("loc") or ():
+            if not isinstance(node, dict) or segment not in node:
+                break
+            segments.append(str(segment))
+            node = node[segment]
+        if segments:
+            keys.append(".".join(segments))
+    return tuple(dict.fromkeys(keys))
 
 
 class _LayerProbe(NamedTuple):
@@ -993,7 +1009,7 @@ class ConfigManager(EngineScoped):
         except ValidationError as e:
             logger.error("Error validating config file: %s", e)
             self.merged_config = self.default_config
-            self._merged_config_rejection = _MergedConfigRejection(keys=_offending_keys(e))
+            self._merged_config_rejection = _MergedConfigRejection(keys=_offending_keys(e, merged_config))
 
     def load_project_config(self, project_dir: Path) -> None:
         """Load the project-adjacent config from the given project directory and remerge all configs.

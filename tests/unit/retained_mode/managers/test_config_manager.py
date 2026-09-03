@@ -4,6 +4,7 @@ import os
 import platform
 import tempfile
 from pathlib import Path
+from typing import Any
 from unittest.mock import Mock, patch
 
 import pytest
@@ -2601,6 +2602,68 @@ class TestConfigProvenance:
         assert isinstance(own, SetConfigValueResultSuccess)
         assert "is not one this setting accepts" in str(own.result_details)
         assert "is a different setting" not in str(own.result_details)
+
+    @pytest.mark.parametrize(
+        ("key", "invalid_value"),
+        [
+            # Scalar: `loc` is already the key path.
+            ("max_nodes_in_parallel", "not-an-int"),
+            # Union: pydantic appends the member it tried, once per member.
+            ("app_events.on_app_initialization_complete.secrets_to_register", 12345),
+            # List of a union: appends the index AND the member.
+            ("app_events.on_app_initialization_complete.libraries_to_register", [12345]),
+            # List of models: appends the index and the failing sub-field.
+            ("mcp_servers", [{"name": 5}]),
+        ],
+    )
+    def test_rejection_names_the_assignable_key_for_every_field_shape(
+        self, key: str, invalid_value: Any, isolate_user_config: Path
+    ) -> None:
+        """The named key has to be one the user can actually assign to.
+
+        Pydantic's `loc` is only a config path for a scalar field. For a union it appends the
+        member it tried (`...secrets_to_register.list[str]`) and for a list the index
+        (`mcp_servers.0.name`), so joining the whole tuple invents keys that exist nowhere. Worse,
+        the invented key never matches the key just written, so a user writing an invalid value to
+        one of these fields was told the fault lay in some other setting.
+        """
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            result = manager.on_handle_set_config_value_request(
+                SetConfigValueRequest(category_and_key=key, value=invalid_value)
+            )
+
+            assert manager._merged_config_rejection is not None
+            # Exactly the written key, deduplicated across the union members tried.
+            assert manager._merged_config_rejection.keys == (key,)
+
+        # So the note blames the write itself rather than sending the user hunting.
+        assert isinstance(result, SetConfigValueResultSuccess)
+        assert result.reason == "rejected"
+        assert "is not one this setting accepts" in str(result.result_details)
+        assert "is a different setting" not in str(result.result_details)
+
+        # Stored despite being invalid, which is why the merge keeps failing until it is fixed.
+        assert key.split(".", maxsplit=1)[0] in json.loads(isolate_user_config.read_text())
+
+    def test_rejection_keeps_a_dot_keyed_leaf_intact(self, isolate_user_config: Path) -> None:
+        """Truncating `loc` must not truncate a segment that genuinely is a key.
+
+        `project_workspaces` is keyed by project file paths, so its `loc` segments contain dots and
+        slashes but are real keys of the validated dict. A shape-based filter would drop them.
+        """
+        dotted_key = "/home/me/projects/my-thing/griptape-nodes-project.yml"
+
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.on_handle_set_config_value_request(
+                SetConfigValueRequest(category_and_key="project_workspaces", value={dotted_key: 12345})
+            )
+
+            assert manager._merged_config_rejection is not None
+            assert manager._merged_config_rejection.keys == (f"project_workspaces.{dotted_key}",)
+
+        assert json.loads(isolate_user_config.read_text())["project_workspaces"] == {dotted_key: 12345}
 
     def test_get_config_category_request_sources_keyed_by_full_root_relative_path(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
