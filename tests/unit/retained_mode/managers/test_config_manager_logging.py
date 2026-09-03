@@ -30,6 +30,7 @@ from griptape_nodes.retained_mode.events.config_events import (
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 
 if TYPE_CHECKING:
+    from collections.abc import Generator
     from pathlib import Path
 
 _CONFIGURE = "griptape_nodes.retained_mode.managers.config_manager.configure_diagnostic_logging"
@@ -37,6 +38,24 @@ _CONFIGURE = "griptape_nodes.retained_mode.managers.config_manager.configure_dia
 _skip_on_windows = pytest.mark.skipif(
     platform.system() == "Windows", reason="xdg_base_dirs cannot find XDG_CONFIG_HOME on Windows on GitHub Actions"
 )
+
+
+@pytest.fixture(autouse=True)
+def restore_the_shared_log_level() -> Generator[None, None, None]:
+    """Put the shared logger's level back when a test is done with it.
+
+    Applying the logging settings sets the level on the process-global ``griptape_nodes``
+    logger, and building a ``ConfigManager`` applies them -- so every test in this file
+    changes it, and one that loads DEBUG leaves the rest of the session running at DEBUG.
+    Which tests those are depends on how ``-n auto`` sharded the suite, which is the kind
+    of failure nobody can reproduce.
+    """
+    shared_logger = logging.getLogger("griptape_nodes")
+    previous_level = shared_logger.level
+    try:
+        yield
+    finally:
+        shared_logger.setLevel(previous_level)
 
 
 @pytest.fixture
@@ -188,15 +207,10 @@ class TestApplyLoggingSettings:
     def test_writing_the_log_level_still_reaches_the_shared_logger(self) -> None:
         """`set_config_value` no longer sets it directly; the reload at the end of it does."""
         manager = ConfigManager()
-        shared_logger = logging.getLogger("griptape_nodes")
-        previous_level = shared_logger.level
 
-        try:
-            manager.set_config_value("log_level", "DEBUG")
+        manager.set_config_value("log_level", "DEBUG")
 
-            assert shared_logger.level == logging.DEBUG
-        finally:
-            shared_logger.setLevel(previous_level)
+        assert logging.getLogger("griptape_nodes").level == logging.DEBUG
 
 
 @_skip_on_windows

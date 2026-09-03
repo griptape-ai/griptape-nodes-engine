@@ -436,8 +436,15 @@ class TestIdentityNormalization:
 
         assert redacted == f"{REDACTED_USER} ran the same sample"
 
-    def test_still_produces_output_when_the_username_cannot_be_read(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Not knowing the username is not a failure; a report still has to be produced."""
+    def test_a_username_that_cannot_be_read_does_not_stop_the_other_rules(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Not knowing the username is not a failure; a report still has to be produced.
+
+        Asserted on a secret the redactor can find rather than on a string nothing matches:
+        a text with nothing to remove comes back unchanged from a redactor that gave up on
+        every rule it has, so it would pass either way.
+        """
 
         def raise_os_error() -> str:
             msg = "no password database"
@@ -445,9 +452,12 @@ class TestIdentityNormalization:
 
         monkeypatch.setattr("getpass.getuser", raise_os_error)
 
-        assert Redactor().redact_text("engine started") == "engine started"
+        redactor = Redactor(secret_values=["s3cr3t-value-12345"])
 
-    def test_still_produces_output_when_there_is_no_home_directory(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        assert redactor.redact_text("started with s3cr3t-value-12345") == f"started with {REDACTED}"
+        assert redactor.counts()[RedactionReason.KNOWN_SECRET_VALUE] == 1
+
+    def test_no_home_directory_does_not_stop_the_other_rules(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Some service accounts and containers have none."""
 
         def raise_runtime_error() -> Path:
@@ -456,7 +466,10 @@ class TestIdentityNormalization:
 
         monkeypatch.setattr(Path, "home", raise_runtime_error)
 
-        assert Redactor().redact_text("engine started") == "engine started"
+        redactor = Redactor(secret_values=["s3cr3t-value-12345"])
+
+        assert redactor.redact_text("started with s3cr3t-value-12345") == f"started with {REDACTED}"
+        assert redactor.counts()[RedactionReason.KNOWN_SECRET_VALUE] == 1
 
 
 class TestCounts:
