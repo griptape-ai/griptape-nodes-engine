@@ -8,7 +8,7 @@ import platform
 import sys
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 from urllib.parse import unquote, urlparse
 
 from dotenv import dotenv_values
@@ -39,10 +39,19 @@ from griptape_nodes.common.diagnostics.report import (
     SecretDiagnostics,
     SessionDiagnostics,
 )
-from griptape_nodes.common.log_capture import active_log_file, find_log_files, session_log_lines
+from griptape_nodes.common.log_capture import (
+    DEFAULT_BUFFER_LINES,
+    active_log_file,
+    find_log_files,
+    session_log_lines,
+)
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_types import BaseNode
-from griptape_nodes.files.path_utils import canonicalize_for_io, strip_windows_long_path_prefix
+from griptape_nodes.files.path_utils import (
+    canonicalize_for_identity,
+    canonicalize_for_io,
+    strip_windows_long_path_prefix,
+)
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import (
     GetEngineVersionRequest,
@@ -89,6 +98,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.project_events import ProjectTemplateInfo
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
+    from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -110,6 +120,19 @@ class SecretLayers(NamedTuple):
     os_environment: dict[str, bool]
     workspace_env_file: dict[str, bool]
     global_env_file: dict[str, bool]
+
+
+class SecretLayer(NamedTuple):
+    """One place the engine looks for a secret, named as a user would recognize it.
+
+    Attributes:
+        label: What to call this source in the report.
+        keys_set: The secret keys the source holds, mapped to whether the value there is
+            non-empty. A key present with an empty value still shadows a lower layer.
+    """
+
+    label: str
+    keys_set: dict[str, bool]
 
 
 class DiagnosticsManager(EngineScoped):
@@ -433,12 +456,14 @@ class DiagnosticsManager(EngineScoped):
         """Return the Griptape Cloud key for the connection check, or None when it cannot be read.
 
         Reading a secret resolves the workspace, so a workspace that has gone missing
-        raises here. That is exactly the situation these checks exist to report, so it
-        must cost the connection check rather than the whole run.
+        raises here. It also parses both ``.env`` files, and a file saved in another
+        encoding raises ``UnicodeDecodeError`` rather than an ``OSError``. Both are exactly
+        the situation these checks exist to report, so either must cost the connection
+        check rather than the whole run.
         """
         try:
             return self.engine.secrets_manager.get_secret(CLOUD_API_KEY_NAME, should_error_on_not_found=False)
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             logger.warning(
                 "Could not read the Griptape Cloud API key while running health checks.",
                 exc_info=True,
@@ -451,20 +476,66 @@ class DiagnosticsManager(EngineScoped):
         if session_lines:
             bundle.add_session_log(session_lines)
         else:
-            warnings.append(
-                "This engine has not logged anything yet, so there is no session log in this bundle. "
-                "Any log files from earlier sessions are still included."
-            )
+            warnings.append(self._missing_session_log_warning())
 
-        log_files = find_log_files(self.engine.config_manager.log_directory)
+        log_files = [path for directory in self._log_directories() for path in find_log_files(directory)]
         if not log_files:
-            warnings.append(
-                "No engine log files were found. Log files are only written when the "
-                "'logging.log_to_file' setting is on."
-            )
+            warnings.append(self._missing_log_files_warning())
             return
 
         bundle.add_log_files(log_files, warnings)
+
+    def _log_directories(self) -> list[Path]:
+        """Return every directory holding this engine's logs, the configured one first.
+
+        Normally just the one. The two differ when the configured directory could not be
+        created or opened: ``log_capture`` keeps the sink it already has rather than dropping
+        file logging altogether, so the file the engine is writing right now lives somewhere
+        the config no longer names. Searching only the configured directory left the current
+        session's log out of the bundle collected to explain it.
+        """
+        directories = [canonicalize_for_identity(self.engine.config_manager.log_directory)]
+
+        active = active_log_file()
+        if active is not None:
+            directories.append(canonicalize_for_identity(active.parent))
+
+        # Canonicalized so the usual case -- the same directory, spelled two ways -- collapses
+        # to one entry rather than staging every log file twice.
+        return list(dict.fromkeys(directories))
+
+    def _missing_session_log_warning(self) -> str:
+        """Explain an absent session log in terms of which of its two causes applies."""
+        buffer_lines = self.engine.config_manager.get_config_value(
+            SESSION_LOG_BUFFER_LINES_KEY, default=DEFAULT_BUFFER_LINES, cast_type=int
+        )
+
+        if buffer_lines <= 0:
+            return (
+                "There is no session log in this bundle, because the 'logging.session_log_buffer_lines' "
+                f"setting is {buffer_lines} and nothing this engine logged was kept. Set it to "
+                f"{DEFAULT_BUFFER_LINES} to have future sessions recorded."
+            )
+
+        return (
+            "This engine has not logged anything yet, so there is no session log in this bundle. "
+            "Any log files from earlier sessions are still included."
+        )
+
+    def _missing_log_files_warning(self) -> str:
+        """Explain an empty log directory without blaming a setting that is switched on."""
+        log_to_file = self.engine.config_manager.get_config_value(LOG_TO_FILE_KEY, default=True, cast_type=bool)
+
+        if not log_to_file:
+            return (
+                "No engine log files are in this bundle, because the 'logging.log_to_file' setting is off. "
+                "Turn it on to have future sessions written to file."
+            )
+
+        return (
+            "The 'logging.log_to_file' setting is on, but no engine log files were found. The log directory "
+            "most likely cannot be written to."
+        )
 
     def _stage_current_workflow(self, bundle: DiagnosticsBundle, warnings: list[str]) -> None:
         """Add the open workflow's saved file to a bundle, when there is one."""
@@ -506,7 +577,9 @@ class DiagnosticsManager(EngineScoped):
 
         return EngineDiagnostics(
             engine_id=self.engine.engine_identity_manager.engine_id,
-            engine_name=self.engine.engine_identity_manager.engine_name,
+            # Free text the user chose, and people name an engine after themselves or the
+            # machine it runs on, so it is redacted like every other field they authored.
+            engine_name=redactor.redact_text(self.engine.engine_identity_manager.engine_name),
             engine_version=await self._resolve_engine_version(),
             session_id=self.engine.session_manager.active_session_id,
             python_version=sys.version,
@@ -565,16 +638,17 @@ class DiagnosticsManager(EngineScoped):
 
         redacted = {name: redactor.redact_path(path) if path is not None else None for name, path in candidates.items()}
         return PathDiagnostics(
-            **redacted, missing_paths=missing, workspace_writable=self._is_workspace_writable(candidates)
+            **redacted,
+            missing_paths=missing,
+            workspace_writable=self._is_workspace_writable(candidates["workspace_directory"]),
         )
 
-    def _is_workspace_writable(self, candidates: dict[str, Path | None]) -> bool | None:
+    def _is_workspace_writable(self, workspace: Path | None) -> bool | None:
         """Report whether the workspace can be written to, or None when it does not exist.
 
         Checked with an access test rather than a trial write: a diagnostics collection
         must not create anything in the user's workspace.
         """
-        workspace = candidates["workspace_directory"]
         if workspace is None or not workspace.exists():
             return None
         return os.access(workspace, os.W_OK)
@@ -619,29 +693,29 @@ class DiagnosticsManager(EngineScoped):
 
         # Highest priority first, matching the order SecretsManager.get_secret searches.
         layers = [
-            ("environment variable", layers_by_source.os_environment),
-            ("workspace .env", layers_by_source.workspace_env_file),
-            ("global .env", layers_by_source.global_env_file),
+            SecretLayer(label="environment variable", keys_set=layers_by_source.os_environment),
+            SecretLayer(label="workspace .env", keys_set=layers_by_source.workspace_env_file),
+            SecretLayer(label="global .env", keys_set=layers_by_source.global_env_file),
         ]
 
         entries: list[SecretDiagnostics] = []
-        for name in sorted({name for _, values in layers for name in values} | declared_names):
+        for name in sorted({name for layer in layers for name in layer.keys_set} | declared_names):
             sources: list[str] = []
             effective_source = None
             is_set = False
 
-            for label, values in layers:
-                if name not in values:
+            for layer in layers:
+                if name not in layer.keys_set:
                     continue
                 is_first_source = not sources
-                sources.append(label)
+                sources.append(layer.label)
                 # The highest-priority source wins outright, even when its value is empty:
                 # a key blanked in the workspace .env really does shadow a working one in
                 # the global .env, and saying so is the point of this section.
                 if is_first_source:
-                    is_set = values[name]
+                    is_set = layer.keys_set[name]
                     if is_set:
-                        effective_source = label
+                        effective_source = layer.label
 
             entries.append(
                 SecretDiagnostics(
@@ -719,33 +793,42 @@ class DiagnosticsManager(EngineScoped):
         """Report how logging is configured and which log files exist."""
         config_manager = self.engine.config_manager
         log_directory = config_manager.log_directory
+        directories = self._log_directories()
 
         files: list[LogFileDiagnostics] = []
         current_file = active_log_file()
-        for path in find_log_files(log_directory):
-            try:
-                stat = path.stat()
-            except OSError:
-                warnings.append(f"Log file '{path.name}' could not be read; it is missing from the report.")
-                continue
-            files.append(
-                LogFileDiagnostics(
-                    # Name only: the directory is reported once above, and repeating it
-                    # per file would just be more path to redact.
-                    name=path.name,
-                    size_bytes=stat.st_size,
-                    modified_at=datetime.fromtimestamp(stat.st_mtime, tz=UTC).isoformat(),
-                    is_active=current_file is not None and path == current_file,
+        for directory in directories:
+            for path in find_log_files(directory):
+                try:
+                    stat = path.stat()
+                except OSError:
+                    warnings.append(f"Log file '{path.name}' could not be read; it is missing from the report.")
+                    continue
+                files.append(
+                    LogFileDiagnostics(
+                        # Name only: the directory is reported once above, and repeating it
+                        # per file would just be more path to redact.
+                        name=path.name,
+                        size_bytes=stat.st_size,
+                        modified_at=datetime.fromtimestamp(stat.st_mtime, tz=UTC).isoformat(),
+                        is_active=current_file is not None and path == current_file,
+                    )
                 )
-            )
+
+        # Only when it is somewhere other than the configured directory, which is the whole
+        # reason to mention it. `_log_directories` puts the configured one first.
+        active_directory = None
+        if len(directories) > 1:
+            active_directory = redactor.redact_path(directories[1])
 
         return LogDiagnostics(
             log_level=str(config_manager.get_config_value("log_level", default="INFO")),
             log_to_file=config_manager.get_config_value(LOG_TO_FILE_KEY, default=True, cast_type=bool),
             log_directory=redactor.redact_path(log_directory),
+            active_log_directory=active_directory,
             retention_days=config_manager.get_config_value(LOG_RETENTION_DAYS_KEY, default=7, cast_type=int),
             session_buffer_lines=config_manager.get_config_value(
-                SESSION_LOG_BUFFER_LINES_KEY, default=5000, cast_type=int
+                SESSION_LOG_BUFFER_LINES_KEY, default=DEFAULT_BUFFER_LINES, cast_type=int
             ),
             session_lines_captured=len(session_log_lines()),
             files=files,
@@ -759,7 +842,12 @@ class DiagnosticsManager(EngineScoped):
         workflow_name = None
         workflow_path = None
         if context_manager.has_current_workflow():
-            workflow_name = context_manager.get_current_workflow_name()
+            # Redacted even though it is a "name": a workflow's registry key is derived from
+            # its path, and `WorkflowManager._workspace_relative_path` falls back to the
+            # absolute path for a workflow saved outside the workspace. So the name of a
+            # workflow saved to the desktop is `/Users/sam/Desktop/flow`, and it would carry
+            # the home directory into a report that promises to have taken it out.
+            workflow_name = redactor.redact_text(context_manager.get_current_workflow_name())
             current_path = context_manager.get_current_workflow_file_path()
             if current_path is not None:
                 workflow_path = redactor.redact_path(current_path)
@@ -800,7 +888,9 @@ class DiagnosticsManager(EngineScoped):
 
         return ProjectDiagnostics(
             project_id=info.project_id,
-            name=info.name,
+            # A project's name is the user's own words, like the engine's. Absent for a
+            # template whose body could not be read, which is not the same as an empty name.
+            name=redactor.redact_text(info.name) if info.name else None,
             parent_project_id=info.parent_project_id,
             path=redactor.redact_path(info.project_file_path) if info.project_file_path else None,
             is_current=current_project_id is not None and info.project_id == current_project_id,
@@ -910,7 +1000,7 @@ class DiagnosticsManager(EngineScoped):
         # dotenv reports a bare `FOO` (no `=`) as None. Treat it as declared-but-empty.
         return {name: value or "" for name, value in values.items()}
 
-    def _collated_problems(self, lib_info: Any, redactor: Redactor) -> str | None:
+    def _collated_problems(self, lib_info: LibraryManager.LibraryInfo, redactor: Redactor) -> str | None:
         """Return a library's problems as the engine already formats them, redacted."""
         collated = self.engine.library_manager.collate_problems_for_lib_info(lib_info)
         if collated is None:

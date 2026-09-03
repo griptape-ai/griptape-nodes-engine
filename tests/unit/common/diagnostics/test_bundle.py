@@ -43,6 +43,11 @@ _GENERATED_AT = "2026-01-01T00:00:00+00:00"
 # A stand-in for a value the engine holds, not a real credential.
 _SECRET = "s3cr3t-value-12345"  # noqa: S105
 
+# The README lines pointing at a whole directory. Matched as the start of the line rather
+# than by the directory name, which also appears in `logs/session.log` a line above.
+_LOGS_DIRECTORY_LINE = f"- `{LOGS_DIRECTORY_NAME}/` --"
+_WORKFLOW_DIRECTORY_LINE = f"- `{WORKFLOW_DIRECTORY_NAME}/` --"
+
 
 class _AssemblyError(Exception):
     """Stands in for something failing partway through building a bundle."""
@@ -85,6 +90,12 @@ def _entry_paths(bundle: DiagnosticsBundle) -> list[str]:
 def _read(bundle: DiagnosticsBundle, path: str) -> str:
     with zipfile.ZipFile(io.BytesIO(bundle.to_zip_bytes())) as archive:
         return archive.read(path).decode("utf-8")
+
+
+def _read_bytes(bundle: DiagnosticsBundle, path: str) -> bytes:
+    """Read a staged file without decoding it, for asserting on line endings."""
+    with zipfile.ZipFile(io.BytesIO(bundle.to_zip_bytes())) as archive:
+        return archive.read(path)
 
 
 class TestSessionLog:
@@ -242,6 +253,27 @@ class TestLogFiles:
         assert contents == "from the current directory\n"
         assert any("same name" in warning for warning in warnings)
 
+    def test_a_log_written_with_windows_line_endings_is_copied_byte_for_byte(self, tmp_path: Path) -> None:
+        r"""A bundle is evidence, so a copied log has to match the file it came from.
+
+        Staging a file with the default newline handling translates every `\n` to the
+        platform's line ending on the way out. On Windows that rewrites a line that already
+        ended `\r\n` as `\r\r\n`, so every log copied into a bundle collected there differed
+        from the file on disk. Asserted on the bytes rather than the text because that is
+        where the difference is, and only fails on Windows: elsewhere the translation is a
+        no-op.
+        """
+        log_file = tmp_path / "engine-1.log"
+        source = b"first line\r\nsecond line\r\n"
+        log_file.write_bytes(source)
+
+        with DiagnosticsBundle(_redactor()) as bundle:
+            bundle.add_log_files([log_file], [])
+
+            staged = _read_bytes(bundle, f"{LOGS_DIRECTORY_NAME}/engine-1.log")
+
+        assert staged == source
+
     def test_a_small_budget_is_stated_in_bytes_rather_than_as_zero_megabytes(self, tmp_path: Path) -> None:
         """A budget rendered as `0 MB` reads as a bug in the message, not as a very small budget."""
         first = tmp_path / "engine-1.log"
@@ -368,6 +400,14 @@ class TestReportAndHealth:
 
 
 class TestReadme:
+    """The guide describes the bundle it is in, not the bundle a full collection would make.
+
+    Every section is optional: switched off by a request flag, or skipped because there was
+    nothing to collect -- no log files on disk yet, a workflow that has never been saved.
+    Naming a file that is not here sends its reader hunting for it, and reads as though the
+    collection came back empty-handed when that part was never asked for.
+    """
+
     def test_points_at_the_health_report_when_one_was_staged(self) -> None:
         with DiagnosticsBundle(_redactor()) as bundle:
             bundle.add_health_report(_health_report())
@@ -382,6 +422,74 @@ class TestReadme:
             bundle.add_readme()
 
             assert HEALTH_FILE_NAME not in _read(bundle, README_FILE_NAME)
+
+    def test_does_not_point_at_a_report_that_was_skipped(self) -> None:
+        with DiagnosticsBundle(_redactor()) as bundle:
+            bundle.add_session_log(["a line"])
+            bundle.add_readme()
+
+            assert REPORT_FILE_NAME not in _read(bundle, README_FILE_NAME)
+
+    def test_points_at_the_session_log_when_the_engine_had_logged_something(self) -> None:
+        with DiagnosticsBundle(_redactor()) as bundle:
+            bundle.add_session_log(["a line"])
+            bundle.add_readme()
+
+            assert SESSION_LOG_FILE_NAME in _read(bundle, README_FILE_NAME)
+
+    def test_does_not_point_at_a_session_log_the_engine_never_wrote(self) -> None:
+        """A brand new engine has logged nothing, and `--skip-logs` leaves it out on purpose."""
+        with DiagnosticsBundle(_redactor()) as bundle:
+            bundle.add_report(_report())
+            bundle.add_readme()
+
+            assert SESSION_LOG_FILE_NAME not in _read(bundle, README_FILE_NAME)
+
+    def test_does_not_point_at_the_log_directory_when_only_the_session_log_is_here(self) -> None:
+        """The two share a directory, so the second line is about the files from earlier runs.
+
+        Nothing had rotated to disk yet, which is the ordinary state of a first session.
+        """
+        with DiagnosticsBundle(_redactor()) as bundle:
+            bundle.add_session_log(["a line"])
+            bundle.add_readme()
+
+            assert _LOGS_DIRECTORY_LINE not in _read(bundle, README_FILE_NAME)
+
+    def test_points_at_the_log_directory_once_a_file_from_disk_is_here(self, tmp_path: Path) -> None:
+        log_file = tmp_path / "engine-1.log"
+        log_file.write_text("from an earlier session\n", encoding="utf-8")
+
+        with DiagnosticsBundle(_redactor()) as bundle:
+            bundle.add_log_files([log_file], [])
+            bundle.add_readme()
+
+            assert _LOGS_DIRECTORY_LINE in _read(bundle, README_FILE_NAME)
+
+    def test_points_at_the_workflow_when_one_was_staged(self, tmp_path: Path) -> None:
+        workflow = tmp_path / "my_flow.py"
+        workflow.write_text("# a workflow\n", encoding="utf-8")
+
+        with DiagnosticsBundle(_redactor()) as bundle:
+            bundle.add_workflow(workflow, [])
+            bundle.add_readme()
+
+            assert _WORKFLOW_DIRECTORY_LINE in _read(bundle, README_FILE_NAME)
+
+    def test_does_not_point_at_a_workflow_that_is_not_here(self) -> None:
+        """Nothing is open in a CLI-launched engine, so this is the usual case rather than a rare one."""
+        with DiagnosticsBundle(_redactor()) as bundle:
+            bundle.add_report(_report())
+            bundle.add_readme()
+
+            assert _WORKFLOW_DIRECTORY_LINE not in _read(bundle, README_FILE_NAME)
+
+    def test_always_points_at_the_manifest(self) -> None:
+        """The one file every bundle has, and the one that says what the others are."""
+        with DiagnosticsBundle(_redactor()) as bundle:
+            bundle.add_readme()
+
+            assert MANIFEST_FILE_NAME in _read(bundle, README_FILE_NAME)
 
 
 class TestManifest:

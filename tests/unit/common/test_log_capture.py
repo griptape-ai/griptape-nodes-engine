@@ -36,8 +36,6 @@ from griptape_nodes.common.log_capture import (
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-    from tests.unit.conftest import RealLogDirectoryChanges
-
 _SECONDS_PER_DAY = 86400
 
 # Directory permissions are not enforced against root, and `chmod` does not restrict writes
@@ -248,6 +246,25 @@ class TestResolveLogDirectory:
         assert resolved == default_log_directory()
         assert "absolute path" in caplog.text
 
+    def test_a_tilde_that_cannot_be_expanded_falls_back_instead_of_raising(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """This runs from `ConfigManager.__init__`, so raising here stops the engine starting.
+
+        `expanduser` raises rather than leaving the `~` in place, on a machine with no home
+        directory to expand to -- a service account, some containers -- and for `~someone`
+        when that account is not on this machine. Both are reported by the standard library
+        returning the path unchanged, which is what is arranged here, so the real `expanduser`
+        raises for the real reason on every platform.
+        """
+        monkeypatch.setattr(os.path, "expanduser", lambda path: path)
+
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            resolved = resolve_log_directory("~/engine-logs")
+
+        assert resolved == default_log_directory()
+        assert "home directory" in caplog.text
+
 
 class TestSuiteIsolation:
     """The developer's own log directory is not the suite's to write in, or to prune.
@@ -258,20 +275,24 @@ class TestSuiteIsolation:
     single assertion noticing.
     """
 
-    def test_nothing_this_run_added_to_the_real_log_directory(
-        self, real_log_directory_changes: RealLogDirectoryChanges
+    def test_this_run_wrote_no_log_file_into_the_real_log_directory(
+        self, own_log_files_in_real_log_directory: list[str]
     ) -> None:
-        """Collection alone used to be enough, which is earlier than any fixture can reach."""
-        assert real_log_directory_changes.added == []
+        """Collection alone used to be enough, which is earlier than any fixture can reach.
 
-    def test_nothing_this_run_deleted_from_the_real_log_directory(
-        self, real_log_directory_changes: RealLogDirectoryChanges
-    ) -> None:
-        """Retention pruning runs on every configuration, and a deleted log cannot come back."""
-        assert real_log_directory_changes.removed == []
+        Covers pruning too: a log file is only aged out of a directory the sink was pointed
+        at, and pointing it there writes a file of this process's own first.
+        """
+        assert own_log_files_in_real_log_directory == []
 
     def test_the_default_log_directory_is_somewhere_temporary(self) -> None:
-        """The check the two above cannot make: they only see the leaks that already happened."""
+        """A redirect is in place right now, which the guard above cannot tell on its own.
+
+        It only reports leaks that have already happened, so on the first run after the
+        isolation breaks it fails somewhere unrelated instead. This says so directly, though
+        only for the moment a test runs: the per-test fixture patches the same seam, so
+        passing here does not prove the session-wide patch that covers collection is on.
+        """
         assert xdg_data_home() not in default_log_directory().parents
 
 
@@ -412,6 +433,50 @@ class TestConfigureDiagnosticLogging:
         log_capture.logger.info("still captured")
 
         assert any("still captured" in line for line in session_log_lines())
+
+
+@pytest.mark.usefixtures("isolated_capture")
+class TestWhetherTheSinksWereInstalled:
+    """The return value is a caller's only way to tell a working file sink from a wished-for one.
+
+    ``ConfigManager`` remembers the settings it applied so an unrelated config write does not
+    re-scan the log directory. Remembering a failed attempt would short-circuit every later
+    load, and the reasons this fails -- a volume not mounted yet, a permission fix on its way
+    -- are the temporary kind, so the engine would never write a log file again.
+    """
+
+    def test_reports_success_when_the_file_sink_was_installed(self, tmp_path: Path) -> None:
+        assert configure_diagnostic_logging(log_directory=tmp_path, retention_days=0) is True
+
+    def test_reports_success_when_no_file_was_asked_for(self) -> None:
+        """Nothing was wanted and nothing failed, so there is nothing to retry."""
+        assert configure_diagnostic_logging(log_to_file=False) is True
+
+    def test_reports_success_when_the_file_asked_for_is_already_open(self, tmp_path: Path) -> None:
+        """The common case on reload: settings unchanged, so the sink is left alone."""
+        configure_diagnostic_logging(log_directory=tmp_path, retention_days=0)
+
+        assert configure_diagnostic_logging(log_directory=tmp_path, retention_days=0) is True
+
+    def test_reports_failure_when_the_directory_could_not_be_created(self, tmp_path: Path) -> None:
+        blocked = tmp_path / "blocked"
+        blocked.write_text("not a directory", encoding="utf-8")
+
+        assert configure_diagnostic_logging(log_directory=blocked / "logs", retention_days=0) is False
+
+    @_needs_posix_permissions
+    def test_reports_failure_when_the_file_could_not_be_opened(self, tmp_path: Path) -> None:
+        """The directory exists, so only opening the file can fail -- a read-only volume."""
+        read_only = tmp_path / "read-only"
+        read_only.mkdir(mode=0o500)
+
+        try:
+            installed = configure_diagnostic_logging(log_directory=read_only, retention_days=0)
+        finally:
+            # Restored so tmp_path can be torn down.
+            read_only.chmod(0o700)
+
+        assert installed is False
 
 
 class TestFindLogFiles:

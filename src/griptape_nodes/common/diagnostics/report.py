@@ -296,7 +296,11 @@ class LogDiagnostics(BaseModel):
     Attributes:
         log_level: The configured verbosity, which bounds what any log can contain.
         log_to_file: Whether the engine is writing log files.
-        log_directory: Where those files go.
+        log_directory: Where the configuration says those files go.
+        active_log_directory: Where the engine is actually writing, set only when that is
+            somewhere else. It differs when the configured directory could not be created
+            or opened and the engine kept the log file it already had open, which is worth
+            saying out loud: the configured directory is unusable.
         retention_days: How long files are kept. 0 means forever.
         session_buffer_lines: How many lines are held in memory for this session.
         session_lines_captured: How many are held right now.
@@ -306,6 +310,7 @@ class LogDiagnostics(BaseModel):
     log_level: str | None = None
     log_to_file: bool = True
     log_directory: str | None = None
+    active_log_directory: str | None = None
     retention_days: int = 0
     session_buffer_lines: int = 0
     session_lines_captured: int = 0

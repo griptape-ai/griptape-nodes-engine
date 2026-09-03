@@ -367,7 +367,7 @@ class LoggingSettings(BaseModel):
     log_retention_days: int = Field(
         category=LOGGING,
         default=7,
-        description="Delete engine log files that have not been written to for this many days. Checked when the engine starts. Set to 0 to keep log files forever.",
+        description="Delete engine log files that have not been written to for this many days. Checked when the engine starts, and again whenever a logging setting changes. The log file the engine is currently writing is never deleted, however old it is. Set to 0 to keep log files forever.",
     )
     session_log_buffer_lines: int = Field(
         category=LOGGING,

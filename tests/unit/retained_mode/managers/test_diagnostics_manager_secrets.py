@@ -23,8 +23,10 @@ import pytest
 
 from griptape_nodes.retained_mode.managers import diagnostics_manager as diagnostics_manager_module
 from griptape_nodes.retained_mode.managers.diagnostics_manager import DiagnosticsManager
+from griptape_nodes.retained_mode.managers.settings import SECRETS_TO_REGISTER_KEY
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
     from griptape_nodes.common.diagnostics.report import SecretDiagnostics
@@ -41,6 +43,22 @@ _GLOBAL_VALUE = "value-from-the-global-file"
 _ENVIRONMENT = "environment variable"
 _WORKSPACE = "workspace .env"
 _GLOBAL = "global .env"
+
+
+def _config_reader(values: dict[str, object]) -> Callable[..., object]:
+    """Return a ``get_config_value`` stand-in that only answers the keys it was given.
+
+    Any other key raises, so a section that starts reading a second setting is caught here
+    rather than being handed whatever this test happened to set up for the first one.
+    """
+
+    def read(key: str, **_kwargs: object) -> object:
+        if key not in values:
+            msg = f"the secrets section read config key '{key}', which this test does not define"
+            raise AssertionError(msg)
+        return values[key]
+
+    return read
 
 
 class _ExplodingSecretsManager:
@@ -62,8 +80,15 @@ class _Layout:
         self.engine = engine
 
     def declare(self, *names: str) -> None:
-        """Say which secrets the config asks the engine to register."""
-        self.engine.config_manager.get_config_value.return_value = dict.fromkeys(names, "")
+        """Say which secrets the config asks the engine to register.
+
+        Answered for that one key rather than by setting a blanket ``return_value``, which
+        would hand this dict to every config read the section makes and make a test pass
+        for reading the wrong setting.
+        """
+        self.engine.config_manager.get_config_value.side_effect = _config_reader(
+            {SECRETS_TO_REGISTER_KEY: dict.fromkeys(names, "")}
+        )
 
     def entries(self) -> list[SecretDiagnostics]:
         return self.manager._build_secrets_section([])
@@ -88,7 +113,7 @@ def layout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Layout:
     monkeypatch.delenv(_OTHER_NAME, raising=False)
 
     engine = Mock()
-    engine.config_manager.get_config_value.return_value = {}
+    engine.config_manager.get_config_value.side_effect = _config_reader({SECRETS_TO_REGISTER_KEY: {}})
     engine.secrets_manager.workspace_env_path = workspace_env
 
     manager = DiagnosticsManager(Mock(), engine=cast("Engine", engine))

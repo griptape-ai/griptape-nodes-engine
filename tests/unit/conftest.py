@@ -1,10 +1,10 @@
 """Shared fixtures for unit tests."""
 
 import json
+import os
 import tempfile
 from collections.abc import Generator
 from pathlib import Path
-from typing import NamedTuple
 from unittest.mock import patch
 
 import pytest
@@ -24,24 +24,19 @@ _session_log_home_patch = patch.object(log_capture, "xdg_data_home", lambda: Pat
 # Deliberately the real one, computed from the unpatched `xdg_data_home`, so a test can
 # check the suite against it. Read, never written.
 _real_log_directory = xdg_data_home() / "griptape_nodes" / "logs"
-_names_in_real_log_directory: set[str] = set()
 
-
-class RealLogDirectoryChanges(NamedTuple):
-    """What the suite did to the developer's real engine log directory.
-
-    Attributes:
-        added: File names that were not there before collection started.
-        removed: File names that were there and are not any more.
-    """
-
-    added: list[str]
-    removed: list[str]
+# Only this process's own log files are the suite's to answer for. A developer running the
+# engine while the suite runs has that engine writing into the same directory, and counting
+# its files as a leak would fail the guard below for a reason nobody can act on. Log file
+# names carry the pid, so ownership is read off the name rather than guessed. Under
+# `-n auto` each xdist worker is its own process and snapshots its own pid.
+_own_log_file_glob = f"{log_capture.LOG_FILE_PREFIX}*-{os.getpid()}.log*"
+_own_names_in_real_log_directory: set[str] = set()
 
 
 def pytest_configure() -> None:
     """Point engine logging at a temporary directory before any test module is imported."""
-    _names_in_real_log_directory.update(path.name for path in _real_log_directory.glob("*"))
+    _own_names_in_real_log_directory.update(path.name for path in _real_log_directory.glob(_own_log_file_glob))
     _session_log_home_patch.start()
 
 
@@ -53,19 +48,20 @@ def pytest_unconfigure() -> None:
 
 
 @pytest.fixture
-def real_log_directory_changes() -> RealLogDirectoryChanges:
-    """Compare the real log directory against how it looked before collection started.
+def own_log_files_in_real_log_directory() -> list[str]:
+    """Log files this process has written into the developer's real engine log directory.
 
-    Both lists are empty unless the isolation above stopped working. Snapshotted in
-    ``pytest_configure`` rather than in a fixture because the leak this catches happened
-    during collection, when a test module imported one of the modules that builds a
-    ``ConfigManager`` at import time.
+    Empty unless the isolation above stopped working. Snapshotted in ``pytest_configure``
+    rather than in this fixture because the leak it catches happened during collection,
+    when a test module imported one of the modules that builds a ``ConfigManager`` at
+    import time -- earlier than a fixture of any scope can run.
+
+    Pruning needs no guard of its own. Files are only aged out of a directory the file sink
+    was pointed at, and pointing it at one creates a file of this process's own there
+    first, so anything the suite deleted it is also listed here for having created.
     """
-    current = {path.name for path in _real_log_directory.glob("*")}
-    return RealLogDirectoryChanges(
-        added=sorted(current - _names_in_real_log_directory),
-        removed=sorted(_names_in_real_log_directory - current),
-    )
+    current = {path.name for path in _real_log_directory.glob(_own_log_file_glob)}
+    return sorted(current - _own_names_in_real_log_directory)
 
 
 @pytest.fixture(autouse=True)

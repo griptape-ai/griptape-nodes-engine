@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 import os
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, ClassVar
@@ -106,7 +106,11 @@ class HealthCheckContext:
     """
 
     report: DiagnosticsReport
-    cloud_api_key: str | None = None
+    # Kept out of the generated `repr`, which is the one way this value can be recorded
+    # after all: a `logger.debug("...%s", context)`, an exception message interpolating the
+    # context, or a pytest assertion dump would put the live key in the process log -- where
+    # the session buffer captures it and the next bundle collects it.
+    cloud_api_key: str | None = field(default=None, repr=False)
 
 
 class HealthCheck(ABC):

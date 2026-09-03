@@ -1454,14 +1454,21 @@ class ConfigManager(EngineScoped):
         if settings == self._applied_logging_settings:
             return
 
-        self._applied_logging_settings = settings
         self._set_log_level(settings.log_level)
-        configure_diagnostic_logging(
+        installed = configure_diagnostic_logging(
             buffer_lines=settings.buffer_lines,
             log_to_file=settings.log_to_file,
             log_directory=settings.log_directory,
             retention_days=settings.retention_days,
         )
+
+        # Recorded only once the sinks asked for are the ones actually installed. Failing to
+        # open the log file is usually temporary -- a volume not mounted yet, a directory a
+        # permission fix is coming for -- and remembering the attempt as done would short-
+        # circuit every later load, so the engine would never write a log file again for the
+        # rest of its life. Assigned after the call rather than before for the same reason.
+        if installed:
+            self._applied_logging_settings = settings
 
     def _resolve_logging_settings(self) -> _LoggingSettings:
         """Read the settings the logger and its sinks are built from."""
