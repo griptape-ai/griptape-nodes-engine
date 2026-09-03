@@ -548,6 +548,16 @@ class LibraryManager(EngineScoped):
         # fitness once the worker has loaded and reported back.
         worker_ready: asyncio.Event | None = field(default=None, repr=False)
 
+        # Set when this library's `.venv-exec` has been built (or has failed to build). The
+        # orchestrator builds it as a background task so a multi-gigabyte torch install does not
+        # block engine startup, and worker spawn waits on this -- the worker needs the directory to
+        # exist so it can be handed over as PYTHONPATH before the worker imports anything.
+        execution_env_ready: asyncio.Event | None = field(default=None, repr=False)
+
+        # The in-flight build itself. Held so the event loop's weak reference to tasks cannot
+        # collect an install mid-download.
+        execution_env_task: asyncio.Task | None = field(default=None, repr=False)
+
     class RegisterLibraryPrerequisites(NamedTuple):
         """Prerequisites established for library loading."""
 
@@ -811,6 +821,43 @@ class LibraryManager(EngineScoped):
         reaching into ``_is_worker``.
         """
         return self._is_worker
+
+    async def wait_for_execution_env(self, library_name: str) -> None:
+        """Block until this library's execution environment has finished building, if one is.
+
+        The orchestrator builds `.venv-exec` as a background task so a torch install does not hold
+        up engine startup. A worker needs that directory to exist BEFORE it starts, because it is
+        handed over as PYTHONPATH -- so spawn waits here rather than racing the install. Returns
+        immediately for a library with no execution dependencies, and after a failed build too: the
+        reason is recorded, and refusing to spawn is decided by the caller.
+        """
+        library_info = self.get_library_info_by_library_name(library_name)
+        if library_info is None or library_info.execution_env_ready is None:
+            return
+        if not library_info.execution_env_ready.is_set():
+            logger.info("Waiting for library '%s' execution environment before starting its worker", library_name)
+        await library_info.execution_env_ready.wait()
+
+    def execution_site_packages(self, library_name: str) -> str | None:
+        """The library's execution site-packages directory, if it has been built.
+
+        Handed to a worker as PYTHONPATH at spawn so the library's dependency versions are on
+        sys.path BEFORE the process imports anything. Splicing the same directory later cannot
+        achieve this: a module already in sys.modules is never reconsidered, and a package that
+        probed for an optional dependency at import time has already cached the answer -- which is
+        how a library that ships `safetensors` still hit `NameError: name 'safetensors' is not
+        defined` from inside huggingface_hub.
+
+        Returns None when the library declares no execution dependencies, or when the build failed
+        -- spawn waits for the build, so a healthy library always has one by the time it is asked.
+        """
+        library_info = self.get_library_info_by_library_name(library_name)
+        if library_info is None:
+            return None
+        venv_path = self._get_library_venv_path(library_name, library_info.library_path, execution=True)
+        if not venv_path.exists():
+            return None
+        return sysconfig.get_path("purelib", vars={"base": str(venv_path), "platbase": str(venv_path)})
 
     def get_worker_for_library(self, library_name: str | None) -> tuple[str, str] | None:
         """Return (worker_engine_id, worker_request_topic) for the worker serving library_name, or None.
@@ -3300,21 +3347,23 @@ class LibraryManager(EngineScoped):
         """
         sys.path.insert(0, str(base_dir))
 
-        await self._add_library_venv_to_sys_path(library_name, library_file_path, execution=False)
+        await self._add_library_edit_venv_to_sys_path(library_name, library_file_path)
 
-        # Same predicate as the install: a worker splices ONLY its own libraries' execution
-        # environments. Gating the build without gating this left the hole open from the other
-        # side -- once the other library's own worker had built the venv, a nested registration
-        # here would put its heavy pins at sys.path[0] of this worker, which is precisely the
-        # shadowing the edit/execution split exists to prevent.
-        if self._is_worker and self._is_one_of_my_target_libraries(library_name):
-            await self._add_library_venv_to_sys_path(library_name, library_file_path, execution=True)
+        # The EXECUTION environment is deliberately not spliced here. Adding it to a running
+        # interpreter cannot give the library its own versions: a module already in sys.modules is
+        # never reconsidered, and a package that probed for an optional dependency at import time
+        # has already cached the answer. A worker receives that directory as PYTHONPATH at spawn
+        # instead (WorkerManager.spawn_worker), which puts it on sys.path before the process
+        # imports anything.
 
-    async def _add_library_venv_to_sys_path(
-        self, library_name: str, library_file_path: str, *, execution: bool
-    ) -> None:
-        """Add one of a library's venv site-packages directories to sys.path, if it exists."""
-        venv_path = self._get_library_venv_path(library_name, library_file_path, execution=execution)
+    async def _add_library_edit_venv_to_sys_path(self, library_name: str, library_file_path: str) -> None:
+        """Add a library's EDIT-time venv site-packages to sys.path, if it exists.
+
+        Only the edit-time environment is ever spliced. The execution environment reaches a worker
+        as PYTHONPATH at spawn, because adding it to a running interpreter cannot give the library
+        its own versions of anything already imported.
+        """
+        venv_path = self._get_library_venv_path(library_name, library_file_path, execution=False)
         if not await anyio.Path(venv_path).exists():
             return
 
@@ -3327,8 +3376,7 @@ class LibraryManager(EngineScoped):
             )
         )
         sys.path.insert(0, site_packages)
-        venv_kind = "execution" if execution else "edit-time"
-        logger.debug("Added library '%s' %s venv to sys.path: %s", library_name, venv_kind, site_packages)
+        logger.debug("Added library '%s' edit-time venv to sys.path: %s", library_name, site_packages)
 
     def _can_write_to_venv_location(self, venv_python_path: Path) -> bool:
         """Check if we can write to the venv location (either create it or modify existing).
@@ -7614,39 +7662,33 @@ class LibraryManager(EngineScoped):
             if edit_failure is not None:
                 return InstallLibraryDependenciesResultFailure(result_details=edit_failure)
 
-        # Only a worker ever imports the execution set, and only a worker splices .venv-exec
-        # onto sys.path (see _add_library_paths_to_sys_path, which gates that on the same
-        # flag). Installing it here too made the orchestrator download and store the entire
-        # weight of every heavy library -- half a gigabyte for one torch pin -- to run code it
-        # will never import, which is the cost the edit/execution split exists to avoid.
+        # The orchestrator builds the execution environment but never imports from it: nothing on
+        # its sys.path comes from .venv-exec, so a heavy pin cannot shadow anything it has loaded.
+        # It has to be the builder, because the worker receives that directory as PYTHONPATH and so
+        # cannot be the process that creates it.
         #
-        # It also decided the wrong thing on failure. An unresolvable execution dependency
-        # returned a registration failure, so the library did not load at all: no node types,
-        # and placeholder nodes reading "Library not found" in any workflow that used it. The
-        # orchestrator needs nothing but the edit-time set to define, draw, and edit those
-        # nodes, so a broken execution dependency must cost execution and nothing else.
+        # A failed build costs execution and nothing else. Returning a registration failure meant
+        # the library did not load at all: no node types, and placeholder nodes reading "Library not
+        # found" in any workflow that used it.
         installed_exec_count = 0
         # Gated on the heavy set, not the combined one: a library with no execution
         # dependencies must still produce no .venv-exec at all.
-        if self._is_worker and pip_dependencies_exec and self._is_one_of_my_target_libraries(library_name):
-            # The edit-time set is resolved INTO the execution environment alongside the heavy
-            # one, not just listed beside it. The two venvs are fully isolated, so resolving them
-            # separately let uv pick a different version of anything they share -- numpy as an
-            # edit-time dep and numpy pulled in by torch, say. .venv-exec is spliced ahead of
-            # .venv in a worker, so the execution copy would then win, and a node module's
-            # `import numpy` would bind one version when the orchestrator built the node and
-            # another when the worker ran it, with no diagnostic anywhere. One resolution over
-            # both sets makes that impossible rather than merely unlikely.
-            exec_failure = await self._install_dependency_set(
-                library_name=library_name,
-                library_file_path=library_file_path,
-                pip_dependencies=[*pip_dependencies, *pip_dependencies_exec],
-                pip_install_flags=pip_install_flags,
-                execution=True,
-            )
-            if exec_failure is not None:
-                return InstallLibraryDependenciesResultFailure(result_details=exec_failure)
-            installed_exec_count = len(pip_dependencies_exec)
+        #
+        # Scheduled rather than awaited, because a torch install is gigabytes and awaiting it here
+        # would block engine startup. Spawn waits on the event instead.
+        if not self._is_worker and pip_dependencies_exec:
+            library_info = self.get_library_info_by_library_name(library_name)
+            if library_info is not None:
+                library_info.execution_env_ready = asyncio.Event()
+                library_info.execution_env_task = asyncio.create_task(
+                    self._build_execution_env(
+                        library_info=library_info,
+                        pip_dependencies=pip_dependencies,
+                        pip_dependencies_exec=pip_dependencies_exec,
+                        pip_install_flags=pip_install_flags,
+                    )
+                )
+                installed_exec_count = len(pip_dependencies_exec)
 
         # Only count the edit-time set if this process actually installed it: a worker for an
         # exec-deps library skips it (the orchestrator owns that venv), so counting it here
@@ -7708,22 +7750,13 @@ class LibraryManager(EngineScoped):
         A worker is scoped to its target libraries by a filter in
         `load_all_libraries_from_config`, but nested registration paths bypass that filter --
         an unregistered library dependency reaches `download_library_request(auto_register=True)`
-        and runs a full registration for a DIFFERENT library inside this worker. Building that
-        library's `.venv-exec` here would put two writers on one directory, which
-        `_install_deps_with_recovery` can rmtree, and would splice another library's heavy pins
-        onto this worker's sys.path -- the shadowing the split exists to prevent. The
-        orchestrator has no target list and legitimately installs for anyone.
+        and runs a full registration for a DIFFERENT library inside this worker. The orchestrator
+        has no target list and legitimately loads for anyone.
 
-        A nested dependency (one library declaring another) may still get its EDIT-time venv
-        built here -- see `_this_process_owns_the_edit_venv`, which claims it only when nothing
-        has built it yet. What it never gets here is an EXECUTION venv, so a nested dependency
-        whose node modules need the heavy set at IMPORT time fails to load in this worker. That
-        means a library whose MANIFEST declares worker mode (`requires_worker_process`), since
-        such modules are not base-clean by contract -- not the per-entry `worker_mode_override`,
-        which cannot apply to a nested registration at all because it is keyed on a registered
-        config path that a nested library does not have. So auditing configs for the override
-        would not find this case. The alternative is letting one worker's sys.path be rewritten
-        by another library's pins, which is the collision the split exists to end.
+        A nested dependency may still get its EDIT-time venv built here -- see
+        `_this_process_owns_the_edit_venv`, which claims it only when nothing has built it yet.
+        What it never gets is this worker's execution environment, which belongs to the library
+        this worker was spawned for and reaches it as PYTHONPATH.
         """
         if self._target_library_names is None:
             return True
@@ -7775,6 +7808,47 @@ class LibraryManager(EngineScoped):
             )
             return False
         return library_info.requires_worker
+
+    async def _build_execution_env(
+        self,
+        *,
+        library_info: LibraryInfo,
+        pip_dependencies: list[str],
+        pip_dependencies_exec: list[str],
+        pip_install_flags: list[str],
+    ) -> None:
+        """Build a library's `.venv-exec`, then release anything waiting to spawn its worker.
+
+        The edit-time set is resolved INTO the execution environment alongside the heavy one, not
+        just listed beside it. The two environments are separate, so resolving them apart let uv
+        pick a different version of anything they share -- numpy as an edit-time dependency and
+        numpy pulled in by torch, say -- and the worker would then run against one version while
+        the orchestrator built the node against another. One resolution over both sets settles it.
+
+        A failure costs execution and nothing else: the library keeps its real node classes on the
+        orchestrator and stays editable, and the reason is recorded so the refusal can say why.
+        """
+        try:
+            library_name = library_info.library_name or "unknown"
+            failure = await self._install_dependency_set(
+                library_name=library_name,
+                library_file_path=library_info.library_path,
+                pip_dependencies=[*pip_dependencies, *pip_dependencies_exec],
+                pip_install_flags=pip_install_flags,
+                execution=True,
+            )
+            if failure is not None:
+                library_info.execution_unavailable_reason = failure
+                logger.error(
+                    "Library '%s' cannot run: its execution environment could not be built. %s",
+                    library_name,
+                    failure,
+                )
+        finally:
+            # Released on every path, including failure: a waiter that never wakes would hold the
+            # spawn loop open for a library that is never going to be runnable.
+            if library_info.execution_env_ready is not None:
+                library_info.execution_env_ready.set()
 
     async def _install_dependency_set(  # noqa: PLR0911
         self,
