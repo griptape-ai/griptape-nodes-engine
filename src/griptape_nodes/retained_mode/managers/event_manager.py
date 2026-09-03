@@ -78,10 +78,57 @@ _active_post_dispatch_hooks: ContextVar[tuple[tuple[type[RequestPayload], Any], 
     "_event_manager_active_post_dispatch_hooks", default=()
 )
 
+# Result/payload types whose broadcast is suppressed for the *current logical chain* only.
+# EventSuppressionContext writes this; should_suppress_event reads it.
+#
+# Scoped to the context rather than to the manager on purpose. Suppression exists to hide
+# engine-internal bookkeeping -- rebuilding and tearing down the short-lived flows a loop runs
+# its body in -- and the types it hides (SetParameterValueResultSuccess,
+# CreateConnectionResultSuccess, CreateNodeResultSuccess) are ones an editor also asks for on
+# its own behalf. handle_request runs on arbitrary threads and asyncio can interleave another
+# task at every await inside a suppression window, so a manager-wide refcount keyed only by type
+# would silently swallow a client's own confirmations mid-loop, leaving the editor showing state
+# the engine does not have. A ContextVar is inherited by the nested requests a suppressed handler
+# dispatches -- which is exactly the lineage meant to be hidden -- and is invisible to any task
+# or thread the engine did not spawn from inside the window.
+#
+# It fails open: work handed to a thread the engine does not control (a library-internal
+# ThreadPoolExecutor) starts from a fresh context and loses the flag, so its results are
+# broadcast as they are today. Over-broadcasting is a cosmetic event; over-suppressing desyncs
+# the editor. Frozensets are replaced, never mutated, because the value object itself is shared
+# with every context that copied it.
+_suppressed_event_types: ContextVar[frozenset[type]] = ContextVar(
+    "_event_manager_suppressed_event_types", default=frozenset()
+)
+
 # Post-dispatch hooks are deliberately unbounded -- every result gets its own task so a
 # notification hook never misses a request. This is purely a "something is wrong" signal
 # for a hook that runs slower than requests arrive.
 POST_DISPATCH_HOOK_INFLIGHT_WARNING_THRESHOLD = 100
+
+
+def _suppression_candidates(event: Any) -> list[Any]:
+    """The event itself plus anything it wraps, for matching against a suppression set.
+
+    Kept a plain function so both the wrapper and the payload naming conventions live in one
+    place: ``EventResultSuccess``/``EventResultFailure`` carry the result payload as ``result``,
+    ``ExecutionEvent`` carries it as ``payload``, and ``GriptapeNodeEvent`` /
+    ``ExecutionGriptapeNodeEvent`` nest one of those under ``wrapped_event``. Suppression sets are
+    written in terms of payload types, so missing one of these attributes means the whole set
+    silently matches nothing.
+    """
+    candidates = [event]
+    wrapped_event = getattr(event, "wrapped_event", None)
+    if wrapped_event is not None:
+        candidates.append(wrapped_event)
+
+    for candidate in list(candidates):
+        for attribute_name in ("result", "payload"):
+            payload = getattr(candidate, attribute_name, None)
+            if payload is not None:
+                candidates.append(payload)
+
+    return candidates
 
 
 def _is_async_callable(callback: Any) -> bool:
@@ -182,8 +229,6 @@ class EventManager(EngineScoped):
         self._loop_thread_id: int | None = None
         # Keep a reference to the event loop for thread-safe operations
         self._event_loop: asyncio.AbstractEventLoop | None = None
-        # Per-event reference counting for event suppression
-        self._event_suppression_counts: dict[type, int] = {}
         # Worker-to-orchestrator forwarding state. Inert until
         # configure_worker_forwarding() is called at worker startup.
         self._worker_forwarding_enabled: bool = False
@@ -248,32 +293,30 @@ class EventManager(EngineScoped):
         return self._event_loop
 
     def should_suppress_event(self, event: BaseEvent | ProgressEvent) -> bool:
-        """Check if events should be suppressed from being sent to websockets.
+        """Whether this event must not reach websocket clients.
 
-        This method checks both the wrapper event type and the payload type for wrapped events.
-        For example, if InvolvedNodesEvent is in the suppression set, an ExecutionGriptapeNodeEvent
-        that wraps an InvolvedNodesEvent will be suppressed.
+        Matches the event's own type and the payload it carries, so a suppression set can name
+        either a wrapper (``ExecutionGriptapeNodeEvent``) or the thing inside it
+        (``InvolvedNodesEvent``, ``CreateNodeResultSuccess``). The payload lives under a different
+        attribute depending on the wrapper: request results expose it as ``result``, execution
+        events as ``payload``, and both may arrive already wrapped in a ``GriptapeNodeEvent``.
+
+        Suppression is scoped to the current context; see ``_suppressed_event_types``.
         """
-        event_type = type(event)
+        suppressed_types = _suppressed_event_types.get()
+        if not suppressed_types:
+            return False
 
-        # Check wrapper type first
-        if self._event_suppression_counts.get(event_type, 0) > 0:
-            return True
-
-        # For wrapped events (like ExecutionGriptapeNodeEvent), also check the payload type
-        wrapped_event = getattr(event, "wrapped_event", None)
-        if wrapped_event is not None:
-            payload = getattr(wrapped_event, "payload", None)
-            if payload is not None:
-                payload_type = type(payload)
-                if self._event_suppression_counts.get(payload_type, 0) > 0:
-                    return True
-
-        return False
+        return any(type(candidate) in suppressed_types for candidate in _suppression_candidates(event))
 
     def clear_event_suppression(self) -> None:
-        """Clear all event suppression counts."""
-        self._event_suppression_counts.clear()
+        """Drop any suppression the current context has in effect.
+
+        A safety valve for a full state reset. Suppression cannot leak past the ``with`` block
+        that opened it (``EventSuppressionContext`` restores the previous value on exit) and is
+        invisible to other contexts, so this is a no-op in the normal case.
+        """
+        _suppressed_event_types.set(frozenset())
 
     def initialize_queue(self, queue: asyncio.Queue | None = None) -> None:
         """Set the event queue for this manager.
@@ -1436,14 +1479,24 @@ class EventManager(EngineScoped):
 
 
 class EventSuppressionContext:
-    """Context manager to suppress events from being sent to websockets.
+    """Keep engine-internal bookkeeping off the websocket while it happens.
 
-    Use this to prevent internal operations (like deserialization/deletion of iteration flows)
-    from sending events to the GUI while still allowing the operations to complete normally.
+    Wrap work the GUI must not see -- deserializing and deleting the short-lived flows a loop
+    runs its body in -- and the listed result/payload types are not broadcast for the duration.
+    The operations themselves complete normally: suppression only skips queueing the broadcast,
+    and in-process callers still receive every result in full.
 
-    Uses per-event reference counting to track nested suppression contexts.
-    Each event type maintains its own reference count, and is only unsuppressed
-    when its count reaches zero.
+    Suppression applies to the current context and to any nested request dispatched from inside
+    the block, not to the manager as a whole -- see ``_suppressed_event_types`` for why that
+    distinction is load-bearing. Nesting composes: the previous value is restored on exit, so an
+    inner block adding a type does not unsuppress what an outer block was already hiding.
+
+    One instance may be entered more than once, whether nested in itself or reused for a later
+    block. Tokens are therefore kept on a stack rather than in a single field: with one field, a
+    second ``__enter__`` overwrites the outer block's token, and the outer ``__exit__`` has nothing
+    left to restore -- so the suppressed set stays in place for the rest of the context. Nothing
+    would report it, and it fails in the harmful direction: over-broadcasting is cosmetic, a
+    permanently dark event stream desyncs the editor.
     """
 
     events_to_suppress: set[type]
@@ -1451,11 +1504,11 @@ class EventSuppressionContext:
     def __init__(self, manager: EventManager, events_to_suppress: set[type]):
         self.manager = manager
         self.events_to_suppress = events_to_suppress
+        self._tokens: list[contextvars.Token[frozenset[type]]] = []
 
     def __enter__(self) -> None:
-        for event_type in self.events_to_suppress:
-            current_count = self.manager._event_suppression_counts.get(event_type, 0)
-            self.manager._event_suppression_counts[event_type] = current_count + 1
+        currently_suppressed = _suppressed_event_types.get()
+        self._tokens.append(_suppressed_event_types.set(currently_suppressed | frozenset(self.events_to_suppress)))
 
     def __exit__(
         self,
@@ -1463,12 +1516,10 @@ class EventSuppressionContext:
         exc_value: BaseException | None,
         exc_traceback: types.TracebackType | None,
     ) -> None:
-        for event_type in self.events_to_suppress:
-            current_count = self.manager._event_suppression_counts.get(event_type, 0)
-            if current_count <= 1:
-                self.manager._event_suppression_counts.pop(event_type, None)
-            else:
-                self.manager._event_suppression_counts[event_type] = current_count - 1
+        if not self._tokens:
+            return
+
+        _suppressed_event_types.reset(self._tokens.pop())
 
 
 class EventTranslationContext:
