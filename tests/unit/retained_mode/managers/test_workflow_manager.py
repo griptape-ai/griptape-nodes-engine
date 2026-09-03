@@ -2110,11 +2110,15 @@ class TestWorkflowManager:
         assert len(build_workflow.body) == 1
         assert isinstance(build_workflow.body[0], ast.Pass)
 
-    def test_generate_workflow_file_content_aexecute_awaits_build_workflow_first(self, engine: Engine) -> None:
-        """aexecute_workflow must `await build_workflow()` before running the executor.
+    def test_generate_workflow_file_content_aexecute_builds_inside_executor_context(self, engine: Engine) -> None:
+        """aexecute_workflow must `await build_workflow()` inside the executor's `async with`.
 
-        Shape-bearing workflows emit execute_workflow + aexecute_workflow, and the async
-        version is expected to construct the graph before invoking the executor.
+        Entering the executor context is what activates the project passed via
+        `--project-file-path`, and only then is a packaged bundle's own
+        griptape_nodes_config.json read -- which is what registers the bundle's libraries.
+        Building the graph before entering would create nodes from libraries nothing has
+        registered yet, so a bundle run on a machine that does not already know those
+        libraries comes up full of Error Proxy nodes.
         """
         content = self._generate(engine, with_shape=True)
         module = ast.parse(content)
@@ -2122,7 +2126,17 @@ class TestWorkflowManager:
         aexecute = next(
             node for node in module.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "aexecute_workflow"
         )
-        first_stmt = aexecute.body[0]
+        async_with = next(stmt for stmt in aexecute.body if isinstance(stmt, ast.AsyncWith))
+
+        # Nothing may await build_workflow() outside the executor context.
+        outside = [stmt for stmt in aexecute.body if stmt is not async_with]
+        assert not any(
+            isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "build_workflow"
+            for stmt in outside
+            for node in ast.walk(stmt)
+        ), ast.unparse(aexecute)
+
+        first_stmt = async_with.body[0]
         # Expected shape: `await build_workflow()`
         assert isinstance(first_stmt, ast.Expr)
         assert isinstance(first_stmt.value, ast.Await)
