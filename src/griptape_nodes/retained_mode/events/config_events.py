@@ -11,47 +11,33 @@ from griptape_nodes.retained_mode.events.base_events import (
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 
-# Fixed vocabulary for which config layer supplies a value's effective content, lowest to
-# highest priority. Matches ConfigManager.load_configs' merge order exactly: "default" is
-# the Settings model's own defaults, "env" is GTN_CONFIG_ environment variables. Shared
-# between ConfigValueSource and ConfigLayer so a caller matching one against the other
-# (e.g. is this key's source among GetConfigLayersResultSuccess.layers) compares equal
-# strings.
+# Config layers in ConfigManager.load_configs' merge order, lowest to highest priority.
+# "default" is the Settings model's own defaults, "env" is GTN_CONFIG_ variables.
 ConfigLayerName = Literal["default", "user", "project", "workspace", "runtime", "env"]
 
-# Why a write that reached disk is not the value now in effect. Set on the `Set*` success
-# payloads as `reason`, so a caller can tell the three apart without inferring from a null
-# `shadowed_by`:
-#   shadowed -- a higher-priority config layer also defines the key and keeps winning the merge.
-#               `shadowed_by` names it; the value changes only when that layer does.
-#   pinned   -- the open project pins `workspace_directory` to the value the config stack gave
-#               it, so every remerge restores it. The write is saved and is what the next
-#               project activation derives its pin from.
-#   rejected -- the merged result failed Settings validation, so the engine kept the previous
-#               configuration. The value on disk needs correcting.
+# Why a write that reached disk is not the value now in effect:
+#   shadowed -- a higher-priority layer also defines the key and keeps winning the merge.
+#   pinned   -- the open project pins `workspace_directory`; the write applies on the next open.
+#   rejected -- the merged result failed Settings validation, so defaults are in effect instead.
 ConfigWriteUnappliedReason = Literal["shadowed", "pinned", "rejected"]
 
 
 class ConfigValueSource(BaseModel):
-    """Identifies which config layer currently supplies a value's effective content.
+    """Which config layer currently supplies a value's effective content.
 
     Only "default" and "user" are writable by `SetConfigValueRequest` /
-    `SetConfigCategoryRequest` today: a value sourced from "project", "workspace",
-    "runtime", or "env" is a value a settings-editor write cannot change, because a
-    higher-priority layer keeps re-supplying its own value on every `load_configs()`
-    remerge. See `ConfigManager.shadowed_by`.
+    `SetConfigCategoryRequest`. Any other layer re-supplies its own value on every
+    `load_configs()` remerge, so a settings-editor write cannot change it. See
+    `ConfigManager.shadowed_by`.
     """
 
     layer: ConfigLayerName
     path: str | None = Field(
         default=None,
         description=(
-            "Absolute path to the config file backing this layer. None for 'default' "
-            "(no file backs the Settings model's own defaults), for 'env' (see env_var "
-            "instead) and for 'runtime' (a project activation pins the value in memory, "
-            "so no file holds it). May be None for 'project'/'workspace' too when no "
-            "project is active, though never in a `shadowed_by` result: a file layer can "
-            "only win a key if its file loaded."
+            "Absolute path to the config file backing this layer. None for 'default', "
+            "'env' (see env_var instead), 'runtime' (pinned in memory by a project "
+            "activation), and for 'project'/'workspace' when no project is active."
         ),
     )
     env_var: str | None = Field(
@@ -64,12 +50,7 @@ class ConfigValueSource(BaseModel):
 
 
 class ConfigLayer(BaseModel):
-    """One layer of the config stack, in isolation: this layer's own contents, unmerged.
-
-    Used by `GetConfigLayersRequest` to answer "which layer set this key" and "did this
-    layer's file even parse" without requiring the caller to already know the answer --
-    unlike `ConfigManager.merged_config`, which only ever shows the winning value.
-    """
+    """One layer of the config stack: its own contents, unmerged."""
 
     layer: ConfigLayerName
     path: str | None = Field(
@@ -87,7 +68,7 @@ class ConfigLayer(BaseModel):
         default=None,
         description=(
             "Set only when this layer's file exists but failed to parse as JSON. A missing "
-            "file is not an error and leaves this None with present=False."
+            "file leaves this None with present=False."
         ),
     )
     values: dict[str, Any] = Field(
@@ -121,15 +102,13 @@ class GetConfigValueResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess)
     Args:
         value: The configuration value (can be any type)
         source: Which config layer currently supplies this value. For a category (dict) key
-            this names the highest-priority layer that mentions the category at all, which
-            says nothing about the individual leaves under it; use
+            this names the highest-priority layer that mentions the category at all; use
             `GetConfigCategoryResultSuccess.sources` for per-leaf provenance.
-        editable: Whether a `SetConfigValueRequest` for this same key is the user's to make.
-            Judged leaf by leaf: a category is editable when no leaf under it is shadowed, so a
-            project layer pinning "nuke.executable" does not lock "nuke.port". True does not
-            promise the next write takes effect immediately -- `workspace_directory` is editable
-            while the open project pins it, and a write to it applies on the next project open.
-            See `SetConfigValueResultSuccess.reason`.
+        editable: Whether a `SetConfigValueRequest` for this key is the user's to make. Judged
+            leaf by leaf, so a project layer pinning "nuke.executable" does not lock
+            "nuke.port". True does not promise the next write takes effect immediately:
+            `workspace_directory` is editable while the open project pins it, and a write to it
+            applies on the next project open. See `SetConfigValueResultSuccess.reason`.
     """
 
     value: Any
@@ -167,25 +146,18 @@ class SetConfigValueRequest(RequestPayload):
 class SetConfigValueResultSuccess(ResultPayloadSuccess):
     """Configuration value set successfully.
 
-    A success here means the write reached disk; it does not mean the value took
-    effect. Check `applied` and `shadowed_by` before assuming so -- a project, workspace or
-    runtime layer (or a GTN_CONFIG_ environment variable) can outrank the write, in which
-    case it is stored but has no visible effect until that layer changes. A value the
-    `Settings` model rejects is also stored without taking effect.
+    Success means the write reached disk, not that the value took effect. Check `applied`.
 
     Args:
-        applied: Whether the requested value is now the effective (merged) value. False means
-            the write reached disk without becoming the value in effect; `reason` says why. A
-            dict value is judged leaf by leaf, so False means at least one leaf it wrote did
-            not take effect, not necessarily all of them.
-        effective_value: What `GetConfigValueRequest` for this same key would return right
-            now, after this write. Equal to the requested value when `applied` is True.
-        shadowed_by: The layer that won instead. Set only when `reason` is "shadowed"; None
-            otherwise, including for the other two unapplied reasons, which no layer causes.
+        applied: Whether the requested value is now the effective (merged) value. A dict value
+            is judged leaf by leaf, so False means at least one written leaf did not take
+            effect, not necessarily all of them.
+        effective_value: What `GetConfigValueRequest` for this key returns after this write.
+            Equal to the requested value when `applied` is True.
+        shadowed_by: The layer that won instead. Set only when `reason` is "shadowed".
         reason: Why the write is not in effect, or None when `applied` is True. Prefer this
-            over inferring from `shadowed_by`: a null `shadowed_by` alone cannot tell a
-            deferred write from a refused one. `result_details` carries the same distinction
-            as user-facing prose.
+            over inferring from `shadowed_by`, which is null for two of the three reasons.
+            `result_details` carries the same distinction as user-facing prose.
     """
 
     applied: bool = True
@@ -225,12 +197,11 @@ class GetConfigCategoryResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucce
     Args:
         contents: Dictionary of key-value pairs within the category
         sources: `ConfigValueSource` for every leaf key under this category, keyed by full
-            dot path FROM THE CONFIG ROOT (not relative to `category`), e.g.
-            "app_events.on_app_initialization_complete.libraries_to_register" even when
-            `category` was "app_events.on_app_initialization_complete". Root-relative keys
-            let a caller look a key up the same way no matter which category it was
-            fetched through. A dict value is a sub-category and is recursed into; a list (or
-            any other non-dict) value is one leaf entry, never split per item.
+            dot path FROM THE CONFIG ROOT, not relative to `category`: fetching
+            "app_events.on_app_initialization_complete" returns keys like
+            "app_events.on_app_initialization_complete.libraries_to_register". A dict value is
+            a sub-category and is recursed into; a list (or any other non-dict) value is one
+            leaf entry, never split per item.
     """
 
     contents: dict[str, Any]
@@ -267,27 +238,20 @@ class SetConfigCategoryRequest(RequestPayload):
 class SetConfigCategoryResultSuccess(ResultPayloadSuccess):
     """Configuration category updated successfully.
 
-    See `SetConfigValueResultSuccess` for what `applied`/`effective_value`/`shadowed_by`
-    mean; the same shadowing risk applies here. They are only computed when `category` is
-    a single named key (the request routes through `ConfigManager.set_config_value` for
-    that key): a full-config replacement (`category` is None or "") rewrites the whole
-    user layer at once, has no single key to check, and leaves these three at their
-    defaults.
+    See `SetConfigValueResultSuccess` for what the four outcome fields mean. They are only
+    computed when `category` names a single key; a full-config replacement (`category` is
+    None or "") rewrites the whole user layer at once and leaves them at their defaults.
 
-    Whether a write took effect is judged per leaf of `contents`, so a higher-priority layer
-    that defines a different key under the same category does not make this write unapplied.
-    `applied` False therefore means at least one of the written leaves did not take effect;
-    the rest may well have. `result_details` names the first such leaf.
+    Whether the write took effect is judged per leaf of `contents`, so a higher-priority
+    layer that defines a different key under the same category does not make this write
+    unapplied. `result_details` names the first leaf that did not take effect.
 
     Args:
-        applied: See `SetConfigValueResultSuccess.applied`. Always True (default) for a
-            full-config replacement.
+        applied: See `SetConfigValueResultSuccess.applied`.
         effective_value: See `SetConfigValueResultSuccess.effective_value`, for the whole
-            category. Always None (default) for a full-config replacement.
-        shadowed_by: See `SetConfigValueResultSuccess.shadowed_by`. Always None (default)
-            for a full-config replacement.
-        reason: See `SetConfigValueResultSuccess.reason`. Always None (default) for a
-            full-config replacement.
+            category.
+        shadowed_by: See `SetConfigValueResultSuccess.shadowed_by`.
+        reason: See `SetConfigValueResultSuccess.reason`.
     """
 
     applied: bool = True
@@ -366,11 +330,9 @@ class GetConfigLayersRequest(RequestPayload):
     """Get the full config layer stack, in isolation, lowest to highest priority.
 
     Use when: diagnosing why a setting doesn't take effect, building a settings UI that
-    shows provenance (which file, or which GTN_CONFIG_ variable, currently owns a value),
-    or writing an environment/support report. Unlike `GetConfigCategoryRequest`, which
-    only ever returns the merged (winning) values, this returns each layer's own contents
-    separately -- including a layer whose file exists but failed to parse, which otherwise
-    reaches only a log line.
+    shows provenance, or writing an environment/support report. Unlike
+    `GetConfigCategoryRequest`, which returns only the merged (winning) values, this returns
+    each layer's own contents separately, including a layer whose file failed to parse.
 
     Results: GetConfigLayersResultSuccess (with layers, lowest to highest priority)
     """
@@ -382,11 +344,10 @@ class GetConfigLayersResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess
     """Config layer stack retrieved successfully.
 
     Args:
-        layers: Every config layer, ordered lowest to highest priority. Always exactly
-            six entries, in this fixed order: default, user, project, workspace, runtime,
-            env. `project`/`workspace` report `path=None`, `present=False` when no project
-            is currently active. `runtime` carries the active project's workspace pin and
-            never has a path.
+        layers: Every config layer, ordered lowest to highest priority. Always exactly six
+            entries: default, user, project, workspace, runtime, env. `project`/`workspace`
+            report `path=None`, `present=False` when no project is active. `runtime` carries
+            the active project's workspace pin and never has a path.
     """
 
     layers: list[ConfigLayer]

@@ -161,11 +161,9 @@ def _print_paths_info() -> None:
 def _print_config_layers() -> None:
     """Print the config layer stack: each layer's file/path, presence, and any parse error.
 
-    Complements `_print_configuration` below, which only ever shows the merged (winning)
-    blob. This shows which layer set what -- the merged view alone cannot answer that, and
-    a layer whose file exists but failed to parse otherwise only ever reaches a log line.
-    The `env` and `runtime` layers have no file to point at, so their own contents are
-    printed inline instead.
+    Complements `_print_configuration` below, which shows only the merged blob and so cannot say
+    which layer set what. The `env` and `runtime` layers have no file to point at, so their own
+    contents are printed inline instead.
     """
     console.print("[bold]Config Layers (lowest to highest priority):[/bold]")
     try:

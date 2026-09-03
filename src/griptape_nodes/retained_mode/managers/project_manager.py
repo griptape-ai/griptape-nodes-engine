@@ -482,10 +482,9 @@ class WorkspaceDecision(NamedTuple):
 
     `pin_supplied_by_config` distinguishes the two kinds of pin, for `set_workspace_override`.
     Branch 5 reads `workspace_directory` out of the user (or default) config layer and pins that
-    value back, so the config layer is still the owner and a settings write to it still decides
-    what the next activation pins. Branches 0, 1 and 4 pin a value no config layer supplies (a
-    project template's field, a `project_workspaces` mapping, an ancestor's workspace), which a
-    settings write cannot reach.
+    value back, so the config layer is still the owner and a settings write to it decides what the
+    next activation pins. Branches 0, 1 and 4 pin a value no config layer supplies (a project
+    template's field, a `project_workspaces` mapping, an ancestor's workspace).
     """
 
     workspace_dir: Path
