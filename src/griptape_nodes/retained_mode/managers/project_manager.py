@@ -2911,6 +2911,12 @@ class ProjectManager(EngineScoped):
                 )
         if workspace_changed:
             await self.engine.workflow_manager.refresh_workflow_registry()
+            # Registry keys are derived against the active workspace, so rebuilding the
+            # registry for a new workspace strands every context entry pushed under the old
+            # one. A library reload would have cleared them (it clears all object state), but
+            # a workspace-only change does not -- leaving keys that resolve to nothing yet
+            # still answer GetWorkflowContext and the heartbeat.
+            self.engine.context_manager.reconcile_with_registry()
         return None
 
     def _project_checkpoint_attributes(self, project_id: ProjectID, *, name: str | None = None) -> dict[str, Any]:
