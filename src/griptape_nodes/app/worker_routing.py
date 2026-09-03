@@ -45,9 +45,13 @@ from griptape_nodes.retained_mode.events.execution_events import (
     CancelExecuteNodeRequest,
     ExecuteNodeRequest,
 )
+from griptape_nodes.retained_mode.events.parameter_events import MigrateParameterRequest
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.events.project_events import (
     SetCurrentProjectRequest,
+)
+from griptape_nodes.retained_mode.events.resource_events import (
+    RegisterResourceTypeRequest,
 )
 from griptape_nodes.retained_mode.events.static_file_events import (
     CreateStaticFileDownloadUrlFromPathRequest,
@@ -198,6 +202,15 @@ LOCAL_ONLY_REQUEST_TYPES: frozenset[type[RequestPayload]] = frozenset(
         ReloadConfigRequest,
         RefreshSecretsRequest,
         ActivateProjectRequest,
+        # Two requests carry a live Python object in a field, and both were local under the
+        # allowlist this exclusion list replaces -- the flip is what started forwarding them.
+        # `_registers_a_python_class` does not catch either: it matches a `type[...]` annotation,
+        # and these carry an INSTANCE (a ResourceType, a Callable). Forwarding puts the object
+        # through `json.dumps(default=str)`, so the orchestrator registers a string and the worker
+        # -- the process that needs it while running a node -- registers nothing, with no error on
+        # either side.
+        RegisterResourceTypeRequest,
+        MigrateParameterRequest,
     }
 )
 
