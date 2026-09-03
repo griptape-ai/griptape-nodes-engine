@@ -158,6 +158,38 @@ class _UnappliedLeaf(NamedTuple):
     source: ConfigValueSource | None = None
 
 
+class _MergedConfigRejection(NamedTuple):
+    """The keys that made the merged config fail `Settings` validation.
+
+    Recorded by `load_configs` when it discards the merge and falls back to defaults, which is
+    otherwise visible only as a log line. Held so a write's outcome can name the setting that is
+    actually broken: it is frequently NOT the key the user just wrote, and without it the only
+    honest thing a message can say is that something somewhere is wrong.
+    """
+
+    keys: tuple[str, ...]
+
+
+def _offending_keys(error: ValidationError) -> tuple[str, ...]:
+    """Dot paths of the config keys a `Settings` validation error blames, in report order.
+
+    Pydantic reports each error's location as a tuple of path segments; joining them yields the
+    same dot notation the config API takes, so the key can be shown to a user or fed back into
+    `GetConfigValueRequest`. Errors with an empty location (whole-model failures) are skipped,
+    since they name no key a user could go and fix.
+
+    Args:
+        error: The validation error raised by `Settings.model_validate`.
+    """
+    keys = []
+    for detail in error.errors():
+        location = detail.get("loc") or ()
+        if not location:
+            continue
+        keys.append(".".join(str(segment) for segment in location))
+    return tuple(keys)
+
+
 class _LayerProbe(NamedTuple):
     """One layer to check when resolving where a key's effective value comes from."""
 
@@ -216,6 +248,9 @@ class ConfigManager(EngineScoped):
         # value came from is the editable owner, and reporting "runtime" would lock a field the
         # user can in fact change.
         self._workspace_pin_supplied_by_config: bool = False
+        # Set by load_configs when the merged result fails Settings validation and the whole merge
+        # is discarded. None means the live merge is valid.
+        self._merged_config_rejection: _MergedConfigRejection | None = None
         self._libraries_root_override: str | None = None
         # (variable name, value) pairs already reported as ignored. The env layer is re-read on
         # every load_configs() and on each read_env_config() call, so without this a single bad
@@ -954,9 +989,11 @@ class ConfigManager(EngineScoped):
         try:
             Settings.model_validate(merged_config)
             self.merged_config = merged_config
+            self._merged_config_rejection = None
         except ValidationError as e:
             logger.error("Error validating config file: %s", e)
             self.merged_config = self.default_config
+            self._merged_config_rejection = _MergedConfigRejection(keys=_offending_keys(e))
 
     def load_project_config(self, project_dir: Path) -> None:
         """Load the project-adjacent config from the given project directory and remerge all configs.
@@ -1558,35 +1595,50 @@ class ConfigManager(EngineScoped):
 
         diverged_path = self._first_diverged_leaf_at(root, value)
         if diverged_path is not None:
-            reason: ConfigWriteUnappliedReason = (
-                "pinned" if self._is_pinned_by_workspace_override(diverged_path) else "rejected"
-            )
-            return _UnappliedLeaf(key=".".join(diverged_path), reason=reason)
+            return _UnappliedLeaf(key=".".join(diverged_path), reason=self._divergence_reason(diverged_path))
 
         return None
 
+    def _divergence_reason(self, path: tuple[str, ...]) -> ConfigWriteUnappliedReason:
+        """Why `path`'s merged value differs from what was written, when no layer shadows it.
+
+        A discarded merge is asked about first, because it explains every divergence and the pin
+        explains none of them while it holds: `load_configs` replaced the merge with defaults, so
+        the pin is not in `merged_config` at all. Deciding pin-versus-discard by comparing the
+        merged value against the pin cannot separate the two, since branch 5 derives the pin from
+        the `default` layer whenever the user config has no `workspace_directory` -- the ordinary
+        state after a `gtn init` without `--workspace-directory` -- and a discarded merge IS the
+        default layer, so the two compare equal.
+
+        Args:
+            path: Key segments of the leaf whose merged value diverged.
+        """
+        if self._merged_config_rejection is not None:
+            return "rejected"
+        if self._is_pinned_by_workspace_override(path):
+            return "pinned"
+        # Unreachable: with a valid merge and nothing shadowing, the written value is the merged
+        # value unless the pin replaced it. `_append_shadow_note` still words this honestly.
+        return "rejected"
+
     def _is_pinned_by_workspace_override(self, path: tuple[str, ...]) -> bool:
         """Whether the runtime workspace pin is what keeps `path` from taking effect.
-
-        Asks whether the pin is winning, not merely whether one is held. Both a pin and a
-        discarded merge can make a leaf diverge, and a discarded merge leaves `merged_config` as
-        `default_config` with the pin nowhere in it -- so a held pin is not evidence that the pin
-        is the cause. Reporting "pinned" there would promise the value takes effect on the next
-        project open, when in truth it never does until whatever failed validation is corrected.
 
         Only `workspace_directory` can be pinned, and only a config-supplied pin can reach here:
         a pin with no config origin is reported as the "runtime" layer, so it is caught as
         shadowing before divergence is ever checked. Both preconditions are asserted rather than
         assumed, so this stays correct if the caller order changes.
 
+        No value comparison is needed: the caller has already excluded a discarded merge, and
+        while the merge stands `load_configs` assigns the pin over the merged value, so a held
+        config-supplied pin is necessarily the value in effect.
+
         Args:
             path: Key segments of the leaf whose merged value diverged.
         """
         if path != ("workspace_directory",):
             return False
-        if self._workspace_dir_override is None or not self._workspace_pin_supplied_by_config:
-            return False
-        return self._layer_value_at(self.merged_config, path) == self._workspace_dir_override
+        return self._workspace_dir_override is not None and self._workspace_pin_supplied_by_config
 
     def _first_shadowed_leaf(self, key: str, value: Any) -> _ShadowedLeaf | None:
         """Return the first written key a higher-priority layer shadows, or None if none is.
@@ -1683,11 +1735,7 @@ class ConfigManager(EngineScoped):
             )
 
         if outcome.reason == "rejected":
-            return (
-                f"{result_details} NOTE: '{outcome.unapplied_key}' is still "
-                f"'{outcome.effective_value}'. The value was saved but is not one this setting "
-                "accepts, so the engine kept the previous configuration."
-            )
+            return self._rejection_note(result_details, outcome)
 
         if outcome.reason == "shadowed" and outcome.shadowed_by is not None:
             location = outcome.shadowed_by.path or outcome.shadowed_by.env_var or "an unknown source"
@@ -1704,6 +1752,43 @@ class ConfigManager(EngineScoped):
             f"{result_details} NOTE: '{outcome.unapplied_key}' is still "
             f"'{outcome.effective_value}'. The value was saved but did not take effect, for a "
             "reason the engine did not record."
+        )
+
+    def _rejection_note(self, result_details: str, outcome: ConfigWriteOutcome) -> str:
+        """Explain a write that reached disk while the merged config was failing validation.
+
+        The broken setting is frequently NOT the one just written: one invalid value anywhere
+        makes `load_configs` discard the entire merge, so an unrelated write reads back as
+        unapplied. Blaming the written value sends the user to re-type a value that was fine.
+
+        Says the merge fell back to built-in defaults rather than that the previous configuration
+        was kept, because that is what happens: every other user, project and workspace setting
+        stops applying for the session while still sitting on disk.
+
+        Args:
+            result_details: The success message describing the write.
+            outcome: The outcome from `_write_outcome`.
+        """
+        rejection = self._merged_config_rejection
+        if rejection is None:
+            return (
+                f"{result_details} NOTE: '{outcome.unapplied_key}' is still "
+                f"'{outcome.effective_value}'. The value was saved but did not take effect, for a "
+                "reason the engine did not record."
+            )
+
+        if outcome.unapplied_key in rejection.keys:
+            blame = f"The value saved for '{outcome.unapplied_key}' is not one this setting accepts"
+        elif rejection.keys:
+            named = ", ".join(f"'{key}'" for key in rejection.keys)
+            blame = f"The value saved for {named} is not valid, which is a different setting"
+        else:
+            blame = "The saved configuration is not valid"
+
+        return (
+            f"{result_details} NOTE: '{outcome.unapplied_key}' is still "
+            f"'{outcome.effective_value}'. {blame}, so the engine could not apply the "
+            "configuration and fell back to built-in defaults for every setting until it is fixed."
         )
 
     def on_handle_set_config_value_request(self, request: SetConfigValueRequest) -> ResultPayload:
