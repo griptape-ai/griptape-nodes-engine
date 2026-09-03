@@ -74,6 +74,9 @@ class AddParameterToNodeRequest(RequestPayload):
     parent_element_name: str | None = None
     # [{"trait_name": str, "trait_state": dict}], as produced by Parameter.trait_states().
     traits: list[dict[str, Any]] | None = None
+    # {"converters": [method name, ...], "validators": [...]} on the owning node, as
+    # produced by Parameter.value_callback_names().
+    value_callbacks: dict[str, list[str]] | None = None
     # initial_setup prevents unnecessary work when we are loading a workflow from a file.
     initial_setup: bool = False
 
@@ -379,6 +382,7 @@ class AlterParameterDetailsRequest(RequestPayload):
         allow_variable_substitution: Whether {VAR} tokens in this parameter's value are substituted at execution time
         ui_options: New UI configuration options
         traits: Trait identity and state, as [{"trait_name": str, "trait_state": dict}]
+        value_callbacks: Converter and validator method names on the owning node
         initial_setup: Skip setup work when loading from file
 
     Results: AlterParameterDetailsResultSuccess | AlterParameterDetailsResultFailure
@@ -403,6 +407,7 @@ class AlterParameterDetailsRequest(RequestPayload):
     allow_variable_substitution: bool | None = None
     ui_options: dict | None = None
     traits: list[dict[str, Any]] | None = None
+    value_callbacks: dict[str, list[str]] | None = None
     # initial_setup prevents unnecessary work when we are loading a workflow from a file.
     initial_setup: bool = False
 
@@ -443,6 +448,7 @@ class AlterParameterDetailsRequest(RequestPayload):
             "allow_variable_substitution",
             "ui_options",
             "traits",
+            "value_callbacks",
         ]
 
 
