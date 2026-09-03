@@ -127,19 +127,24 @@ class ConfigWriteOutcome(NamedTuple):
     """Whether a completed user-layer write is the value now in effect.
 
     A write always lands in the user config file; whether it takes effect depends on more than
-    where it landed. `written_key` is the key the caller wrote, and `unapplied_key` names the first
-    key under it that did not take effect, which for a category write is a leaf rather than the
-    category itself. `reason` says why, and `shadowed_by` is set only for `reason == "shadowed"`.
-    See `ConfigManager._write_outcome`.
+    where it landed. `written_path` is the key the caller wrote, held as segments because every
+    comparison against it is a parent/child test that a joined string cannot express; `written_key`
+    is the display view. `unapplied_key` names the first key under it that did not take effect,
+    which for a category write is a leaf rather than the category itself. `reason` says why, and
+    `shadowed_by` is set only for `reason == "shadowed"`. See `ConfigManager._write_outcome`.
     """
 
     applied: bool
     effective_value: Any
-    written_key: str
     written_path: tuple[str, ...]
     unapplied_key: str | None
     shadowed_by: ConfigValueSource | None
     reason: ConfigWriteUnappliedReason | None = None
+
+    @property
+    def written_key(self) -> str:
+        """The written path as a dot-notation key, for messages."""
+        return ".".join(self.written_path)
 
 
 class _ShadowedLeaf(NamedTuple):
@@ -1609,7 +1614,6 @@ class ConfigManager(EngineScoped):
             return ConfigWriteOutcome(
                 applied=True,
                 effective_value=effective_value,
-                written_key=key,
                 written_path=written_path,
                 unapplied_key=None,
                 shadowed_by=None,
@@ -1617,7 +1621,6 @@ class ConfigManager(EngineScoped):
         return ConfigWriteOutcome(
             applied=False,
             effective_value=effective_value,
-            written_key=key,
             written_path=written_path,
             unapplied_key=unapplied_leaf.key,
             shadowed_by=unapplied_leaf.source,

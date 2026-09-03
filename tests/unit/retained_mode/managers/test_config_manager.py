@@ -2700,8 +2700,9 @@ class TestConfigProvenance:
 
         `project_workspaces` is keyed by project file paths, so `project_workspaces./srv/site` is a
         textual dot-prefix of `project_workspaces./srv/site.com/...` while being an unrelated
-        sibling. Dropping prefixes by string comparison hid one of the two, and the user would fix
-        the named key, get the same rejection, and have no pointer to the other.
+        sibling. A textual dot-prefix is a sibling relationship here, not a parent one, so both keys
+        have to survive the drop: naming one sends the user to fix it and hit the same rejection
+        with no pointer to the other.
         """
         plain = "/srv/site"
         dotted = "/srv/site.com/griptape-nodes-project.yml"
@@ -2724,9 +2725,9 @@ class TestConfigProvenance:
         """A write must not own a broken key that merely shares its text plus a dot.
 
         Writing a valid value to `project_workspaces./srv/site` while
-        `project_workspaces./srv/site.com/...` is broken has to read as someone else's fault. The
-        string test claimed it, telling the user the value they just wrote was refused when it was
-        the one valid thing in the file.
+        `project_workspaces./srv/site.com/...` is broken is someone else's fault, because the two
+        are siblings rather than parent and child. Owning it would tell the user the value they just
+        wrote was refused when it is the one valid thing in the file.
         """
         plain = "/srv/site"
         dotted = "/srv/site.com/griptape-nodes-project.yml"
