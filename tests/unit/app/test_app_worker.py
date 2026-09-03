@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import threading
 import time
@@ -72,6 +73,9 @@ def worker_manager() -> WorkerManager:
     # spawn_worker builds the child env from the orchestrator's pre-project environ;
     # hand back a real dict so {**base_environ, ...} doesn't choke on a MagicMock.
     gtn.project_manager.get_pre_project_environ.return_value = {}
+    # Spawn awaits the library's execution environment before starting the process; a bare
+    # MagicMock is not awaitable.
+    gtn.library_manager.wait_for_execution_env = AsyncMock()
     wm = WorkerManager(engine=gtn, event_manager=MagicMock())
     wm.attach_transport(
         ws_outgoing_queue=asyncio.Queue(),
@@ -1243,3 +1247,80 @@ class TestWorkerManagerDomainEventListeners:
         assert len(send_calls) == 1
         sent_payload = json.loads(send_calls[0][1])
         assert sent_payload["request_type"] == "ReloadConfigRequest"
+
+
+class TestWorkerExecutionPath:
+    """A worker gets its library's execution dependencies as PYTHONPATH, not as a later splice.
+
+    Splicing them onto a running interpreter cannot give the library its own versions. A module
+    already in sys.modules is never reconsidered, and a package that probed for an optional
+    dependency at import time has cached the answer -- which is how a library that ships
+    `safetensors` still hit `NameError: name 'safetensors' is not defined` inside huggingface_hub.
+    PYTHONPATH is on sys.path before the process imports anything, which is the whole point.
+    """
+
+    @pytest.mark.asyncio
+    async def test_spawn_hands_the_worker_its_execution_path(self, worker_manager: WorkerManager) -> None:
+        worker_manager.engine.library_manager.execution_site_packages.return_value = "/libs/mine/.venv-exec/sp"  # type: ignore[attr-defined]
+
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=_managed_proc_mock())) as spawn:
+            await worker_manager.spawn_worker([sys.executable, "-c", ""], "My Library")
+
+        env = spawn.call_args.kwargs["env"]
+        assert env["PYTHONPATH"] == "/libs/mine/.venv-exec/sp"
+
+    @pytest.mark.asyncio
+    async def test_an_inherited_pythonpath_survives_the_handover(self, worker_manager: WorkerManager) -> None:
+        """Prepended, not assigned.
+
+        A launcher-set PYTHONPATH -- embedding hosts, source checkouts -- is part of the environment
+        the engine itself booted with. Assigning over it would lose those modules in exactly one
+        process kind, so an import that resolves in the orchestrator would fail in its worker.
+        """
+        worker_manager.engine.library_manager.execution_site_packages.return_value = "/libs/mine/.venv-exec/sp"  # type: ignore[attr-defined]
+        worker_manager.engine.project_manager.get_pre_project_environ.return_value = {"PYTHONPATH": "/host/libs"}  # type: ignore[attr-defined]
+
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=_managed_proc_mock())) as spawn:
+            await worker_manager.spawn_worker([sys.executable, "-c", ""], "My Library")
+
+        env = spawn.call_args.kwargs["env"]
+        # Library first, so a package the library pins wins; the engine's own environment still
+        # resolves anything the library does not carry.
+        assert env["PYTHONPATH"] == f"/libs/mine/.venv-exec/sp{os.pathsep}/host/libs"
+
+    @pytest.mark.asyncio
+    async def test_spawn_waits_for_the_environment_before_starting(self, worker_manager: WorkerManager) -> None:
+        """The wait is the whole point: a worker cannot be handed a directory that is not there yet.
+
+        On a library's first run the orchestrator is still building `.venv-exec`. Spawning before it
+        finishes would leave PYTHONPATH unset for that process, which is the pre-fix ordering and
+        exactly the bug -- so the environment must be awaited, not raced.
+        """
+        order: list[str] = []
+        worker_manager.engine.library_manager.wait_for_execution_env = AsyncMock(  # type: ignore[attr-defined]
+            side_effect=lambda _name: order.append("waited")
+        )
+        worker_manager._session_ready_event.set()
+        worker_manager.engine.get_session_id.return_value = "sess-1"  # type: ignore[attr-defined]
+
+        async def record_spawn(_args: list[str], _worker_key: str) -> None:
+            order.append("spawned")
+
+        with patch.object(worker_manager, "spawn_worker", new=AsyncMock(side_effect=record_spawn)):
+            await worker_manager._spawn_when_session_ready("My Library")
+
+        assert order == ["waited", "spawned"]
+
+    @pytest.mark.asyncio
+    async def test_no_execution_environment_means_no_pythonpath(self, worker_manager: WorkerManager) -> None:
+        """A library with no execution dependencies, or one whose environment is not built yet.
+
+        Pointing PYTHONPATH at a directory that does not exist would be silently ignored by Python,
+        so an absent entry and a wrong one look identical from inside the worker. Leave it unset.
+        """
+        worker_manager.engine.library_manager.execution_site_packages.return_value = None  # type: ignore[attr-defined]
+
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=_managed_proc_mock())) as spawn:
+            await worker_manager.spawn_worker([sys.executable, "-c", ""], "Light Library")
+
+        assert "PYTHONPATH" not in spawn.call_args.kwargs["env"]
