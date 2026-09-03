@@ -13,6 +13,7 @@ import os
 import sys
 import threading
 import time
+from pathlib import Path
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
@@ -133,6 +134,24 @@ class TestHandleRegisterWorkerRequest:
 
         assert isinstance(result, worker_events.RegisterWorkerResultSuccess)
         assert result.worker_engine_id == _ENGINE
+
+
+class TestRegistrationCarriesTheProject:
+    @pytest.mark.asyncio
+    async def test_success_reply_names_the_orchestrators_current_project(self, worker_manager: WorkerManager) -> None:
+        """Registration is the one moment both processes are guaranteed to exist.
+
+        The worker adopts this project BEFORE loading libraries, and the workspace follows the
+        project -- so carrying it in the reply the worker already waits for is what makes the two
+        workspaces match deterministically rather than by message-ordering luck.
+        """
+        worker_manager.engine.project_manager.current_project_id.return_value = "proj-42"  # type: ignore[union-attr]
+        request = worker_events.RegisterWorkerRequest(worker_engine_id=_ENGINE, engine_version=engine_version)
+
+        result = await worker_manager.handle_register_worker_request(request)
+
+        assert isinstance(result, worker_events.RegisterWorkerResultSuccess)
+        assert result.current_project_id == "proj-42"
 
 
 class TestHandleRegisterWorkerRequestEngineVersion:
@@ -482,6 +501,22 @@ class TestSpawnWorker:
         # Worker stdout is a pipe under a GUI-hosted orchestrator; unbuffered output keeps
         # log lines from stalling in Python's block buffer.
         assert mock_exec.call_args.kwargs["env"]["PYTHONUNBUFFERED"] == "1"
+
+    @pytest.mark.asyncio
+    async def test_spawn_does_not_pin_the_workspace_into_the_env(self, worker_manager: WorkerManager) -> None:
+        """The spawn env must not carry GTN_CONFIG_WORKSPACE_DIRECTORY.
+
+        Workers spawn before any project resolves, so the value at spawn time is the CWD-relative
+        placeholder -- and GTN_CONFIG_ outranks the runtime project override, so a worker handed it
+        could never follow its orchestrator onto a project's workspace again. The workspace comes
+        from the project adopted out of the registration reply instead.
+        """
+        worker_manager.engine.config_manager.workspace_path = Path("/somewhere/else/GriptapeNodes")  # type: ignore[union-attr]
+
+        with patch("asyncio.create_subprocess_exec", return_value=MagicMock()) as mock_exec:
+            await worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "my-key")
+
+        assert "GTN_CONFIG_WORKSPACE_DIRECTORY" not in mock_exec.call_args.kwargs["env"]
 
     @pytest.mark.asyncio
     async def test_spawn_env_stamps_orchestrator_engine_id(self, worker_manager: WorkerManager) -> None:

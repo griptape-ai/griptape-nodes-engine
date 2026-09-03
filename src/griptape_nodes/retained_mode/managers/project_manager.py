@@ -3342,6 +3342,16 @@ class ProjectManager(EngineScoped):
         await self._load_registered_projects()
         return project_id in self._successfully_loaded_project_templates
 
+    def current_project_id(self) -> ProjectID:
+        """The project this engine has active, or SYSTEM_DEFAULTS_KEY when it has none.
+
+        Exists so a peer manager can read the active project without going through a request, which
+        WorkerManager needs while answering a worker's registration: the reply has to carry this
+        value, and issuing a request from inside a request handler is the reentrancy the forwarding
+        machinery exists to avoid.
+        """
+        return self._current_project_id
+
     def on_get_current_project_request(
         self, _request: GetCurrentProjectRequest
     ) -> GetCurrentProjectResultSuccess | GetCurrentProjectResultFailure:
