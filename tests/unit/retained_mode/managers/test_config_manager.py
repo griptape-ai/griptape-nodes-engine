@@ -2532,6 +2532,76 @@ class TestConfigProvenance:
 
         assert json.loads(isolate_user_config.read_text())["max_nodes_in_parallel"] == "not-an-int"
 
+    def test_set_config_value_request_pin_derived_from_default_layer_still_reports_rejected(
+        self, tmp_path: Path, isolate_user_config: Path
+    ) -> None:
+        """A discarded merge outranks the pin as an explanation even when the two values match.
+
+        Branch 5 derives the pin from the `default` layer when the user config has no
+        `workspace_directory`, which is the ordinary state after `gtn init` without
+        `--workspace-directory`. A discarded merge *is* the default layer, so comparing the merged
+        value against the pin cannot tell the two causes apart and the misattribution returns.
+        """
+        isolate_user_config.write_text(json.dumps({"max_nodes_in_parallel": "not-an-int"}), encoding="utf-8")
+        typed_ws = tmp_path / "typed_workspace"
+
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            # Pin exactly what branch 5 would: the default layer's own value, since the user
+            # config declares none.
+            pinned = manager.get_config_value("workspace_directory", config_source="default_config")
+            manager.set_workspace_override(Path(pinned), supplied_by_config=True)
+            manager.load_configs()
+
+            assert manager.merged_config is manager.default_config
+            # The precondition that made value-equality useless here.
+            assert manager._layer_value_at(manager.merged_config, ("workspace_directory",)) == str(
+                Path(pinned).expanduser().resolve()
+            )
+
+            result = manager.on_handle_set_config_value_request(
+                SetConfigValueRequest(category_and_key="workspace_directory", value=str(typed_ws))
+            )
+
+        assert isinstance(result, SetConfigValueResultSuccess)
+        assert result.reason == "rejected"
+        assert "pins its workspace" not in str(result.result_details)
+
+    def test_set_config_value_request_rejection_note_names_the_offending_key(
+        self, tmp_path: Path, isolate_user_config: Path
+    ) -> None:
+        """The note must not blame a valid written value for another setting's invalidity.
+
+        One bad value anywhere discards the whole merge, so an unrelated write reads back as
+        unapplied. Telling the user their own value was refused sends them to re-type something
+        that was already correct, with no pointer to the setting that is actually broken.
+        """
+        isolate_user_config.write_text(json.dumps({"max_nodes_in_parallel": "not-an-int"}), encoding="utf-8")
+        valid_ws = tmp_path / "valid_workspace"
+        valid_ws.mkdir()
+
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.load_configs()
+            unrelated = manager.on_handle_set_config_value_request(
+                SetConfigValueRequest(category_and_key="workspace_directory", value=str(valid_ws))
+            )
+            own = manager.on_handle_set_config_value_request(
+                SetConfigValueRequest(category_and_key="max_nodes_in_parallel", value="still-not-an-int")
+            )
+
+        # The broken key is named, and the written value is not blamed for it.
+        assert isinstance(unrelated, SetConfigValueResultSuccess)
+        assert "'max_nodes_in_parallel'" in str(unrelated.result_details)
+        assert "is a different setting" in str(unrelated.result_details)
+        # The engine drops every layer, so saying the previous configuration was kept would lie.
+        assert "built-in defaults" in str(unrelated.result_details)
+
+        # When the written key IS the broken one, it is blamed directly.
+        assert isinstance(own, SetConfigValueResultSuccess)
+        assert "is not one this setting accepts" in str(own.result_details)
+        assert "is a different setting" not in str(own.result_details)
+
     def test_get_config_category_request_sources_keyed_by_full_root_relative_path(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             result = ConfigManager().on_handle_get_config_category_request(
