@@ -21,6 +21,7 @@ from griptape_nodes.retained_mode.events.config_events import (
     ConfigLayer,
     ConfigLayerName,
     ConfigValueSource,
+    ConfigWriteUnappliedReason,
     GetConfigCategoryRequest,
     GetConfigCategoryResultFailure,
     GetConfigCategoryResultSuccess,
@@ -75,14 +76,6 @@ USER_CONFIG_PATH = xdg_config_home() / "griptape_nodes" / "griptape_nodes_config
 # dict has an entry whose value happens to be None" (e.g. `project_file: str | None`).
 # A plain `None` default can't do this job: `None` is also a legitimate stored value.
 _KEY_NOT_IN_LAYER = object()
-
-# Why a write that reached disk is not the value now in effect.
-#   shadowed -- a higher-priority config layer also defines the key and keeps winning the merge
-#   pinned   -- the active project's workspace pin restates the value it was given on every
-#               remerge, so the write decides what the NEXT activation pins, not what is in
-#               effect now
-#   rejected -- the merged result failed Settings validation, so load_configs discarded it
-_UnappliedReason = Literal["shadowed", "pinned", "rejected"]
 
 # The only layers a settings write can control. `set_config_value` writes the user config
 # file, and "default" means nothing has overridden the Settings model, so a key sourced
@@ -143,7 +136,7 @@ class ConfigWriteOutcome(NamedTuple):
     effective_value: Any
     unapplied_key: str | None
     shadowed_by: ConfigValueSource | None
-    reason: _UnappliedReason | None = None
+    reason: ConfigWriteUnappliedReason | None = None
 
 
 class _ShadowedLeaf(NamedTuple):
@@ -161,7 +154,7 @@ class _UnappliedLeaf(NamedTuple):
     """
 
     key: str
-    reason: _UnappliedReason
+    reason: ConfigWriteUnappliedReason
     source: ConfigValueSource | None = None
 
 
@@ -1366,6 +1359,7 @@ class ConfigManager(EngineScoped):
             applied=outcome.applied,
             effective_value=outcome.effective_value,
             shadowed_by=outcome.shadowed_by,
+            reason=outcome.reason,
         )
 
     def on_handle_get_config_value_request(self, request: GetConfigValueRequest) -> ResultPayload:
@@ -1564,7 +1558,9 @@ class ConfigManager(EngineScoped):
 
         diverged_path = self._first_diverged_leaf_at(root, value)
         if diverged_path is not None:
-            reason: _UnappliedReason = "pinned" if self._is_pinned_by_workspace_override(diverged_path) else "rejected"
+            reason: ConfigWriteUnappliedReason = (
+                "pinned" if self._is_pinned_by_workspace_override(diverged_path) else "rejected"
+            )
             return _UnappliedLeaf(key=".".join(diverged_path), reason=reason)
 
         return None
@@ -1572,14 +1568,25 @@ class ConfigManager(EngineScoped):
     def _is_pinned_by_workspace_override(self, path: tuple[str, ...]) -> bool:
         """Whether the runtime workspace pin is what keeps `path` from taking effect.
 
-        Only `workspace_directory` can be pinned, and only a config-supplied pin reaches here: a
-        pin with no config-layer origin is reported as the "runtime" layer and so is caught as
-        shadowing before divergence is ever checked.
+        Asks whether the pin is winning, not merely whether one is held. Both a pin and a
+        discarded merge can make a leaf diverge, and a discarded merge leaves `merged_config` as
+        `default_config` with the pin nowhere in it -- so a held pin is not evidence that the pin
+        is the cause. Reporting "pinned" there would promise the value takes effect on the next
+        project open, when in truth it never does until whatever failed validation is corrected.
+
+        Only `workspace_directory` can be pinned, and only a config-supplied pin can reach here:
+        a pin with no config origin is reported as the "runtime" layer, so it is caught as
+        shadowing before divergence is ever checked. Both preconditions are asserted rather than
+        assumed, so this stays correct if the caller order changes.
 
         Args:
             path: Key segments of the leaf whose merged value diverged.
         """
-        return path == ("workspace_directory",) and self._workspace_dir_override is not None
+        if path != ("workspace_directory",):
+            return False
+        if self._workspace_dir_override is None or not self._workspace_pin_supplied_by_config:
+            return False
+        return self._layer_value_at(self.merged_config, path) == self._workspace_dir_override
 
     def _first_shadowed_leaf(self, key: str, value: Any) -> _ShadowedLeaf | None:
         """Return the first written key a higher-priority layer shadows, or None if none is.
@@ -1682,14 +1689,21 @@ class ConfigManager(EngineScoped):
                 "accepts, so the engine kept the previous configuration."
             )
 
-        if outcome.shadowed_by is None:
-            return result_details
+        if outcome.reason == "shadowed" and outcome.shadowed_by is not None:
+            location = outcome.shadowed_by.path or outcome.shadowed_by.env_var or "an unknown source"
+            return (
+                f"{result_details} NOTE: '{outcome.unapplied_key}' is supplied by a higher-priority "
+                f"'{outcome.shadowed_by.layer}' layer ({location}), so that value does not change "
+                "until that layer does."
+            )
 
-        location = outcome.shadowed_by.path or outcome.shadowed_by.env_var or "an unknown source"
+        # Defensive tail: every reason above is accounted for, so this is unreachable today. It
+        # still says the write did not land, because a future reason arriving here silently
+        # unexplained would be the same bare success this reporting exists to remove.
         return (
-            f"{result_details} NOTE: '{outcome.unapplied_key}' is supplied by a higher-priority "
-            f"'{outcome.shadowed_by.layer}' layer ({location}), so that value does not change "
-            "until that layer does."
+            f"{result_details} NOTE: '{outcome.unapplied_key}' is still "
+            f"'{outcome.effective_value}'. The value was saved but did not take effect, for a "
+            "reason the engine did not record."
         )
 
     def on_handle_set_config_value_request(self, request: SetConfigValueRequest) -> ResultPayload:
@@ -1739,6 +1753,7 @@ class ConfigManager(EngineScoped):
             applied=outcome.applied,
             effective_value=outcome.effective_value,
             shadowed_by=outcome.shadowed_by,
+            reason=outcome.reason,
         )
 
     def _write_user_config_delta(self, user_config_delta: dict) -> bool:  # noqa: C901, PLR0911, PLR0912, PLR0915

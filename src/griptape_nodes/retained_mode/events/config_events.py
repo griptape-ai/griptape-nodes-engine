@@ -19,6 +19,18 @@ from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 # strings.
 ConfigLayerName = Literal["default", "user", "project", "workspace", "runtime", "env"]
 
+# Why a write that reached disk is not the value now in effect. Set on the `Set*` success
+# payloads as `reason`, so a caller can tell the three apart without inferring from a null
+# `shadowed_by`:
+#   shadowed -- a higher-priority config layer also defines the key and keeps winning the merge.
+#               `shadowed_by` names it; the value changes only when that layer does.
+#   pinned   -- the open project pins `workspace_directory` to the value the config stack gave
+#               it, so every remerge restores it. The write is saved and is what the next
+#               project activation derives its pin from.
+#   rejected -- the merged result failed Settings validation, so the engine kept the previous
+#               configuration. The value on disk needs correcting.
+ConfigWriteUnappliedReason = Literal["shadowed", "pinned", "rejected"]
+
 
 class ConfigValueSource(BaseModel):
     """Identifies which config layer currently supplies a value's effective content.
@@ -112,10 +124,12 @@ class GetConfigValueResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess)
             this names the highest-priority layer that mentions the category at all, which
             says nothing about the individual leaves under it; use
             `GetConfigCategoryResultSuccess.sources` for per-leaf provenance.
-        editable: Whether a `SetConfigValueRequest` for this same key can actually change the
-            effective value. Judged leaf by leaf, matching how the write path judges
-            `applied`: a category is editable when no leaf under it is shadowed, so a project
-            layer pinning "nuke.executable" does not lock "nuke.port".
+        editable: Whether a `SetConfigValueRequest` for this same key is the user's to make.
+            Judged leaf by leaf: a category is editable when no leaf under it is shadowed, so a
+            project layer pinning "nuke.executable" does not lock "nuke.port". True does not
+            promise the next write takes effect immediately -- `workspace_directory` is editable
+            while the open project pins it, and a write to it applies on the next project open.
+            See `SetConfigValueResultSuccess.reason`.
     """
 
     value: Any
@@ -161,21 +175,23 @@ class SetConfigValueResultSuccess(ResultPayloadSuccess):
 
     Args:
         applied: Whether the requested value is now the effective (merged) value. False means
-            either a higher-priority layer still supplies a different value (see
-            `shadowed_by`) or the merged result failed validation and was discarded. A dict
-            value is judged leaf by leaf, so False means at least one leaf it wrote did not
-            take effect, not necessarily all of them.
+            the write reached disk without becoming the value in effect; `reason` says why. A
+            dict value is judged leaf by leaf, so False means at least one leaf it wrote did
+            not take effect, not necessarily all of them.
         effective_value: What `GetConfigValueRequest` for this same key would return right
             now, after this write. Equal to the requested value when `applied` is True.
-        shadowed_by: The layer that won instead, when `applied` is False. None when `applied`
-            is True, and also None when `applied` is False because validation rejected the
-            value rather than because a layer outranked it. `result_details` names the key
-            that did not change and explains which case it was.
+        shadowed_by: The layer that won instead. Set only when `reason` is "shadowed"; None
+            otherwise, including for the other two unapplied reasons, which no layer causes.
+        reason: Why the write is not in effect, or None when `applied` is True. Prefer this
+            over inferring from `shadowed_by`: a null `shadowed_by` alone cannot tell a
+            deferred write from a refused one. `result_details` carries the same distinction
+            as user-facing prose.
     """
 
     applied: bool = True
     effective_value: Any = None
     shadowed_by: ConfigValueSource | None = None
+    reason: ConfigWriteUnappliedReason | None = None
 
 
 @dataclass
@@ -270,11 +286,14 @@ class SetConfigCategoryResultSuccess(ResultPayloadSuccess):
             category. Always None (default) for a full-config replacement.
         shadowed_by: See `SetConfigValueResultSuccess.shadowed_by`. Always None (default)
             for a full-config replacement.
+        reason: See `SetConfigValueResultSuccess.reason`. Always None (default) for a
+            full-config replacement.
     """
 
     applied: bool = True
     effective_value: Any = None
     shadowed_by: ConfigValueSource | None = None
+    reason: ConfigWriteUnappliedReason | None = None
 
 
 @dataclass
