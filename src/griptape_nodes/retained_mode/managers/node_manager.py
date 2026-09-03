@@ -16,6 +16,7 @@ from griptape_nodes.common.strict_mode import (
     StrictModeScopeKind,
     StrictModeSeverity,
 )
+from griptape_nodes.common.strict_mode_checks import RULES
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -1920,6 +1921,11 @@ class NodeManager(EngineScoped):
             details = f"Couldn't add parameter with name {request.parameter_name} to Node '{node_name}'. Error: {e}"
             return AddParameterToNodeResultFailure(result_details=details)
 
+        # Re-bind trait callbacks now that the parameter is attached: a saved callback names
+        # a method on the owning node, which the parameter can only reach once it has one.
+        if request.traits:
+            NodeManager._apply_trait_callbacks(new_param, request.traits)
+
         details = f"Successfully added Parameter '{final_param_name}' to Node '{node_name}'."
         log_level = logging.DEBUG
         if final_param_name != requested_parameter_name:
@@ -2274,7 +2280,10 @@ class NodeManager(EngineScoped):
             if request.tooltip_as_output is not None:
                 parameter.tooltip_as_output = request.tooltip_as_output
             if request.traits is not None:
+                # An altered parameter is already attached to its node, so state and
+                # callbacks can both be restored here.
                 NodeManager._apply_trait_states(parameter, request.traits)
+                NodeManager._apply_trait_callbacks(parameter, request.traits)
         if request.ui_options is not None and hasattr(parameter, "ui_options"):
             parameter.ui_options = request.ui_options  # type: ignore[attr-defined]
 
@@ -3716,6 +3725,7 @@ class NodeManager(EngineScoped):
                     # the trait regenerates its own on load.
                     param_dict["ui_options"] = parameter.authored_ui_options()
                     param_dict["traits"] = parameter.trait_states()
+                    NodeManager._report_unsaveable_callbacks(parameter)
                     add_param_request = AddParameterToNodeRequest.create(**param_dict)
                     element_modification_commands.append(add_param_request)
                 elif isinstance(node, ErrorProxyNode):
@@ -4330,6 +4340,30 @@ class NodeManager(EngineScoped):
         )
 
     @staticmethod
+    def _report_unsaveable_callbacks(parameter: Parameter) -> None:
+        """Warn about callbacks on this parameter that saving cannot record.
+
+        Called while serializing a run-time parameter, which is the moment the loss
+        happens: a lambda or closure has no method name to write down, so the control comes
+        back inert. A declared parameter is exempt because its node's ``__init__`` rebuilds
+        the callback on load.
+        """
+        owner = parameter.get_node()
+        rule = RULES["callback-cannot-be-saved"]
+        for trait in parameter.find_elements_by_type(Trait):
+            unnameable = trait.unnameable_callbacks(owner)
+            if not unnameable:
+                continue
+            STRICT_MODE.report(
+                rule_id=rule.rule_id,
+                message=rule.render(
+                    parameter_name=parameter.name,
+                    trait_name=type(trait).__name__,
+                    callback_names=", ".join(unnameable),
+                ),
+            )
+
+    @staticmethod
     def _apply_trait_states(parameter: Parameter, trait_states: list[dict[str, Any]]) -> None:
         """Restore saved trait state onto a parameter.
 
@@ -4338,6 +4372,9 @@ class NodeManager(EngineScoped):
         with no counterpart on the parameter is built fresh. An unresolvable trait name is
         logged and skipped: the parameter loses that trait's behavior, which is worth
         saying out loud rather than failing the whole load.
+
+        Callbacks are handled separately by ``_apply_trait_callbacks``, which has to run
+        after the parameter is attached to its node.
         """
         existing_by_class = {type(trait).__name__: trait for trait in parameter.find_elements_by_type(Trait)}
         for entry in trait_states:
@@ -4359,6 +4396,28 @@ class NodeManager(EngineScoped):
                 )
                 continue
             parameter.add_trait(trait_class.from_state(state))
+
+    @staticmethod
+    def _apply_trait_callbacks(parameter: Parameter, trait_states: list[dict[str, Any]]) -> None:
+        """Re-bind saved trait callbacks to methods on the parameter's node.
+
+        Separate from ``_apply_trait_states`` because a saved callback is the name of a
+        method on the owning node, so the parameter has to be attached before the name can
+        be resolved.
+
+        A callback the node's ``__init__`` already supplied is left alone by
+        ``apply_callback_names``: live code beats a saved name.
+        """
+        owner = parameter.get_node()
+        traits_by_class = {type(trait).__name__: trait for trait in parameter.find_elements_by_type(Trait)}
+        for entry in trait_states:
+            callback_names = entry.get("trait_callbacks")
+            if not callback_names:
+                continue
+            trait = traits_by_class.get(entry.get("trait_name", ""))
+            if trait is None:
+                continue
+            trait.apply_callback_names(callback_names, owner)
 
     @staticmethod
     def _manage_alter_details(parameter: Parameter, base_node_obj: BaseNode) -> dict:

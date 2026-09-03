@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, NamedTuple, Self, Type
 
 from pydantic import BaseModel
 
+from griptape_nodes.exe_types.callback_binding import is_derived_from_state, name_callback, resolve_callback
+
 logger = logging.getLogger("griptape_nodes")
 
 
@@ -1763,16 +1765,27 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         return our_dict
 
     def trait_states(self) -> list[dict[str, Any]]:
-        """Return trait identity plus the state needed to rebuild each one.
+        """Return trait identity, the state needed to rebuild each one, and its callbacks.
 
         Deliberately not folded into ``to_dict()``: that dict is also the
-        GUI event payload, and trait state is save-only. ``children`` already carries trait
+        GUI event payload, and this is save-only. ``children`` already carries trait
         dicts, but they hold rendered ui_options rather than constructor arguments.
+
+        Callbacks are recorded as the name of a method on the owning node, never as the
+        callback itself. A trait with no nameable callbacks omits the key.
         """
-        return [
-            {"trait_name": type(trait).__name__, "trait_state": trait.to_state()}
-            for trait in self.find_elements_by_type(Trait)
-        ]
+        owner = self.get_node()
+        states: list[dict[str, Any]] = []
+        for trait in self.find_elements_by_type(Trait):
+            state: dict[str, Any] = {
+                "trait_name": type(trait).__name__,
+                "trait_state": trait.to_state(),
+            }
+            callback_names = trait.callback_names(owner)
+            if callback_names:
+                state["trait_callbacks"] = callback_names
+            states.append(state)
+        return states
 
     def to_event(self, node: BaseNode) -> dict:
         event_dict = self.to_dict()
@@ -3236,6 +3249,56 @@ class Trait(ABC, BaseNodeElement):
         """
         for name, value in state.items():
             setattr(self, self.STATE_ALIASES.get(name, name), value)
+
+    def callback_names(self, owner: BaseNode | None) -> dict[str, str]:
+        """Return each attached callback as the name of a method on ``owner``.
+
+        Covers the ``STATE_EXCLUDE`` parameters, which is where a trait declares the
+        arguments that are behavior rather than state. A callback that cannot be named is
+        omitted; ``unnameable_callbacks`` reports those.
+        """
+        names: dict[str, str] = {}
+        for parameter_name in self.STATE_EXCLUDE:
+            callback = getattr(self, self.STATE_ALIASES.get(parameter_name, parameter_name), None)
+            name = name_callback(callback, owner)
+            if name is not None:
+                names[parameter_name] = name
+        return names
+
+    def unnameable_callbacks(self, owner: BaseNode | None) -> list[str]:
+        """Return the parameter names holding a callback that cannot be saved.
+
+        A lambda, a closure, or a function belonging to something other than the owning
+        node has no name to resolve on load, so it would be silently lost.
+        """
+        unnameable: list[str] = []
+        for parameter_name in sorted(self.STATE_EXCLUDE):
+            attribute_name = self.STATE_ALIASES.get(parameter_name, parameter_name)
+            callback = getattr(self, attribute_name, None)
+            if callback is None:
+                continue
+            if is_derived_from_state(callback):
+                continue
+            if name_callback(callback, owner) is None:
+                unnameable.append(parameter_name)
+        return unnameable
+
+    def apply_callback_names(self, names: dict[str, str], owner: BaseNode | None) -> None:
+        """Re-bind saved callback names to ``owner``'s methods.
+
+        A callback already present is left alone. On a freshly rebuilt trait nothing is
+        present, so every saved name binds; on a trait the node's ``__init__`` just built,
+        the constructor's wiring wins, which is what a node that rewired a button in a new
+        version should get.
+        """
+        for parameter_name, method_name in names.items():
+            attribute_name = self.STATE_ALIASES.get(parameter_name, parameter_name)
+            if getattr(self, attribute_name, None) is not None:
+                continue
+            described_as = f"the '{parameter_name}' behavior of the '{type(self).__name__}' control"
+            callback = resolve_callback(method_name, owner, described_as=described_as)
+            if callback is not None:
+                setattr(self, attribute_name, callback)
 
     @classmethod
     def _state_parameter_names(cls) -> list[str]:

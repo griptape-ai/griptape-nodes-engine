@@ -2,6 +2,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar, Literal, get_args
 
+from griptape_nodes.exe_types.callback_binding import mark_derived_from_state
 from griptape_nodes.exe_types.core_types import NodeMessagePayload, NodeMessageResult, Trait
 
 if TYPE_CHECKING:
@@ -82,8 +83,13 @@ class SetButtonStatusMessagePayload(NodeMessagePayload):
 
 @dataclass(eq=False)
 class Button(Trait):
-    # The two callbacks are behavior, not state, so they are never saved.
+    # The two callbacks are behavior, not state, so they are never saved as state. They are
+    # carried by method name instead, which is why they still need an attribute mapping.
     STATE_EXCLUDE: ClassVar[frozenset[str]] = frozenset({"on_click", "get_button_state"})
+    STATE_ALIASES: ClassVar[dict[str, str]] = {
+        "on_click": "on_click_callback",
+        "get_button_state": "get_button_state_callback",
+    }
 
     # Specific callback types for better type safety and clarity
     type OnClickCallback = Callable[[Button, ButtonDetailsMessagePayload], NodeMessageResult | None]
@@ -179,7 +185,8 @@ class Button(Trait):
                 altered_workflow_state=False,
             )
 
-        return handler
+        # Rebuilt from button_link, which is saved as state, so this handler needs no name.
+        return mark_derived_from_state(handler)
 
     @classmethod
     def get_trait_keys(cls) -> list[str]:
