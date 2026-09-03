@@ -602,7 +602,12 @@ class TestCurrentWorkflowChangedNotification:
         context_manager.pop_workflow()
 
     def test_set_current_workflow_name_notifies(self, engine: Engine) -> None:
-        """A Save As / Move that rekeys the open workflow reports its new registry key."""
+        """Rekeying the open workflow through this primitive reports its new registry key.
+
+        Drives the primitive, not a handler. Move is the caller that reaches it
+        (`on_move_workflow_request`); the handler-level behavior of rename and first-save is
+        pinned in test_workflow_manager.py, because those two do not come through here.
+        """
         context_manager = engine.context_manager
         context_manager.push_workflow(workflow_name="before_rename")
 
@@ -648,6 +653,73 @@ class TestCurrentWorkflowChangedNotification:
 
         assert isinstance(result, SetWorkflowContextSuccess)
         assert self._notified_workflow_names(put_event) == ["requested_workflow"]
+
+        context_manager.pop_workflow()
+
+    def test_dedupe_is_against_the_last_notification_not_everything_ever_seen(self, engine: Engine) -> None:
+        """Leaving a workflow and coming back is a real change, even though the name repeats.
+
+        Pins the meaning of the dedupe field: it holds the name clients were told last, not a
+        set of names already broadcast. Were it the latter, an artist reopening the workflow
+        they just closed would get no event and every editor would keep showing an empty canvas.
+        """
+        context_manager = engine.context_manager
+
+        with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
+            context_manager.push_workflow(workflow_name="revisited_workflow")
+            context_manager.pop_workflow()
+            context_manager.push_workflow(workflow_name="revisited_workflow")
+
+        assert self._notified_workflow_names(put_event) == ["revisited_workflow", None, "revisited_workflow"]
+
+        context_manager.pop_workflow()
+
+    def test_rekey_workflow_notifies_when_the_current_workflow_is_the_one_rekeyed(self, engine: Engine) -> None:
+        """The first save of a scratch workflow changes its key, and clients hear the new one."""
+        context_manager = engine.context_manager
+        context_manager.push_workflow(workflow_name="unsaved:abc-123")
+
+        with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
+            context_manager.rekey_workflow(
+                old_name="unsaved:abc-123", new_name="my_flow", new_file_path="/workspace/my_flow.py"
+            )
+
+        assert self._notified_workflow_names(put_event) == ["my_flow"]
+        assert context_manager.get_current_workflow_name() == "my_flow"
+        # The retained path moves with the key; `workflow_dir` answers from it.
+        assert context_manager.get_current_workflow_file_path() == "/workspace/my_flow.py"
+
+        context_manager.pop_workflow()
+
+    def test_rekey_workflow_stays_quiet_when_only_a_buried_entry_matches(self, engine: Engine) -> None:
+        """Saving a workflow that something else is nested on top of does not change what is current."""
+        context_manager = engine.context_manager
+        context_manager.push_workflow(workflow_name="unsaved:buried")
+        context_manager.push_workflow(workflow_name="nested_on_top")
+
+        with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
+            context_manager.rekey_workflow(
+                old_name="unsaved:buried", new_name="saved_below", new_file_path="/workspace/saved_below.py"
+            )
+
+        assert self._notified_workflow_names(put_event) == []
+        assert context_manager.get_current_workflow_name() == "nested_on_top"
+        # Buried or not, the entry was still rekeyed -- popping back to it uncovers the new name.
+        context_manager.pop_workflow()
+        assert context_manager.get_current_workflow_name() == "saved_below"
+
+        context_manager.pop_workflow()
+
+    def test_rekey_workflow_matching_nothing_notifies_nothing(self, engine: Engine) -> None:
+        """Saving a workflow that is not in context at all is not a context change."""
+        context_manager = engine.context_manager
+        context_manager.push_workflow(workflow_name="untouched_workflow")
+
+        with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
+            context_manager.rekey_workflow(old_name="not_in_context", new_name="whatever", new_file_path=None)
+
+        assert self._notified_workflow_names(put_event) == []
+        assert context_manager.get_current_workflow_name() == "untouched_workflow"
 
         context_manager.pop_workflow()
 
