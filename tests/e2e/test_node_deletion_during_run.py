@@ -33,6 +33,7 @@ from griptape_nodes.exe_types.node_types import NodeResolutionState
 from griptape_nodes.retained_mode.events.base_events import ProgressEvent
 from griptape_nodes.retained_mode.events.execution_events import (
     ControlFlowCancelledEvent,
+    InvolvedNodesEvent,
     NodeUnresolvedEvent,
     ResolveNodeRequest,
     StartFlowRequest,
@@ -468,4 +469,64 @@ async def test_deleting_a_downstream_node_that_has_not_started_leaves_the_run_al
     assert not cancellations, "Deleting a not-yet-started downstream node cancelled a healthy run."
     assert producer.state is NodeResolutionState.RESOLVED
     assert producer.parameter_output_values.get("result") == "produced"
+    assert engine.flow_manager.check_for_existing_running_flow() is False
+
+
+@requires_fixture_library
+@pytest.mark.usefixtures("registered_library", "parallel_mode")
+@pytest.mark.asyncio
+async def test_deleting_a_settled_node_removes_it_from_the_live_dag(
+    tmp_path: Path,
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    create_node: Callable[..., str],
+    connect: Callable[..., None],
+) -> None:
+    """A node deleted mid-run must not be left behind in the scheduler's bookkeeping.
+
+    Deleting a node removes it from the flow, but for a long time nothing removed it from the DAG
+    the run is executing -- and that DAG is only emptied when the run tears down. A leftover entry
+    is not inert: it is published to the editor as a node involved in the run, it is iterated when
+    the run is cancelled, and it blocks a node of the same name from being started again.
+    """
+    flow_name = _new_flow(engine, "delete_settled_dag_hygiene_wf")
+    upstream_gate = tmp_path / "gates" / "upstream.gate"
+    downstream_gate = tmp_path / "gates" / "downstream.gate"
+
+    create_node(NODE_TYPE, "Upstream", flow_name, library_name=LIBRARY_NAME)
+    create_node(NODE_TYPE, "Downstream", flow_name, library_name=LIBRARY_NAME)
+    connect("Upstream", "result", "Downstream", "linked_text")
+    _configure(engine, "Upstream", text="from upstream", gate_file=upstream_gate)
+    _configure(engine, "Downstream", text="downstream default", gate_file=downstream_gate)
+
+    involved = _record_published(engine, monkeypatch, InvolvedNodesEvent, lambda payload: payload.involved_nodes)
+
+    run = asyncio.create_task(engine.ahandle_request(ResolveNodeRequest(node_name="Downstream")))
+
+    await _wait_until_resolving(engine, "Upstream")
+    _open_gate(upstream_gate)
+    await _wait_until_resolved(engine, "Upstream")
+    await _wait_until_resolving(engine, "Downstream")
+
+    dag_nodes = engine.flow_manager.global_dag_builder.node_to_reference
+    assert "Upstream" in dag_nodes, "Test setup is wrong: Upstream was never in the live DAG to begin with."
+
+    await _delete_node(engine, flow_name, "Upstream")
+
+    assert "Upstream" not in dag_nodes, (
+        "A deleted node was left in the live DAG, where it is still announced to the editor as part "
+        "of the run and still iterated when the run is cancelled."
+    )
+    for graph in engine.flow_manager.global_dag_builder.graphs.values():
+        assert "Upstream" not in graph.nodes()
+    for graph_node_names in engine.flow_manager.global_dag_builder.graph_to_nodes.values():
+        assert "Upstream" not in graph_node_names
+
+    involved_before_finish = len(involved)
+    _open_gate(downstream_gate)
+    await asyncio.wait_for(run, timeout=_RUN_TIMEOUT_SECONDS)
+
+    # Nothing published after the delete may still claim the deleted node is part of the run.
+    for involved_nodes in involved[involved_before_finish:]:
+        assert "Upstream" not in involved_nodes
     assert engine.flow_manager.check_for_existing_running_flow() is False
