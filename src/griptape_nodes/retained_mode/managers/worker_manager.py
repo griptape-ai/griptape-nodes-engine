@@ -4,6 +4,7 @@ import asyncio
 import functools
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -343,6 +344,26 @@ class WorkerManager(EngineScoped):
         # block buffer and from being lost on a crash.
         worker_environ["PYTHONUNBUFFERED"] = "1"
 
+        # PYTHONPATH precedes site-packages, making this library-first with the engine's own
+        # environment as the fallback. It must be the environment rather than a later sys.path
+        # splice: sys.modules never reconsiders a module this process has already imported.
+        execution_site_packages = self.engine.library_manager.execution_site_packages(worker_key)
+        if execution_site_packages is not None:
+            # Prepended, not assigned: a launcher-set PYTHONPATH (embedding hosts, source checkouts)
+            # is part of the environment the engine itself booted with, and dropping it only in
+            # exec-deps workers would lose those modules in exactly one process kind.
+            inherited_pythonpath = worker_environ.get("PYTHONPATH")
+            worker_environ["PYTHONPATH"] = (
+                execution_site_packages + os.pathsep + inherited_pythonpath
+                if inherited_pythonpath
+                else execution_site_packages
+            )
+            logger.debug(
+                "Worker for library '%s' will resolve imports from %s first",
+                worker_key,
+                execution_site_packages,
+            )
+
         # Hand the worker the URL of the static server the orchestrator is ALREADY serving
         # this workspace on. Without it the worker starts its own server, wins an arbitrary
         # OS-assigned port, and hands back asset URLs on that port -- which die when the
@@ -675,6 +696,10 @@ class WorkerManager(EngineScoped):
         if not session_id:
             logger.error("Session event set but no session ID available for library '%s'.", library_name)
             return
+        # The worker is handed its library's execution environment as PYTHONPATH, so that directory
+        # has to exist before the process starts. The orchestrator builds it in the background to
+        # keep a torch install off the boot path; this is where the two meet.
+        await self.engine.library_manager.wait_for_execution_env(library_name)
         args = [
             sys.executable,
             "-m",
