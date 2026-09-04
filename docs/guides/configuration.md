@@ -144,31 +144,52 @@ Here are a few scenarios to illustrate how configuration files are located and l
 
 ## Environment Variable Overrides
 
-A top-level configuration value can be set or overridden using an environment variable with the `GTN_CONFIG_` prefix. The key is the config setting name in uppercase:
+A configuration value can be set or overridden using an environment variable with the `GTN_CONFIG_` prefix. The key is the config setting name in uppercase:
 
 ```
 GTN_CONFIG_<SETTING_NAME>=<value>
 ```
 
+A nested setting (one that lives inside an object like `worker`, `agent`, or `library`) is reached with a double underscore (`__`) separating each level of the path, still uppercase:
+
+```
+GTN_CONFIG_<PARENT>__<SUB_KEY>=<value>
+```
+
+A double underscore is required rather than a single one because setting names already contain underscores. `GTN_CONFIG_WORKER_HEARTBEAT_TIMEOUT_S` would be ambiguous between a top-level setting named `worker_heartbeat_timeout_s` and `worker.heartbeat_timeout_s`. No setting name contains `__`, so it unambiguously marks where the path descends a level.
+
 Environment variable overrides have the **highest priority** — they win over user config files, project-adjacent config files, the per-project workspace override, and built-in defaults.
 
 Examples:
 
-| Setting               | Environment variable             |
-| --------------------- | -------------------------------- |
-| `workspace_directory` | `GTN_CONFIG_WORKSPACE_DIRECTORY` |
-| `libraries_directory` | `GTN_CONFIG_LIBRARIES_DIRECTORY` |
-| `project_file`        | `GTN_CONFIG_PROJECT_FILE`        |
-| `log_level`           | `GTN_CONFIG_LOG_LEVEL`           |
-| `storage_backend`     | `GTN_CONFIG_STORAGE_BACKEND`     |
+| Setting                      | Environment variable                     |
+| ---------------------------- | ---------------------------------------- |
+| `workspace_directory`        | `GTN_CONFIG_WORKSPACE_DIRECTORY`         |
+| `libraries_directory`        | `GTN_CONFIG_LIBRARIES_DIRECTORY`         |
+| `project_file`               | `GTN_CONFIG_PROJECT_FILE`                |
+| `log_level`                  | `GTN_CONFIG_LOG_LEVEL`                   |
+| `storage_backend`            | `GTN_CONFIG_STORAGE_BACKEND`             |
+| `worker.heartbeat_timeout_s` | `GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S` |
+| `library.lazy_node_loading`  | `GTN_CONFIG_LIBRARY__LAZY_NODE_LOADING`  |
+| `agent.system_prompt`        | `GTN_CONFIG_AGENT__SYSTEM_PROMPT`        |
 
 This is useful for scripted environments, containers, and CI/CD pipelines where you want to inject configuration without modifying any config files:
 
 ```bash
 GTN_CONFIG_PROJECT_FILE=/shared/studio-project.yml gtn
+GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S=30 gtn
+GTN_CONFIG_LIBRARY__LAZY_NODE_LOADING=false gtn
+GTN_CONFIG_AGENT__SYSTEM_PROMPT="Answer tersely." gtn
 ```
 
-> **Only top-level settings can be set this way.** `GTN_CONFIG_*` variables map to a single top-level config key; they cannot reach nested settings (anything under `app_events`, `worker`, or `agent`, such as `libraries_to_register`). To change a nested setting, edit a `griptape_nodes_config.json` file. The [Configuration Reference](../reference/configuration_reference.md) marks which settings have an environment variable.
+A value is converted to the setting's declared type before it takes effect, so `false` for a boolean setting means `False` (not the truthy string `"false"`), and `30` for a number setting means the number `30`, not text. That conversion does not reach an entry in a mapping-valued setting, such as `GTN_CONFIG_ARTIFACTS__SOME_KEY`: its value is typed to accept anything, so it arrives exactly as written, and a boolean or numeric mapping entry needs a config file instead.
+
+> **Two limits:**
+>
+> 1. **List-valued settings, and any case-sensitive key.** A list has no string form the `Settings` model accepts, so a setting that holds a list, such as `app_events.on_app_initialization_complete.libraries_to_register` or `mcp_servers`, cannot be set from the environment. A *mapping*-valued setting is different: an entry can be set with `GTN_CONFIG_<NAME>__<KEY>=<value>`, e.g. `GTN_CONFIG_ARTIFACTS__SOME_KEY=1`. But the whole variable name is lowercased before it becomes a config key, so this only reaches an entry whose key is already lowercase. That makes `artifacts` usable this way, but makes `project_workspaces` (keys are case-sensitive project IDs or file paths) and `secrets_to_register` (uppercase secret names) unreliable in practice, and makes a case-sensitive path outside any declared setting, such as `nodes.<LibraryName>.<SECRET_NAME>`, unreachable outright. Edit a `griptape_nodes_config.json` file for any of these.
+> 1. **An unparsable value usually falls back to the config files. Four settings don't.** A value that doesn't fit a setting's type (e.g. `GTN_CONFIG_MAX_NODES_IN_PARALLEL=not-a-number`) is ignored with a warning, and the config-file layers supply the value instead. `log_level`, `workflow_execution_mode`, `thread_storage_backend`, and `library.dependency_install_behavior` are the exception: an unrecognized value for one of these silently becomes that setting's built-in default, with no warning and no config-file fallback.
+>
+> The [Configuration Reference](../reference/configuration_reference.md) lists the exact environment variable for every setting that has one, including the full `__` path for each nested sub-key.
 
 ### Recursive Discovery Depth (`discovery_max_depth`)
 
