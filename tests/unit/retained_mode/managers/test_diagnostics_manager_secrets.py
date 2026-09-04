@@ -16,7 +16,7 @@ key was found in, in the order the engine searches them, and which one actually 
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 from unittest.mock import Mock
 
 import pytest
@@ -30,7 +30,6 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from griptape_nodes.common.diagnostics.report import SecretDiagnostics
-    from griptape_nodes.retained_mode.engine import Engine
 
 # The name of a secret, which is exactly what this section is allowed to report.
 _SECRET_NAME = "GTN_TEST_DIAGNOSTICS_KEY"  # noqa: S105
@@ -116,7 +115,7 @@ def layout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Layout:
     engine.config_manager.get_config_value.side_effect = _config_reader({SECRETS_TO_REGISTER_KEY: {}})
     engine.secrets_manager.workspace_env_path = workspace_env
 
-    manager = DiagnosticsManager(Mock(), engine=cast("Engine", engine))
+    manager = DiagnosticsManager(Mock(), engine=engine)
     return _Layout(manager, engine)
 
 

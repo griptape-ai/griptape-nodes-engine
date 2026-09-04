@@ -13,7 +13,7 @@ a missing workspace is exactly the thing these checks are collected to report.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Self, cast
+from typing import TYPE_CHECKING, Self
 from unittest.mock import Mock, patch
 
 import pytest
@@ -27,8 +27,6 @@ from griptape_nodes.retained_mode.managers.diagnostics_manager import Diagnostic
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-
-    from griptape_nodes.retained_mode.engine import Engine
 
 _MODULE = "griptape_nodes.retained_mode.managers.diagnostics_manager"
 _BUNDLE_NAME = "griptape-nodes-diagnostics-0.1.0-20260101.zip"
@@ -57,7 +55,7 @@ class _UnwritableBundle:
 @pytest.fixture
 def manager() -> DiagnosticsManager:
     """A manager with a stand-in engine, since these paths never reach one."""
-    return DiagnosticsManager(Mock(), engine=cast("Engine", Mock()))
+    return DiagnosticsManager(Mock(), engine=Mock())
 
 
 def _destination(manager: DiagnosticsManager, output_path: str) -> Path:
@@ -153,7 +151,7 @@ class TestCollectFailsCleanly:
     ) -> None:
         engine = Mock()
         engine.config_manager.log_directory = tmp_path
-        manager = DiagnosticsManager(Mock(), engine=cast("Engine", engine))
+        manager = DiagnosticsManager(Mock(), engine=engine)
         request = CollectDiagnosticsRequest(
             include_current_workflow=False, include_health_checks=False, output_path=str(tmp_path)
         )
@@ -175,7 +173,7 @@ class TestCollectFailsCleanly:
         """Read by someone who is already troubleshooting something else."""
         engine = Mock()
         engine.config_manager.log_directory = tmp_path
-        manager = DiagnosticsManager(Mock(), engine=cast("Engine", engine))
+        manager = DiagnosticsManager(Mock(), engine=engine)
         request = CollectDiagnosticsRequest(
             include_current_workflow=False, include_health_checks=False, output_path=str(tmp_path)
         )
@@ -195,7 +193,7 @@ class TestCloudApiKey:
     def test_returns_the_key_the_connection_check_needs(self) -> None:
         engine = Mock()
         engine.secrets_manager.get_secret.return_value = "a-key"
-        manager = DiagnosticsManager(Mock(), engine=cast("Engine", engine))
+        manager = DiagnosticsManager(Mock(), engine=engine)
 
         assert manager._cloud_api_key() == "a-key"
 
@@ -205,7 +203,7 @@ class TestCloudApiKey:
         """Reading a secret resolves the workspace, which is what these checks report on."""
         engine = Mock()
         engine.secrets_manager.get_secret.side_effect = OSError("the workspace directory is gone")
-        manager = DiagnosticsManager(Mock(), engine=cast("Engine", engine))
+        manager = DiagnosticsManager(Mock(), engine=engine)
 
         with caplog.at_level("WARNING", logger="griptape_nodes"):
             key = manager._cloud_api_key()
@@ -226,7 +224,7 @@ class TestCloudApiKey:
         engine.secrets_manager.get_secret.side_effect = UnicodeDecodeError(
             "utf-8", b"a-value-\xe9", 8, 9, "invalid continuation byte"
         )
-        manager = DiagnosticsManager(Mock(), engine=cast("Engine", engine))
+        manager = DiagnosticsManager(Mock(), engine=engine)
 
         with caplog.at_level("WARNING", logger="griptape_nodes"):
             key = manager._cloud_api_key()

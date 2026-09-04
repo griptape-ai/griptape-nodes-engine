@@ -15,7 +15,7 @@ logged yet — and naming the wrong one sends someone to change a setting that i
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 from unittest.mock import Mock, patch
 
 from griptape_nodes.common.diagnostics.redaction import Redactor
@@ -30,8 +30,6 @@ from griptape_nodes.retained_mode.managers.settings import (
 if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
-
-    from griptape_nodes.retained_mode.engine import Engine
 
 _MODULE = "griptape_nodes.retained_mode.managers.diagnostics_manager"
 
@@ -68,7 +66,7 @@ def _manager(
             "log_level": "INFO",
         }
     )
-    return DiagnosticsManager(Mock(), engine=cast("Engine", engine))
+    return DiagnosticsManager(Mock(), engine=engine)
 
 
 def _redactor() -> Redactor:
