@@ -186,6 +186,28 @@ clashing heavy pins can still be edited side by side.
 Declaring no `pip_dependencies_exec` is always safe: the library
 behaves exactly as it did before the split existed.
 
+#### What declaring execution dependencies changes
+
+A library that declares them runs differently, in three ways:
+
+- **Its nodes execute in the library's own process.** The main
+    engine can show, edit, and save them (it has the edit-time
+    dependencies), but running them happens where the heavy
+    packages live. If that process isn't up yet, running the node
+    reports that rather than failing strangely.
+- **Node code asks the engine for state instead of reading it.**
+    Inside `process()`, reaching for a manager directly (config,
+    secrets, files) raises an error telling you the request to use
+    instead. The library's process holds no settings or secrets of
+    its own, so a direct read would be answering from the wrong
+    place. Saving static files still works normally.
+- **Values that can't leave the process must stay inside it.** If a
+    node outputs something marked `serializable=False` (a live
+    model handle, a tensor), you'll get an error explaining the two
+    ways forward: make the value serializable, or keep it inside
+    the library by caching it library-side and outputting a small
+    descriptor that the next node trades back.
+
 ### Process isolation: the Isolated mode
 
 Running a library **Isolated** (in its own dedicated process,
