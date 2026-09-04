@@ -709,6 +709,124 @@ class TestProjectManagerBuiltinVariables:
         assert "project_name not yet implemented" in str(result.result_details)
 
     @patch("griptape_nodes.retained_mode.managers.project_manager.WorkflowRegistry")
+    def test_mirrored_workflow_context_resolves_the_lenders_folder(
+        self,
+        mock_workflow_registry: Mock,
+        project_manager_with_template: ProjectManager,
+    ) -> None:
+        """After adopting a peer's context, workflow builtins resolve through the NORMAL path.
+
+        Unadopted, a worker's resolver raises, the optional `{workflow_dir?:/}` in the default
+        `{outputs}` template swallows it, and the path degrades to workspace-relative -- so the
+        worker writes where the orchestrator does not read, with no error at the divergence.
+        """
+        from griptape_nodes.common.macro_parser import ParsedMacro
+        from griptape_nodes.retained_mode.managers.context_manager import ContextManager
+
+        # A real ContextManager with an empty stack: exactly a worker before adopting.
+        context_manager = ContextManager(event_manager=MagicMock(), engine=MagicMock())
+        project_manager_with_template._engine = MagicMock()
+        project_manager_with_template._engine.context_manager = context_manager
+
+        dir_request = GetPathForMacroRequest(parsed_macro=ParsedMacro("{workflow_dir}/output.txt"), variables={})
+        name_request = GetPathForMacroRequest(parsed_macro=ParsedMacro("{workflow_name}.txt"), variables={})
+
+        # Unadopted: the folder is unresolvable, which is what silently degrades the path.
+        assert not isinstance(
+            project_manager_with_template.on_get_path_for_macro_request(dir_request),
+            GetPathForMacroResultSuccess,
+        )
+
+        context_manager.mirror_workflow_context("my_show", "/orchestrator/shows/my_show/my_show.py", None)
+
+        resolved_dir = project_manager_with_template.on_get_path_for_macro_request(dir_request)
+        resolved_name = project_manager_with_template.on_get_path_for_macro_request(name_request)
+
+        assert isinstance(resolved_dir, GetPathForMacroResultSuccess)
+        assert resolved_dir.resolved_path == Path("/orchestrator/shows/my_show/output.txt")
+        # workflow_name is the same defect, fixed by the same adoption rather than a second handoff.
+        assert isinstance(resolved_name, GetPathForMacroResultSuccess)
+        assert resolved_name.resolved_path.name == "my_show.txt"
+        mock_workflow_registry.get_workflow_by_name.assert_not_called()
+
+    def test_mirroring_keeps_the_stack_indexable(self) -> None:
+        """Adoption installs a REAL entry, so stack-indexing readers stay safe.
+
+        `has_current_workflow()` also means "there is an entry to index", so answering it True
+        without one raises IndexError in has_current_flow, push_flow, pop_flow and the setters.
+        """
+        from griptape_nodes.retained_mode.managers.context_manager import ContextManager
+
+        context_manager = ContextManager(event_manager=MagicMock(), engine=MagicMock())
+        context_manager.mirror_workflow_context("w", "/a/b/w.py", None)
+
+        assert context_manager.has_current_workflow() is True
+        assert context_manager.has_current_flow() is False
+        assert context_manager.get_current_workflow_name() == "w"
+        assert context_manager.get_current_workflow_file_path() == "/a/b/w.py"
+
+    def test_mirroring_replaces_rather_than_stacks(self) -> None:
+        """A mirror tracks ONE peer context; stacking would leave a stale workflow to be read."""
+        from griptape_nodes.retained_mode.managers.context_manager import ContextManager
+
+        context_manager = ContextManager(event_manager=MagicMock(), engine=MagicMock())
+        context_manager.mirror_workflow_context("first", "/a/first.py", None)
+        context_manager.mirror_workflow_context("second", "/b/second.py", None)
+        # Re-adopting the same context must not grow the stack either.
+        context_manager.mirror_workflow_context("second", "/b/second.py", None)
+
+        assert len(context_manager._workflow_stack) == 1
+        assert context_manager.get_current_workflow_name() == "second"
+
+    def test_mirroring_an_empty_context_drops_the_previous_one(self) -> None:
+        """A peer with no workflow must leave this engine with none either.
+
+        The mirror is replaced in place and never popped, so skipping the empty case left the
+        previous execution's workflow installed: the worker resolved `{workflow_dir}` to that
+        folder while the orchestrator degraded to workspace-relative, and wrote a real file
+        where the orchestrator does not read.
+        """
+        from griptape_nodes.retained_mode.managers.context_manager import ContextManager
+
+        context_manager = ContextManager(event_manager=MagicMock(), engine=MagicMock())
+        context_manager.mirror_workflow_context("showA", "/a/showA.py", None)
+
+        context_manager.mirror_workflow_context(None, None, None)
+
+        assert context_manager.has_current_workflow() is False
+
+    def test_dispatch_snapshot_is_empty_when_there_is_no_workflow(
+        self,
+        project_manager_with_template: ProjectManager,
+    ) -> None:
+        """Nothing to lend, so the peer must drop any mirror it holds and degrade identically."""
+        mock_context_manager = Mock()
+        mock_context_manager.has_current_workflow.return_value = False
+        project_manager_with_template._engine = MagicMock()
+        project_manager_with_template._engine.context_manager = mock_context_manager
+
+        assert project_manager_with_template.workflow_context_for_dispatch().name is None
+
+    def test_dispatch_snapshot_carries_the_whole_context(
+        self,
+        project_manager_with_template: ProjectManager,
+    ) -> None:
+        """Raw context, not a resolved path: derived values are then computed by the peer."""
+        mock_context_manager = Mock()
+        mock_context_manager.has_current_workflow.return_value = True
+        mock_context_manager.get_current_workflow_name.return_value = "my_show"
+        mock_context_manager.get_current_workflow_file_path.return_value = "/shows/my_show/my_show.py"
+        mock_context_manager.get_current_workflow_working_directory.return_value = "/shows/my_show"
+        project_manager_with_template._engine = MagicMock()
+        project_manager_with_template._engine.context_manager = mock_context_manager
+
+        snapshot = project_manager_with_template.workflow_context_for_dispatch()
+
+        assert snapshot.name == "my_show"
+        assert snapshot.file_path == "/shows/my_show/my_show.py"
+        assert snapshot.working_directory == "/shows/my_show"
+
+    @patch("griptape_nodes.retained_mode.managers.project_manager.WorkflowRegistry")
     def test_builtin_workflow_dir_resolves_correctly(
         self,
         mock_workflow_registry: Mock,
