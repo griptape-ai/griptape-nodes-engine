@@ -11524,16 +11524,14 @@ class TestImportProject:
         """Path-typed request fields arriving as wire strings round-trip cleanly.
 
         project_events declares destination_path/archive_path/target_directory as
-        Path. Over the WebSocket they arrive as plain JSON strings. Because
-        project_events imports Path at runtime, cattrs coerces those fields to Path
-        for the preview/import requests (verified below). ExportProjectRequest is
-        the exception: it also carries project_id: ProjectID, a TYPE_CHECKING-only
-        forward reference (project_events cannot import project_manager at runtime
-        without a cycle), so get_type_hints() raises NameError for the whole class
-        and cattrs falls back to a no-coercion structure. destination_path stays a
-        str there, so on_export_project_request coerces it at the boundary. Either
-        way the handler must not crash on a wire string; this exercises the real
-        converter path end to end.
+        Path. Over the WebSocket they arrive as plain JSON strings, and cattrs
+        coerces them to Path for every request here -- including
+        ExportProjectRequest, whose project_id: ProjectID annotation used to be a
+        TYPE_CHECKING-only forward reference that made get_type_hints() raise for
+        the whole class and dropped it to a no-coercion structure. ProjectID now
+        lives in project_events at runtime (pydantic consumers need the name
+        resolvable too), so the exception is gone. The handler still coerces at
+        the boundary, which keeps it safe for any payload that arrives unconverted.
         """
         from griptape_nodes.retained_mode.events.event_converter import converter
         from griptape_nodes.retained_mode.events.project_events import (
@@ -11557,8 +11555,8 @@ class TestImportProject:
             {"project_id": load_result.project_id, "destination_path": str(destination)},
             ExportProjectRequest,
         )
-        # ProjectID forward ref blocks coercion for this class; the field stays str.
-        assert isinstance(export_request.destination_path, str)
+        # ProjectID resolves at runtime now, so this class coerces like the others.
+        assert isinstance(export_request.destination_path, Path)
         export_result = pm.on_export_project_request(export_request)
         assert isinstance(export_result, ExportProjectResultSuccess)
 
