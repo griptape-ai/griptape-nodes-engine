@@ -45,6 +45,7 @@ from griptape_nodes.retained_mode.events.execution_events import (
     CancelExecuteNodeRequest,
     ExecuteNodeRequest,
 )
+from griptape_nodes.retained_mode.events.library_events import ReloadAllLibrariesRequest
 from griptape_nodes.retained_mode.events.parameter_events import MigrateParameterRequest
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.events.project_events import (
@@ -202,6 +203,13 @@ LOCAL_ONLY_REQUEST_TYPES: frozenset[type[RequestPayload]] = frozenset(
         ReloadConfigRequest,
         RefreshSecretsRequest,
         ActivateProjectRequest,
+        # Adopting a project reloads this worker's libraries, and that reload must stay here. The
+        # orchestrator decides WHEN libraries reload -- it is mid-reload already, which is what sent
+        # the activation -- so forwarding would have the worker dictate to it. Worse, the
+        # orchestrator's pre-reload callback is reset_workers, which terminates the very worker that
+        # asked, mid-node. Reached because in_node_execution() is a process-wide refcount, so a
+        # reload dispatched by a broadcast handler forwards whenever any node happens to be running.
+        ReloadAllLibrariesRequest,
         # Two requests carry a live Python object in a field, and both were local under the
         # allowlist this exclusion list replaces -- the flip is what started forwarding them.
         # `_registers_a_python_class` does not catch either: it matches a `type[...]` annotation,

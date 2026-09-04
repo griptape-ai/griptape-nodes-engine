@@ -23,6 +23,8 @@ import pytest
 
 from griptape_nodes.app.worker_routing import (
     LOCAL_ONLY_REQUEST_TYPES,
+    ActivateProjectRequest,
+    ReloadAllLibrariesRequest,
     RemoteHandler,
     register_remote_handlers,
 )
@@ -178,6 +180,17 @@ class TestInstallRemoteHandlersSwap:
             assert event_manager.get_manager_for_request_type(request_type) is original, (
                 f"{request_type.__name__} must not be forwarded"
             )
+
+    def test_a_project_activation_and_the_reload_it_causes_are_both_local(self) -> None:
+        """The orchestrator decides when libraries reload; a worker must not ask it to.
+
+        Adopting a project reloads the worker's libraries, and that dispatch goes through the bus.
+        Forwarded, it reaches the orchestrator's pre-reload callback -- reset_workers -- which
+        terminates the worker that asked, mid-node. The pair has to stay local together: making the
+        activation local while its consequence forwards is the same defect with an extra hop.
+        """
+        assert ActivateProjectRequest in LOCAL_ONLY_REQUEST_TYPES
+        assert ReloadAllLibrariesRequest in LOCAL_ONLY_REQUEST_TYPES
 
     def test_unregistered_types_are_skipped_without_error(self) -> None:
         """Nothing to swap is not a bootstrap failure: only registered types are touched.
