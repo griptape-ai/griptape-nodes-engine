@@ -3086,7 +3086,7 @@ class LibraryManager(EngineScoped):
             if isinstance(result, ListCompatibleResourceInstancesResultSuccess) and not result.instance_ids:
                 system_capabilities = self._get_system_capabilities()
                 logger.warning(
-                    "Library '%s' OS requirements not met. Required: %s, System: %s",
+                    "Library '%s' required OS resources not met. Wanted: %s, System: %s",
                     library_name,
                     os_requirements,
                     system_capabilities,
@@ -3107,7 +3107,7 @@ class LibraryManager(EngineScoped):
             if isinstance(result, ListCompatibleResourceInstancesResultSuccess) and not result.instance_ids:
                 system_capabilities = self._get_system_capabilities()
                 logger.warning(
-                    "Library '%s' compute requirements not met. Required: %s, System: %s",
+                    "Library '%s' required compute resources not met. Wanted: %s, System: %s",
                     library_name,
                     compute_requirements,
                     system_capabilities,
@@ -5073,7 +5073,6 @@ class LibraryManager(EngineScoped):
                 node_registered = self._register_node_eager(
                     node_definition, node_file_path, library, library_info, module_loaders
                 )
-
             if node_registered:
                 any_nodes_loaded_successfully = True
 
