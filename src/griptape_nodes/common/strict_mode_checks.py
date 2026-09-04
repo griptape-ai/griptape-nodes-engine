@@ -126,36 +126,6 @@ RULES: dict[str, StrictModeRule] = {
             "here only if __init__ or a value hook re-creates it."
         ),
     ),
-    "worker-reach-into-orchestrator": StrictModeRule(
-        rule_id="worker-reach-into-orchestrator",
-        default_severity=StrictModeSeverity.WARNING,
-        correctness=False,
-        description=(
-            "A node running on a worker issued a request whose "
-            "authoritative state lives on the orchestrator (flow "
-            "graph, connections, parameter registry, config, or "
-            "secrets). The request was forwarded to the orchestrator "
-            "over the WebSocket bus; each call is a network round-"
-            "trip and the returned view is stale-by-call. Events are "
-            "the sanctioned cross-side boundary, but authors are "
-            "often unaware they are paying for it. Detection runs at "
-            "the RemoteHandler dispatch site, which covers both input "
-            "hydration (before/after_value_set) and aprocess. "
-            "Violations issued from library-internal helper threads "
-            "(e.g. ThreadPoolExecutor inside diffusers/transformers) "
-            "are not reported because the strict-mode reporter is "
-            "task-local; the forward still proceeds normally."
-        ),
-        remediation_template=(
-            "Worker-side node issued '{request_type}' during node "
-            "execution. If this is an intentional write (e.g. "
-            "publishing a parameter value), ignore. If this is a read "
-            "of flow / connection state, consider whether the data "
-            "could be passed in via parameters instead of fetched "
-            "per-call."
-        ),
-        worker_escalation=False,
-    ),
     "connection-hooks-inert-on-worker": StrictModeRule(
         rule_id="connection-hooks-inert-on-worker",
         default_severity=StrictModeSeverity.WARNING,
