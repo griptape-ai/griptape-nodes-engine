@@ -74,6 +74,23 @@ class ResolvedStaticFilePath(NamedTuple):
     file_metadata: SidecarContent | None = None
 
 
+class PreviewResolution(NamedTuple):
+    """Outcome of resolving which file to serve for a preview-eligible request.
+
+    Attributes:
+        path_to_serve: The preview file when one was available or generated,
+            otherwise the original file.
+        artifact_metadata: Properties extracted from the source file header, when known.
+        preview_failure_reason: Why the preview could not be served, when
+            path_to_serve fell back to the original file despite a preview being
+            requested. None when the preview was served or none was requested.
+    """
+
+    path_to_serve: Path
+    artifact_metadata: dict | None = None
+    preview_failure_reason: str | None = None
+
+
 class StaticFilesManager(EngineScoped):
     """A class to manage the creation and management of static files."""
 
@@ -179,46 +196,66 @@ class StaticFilesManager(EngineScoped):
             raise RuntimeError(msg)
         return self._static_server_base_url
 
-    async def _generate_preview_if_needed(self, file_path: Path) -> tuple[Path, dict | None]:
+    async def _generate_preview_if_needed(
+        self, file_path: Path, source_macro_path: MacroPath | None = None
+    ) -> PreviewResolution:
         """Generate preview for a file if needed.
 
-        Returns (path, artifact_metadata) where path is the preview if generated/cached,
-        or the original file path if no provider supports the format or preview generation fails.
+        Serves the preview when one is available or can be generated; otherwise falls
+        back to the original file and says why in preview_failure_reason.
 
         Args:
             file_path: Path to the original file
+            source_macro_path: The original macro form of file_path, when known. Used
+                for the preview request so the generated metadata records the portable
+                macro template; without it the resolved absolute path is wrapped as a
+                degenerate single-segment macro.
 
         Returns:
-            Tuple of (path to serve, original source metadata or None)
+            PreviewResolution naming the file to serve, any extracted source metadata,
+            and the failure reason when the preview could not be served.
         """
         extension = file_path.suffix.lstrip(".").lower()
         if not extension:
-            return file_path, None
+            return PreviewResolution(path_to_serve=file_path)
 
         registry = self.engine.artifact_manager._registry
         provider_classes = registry.get_provider_classes_by_format(extension)
         if not provider_classes:
+            # Not a failure: formats without a provider (e.g. text) have no previews.
             logger.debug("Skipping preview for unsupported file format: %s", file_path)
-            return file_path, None
+            return PreviewResolution(path_to_serve=file_path)
 
         provider_name = provider_classes[0].get_friendly_name()
 
+        if source_macro_path is not None:
+            macro_path = source_macro_path
+        else:
+            macro_path = MacroPath(ParsedMacro(str(file_path)), {})
+
         result = await self.engine.ahandle_request(
             GetPreviewForArtifactRequest(
-                macro_path=MacroPath(ParsedMacro(str(file_path)), {}),
+                macro_path=macro_path,
                 artifact_provider_name=provider_name,
                 preview_generation_policy=PreviewGenerationPolicy.ONLY_IF_STALE,
+                # DEBUG on the inner request so the failure logs once, here, at the
+                # layer that knows it is falling back to the original file.
                 failure_log_level=logging.DEBUG,
             )
         )
 
         if not isinstance(result, GetPreviewForArtifactResultSuccess) or not isinstance(result.paths_to_preview, str):
-            logger.debug("Preview generation failed for %s: %s", file_path, result.result_details)
-            return file_path, None
+            failure_reason = str(result.result_details)
+            logger.warning(
+                "Preview unavailable for %s; serving the original file instead. Reason: %s",
+                file_path,
+                failure_reason,
+            )
+            return PreviewResolution(path_to_serve=file_path, preview_failure_reason=failure_reason)
 
         preview_path = Path(result.paths_to_preview)
         logger.debug("Serving preview for %s -> %s", file_path, preview_path)
-        return preview_path, result.artifact_metadata
+        return PreviewResolution(path_to_serve=preview_path, artifact_metadata=result.artifact_metadata)
 
     def on_handle_create_static_file_request(
         self,
@@ -358,8 +395,13 @@ class StaticFilesManager(EngineScoped):
             return None
 
     async def _resolve_preview_path(
-        self, file_path: Path, *, preview: bool, metadata_only: bool = False
-    ) -> tuple[Path, dict | None]:
+        self,
+        file_path: Path,
+        *,
+        preview: bool,
+        metadata_only: bool = False,
+        source_macro_path: MacroPath | None = None,
+    ) -> PreviewResolution:
         """Return the path to serve and any source metadata, generating a preview when requested.
 
         Args:
@@ -367,24 +409,28 @@ class StaticFilesManager(EngineScoped):
             preview: Whether to generate and serve a preview.
             metadata_only: When True, extract metadata without generating a preview. The
                 returned path is always the original file. Takes precedence over preview.
+            source_macro_path: The original macro form of file_path, when the request
+                supplied one. Passed through so preview metadata records the portable
+                template instead of this machine's resolved absolute path.
 
         Returns:
-            Tuple of (path to serve, artifact metadata or None).
+            PreviewResolution naming the file to serve, any extracted source metadata,
+            and the failure reason when a requested preview could not be served.
         """
         if metadata_only:
             artifact_metadata = await self._extract_metadata_only(file_path)
-            return file_path, artifact_metadata
+            return PreviewResolution(path_to_serve=file_path, artifact_metadata=artifact_metadata)
         if not preview:
             logger.debug("Serving full image for %s", file_path)
-            return file_path, None
+            return PreviewResolution(path_to_serve=file_path)
         try:
-            preview_path, artifact_metadata = await self._generate_preview_if_needed(file_path)
+            resolution = await self._generate_preview_if_needed(file_path, source_macro_path=source_macro_path)
         except Exception as e:
             logger.warning("Preview generation failed for %s, using original: %s", file_path, e)
-            return file_path, None
-        if preview_path == file_path:
+            return PreviewResolution(path_to_serve=file_path, preview_failure_reason=str(e))
+        if resolution.path_to_serve == file_path and resolution.preview_failure_reason is None:
             logger.debug("Serving full image (no thumbnail available) for %s", file_path)
-        return preview_path, artifact_metadata
+        return resolution
 
     async def on_handle_create_static_file_download_url_from_path_request(
         self,
@@ -414,6 +460,10 @@ class StaticFilesManager(EngineScoped):
             logger.warning(msg)
             return CreateStaticFileDownloadUrlResultFailure(error=msg, result_details=msg)
 
+        # Keep the original macro form alongside the resolved path: preview metadata
+        # records the macro template, and handing it a resolved absolute path bakes a
+        # machine-specific path into a file that lives inside the project.
+        source_macro_path: MacroPath | None = None
         if parsed.get_variables():
             resolve_result = self.engine.handle_request(
                 GetPathForMacroRequest(parsed_macro=parsed, variables=request.macro_variables)
@@ -421,6 +471,7 @@ class StaticFilesManager(EngineScoped):
             if not isinstance(resolve_result, GetPathForMacroResultSuccess):
                 msg = f"Attempted to create download URL. Failed with file_path='{file_path}' because macro resolution failed: {resolve_result.result_details}"
                 return CreateStaticFileDownloadUrlResultFailure(error=msg, result_details=msg)
+            source_macro_path = MacroPath(parsed, request.macro_variables)
             file_path = str(resolve_result.absolute_path)
 
         # Detect if this is a Griptape Cloud URL and extract bucket_id
@@ -441,12 +492,15 @@ class StaticFilesManager(EngineScoped):
 
         # If preview requested, generate preview and get preview path + artifact metadata.
         # If metadata_only requested, extract metadata without generating a preview.
-        file_path_to_use, artifact_metadata = await self._resolve_preview_path(
-            file_path_for_driver, preview=request.preview, metadata_only=request.metadata_only
+        resolution = await self._resolve_preview_path(
+            file_path_for_driver,
+            preview=request.preview,
+            metadata_only=request.metadata_only,
+            source_macro_path=source_macro_path,
         )
 
         try:
-            url = driver.create_signed_download_url(file_path_to_use)
+            url = driver.create_signed_download_url(resolution.path_to_serve)
         except Exception as e:
             msg = f"Failed to create presigned URL for file {file_path}: {e}"
             return CreateStaticFileDownloadUrlResultFailure(error=msg, result_details=msg)
@@ -454,7 +508,8 @@ class StaticFilesManager(EngineScoped):
         return CreateStaticFileDownloadUrlFromPathResultSuccess(
             url=url,
             file_url=driver.get_asset_url(file_path_for_driver),
-            artifact_metadata=artifact_metadata,
+            artifact_metadata=resolution.artifact_metadata,
+            preview_failure_reason=resolution.preview_failure_reason,
             result_details="Successfully created static file download URL",
         )
 

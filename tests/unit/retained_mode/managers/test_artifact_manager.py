@@ -4,7 +4,7 @@ import tempfile
 from collections.abc import Generator
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import anyio
 import pytest
@@ -17,6 +17,7 @@ from griptape_nodes.common.macro_parser import ParsedMacro
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.artifact_events import (
+    GeneratePreviewFromDefaultsRequest,
     GeneratePreviewRequest,
     GeneratePreviewResultFailure,
     GeneratePreviewResultSuccess,
@@ -1016,6 +1017,91 @@ class TestGeneratePreview:
         assert metadata.preview_generator_name == "Standard Thumbnail Generation"
         assert isinstance(metadata.preview_generator_parameters, dict)
 
+    @pytest.mark.asyncio
+    async def test_source_changed_mid_generation_retries_once(
+        self, artifact_manager: ArtifactManager, test_macro_path: MacroPath, test_image_path: Path
+    ) -> None:
+        """A source edited while its preview renders triggers exactly one retry.
+
+        The first attempt's preview depicts old content; the retry re-stats and
+        regenerates, so the recorded metadata matches the file actually on disk.
+        """
+        generation_calls = 0
+        original = ImageArtifactProvider.attempt_generate_preview
+
+        async def generate_then_mutate_source(provider_self: ImageArtifactProvider, **kwargs: object) -> object:
+            nonlocal generation_calls
+            generation_calls += 1
+            result = await original(provider_self, **kwargs)  # type: ignore[arg-type]
+            if generation_calls == 1:
+                with test_image_path.open("ab") as f:
+                    f.write(b"changed while the preview was rendering")
+            return result
+
+        request = GeneratePreviewRequest(
+            macro_path=test_macro_path,
+            artifact_provider_name="Image",
+            generate_preview_metadata_json=True,
+            preview_generator_parameters={"max_width": 50, "max_height": 50},
+        )
+        with patch.object(ImageArtifactProvider, "attempt_generate_preview", generate_then_mutate_source):
+            result = await artifact_manager.on_handle_generate_preview_request(request)
+
+        assert isinstance(result, GeneratePreviewResultSuccess)
+        assert generation_calls == 2  # noqa: PLR2004
+        metadata_path = test_image_path.parent / ".griptape-nodes-previews" / f"{test_image_path.name}.json"
+        metadata = json.loads(await anyio.Path(metadata_path).read_text())
+        # The retry's pre-generation stat matches the final on-disk file: fresh.
+        source_stat = await anyio.Path(test_image_path).stat()
+        assert metadata["source_file_size"] == source_stat.st_size
+
+    @pytest.mark.asyncio
+    async def test_source_still_changing_stops_after_two_attempts(
+        self,
+        artifact_manager: ArtifactManager,
+        test_macro_path: MacroPath,
+        test_image_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A source that keeps changing (e.g. a render mid-write) does not spin us.
+
+        Exactly two attempts run; the recorded stat mismatches the on-disk file,
+        which is what makes the next request judge the preview stale and heal.
+        """
+        import logging
+
+        generation_calls = 0
+        original = ImageArtifactProvider.attempt_generate_preview
+
+        async def generate_always_mutating_source(provider_self: ImageArtifactProvider, **kwargs: object) -> object:
+            nonlocal generation_calls
+            generation_calls += 1
+            result = await original(provider_self, **kwargs)  # type: ignore[arg-type]
+            with test_image_path.open("ab") as f:
+                f.write(b"still changing")
+            return result
+
+        request = GeneratePreviewRequest(
+            macro_path=test_macro_path,
+            artifact_provider_name="Image",
+            generate_preview_metadata_json=True,
+            preview_generator_parameters={"max_width": 50, "max_height": 50},
+        )
+        with (
+            patch.object(ImageArtifactProvider, "attempt_generate_preview", generate_always_mutating_source),
+            caplog.at_level(logging.INFO, logger="griptape_nodes"),
+        ):
+            result = await artifact_manager.on_handle_generate_preview_request(request)
+
+        assert isinstance(result, GeneratePreviewResultSuccess)
+        assert generation_calls == 2  # noqa: PLR2004
+        assert any("still changing" in record.message for record in caplog.records)
+        metadata_path = test_image_path.parent / ".griptape-nodes-previews" / f"{test_image_path.name}.json"
+        metadata = json.loads(await anyio.Path(metadata_path).read_text())
+        # Deliberately stale: the next preview request will regenerate.
+        source_stat = await anyio.Path(test_image_path).stat()
+        assert metadata["source_file_size"] != source_stat.st_size
+
 
 class TestPreviewMetadataDoesNotCreateSidecar:
     """Tests that preview metadata JSON files do not trigger sidecar creation.
@@ -1497,6 +1583,116 @@ class TestGetPreviewForArtifact:
         # Should regenerate successfully even though preview was fresh
         assert isinstance(result, GetPreviewForArtifactResultSuccess)
         assert result.paths_to_preview is not None
+
+    def test_stale_check_size_mismatch_is_stale(self, artifact_manager: ArtifactManager) -> None:
+        """Any size difference marks the preview stale, regardless of mtime."""
+        metadata = _make_preview_metadata(source_file_size=100, source_file_modified_time=1000.0)
+
+        assert artifact_manager._is_preview_source_stale(metadata, source_size=101, source_mtime=1000.0)
+
+    def test_stale_check_tolerates_mtime_drift(self, artifact_manager: ArtifactManager) -> None:
+        """Sub-tolerance mtime drift (sync tools, FAT granularity, float noise) is not stale."""
+        metadata = _make_preview_metadata(source_file_size=100, source_file_modified_time=1000.0)
+
+        assert not artifact_manager._is_preview_source_stale(metadata, source_size=100, source_mtime=1000.0)
+        assert not artifact_manager._is_preview_source_stale(metadata, source_size=100, source_mtime=1000.0000001)
+        assert not artifact_manager._is_preview_source_stale(metadata, source_size=100, source_mtime=1001.9)
+        assert not artifact_manager._is_preview_source_stale(metadata, source_size=100, source_mtime=998.1)
+
+    def test_stale_check_rejects_real_mtime_change(self, artifact_manager: ArtifactManager) -> None:
+        """An mtime moved beyond the tolerance window, in either direction, is stale."""
+        metadata = _make_preview_metadata(source_file_size=100, source_file_modified_time=1000.0)
+
+        assert artifact_manager._is_preview_source_stale(metadata, source_size=100, source_mtime=1002.1)
+        assert artifact_manager._is_preview_source_stale(metadata, source_size=100, source_mtime=997.9)
+
+    @pytest.mark.usefixtures("generated_preview_with_metadata")
+    def test_get_preview_mtime_drift_within_tolerance_is_not_stale(
+        self,
+        artifact_manager: ArtifactManager,
+        test_macro_path: MacroPath,
+        test_image_path: Path,
+    ) -> None:
+        """A synced/copied source whose mtime drifted slightly still serves its preview.
+
+        Before the tolerance existed, exact float equality made this a permanent
+        DO_NOT_GENERATE failure with a valid preview sitting on disk.
+        """
+        import asyncio
+        import os
+
+        stat_result = test_image_path.stat()
+        os.utime(test_image_path, (stat_result.st_atime, stat_result.st_mtime + 1.0))
+
+        request = GetPreviewForArtifactRequest(
+            macro_path=test_macro_path,
+            artifact_provider_name="Image",
+            preview_generation_policy=PreviewGenerationPolicy.DO_NOT_GENERATE,
+        )
+
+        result = asyncio.run(artifact_manager.on_handle_get_preview_for_artifact_request(request))
+
+        assert isinstance(result, GetPreviewForArtifactResultSuccess)
+
+    @pytest.mark.usefixtures("generated_preview_with_metadata")
+    def test_concurrent_stale_requests_regenerate_once(
+        self,
+        artifact_manager: ArtifactManager,
+        test_macro_path: MacroPath,
+        test_image_path: Path,
+    ) -> None:
+        """Concurrent requests for one stale source produce exactly one regeneration.
+
+        The editor renders the same artifact in several components and each fires its
+        own preview request; without the per-source lock they all regenerate the same
+        file simultaneously, tearing the copy a browser is fetching.
+        """
+        import asyncio
+
+        # Make the source genuinely stale (size change)
+        with test_image_path.open("ab") as f:
+            f.write(b"extra data to change size")
+
+        generation_count = 0
+        original_generate = artifact_manager.on_handle_generate_preview_from_defaults_request
+
+        async def counting_generate(request: GeneratePreviewFromDefaultsRequest) -> object:
+            nonlocal generation_count
+            generation_count += 1
+            return await original_generate(request)
+
+        artifact_manager.on_handle_generate_preview_from_defaults_request = counting_generate  # type: ignore[method-assign]
+
+        async def fire_concurrent_requests() -> list[object]:
+            requests = [
+                GetPreviewForArtifactRequest(
+                    macro_path=test_macro_path,
+                    artifact_provider_name="Image",
+                    preview_generation_policy=PreviewGenerationPolicy.ONLY_IF_STALE,
+                )
+                for _ in range(5)
+            ]
+            return await asyncio.gather(
+                *(artifact_manager.on_handle_get_preview_for_artifact_request(r) for r in requests)
+            )
+
+        results = asyncio.run(fire_concurrent_requests())
+
+        assert all(isinstance(r, GetPreviewForArtifactResultSuccess) for r in results)
+        assert generation_count == 1
+
+
+def _make_preview_metadata(*, source_file_size: int, source_file_modified_time: float) -> PreviewMetadata:
+    """Build a PreviewMetadata with the fields the staleness check reads."""
+    return PreviewMetadata(
+        version=PreviewMetadata.LATEST_SCHEMA_VERSION,
+        source_macro_path="{inputs}/test.jpg",
+        source_file_size=source_file_size,
+        source_file_modified_time=source_file_modified_time,
+        preview_file_names="test.jpg.webp",
+        preview_generator_name="Standard Thumbnail Generation",
+        preview_generator_parameters={},
+    )
 
 
 class TestGeneratorValidation:

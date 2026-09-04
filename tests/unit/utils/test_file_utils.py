@@ -632,3 +632,44 @@ class TestAtomicWriteBytes:
         assert target.read_bytes() == b"original"
         # No stray temp file survives the failure.
         assert sorted(p.name for p in temp_dir.iterdir()) == ["data.bin"]
+
+    def test_failed_fsync_removes_temp_and_preserves_original(self, temp_dir: Path) -> None:
+        """A write that dies before the rename cleans up and leaves the original intact."""
+        target = temp_dir / "data.bin"
+        target.write_bytes(b"original")
+        with (
+            patch("griptape_nodes.utils.file_utils.os.fsync", side_effect=OSError("device error")),
+            pytest.raises(OSError, match="device error"),
+        ):
+            atomic_write_bytes(target, b"new")
+        assert target.read_bytes() == b"original"
+        assert sorted(p.name for p in temp_dir.iterdir()) == ["data.bin"]
+
+    def test_preserves_existing_file_mode(self, temp_dir: Path) -> None:
+        """Overwriting keeps the destination's permissions.
+
+        mkstemp creates the temp file as 0600; without the chmod, every atomic
+        overwrite would silently tighten a shared file's permissions.
+        """
+        import stat
+
+        target = temp_dir / "data.bin"
+        target.write_bytes(b"original")
+        target.chmod(0o604)
+
+        atomic_write_bytes(target, b"new")
+
+        assert stat.S_IMODE(target.stat().st_mode) == 0o604  # noqa: PLR2004
+
+    def test_new_file_gets_umask_default_mode(self, temp_dir: Path) -> None:
+        """A brand-new file gets the same mode open(mode="w") would have produced."""
+        import stat
+
+        current_umask = os.umask(0)
+        os.umask(current_umask)
+        expected_mode = 0o666 & ~current_umask
+
+        target = temp_dir / "data.bin"
+        atomic_write_bytes(target, b"new")
+
+        assert stat.S_IMODE(target.stat().st_mode) == expected_mode

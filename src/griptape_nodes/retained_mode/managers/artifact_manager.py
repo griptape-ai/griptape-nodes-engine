@@ -11,7 +11,7 @@ from pydantic import BaseModel, ValidationError
 
 from griptape_nodes.common.macro_parser import MacroVariables, ParsedMacro
 from griptape_nodes.common.project_templates.situation import BuiltInSituation
-from griptape_nodes.files.path_utils import decompose_source_path
+from griptape_nodes.files.path_utils import canonicalize_for_identity, decompose_source_path
 from griptape_nodes.retained_mode.engine import Engine, EngineScoped
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.artifact_events import (
@@ -109,6 +109,8 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import Check
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.utils.async_utils import to_thread
 from griptape_nodes.utils.ffmpeg_cache import install_ffmpeg_cache_redirect
+from griptape_nodes.utils.file_utils import mtimes_match
+from griptape_nodes.utils.keyed_mutex import KeyedMutex
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -186,6 +188,14 @@ class ArtifactManager(EngineScoped):
         super().__init__(engine)
         # Provider registry for managing artifact providers
         self._registry = ProviderRegistry(engine=engine)
+
+        # Per-source single-flight lock for preview lookup/regeneration, keyed on the
+        # canonicalized source path. Must be a KeyedMutex, not asyncio.Locks: request
+        # handlers run on arbitrary threads and the sync handle_request path drives
+        # async handlers on a transient event loop per call, which asyncio primitives
+        # do not survive. Cross-process races are made non-destructive by the atomic
+        # OVERWRITE write in OSManager.
+        self._preview_mutex = KeyedMutex()
 
         if event_manager is not None:
             event_manager.assign_manager_to_request_type(
@@ -465,6 +475,10 @@ class ArtifactManager(EngineScoped):
                 result_details=f"Attempted to generate preview for '{source_path}'. Failed due to: file not found"
             )
 
+        # The pre-generation stat recorded in the metadata; the generate-then-verify
+        # loop below refreshes it when a retry re-stats the source.
+        source_file_entry = file_info_result.file_entry
+
         # FAILURE CASE: Extract file extension
         file_extension = Path(source_path).suffix[1:].lower()
         if not file_extension:
@@ -527,20 +541,66 @@ class ArtifactManager(EngineScoped):
         destination_dir = resolved_path.destination_dir
         preview_file_name = resolved_path.file_name
 
-        # FAILURE CASE: Call provider and get returned filenames
-        try:
-            preview_file_names = await provider_instance.attempt_generate_preview(
-                preview_generator_friendly_name=generator_name,
-                source_file_location=source_path,
-                preview_format=preview_format,
-                destination_preview_directory=str(destination_dir),
-                destination_preview_file_name=preview_file_name,
-                params=request.preview_generator_parameters,
+        # FAILURE CASE: Call provider and get returned filenames.
+        #
+        # Generate-then-verify loop: if the source changed while the preview was
+        # rendering, the preview depicts the old content — retry once with a fresh
+        # pre-generation stat. If the source is STILL changing after the retry (e.g.
+        # a render writing frames), stop: the recorded pre-generation stat then
+        # mismatches the file on disk, which is exactly what makes the next request
+        # judge the preview stale and regenerate. "Changed" uses the same size/mtime
+        # comparison as the staleness check, so we only chase changes that check
+        # would notice.
+        max_generation_attempts = 2
+        generation_attempt = 1
+        while True:
+            try:
+                preview_file_names = await provider_instance.attempt_generate_preview(
+                    preview_generator_friendly_name=generator_name,
+                    source_file_location=source_path,
+                    preview_format=preview_format,
+                    destination_preview_directory=str(destination_dir),
+                    destination_preview_file_name=preview_file_name,
+                    params=request.preview_generator_parameters,
+                )
+            except Exception as e:
+                return GeneratePreviewResultFailure(
+                    result_details=f"Attempted to generate preview for '{source_path}'. Failed due to: {e}"
+                )
+
+            post_generation_info_result = self.engine.handle_request(
+                GetFileInfoRequest(path=source_path, workspace_only=False)
             )
-        except Exception as e:
-            return GeneratePreviewResultFailure(
-                result_details=f"Attempted to generate preview for '{source_path}'. Failed due to: {e}"
+            if (
+                not isinstance(post_generation_info_result, GetFileInfoResultSuccess)
+                or post_generation_info_result.file_entry is None
+            ):
+                # Can't verify (file vanished mid-flight?); keep what we generated.
+                break
+
+            source_unchanged = post_generation_info_result.file_entry.size == source_file_entry.size and (
+                mtimes_match(
+                    post_generation_info_result.file_entry.modified_time,
+                    source_file_entry.modified_time,
+                )
             )
+            if source_unchanged:
+                break
+
+            if generation_attempt >= max_generation_attempts:
+                logger.info(
+                    "Source file '%s' is still changing; keeping the pre-generation stat so the next request regenerates.",
+                    source_path,
+                )
+                break
+
+            logger.info(
+                "Source file '%s' changed while its preview was being generated; regenerating from the new content.",
+                source_path,
+            )
+            # The post-generation stat becomes the retry's pre-generation stat.
+            source_file_entry = post_generation_info_result.file_entry
+            generation_attempt += 1
 
         # OPTIONAL: Generate metadata if requested
         metadata_path = None
@@ -568,15 +628,19 @@ class ArtifactManager(EngineScoped):
 
                 return GeneratePreviewResultFailure(result_details=error_details)
 
-            # Step 1: Create metadata object
+            # Step 1: Create metadata object. The recorded stat is deliberately the
+            # PRE-generation one from the last generation attempt: if the source
+            # changed during that attempt, recording the old stat is what makes the
+            # next request see the preview as stale and regenerate. Recording a
+            # post-generation stat would brand a preview of old content as fresh.
             # Run in a thread because video providers shell out to ffprobe synchronously,
             # which would otherwise block the event loop.
             _artifact_metadata = await to_thread(provider_class.get_artifact_metadata, source_path)
             metadata = PreviewMetadata(
                 version=PreviewMetadata.LATEST_SCHEMA_VERSION,
                 source_macro_path=request.macro_path.parsed_macro.template,
-                source_file_size=file_info_result.file_entry.size,
-                source_file_modified_time=file_info_result.file_entry.modified_time,
+                source_file_size=source_file_entry.size,
+                source_file_modified_time=source_file_entry.modified_time,
                 preview_file_names=preview_file_names,
                 preview_generator_name=generator_name,
                 preview_generator_parameters=deepcopy(request.preview_generator_parameters),
@@ -679,7 +743,7 @@ class ArtifactManager(EngineScoped):
             result_details=result.result_details, paths_to_preview=result.paths_to_preview
         )
 
-    async def on_handle_get_preview_for_artifact_request(  # noqa: C901, PLR0911, PLR0912, PLR0915
+    async def on_handle_get_preview_for_artifact_request(
         self, request: GetPreviewForArtifactRequest
     ) -> GetPreviewForArtifactResultSuccess | GetPreviewForArtifactResultFailure:
         """Handle get preview for artifact request with policy-based generation.
@@ -701,6 +765,31 @@ class ArtifactManager(EngineScoped):
 
         source_path = resolve_result.resolved_path
 
+        # Single-flight guard: the editor renders one image per component and each
+        # fires its own preview request, so a stale preview arrives as several
+        # concurrent requests. Without the lock they all judge the preview stale and
+        # regenerate the same file simultaneously. The staleness check must run under
+        # the same lock as regeneration so waiters re-read the freshly written
+        # metadata and return the cached preview instead of regenerating again.
+        lock_key = str(canonicalize_for_identity(source_path))
+        async with self._preview_mutex.locked(lock_key):
+            return await self._get_preview_for_artifact_locked(request, source_path)
+
+    async def _get_preview_for_artifact_locked(  # noqa: C901, PLR0911, PLR0912, PLR0915
+        self, request: GetPreviewForArtifactRequest, source_path: str
+    ) -> GetPreviewForArtifactResultSuccess | GetPreviewForArtifactResultFailure:
+        """Look up, validate, and (per policy) regenerate a preview for one source.
+
+        Runs under the per-source lock from on_handle_get_preview_for_artifact_request;
+        do not call directly.
+
+        Args:
+            request: Contains macro_path, artifact_provider_name, and preview_generation_policy
+            source_path: The macro-resolved absolute path of the source artifact
+
+        Returns:
+            Success with path_to_preview string, or failure with details
+        """
         # FAILURE CASE: Verify source file exists and get its metadata
         file_info_request = GetFileInfoRequest(path=source_path, workspace_only=False)
         file_info_result = self.engine.handle_request(file_info_request)
@@ -1578,7 +1667,9 @@ class ArtifactManager(EngineScoped):
         Returns:
             True if source file has changed (stale), False otherwise
         """
-        return metadata.source_file_size != source_size or metadata.source_file_modified_time != source_mtime
+        if metadata.source_file_size != source_size:
+            return True
+        return not mtimes_match(metadata.source_file_modified_time, source_mtime)
 
     def _does_preview_match_current_settings(
         self,

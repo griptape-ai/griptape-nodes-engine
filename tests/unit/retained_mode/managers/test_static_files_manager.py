@@ -741,6 +741,182 @@ class TestStaticFilesManagerCreateDownloadUrlFromPath:
         assert result.artifact_metadata is None
         extract_metadata.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_preview_failure_serves_original_with_reason_and_warning(
+        self,
+        mock_static_files_manager: StaticFilesManager,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A failed preview falls back to the original file, names why, and logs at WARNING.
+
+        Before this, the failure logged at DEBUG and the result carried no signal, so
+        the editor rendered an unexplained full-size image or an empty frame.
+        """
+        import logging
+
+        from griptape_nodes.retained_mode.events.artifact_events import GetPreviewForArtifactResultFailure
+        from griptape_nodes.retained_mode.events.static_file_events import (
+            CreateStaticFileDownloadUrlFromPathRequest,
+            CreateStaticFileDownloadUrlFromPathResultSuccess,
+        )
+
+        source_file = tmp_path / "image.png"
+        source_file.write_bytes(b"not a real png")
+
+        provider_class = Mock()
+        provider_class.get_friendly_name.return_value = "Image"
+        registry = mock_static_files_manager.engine.artifact_manager._registry
+        registry.get_provider_classes_by_format.return_value = [provider_class]
+        mock_static_files_manager.engine.ahandle_request = AsyncMock(
+            return_value=GetPreviewForArtifactResultFailure(result_details="source file not found")
+        )
+        mock_static_files_manager.storage_driver.create_signed_download_url.return_value = "http://signed-url.com"
+        mock_static_files_manager.storage_driver.get_asset_url.return_value = "http://asset-url.com"
+
+        request = CreateStaticFileDownloadUrlFromPathRequest(file_path=str(source_file), preview=True)
+
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            result = await mock_static_files_manager.on_handle_create_static_file_download_url_from_path_request(
+                request
+            )
+
+        assert isinstance(result, CreateStaticFileDownloadUrlFromPathResultSuccess)
+        assert result.preview_failure_reason is not None
+        assert "source file not found" in result.preview_failure_reason
+        # The ORIGINAL file is served, not a preview path
+        mock_static_files_manager.storage_driver.create_signed_download_url.assert_called_once_with(source_file)
+        warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("Preview unavailable" in m for m in warning_messages)
+
+    @pytest.mark.asyncio
+    async def test_preview_success_has_no_failure_reason(
+        self, mock_static_files_manager: StaticFilesManager, tmp_path: Path
+    ) -> None:
+        """A served preview carries no failure reason."""
+        from griptape_nodes.retained_mode.events.artifact_events import GetPreviewForArtifactResultSuccess
+        from griptape_nodes.retained_mode.events.static_file_events import (
+            CreateStaticFileDownloadUrlFromPathRequest,
+            CreateStaticFileDownloadUrlFromPathResultSuccess,
+        )
+
+        source_file = tmp_path / "image.png"
+        source_file.write_bytes(b"not a real png")
+        preview_path = tmp_path / ".griptape-nodes-previews" / "image.png.webp"
+
+        provider_class = Mock()
+        provider_class.get_friendly_name.return_value = "Image"
+        registry = mock_static_files_manager.engine.artifact_manager._registry
+        registry.get_provider_classes_by_format.return_value = [provider_class]
+        mock_static_files_manager.engine.ahandle_request = AsyncMock(
+            return_value=GetPreviewForArtifactResultSuccess(
+                result_details="ok", paths_to_preview=str(preview_path), artifact_metadata={"width": 100}
+            )
+        )
+        mock_static_files_manager.storage_driver.create_signed_download_url.return_value = "http://signed-url.com"
+        mock_static_files_manager.storage_driver.get_asset_url.return_value = "http://asset-url.com"
+
+        request = CreateStaticFileDownloadUrlFromPathRequest(file_path=str(source_file), preview=True)
+
+        result = await mock_static_files_manager.on_handle_create_static_file_download_url_from_path_request(request)
+
+        assert isinstance(result, CreateStaticFileDownloadUrlFromPathResultSuccess)
+        assert result.preview_failure_reason is None
+        assert result.artifact_metadata == {"width": 100}
+        mock_static_files_manager.storage_driver.create_signed_download_url.assert_called_once_with(preview_path)
+
+    @pytest.mark.asyncio
+    async def test_preview_request_carries_original_macro(
+        self, mock_static_files_manager: StaticFilesManager, tmp_path: Path
+    ) -> None:
+        """The preview request preserves the caller's macro template.
+
+        Preview metadata records the macro template as source_macro_path; re-wrapping
+        the resolved absolute path bakes a machine-specific path into a file that
+        lives inside the project (griptape-ai/internal#240, Lead 1).
+        """
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            GetPreviewForArtifactRequest,
+            GetPreviewForArtifactResultSuccess,
+        )
+        from griptape_nodes.retained_mode.events.project_events import GetPathForMacroResultSuccess
+        from griptape_nodes.retained_mode.events.static_file_events import (
+            CreateStaticFileDownloadUrlFromPathRequest,
+            CreateStaticFileDownloadUrlFromPathResultSuccess,
+        )
+
+        resolved_path = tmp_path / "outputs" / "file.png"
+
+        provider_class = Mock()
+        provider_class.get_friendly_name.return_value = "Image"
+        registry = mock_static_files_manager.engine.artifact_manager._registry
+        registry.get_provider_classes_by_format.return_value = [provider_class]
+        mock_static_files_manager.engine.handle_request = Mock(
+            return_value=GetPathForMacroResultSuccess(
+                result_details="resolved",
+                resolved_path=Path("outputs/file.png"),
+                absolute_path=resolved_path,
+            )
+        )
+        mock_static_files_manager.engine.ahandle_request = AsyncMock(
+            return_value=GetPreviewForArtifactResultSuccess(
+                result_details="ok", paths_to_preview=str(tmp_path / "file.png.webp")
+            )
+        )
+        mock_static_files_manager.storage_driver.create_signed_download_url.return_value = "http://signed-url.com"
+        mock_static_files_manager.storage_driver.get_asset_url.return_value = "http://asset-url.com"
+
+        request = CreateStaticFileDownloadUrlFromPathRequest(file_path="{outputs}/file.png", preview=True)
+
+        result = await mock_static_files_manager.on_handle_create_static_file_download_url_from_path_request(request)
+
+        assert isinstance(result, CreateStaticFileDownloadUrlFromPathResultSuccess)
+        await_args = mock_static_files_manager.engine.ahandle_request.await_args
+        assert await_args is not None
+        preview_request = await_args.args[0]
+        assert isinstance(preview_request, GetPreviewForArtifactRequest)
+        assert preview_request.macro_path.parsed_macro.template == "{outputs}/file.png"
+
+    @pytest.mark.asyncio
+    async def test_preview_request_wraps_plain_path_when_no_macro(
+        self, mock_static_files_manager: StaticFilesManager, tmp_path: Path
+    ) -> None:
+        """A plain path request (no macro variables) keeps today's resolved-path wrap."""
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            GetPreviewForArtifactRequest,
+            GetPreviewForArtifactResultSuccess,
+        )
+        from griptape_nodes.retained_mode.events.static_file_events import (
+            CreateStaticFileDownloadUrlFromPathRequest,
+            CreateStaticFileDownloadUrlFromPathResultSuccess,
+        )
+
+        source_file = tmp_path / "image.png"
+        source_file.write_bytes(b"not a real png")
+
+        provider_class = Mock()
+        provider_class.get_friendly_name.return_value = "Image"
+        registry = mock_static_files_manager.engine.artifact_manager._registry
+        registry.get_provider_classes_by_format.return_value = [provider_class]
+        mock_static_files_manager.engine.ahandle_request = AsyncMock(
+            return_value=GetPreviewForArtifactResultSuccess(
+                result_details="ok", paths_to_preview=str(tmp_path / "image.png.webp")
+            )
+        )
+        mock_static_files_manager.storage_driver.create_signed_download_url.return_value = "http://signed-url.com"
+        mock_static_files_manager.storage_driver.get_asset_url.return_value = "http://asset-url.com"
+
+        request = CreateStaticFileDownloadUrlFromPathRequest(file_path=str(source_file), preview=True)
+
+        result = await mock_static_files_manager.on_handle_create_static_file_download_url_from_path_request(request)
+
+        assert isinstance(result, CreateStaticFileDownloadUrlFromPathResultSuccess)
+        await_args = mock_static_files_manager.engine.ahandle_request.await_args
+        assert await_args is not None
+        preview_request = await_args.args[0]
+        assert isinstance(preview_request, GetPreviewForArtifactRequest)
+        assert preview_request.macro_path.parsed_macro.template == str(source_file)
+
 
 class TestStaticFilesManagerResolveStaticFilePath:
     """Test StaticFilesManager._resolve_static_file_path() method."""

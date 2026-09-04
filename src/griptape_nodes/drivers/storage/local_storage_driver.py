@@ -189,8 +189,12 @@ class LocalStorageDriver(BaseStorageDriver):
             base_without_workspace = self.base_url.rsplit("/workspace", 1)[0]
             url = f"{base_without_workspace}/external/{path_str}"
 
-        # Add a cache-busting query parameter to the URL so that the browser always reloads the file
-        cache_busted_url = f"{url}?t={int(time.time())}"
+        # Add a cache-busting query parameter to the URL so that the browser always reloads
+        # the file. Millisecond resolution: with whole seconds, two URLs minted in the same
+        # second are identical strings, so the browser serves one cached response for both —
+        # and if that response was bad (e.g. a failed load), every same-second consumer
+        # inherits it.
+        cache_busted_url = f"{url}?t={time.time_ns() // 1_000_000}"
         return cache_busted_url
 
     def delete_file(self, path: Path) -> None:

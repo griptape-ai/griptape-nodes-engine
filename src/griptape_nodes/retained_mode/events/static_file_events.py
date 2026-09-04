@@ -183,9 +183,16 @@ class CreateStaticFileDownloadUrlFromPathResultSuccess(CreateStaticFileDownloadU
             Populated when preview=True or metadata_only=True and the file format has
             a registered provider. Contains a subset of: width, height, format, channels,
             color_space, file_size, duration_seconds, codec, frame_rate.
+        preview_failure_reason: Why a requested preview could not be served, when the
+            URL points at the original file instead of a preview. None when the preview
+            was served, or when no preview was requested. Editors should surface this
+            instead of rendering an unexplained full-size image or empty frame. The
+            text is human-readable and NOT machine-parseable — do not branch on its
+            contents; only its presence/absence is contract.
     """
 
     artifact_metadata: dict | None = None
+    preview_failure_reason: str | None = None
 
 
 @dataclass
