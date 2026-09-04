@@ -154,6 +154,64 @@ class TestRegistrationCarriesTheProject:
         assert result.current_project_id == "proj-42"
 
 
+class TestProjectSwitchWaitsForWorkers:
+    @pytest.mark.asyncio
+    async def test_switch_awaits_each_worker_and_reports_failures(self, worker_manager: WorkerManager) -> None:
+        """A switch must not report success while a worker is still on the old workspace.
+
+        The fire-and-forget fan-out returns once messages are sent, so execution dispatched right
+        after a switch could reach a worker that had not adopted yet -- which writes files where
+        this engine does not read, silently.
+        """
+        worker_manager._workers = {
+            "worker-a": WorkerRegistration(request_topic="t/a", worker_key=None),
+            "worker-b": WorkerRegistration(request_topic="t/b", worker_key=None),
+        }
+        replies = {
+            "worker-a": {"result_type": "ActivateProjectResultSuccess", "result": {}},
+            "worker-b": {"result_type": "ActivateProjectResultFailure", "result": {"result_details": "unknown id"}},
+        }
+        awaited: list[str] = []
+
+        async def fake_route(_event: object, worker_engine_id: str, _topic: str) -> dict:
+            awaited.append(worker_engine_id)
+            return replies[worker_engine_id]
+
+        worker_manager.route_to_worker = fake_route  # type: ignore[method-assign]
+
+        failures = await worker_manager.broadcast_to_workers_awaiting_replies(
+            EventRequest(request=worker_events.UnregisterWorkerRequest(worker_engine_id="x"))
+        )
+
+        # Every worker was awaited, and the one that refused is named rather than swallowed.
+        assert sorted(awaited) == ["worker-a", "worker-b"]
+        assert len(failures) == 1
+        assert "worker-b" in failures[0]
+        assert "unknown id" in failures[0]
+
+    @pytest.mark.asyncio
+    async def test_one_unreachable_worker_does_not_strand_the_others(self, worker_manager: WorkerManager) -> None:
+        worker_manager._workers = {
+            "dead": WorkerRegistration(request_topic="t/dead", worker_key=None),
+            "alive": WorkerRegistration(request_topic="t/alive", worker_key=None),
+        }
+
+        async def fake_route(_event: object, worker_engine_id: str, _topic: str) -> dict:
+            if worker_engine_id == "dead":
+                msg = "worker is gone"
+                raise RuntimeError(msg)
+            return {"result_type": "ActivateProjectResultSuccess", "result": {}}
+
+        worker_manager.route_to_worker = fake_route  # type: ignore[method-assign]
+
+        failures = await worker_manager.broadcast_to_workers_awaiting_replies(
+            EventRequest(request=worker_events.UnregisterWorkerRequest(worker_engine_id="x"))
+        )
+
+        assert len(failures) == 1
+        assert "dead" in failures[0]
+
+
 class TestHandleRegisterWorkerRequestEngineVersion:
     @pytest.mark.asyncio
     async def test_rejects_mismatched_engine_version(self, worker_manager: WorkerManager) -> None:
