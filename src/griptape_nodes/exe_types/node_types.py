@@ -50,11 +50,16 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     RemoveElementEvent,
     RemoveParameterFromNodeRequest,
 )
+from griptape_nodes.retained_mode.events.resource_events import (
+    GetExecutionDeviceRequest,
+    GetExecutionDeviceResultSuccess,
+)
 from griptape_nodes.traits.options import Options
 from griptape_nodes.traits.widget import Widget
 from griptape_nodes.utils import async_utils
 
 if TYPE_CHECKING:
+    from pathlib import Path
     from types import ModuleType
 
     from griptape_nodes.exe_types.core_types import NodeMessagePayload
@@ -1298,6 +1303,71 @@ class BaseNode(ABC):
             msg = str(f"Parameter \"{param}\" was left blank for node '{node_name}'. {additional_msg}").strip()
             return ValueError(msg)
         return None
+
+    @property
+    def execution_device(self) -> str:
+        """The compute device this node should run on: "cuda", "mps" or "cpu".
+
+        Answered by the engine, which detects the machine's backends without importing a
+        framework. Every model-wrapping library currently imports torch purely to call
+        `torch.cuda.is_available()`, which pulls an execution-time dependency into whichever
+        process asks -- including one that only edits, where the import fails outright.
+
+            def process(self) -> None:
+                model = model.to(self.execution_device)
+
+        Falls back to "cpu" if the engine cannot determine the backends, because a node that
+        cannot pick a device is worse than one running slowly.
+        """
+        result = self.engine.handle_request(GetExecutionDeviceRequest())
+        if isinstance(result, GetExecutionDeviceResultSuccess):
+            return result.device
+        logger.warning(
+            "Node %s could not determine an execution device (%s); using cpu.",
+            self.name,
+            result.result_details,
+        )
+        return "cpu"
+
+    @property
+    def available_compute(self) -> list[str]:
+        """Every compute backend this machine has, in detection order.
+
+        Cpu first, then any accelerator found. NOT ranked: `available_compute[0]` is "cpu" even on
+        a machine with a GPU. Use
+        `execution_device` to get the device to actually run on; this list answers "what
+        exists here", which is a different question.
+
+        For a node that wants to decide for itself rather than take `execution_device`.
+        """
+        result = self.engine.handle_request(GetExecutionDeviceRequest())
+        if isinstance(result, GetExecutionDeviceResultSuccess):
+            return result.available
+        # A GPU-less machine still takes the success path above, so reaching here means detection
+        # itself failed. Logged because a node branching on this list would otherwise take its CPU
+        # path on an accelerated machine with nothing to show why.
+        logger.warning("Could not detect compute backends; reporting cpu only. %s", result.result_details)
+        return ["cpu"]
+
+    def model_asset(self, asset_id: str) -> Path:
+        """Return the local directory holding one of this library's declared model assets.
+
+        Weights are declared in the manifest, not installed as dependencies and not fetched by a
+        library-load hook. This resolves on demand in whichever process is about to run the model,
+        and caches under an engine-owned root:
+
+            def process(self) -> None:
+                weights = self.model_asset("sam3-base")
+                model = load_from(weights)
+
+        Raises:
+            RuntimeError: If the library declares no asset by that id, or the fetch fails.
+        """
+        library_name = self.metadata.get("library")
+        if not library_name:
+            msg = f"Node '{self.name}' has no library recorded in its metadata, so its model assets cannot be located."
+            raise RuntimeError(msg)
+        return self.engine.library_manager.get_model_asset(library_name, asset_id)
 
     def execution_module(self, module_name: str) -> ModuleType:
         """Return one of this library's execution modules.

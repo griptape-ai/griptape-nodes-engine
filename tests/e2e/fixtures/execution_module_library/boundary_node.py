@@ -18,6 +18,42 @@ class BoundaryNode(DataNode):
         super().__init__(name, metadata=metadata)
         self.add_parameter(
             Parameter(
+                name="probe_boundary",
+                type="str",
+                default_value="",
+                tooltip="Set anything to make the value hook report what the boundary answers here",
+                allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+            )
+        )
+        self.add_parameter(
+            Parameter(
+                name="boundary_answer",
+                type="str",
+                default_value="",
+                tooltip="What execution_module() answered in whichever process ran the hook",
+                allowed_modes={ParameterMode.OUTPUT, ParameterMode.PROPERTY},
+            )
+        )
+        self.add_parameter(
+            Parameter(
+                name="chosen_device",
+                type="str",
+                default_value="",
+                tooltip="The device the engine chose, with no framework imported to ask",
+                allowed_modes={ParameterMode.OUTPUT},
+            )
+        )
+        self.add_parameter(
+            Parameter(
+                name="run_summary",
+                type="str",
+                default_value="",
+                tooltip="What the execution module produced from the device and the asset path",
+                allowed_modes={ParameterMode.OUTPUT},
+            )
+        )
+        self.add_parameter(
+            Parameter(
                 name="reported_version",
                 type="str",
                 default_value="",
@@ -26,6 +62,30 @@ class BoundaryNode(DataNode):
             )
         )
 
+    def after_value_set(self, parameter: Parameter, value: Any) -> None:  # noqa: ARG002
+        """Record what reaching for an execution module does wherever this hook runs.
+
+        Value hooks fire on the orchestrator when a user edits, and again in the worker during
+        hydration -- so this one parameter reports the boundary's answer from both sides without
+        needing to inspect either process.
+        """
+        if parameter.name != "probe_boundary":
+            return
+        try:
+            self.execution_module("runner")
+            self.set_parameter_value("boundary_answer", "reached it")
+        except RuntimeError as err:
+            self.set_parameter_value("boundary_answer", str(err))
+
     def process(self) -> None:
+        # Three engine-owned answers, none of which this module could compute for itself without
+        # importing something that does not exist in the process that edits it.
         runner = self.execution_module("runner")
         self.parameter_output_values["reported_version"] = runner.dependency_version()
+        self.parameter_output_values["chosen_device"] = self.execution_device
+        try:
+            weights = self.model_asset("stand-in-weights")
+        except RuntimeError as err:
+            self.parameter_output_values["run_summary"] = f"no weights: {err}"
+            return
+        self.parameter_output_values["run_summary"] = runner.load_and_run(self.execution_device, weights)

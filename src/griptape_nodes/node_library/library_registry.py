@@ -88,11 +88,38 @@ class Dependencies(BaseModel):
     pip_install_flags: list[str] | None = None
 
 
+class ModelAsset(BaseModel):
+    """Weight files a library needs on disk, declared rather than installed.
+
+    Declaring them, rather than installing them as dependencies, is what lets the engine own
+    fetching, cache location, revision pinning and the entitlement gate while a node only asks for
+    a path.
+
+    Distinct from ``model_catalog``, which declares HOSTED models a node may invoke and the keys
+    and terms that govern them. This is about bytes on local disk.
+
+    Args:
+        source: Where the weights come from. ``hf:owner/repo`` is the only scheme today.
+        revision: Git revision to pin. Defaults to "main", but pinning is strongly preferred: an
+            unpinned asset means a workflow can produce different output next month.
+        files: Optional glob patterns to fetch instead of the whole repository, e.g.
+            ``["*.safetensors", "config.json"]``. Whole repositories are often much larger than
+            what a node actually loads.
+    """
+
+    source: str
+    revision: str = "main"
+    files: list[str] | None = None
+
+
 class ResourceRequirements(BaseModel):
     """Resource requirements for a library.
 
     Specifies what system resources (OS, compute backends) the library needs.
     Example: {"platform": (["linux", "windows"], "has_any"), "arch": "x86_64", "compute": (["cuda", "cpu"], "has_all")}
+
+    ``required`` is the only tier: without it the library cannot run. Execution refuses with the
+    reason and editing is unaffected, so a cuda-only library stays fully editable on a laptop.
     """
 
     required: Requirements | None = None
@@ -291,6 +318,9 @@ class LibrarySchema(BaseModel):
     is_default_library: bool | None = None
     advanced_library_path: str | None = None
     widgets: list[WidgetDefinition] | None = None
+    # Weight files this library needs on disk, keyed by the id node code asks for. Fetched on
+    # demand by whichever process runs the model -- never at library load.
+    model_assets: dict[str, ModelAsset] | None = None
     # Modules that only ever run where nodes execute. Paths relative to this manifest; a
     # directory means every `.py` beneath it.
     #

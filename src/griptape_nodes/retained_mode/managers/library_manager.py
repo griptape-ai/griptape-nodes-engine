@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import sysconfig
+import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -56,6 +57,7 @@ from griptape_nodes.node_library.library_registry import (
     LibraryRegistry,
     LibraryRegistryError,
     LibrarySchema,
+    ModelAsset,
     NodeDefinition,
     NodeMetadata,
     WidgetDefinition,
@@ -186,6 +188,10 @@ from griptape_nodes.retained_mode.events.library_events import (
     UpdateLibraryResultSuccess,
     WidgetInfo,
 )
+from griptape_nodes.retained_mode.events.model_events import (
+    DownloadModelRequest,
+    DownloadModelResultSuccess,
+)
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.os_events import (
     DeleteFileRequest,
@@ -300,6 +306,11 @@ logger = logging.getLogger("griptape_nodes")
 
 # Directories to exclude when scanning for Python source files (in addition to any directory starting with '.')
 EXCLUDED_SCAN_DIRECTORIES = frozenset({"venv", "__pycache__"})
+
+# One in-flight fetch per model-asset directory. Module-level rather than per-manager because what
+# it guards is a directory on disk: two engines in one process resolving the same asset would
+# otherwise hold separate locks and race each other into it.
+_MODEL_ASSET_FETCH_LOCKS: dict[Path, threading.Lock] = {}
 
 TRegisteredEventData = TypeVar("TRegisteredEventData")
 
@@ -3085,7 +3096,7 @@ class LibraryManager(EngineScoped):
             if isinstance(result, ListCompatibleResourceInstancesResultSuccess) and not result.instance_ids:
                 system_capabilities = self._get_system_capabilities()
                 logger.warning(
-                    "Library '%s' OS requirements not met. Required: %s, System: %s",
+                    "Library '%s' required OS resources not met. Wanted: %s, System: %s",
                     library_name,
                     os_requirements,
                     system_capabilities,
@@ -3106,7 +3117,7 @@ class LibraryManager(EngineScoped):
             if isinstance(result, ListCompatibleResourceInstancesResultSuccess) and not result.instance_ids:
                 system_capabilities = self._get_system_capabilities()
                 logger.warning(
-                    "Library '%s' compute requirements not met. Required: %s, System: %s",
+                    "Library '%s' required compute resources not met. Wanted: %s, System: %s",
                     library_name,
                     compute_requirements,
                     system_capabilities,
@@ -5094,7 +5105,9 @@ class LibraryManager(EngineScoped):
                 )
                 return
             library_info.execution_modules[path.stem] = module
-            logger.debug("Library '%s': imported execution module '%s'", library_data.name, path.stem)
+            # INFO, not debug: this is the record that a worker is ready to RUN this library, and
+            # the first thing to look for when it turns out it cannot.
+            logger.info("Library '%s': imported execution module '%s'", library_data.name, path.stem)
 
     def _check_execution_module_boundary(
         self,
@@ -5183,6 +5196,117 @@ class LibraryManager(EngineScoped):
             if resolved in library_info.declared_execution_module_paths:
                 return resolved
         return None
+
+    def get_model_asset(self, library_name: str, asset_id: str) -> Path:
+        """Return the local directory holding a declared model asset, fetching it if needed.
+
+        Weights are not dependencies, and they are not a library-load concern either. Resolved on
+        demand and cached under an engine-owned root, so no library has to invent a location.
+
+        The fetch itself is a request, so a worker asking mid-execution has the ORCHESTRATOR
+        download it; only the completion marker is written by the caller. That holds together
+        because both processes share the cache root, and stops holding the moment they do not.
+
+        Raises:
+            RuntimeError: If the library is unknown, declares no asset by that id, or the fetch
+                fails. Each message says which of those it was.
+        """
+        # Read through the registry rather than LibraryInfo: the registry holds the schema and
+        # resolves library-local declarations correctly in both the orchestrator and a worker,
+        # which is the same route get_declared_models takes.
+        try:
+            library = LibraryRegistry.get_library(library_name)
+        except KeyError as err:
+            msg = f"No library named '{library_name}' is registered, so its model assets cannot be resolved."
+            raise RuntimeError(msg) from err
+
+        declared = library.get_library_data().model_assets or {}
+        asset = declared.get(asset_id)
+        if asset is None:
+            available = ", ".join(sorted(declared)) or "none"
+            msg = (
+                f"Library '{library_name}' declares no model asset named '{asset_id}'. "
+                f"Declared: {available}. Add it to the manifest's model_assets."
+            )
+            raise RuntimeError(msg)
+
+        target = self._model_asset_path(library_name, asset_id, asset)
+        # A marker written only after a fetch succeeds, rather than "the directory has something in
+        # it". The directory is created before the download starts, so an interrupted fetch -- a
+        # dropped connection, a cancelled run, a rate limit part-way through a repo -- leaves
+        # partial weights behind. Treating those as present handed back a truncated model from every
+        # later call, failing in a way that points at the model rather than the cache, with nothing
+        # but manual deletion to recover.
+        complete_marker = target / ".griptape-nodes-complete"
+        if complete_marker.exists():
+            logger.debug("Model asset '%s' for library '%s' is already present at %s", asset_id, library_name, target)
+            return target
+
+        scheme, _, reference = asset.source.partition(":")
+        supported_schemes = ("hf",)
+        if scheme not in supported_schemes:
+            msg = (
+                f"Model asset '{asset_id}' of library '{library_name}' declares source "
+                f"'{asset.source}'. Supported schemes: {', '.join(supported_schemes)} "
+                "(e.g. 'hf:owner/repo')."
+            )
+            raise RuntimeError(msg)
+
+        # Serialized per directory, and re-checked inside. Node execution is concurrent, so two
+        # nodes asking for one asset both passed the marker check above, both downloaded into the
+        # same directory, and the first to return marked it complete while the second was still
+        # writing -- after which every later call short-circuits on the marker and hands back a
+        # truncated model, which is the outcome the marker exists to prevent.
+        with self._model_asset_lock(target):
+            if complete_marker.exists():
+                logger.debug("Model asset '%s' for library '%s' was fetched while waiting", asset_id, library_name)
+                return target
+            logger.info(
+                "Fetching model asset '%s' for library '%s' from %s (revision %s)",
+                asset_id,
+                library_name,
+                reference,
+                asset.revision,
+            )
+            target.mkdir(parents=True, exist_ok=True)
+            result = self.engine.handle_request(
+                DownloadModelRequest(
+                    model_id=reference,
+                    local_dir=str(target),
+                    revision=asset.revision,
+                    allow_patterns=asset.files,
+                )
+            )
+            if not isinstance(result, DownloadModelResultSuccess):
+                msg = (
+                    f"Attempted to fetch model asset '{asset_id}' for library '{library_name}' from "
+                    f"{reference}. Failed with: {result.result_details}"
+                )
+                # isinstance here discriminates a result payload, the engine's universal idiom; the
+                # failure is a fetch failure, not a type error.
+                raise RuntimeError(msg)  # noqa: TRY004
+            complete_marker.touch()
+        return target
+
+    @staticmethod
+    def _model_asset_lock(target: Path) -> threading.Lock:
+        """The lock owning fetches into `target`, created on first ask.
+
+        `setdefault` needs no guard of its own: two callers may each build a Lock, but both receive
+        whichever one landed in the map.
+        """
+        return _MODEL_ASSET_FETCH_LOCKS.setdefault(target, threading.Lock())
+
+    @staticmethod
+    def _model_asset_path(library_name: str, asset_id: str, asset: ModelAsset) -> Path:
+        """Where a model asset lives. Keyed by revision so a re-pin does not overwrite the old one.
+
+        Engine-owned rather than library-adjacent: a library directory can be read-only, can be
+        reinstalled underneath the weights, and is the wrong place for gigabytes that two libraries
+        might share.
+        """
+        safe_library = "".join(char if char.isalnum() or char in "-_" else "_" for char in library_name)
+        return xdg_data_home() / "griptape_nodes" / "model_assets" / safe_library / asset_id / asset.revision
 
     def get_execution_module(self, library_name: str, module_name: str) -> ModuleType:
         """Return one of a library's execution modules, or explain why it is not available here.
