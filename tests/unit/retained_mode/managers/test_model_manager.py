@@ -38,7 +38,13 @@ from griptape_nodes.retained_mode.events.model_events import (
     SearchModelsResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
-from griptape_nodes.retained_mode.managers.model_manager import DownloadParams, ModelManager, _load_status_file
+from griptape_nodes.retained_mode.managers.model_manager import (
+    _STATUS_READ_LOCK_ATTEMPTS,
+    _STATUS_READ_TORN_ATTEMPTS,
+    DownloadParams,
+    ModelManager,
+    _load_status_file,
+)
 
 
 @pytest.fixture
@@ -566,11 +572,7 @@ _COMPLETED_RECORD = {
 class TestStatusFileReadsSurviveConcurrentWrites:
     """A status file mid-write must not turn a poll into a reported failure.
 
-    The collision `TestAppInitializationCompleteWorkerGuard` describes
-    (griptape-ai/griptape-nodes-engine#5373), reached through the reader that guard could not
-    remove: the terminal `"completed"` write holds the lock while the editor polls for
-    progress, so the handler reported `PermissionError: [Errno 13] Permission denied` on the
-    line after "Successfully downloaded model".
+    The terminal `"completed"` write holds the lock while the editor polls for progress.
     """
 
     @pytest.fixture
@@ -597,7 +599,7 @@ class TestStatusFileReadsSurviveConcurrentWrites:
         assert data == _COMPLETED_RECORD
 
     def test_retries_past_a_half_written_file(self, status_file: Path) -> None:
-        # The write truncates before it locks, so a reader can see zero bytes.
+        # Advisory flock does not stop the reader, so it can see the rewrite at zero bytes.
         real_open = Path.open
         attempts = []
 
@@ -615,22 +617,44 @@ class TestStatusFileReadsSurviveConcurrentWrites:
         assert data == _COMPLETED_RECORD
 
     def test_a_file_that_never_frees_up_is_dropped_not_raised(self, status_file: Path) -> None:
-        with patch.object(Path, "open", side_effect=PermissionError(13, "Permission denied")):
+        with patch.object(Path, "open", side_effect=PermissionError(13, "Permission denied")) as locked_open:
             assert _load_status_file(status_file) is None
+
+        assert locked_open.call_count == _STATUS_READ_LOCK_ATTEMPTS
+
+    def test_a_permanently_malformed_file_does_not_pay_the_lock_budget(self, status_file: Path) -> None:
+        # Nothing distinguishes this from a torn read, and a poll cannot afford to wait on
+        # every corrupt file in the directory once per second.
+        status_file.write_text("{ truncated", encoding="utf-8")
+        real_open = Path.open
+        attempts = []
+
+        def count_attempts(self_path: Path, *args: Any, **kwargs: Any) -> Any:
+            attempts.append(self_path)
+            return real_open(self_path, *args, **kwargs)
+
+        with patch.object(Path, "open", count_attempts):
+            assert _load_status_file(status_file) is None
+
+        assert len(attempts) == _STATUS_READ_TORN_ATTEMPTS
 
     def test_missing_file_reads_as_no_status(self, tmp_path: Path) -> None:
         assert _load_status_file(tmp_path / "never-downloaded.json") is None
 
-    @pytest.mark.skipif(sys.platform != "win32", reason="only Windows fails a read inside another handle's lock")
-    def test_a_real_exclusive_lock_is_contained(self, status_file: Path) -> None:
-        # The lock os_manager takes for every status file write.
+    def test_a_real_write_lock_is_contained(self, status_file: Path) -> None:
+        # The lock os_manager takes for every status file write, mode included: `"w"` is what
+        # makes portalocker truncate under the lock, which is the window a POSIX reader sees.
         with portalocker.Lock(
             str(status_file),
-            mode="r+",
+            mode="w",
             timeout=0,
             flags=portalocker.LockFlags.EXCLUSIVE | portalocker.LockFlags.NON_BLOCKING,
         ):
+            # Windows fails the read on the locked range; POSIX reads the truncated file.
             assert _load_status_file(status_file) is None
+
+        status_file.write_text(json.dumps(_COMPLETED_RECORD), encoding="utf-8")
+        assert _load_status_file(status_file) == _COMPLETED_RECORD
 
     @pytest.mark.asyncio
     async def test_list_downloads_still_succeeds_when_a_read_fails(

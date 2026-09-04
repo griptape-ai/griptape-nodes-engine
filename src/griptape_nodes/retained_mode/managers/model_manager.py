@@ -99,7 +99,8 @@ class DownloadParams:
 
 _DOWNLOAD_PROGRESS_EMIT_INTERVAL = 1.0  # seconds between stdout progress events
 _PROGRESS_PIPE_ENV_VAR = "GRIPTAPE_NODES_PROGRESS_PIPE"  # set by parent to enable JSON stdout emission
-_STATUS_READ_ATTEMPTS = 5  # tries before giving up on a status file a writer is holding
+_STATUS_READ_LOCK_ATTEMPTS = 5  # tries before giving up on a status file a writer is holding
+_STATUS_READ_TORN_ATTEMPTS = 2  # a torn read clears on the next try; a file malformed on disk never does
 _STATUS_READ_RETRY_DELAY = 0.05  # seconds to wait out that writer between tries
 
 
@@ -237,20 +238,17 @@ def _load_status_file(status_file: Path) -> dict | None:
     """Read a download status file, waiting out a write in progress.
 
     Status files are written under an exclusive lock (`ModelManager._write_download_status`
-    -> `File.write_text` -> os_manager's portalocker write), and that write truncates the
-    file before it takes the lock. Windows byte-range locks are mandatory, so a reader that
-    lands inside the lock opens the file and then fails on the locked range with
-    `PermissionError: [Errno 13] Permission denied`; one that lands in the truncate window
-    sees an empty file instead. The lock is held per handle, so the writing process is no
-    more exempt than any other reader.
+    -> `File.write_text` -> os_manager's portalocker write) held across the write and the
+    fsync, and each platform fails a read inside that lock differently. Windows byte-range
+    locks are mandatory, so the reader opens the file and then fails on the locked range with
+    `PermissionError: [Errno 13] Permission denied`; the lock is per handle, so the writing
+    process is no more exempt than any other reader. POSIX `flock` is advisory, so the reader
+    is not stopped at all and parses the rewrite mid-flight instead -- portalocker truncates
+    under the lock rather than in `open`, so that read sees an empty or partial file.
 
-    griptape-ai/griptape-nodes-engine#5373 answered this for the startup scan by taking the
-    worker's reader away. This is the reader that has to stay: the editor asks what is
-    downloading while something is downloading. Both windows are milliseconds wide, but a
-    download rewrites its status file every second and again the moment it completes, so that
-    poll lands in them regularly -- reporting it is what turned a finished download into
-    "Failed to get download status: [Errno 13] Permission denied". Retrying reads the value
-    the writer was in the middle of committing instead.
+    A download rewrites its status file every second and again the moment it completes, so a
+    polling reader lands in these millisecond-wide windows regularly. Retrying reads the value
+    the writer was committing.
 
     Args:
         status_file: Path to the status file to read.
@@ -260,42 +258,71 @@ def _load_status_file(status_file: Path) -> dict | None:
             unreadable after every attempt, or does not hold a status record.
     """
     read_error: OSError | ValueError | None = None
+    # A budget per cause, spent only by the cause that failed: sharing one total would let a
+    # torn read spend the lock's tries. Either cause can happen on either platform, so
+    # neither budget is dead code.
+    lock_attempts = 0
+    torn_attempts = 0
 
-    for attempt in range(_STATUS_READ_ATTEMPTS):
+    while True:
         try:
             with status_file.open(encoding="utf-8") as f:
                 data = json.load(f)
         except FileNotFoundError:
             return None
-        # PermissionError is the held lock; the other two are a half-written file.
-        except (PermissionError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        except PermissionError as e:
+            # Overwhelmingly the writer's lock, which clears as soon as its fsync returns.
+            # A permanently denied file (wrong owner, quarantined) spends the budget for
+            # nothing, which is the cheaper of the two ways to be wrong here.
             read_error = e
-            if attempt < _STATUS_READ_ATTEMPTS - 1:
-                time.sleep(_STATUS_READ_RETRY_DELAY)
+            lock_attempts += 1
+            exhausted = lock_attempts >= _STATUS_READ_LOCK_ATTEMPTS
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            # Indistinguishable here from a file malformed on disk, which no amount of
+            # waiting fixes, so this cause gets far fewer tries than the lock.
+            read_error = e
+            torn_attempts += 1
+            exhausted = torn_attempts >= _STATUS_READ_TORN_ATTEMPTS
         else:
             if not isinstance(data, dict):
                 logger.warning("Status file '%s' does not contain a download record; ignoring it", status_file)
                 return None
             return data
 
+        if exhausted:
+            break
+
+        time.sleep(_STATUS_READ_RETRY_DELAY)
+
     logger.warning(
-        "Could not read status file '%s' after %d attempts: %s", status_file, _STATUS_READ_ATTEMPTS, read_error
+        "Could not read status file '%s' after %d attempts: %s",
+        status_file,
+        lock_attempts + torn_attempts,
+        read_error,
     )
     return None
 
 
-def _build_download_status(data: dict) -> ModelDownloadStatus | None:
+def _build_download_status(data: dict, status_file: Path) -> ModelDownloadStatus | None:
     """Build a ModelDownloadStatus from the contents of a status file.
 
     Args:
         data: Parsed status file data.
+        status_file: Path the data came from, to name it when the data is unusable.
 
     Returns:
         ModelDownloadStatus | None: The status, or None if required fields are missing.
     """
-    missing_fields = [field for field in ("model_id", "status", "started_at", "updated_at") if field not in data]
+    # An empty value is as unusable as an absent key: `model_id` keys a row in the editor.
+    missing_fields = [field for field in ("model_id", "status", "started_at", "updated_at") if not data.get(field)]
     if missing_fields:
-        logger.warning("Skipping a download record missing required fields: %s", ", ".join(missing_fields))
+        # DEBUG, not WARNING: nothing prunes the status directory, so a single junk file
+        # would otherwise log once per poll of the download panel forever.
+        logger.debug(
+            "Skipping status file '%s' with missing or empty required fields: %s",
+            status_file,
+            ", ".join(missing_fields),
+        )
         return None
 
     # Get byte counts from status file
@@ -1098,7 +1125,7 @@ class ModelManager(EngineScoped):
         if data is None:
             return None
 
-        return _build_download_status(data)
+        return _build_download_status(data, status_file)
 
     def _list_all_download_statuses(self) -> list[ModelDownloadStatus]:
         """List all model download statuses from status files.
@@ -1113,14 +1140,13 @@ class ModelManager(EngineScoped):
 
         statuses = []
         for status_file in status_dir.glob("*.json"):
-            # Build from what this file holds rather than re-reading it through
-            # _read_model_download_status: the second read only doubles the odds of
-            # landing on a writer holding the lock.
+            # Build from this file's own contents; routing through _read_model_download_status
+            # would read every file twice and double the exposure to a writer's lock.
             data = _load_status_file(status_file)
             if data is None:
                 continue
 
-            status = _build_download_status(data)
+            status = _build_download_status(data, status_file)
             if status is not None:
                 statuses.append(status)
 
