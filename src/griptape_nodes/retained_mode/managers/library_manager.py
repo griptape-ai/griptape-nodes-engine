@@ -7718,10 +7718,10 @@ class LibraryManager(EngineScoped):
     ) -> str:
         """Describe what THIS process installed, which is not always what the library declares.
 
-        The two environments have different owners: the orchestrator owns the edit-time venv for
-        an execution-dependency library, and only a worker builds an execution venv, and only for
-        its own libraries. So a count read off the manifest reported dependencies nobody here
-        installed.
+        The orchestrator owns both environments for an execution-dependency library: it builds the
+        execution venv because the worker receives that directory as PYTHONPATH and so cannot be
+        the process that creates it. A worker installs neither set, so a count read off the
+        manifest reported dependencies nobody here installed.
         """
         installed_total = installed_edit + installed_exec
         if installed_total == 0 and (declared_edit or declared_exec):

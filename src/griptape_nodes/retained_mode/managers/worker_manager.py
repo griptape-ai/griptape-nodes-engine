@@ -344,16 +344,9 @@ class WorkerManager(EngineScoped):
         # block buffer and from being lost on a crash.
         worker_environ["PYTHONUNBUFFERED"] = "1"
 
-        # Put the library's execution dependencies on sys.path BEFORE this process imports
-        # anything, which is the one thing splicing them in later cannot do. A module already in
-        # sys.modules is never reconsidered, and a package that probed for an optional dependency
-        # at import time has already cached the answer -- so a library shipping `safetensors` still
-        # hit `NameError: name 'safetensors' is not defined` inside huggingface_hub, because the
-        # engine imported huggingface_hub at boot when safetensors was not yet reachable.
-        #
-        # PYTHONPATH precedes site-packages, so this is library-first with the engine's own
-        # environment as the fallback: a package the library pins wins, and one it does not carry
-        # resolves from the engine as before.
+        # PYTHONPATH precedes site-packages, making this library-first with the engine's own
+        # environment as the fallback. It must be the environment rather than a later sys.path
+        # splice: sys.modules never reconsiders a module this process has already imported.
         execution_site_packages = self.engine.library_manager.execution_site_packages(worker_key)
         if execution_site_packages is not None:
             # Prepended, not assigned: a launcher-set PYTHONPATH (embedding hosts, source checkouts)
