@@ -25,7 +25,10 @@ from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileRequest,
     RegisterLibraryFromFileResultFailure,
 )
-from griptape_nodes.retained_mode.managers.fitness_problems.libraries import LibraryDependencyProblem
+from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
+    DependencyInstallationFailedProblem,
+    LibraryDependencyProblem,
+)
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.managers.settings import LibraryDependencyInstallBehavior
 
@@ -900,3 +903,66 @@ class TestRequiresWorkerResolvedOnFilePathRegistration:
 
         assert isinstance(result, LibraryManager.RegisterLibraryPrerequisites)
         assert result.library_info.requires_worker is False
+
+
+class TestPipInstallFailureIsRecordedOnTheLibrary:
+    """A failed dependency install must leave an account of itself on the LibraryInfo.
+
+    Until this was wired, a pip failure recorded nothing: the resolver's complaint went to a log
+    line and the library itself reported no problem at all. Anything that later asked the
+    library what was wrong with it -- the settings panel, or a worker explaining why it cannot
+    run a node -- had nothing to report.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_failed_install_records_a_dependency_installation_problem(self, engine: Engine) -> None:
+        mgr = engine.library_manager
+        lib_info = _make_lib_info()
+        schema = _make_schema_mock([])
+
+        failure = InstallLibraryDependenciesResultFailure(
+            result_details="No solution found when resolving dependencies: nonexistent-package"
+        )
+        with (
+            patch.object(mgr, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)),
+            patch.object(mgr, "install_library_dependencies_request", return_value=failure),
+            patch.object(mgr, "_library_file_path_to_info", {"/mock.json": lib_info}),
+        ):
+            await mgr._progress_library_through_lifecycle(
+                library_info=lib_info,
+                file_path="/mock.json",
+                request=RegisterLibraryFromFileRequest(file_path="/mock.json"),
+            )
+
+        install_problems = [p for p in lib_info.problems if isinstance(p, DependencyInstallationFailedProblem)]
+        assert len(install_problems) == 1
+        assert "nonexistent-package" in install_problems[0].error_details
+        # Readable by the collator the settings panel and the worker both go through.
+        collated = mgr.collate_problems_for_lib_info(lib_info)
+        assert collated is not None
+        assert "nonexistent-package" in collated
+
+    @pytest.mark.asyncio
+    async def test_a_failed_install_is_not_reported_as_a_missing_library_dependency(self, engine: Engine) -> None:
+        """The two are different failures and must not be conflated.
+
+        LibraryDependencyProblem means another griptape LIBRARY could not be fetched. Reusing it
+        for a pip failure would misreport the cause, and would silently change what the existing
+        dependency tests observe, since they filter problems by exactly that type.
+        """
+        mgr = engine.library_manager
+        lib_info = _make_lib_info()
+        schema = _make_schema_mock([])
+
+        with (
+            patch.object(mgr, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)),
+            patch.object(mgr, "install_library_dependencies_request", return_value=_INSTALL_STOP),
+            patch.object(mgr, "_library_file_path_to_info", {"/mock.json": lib_info}),
+        ):
+            await mgr._progress_library_through_lifecycle(
+                library_info=lib_info,
+                file_path="/mock.json",
+                request=RegisterLibraryFromFileRequest(file_path="/mock.json"),
+            )
+
+        assert not [p for p in lib_info.problems if isinstance(p, LibraryDependencyProblem)]

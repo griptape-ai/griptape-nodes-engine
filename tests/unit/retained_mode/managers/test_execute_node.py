@@ -10,6 +10,7 @@ from griptape_nodes.retained_mode.events.execution_events import (
     ExecuteNodeResultSuccess,
     NodeMetadata,
 )
+from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.managers.node_manager import NodeManager
 
 _LIBRARY_REGISTRY_CREATE_NODE_PATH = "griptape_nodes.retained_mode.managers.node_manager.LibraryRegistry.create_node"
@@ -31,7 +32,14 @@ def _make_mock_obj_mgr(existing_node: MagicMock | None = None) -> MagicMock:
     return mock_obj_mgr
 
 
-def _make_mock_library_manager(*, is_worker: bool) -> MagicMock:
+def _make_mock_library_manager(*, is_worker: bool, library_loaded: bool = True) -> MagicMock:
+    """A stub LibraryManager.
+
+    `library_loaded` matters because the worker-side failure path asks whether the library
+    actually LOADED before blaming the process for not starting. Left as a bare MagicMock, that
+    question answers with a truthy mock and every failure claims the process died -- so the state
+    is set explicitly here rather than left to mock defaults.
+    """
     lib_mgr = MagicMock()
     lib_mgr.is_worker = is_worker
     lib_mgr._is_worker = is_worker
@@ -39,6 +47,16 @@ def _make_mock_library_manager(*, is_worker: bool) -> MagicMock:
     # The execute path awaits this before consulting get_worker_for_library; a plain
     # MagicMock attribute is not awaitable.
     lib_mgr.wait_for_worker_library_load = AsyncMock()
+    if library_loaded:
+        lib_mgr.get_library_info_by_library_name.return_value.lifecycle_state = (
+            LibraryManager.LibraryLifecycleState.LOADED
+        )
+    else:
+        lib_mgr.get_library_info_by_library_name.return_value.lifecycle_state = (
+            LibraryManager.LibraryLifecycleState.EVALUATED
+        )
+        # The name the code actually calls; configuring the other one left the reason unexercised.
+        lib_mgr.get_collated_problems_for_library.return_value = "Dependency installation failed: no solution found"
     return lib_mgr
 
 
@@ -332,9 +350,37 @@ class TestExecuteNodeWorkerPathStateless:
             result = await node_manager.on_execute_node_request(request)
 
         assert isinstance(result, ExecuteNodeResultFailure)
-        assert "test_node" in str(result.result_details)
-        assert "SomeNodeType" in str(result.result_details)
-        assert "library not loaded" in str(result.result_details)
+        details = str(result.result_details)
+        assert "test_node" in details
+        assert "SomeNodeType" in details
+        # The library itself is LOADED, so this is one broken node type -- not a library that
+        # could not start. The underlying error is the useful thing to report.
+        assert "library not loaded" in details
+        assert "could not start it up" not in details
+
+    @pytest.mark.asyncio
+    async def test_a_library_that_never_loaded_explains_itself_without_the_raw_error(self) -> None:
+        """When the worker could not load the library, say that -- and not "not found".
+
+        "Library 'X' not found" is what LibraryRegistry raises, and it is actively misleading
+        here: the orchestrator holds that library and is drawing its nodes, so it sends the reader
+        hunting for something that is right in front of them. The cause belongs in the log.
+        """
+        mock_obj_mgr = _make_mock_obj_mgr(existing_node=None)
+        lib_mgr = _make_mock_library_manager(is_worker=True, library_loaded=False)
+        node_manager = _make_node_manager(object_manager=mock_obj_mgr, library_manager=lib_mgr)
+
+        with patch(_LIBRARY_REGISTRY_CREATE_NODE_PATH, side_effect=RuntimeError("Library 'some_library' not found")):
+            request = ExecuteNodeRequest(
+                node_name="test_node",
+                node_metadata={"node_type": "SomeNodeType", "library": "some_library"},
+            )
+            result = await node_manager.on_execute_node_request(request)
+
+        details = str(result.result_details)
+        assert "could not start it up" in details
+        assert "Editing the node still works" in details
+        assert "not found" not in details
 
 
 class TestExecuteNodeWorkerRoute:

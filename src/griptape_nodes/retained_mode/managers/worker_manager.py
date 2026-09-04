@@ -661,11 +661,21 @@ class WorkerManager(EngineScoped):
         await self.spawn_worker(args, library_name)
 
     def _log_spawn_error(self, task: asyncio.Task, library_name: str) -> None:
-        """Log a spawn that never produced a worker."""
+        """Record a spawn that never produced a worker.
+
+        `handle_start_worker_request` schedules the spawn and returns Success immediately, so its
+        caller cannot tell that a bad interpreter, an OSError, or a missing session stopped the
+        worker ever existing. Without recording it here the library reports that its worker "may
+        still be starting up" for the rest of the session -- which is exactly the message
+        `execution_unavailable_reason` exists to replace, for the most likely failure.
+        """
         exc = task.exception()
         if exc is None:
             return
         logger.error("Failed to spawn worker for library '%s': %s", library_name, exc)
+        library_info = self.engine.library_manager.get_library_info_by_library_name(library_name)
+        if library_info is not None:
+            library_info.execution_unavailable_reason = f"the worker process that runs it could not be started ({exc})."
 
     def get_topics_to_subscribe(self, *, is_worker: bool) -> list[str]:
         """Build the list of topics to subscribe to at connection start.

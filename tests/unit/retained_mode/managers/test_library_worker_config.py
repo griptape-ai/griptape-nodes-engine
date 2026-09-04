@@ -120,12 +120,32 @@ class TestGetWorkerForLibrary:
 
 class TestOnLibraryLoadedNotification:
     def _make_lib_info(self, library_name: str) -> LibraryManager.LibraryInfo:
+        """A legacy worker-mode library awaiting its worker's verdict.
+
+        `requires_worker` is what puts a library in WORKER_PENDING in the first place (see
+        `_start_workers`), so a fixture in that state without the flag describes something the
+        engine never produces.
+        """
         return LibraryManager.LibraryInfo(
             lifecycle_state=LibraryManager.LibraryLifecycleState.WORKER_PENDING,
             fitness=LibraryManager.LibraryFitness.NOT_EVALUATED,
             library_path="/some/path.json",
             is_sandbox=False,
             library_name=library_name,
+            requires_worker=True,
+            executes_in_worker=True,
+        )
+
+    def _make_exec_deps_lib_info(self, library_name: str) -> LibraryManager.LibraryInfo:
+        """An execution-dependency library that already loaded its real nodes locally."""
+        return LibraryManager.LibraryInfo(
+            lifecycle_state=LibraryManager.LibraryLifecycleState.LOADED,
+            fitness=LibraryManager.LibraryFitness.FLAWED,
+            library_path="/some/exec-deps.json",
+            is_sandbox=False,
+            library_name=library_name,
+            requires_worker=False,
+            executes_in_worker=True,
         )
 
     @pytest.mark.asyncio
@@ -138,6 +158,26 @@ class TestOnLibraryLoadedNotification:
 
         assert lib_info.lifecycle_state == LibraryManager.LibraryLifecycleState.LOADED
         assert lib_info.fitness == LibraryManager.LibraryFitness.GOOD
+
+    @pytest.mark.asyncio
+    async def test_a_worker_does_not_overwrite_a_locally_derived_fitness(self) -> None:
+        """An exec-deps library's fitness is the orchestrator's own finding, not the worker's.
+
+        It loaded real node classes here, so its FLAWED verdict came from doing that -- an
+        edit-time dependency that failed, a node module that would not import. The worker only
+        knows whether ITS copy came up. Taking the worker's answer would paint over a broken node
+        that is sitting on the canvas, and the reason would not travel with it.
+        """
+        mgr = _make_library_manager()
+        lib_info = self._make_exec_deps_lib_info("exec_deps_lib")
+        mgr._library_file_path_to_info["/some/exec-deps.json"] = lib_info
+
+        await mgr._on_library_loaded_notification(
+            LibraryLoadedNotification(library_name="exec_deps_lib", fitness="GOOD")
+        )
+
+        assert lib_info.fitness == LibraryManager.LibraryFitness.FLAWED
+        assert lib_info.lifecycle_state == LibraryManager.LibraryLifecycleState.LOADED
 
     @pytest.mark.asyncio
     async def test_accepts_flawed_fitness(self) -> None:
@@ -311,3 +351,52 @@ class TestExecuteWaitsForTheWorkerLibraryLoad:
         assert info.lifecycle_state is LibraryManager.LibraryLifecycleState.LOADED, (
             "an exec-deps library must stay editable through an eviction"
         )
+
+
+class TestOnWorkerEvicted:
+    """What an evicted worker leaves behind, per library kind.
+
+    An exec-dependencies library loaded real node classes on the orchestrator before its worker
+    ever spawned, so losing the worker must cost EXECUTION and nothing else: still LOADED, still
+    editable, with a reason the next run can report. A legacy worker-mode library has only stubs
+    until its worker confirms, so losing the worker is a load failure. Neither was covered, and
+    the difference is the whole point of the split.
+    """
+
+    def _info(self, *, requires_worker: bool, lifecycle: LibraryManager.LibraryLifecycleState) -> Any:
+        return LibraryManager.LibraryInfo(
+            lifecycle_state=lifecycle,
+            fitness=LibraryManager.LibraryFitness.GOOD,
+            library_path="/some/path.json",
+            is_sandbox=False,
+            library_name="Lib",
+            requires_worker=requires_worker,
+            executes_in_worker=True,
+        )
+
+    def test_exec_deps_library_stays_loaded_and_records_why(self) -> None:
+        manager = _make_library_manager()
+        info = self._info(requires_worker=False, lifecycle=LibraryManager.LibraryLifecycleState.LOADED)
+        manager._library_file_path_to_info["/some/path.json"] = info
+
+        manager.on_worker_evicted("worker-1", "Lib")
+
+        assert info.lifecycle_state is LibraryManager.LibraryLifecycleState.LOADED
+        assert info.fitness is LibraryManager.LibraryFitness.GOOD
+        assert info.execution_unavailable_reason is not None
+        assert "stopped responding" in info.execution_unavailable_reason
+
+    def test_legacy_worker_pending_library_becomes_failure(self) -> None:
+        manager = _make_library_manager()
+        info = self._info(requires_worker=True, lifecycle=LibraryManager.LibraryLifecycleState.WORKER_PENDING)
+        manager._library_file_path_to_info["/some/path.json"] = info
+
+        manager.on_worker_evicted("worker-1", "Lib")
+
+        assert info.lifecycle_state is LibraryManager.LibraryLifecycleState.FAILURE
+        assert info.fitness is LibraryManager.LibraryFitness.UNUSABLE
+
+    def test_unknown_library_name_is_a_no_op(self) -> None:
+        manager = _make_library_manager()
+        manager.on_worker_evicted("worker-1", "Never Registered")
+        manager.on_worker_evicted("worker-1", None)

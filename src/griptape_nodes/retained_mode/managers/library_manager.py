@@ -211,6 +211,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     AfterLibraryCallbackProblem,
     BeforeLibraryCallbackProblem,
     CreateConfigCategoryProblem,
+    DependencyInstallationFailedProblem,
     DuplicateLibraryProblem,
     EngineVersionErrorProblem,
     IncompatibleRequirementsProblem,
@@ -493,6 +494,13 @@ class LibraryManager(EngineScoped):
         is_sandbox: bool
         library_name: str | None = None
         library_version: str | None = None
+        # Why this library cannot execute right now, phrased for whoever has to act on it.
+        # A library can be perfectly loaded and editable while execution is unavailable. Set when
+        # its worker is evicted. Deliberately NOT set when execution dependencies fail to install:
+        # that happens in the worker's own process against the worker's own LibraryInfo, so the
+        # orchestrator never learns it -- the worker reports that itself when a run is attempted.
+        # None means nothing is known to be wrong.
+        execution_unavailable_reason: str | None = None
         # The path string the user wrote in `libraries_to_register` before workspace
         # resolution / `~`-expansion / symlink-following. Surfaced to the GUI so the
         # settings panel can match library metadata back to its config row using the
@@ -746,8 +754,16 @@ class LibraryManager(EngineScoped):
                 notification.library_name,
             )
             return
-        library_info.fitness = LibraryManager.LibraryFitness(notification.fitness)
-        library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.LOADED
+        # Only a legacy worker-mode library takes its fitness from the worker: for that kind the
+        # orchestrator never loaded the library itself, so the worker's verdict is the only one
+        # there is. An exec-deps library loaded REAL nodes here and derived its own fitness from
+        # doing so. Overwriting that misreports both ways -- a clean worker paints over a
+        # genuinely FLAWED local load, leaving the settings panel claiming health while a broken
+        # node sits on the canvas; a FLAWED worker downgrades a copy that is perfectly editable --
+        # and in neither case does the reason travel, since only the log gets problem_details.
+        if library_info.requires_worker:
+            library_info.fitness = LibraryManager.LibraryFitness(notification.fitness)
+            library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.LOADED
         if notification.problem_details:
             logger.warning(
                 "Worker reported problems loading library '%s': %s",
@@ -792,10 +808,20 @@ class LibraryManager(EngineScoped):
                     worker = wm.get_worker_for_key(library_name)
                     if worker:
                         return worker
-                    msg = (
-                        f"Library '{library_name}' requires a dedicated worker process "
-                        "that is not yet registered. The worker may still be starting up."
-                    )
+                    # Distinguish "not ready yet" from "went away", which read identically
+                    # before: a library whose worker had been evicted reported that it might
+                    # still be starting up, forever.
+                    if library_info.execution_unavailable_reason:
+                        msg = (
+                            f"Library '{library_name}' cannot run right now: "
+                            f"{library_info.execution_unavailable_reason} Editing its nodes still "
+                            "works, and a saved workflow keeps them."
+                        )
+                    else:
+                        msg = (
+                            f"Library '{library_name}' requires a dedicated worker process "
+                            "that is not yet registered. The worker may still be starting up."
+                        )
                     raise RuntimeError(msg)
                 msg = (
                     f"Library '{library_name}' requires a dedicated worker process. "
@@ -843,7 +869,17 @@ class LibraryManager(EngineScoped):
         that worker creation is always tied to an active session.
         """
         for library_info in self._library_file_path_to_info.values():
-            if library_info.executes_in_worker and library_info.library_name and not self._is_worker:
+            # `enabled` matters: executes_in_worker is set before the lifecycle is overwritten with
+            # DISABLED, so without this a library the user turned off still got an idle worker
+            # subprocess -- and a legacy worker-mode one had its DISABLED state overwritten with
+            # WORKER_PENDING, then blocked boot for the full startup grace waiting on a worker that
+            # was never going to report.
+            if (
+                library_info.executes_in_worker
+                and library_info.enabled
+                and library_info.library_name
+                and not self._is_worker
+            ):
                 # Legacy worker-mode libraries load AS the worker confirms (stubs meanwhile),
                 # so their lifecycle gates on the spawn. Exec-deps libraries loaded real
                 # nodes locally already: the worker gates execution availability only, and
@@ -857,6 +893,12 @@ class LibraryManager(EngineScoped):
                 # "Library not found". This event is set by the worker's LibraryLoadedNotification,
                 # and the execute path waits on it (wait_for_worker_library_load).
                 library_info.worker_ready = asyncio.Event()
+                # A fresh attempt, so whatever made execution unavailable before no longer
+                # describes the situation. Deliberately not conditioned on the result:
+                # StartWorkerRequest only SCHEDULES the spawn and always reports success, so a
+                # spawn that dies records its own reason from the task's exception handler
+                # (WorkerManager._log_spawn_error) rather than being inferred from here.
+                library_info.execution_unavailable_reason = None
                 await self.engine.ahandle_request(StartWorkerRequest(library_name=library_info.library_name))
 
     def on_worker_evicted(self, worker_engine_id: str, library_name: str | None) -> None:
@@ -877,6 +919,14 @@ class LibraryManager(EngineScoped):
         # worker that is already gone.
         if library_info.worker_ready is not None:
             library_info.worker_ready.set()
+        # Record WHY execution stopped being possible, for every library that routes execution
+        # to a worker. Nothing respawns an evicted worker, so without this the next run reports
+        # that the worker "may still be starting up" -- for the rest of the session.
+        if library_info.executes_in_worker:
+            library_info.execution_unavailable_reason = (
+                "the worker process that runs it stopped responding and was shut down."
+            )
+
         if library_info.lifecycle_state == LibraryManager.LibraryLifecycleState.WORKER_PENDING:
             library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.FAILURE
             library_info.fitness = LibraryManager.LibraryFitness.UNUSABLE
@@ -2527,6 +2577,18 @@ class LibraryManager(EngineScoped):
                             InstallLibraryDependenciesRequest(library_file_path=library_info.library_path)
                         )
                         if isinstance(install_result, InstallLibraryDependenciesResultFailure):
+                            # Replaced, not appended: the lifecycle re-enters at EVALUATED on every
+                            # reload while the LibraryInfo survives, and the display shows the
+                            # OLDEST instance -- appending would keep reporting the first reason.
+                            # Fitness stays with the dependency block above, which decides it.
+                            library_info.problems = [
+                                problem
+                                for problem in library_info.problems
+                                if not isinstance(problem, DependencyInstallationFailedProblem)
+                            ]
+                            library_info.problems.append(
+                                DependencyInstallationFailedProblem(error_details=str(install_result.result_details))
+                            )
                             self._library_file_path_to_info[library_info.library_path] = library_info
                             return RegisterLibraryFromFileResultFailure(result_details=install_result.result_details)
 
@@ -3060,6 +3122,11 @@ class LibraryManager(EngineScoped):
         process: the orchestrator must never have a library's heavy dependencies on its import
         path, since keeping them out is what stops one library's pins from shadowing another's.
 
+        The execution environment goes on FIRST, so it wins for anything present in both. That is
+        safe only because it is resolved over the edit-time set as well (see
+        on_install_library_dependencies_request): one resolver saw both, so there is no version
+        of a shared package for it to disagree with.
+
         Args:
             library_name: Name of the library (for venv lookup)
             library_file_path: Path to the library JSON file (for venv lookup)
@@ -3069,7 +3136,12 @@ class LibraryManager(EngineScoped):
 
         await self._add_library_venv_to_sys_path(library_name, library_file_path, execution=False)
 
-        if self._is_worker:
+        # Same predicate as the install: a worker splices ONLY its own libraries' execution
+        # environments. Gating the build without gating this left the hole open from the other
+        # side -- once the other library's own worker had built the venv, a nested registration
+        # here would put its heavy pins at sys.path[0] of this worker, which is precisely the
+        # shadowing the edit/execution split exists to prevent.
+        if self._is_worker and self._is_one_of_my_target_libraries(library_name):
             await self._add_library_venv_to_sys_path(library_name, library_file_path, execution=True)
 
     async def _add_library_venv_to_sys_path(
@@ -7008,40 +7080,179 @@ class LibraryManager(EngineScoped):
             pip_dependencies_exec = library_metadata.dependencies.pip_dependencies_exec or []
             pip_install_flags = library_metadata.dependencies.pip_install_flags or []
 
-        edit_failure = await self._install_dependency_set(
-            library_name=library_name,
-            library_file_path=library_file_path,
-            pip_dependencies=pip_dependencies,
-            pip_install_flags=pip_install_flags,
-            execution=False,
-        )
-        if edit_failure is not None:
-            return InstallLibraryDependenciesResultFailure(result_details=edit_failure)
-
-        exec_failure = await self._install_dependency_set(
-            library_name=library_name,
-            library_file_path=library_file_path,
-            pip_dependencies=pip_dependencies_exec,
-            pip_install_flags=pip_install_flags,
-            execution=True,
-        )
-        if exec_failure is not None:
-            return InstallLibraryDependenciesResultFailure(result_details=exec_failure)
-
-        installed_count = len(pip_dependencies) + len(pip_dependencies_exec)
-        if installed_count == 0:
-            details = f"Library '{library_name}' has no dependencies to install"
-        elif pip_dependencies_exec:
-            details = (
-                f"Installed {len(pip_dependencies)} edit-time and {len(pip_dependencies_exec)} "
-                f"execution dependencies for library '{library_name}'"
+        owns_edit_venv = self._this_process_owns_the_edit_venv(library_file_path)
+        if owns_edit_venv:
+            edit_failure = await self._install_dependency_set(
+                library_name=library_name,
+                library_file_path=library_file_path,
+                pip_dependencies=pip_dependencies,
+                pip_install_flags=pip_install_flags,
+                execution=False,
             )
-        else:
-            details = f"Installed {len(pip_dependencies)} dependencies for library '{library_name}'"
+            if edit_failure is not None:
+                return InstallLibraryDependenciesResultFailure(result_details=edit_failure)
+
+        # Only a worker ever imports the execution set, and only a worker splices .venv-exec
+        # onto sys.path (see _add_library_paths_to_sys_path, which gates that on the same
+        # flag). Installing it here too made the orchestrator download and store the entire
+        # weight of every heavy library -- half a gigabyte for one torch pin -- to run code it
+        # will never import, which is the cost the edit/execution split exists to avoid.
+        #
+        # It also decided the wrong thing on failure. An unresolvable execution dependency
+        # returned a registration failure, so the library did not load at all: no node types,
+        # and placeholder nodes reading "Library not found" in any workflow that used it. The
+        # orchestrator needs nothing but the edit-time set to define, draw, and edit those
+        # nodes, so a broken execution dependency must cost execution and nothing else.
+        installed_exec_count = 0
+        # Gated on the heavy set, not the combined one: a library with no execution
+        # dependencies must still produce no .venv-exec at all.
+        if self._is_worker and pip_dependencies_exec and self._is_one_of_my_target_libraries(library_name):
+            # The edit-time set is resolved INTO the execution environment alongside the heavy
+            # one, not just listed beside it. The two venvs are fully isolated, so resolving them
+            # separately let uv pick a different version of anything they share -- numpy as an
+            # edit-time dep and numpy pulled in by torch, say. .venv-exec is spliced ahead of
+            # .venv in a worker, so the execution copy would then win, and a node module's
+            # `import numpy` would bind one version when the orchestrator built the node and
+            # another when the worker ran it, with no diagnostic anywhere. One resolution over
+            # both sets makes that impossible rather than merely unlikely.
+            exec_failure = await self._install_dependency_set(
+                library_name=library_name,
+                library_file_path=library_file_path,
+                pip_dependencies=[*pip_dependencies, *pip_dependencies_exec],
+                pip_install_flags=pip_install_flags,
+                execution=True,
+            )
+            if exec_failure is not None:
+                return InstallLibraryDependenciesResultFailure(result_details=exec_failure)
+            installed_exec_count = len(pip_dependencies_exec)
+
+        # Only count the edit-time set if this process actually installed it: a worker for an
+        # exec-deps library skips it (the orchestrator owns that venv), so counting it here
+        # reported dependencies nobody installed.
+        installed_edit_count = len(pip_dependencies) if owns_edit_venv else 0
+        installed_count = installed_edit_count + installed_exec_count
+        details = self._describe_dependency_install(
+            library_name=library_name,
+            declared_edit=len(pip_dependencies),
+            declared_exec=len(pip_dependencies_exec),
+            installed_edit=installed_edit_count,
+            installed_exec=installed_exec_count,
+        )
         logger.info(details)
         return InstallLibraryDependenciesResultSuccess(
             library_name=library_name, dependencies_installed=installed_count, result_details=details
         )
+
+    @staticmethod
+    def _describe_dependency_install(
+        *,
+        library_name: str,
+        declared_edit: int,
+        declared_exec: int,
+        installed_edit: int,
+        installed_exec: int,
+    ) -> str:
+        """Describe what THIS process installed, which is not always what the library declares.
+
+        The two environments have different owners: the orchestrator owns the edit-time venv for
+        an execution-dependency library, and only a worker builds an execution venv, and only for
+        its own libraries. So a count read off the manifest reported dependencies nobody here
+        installed.
+        """
+        installed_total = installed_edit + installed_exec
+        if installed_total == 0 and (declared_edit or declared_exec):
+            return (
+                f"Library '{library_name}' declares dependencies, none of which install in this "
+                f"process; whichever process owns each environment installs it"
+            )
+        if installed_total == 0:
+            return f"Library '{library_name}' has no dependencies to install"
+        if installed_exec:
+            return (
+                f"Installed {installed_edit} edit-time and {installed_exec} execution "
+                f"dependencies for library '{library_name}'"
+            )
+        if declared_exec:
+            return (
+                f"Installed {installed_edit} edit-time dependencies for library "
+                f"'{library_name}'; its {declared_exec} execution dependencies install in the "
+                f"worker that runs them"
+            )
+        return f"Installed {installed_edit} dependencies for library '{library_name}'"
+
+    def _is_one_of_my_target_libraries(self, library_name: str) -> bool:
+        """Whether this worker was spawned to serve `library_name`.
+
+        A worker is scoped to its target libraries by a filter in
+        `load_all_libraries_from_config`, but nested registration paths bypass that filter --
+        an unregistered library dependency reaches `download_library_request(auto_register=True)`
+        and runs a full registration for a DIFFERENT library inside this worker. Building that
+        library's `.venv-exec` here would put two writers on one directory, which
+        `_install_deps_with_recovery` can rmtree, and would splice another library's heavy pins
+        onto this worker's sys.path -- the shadowing the split exists to prevent. The
+        orchestrator has no target list and legitimately installs for anyone.
+
+        A nested dependency (one library declaring another) may still get its EDIT-time venv
+        built here -- see `_this_process_owns_the_edit_venv`, which claims it only when nothing
+        has built it yet. What it never gets here is an EXECUTION venv, so a nested dependency
+        whose node modules need the heavy set at IMPORT time fails to load in this worker. That
+        means a library whose MANIFEST declares worker mode (`requires_worker_process`), since
+        such modules are not base-clean by contract -- not the per-entry `worker_mode_override`,
+        which cannot apply to a nested registration at all because it is keyed on a registered
+        config path that a nested library does not have. So auditing configs for the override
+        would not find this case. The alternative is letting one worker's sys.path be rewritten
+        by another library's pins, which is the collision the split exists to end.
+        """
+        if self._target_library_names is None:
+            return True
+        return library_name in self._target_library_names
+
+    def _this_process_owns_the_edit_venv(self, library_file_path: str) -> bool:
+        """Whether this process may write `<library>/.venv`. Exactly one process may.
+
+        An execution-dependency library is loaded on the ORCHESTRATOR (real node classes, not
+        stubs), so the orchestrator builds that venv and keeps it on its own sys.path for the
+        session. A worker for such a library must not touch it: two concurrent `uv pip install`
+        runs at one target is the mild version, and the corrupt-install recovery path rmtrees
+        the directory outright -- so an execution-side retry would delete the environment the
+        orchestrator is importing from, which is the exact inverse of the isolation this design
+        exists to provide. The worker does not need it either way: `.venv-exec` is resolved
+        over BOTH dependency sets, so everything the edit-time set provides is already there.
+
+        A legacy worker-mode library is the other case: the orchestrator skips loading it
+        entirely (WORKER_DELEGATED), so nobody else creates `.venv` and the worker must.
+
+        A worker with NO record for the library cannot tell which case it is in, and guessing
+        wrong re-opens the double-writer hazard -- so it refuses, loudly.
+        """
+        if not self._is_worker:
+            return True
+        library_info = self._library_file_path_to_info.get(library_file_path)
+        # A library this worker was NOT spawned for arrives through a nested registration (one
+        # library declaring another as a dependency), and registration continues here into module
+        # imports -- which resolve against `<library>/.venv`. If nothing has built it, this
+        # process must, or the import fails and takes the outer library down as UNUSABLE.
+        #
+        # Only when nothing has built it, though: the orchestrator runs the same nested loop and
+        # may have built this venv already (and be importing from it). Claiming ownership of an
+        # existing directory would put this process on `_install_deps_with_recovery`, which
+        # rmtrees on a failed install -- the exact hazard this predicate exists to prevent, just
+        # reached from the other side.
+        if (
+            library_info is not None
+            and library_info.library_name is not None
+            and not self._is_one_of_my_target_libraries(library_info.library_name)
+        ):
+            venv_path = self._get_library_venv_path(library_info.library_name, library_file_path, execution=False)
+            return not Path(venv_path).exists()
+        if library_info is None:
+            logger.warning(
+                "No library record found for '%s' in this worker; skipping the edit-time "
+                "environment install rather than risk writing a venv another process owns.",
+                library_file_path,
+            )
+            return False
+        return library_info.requires_worker
 
     async def _install_dependency_set(  # noqa: PLR0911
         self,
