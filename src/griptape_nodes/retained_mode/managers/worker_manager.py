@@ -18,6 +18,7 @@ from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events import worker_events
 from griptape_nodes.retained_mode.events.app_events import ConfigChanged, CurrentProjectChanged, SecretChanged
 from griptape_nodes.retained_mode.events.base_events import EventRequest
+from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
 from griptape_nodes.retained_mode.managers.settings import (
     WORKER_HEARTBEAT_INTERVAL_KEY,
     WORKER_HEARTBEAT_STARTUP_GRACE_KEY,
@@ -225,8 +226,21 @@ class WorkerManager(EngineScoped):
 
         response_topic = f"sessions/{session_id}/workers/{wid}/response"
         await self._tx.subscribe_to_topic(response_topic)
+        # Answer with the project this orchestrator has active. Registration is the only moment
+        # both sides are guaranteed to exist, so it is the one place the two can be put on the same
+        # workspace without a race: the worker adopts this before it loads any library, and
+        # libraries resolve against the workspace a project decides. Pushing it afterwards would
+        # leave the worker's library load and the push ordered by chance.
+        # None on the wire for system defaults, so the worker needs no sentinel knowledge: a
+        # fresh worker IS on system defaults, and both processes derive that workspace from the
+        # same config files, the same CWD, and the same inherited environment.
+        current_project_id = self.engine.project_manager.current_project_id()
+        if current_project_id == SYSTEM_DEFAULTS_KEY:
+            current_project_id = None
         return worker_events.RegisterWorkerResultSuccess(
-            worker_engine_id=wid, result_details="Worker registered successfully."
+            worker_engine_id=wid,
+            current_project_id=current_project_id,
+            result_details="Worker registered successfully.",
         )
 
     def handle_worker_heartbeat_request(
@@ -363,6 +377,10 @@ class WorkerManager(EngineScoped):
                 worker_key,
                 execution_site_packages,
             )
+
+        # No workspace variable here: GTN_CONFIG_ outranks the runtime project override, so a worker
+        # handed one could never follow its orchestrator onto a project's workspace again. The
+        # workspace arrives with the project, adopted from the registration reply.
 
         # Hand the worker the URL of the static server the orchestrator is ALREADY serving
         # this workspace on. Without it the worker starts its own server, wins an arbitrary

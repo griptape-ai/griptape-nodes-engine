@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+import anyio
 from pydantic import ValidationError
 
 from griptape_nodes.common.macro_parser import (
@@ -44,6 +45,7 @@ from griptape_nodes.common.project_templates import (
     schema_major_or_none,
     select_project_path,
 )
+from griptape_nodes.common.workflow_context_handoff import WorkflowContextSnapshot
 from griptape_nodes.files.derivation import DERIVATION_RULES, apply_derivation_rules
 from griptape_nodes.files.file import File, FileWriteError
 from griptape_nodes.files.path_utils import (
@@ -3065,10 +3067,8 @@ class ProjectManager(EngineScoped):
 
         # Push the switch to running workers so they adopt the orchestrator's project
         # even on a shallow switch (same workspace + library config) that would not
-        # restart them. Boot is handled separately (a worker boots like an engine and
-        # re-derives the same project), so emit only post-init and only when the
-        # project actually changed. A worker that boots like the orchestrator has the
-        # same registry, so the id resolves there too.
+        # restart them. A worker that starts after this adopts from its registration
+        # reply instead, so emit only post-init and only on an actual change.
         if self._initialization_complete and previous_project_id != resolved_project_id:
             self._event_manager.put_event(AppEvent(payload=CurrentProjectChanged(project_id=resolved_project_id)))
         return result
@@ -3340,7 +3340,36 @@ class ProjectManager(EngineScoped):
             return True
         self._config_manager.load_configs()
         await self._load_registered_projects()
+        if project_id in self._successfully_loaded_project_templates:
+            return True
+        # Registered-project discovery only covers projects_to_register. A project the
+        # orchestrator holds via the persisted `project_file` -- which is how every install names
+        # its project after any prior activation -- is invisible to it, and that miss is exactly
+        # how a worker ended up running against a different workspace than its orchestrator. The
+        # id IS the canonical template path, so when a file exists there, load it directly with
+        # the same loader the orchestrator used; the resulting id matches by construction.
+        candidate = Path(project_id)
+        if await anyio.Path(candidate).is_file():
+            load_result = await self.on_load_project_template_request(
+                LoadProjectTemplateRequest(project_path=candidate)
+            )
+            if load_result.failed():
+                logger.error(
+                    "Attempted to load project '%s' by path during re-derivation. Failed with: %s",
+                    project_id,
+                    load_result.result_details,
+                )
         return project_id in self._successfully_loaded_project_templates
+
+    def current_project_id(self) -> ProjectID:
+        """The project this engine has active, or SYSTEM_DEFAULTS_KEY when it has none.
+
+        Exists so a peer manager can read the active project without going through a request, which
+        WorkerManager needs while answering a worker's registration: the reply has to carry this
+        value, and issuing a request from inside a request handler is the reentrancy the forwarding
+        machinery exists to avoid.
+        """
+        return self._current_project_id
 
     def on_get_current_project_request(
         self, _request: GetCurrentProjectRequest
@@ -4752,6 +4781,26 @@ class ProjectManager(EngineScoped):
         # static analyzers (CodeQL) can prove the function never implicitly returns None.
         msg = f"Unknown builtin variable: {var_name}"
         raise ValueError(msg)
+
+    def workflow_context_for_dispatch(self) -> WorkflowContextSnapshot:
+        """This engine's workflow context, in the form another engine can adopt.
+
+        Raw context, not resolved paths: the adopting engine then derives every workflow-dependent
+        value through its own normal code paths, so the two cannot drift and a new derived value
+        needs no new handoff.
+
+        Empty when this process has no workflow -- there is nothing to lend, and the peer keeps
+        answering from its own equally-empty context, so both degrade identically.
+        """
+        context_manager = self.engine.context_manager
+        if not context_manager.has_current_workflow():
+            return WorkflowContextSnapshot()
+
+        return WorkflowContextSnapshot(
+            name=context_manager.get_current_workflow_name(),
+            file_path=context_manager.get_current_workflow_file_path(),
+            working_directory=context_manager.get_current_workflow_working_directory(),
+        )
 
     def _resolve_workflow_dir(self) -> str:
         """Resolve the `workflow_dir` builtin: the folder the current workflow belongs to.

@@ -41,9 +41,16 @@ class RegisterWorkerResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess)
 
     Args:
         worker_engine_id: The engine_id of the worker that was registered.
+        current_project_id: The project the orchestrator has active, or None when it is on system
+            defaults. The worker adopts this BEFORE loading libraries, which is what keeps the two
+            processes on one workspace: a project decides the workspace, libraries resolve against
+            the workspace, and a worker that loaded first would resolve them against a different
+            one. Answered here rather than pushed afterwards so the ordering is a consequence of
+            the reply the worker already waits for, not of two messages racing.
     """
 
     worker_engine_id: str
+    current_project_id: str | None = None
 
 
 @dataclass

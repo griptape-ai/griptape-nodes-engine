@@ -3411,6 +3411,18 @@ class NodeManager(EngineScoped):
         if tracked_request_id and current_task is not None:
             self._worker_inflight_aprocesses[tracked_request_id] = (current_task, node)
         try:
+            # Adopt the orchestrator's workflow context before anything resolves a path.
+            # Hydration resolves paths too, so this has to precede it -- and it cannot ride
+            # aprocess_scope, which is specified to stay narrow so its mutation detector fires
+            # only inside aprocess. Worker-only: on the orchestrator route this process already
+            # owns the context it just sent, and re-adopting it would be writing over the top of
+            # its own stack.
+            if self.engine.library_manager.is_worker:
+                self.engine.context_manager.mirror_workflow_context(
+                    request.workflow_name,
+                    request.workflow_file_path,
+                    request.workflow_working_directory,
+                )
             return await self._hydrate_and_run_node_inner(node, request)
         finally:
             if tracked_request_id:

@@ -88,6 +88,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
 )
 from griptape_nodes.retained_mode.events.project_events import (
     GetCurrentProjectRequest,
+    LoadProjectTemplateRequest,
     SetCurrentProjectRequest,
 )
 from griptape_nodes.retained_mode.events.workflow_events import (
@@ -100,12 +101,11 @@ from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
 
 SUPPORTED_REQUEST_EVENTS: dict[str, type[RequestPayload]] = {
-    # Projects. The GUI can switch projects; a headless client (agents, the e2e harnesses)
-    # could not, which left the post-switch behaviors -- workspace override, worker fan-out --
-    # untestable without a human clicking. Get is here so a client can assert the live state
-    # instead of inferring it.
+    # Projects. Exposed so a headless client (agents, the e2e harnesses) can drive a switch and
+    # then assert the live state rather than infer it.
     "SetCurrentProjectRequest": SetCurrentProjectRequest,
     "GetCurrentProjectRequest": GetCurrentProjectRequest,
+    "LoadProjectTemplateRequest": LoadProjectTemplateRequest,
     # Workflows
     "RunWorkflowWithCurrentStateRequest": RunWorkflowWithCurrentStateRequest,
     "ListAllWorkflowsRequest": ListAllWorkflowsRequest,
