@@ -2577,26 +2577,10 @@ class LibraryManager(EngineScoped):
                             InstallLibraryDependenciesRequest(library_file_path=library_info.library_path)
                         )
                         if isinstance(install_result, InstallLibraryDependenciesResultFailure):
-                            # Record WHY on the library itself. Until now a failed install left
-                            # no trace on the LibraryInfo, so anything that later asked the
-                            # library what was wrong with it -- the settings panel, or a worker
-                            # explaining why it cannot run a node -- had nothing to report, and
-                            # the resolver's actual complaint lived only in a log line.
-                            #
-                            # DependencyInstallationFailedProblem already existed for this and
-                            # was wired to nothing. Deliberately NOT LibraryDependencyProblem,
-                            # which means something else: that another griptape LIBRARY this one
-                            # depends on could not be fetched.
-                            #
-                            # Fitness is deliberately left alone. Registration already fails
-                            # here, and the fitness a library ends up with is decided by the
-                            # dependency block above; overriding it from this branch changes what
-                            # a skipped-dependency library reports.
                             # Replaced, not appended: the lifecycle re-enters at EVALUATED on every
-                            # reload and project switch while the LibraryInfo is preserved, so
-                            # appending accumulated one copy per reload.
-                            # DependencyInstallationFailedProblem logs an error above one instance
-                            # and then displays the OLDEST, so a changed reason would show stale.
+                            # reload while the LibraryInfo survives, and the display shows the
+                            # OLDEST instance -- appending would keep reporting the first reason.
+                            # Fitness stays with the dependency block above, which decides it.
                             library_info.problems = [
                                 problem
                                 for problem in library_info.problems
