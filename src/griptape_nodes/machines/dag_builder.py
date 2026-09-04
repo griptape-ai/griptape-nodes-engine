@@ -439,6 +439,18 @@ class DagBuilder(EngineScoped):
                 self.node_to_reference.pop(node_name, None)
             self.graph_to_nodes.pop(graph_name, None)
 
+    def remove_node(self, node_name: str) -> None:
+        """Forget a node entirely, for when it is deleted while a run is in flight.
+
+        Only safe for a node the run no longer needs -- see `NodeManager._find_entangled_live_node`.
+        Removing a node the run is still waiting on would drop a successor's in-degree to zero and
+        let it start on inputs that never arrived.
+        """
+        self.node_to_reference.pop(node_name, None)
+        for graph_name, graph in self.graphs.items():
+            graph.remove_node(node_name)
+            self.graph_to_nodes.get(graph_name, set()).discard(node_name)
+
     def remove_node_from_dependencies(self, completed_node: str, graph_name: str) -> list[str]:
         """Remove completed node from all dependencies, return nodes ready to execute.
 

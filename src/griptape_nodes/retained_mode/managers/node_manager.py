@@ -1268,10 +1268,10 @@ class NodeManager(EngineScoped):
             parent_flow.clear_execution_queue()
         return None
 
-    def _find_entangled_live_node(self, node: BaseNode) -> BaseNode | None:
-        """Find the live node that deleting `node` would damage, or None if nothing would be.
+    def _find_entangled_live_node(self, node: BaseNode) -> str | None:
+        """Name the live node that deleting `node` would damage, or None if nothing would be.
 
-        Two ways a delete can damage a run, and only these two:
+        Three ways a delete can damage a run, and only these three:
 
         1. The node is part of the live run and has not settled, so the run is still counting on it
            to produce something.
@@ -1279,6 +1279,8 @@ class NodeManager(EngineScoped):
            when a node collects its inputs from upstream, so a consumer that has not been dispatched
            has not received this node's outputs and would fall back to its parameter defaults --
            finishing the run with the wrong answer and no indication anything went wrong.
+        3. The run is gated on this node: a data node is registered as reachable only once this node
+           finishes, and would otherwise wait forever for something that is never coming.
 
         A consumer that is already processing or done has its values, so it is not damaged. Control
         connections count the same as data connections here: deleting a settled node whose control
@@ -1287,17 +1289,23 @@ class NodeManager(EngineScoped):
         The live run is the DAG, not the flow. Nodes the run was never going to reach are absent
         from it, which is what makes deleting a bystander or an unreached consumer free.
         """
-        dag_nodes = self.engine.flow_manager.global_dag_builder.node_to_reference
+        dag_builder = self.engine.flow_manager.global_dag_builder
+        dag_nodes = dag_builder.node_to_reference
 
         own_dag_node = dag_nodes.get(node.name)
         if own_dag_node is not None and own_dag_node.node_state not in _SETTLED_NODE_STATES:
-            return node
+            return node.name
 
         connections = self.engine.flow_manager.get_connections()
         for connection in connections.get_all_outgoing_connections(node):
             target_dag_node = dag_nodes.get(connection.target_node.name)
             if target_dag_node is not None and target_dag_node.node_state in _UNCOLLECTED_NODE_STATES:
-                return connection.target_node
+                return connection.target_node.name
+
+        for gated_node_name, boundary_nodes_by_graph in dag_builder.start_node_candidates.items():
+            for boundary_node_names in boundary_nodes_by_graph.values():
+                if node.name in boundary_node_names:
+                    return gated_node_name
 
         return None
 
@@ -1331,6 +1339,11 @@ class NodeManager(EngineScoped):
             cancel_result = await self.cancel_conditionally(parent_flow, parent_flow_name, node)
             if cancel_result is not None:
                 return cancel_result
+
+            # The node is leaving, so the live DAG has to stop naming it: it is published to the
+            # editor as an involved node, iterated on cancel, and checked before a node is allowed
+            # to start. Harmless when the run was cancelled above, since teardown clears it anyway.
+            self.engine.flow_manager.global_dag_builder.remove_node(node_name)
 
             # Call after_node_deleted hook for cleanup of a node, implemented by node author.
             try:
