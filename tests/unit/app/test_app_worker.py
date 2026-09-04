@@ -20,6 +20,7 @@ import pytest
 
 from griptape_nodes.api_client.request_client import _PendingRequest
 from griptape_nodes.retained_mode.events import worker_events
+from griptape_nodes.retained_mode.events.app_events import CurrentProjectChanged
 from griptape_nodes.retained_mode.events.base_events import EventRequest
 from griptape_nodes.retained_mode.events.execution_events import (
     ExecuteNodeRequest,
@@ -296,6 +297,27 @@ class TestProjectSwitchWaitsForWorkers:
 
         assert len(failures) == 1
         assert "nope" in failures[0]
+
+    @pytest.mark.asyncio
+    async def test_fan_out_carries_the_committed_generation(self, worker_manager: WorkerManager) -> None:
+        """A worker adopts only strictly newer generations, so a fan-out that omits one is skipped.
+
+        The worker records the generation it adopted, so a fan-out stamped with the default 0
+        makes every switch after the first look stale -- and the worker answers Success, which
+        costs the caller the failure log too.
+        """
+        worker_manager._workers = {"worker-a": WorkerRegistration(request_topic="t/a", worker_key=None)}
+        sent: list[int] = []
+
+        async def carrying_route(event: EventRequest, _worker_engine_id: str, _topic: str) -> dict:
+            sent.append(event.request.generation)  # type: ignore[attr-defined]
+            return {"result_type": "ActivateProjectResultSuccess", "result": {}}
+
+        worker_manager.route_to_worker = carrying_route  # type: ignore[method-assign]
+
+        await worker_manager._on_current_project_changed(CurrentProjectChanged(project_id="proj-9", generation=4))
+
+        assert sent == [4]
 
 
 class TestHandleRegisterWorkerRequestEngineVersion:

@@ -719,6 +719,7 @@ class WorkerManager(EngineScoped):
         session_id = self.engine.get_session_id()
         if not session_id:
             logger.error("Session event set but no session ID available for library '%s'.", library_name)
+            self._refuse_spawn(library_name, "no session was available to start its worker process.")
             return
         # The worker is handed its library's execution environment as PYTHONPATH, so that directory
         # has to exist before the process starts. The orchestrator builds it in the background to
@@ -736,15 +737,7 @@ class WorkerManager(EngineScoped):
                 library_name,
                 failed_env_reason,
             )
-            # Recorded the same way _log_spawn_error records its failures: _start_workers
-            # cleared execution_unavailable_reason before scheduling this spawn, so without
-            # this a run reports the worker "may still be starting up" for the whole session.
-            library_info = self.engine.library_manager.get_library_info_by_library_name(library_name)
-            if library_info is not None:
-                library_info.execution_unavailable_reason = failed_env_reason
-                # No worker is coming; anything waiting on it must be released to see the reason.
-                if library_info.worker_ready is not None:
-                    library_info.worker_ready.set()
+            self._refuse_spawn(library_name, failed_env_reason)
             return
         args = [
             sys.executable,
@@ -759,24 +752,31 @@ class WorkerManager(EngineScoped):
         await self.spawn_worker(args, library_name)
 
     def _log_spawn_error(self, task: asyncio.Task, library_name: str) -> None:
-        """Record a spawn that never produced a worker.
+        """Record a spawn that raised before producing a worker.
 
         `handle_start_worker_request` schedules the spawn and returns Success immediately, so its
-        caller cannot tell that a bad interpreter, an OSError, or a missing session stopped the
-        worker ever existing. Without recording it here the library reports that its worker "may
-        still be starting up" for the rest of the session -- which is exactly the message
-        `execution_unavailable_reason` exists to replace, for the most likely failure.
+        caller cannot tell that a bad interpreter or an OSError stopped the worker ever existing.
+        Refusals that return rather than raise are invisible here and record themselves.
         """
         exc = task.exception()
         if exc is None:
             return
         logger.error("Failed to spawn worker for library '%s': %s", library_name, exc)
+        self._refuse_spawn(library_name, f"the worker process that runs it could not be started ({exc}).")
+
+    def _refuse_spawn(self, library_name: str, reason: str) -> None:
+        """Record why no worker is coming for `library_name`, and release anything waiting on one.
+
+        `_start_workers` clears `execution_unavailable_reason` and installs a fresh `worker_ready`
+        before scheduling a spawn, so a refusal that records neither leaves the next run waiting
+        out the whole startup grace and then blaming a library load that never began.
+        """
         library_info = self.engine.library_manager.get_library_info_by_library_name(library_name)
-        if library_info is not None:
-            library_info.execution_unavailable_reason = f"the worker process that runs it could not be started ({exc})."
-            # No worker is coming; anything waiting on it must be released to see the reason.
-            if library_info.worker_ready is not None:
-                library_info.worker_ready.set()
+        if library_info is None:
+            return
+        library_info.execution_unavailable_reason = reason
+        if library_info.worker_ready is not None:
+            library_info.worker_ready.set()
 
     def get_topics_to_subscribe(self, *, is_worker: bool) -> list[str]:
         """Build the list of topics to subscribe to at connection start.
@@ -871,26 +871,24 @@ class WorkerManager(EngineScoped):
     async def _on_current_project_changed(self, event: CurrentProjectChanged) -> None:
         """Fan out an ActivateProjectRequest after the orchestrator switched projects.
 
-        ProjectManager only emits ``CurrentProjectChanged`` from a successful
-        post-init activation, so receiving it means workers should adopt the new
-        project. Carries the new project's id; a worker boots like an engine, so
-        the same id is already loaded in its registry. Awaited inline for the same
-        side-loop reason documented on ``_on_config_changed``; lazy import for
-        the same circular-dependency reason.
+        The generation must ride along: a worker orders this fan-out against its registration
+        reply, which arrives on a different loop, and adopts only strictly newer generations.
+        Awaited inline for the same side-loop reason documented on ``_on_config_changed``; lazy
+        import for the same circular-dependency reason.
         """
         from griptape_nodes.app.worker_routing import ActivateProjectRequest
 
         if self._transport is None or not self._workers:
             return
         failures = await self.broadcast_to_workers_awaiting_replies(
-            EventRequest(request=ActivateProjectRequest(project_id=event.project_id))
+            EventRequest(request=ActivateProjectRequest(project_id=event.project_id, generation=event.generation))
         )
         # A worker left on the old project resolves workspace-relative paths against the old
         # workspace, so it writes where this engine does not read. Loud here beats silent there.
         for failure in failures:
             logger.error(
                 "Worker did not adopt project '%s' after the switch; its file paths will not match "
-                "this engine's. Details -- %s",
+                "this engine's. Details: %s",
                 event.project_id,
                 failure,
             )

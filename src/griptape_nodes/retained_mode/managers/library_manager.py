@@ -918,8 +918,8 @@ class LibraryManager(EngineScoped):
         how a library that ships `safetensors` still hit `NameError: name 'safetensors' is not
         defined` from inside huggingface_hub.
 
-        Returns None when the library declares no execution dependencies, or when the build failed
-        -- spawn waits for the build, so a healthy library always has one by the time it is asked.
+        Returns None when the directory does not exist. A failed build leaves it behind, so
+        callers must consult `execution_env_failure_reason` before treating a path as usable.
         """
         library_info = self.get_library_info_by_library_name(library_name)
         if library_info is None:
@@ -1009,6 +1009,17 @@ class LibraryManager(EngineScoped):
                         "Not starting a worker for library '%s': %s",
                         library_info.library_name,
                         library_info.execution_unavailable_reason,
+                    )
+                    continue
+                # A worker already serving this library makes the whole block below wrong, not
+                # merely redundant: spawn_worker refuses the duplicate without raising, so the
+                # reset event below would never be set again and every later run would wait out
+                # the startup grace against a live, loaded worker. Reached whenever _start_workers
+                # runs twice for one session -- a second GUI client joining is enough.
+                if self.engine.worker_manager.get_worker_for_key(library_info.library_name) is not None:
+                    logger.debug(
+                        "Not restarting a worker for library '%s': one is already registered.",
+                        library_info.library_name,
                     )
                     continue
                 # Legacy worker-mode libraries load AS the worker confirms (stubs meanwhile),
@@ -4898,6 +4909,11 @@ class LibraryManager(EngineScoped):
                 ):
                     info.lifecycle_state = LibraryManager.LibraryLifecycleState.FAILURE
                     info.fitness = LibraryManager.LibraryFitness.UNUSABLE
+                    # Released waiters need the reason too, or the next run falls through to
+                    # "the worker may still be starting up" for a worker already given up on.
+                    info.execution_unavailable_reason = (
+                        f"its worker process did not report a library load within {wait_seconds} seconds."
+                    )
                     info.worker_ready.set()
                     logger.warning(
                         "Worker for library '%s' timed out after %s seconds; marked as FAILURE.",

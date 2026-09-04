@@ -3155,7 +3155,7 @@ class NodeManager(EngineScoped):
             #
             # The wait comes first: a worker is routable the moment it registers, but it loads
             # its library after registering, and forwarding into that window fails node creation
-            # over there. The event is set on every terminal outcome, so this cannot hang.
+            # over there. Bounded by the startup grace, which surfaces here as a node failure.
             try:
                 if library_name:
                     await library_manager.wait_for_worker_ready(library_name)
