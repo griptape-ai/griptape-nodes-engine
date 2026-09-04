@@ -44,9 +44,9 @@ def _make_mock_library_manager(*, is_worker: bool, library_loaded: bool = True) 
     lib_mgr.is_worker = is_worker
     lib_mgr._is_worker = is_worker
     lib_mgr.get_worker_for_library.return_value = None
-    # The execute path awaits this before consulting get_worker_for_library; a plain
-    # MagicMock attribute is not awaitable.
-    lib_mgr.wait_for_worker_library_load = AsyncMock()
+    # The execute path awaits this before consulting get_worker_for_library, so a
+    # plain MagicMock attribute is not awaitable and fails the call.
+    lib_mgr.wait_for_worker_ready = AsyncMock()
     if library_loaded:
         lib_mgr.get_library_info_by_library_name.return_value.lifecycle_state = (
             LibraryManager.LibraryLifecycleState.LOADED
@@ -420,8 +420,9 @@ class TestExecuteNodeWorkerRoute:
         lib_mgr = MagicMock()
         lib_mgr.is_worker = False
         lib_mgr._is_worker = False
-        lib_mgr.wait_for_worker_library_load = AsyncMock()
+        lib_mgr.wait_for_worker_ready = AsyncMock()
         lib_mgr.get_worker_for_library.return_value = ("eng-id", "topic")
+        lib_mgr.wait_for_worker_ready = AsyncMock()
 
         node_manager = _make_node_manager(object_manager=mock_obj_mgr, library_manager=lib_mgr, worker_manager=wm)
 
@@ -452,8 +453,9 @@ class TestExecuteNodeWorkerRoute:
         lib_mgr = MagicMock()
         lib_mgr.is_worker = False
         lib_mgr._is_worker = False
-        lib_mgr.wait_for_worker_library_load = AsyncMock()
+        lib_mgr.wait_for_worker_ready = AsyncMock()
         lib_mgr.get_worker_for_library.return_value = ("eng-id", "topic")
+        lib_mgr.wait_for_worker_ready = AsyncMock()
 
         node_manager = _make_node_manager(object_manager=mock_obj_mgr, library_manager=lib_mgr, worker_manager=wm)
 

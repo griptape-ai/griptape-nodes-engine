@@ -675,6 +675,17 @@ class ProjectManager(EngineScoped):
         # is selected. Any code path that previously cleared this to None now routes
         # back to system defaults via SetCurrentProjectRequest's default value.
         self._current_project_id: ProjectID = SYSTEM_DEFAULTS_KEY
+        # The last activation that fully SUCCEEDED, with a generation that increments on each.
+        # `_current_project_id` is assigned before activation's fallible steps, so reading it
+        # mid-switch can observe a project about to be rolled back; a worker registering in that
+        # window would adopt an abandoned project and never hear otherwise. The committed pair is
+        # what registration replies and fan-outs carry, and the generation is how a worker orders
+        # a registration reply against a concurrently-delivered switch fan-out.
+        self._committed_project_id: ProjectID = SYSTEM_DEFAULTS_KEY
+        self._project_generation: int = 0
+        # Worker-side: the highest generation this engine has adopted, so a stale activation
+        # (an older fan-out, or a registration reply racing a newer switch) is skipped.
+        self._last_adopted_generation: int = -1
         # Set to True at end of on_app_initialization_complete. Guards workspace switch
         # logic so expensive reloads don't fire during startup.
         self._initialization_complete: bool = False
@@ -3067,10 +3078,25 @@ class ProjectManager(EngineScoped):
 
         # Push the switch to running workers so they adopt the orchestrator's project
         # even on a shallow switch (same workspace + library config) that would not
-        # restart them. A worker that starts after this adopts from its registration
-        # reply instead, so emit only post-init and only on an actual change.
-        if self._initialization_complete and previous_project_id != resolved_project_id:
-            self._event_manager.put_event(AppEvent(payload=CurrentProjectChanged(project_id=resolved_project_id)))
+        # restart them. Emitted on every actual change, including during boot: boot
+        # activations all precede worker spawn, so those emissions reach zero workers
+        # and are inert. Gating on initialization instead left a switch that landed after
+        # a worker registered but before init finished un-fanned-out for the session.
+        if previous_project_id != resolved_project_id:
+            # The generation is read here, with no await between the commit inside
+            # _activate_project and this line, so the (id, generation) pair is atomic. Reading
+            # it later -- in the fan-out handler -- can pair this id with a NEWER switch's
+            # generation, and this project would then beat that one on the workers.
+            changed = CurrentProjectChanged(project_id=resolved_project_id, generation=self._project_generation)
+            # The wire copy goes up first, still synchronous with the commit, so GUI clients
+            # see switches in commit order even when two overlap.
+            self._event_manager.put_event(AppEvent(payload=changed))
+            # The in-process listeners -- the worker fan-out -- are awaited BEFORE the switch
+            # reports success: the moment a caller sees the switch complete it may run a node,
+            # and a worker that has not yet adopted would run it against the old workspace.
+            # The queued copy above passes through these listeners a second time; the workers'
+            # generation guard skips that pass (or retries an adoption that failed here).
+            await self._event_manager.abroadcast_app_event(changed)
         return result
 
     def _refuse_unresolvable_declared_paths(
@@ -3241,6 +3267,10 @@ class ProjectManager(EngineScoped):
             if failure is not None:
                 return _ProjectActivationOutcome(failure=failure, workspace_changed=workspace_changed)
 
+        # Every path that reaches here established the project's layers completely: the
+        # requested switch, the boot seed, and the rollback re-activation all commit.
+        self._project_generation += 1
+        self._committed_project_id = resolved_project_id
         return _ProjectActivationOutcome(failure=None, workspace_changed=workspace_changed)
 
     async def _apply_workspace_and_libraries_layers(
@@ -3349,7 +3379,10 @@ class ProjectManager(EngineScoped):
         # id IS the canonical template path, so when a file exists there, load it directly with
         # the same loader the orchestrator used; the resulting id matches by construction.
         candidate = Path(project_id)
-        if await anyio.Path(candidate).is_file():
+        # Absolute only: the branch's premise is that the id IS the canonical template path. The
+        # id space also holds custom non-path ids, and probing those against this process's CWD
+        # could load an unrelated file that merely shares a relative name.
+        if candidate.is_absolute() and await anyio.Path(candidate).is_file():
             load_result = await self.on_load_project_template_request(
                 LoadProjectTemplateRequest(project_path=candidate)
             )
@@ -3361,15 +3394,40 @@ class ProjectManager(EngineScoped):
                 )
         return project_id in self._successfully_loaded_project_templates
 
-    def current_project_id(self) -> ProjectID:
-        """The project this engine has active, or SYSTEM_DEFAULTS_KEY when it has none.
+    def committed_project(self) -> tuple[ProjectID, int]:
+        """The last fully-successful activation, as (project id, generation).
 
-        Exists so a peer manager can read the active project without going through a request, which
-        WorkerManager needs while answering a worker's registration: the reply has to carry this
-        value, and issuing a request from inside a request handler is the reentrancy the forwarding
-        machinery exists to avoid.
+        This is what crosses to workers. `current_project_id` can name a project mid-switch that
+        is about to be rolled back; this pair only ever names one whose layers were established.
         """
-        return self._current_project_id
+        return (self._committed_project_id, self._project_generation)
+
+    def is_stale_adoption(self, project_id: ProjectID, generation: int) -> bool:
+        """True when `generation` is not newer than the last adoption this engine completed.
+
+        A worker receives activations from two racing sources -- the registration reply and the
+        switch fan-out. Ordering by generation is what makes the outcome deterministic: the
+        newest committed switch wins regardless of arrival order, and a stale one is skipped
+        before it can touch config layers. The generation is recorded separately, via
+        `record_adopted_generation` AFTER the activation succeeds, so a failed adoption does not
+        consume its generation and block a retry of the same switch. The flip side is accepted:
+        a FAILED newer adoption does not make an older in-flight one stale, so the worker can
+        land on the older project -- the orchestrator's loud log of the failed one is the signal
+        for that case.
+        """
+        if generation <= self._last_adopted_generation:
+            logger.info(
+                "Skipping adoption of project '%s' (generation %d): generation %d already adopted.",
+                project_id,
+                generation,
+                self._last_adopted_generation,
+            )
+            return True
+        return False
+
+    def record_adopted_generation(self, generation: int) -> None:
+        """Mark `generation` as adopted, once its activation has fully succeeded."""
+        self._last_adopted_generation = max(self._last_adopted_generation, generation)
 
     def on_get_current_project_request(
         self, _request: GetCurrentProjectRequest

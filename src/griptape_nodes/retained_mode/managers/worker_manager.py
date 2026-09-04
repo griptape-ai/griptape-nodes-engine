@@ -234,12 +234,18 @@ class WorkerManager(EngineScoped):
         # None on the wire for system defaults, so the worker needs no sentinel knowledge: a
         # fresh worker IS on system defaults, and both processes derive that workspace from the
         # same config files, the same CWD, and the same inherited environment.
-        current_project_id = self.engine.project_manager.current_project_id()
+        # The COMMITTED pair, not the live id: `_current_project_id` is assigned before
+        # activation's fallible steps, so a registration handled mid-switch could otherwise name
+        # a project about to be rolled back. The generation lets the worker order this reply
+        # against a switch fan-out delivered concurrently -- newest committed activation wins,
+        # regardless of which message arrives first.
+        current_project_id, project_generation = self.engine.project_manager.committed_project()
         if current_project_id == SYSTEM_DEFAULTS_KEY:
             current_project_id = None
         return worker_events.RegisterWorkerResultSuccess(
             worker_engine_id=wid,
             current_project_id=current_project_id,
+            project_generation=project_generation,
             result_details="Worker registered successfully.",
         )
 
@@ -713,11 +719,26 @@ class WorkerManager(EngineScoped):
         session_id = self.engine.get_session_id()
         if not session_id:
             logger.error("Session event set but no session ID available for library '%s'.", library_name)
+            self._refuse_spawn(library_name, "no session was available to start its worker process.")
             return
         # The worker is handed its library's execution environment as PYTHONPATH, so that directory
         # has to exist before the process starts. The orchestrator builds it in the background to
         # keep a torch install off the boot path; this is where the two meet.
         await self.engine.library_manager.wait_for_execution_env(library_name)
+        # A failed build records why and leaves the venv directory behind, so spawning anyway
+        # would put a partial or stale site-packages at the front of the worker's import path --
+        # the exact unpinned execution the edit/exec split exists to prevent -- and the raw
+        # ModuleNotFoundError would bury the recorded uv error. Refusing here keeps the reason
+        # as the thing the next run reports.
+        failed_env_reason = self.engine.library_manager.execution_env_failure_reason(library_name)
+        if failed_env_reason is not None:
+            logger.error(
+                "Not spawning a worker for library '%s': %s",
+                library_name,
+                failed_env_reason,
+            )
+            self._refuse_spawn(library_name, failed_env_reason)
+            return
         args = [
             sys.executable,
             "-m",
@@ -731,21 +752,31 @@ class WorkerManager(EngineScoped):
         await self.spawn_worker(args, library_name)
 
     def _log_spawn_error(self, task: asyncio.Task, library_name: str) -> None:
-        """Record a spawn that never produced a worker.
+        """Record a spawn that raised before producing a worker.
 
         `handle_start_worker_request` schedules the spawn and returns Success immediately, so its
-        caller cannot tell that a bad interpreter, an OSError, or a missing session stopped the
-        worker ever existing. Without recording it here the library reports that its worker "may
-        still be starting up" for the rest of the session -- which is exactly the message
-        `execution_unavailable_reason` exists to replace, for the most likely failure.
+        caller cannot tell that a bad interpreter or an OSError stopped the worker ever existing.
+        Refusals that return rather than raise are invisible here and record themselves.
         """
         exc = task.exception()
         if exc is None:
             return
         logger.error("Failed to spawn worker for library '%s': %s", library_name, exc)
+        self._refuse_spawn(library_name, f"the worker process that runs it could not be started ({exc}).")
+
+    def _refuse_spawn(self, library_name: str, reason: str) -> None:
+        """Record why no worker is coming for `library_name`, and release anything waiting on one.
+
+        `_start_workers` clears `execution_unavailable_reason` and installs a fresh `worker_ready`
+        before scheduling a spawn, so a refusal that records neither leaves the next run waiting
+        out the whole startup grace and then blaming a library load that never began.
+        """
         library_info = self.engine.library_manager.get_library_info_by_library_name(library_name)
-        if library_info is not None:
-            library_info.execution_unavailable_reason = f"the worker process that runs it could not be started ({exc})."
+        if library_info is None:
+            return
+        library_info.execution_unavailable_reason = reason
+        if library_info.worker_ready is not None:
+            library_info.worker_ready.set()
 
     def get_topics_to_subscribe(self, *, is_worker: bool) -> list[str]:
         """Build the list of topics to subscribe to at connection start.
@@ -840,18 +871,77 @@ class WorkerManager(EngineScoped):
     async def _on_current_project_changed(self, event: CurrentProjectChanged) -> None:
         """Fan out an ActivateProjectRequest after the orchestrator switched projects.
 
-        ProjectManager only emits ``CurrentProjectChanged`` from a successful
-        post-init activation, so receiving it means workers should adopt the new
-        project. Carries the new project's id; a worker boots like an engine, so
-        the same id is already loaded in its registry. Awaited inline for the same
-        side-loop reason documented on ``_on_config_changed``; lazy import for
-        the same circular-dependency reason.
+        The generation must ride along: a worker orders this fan-out against its registration
+        reply, which arrives on a different loop, and adopts only strictly newer generations.
+        Awaited inline for the same side-loop reason documented on ``_on_config_changed``; lazy
+        import for the same circular-dependency reason.
         """
         from griptape_nodes.app.worker_routing import ActivateProjectRequest
 
         if self._transport is None or not self._workers:
             return
-        await self.broadcast_to_workers(EventRequest(request=ActivateProjectRequest(project_id=event.project_id)))
+        failures = await self.broadcast_to_workers_awaiting_replies(
+            EventRequest(request=ActivateProjectRequest(project_id=event.project_id, generation=event.generation))
+        )
+        # A worker left on the old project resolves workspace-relative paths against the old
+        # workspace, so it writes where this engine does not read. Loud here beats silent there.
+        for failure in failures:
+            logger.error(
+                "Worker did not adopt project '%s' after the switch; its file paths will not match "
+                "this engine's. Details: %s",
+                event.project_id,
+                failure,
+            )
+
+    async def broadcast_to_workers_awaiting_replies(self, event: EventRequest) -> list[str]:
+        """Fan out to every worker and WAIT for each to answer. Returns the failures, named.
+
+        The fire-and-forget variant is wrong for anything that changes where paths resolve. A
+        project switch moves the workspace, and `broadcast_to_workers` returns as soon as the
+        messages are sent -- so `SetCurrentProjectRequest` reports success while a worker may still
+        be on the old workspace. Execution dispatched in that window writes files where nothing
+        looks, with no error. Awaiting closes the window by construction instead of hoping the
+        fan-out wins the race against the next dispatch.
+
+        Concurrent, and bounded per worker. Serially, a worker that is merely SLOW -- adoption runs a
+        full library reload, which can include installs -- kept every worker behind it from even
+        receiving the request, so the caller waited out the sum rather than the slowest. And
+        `route_to_worker` has no ceiling of its own: it argues liveness from the heartbeat, which
+        evicts a SILENT worker and says nothing about a busy one, so a user-facing switch could wait
+        forever. The bound is the startup grace, the same budget a worker's own slow startup gets.
+
+        Each worker gets its own request id so replies cannot be confused. One worker's failure does
+        not affect the others; the caller decides what a failure means.
+        """
+        if not self._workers:
+            return []
+
+        async def ask(worker_engine_id: str, request_topic: str) -> str | None:
+            per_worker = EventRequest(request=event.request)
+            per_worker.request_id = str(uuid.uuid4())
+            try:
+                raw = await asyncio.wait_for(
+                    self.route_to_worker(per_worker, worker_engine_id, request_topic),
+                    timeout=self.heartbeat_startup_grace_s,
+                )
+            except TimeoutError:
+                return f"{worker_engine_id}: no reply within {self.heartbeat_startup_grace_s:g} seconds"
+            except Exception as e:
+                return f"{worker_engine_id}: {type(e).__name__}: {e}"
+            # endswith rather than a substring test: every result payload ends in ResultSuccess or
+            # ResultFailure, and a substring match would read any type merely CONTAINING "Success"
+            # as one. The result may also be absent or not a dict, in which case the raw reply is
+            # the most informative thing to report.
+            if not str(raw.get("result_type", "")).endswith("ResultSuccess"):
+                result = raw.get("result")
+                details = result.get("result_details", raw) if isinstance(result, dict) else raw
+                return f"{worker_engine_id}: {details}"
+            return None
+
+        outcomes = await asyncio.gather(
+            *(ask(wid, registration.request_topic) for wid, registration in list(self._workers.items()))
+        )
+        return [failure for failure in outcomes if failure is not None]
 
     def schedule_broadcast(self, request_type: type[RequestPayload]) -> None:
         """Tell every registered worker to handle ``request_type`` locally.

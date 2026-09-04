@@ -2213,6 +2213,7 @@ situations:
     def pm(self) -> ProjectManager:
         mock_event_manager = Mock()
         mock_event_manager.evaluate_authorization_checkpoint.return_value = None
+        mock_event_manager.abroadcast_app_event = AsyncMock()
         mock_config_manager = Mock()
         mock_config_manager.project_config = {}
         mock_config_manager.env_config = {}
@@ -2900,6 +2901,7 @@ name: Modern Project
     def pm(self) -> ProjectManager:
         mock_event_manager = Mock()
         mock_event_manager.evaluate_authorization_checkpoint.return_value = None
+        mock_event_manager.abroadcast_app_event = AsyncMock()
         mock_config_manager = Mock()
         mock_config_manager.project_config = {}
         mock_config_manager.env_config = {}
@@ -2960,6 +2962,7 @@ name: Legacy Project
     def pm(self) -> ProjectManager:
         mock_event_manager = Mock()
         mock_event_manager.evaluate_authorization_checkpoint.return_value = None
+        mock_event_manager.abroadcast_app_event = AsyncMock()
         mock_config_manager = Mock()
         mock_config_manager.project_config = {}
         mock_config_manager.env_config = {}
@@ -5139,6 +5142,7 @@ class TestProjectManagerProjectWorkspaces:
 
         mock_event_manager = Mock()
         mock_event_manager.evaluate_authorization_checkpoint.return_value = None
+        mock_event_manager.abroadcast_app_event = AsyncMock()
         mock_secrets = Mock()
         pm = ProjectManager(mock_event_manager, mock_config, mock_secrets)
 
@@ -5488,6 +5492,7 @@ class TestProjectManagerProjectWorkspaces:
         )
         mock_event_manager = Mock()
         mock_event_manager.evaluate_authorization_checkpoint.return_value = None
+        mock_event_manager.abroadcast_app_event = AsyncMock()
         pm = ProjectManager(mock_event_manager, mock_config, Mock())
         pm._read_overlay = fake_read_overlay  # type: ignore[method-assign]
         pm._resolve_registered_entry_paths = lambda _entries: [_canon(parent_file), _canon(child_file)]  # type: ignore[method-assign]
@@ -9890,6 +9895,7 @@ situations:
     def pm(self) -> ProjectManager:
         mock_event_manager = Mock()
         mock_event_manager.evaluate_authorization_checkpoint.return_value = None
+        mock_event_manager.abroadcast_app_event = AsyncMock()
         mock_config_manager = Mock()
         mock_config_manager.project_config = {}
         mock_config_manager.env_config = {}
@@ -10223,6 +10229,7 @@ parent_project_id: "ghost-parent-id"
     def pm(self, tmp_path: Path) -> ProjectManager:
         mock_event_manager = Mock()
         mock_event_manager.evaluate_authorization_checkpoint.return_value = None
+        mock_event_manager.abroadcast_app_event = AsyncMock()
         mock_config_manager = Mock()
         mock_config_manager.project_config = {}
         mock_config_manager.env_config = {}
@@ -12852,9 +12859,6 @@ class TestCurrentProjectChangedReachesClients:
 
         project_id = self._load(engine, tmp_path)
         original_workspace = engine.config_manager.workspace_path
-        # The broadcast is gated on initialization being complete; a real engine has
-        # finished booting long before a user switches projects.
-        engine.project_manager._initialization_complete = True
 
         published: list[Any] = []
         try:
@@ -12865,7 +12869,6 @@ class TestCurrentProjectChangedReachesClients:
             assert len(changes) == 1, "a project switch must publish exactly one CurrentProjectChanged"
             assert changes[0].project_id == project_id
         finally:
-            engine.project_manager._initialization_complete = False
             engine.handle_request(SetCurrentProjectRequest(project_id=None))
             engine.config_manager.workspace_path = original_workspace
 
@@ -12875,7 +12878,6 @@ class TestCurrentProjectChangedReachesClients:
 
         project_id = self._load(engine, tmp_path)
         original_workspace = engine.config_manager.workspace_path
-        engine.project_manager._initialization_complete = True
 
         published: list[Any] = []
         try:
@@ -12885,6 +12887,5 @@ class TestCurrentProjectChangedReachesClients:
 
             assert self._published_project_changes(published) == []
         finally:
-            engine.project_manager._initialization_complete = False
             engine.handle_request(SetCurrentProjectRequest(project_id=None))
             engine.config_manager.workspace_path = original_workspace
