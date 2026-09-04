@@ -169,7 +169,9 @@ logger = logging.getLogger("griptape_nodes")
 # the canonicalized project file path string as their id (the legacy bridge), so
 # the id-space is mixed (GUID/custom ids, legacy path-string ids, and the
 # synthetic SYSTEM_DEFAULTS_KEY). The on-disk file path is a separate locator.
-ProjectID = str
+# ProjectID lives in project_events (payloads annotate with it and pydantic needs the name
+# resolvable at runtime); re-exported here because this module is where most callers look.
+from griptape_nodes.retained_mode.events.project_events import ProjectID  # noqa: E402
 
 # Synthetic identifier for the system default project template
 SYSTEM_DEFAULTS_KEY: ProjectID = "<system-defaults>"
