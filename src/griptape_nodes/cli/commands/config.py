@@ -60,8 +60,10 @@ def _print_user_config(config_path: str | None = None) -> None:
 def _list_user_configs() -> None:
     """Lists user configuration files in ascending precedence."""
     num_config_files = len(config_manager.config_files)
+    # ASCII arrow only: "\u27f6" raises UnicodeEncodeError on consoles whose
+    # stdout encoding is cp1252 (see issue #5470).
     console.print(
-        f"[bold]User Configuration Files (lowest precedence (1.) ⟶ highest precedence ({num_config_files}.)):[/bold]"
+        f"[bold]User Configuration Files (lowest precedence (1.) -> highest precedence ({num_config_files}.)):[/bold]"
     )
     for idx, config in enumerate(config_manager.config_files):
         console.print(f"[green]{idx + 1}. {config}[/green]")
