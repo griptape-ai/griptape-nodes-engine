@@ -1057,6 +1057,9 @@ class WorkflowManager(EngineScoped):
                     return RunWorkflowFromRegistryResultFailure(result_details=details)
 
             # Let's run under the assumption that this Workflow will become our Current Context; if we fail, it will revert.
+            # This push is what tells clients the workflow changed: it emits CurrentWorkflowChanged,
+            # as does the revert below, so both the success and failure paths leave every attached
+            # client agreeing with the engine about what is open. Nothing to emit from here.
             self.engine.context_manager.push_workflow(request.workflow_name)
             # run file
             execution_result = await self.run_workflow(relative_file_path=relative_file_path)
@@ -1418,14 +1421,31 @@ class WorkflowManager(EngineScoped):
                     "Failed while attempting to remove the original file name from the registry."
                 )
 
-        # If the renamed workflow is the current context, update the context name so the
-        # heartbeat and other callers reflect the new registry key immediately. The retained
-        # path moves with it: rename keeps the directory, so `workflow_dir` is unaffected, but
-        # the path itself would otherwise name a file that no longer exists.
+        # If the renamed workflow is still the current context, repoint it so the heartbeat and
+        # other callers reflect the new registry key immediately. The retained path moves with it:
+        # rename keeps the directory, so `workflow_dir` is unaffected, but the path itself would
+        # otherwise name a file that no longer exists. Both land in one `rekey_workflow` call so
+        # the CurrentWorkflowChanged it emits describes an entry that is already wholly renamed --
+        # setting the name first would announce the switch while the retained path still named the
+        # old file, and that path is what `workflow_dir` answers with.
+        #
+        # "Still" is load-bearing: renaming a registered workflow that is open normally does not
+        # reach here. The delete above drops the old registry entry while that entry is the one in
+        # context, and `on_delete_workflows_request` tears the context down for exactly that case
+        # -- so what clients hear from an ordinary rename is the teardown, not a new key. This
+        # branch serves the renames that skip the delete: a Save As of an unregistered workflow,
+        # and a rename that resolves to the key it already had (which rekeys the retained path and
+        # is deduped into silence, since the key clients hold has not moved). It also catches the
+        # one open-and-registered case the teardown does not finish: the same key stacked twice by
+        # a `run_with_clean_slate=False` open, where popping one entry leaves the duplicate
+        # underneath still naming the workflow the delete just dropped.
         context_manager = self.engine.context_manager
         if context_manager.has_current_workflow() and context_manager.get_current_workflow_name() == old_workflow_name:
-            context_manager.set_current_workflow_name(new_workflow_name)
-            context_manager.set_current_workflow_file_path(str(save_result.file_path))
+            context_manager.rekey_workflow(
+                old_name=old_workflow_name,
+                new_name=new_workflow_name,
+                new_file_path=str(save_result.file_path),
+            )
 
         return None
 
@@ -1859,12 +1879,17 @@ class WorkflowManager(EngineScoped):
                     context_manager.has_current_workflow()
                     and context_manager.get_current_workflow_name() == old_registry_key
                 ):
-                    context_manager.set_current_workflow_name(new_registry_key)
                     # The context also retains the workflow's path, and that is what
                     # `workflow_dir` answers with. Move is the one operation that changes the
-                    # directory, so without this the builtin keeps resolving to the folder the
-                    # file just left.
-                    context_manager.set_current_workflow_file_path(str(new_absolute_path))
+                    # directory, so without repointing it the builtin keeps resolving to the
+                    # folder the file just left. Key and path move in one call: `rekey_workflow`
+                    # notifies clients only once both are in place, so nobody is told the
+                    # workflow switched while its retained path still points at the old folder.
+                    context_manager.rekey_workflow(
+                        old_name=old_registry_key,
+                        new_name=new_registry_key,
+                        new_file_path=str(new_absolute_path),
+                    )
 
         except OSError as e:
             error_messages = []
@@ -2601,14 +2626,18 @@ class WorkflowManager(EngineScoped):
                 self._rekey_substitution_flag(unsaved_source_key, registry_key)
                 rekeyed_workflow = WorkflowRegistry.get_workflow_by_name(registry_key)
                 rekeyed_workflow.file_path = relative_file_path
-            for workflow_context_state in self.engine.context_manager._workflow_stack:
-                if workflow_context_state._name == unsaved_source_key:
-                    workflow_context_state._name = registry_key
-                    # The context also retains the workflow's path, and `workflow_dir` prefers
-                    # it over a registry lookup. An unsaved context has no path; this save is
-                    # where it gets one, so record it here or the builtin keeps falling back to
-                    # the registry key -- the thing that goes stale on the next project switch.
-                    workflow_context_state._file_path = str(save_file_result.file_path)
+            # The context also retains the workflow's path, and `workflow_dir` prefers it over a
+            # registry lookup. An unsaved context has no path; this save is where it gets one, so
+            # record it here or the builtin keeps falling back to the registry key -- the thing
+            # that goes stale on the next project switch. Going through the ContextManager (rather
+            # than walking its stack here) is also what tells clients the current workflow's key
+            # changed: the first save is the one rename an editor cannot predict, because the key
+            # is derived from the path the artist just picked.
+            self.engine.context_manager.rekey_workflow(
+                old_name=unsaved_source_key,
+                new_name=registry_key,
+                new_file_path=str(save_file_result.file_path),
+            )
             registered_workflows = WorkflowRegistry.list_workflows()
 
         if registry_key not in registered_workflows:

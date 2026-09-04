@@ -26,7 +26,8 @@ from griptape_nodes.node_library.workflow_registry import (
     read_workflow_metadata,
 )
 from griptape_nodes.retained_mode.engine import Engine
-from griptape_nodes.retained_mode.events.base_events import ResultDetails
+from griptape_nodes.retained_mode.events.base_events import AppEvent, ResultDetails
+from griptape_nodes.retained_mode.events.context_events import CurrentWorkflowChanged
 from griptape_nodes.retained_mode.events.flow_events import SerializedFlowCommands
 from griptape_nodes.retained_mode.events.workflow_events import (
     BranchWorkflowRequest,
@@ -64,6 +65,9 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     RegisterWorkflowResultSuccess,
     ResetWorkflowBranchRequest,
     ResetWorkflowBranchResultSuccess,
+    RunWorkflowFromRegistryRequest,
+    RunWorkflowFromRegistryResultFailure,
+    RunWorkflowFromRegistryResultSuccess,
     SetWorkflowMetadataRequest,
     SetWorkflowMetadataResultSuccess,
     WorkflowDependencyInfo,
@@ -90,6 +94,16 @@ def _register_unsaved_workflow(key: str, name: str) -> None:
         creation_date=datetime.now(UTC),
     )
     WorkflowRegistry.generate_new_workflow(registry_key=key, metadata=metadata, file_path=None)
+
+
+def _notified_workflow_names(put_event: Mock) -> list[str | None]:
+    """The workflow_name off every CurrentWorkflowChanged put on the queue, in order."""
+    names: list[str | None] = []
+    for put_call in put_event.call_args_list:
+        event = put_call.args[0]
+        if isinstance(event, AppEvent) and isinstance(event.payload, CurrentWorkflowChanged):
+            names.append(event.payload.workflow_name)
+    return names
 
 
 class TestWorkflowManager:
@@ -614,16 +628,20 @@ class TestWorkflowManager:
             patch.object(config_mgr, "delete_user_workflow"),
             patch.object(context_mgr, "has_current_workflow", return_value=True),
             patch.object(context_mgr, "get_current_workflow_name", return_value="my_workflow"),
-            patch.object(context_mgr, "set_current_workflow_name") as mock_set_name,
-            patch.object(context_mgr, "set_current_workflow_file_path") as mock_set_file_path,
+            patch.object(context_mgr, "rekey_workflow") as mock_rekey_context,
         ):
             result = workflow_manager.on_move_workflow_request(request)
 
         assert isinstance(result, MoveWorkflowResultSuccess)
-        mock_set_name.assert_called_once_with("subdir/my_workflow")
-        # The retained path travels with the key: `workflow_dir` reads it in preference to the
-        # registry, so a rekey without a repoint leaves the builtin on the pre-move directory.
-        mock_set_file_path.assert_called_once_with(str(config_mgr.workspace_path / "subdir" / "my_workflow.py"))
+        # Key and retained path move in one call. The path travels with the key because
+        # `workflow_dir` reads it in preference to the registry, so a rekey without a repoint
+        # leaves the builtin on the pre-move directory; and it has to land in the same call
+        # because that call is what tells clients the workflow switched.
+        mock_rekey_context.assert_called_once_with(
+            old_name="my_workflow",
+            new_name="subdir/my_workflow",
+            new_file_path=str(config_mgr.workspace_path / "subdir" / "my_workflow.py"),
+        )
 
     def test_on_move_workflow_request_does_not_update_context_for_other_workflow(self, engine: Engine) -> None:
         workflow_manager = engine.workflow_manager
@@ -644,12 +662,12 @@ class TestWorkflowManager:
             patch.object(config_mgr, "delete_user_workflow"),
             patch.object(context_mgr, "has_current_workflow", return_value=True),
             patch.object(context_mgr, "get_current_workflow_name", return_value="other_workflow"),
-            patch.object(context_mgr, "set_current_workflow_name") as mock_set_name,
+            patch.object(context_mgr, "rekey_workflow") as mock_rekey_context,
         ):
             result = workflow_manager.on_move_workflow_request(request)
 
         assert isinstance(result, MoveWorkflowResultSuccess)
-        mock_set_name.assert_not_called()
+        mock_rekey_context.assert_not_called()
 
     def test_on_move_workflow_request_updates_context_file_path_for_current_workflow(
         self, engine: Engine, tmp_path: Path
@@ -689,15 +707,21 @@ class TestWorkflowManager:
                 )
                 context_manager.push_workflow(workflow_name="my_workflow")
                 try:
-                    result = workflow_manager.on_move_workflow_request(
-                        MoveWorkflowRequest(workflow_name="my_workflow", target_directory="subdir")
-                    )
+                    with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
+                        result = workflow_manager.on_move_workflow_request(
+                            MoveWorkflowRequest(workflow_name="my_workflow", target_directory="subdir")
+                        )
 
                     assert isinstance(result, MoveWorkflowResultSuccess)
                     assert context_manager.get_current_workflow_name() == "subdir/my_workflow"
                     assert context_manager.get_current_workflow_file_path() == str(
                         workspace / "subdir" / "my_workflow.py"
                     )
+
+                    # A move renames the workflow as far as every other request is concerned, so
+                    # clients hear about it -- exactly once, from the single rekey that moves the
+                    # key and the retained path together.
+                    assert _notified_workflow_names(put_event) == ["subdir/my_workflow"]
                 finally:
                     context_manager.pop_workflow()
         finally:
@@ -788,6 +812,7 @@ class TestWorkflowManager:
                         "extract_workflow_shape",
                         side_effect=ValueError("no shape"),
                     ),
+                    patch.object(engine.event_manager, "put_event", Mock()) as put_event,
                 ):
                     result = asyncio.run(
                         workflow_manager.on_save_workflow_request(SaveWorkflowRequest(file_name=saved_key))
@@ -808,6 +833,13 @@ class TestWorkflowManager:
                 # prefers this over a registry lookup, and the lookup is what goes stale on the
                 # next project switch.
                 assert context_manager.get_current_workflow_file_path() == str(saved_full_path)
+
+                # The key an editor has to address this workflow by just changed out from under
+                # it, and the key it held is now gone from the registry. Anyone still holding
+                # "unsaved:abc-123" -- a second editor, an MCP agent that cached it -- would send
+                # requests against a workflow that no longer exists, so the switch has to be on
+                # the wire like every other one.
+                assert _notified_workflow_names(put_event) == [saved_key]
             finally:
                 if context_manager.has_current_workflow():
                     context_manager.pop_workflow()
@@ -1199,6 +1231,79 @@ class TestWorkflowManager:
         )
         assert captured["save_display_name"] == "My Name"
 
+    def test_rename_bookkeeping_moves_the_open_workflows_key_and_path_together(self, engine: Engine) -> None:
+        """A rename that leaves the context standing repoints it and reports the new key, once.
+
+        Drives `on_rename_workflow_request` with its delete step mocked out, which isolates the
+        bookkeeping at the end of the handler. That is the real shape of a Save As of an
+        unregistered workflow: the key moves, so clients hear about it. The other delete-skipping
+        rename -- one that resolves to the key it already had -- is
+        `test_rename_to_the_same_key_moves_the_path_and_stays_quiet` below. An ordinary rename of a
+        registered, open workflow does not get here at all: the delete drops the entry that is in
+        context, and the real delete handler tears the context down, which is pinned by
+        `test_delete_active_workflow_clears_context_stack`.
+
+        What this pins is the bookkeeping itself: the key an editor addresses the workflow by
+        changes, so a client that never hears about it keeps sending requests against a name the
+        registry has dropped, and the retained path has to travel in the same breath because it is
+        what `workflow_dir` answers with.
+        """
+        context_manager = engine.context_manager
+        context_manager.push_workflow(workflow_name="my_workflow")
+
+        try:
+            with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
+                self._run_rename(
+                    engine.workflow_manager,
+                    self._RenameScenario(
+                        workflow_name="my_workflow",
+                        requested_name="my_workflow_renamed",
+                        source_file_path="my_workflow.py",
+                        save_file_path="/workspace/my_workflow_renamed.py",
+                        save_workflow_name="my_workflow_renamed",
+                    ),
+                )
+
+            assert context_manager.get_current_workflow_name() == "my_workflow_renamed"
+            assert context_manager.get_current_workflow_file_path() == "/workspace/my_workflow_renamed.py"
+            assert _notified_workflow_names(put_event) == ["my_workflow_renamed"]
+        finally:
+            if context_manager.has_current_workflow():
+                context_manager.pop_workflow()
+
+    def test_rename_to_the_same_key_moves_the_path_and_stays_quiet(self, engine: Engine) -> None:
+        """Renaming to a name that sanitizes back to the current key tells clients nothing.
+
+        The display name an artist typed can change while the file name -- and so the registry key
+        -- does not. The bookkeeping still runs and still repoints the retained path, because that
+        is what `workflow_dir` answers with, but the key clients address the workflow by has not
+        moved, so `CurrentWorkflowChanged` dedupes into silence. Pinned so a rename never starts
+        waking every attached editor for a switch that did not happen.
+        """
+        context_manager = engine.context_manager
+        context_manager.push_workflow(workflow_name="my_workflow")
+        context_manager.set_current_workflow_file_path("/workspace/my_workflow.py")
+
+        try:
+            with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
+                self._run_rename(
+                    engine.workflow_manager,
+                    self._RenameScenario(
+                        workflow_name="my_workflow",
+                        requested_name="My Workflow",
+                        source_file_path="my_workflow.py",
+                        save_file_path="/workspace/my_workflow.py",
+                        save_workflow_name="my_workflow",
+                    ),
+                )
+
+            assert context_manager.get_current_workflow_name() == "my_workflow"
+            assert context_manager.get_current_workflow_file_path() == "/workspace/my_workflow.py"
+            assert _notified_workflow_names(put_event) == []
+        finally:
+            if context_manager.has_current_workflow():
+                context_manager.pop_workflow()
+
     @pytest.mark.parametrize(
         "non_override_behavior",
         [
@@ -1465,13 +1570,19 @@ class TestWorkflowManager:
             assert object_manager.has_object_with_name(flow_name)
 
             try:
-                result = asyncio.run(
-                    workflow_manager.on_delete_workflows_request(DeleteWorkflowRequest(name=workflow_key))
-                )
+                with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
+                    result = asyncio.run(
+                        workflow_manager.on_delete_workflows_request(DeleteWorkflowRequest(name=workflow_key))
+                    )
 
                 assert isinstance(result, DeleteWorkflowResultSuccess)
                 # Context stack is fully torn down.
                 assert not context_manager.has_current_workflow()
+                # ...and every client is told, once, that nothing is open. This is also the
+                # mechanism behind renaming the open workflow reporting no workflow: the rename
+                # deletes the old registry entry while it is the one in context, and this is that
+                # delete. A client left on the old title would be pointing at a dead key.
+                assert _notified_workflow_names(put_event) == [None]
                 # Child flow was deleted too; no orphans left in the ObjectManager.
                 assert not object_manager.has_object_with_name(flow_name)
                 assert not object_manager.get_filtered_subset(type=ControlFlow)
@@ -1500,14 +1611,18 @@ class TestWorkflowManager:
             context_manager.push_workflow(workflow_name=active_key)
 
             try:
-                result = asyncio.run(
-                    workflow_manager.on_delete_workflows_request(DeleteWorkflowRequest(name=other_key))
-                )
+                with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
+                    result = asyncio.run(
+                        workflow_manager.on_delete_workflows_request(DeleteWorkflowRequest(name=other_key))
+                    )
 
                 assert isinstance(result, DeleteWorkflowResultSuccess)
                 # The active workflow is still active.
                 assert context_manager.has_current_workflow()
                 assert context_manager.get_current_workflow_name() == active_key
+                # Nothing switched, so nobody is told anything -- an editor that reloaded its
+                # canvas here would be reloading it for no reason.
+                assert _notified_workflow_names(put_event) == []
                 # Only the non-active workflow was removed.
                 assert other_key not in WorkflowRegistry._workflows
                 assert active_key in WorkflowRegistry._workflows
@@ -4852,3 +4967,128 @@ class TestRepairPathShapedDisplayName:
         assert isinstance(result, BranchWorkflowResultSuccess)
         branch = WorkflowRegistry.get_workflow_by_name(result.branched_workflow_name)
         assert branch.metadata.name == "comp (branch 1)"
+
+
+class TestRunWorkflowFromRegistryNotifiesContextChange:
+    """Opening a workflow has to be observable to clients that did not ask for it.
+
+    RunWorkflowFromRegistry pushes the opened workflow onto the context stack directly, so no
+    result event names it. With two editors on one engine that left the one that did not open
+    the workflow showing the newly loaded nodes under its own previous workflow's title, and
+    it left an MCP-driven open invisible to every editor. The push emits CurrentWorkflowChanged
+    instead, and the failure path's teardown emits the revert.
+    """
+
+    @staticmethod
+    def _saved_workflow(key: str) -> Mock:
+        """A registry entry backed by a file. `run_workflow` is mocked, so the file is never read."""
+        workflow = Mock(spec=Workflow)
+        workflow.file_path = f"{key}.py"
+        return workflow
+
+    @staticmethod
+    def _run_workflow_result(*, successful: bool) -> AsyncMock:
+        details = "ok"
+        if not successful:
+            details = "boom"
+        return AsyncMock(
+            return_value=WorkflowManager.WorkflowExecutionResult(
+                execution_successful=successful, execution_details=details
+            )
+        )
+
+    @pytest.mark.asyncio
+    async def test_clean_slate_open_notifies_the_opened_workflow_last(self, engine: Engine) -> None:
+        """The GUI's normal open path: the clear reports an empty engine, then the opened workflow."""
+        workflow_manager = engine.workflow_manager
+        workflow_manager._workflows_loading_complete.set()
+        context_manager = engine.context_manager
+        context_manager.push_workflow(workflow_name="was_open_before")
+
+        with (
+            patch.object(WorkflowRegistry, "get_workflow_by_name", return_value=self._saved_workflow("opened")),
+            patch.object(workflow_manager, "run_workflow", self._run_workflow_result(successful=True)),
+            patch.object(engine.event_manager, "put_event", Mock()) as put_event,
+        ):
+            result = await workflow_manager.on_run_workflow_from_registry_request(
+                RunWorkflowFromRegistryRequest(workflow_name="opened", run_with_clean_slate=True)
+            )
+
+        assert isinstance(result, RunWorkflowFromRegistryResultSuccess)
+        # The clean slate empties the context before the open fills it, and clients hear both.
+        assert _notified_workflow_names(put_event) == [None, "opened"]
+        assert context_manager.get_current_workflow_name() == "opened"
+
+        context_manager.pop_workflow()
+
+    @pytest.mark.asyncio
+    async def test_bare_open_notifies_even_though_a_workflow_was_already_in_context(self, engine: Engine) -> None:
+        """run_with_clean_slate=False pushes on top of the old context, and that still notifies."""
+        workflow_manager = engine.workflow_manager
+        workflow_manager._workflows_loading_complete.set()
+        context_manager = engine.context_manager
+        context_manager.push_workflow(workflow_name="was_open_before")
+
+        with (
+            patch.object(WorkflowRegistry, "get_workflow_by_name", return_value=self._saved_workflow("opened_bare")),
+            patch.object(workflow_manager, "run_workflow", self._run_workflow_result(successful=True)),
+            patch.object(engine.event_manager, "put_event", Mock()) as put_event,
+        ):
+            result = await workflow_manager.on_run_workflow_from_registry_request(
+                RunWorkflowFromRegistryRequest(workflow_name="opened_bare", run_with_clean_slate=False)
+            )
+
+        assert isinstance(result, RunWorkflowFromRegistryResultSuccess)
+        assert _notified_workflow_names(put_event) == ["opened_bare"]
+        assert context_manager.get_current_workflow_name() == "opened_bare"
+
+        context_manager.pop_workflow()
+        context_manager.pop_workflow()
+
+    @pytest.mark.asyncio
+    async def test_failed_open_notifies_the_revert_so_clients_do_not_show_a_workflow_that_is_gone(
+        self, engine: Engine
+    ) -> None:
+        """A failed open tears the engine down, and clients are told the engine now has nothing."""
+        workflow_manager = engine.workflow_manager
+        workflow_manager._workflows_loading_complete.set()
+        context_manager = engine.context_manager
+
+        with (
+            patch.object(WorkflowRegistry, "get_workflow_by_name", return_value=self._saved_workflow("open_fails")),
+            patch.object(workflow_manager, "run_workflow", self._run_workflow_result(successful=False)),
+            patch.object(engine.event_manager, "put_event", Mock()) as put_event,
+        ):
+            result = await workflow_manager.on_run_workflow_from_registry_request(
+                RunWorkflowFromRegistryRequest(workflow_name="open_fails", run_with_clean_slate=True)
+            )
+
+        assert isinstance(result, RunWorkflowFromRegistryResultFailure)
+        # Pushed hopefully, then reverted by the failure teardown. Both go out, in that order, and
+        # the last word is the truth: a client that acted on the first is corrected by the second
+        # rather than being left showing a workflow the engine no longer has. The clean slate at
+        # the top of the open is silent here because the context started empty.
+        assert _notified_workflow_names(put_event) == ["open_fails", None]
+        assert not context_manager.has_current_workflow()
+
+    @pytest.mark.asyncio
+    async def test_unsaved_workflow_is_rejected_before_anything_is_notified(self, engine: Engine) -> None:
+        """An unsaved workflow has no file to replay, and the reject leaves the context untouched."""
+        workflow_manager = engine.workflow_manager
+        workflow_manager._workflows_loading_complete.set()
+        context_manager = engine.context_manager
+
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            _register_unsaved_workflow(key="unsaved:no-file", name="Untitled")
+            context_manager.push_workflow(workflow_name="stays_open")
+
+            with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
+                result = await workflow_manager.on_run_workflow_from_registry_request(
+                    RunWorkflowFromRegistryRequest(workflow_name="unsaved:no-file")
+                )
+
+            assert isinstance(result, RunWorkflowFromRegistryResultFailure)
+            assert _notified_workflow_names(put_event) == []
+            assert context_manager.get_current_workflow_name() == "stays_open"
+
+            context_manager.pop_workflow()

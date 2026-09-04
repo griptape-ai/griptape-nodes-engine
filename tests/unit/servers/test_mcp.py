@@ -8,6 +8,7 @@ import pytest
 from mcp.types import CallToolRequestParams
 
 from griptape_nodes.retained_mode.events.base_events import RequestPayload
+from griptape_nodes.retained_mode.events.workflow_events import RunWorkflowFromRegistryRequest
 from griptape_nodes.servers import mcp as mcp_module
 from griptape_nodes.servers.mcp import (
     _BATCH_MAX_AUTO_TIMEOUT_MS,
@@ -446,3 +447,21 @@ class TestDispatchToEngineShield:
             assert result == {"ok": True}
         finally:
             self._stop_engine_loop(engine_loop, thread)
+
+
+class TestSupportedRequestEventsExposesOpeningAWorkflow:
+    """An MCP client has to be able to open a workflow.
+
+    SetWorkflowContextRequest only records a name -- and refuses outright while the editor has
+    a workflow open, which is always -- so without RunWorkflowFromRegistryRequest exposed here
+    an agent driving the engine had no way to open anything at all.
+    """
+
+    def test_run_workflow_from_registry_is_exposed(self) -> None:
+        """Membership is the whole contract: `list_tools` advertises exactly this mapping.
+
+        `TestListTools.test_advertises_every_request_event_plus_the_batch_envelope` asserts the
+        tool names equal `SUPPORTED_REQUEST_EVENTS` plus the batch envelope, so being in here is
+        being offered to the agent.
+        """
+        assert SUPPORTED_REQUEST_EVENTS["RunWorkflowFromRegistryRequest"] is RunWorkflowFromRegistryRequest

@@ -9,7 +9,9 @@ from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.files.path_utils import canonicalize_for_identity, derive_registry_key
 from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
 from griptape_nodes.retained_mode.engine import EngineScoped
+from griptape_nodes.retained_mode.events.base_events import AppEvent
 from griptape_nodes.retained_mode.events.context_events import (
+    CurrentWorkflowChanged,
     EnsureWorkflowAndFlowRequest,
     EnsureWorkflowAndFlowResultFailure,
     EnsureWorkflowAndFlowResultSuccess,
@@ -41,6 +43,7 @@ class ContextManager(EngineScoped):
     """
 
     _workflow_stack: list[ContextManager.WorkflowContextState]
+    _last_notified_workflow_name: str | None
 
     class WorkflowContextError(Exception):
         """Base exception for workflow context errors."""
@@ -266,6 +269,15 @@ class ContextManager(EngineScoped):
         """Initialize the context manager with empty workflow and flow stacks."""
         super().__init__(engine)
         self._workflow_stack = []
+        # What the last CurrentWorkflowChanged told clients. Starts as None, which is exactly
+        # what an empty stack reports, so a fresh engine owes nobody a notification. Tracked
+        # rather than derived so it stays a faithful mirror of the stack top: every mutation
+        # updates it, including the ones whose event `put_event` drops because the queue does
+        # not exist yet (engine construction, and a workflow file replayed by a script or the
+        # CLI). A client therefore cannot treat this event as a snapshot of state it missed
+        # while disconnected -- it reads GetWorkflowContextRequest once on connect, and follows
+        # the event stream from there.
+        self._last_notified_workflow_name = None
         event_manager.assign_manager_to_request_type(
             request_type=SetWorkflowContextRequest, callback=self.on_set_workflow_context_request
         )
@@ -278,8 +290,20 @@ class ContextManager(EngineScoped):
 
     def on_set_workflow_context_request(self, request: SetWorkflowContextRequest) -> ResultPayload:
         # As of today, we only allow a single Workflow context at a time. This may change in the future.
+        # Point the caller at the request that actually opens a workflow first: this one is
+        # bookkeeping, so on its own it would leave them with the name of a workflow and none
+        # of its nodes. ClearAllObjectState is named second because it is the destructive route
+        # to the same goal, and callers reached for it purely because it used to be the only
+        # thing this message mentioned.
         if self.has_current_workflow():
-            msg = f"Attempted to set the Workflow '{request.workflow_name}' as the Current Context. Failed because an existing workflow, '{self.get_current_workflow_name()}', is already in the Current Context. In order to clear the existing workflow and remove all objects and references to it, issue a ClearAllObjectState request."
+            msg = (
+                f"Attempted to set the Workflow '{request.workflow_name}' as the Current Context. "
+                f"Failed because an existing workflow, '{self.get_current_workflow_name()}', is already "
+                f"in the Current Context. To open a saved workflow -- loading its nodes, connections, and "
+                f"values, and replacing whatever is open now -- issue a RunWorkflowFromRegistry request "
+                f"instead; it does not require an empty context. To close the existing workflow and "
+                f"discard all of its objects without opening anything, issue a ClearAllObjectState request."
+            )
             return SetWorkflowContextFailure(result_details=msg)
 
         # Normalized here rather than at read time so `workflow_dir` never has to care whether
@@ -578,6 +602,9 @@ class ContextManager(EngineScoped):
     def set_current_workflow_name(self, new_name: str) -> None:
         """Update the name of the current Workflow context.
 
+        For a name change on its own. When the file behind the workflow moves too -- a save, a
+        rename, a Move -- use `rekey_workflow`, which updates both before it tells clients.
+
         Args:
             new_name: The new name to assign to the current Workflow.
 
@@ -589,16 +616,54 @@ class ContextManager(EngineScoped):
             raise self.NoActiveWorkflowError(msg)
 
         self._workflow_stack[-1]._name = new_name
+        self._notify_current_workflow_changed()
+
+    def rekey_workflow(self, *, old_name: str, new_name: str, new_file_path: str | None) -> None:
+        """Repoint every context entry for `old_name` at `new_name`, wherever it sits on the stack.
+
+        This is how a workflow that stays open changes identity underneath the artist: the first
+        save of a scratch workflow (`unsaved:<uuid>` becomes the key derived from the path they
+        just picked), a Save As, a rename, a Move. All four change the key *and* the file behind
+        it, which is why they go through here rather than `set_current_workflow_name`: both land
+        before anything is broadcast, so the CurrentWorkflowChanged that comes out describes an
+        entry that is wholly moved. Setting the name alone would announce the new key while
+        `get_current_workflow_file_path` -- what `workflow_dir` answers with -- still named the
+        old file.
+
+        Walks the whole stack rather than just the top entry, which is what the in-place stack
+        walk this replaced did. Callers only ever rekey the current workflow, so the top entry
+        matches; the walk is there so a buried duplicate of the same key cannot be left holding a
+        name the registry has dropped. No entry matching is therefore not expected, and is quietly
+        treated as nothing to do.
+
+        A notification follows unless the key did not actually move -- a rename whose new name
+        sanitizes back to the current key repoints the path here and is deduped into silence by
+        `_notify_current_workflow_changed`, because the payload carries the key and nothing else.
+
+        Args:
+            old_name: The registry key the context currently holds.
+            new_name: The registry key it should hold instead.
+            new_file_path: The workflow's path on disk afterwards, or None if it has none.
+        """
+        for workflow_context_state in self._workflow_stack:
+            if workflow_context_state._name == old_name:
+                workflow_context_state._name = new_name
+                workflow_context_state._file_path = new_file_path
+
+        self._notify_current_workflow_changed()
 
     def set_current_workflow_file_path(self, new_file_path: str | None) -> None:
         """Update the file path retained on the current Workflow context.
 
-        Anything that relocates the current workflow's file on disk (Move, Rename) must call
-        this alongside `set_current_workflow_name`. The retained path is the authoritative
-        answer for the workflow's location -- `get_current_workflow_file_path` is preferred
-        over a registry lookup precisely because it survives a workspace switch -- so leaving
-        it at the pre-move value keeps `workflow_dir` pointing at the old directory even
-        though the registry is correct.
+        The retained path is the authoritative answer for the workflow's location --
+        `get_current_workflow_file_path` is preferred over a registry lookup precisely because it
+        survives a workspace switch -- so leaving it at the pre-move value keeps `workflow_dir`
+        pointing at the old directory even though the registry is correct.
+
+        For a path change on its own, which is why this does not notify: the payload clients
+        receive carries the registry key and nothing else. Anything that relocates the file *and*
+        rekeys it (Move, Rename, a first save) calls `rekey_workflow` instead, so both halves land
+        before the switch goes out.
 
         Args:
             new_file_path: The workflow's new path, or None when it no longer has one.
@@ -734,6 +799,7 @@ class ContextManager(EngineScoped):
             resolved_name, file_path=file_path, working_directory=working_directory
         )
         self._workflow_stack.append(workflow_context_state)
+        self._notify_current_workflow_changed()
         return resolved_name
 
     def pop_workflow(self) -> str:
@@ -750,6 +816,7 @@ class ContextManager(EngineScoped):
             raise self.EmptyStackError(msg)
 
         workflow_context = self._workflow_stack.pop()
+        self._notify_current_workflow_changed()
         return workflow_context._name
 
     def push_flow(self, flow: ControlFlow) -> ControlFlow:
@@ -877,3 +944,72 @@ class ContextManager(EngineScoped):
 
         current_node = current_flow._node_stack[-1]
         return current_node.pop_element()
+
+    def _notify_current_workflow_changed(self) -> None:
+        """Broadcast which Workflow is now current, when that answer has changed.
+
+        Called from every method that changes which Workflow this manager reports as current:
+        `push_workflow`, `pop_workflow`, `set_current_workflow_name`, and `rekey_workflow`.
+        Clients cannot see those mutations any other way. Most of them happen deep inside some
+        other request -- RunWorkflowFromRegistry pushes, ClearAllObjectState and DeleteWorkflow
+        pop, Move and Rename and a first save rekey -- and none of those results name the workflow that
+        ended up in context, so a client that did not issue the request learns nothing. With two
+        editors on one engine that is worse than stale: opening a workflow in one leaves the
+        other showing the newly loaded nodes under its own previous workflow's title.
+
+        Says which workflow is current, not that its contents have finished loading.
+        RunWorkflowFromRegistry pushes before it replays the saved file, so this event goes out
+        first and the workflow's nodes arrive behind it as ordinary creation events.
+
+        Reports the registry key only, because the key is what identifies the workflow to every
+        other request. A client that also needs the display name reads it with
+        GetWorkflowMetadataRequest, and the location from the entry ListAllWorkflowsRequest
+        returns for that key. That is why `set_current_workflow_file_path` does not notify: the
+        path is not in this payload, so a notification from the path setter would compute an
+        unchanged name and dedupe away to nothing anyway. Anything that changes the name and the
+        path together goes through `rekey_workflow`, which lands both before it notifies.
+
+        Deduped so "changed" means what it says: re-entering the workflow that is already
+        current, or renaming it to the name clients were already told, is not something
+        anyone needs to act on.
+        """
+        workflow_name = None
+        if self.has_current_workflow():
+            workflow_name = self.get_current_workflow_name()
+
+        if workflow_name == self._last_notified_workflow_name:
+            return
+
+        # Emitted on `self.engine`'s bus, which is the bus whose `assign_manager_to_request_type`
+        # calls in `__init__` routed the requests that get us here -- `Engine` hands both from the
+        # same place. A manager built bare for a test, with an event manager but no engine, would
+        # answer requests on one and announce on whatever `current_engine()` returns.
+        #
+        # A notification that cannot be sent must not fail the mutation that triggered it.
+        # `put_event` hands cross-thread events to the engine's event loop, which raises if that
+        # loop has closed -- and `pop_workflow` runs inside ClearAllObjectState's teardown, which
+        # turns any exception into a failure result. That would report a wipe that in fact
+        # finished, and abort the open that asked for it, because a broadcast went missing.
+        #
+        # Recording what clients were told only after a clean send is what keeps the missed
+        # transition owed: the next notify compares against the older name and re-sends it rather
+        # than deduping it into silence. A pre-queue drop is not that case -- `put_event` returns
+        # normally, so the field advances and the mirror stays faithful, which is what the comment
+        # in `__init__` is about. Safe against re-entrancy: `put_event` dispatches only to
+        # execution listeners, which ignore an AppEvent.
+        try:
+            self.engine.event_manager.put_event(AppEvent(payload=CurrentWorkflowChanged(workflow_name=workflow_name)))
+        except RuntimeError as e:
+            if workflow_name is None:
+                switched_to = "no workflow is open any more"
+            else:
+                switched_to = f"the open workflow is now '{workflow_name}'"
+            logger.warning(
+                "Attempted to tell connected editors that %s. They will be told at the next switch, "
+                "if the engine is still running to make one. Failed due to: %s",
+                switched_to,
+                e,
+            )
+            return
+
+        self._last_notified_workflow_name = workflow_name

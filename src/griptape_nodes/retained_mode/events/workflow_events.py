@@ -84,16 +84,56 @@ class RunWorkflowWithCurrentStateResultFailure(ResultPayloadFailure):
 @dataclass
 @PayloadRegistry.register
 class RunWorkflowFromRegistryRequest(RequestPayload):
-    """Run a workflow from the registry.
+    """Open a saved workflow from the registry and make it the Current Context.
 
-    Use when: Executing registered workflows, running workflows by name,
-    using workflow templates, automated workflow execution.
+    Use when: Opening a workflow by name, switching which workflow is open, loading a
+    workflow template. This is the request that OPENS a workflow: it executes the saved
+    `.py` file, which rebuilds the workflow's nodes, connections, and parameter values in
+    the engine, then leaves that workflow in the Current Context. Use this rather than
+    SetWorkflowContextRequest, which only records the name and would leave you holding an
+    empty engine -- and which refuses outright while another workflow is open.
+
+    Building the graph is where this stops. It does NOT execute the workflow; issue a
+    StartFlowRequest afterwards to do that. It also cannot open an unsaved workflow,
+    because there is no file to replay.
+
+    DESTRUCTIVE BY DEFAULT. With run_with_clean_slate=True this first wipes the engine,
+    which throws away unsaved changes in whatever workflow is currently open -- including
+    work an artist has in front of them right now in the editor, which cannot be
+    recovered. Save first (SaveWorkflowRequest) if that matters.
+
+    The engine emits CurrentWorkflowChanged app events as the context moves, and the last one
+    is always the truth. Wait for the workflow you asked for, not for a fixed number of events:
+    with run_with_clean_slate=True -- the ordinary open -- there are two when a workflow was
+    already open (None from the wipe, then the workflow that was opened) and only one when the
+    engine had nothing open, because there is nothing to wipe. Treat that None as "mid-switch",
+    not as "the artist closed everything". A failure after the switch adds a trailing None,
+    because the failed open reverts to an empty engine. Each fires when the context
+    moves, which is before the file is replayed, so they announce which workflow is opening
+    rather than that its nodes have arrived. A request rejected before the switch -- unknown
+    registry key, or an unsaved workflow -- leaves the Current Context untouched and emits
+    nothing; the one exception is a clean slate that itself fails, which leaves the engine
+    partially cleared and reports whatever the clearing left behind.
+
+    Opening a large workflow can take a while: it resolves node libraries and replays the
+    whole file. A client-side timeout does NOT cancel the open, so do not retry on one --
+    a retry's clean slate lands partway through the first attempt and leaves a half-built
+    graph. The engine runs the open to completion regardless, so wait and then read the graph
+    back (ListNodesInFlowRequest against the current flow). GetWorkflowContextRequest is not a
+    readiness check: it reports the new workflow from the moment the switch happens, so it
+    answers the same way whether the replay has finished or not.
 
     Args:
-        workflow_name: Name of the workflow in the registry to execute
-        run_with_clean_slate: Whether to start with a clean state (default: True)
+        workflow_name: Registry key of the workflow to open. These are the keys of the
+            dict returned by ListAllWorkflowsRequest, not the display name inside each
+            entry's metadata.
+        run_with_clean_slate: Whether to discard everything currently in the engine before
+            opening (default: True). True is the normal "open this workflow" behavior.
+            False loads the workflow's objects alongside whatever is already there and
+            nests it on top of the existing Current Context rather than replacing it, so
+            the workflow underneath stays on the stack. Rarely what you want.
 
-    Results: RunWorkflowFromRegistryResultSuccess | RunWorkflowFromRegistryResultFailure (workflow not found, execution error)
+    Results: RunWorkflowFromRegistryResultSuccess | RunWorkflowFromRegistryResultFailure (workflow not found, workflow unsaved, execution error)
     """
 
     workflow_name: str

@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 
 from griptape_nodes.retained_mode.events.base_events import (
+    AppPayload,
     RequestPayload,
     ResultPayloadFailure,
     ResultPayloadSuccess,
@@ -157,3 +158,52 @@ class EnsureWorkflowAndFlowResultSuccess(WorkflowAlteredMixin, ResultPayloadSucc
 @PayloadRegistry.register
 class EnsureWorkflowAndFlowResultFailure(ResultPayloadFailure):
     """EnsureWorkflowAndFlow failed. Common causes: could not push workflow context, flow creation rejected by the engine."""
+
+
+@dataclass
+@PayloadRegistry.register
+class CurrentWorkflowChanged(AppPayload):
+    """Current workflow switched notification.
+
+    Emitted by ContextManager whenever the workflow it reports as current changes:
+    opening a saved workflow, starting a scratch one, saving a scratch one for the first
+    time (which rekeys it from "unsaved:<uuid>" to the key derived from its new path),
+    moving it to another directory, clearing all object state, or deleting it.
+
+    Renaming a saved workflow while it is the one open is the exception worth knowing about:
+    the rename deletes the old registry entry while that entry is still in context, and the
+    delete tears the context down. So this reports what the teardown left behind -- None on
+    a single-workflow stack, or the key of whatever was underneath it -- rather than the new
+    name. That is the engine's actual state afterwards, not a reporting quirk. Renaming an
+    open workflow that has never been saved goes the other way: the save inside the rename
+    rekeys the context first, so what arrives is the new key.
+
+    This is the authoritative "you are now looking at a different workflow" signal, and the
+    one a client should drive its title from. It answers which workflow, not whether that
+    workflow's contents have finished loading: RunWorkflowFromRegistry switches the context
+    before it replays the saved file, so this arrives first and the workflow's nodes follow
+    behind it as ordinary creation events. A client that repopulates a canvas on this event
+    should expect to fill it from those, not from a graph that is already complete.
+
+    Where one operation moves the context more than once, every move is reported and the last
+    one is the truth. An ordinary open of a workflow while another one is open is two: None
+    while the engine is wiped, then the workflow that was opened. A None in the middle of a
+    switch is not the artist closing their work. Opening on an engine with nothing open is a
+    single event, since there was no workflow to wipe -- how many arrive depends on where the
+    engine started, so a client should react to each one rather than count them.
+
+    Unlike SetWorkflowContextSuccess it is not the result of a request, so a client observes
+    it even when it was not the one that asked -- a second editor attached to the same
+    engine, or an agent driving the engine over MCP. Most of these switches happen deep
+    inside another request, where no result event names the new workflow at all.
+
+    Args:
+        workflow_name: Registry key of the workflow now in context, or None when the
+            engine has no current workflow (the state right after ClearAllObjectState,
+            and the state a failed open reverts to). A workflow that has never been
+            saved reports its "unsaved:<uuid>" key. Deliberately has no default: None
+            means "nothing is open", so a field that never arrived must not be able to
+            deserialize into it.
+    """
+
+    workflow_name: str | None
