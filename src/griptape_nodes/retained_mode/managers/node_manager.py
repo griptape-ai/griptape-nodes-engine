@@ -3146,6 +3146,12 @@ class NodeManager(EngineScoped):
         # scope, not ours. Decide forwarding first; only open a local scope when
         # this process is actually going to execute the node.
         if not is_worker:
+            # The worker registers before it has loaded its library; routing in that window
+            # fails in the worker with "Library not found". Wait for the worker's
+            # LibraryLoadedNotification first -- immediate for any library without a
+            # spawned worker.
+            if library_name:
+                await library_manager.wait_for_worker_library_load(library_name)
             worker = library_manager.get_worker_for_library(library_name) if library_name else None
             wm = self.engine.worker_manager
             if wm is not None and worker is not None:
