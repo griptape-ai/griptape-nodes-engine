@@ -117,3 +117,30 @@ class TestCrossLoopSettlement:
             elapsed = pending.result(timeout=WAITER_TIMEOUT_S + 5)
 
         assert elapsed < PROMPT_S, f"waiter learned of the cancel after {elapsed:.1f}s"
+
+
+class TestLockCrossesLoops:
+    """The pending map is mutated from more than one loop, through the real locked methods.
+
+    This does NOT reproduce a loop-bound lock's failure, and it passes with either primitive:
+    `asyncio.Lock.acquire` only consults its bound loop on the CONTENDED path, and no section this
+    lock guards contains an await, so a section is always released before anything else can reach
+    it. What the wrong primitive costs is exclusion rather than an exception -- two threads both
+    pass the uncontended fast path and mutate the dict together -- which is not deterministically
+    reachable from a test. Kept as a smoke test that the cross-loop path works at all.
+    """
+
+    def test_tracking_and_cancelling_from_different_loops(self) -> None:
+        with _LoopInThread() as other_loop:
+            client = _client()
+
+            asyncio.run(client.track_request("req-a", tag="worker-a"))
+
+            # Same lock, second loop, through the public API.
+            asyncio.run_coroutine_threadsafe(client.track_request("req-b", tag="worker-b"), other_loop).result(
+                timeout=5
+            )
+            asyncio.run_coroutine_threadsafe(client.cancel_requests_by_tag("worker-a"), other_loop).result(timeout=5)
+
+            assert "req-a" not in client._pending_requests
+            assert "req-b" in client._pending_requests

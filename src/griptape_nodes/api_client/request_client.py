@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Self
@@ -74,7 +75,13 @@ class RequestClient:
 
         # Map of request_id -> pending request where tag identifies the originating worker/caller
         self._pending_requests: dict[str, _PendingRequest] = {}
-        self._lock = asyncio.Lock()
+        # threading.Lock, not asyncio.Lock: this guards state reached from more than one loop --
+        # _try_match runs on the transport loop while _track_request and _cancel_request run on the
+        # loop that issued the request. An asyncio.Lock binds to the loop that first awaits it and
+        # only checks on the CONTENDED path, so a cross-loop acquire raises intermittently while the
+        # uncontended fast path excludes nothing at all. Every section it guards is synchronous
+        # bookkeeping -- no await inside -- so a plain lock cannot deadlock here.
+        self._lock = threading.Lock()
 
         # Track subscribed response topics
         self._subscribed_response_topics: set[str] = set()
@@ -354,7 +361,7 @@ class RequestClient:
         Args:
             tag: The tag value used when track_request was called (e.g. worker_engine_id)
         """
-        async with self._lock:
+        with self._lock:
             to_cancel = [rid for rid, entry in self._pending_requests.items() if entry.tag == tag]
             for rid in to_cancel:
                 entry = self._pending_requests.pop(rid)
@@ -381,7 +388,7 @@ class RequestClient:
         Raises:
             ValueError: If request_id is already being tracked
         """
-        async with self._lock:
+        with self._lock:
             if request_id in self._pending_requests:
                 msg = f"Request ID already exists: {request_id}"
                 raise ValueError(msg)
@@ -458,7 +465,7 @@ class RequestClient:
             request_id: Request identifier
             result: Result data to return to the requester
         """
-        async with self._lock:
+        with self._lock:
             self._resolve_request_unlocked(request_id, result)
 
     async def _reject_request(self, request_id: str, error: Exception) -> None:
@@ -468,7 +475,7 @@ class RequestClient:
             request_id: Request identifier
             error: Exception to raise for the requester
         """
-        async with self._lock:
+        with self._lock:
             self._reject_request_unlocked(request_id, error)
 
     async def _cancel_request(self, request_id: str) -> None:
@@ -477,7 +484,7 @@ class RequestClient:
         Args:
             request_id: Request identifier
         """
-        async with self._lock:
+        with self._lock:
             entry = self._pending_requests.pop(request_id, None)
 
             if entry is None:
@@ -526,7 +533,7 @@ class RequestClient:
         payload = message.get("payload", {})
 
         request_id = payload.get("request_id") or ""
-        async with self._lock:
+        with self._lock:
             if not request_id or request_id not in self._pending_requests:
                 return False
 
