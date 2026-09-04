@@ -865,6 +865,27 @@ class TestRouteToWorker:
             await worker_manager.route_to_worker(event_request, _ENGINE, _WORKER_REQUEST_TOPIC)
 
     @pytest.mark.asyncio
+    async def test_reset_settles_in_flight_requests_too(self, worker_manager: WorkerManager) -> None:
+        """reset_workers is the other path that takes a worker away, and it clears the registry.
+
+        Eviction is not reachable afterwards -- the heartbeat loop can only evict ids it can still
+        see -- and route_to_worker has no wall-clock ceiling, so a node dispatched into a worker a
+        library reload terminates would await a future nothing ever settles: RESOLVING forever.
+        """
+        assert isinstance(worker_manager._tx.request_client, _FakeRequestClient)
+        worker_manager._workers = {_ENGINE: WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key="Lib")}
+        event_request = EventRequest(request=ExecuteNodeRequest(node_name="MyNode", parameter_values={}))
+
+        async def reset_mid_flight() -> None:
+            await asyncio.sleep(0)
+            await worker_manager.reset_workers()
+
+        asyncio.create_task(reset_mid_flight())  # noqa: RUF006
+
+        with pytest.raises(RuntimeError, match="stopped responding and was shut down"):
+            await worker_manager.route_to_worker(event_request, _ENGINE, _WORKER_REQUEST_TOPIC)
+
+    @pytest.mark.asyncio
     async def test_flow_cancellation_still_cancels(self, worker_manager: WorkerManager) -> None:
         """Cancelling the awaiting task must still raise CancelledError, so stop stays stop."""
         assert isinstance(worker_manager._tx.request_client, _FakeRequestClient)

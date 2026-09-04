@@ -388,6 +388,15 @@ class WorkerManager(EngineScoped):
                 for library_name, proc in list(self._managed_worker_processes.items())
             )
         )
+        # Settle anything still awaiting one of these workers, BEFORE the registry is cleared.
+        # Clearing it is what makes this the last chance: the heartbeat loop can only evict ids it
+        # can still see, so after this nothing reaches cancel_requests_by_tag for them. route_to_worker
+        # has no wall-clock ceiling, so a node dispatched into a worker this call terminates would
+        # await a future that never settles. Surfaces there as a worker-died error rather than a
+        # cancellation, because it is not aimed at the awaiting task.
+        if self._transport is not None:
+            for wid in list(self._workers):
+                await self._tx.request_client.cancel_requests_by_tag(wid)
         session_id = self.engine.get_session_id()
         if session_id and self._transport is not None:
             for wid in list(self._workers):
