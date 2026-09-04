@@ -154,6 +154,144 @@ class TestRegistrationCarriesTheProject:
         assert result.current_project_id == "proj-42"
 
 
+class TestProjectSwitchWaitsForWorkers:
+    @pytest.mark.asyncio
+    async def test_switch_awaits_each_worker_and_reports_failures(self, worker_manager: WorkerManager) -> None:
+        """A switch must not report success while a worker is still on the old workspace.
+
+        The fire-and-forget fan-out returns once messages are sent, so execution dispatched right
+        after a switch could reach a worker that had not adopted yet -- which writes files where
+        this engine does not read, silently.
+        """
+        worker_manager._workers = {
+            "worker-a": WorkerRegistration(request_topic="t/a", worker_key=None),
+            "worker-b": WorkerRegistration(request_topic="t/b", worker_key=None),
+        }
+        replies = {
+            "worker-a": {"result_type": "ActivateProjectResultSuccess", "result": {}},
+            "worker-b": {"result_type": "ActivateProjectResultFailure", "result": {"result_details": "unknown id"}},
+        }
+        awaited: list[str] = []
+
+        async def fake_route(_event: object, worker_engine_id: str, _topic: str) -> dict:
+            awaited.append(worker_engine_id)
+            return replies[worker_engine_id]
+
+        worker_manager.route_to_worker = fake_route  # type: ignore[method-assign]
+
+        failures = await worker_manager.broadcast_to_workers_awaiting_replies(
+            EventRequest(request=worker_events.UnregisterWorkerRequest(worker_engine_id="x"))
+        )
+
+        # Every worker was awaited, and the one that refused is named rather than swallowed.
+        assert sorted(awaited) == ["worker-a", "worker-b"]
+        assert len(failures) == 1
+        assert "worker-b" in failures[0]
+        assert "unknown id" in failures[0]
+
+    @pytest.mark.asyncio
+    async def test_one_unreachable_worker_does_not_strand_the_others(self, worker_manager: WorkerManager) -> None:
+        worker_manager._workers = {
+            "dead": WorkerRegistration(request_topic="t/dead", worker_key=None),
+            "alive": WorkerRegistration(request_topic="t/alive", worker_key=None),
+        }
+
+        async def fake_route(_event: object, worker_engine_id: str, _topic: str) -> dict:
+            if worker_engine_id == "dead":
+                msg = "worker is gone"
+                raise RuntimeError(msg)
+            return {"result_type": "ActivateProjectResultSuccess", "result": {}}
+
+        worker_manager.route_to_worker = fake_route  # type: ignore[method-assign]
+
+        failures = await worker_manager.broadcast_to_workers_awaiting_replies(
+            EventRequest(request=worker_events.UnregisterWorkerRequest(worker_engine_id="x"))
+        )
+
+        assert len(failures) == 1
+        assert "dead" in failures[0]
+
+    @pytest.mark.asyncio
+    async def test_a_slow_worker_does_not_delay_the_others(self, worker_manager: WorkerManager) -> None:
+        """Serially, the caller waited out the SUM of every worker's adoption, not the slowest.
+
+        Adoption runs a full library reload, so slow is the normal case rather than the exception,
+        and this is on SetCurrentProjectRequest -- a GUI action someone is sitting in front of.
+        """
+        worker_count = 4
+        worker_manager._workers = {
+            f"w{i}": WorkerRegistration(request_topic=f"t/w{i}", worker_key=None) for i in range(worker_count)
+        }
+        peak = 0
+        in_flight = 0
+
+        async def fake_route(_event: object, _worker_engine_id: str, _topic: str) -> dict:
+            nonlocal peak, in_flight
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0.05)
+            in_flight -= 1
+            return {"result_type": "ActivateProjectResultSuccess", "result": {}}
+
+        worker_manager.route_to_worker = fake_route  # type: ignore[method-assign]
+
+        failures = await worker_manager.broadcast_to_workers_awaiting_replies(
+            EventRequest(request=worker_events.UnregisterWorkerRequest(worker_engine_id="x"))
+        )
+
+        assert failures == []
+        assert peak == worker_count, f"workers were asked one at a time (peak concurrency {peak})"
+
+    @pytest.mark.asyncio
+    async def test_a_worker_that_never_answers_is_reported_rather_than_waited_on(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        """A worker that never answers is named, not waited on.
+
+        route_to_worker has no ceiling: it argues liveness from the heartbeat, which evicts a SILENT
+        worker and says nothing about one busy adopting. Unbounded, the switch never returns.
+        """
+        worker_manager.heartbeat_startup_grace_s = 0.05
+        worker_manager._workers = {"stuck": WorkerRegistration(request_topic="t/stuck", worker_key=None)}
+
+        async def never_answers(_event: object, _worker_engine_id: str, _topic: str) -> dict:
+            await asyncio.sleep(30)
+            msg = "unreachable"
+            raise AssertionError(msg)
+
+        worker_manager.route_to_worker = never_answers  # type: ignore[method-assign]
+
+        failures = await worker_manager.broadcast_to_workers_awaiting_replies(
+            EventRequest(request=worker_events.UnregisterWorkerRequest(worker_engine_id="x"))
+        )
+
+        assert len(failures) == 1
+        assert "no reply within" in failures[0]
+
+    @pytest.mark.asyncio
+    async def test_a_result_type_merely_containing_success_is_not_treated_as_one(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        """The suffix is the discriminator, not the substring.
+
+        A substring test read any type merely containing "Success" as one. Result payloads all end
+        in ResultSuccess or ResultFailure.
+        """
+        worker_manager._workers = {"w": WorkerRegistration(request_topic="t/w", worker_key=None)}
+
+        async def odd_reply(_event: object, _worker_engine_id: str, _topic: str) -> dict:
+            return {"result_type": "SuccessorLookupResultFailure", "result": {"result_details": "nope"}}
+
+        worker_manager.route_to_worker = odd_reply  # type: ignore[method-assign]
+
+        failures = await worker_manager.broadcast_to_workers_awaiting_replies(
+            EventRequest(request=worker_events.UnregisterWorkerRequest(worker_engine_id="x"))
+        )
+
+        assert len(failures) == 1
+        assert "nope" in failures[0]
+
+
 class TestHandleRegisterWorkerRequestEngineVersion:
     @pytest.mark.asyncio
     async def test_rejects_mismatched_engine_version(self, worker_manager: WorkerManager) -> None:

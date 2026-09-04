@@ -851,7 +851,68 @@ class WorkerManager(EngineScoped):
 
         if self._transport is None or not self._workers:
             return
-        await self.broadcast_to_workers(EventRequest(request=ActivateProjectRequest(project_id=event.project_id)))
+        failures = await self.broadcast_to_workers_awaiting_replies(
+            EventRequest(request=ActivateProjectRequest(project_id=event.project_id))
+        )
+        # A worker left on the old project resolves workspace-relative paths against the old
+        # workspace, so it writes where this engine does not read. Loud here beats silent there.
+        for failure in failures:
+            logger.error(
+                "Worker did not adopt project '%s' after the switch; its file paths will not match "
+                "this engine's. Details -- %s",
+                event.project_id,
+                failure,
+            )
+
+    async def broadcast_to_workers_awaiting_replies(self, event: EventRequest) -> list[str]:
+        """Fan out to every worker and WAIT for each to answer. Returns the failures, named.
+
+        The fire-and-forget variant is wrong for anything that changes where paths resolve. A
+        project switch moves the workspace, and `broadcast_to_workers` returns as soon as the
+        messages are sent -- so `SetCurrentProjectRequest` reports success while a worker may still
+        be on the old workspace. Execution dispatched in that window writes files where nothing
+        looks, with no error. Awaiting closes the window by construction instead of hoping the
+        fan-out wins the race against the next dispatch.
+
+        Concurrent, and bounded per worker. Serially, a worker that is merely SLOW -- adoption runs a
+        full library reload, which can include installs -- kept every worker behind it from even
+        receiving the request, so the caller waited out the sum rather than the slowest. And
+        `route_to_worker` has no ceiling of its own: it argues liveness from the heartbeat, which
+        evicts a SILENT worker and says nothing about a busy one, so a user-facing switch could wait
+        forever. The bound is the startup grace, the same budget a worker's own slow startup gets.
+
+        Each worker gets its own request id so replies cannot be confused. One worker's failure does
+        not affect the others; the caller decides what a failure means.
+        """
+        if not self._workers:
+            return []
+
+        async def ask(worker_engine_id: str, request_topic: str) -> str | None:
+            per_worker = EventRequest(request=event.request)
+            per_worker.request_id = str(uuid.uuid4())
+            try:
+                raw = await asyncio.wait_for(
+                    self.route_to_worker(per_worker, worker_engine_id, request_topic),
+                    timeout=self.heartbeat_startup_grace_s,
+                )
+            except TimeoutError:
+                return f"{worker_engine_id}: no reply within {self.heartbeat_startup_grace_s:g} seconds"
+            except Exception as e:
+                return f"{worker_engine_id}: {type(e).__name__}: {e}"
+            # endswith rather than a substring test: every result payload ends in ResultSuccess or
+            # ResultFailure, and a substring match would read any type merely CONTAINING "Success"
+            # as one. The result may also be absent or not a dict, in which case the raw reply is
+            # the most informative thing to report.
+            if not str(raw.get("result_type", "")).endswith("ResultSuccess"):
+                result = raw.get("result")
+                details = result.get("result_details", raw) if isinstance(result, dict) else raw
+                return f"{worker_engine_id}: {details}"
+            return None
+
+        outcomes = await asyncio.gather(
+            *(ask(wid, registration.request_topic) for wid, registration in list(self._workers.items()))
+        )
+        return [failure for failure in outcomes if failure is not None]
 
     def schedule_broadcast(self, request_type: type[RequestPayload]) -> None:
         """Tell every registered worker to handle ``request_type`` locally.
