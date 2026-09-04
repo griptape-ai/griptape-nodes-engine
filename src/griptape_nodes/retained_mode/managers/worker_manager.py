@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from griptape_nodes.bootstrap.utils.subprocess_websocket_base import WebSocketMessage
+from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events import worker_events
 from griptape_nodes.retained_mode.events.app_events import ConfigChanged, CurrentProjectChanged, SecretChanged
@@ -446,7 +447,21 @@ class WorkerManager(EngineScoped):
         try:
             return self.engine.static_files_manager.static_server_base_url
         except RuntimeError:
-            # Raised when accessed before on_app_initialization_complete resolved it.
+            # Raised when accessed before on_app_initialization_complete resolved it. The two
+            # listeners involved run as concurrent tasks, so this is a race the static one normally
+            # wins -- but losing it hands the worker no URL, and it falls back to serving on its own
+            # ephemeral port, which is the dead-links bug this exists to prevent. Loud, because it
+            # is invisible otherwise.
+            #
+            # Only for local storage. On a cloud backend nothing resolves this property at all, and
+            # a worker's URLs come from the same bucket as the orchestrator's, so they outlive it
+            # regardless -- warning there would fire on every single spawn and be false.
+            if isinstance(self.engine.static_files_manager.storage_driver, LocalStorageDriver):
+                logger.warning(
+                    "The static server URL was not resolved yet when a worker was spawned, so the "
+                    "worker will serve assets on its own port. URLs it produces will stop working "
+                    "when it exits."
+                )
             return None
 
     async def evict_worker(self, worker_engine_id: str) -> None:
@@ -645,11 +660,12 @@ class WorkerManager(EngineScoped):
         ]
         await self.spawn_worker(args, library_name)
 
-    @staticmethod
-    def _log_spawn_error(task: asyncio.Task, library_name: str) -> None:
+    def _log_spawn_error(self, task: asyncio.Task, library_name: str) -> None:
+        """Log a spawn that never produced a worker."""
         exc = task.exception()
-        if exc is not None:
-            logger.error("Failed to spawn worker for library '%s': %s", library_name, exc)
+        if exc is None:
+            return
+        logger.error("Failed to spawn worker for library '%s': %s", library_name, exc)
 
     def get_topics_to_subscribe(self, *, is_worker: bool) -> list[str]:
         """Build the list of topics to subscribe to at connection start.

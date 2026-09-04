@@ -180,10 +180,6 @@ ignore = [
 # WorkflowRegistry is still a process-global fake singleton reaching the facade for config.
 # Making it engine-owned is its own change, since it alters what node libraries import.
 "src/griptape_nodes/node_library/workflow_registry.py" = ["TID251"]
-# artifact_normalization.py is called from Parameter converter closures in
-# exe_types/param_types/parameter_{image,audio,video,three_d}.py, which have no Engine of
-# their own yet, so it cannot come off this list until exe_types does.
-"src/griptape_nodes/utils/artifact_normalization.py" = ["TID251"]
 
 [tool.ruff.lint.flake8-type-checking]
 runtime-evaluated-base-classes = ["pydantic.BaseModel"]

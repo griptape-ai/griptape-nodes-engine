@@ -469,7 +469,17 @@ class StaticFilesManager(EngineScoped):
         if not isinstance(self.storage_driver, LocalStorageDriver):
             return
 
-        if payload.static_server_base_url is not None:
+        # The env var outranks the payload: a parent that set it serves the shared workspace on a
+        # port outliving this process, a stronger signal than "some process serves it". Gated on
+        # being a worker, because anywhere else the variable is a leaked shell export and adopting
+        # it would point every asset URL at an address nothing here controls. Read from the payload
+        # rather than the engine-level worker flag, which LibraryManager sets from a concurrent
+        # listener for this same event.
+        if payload.is_worker and os.getenv(ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV):
+            adopted = os.environ[ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV].rstrip("/")
+            self._static_server_base_url = adopted
+            logger.debug("Adopted the orchestrator's static server at %s", adopted)
+        elif payload.static_server_base_url is not None:
             # The host process serves this workspace and told us where. Pointing at its server
             # keeps asset URLs valid for as long as the host runs, rather than only as long as
             # this engine does.
@@ -479,13 +489,6 @@ class StaticFilesManager(EngineScoped):
             # Initialization can complete more than once per process: a workflow executor
             # broadcasts it for its own run. Where the workspace is served is already settled.
             logger.debug("Static server already settled at %s", self._static_server_base_url)
-        elif os.getenv(ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV):
-            # A worker: the orchestrator that spawned this process already serves the shared
-            # workspace, and its server outlives this one. Adopting it keeps asset URLs valid
-            # after this worker is evicted, where a URL on our own ephemeral port would not be.
-            adopted = os.environ[ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV].rstrip("/")
-            self._static_server_base_url = adopted
-            logger.debug("Adopted the orchestrator's static server at %s", adopted)
         else:
             # No host-provided server, so serve the workspace here.
             #

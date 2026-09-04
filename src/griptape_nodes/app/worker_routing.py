@@ -4,8 +4,8 @@ On a worker, a handful of request types must be serviced by the orchestrator
 because the authoritative state (flow graph, connections, node registry) lives
 there. This module provides:
 
-- ``LOCAL_ONLY_REQUEST_TYPES``: the exclusion list of request classes whose worker-
-  side handler should forward to the orchestrator.
+- ``LOCAL_ONLY_REQUEST_TYPES``: the request classes a worker answers ITSELF. Every other
+  registered type gets a ``RemoteHandler`` that forwards to the orchestrator.
 - ``RemoteHandler``: an async callable that replaces the original manager
   handler for those request types on the worker. While the worker is actively
   executing a node it forwards; outside that scope it delegates back to the
@@ -29,10 +29,12 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from dataclasses import fields as dc_fields
 from typing import TYPE_CHECKING, Any, cast
 
 from griptape_nodes.common.strict_mode import STRICT_MODE
 from griptape_nodes.common.strict_mode_checks import RULES
+from griptape_nodes.retained_mode.events import artifact_events, os_events
 from griptape_nodes.retained_mode.events.base_events import (
     RequestPayload,
     ResultPayload,
@@ -49,6 +51,10 @@ from griptape_nodes.retained_mode.events.library_events import ReloadAllLibrarie
 from griptape_nodes.retained_mode.events.parameter_events import MigrateParameterRequest
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.events.project_events import (
+    AttemptMapAbsolutePathToProjectRequest,
+    GetCurrentProjectRequest,
+    GetPathForMacroRequest,
+    GetSituationRequest,
     SetCurrentProjectRequest,
 )
 from griptape_nodes.retained_mode.events.resource_events import (
@@ -172,6 +178,93 @@ class ActivateProjectResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure
     """Worker failed to adopt the orchestrator's current project."""
 
 
+def _registers_a_python_class(payload: type) -> bool:
+    """Whether a field is declared as a bare ``type``.
+
+    Two reasons such a request must stay local, and either alone is sufficient. cattrs has no
+    structure hook for ``type``, so the orchestrator's ingress raises and the worker blocks until
+    the forward times out. And the point of the request is to put a *class* into a process-local
+    registry: forwarding it would register something in the wrong process while the worker -- the
+    one that needs the provider while running a node -- registers nothing.
+    """
+    return any(
+        _annotation_text(field.type).strip().startswith(("type[", "type "))
+        or _annotation_text(field.type).strip() == "type"
+        for field in dc_fields(payload)
+    )
+
+
+def _annotation_text(annotation: object) -> str:
+    """The annotation as text, whichever form the module stored it in.
+
+    `str(annotation)` rather than `__name__`, because composite shapes have no useful name:
+    `MacroPath | None` is a UnionType whose `__name__` does not exist, and `list[MacroPath]`
+    is named just `list` -- both would silently defeat a matcher that only reads names, and
+    a missed MacroPath means a forwarded request that dies on the wire instead of answering
+    locally.
+    """
+    if isinstance(annotation, str):
+        return annotation
+    if isinstance(annotation, type):
+        # str() of a plain class is "<class 'x.Y'>", which matches nothing a matcher looks
+        # for -- and `provider_class: type` (a bare builtin) is exactly the shape the
+        # type-registration predicate exists to catch.
+        return annotation.__name__
+    return str(annotation)
+
+
+def _carries_a_macro_path(payload: type) -> bool:
+    """Whether any field of ``payload`` is declared as a ``MacroPath``.
+
+    A MacroPath wraps a ParsedMacro, which will not serialize, so a request carrying one cannot be
+    forwarded at all: the send raises and the worker blocks until the forward times out. Matched on
+    the declared annotation text rather than a resolved type, because these modules annotate under
+    `from __future__ import annotations` and several cannot be resolved at runtime.
+
+    Applied to the two modules swept below, which are the only ones defining a MacroPath carrier
+    today. The invariant is wider than that scope, so a test sweeps the whole payload registry
+    and fails if a carrier appears elsewhere -- rather than this widening to the registry, where
+    a false positive would silently answer a request in the wrong process.
+    """
+    return any("MacroPath" in _annotation_text(field.type) for field in dc_fields(payload))
+
+
+# Requests a worker must answer itself, derived from the CAUSE rather than listed, so a request
+# added later is covered without anyone remembering this file. Two independent reasons: filesystem
+# work, where the shared-on-disk workspace makes the worker's own answer the authoritative one and
+# forwarding a write corrupts it (`content` is `str | bytes` and the wire form resolves back to
+# `str`); and carrying a MacroPath, which cannot serialize at all.
+#
+# OpenAssociatedFileRequest is the one filesystem request deliberately NOT local: it hands a path to
+# the OS to open in the user's default application, and that side effect belongs where the user is,
+# not in a headless subprocess. It carries no MacroPath, so nothing else claims it.
+_FORWARDING_FILESYSTEM_REQUESTS: frozenset[type[RequestPayload]] = frozenset({os_events.OpenAssociatedFileRequest})
+
+
+def _local_only_by_derivation() -> frozenset[type[RequestPayload]]:
+    derived: set[type[RequestPayload]] = set()
+    for module in (os_events, artifact_events):
+        for payload in vars(module).values():
+            # `__module__` rather than mere namespace membership: these modules import request
+            # types from each other, and a re-exported CreateNodeRequest becoming local-only would
+            # silently let a worker mutate its own non-authoritative graph.
+            if (
+                not isinstance(payload, type)
+                or not issubclass(payload, RequestPayload)
+                or payload is RequestPayload
+                or payload.__module__ != module.__name__
+            ):
+                continue
+            if payload in _FORWARDING_FILESYSTEM_REQUESTS:
+                continue
+            if module is os_events or _carries_a_macro_path(payload) or _registers_a_python_class(payload):
+                derived.add(payload)
+    return frozenset(derived)
+
+
+_LOCAL_ONLY_FILESYSTEM_REQUESTS: frozenset[type[RequestPayload]] = _local_only_by_derivation()
+
+
 LOCAL_ONLY_REQUEST_TYPES: frozenset[type[RequestPayload]] = frozenset(
     {
         # Requests a worker must answer ITSELF while executing a node. Everything else
@@ -210,6 +303,50 @@ LOCAL_ONLY_REQUEST_TYPES: frozenset[type[RequestPayload]] = frozenset(
         # asked, mid-node. Reached because in_node_execution() is a process-wide refcount, so a
         # reload dispatched by a broadcast handler forwards whenever any node happens to be running.
         ReloadAllLibrariesRequest,
+        # os_events: a worker does its own filesystem work. The workspace is shared on disk, so
+        # the local answer is already the right one -- the same argument as the project reads
+        # below -- and forwarding was actively destructive. `content` is `str | bytes`, and the
+        # wire form base64s bytes into a JSON string that cattrs resolves back to `str`, so a
+        # worker's write landed corrupted with no error anywhere. Requests carrying a `MacroPath`
+        # (`File("{outputs}/out.png")`, `Directory(...).with_versioning()`) cannot be serialized
+        # at all, so the worker blocked until the forward timed out. And four of the failure
+        # results declare `SequenceScanFailureReason | FileIOFailureReason`, a union cattrs cannot
+        # disambiguate, so even the error could not come back.
+        #
+        # Stated as a rule over the whole module rather than a list of the ones found broken,
+        # because the list kept being incomplete: `_LOCAL_ONLY_FILESYSTEM_REQUESTS` is derived
+        # from os_events itself, so a filesystem request added later is covered by construction.
+        # `tests/unit/app/test_worker_routing_filesystem.py` fails if a new one appears without a
+        # routing decision.
+        *_LOCAL_ONLY_FILESYSTEM_REQUESTS,
+        # project_events: a worker already adopts the orchestrator's project (at spawn, and
+        # again on a switch), and a project's base directory is shared on-disk state -- the
+        # same class as the workspace path. So the worker's own answer is correct by
+        # construction, and forwarding buys nothing while costing a round trip on a path as
+        # hot as writing sidecar metadata for every saved file.
+        #
+        # It also cost correctness. Forwarded results are rebuilt with cattrs, and
+        # GetCurrentProjectResultSuccess annotates `project_info: ProjectInfo` under
+        # TYPE_CHECKING to break an import cycle. cattrs cannot resolve that name from this
+        # module's namespace, so the converter's documented NameError fallback passes the raw
+        # dict into the constructor: isinstance() passes while `.project_info` is a dict, and
+        # the first attribute access fails. In a worker that meant every sidecar write logged
+        # "'dict' object has no attribute 'project_base_dir'" and silently wrote nothing.
+        GetCurrentProjectRequest,
+        # The same argument, for the reads that resolve a path against that project. All three are
+        # pure template reads carrying serializable payloads, and all three sit on the per-file
+        # write path, so forwarding them costs a round trip per saved file.
+        # GetPathForMacroResultFailure also declares `missing_variables: set[str] | None`, the same
+        # shape cattrs cannot round-trip that broke the os_events forwards.
+        #
+        # AttemptMapAbsolutePathToProjectRequest is the write-side counterpart and hid longest:
+        # every file written through a ProjectFileDestination asks whether its absolute path maps
+        # back into the project so the caller can store a portable macro reference instead. It sits
+        # AFTER the write rather than before it, which is the only reason it read as a different
+        # case; its handler is a pure read of the same project template.
+        GetSituationRequest,
+        GetPathForMacroRequest,
+        AttemptMapAbsolutePathToProjectRequest,
         # Two requests carry a live Python object in a field, and both were local under the
         # allowlist this exclusion list replaces -- the flip is what started forwarding them.
         # `_registers_a_python_class` does not catch either: it matches a `type[...]` annotation,
@@ -227,8 +364,8 @@ LOCAL_ONLY_REQUEST_TYPES: frozenset[type[RequestPayload]] = frozenset(
 class RemoteHandler:
     """Worker-side dispatch shim.
 
-    Registered in place of the original manager handler for types in
-    every registered type except LOCAL_ONLY_REQUEST_TYPES. Forwards to the orchestrator while the worker is
+    Registered in place of the original manager handler for every registered type except
+    LOCAL_ONLY_REQUEST_TYPES. Forwards to the orchestrator while the worker is
     inside a ``worker_node_execution_scope``; delegates to the original
     handler otherwise (so bootstrap / library-load paths keep running locally).
 
