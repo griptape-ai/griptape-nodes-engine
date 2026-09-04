@@ -1061,7 +1061,7 @@ class LibraryManager(EngineScoped):
                 continue
 
             for dep in lib_deps:
-                repo_name = extract_repo_name_from_url(dep.url)
+                repo_name = self._repo_name_from_dependency_url(dep.url)
                 dep_info = self._library_info_for_repo_name(repo_name)
                 if dep_info is None:
                     logger.warning(
@@ -1104,12 +1104,21 @@ class LibraryManager(EngineScoped):
                 LoadLibraryMetadataFromFileRequest(file_path=info.library_path)
             )
             if isinstance(metadata_result, LoadLibraryMetadataFromFileResultFailure):
+                # Every dependency this manifest declares is dropped, so say so: silently it looks
+                # identical to a library that declares none.
+                logger.warning(
+                    "Could not read library '%s' manifest at %s, so its declared library "
+                    "dependencies are not being added to this worker's targets: %s",
+                    library_name,
+                    info.library_path,
+                    metadata_result.result_details,
+                )
                 continue
             declarations = metadata_result.library_schema.metadata.declarations or []
             for dep in declarations:
                 if not isinstance(dep, LibraryDependencyDeclaration):
                     continue
-                repo_name = extract_repo_name_from_url(normalize_github_url(parse_git_url_with_ref(dep.url).url))
+                repo_name = self._repo_name_from_dependency_url(dep.url)
                 dep_info = self._library_info_for_repo_name(repo_name)
                 if dep_info is None or dep_info.library_name is None:
                     logger.info(
@@ -1123,6 +1132,17 @@ class LibraryManager(EngineScoped):
                     expanded.append(dep_info.library_name)
                     queue.append(dep_info.library_name)
         return expanded
+
+    @staticmethod
+    def _repo_name_from_dependency_url(url: str) -> str:
+        """The repo name a dependency declaration resolves to, normalized once for every caller.
+
+        A declaration URL may carry an `@ref` suffix and a `.git` extension, and both change the
+        final path segment this yields. Two call sites normalizing differently meant one resolved a
+        declaration the other missed, and a miss only logs -- so a worker's target list quietly
+        disagreed with the transitive resolver about the same manifest.
+        """
+        return extract_repo_name_from_url(normalize_github_url(parse_git_url_with_ref(url).url))
 
     def _library_info_for_repo_name(self, repo_name: str) -> LibraryInfo | None:
         """Resolve a library-dependency URL's repo name to a discovered library.
@@ -1138,10 +1158,16 @@ class LibraryManager(EngineScoped):
         by_name = self.get_library_info_by_library_name(repo_name)
         if by_name is not None:
             return by_name
-        for info in self._library_file_path_to_info.values():
-            if repo_name in Path(info.library_path).parts:
-                return info
-        return None
+        # Both callers need library_name, and one path can hold more than one entry -- a FAILURE
+        # record alongside the copy that loaded -- so a match on the failed one answers "not
+        # installed here" for a library that is. Prefer an entry that actually names itself.
+        matches = [
+            info for info in self._library_file_path_to_info.values() if repo_name in Path(info.library_path).parts
+        ]
+        named = next((info for info in matches if info.library_name is not None), None)
+        if named is not None:
+            return named
+        return matches[0] if matches else None
 
     def collate_problems_for_lib_info(self, lib_info: LibraryInfo) -> str | None:
         """Return a collated display string for a LibraryInfo's problems, or None if there are none."""
