@@ -12,6 +12,7 @@ from griptape_nodes.node_library.library_registry import Library, LibraryRegistr
 
 def _make_schema(name: str = "TestLib") -> LibrarySchema:
     schema = MagicMock(spec=LibrarySchema)
+    schema.execution_modules = None
     schema.is_default_library = False
     schema.name = name
     return schema

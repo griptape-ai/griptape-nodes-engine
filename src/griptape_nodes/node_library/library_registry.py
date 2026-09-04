@@ -93,6 +93,9 @@ class ResourceRequirements(BaseModel):
 
     Specifies what system resources (OS, compute backends) the library needs.
     Example: {"platform": (["linux", "windows"], "has_any"), "arch": "x86_64", "compute": (["cuda", "cpu"], "has_all")}
+
+    ``required`` is the only tier: without it the library cannot run. Execution refuses with the
+    reason and editing is unaffected, so a cuda-only library stays fully editable on a laptop.
     """
 
     required: Requirements | None = None
@@ -273,9 +276,10 @@ class LibrarySchema(BaseModel):
     library itself.
     """
 
-    # Dependencies.pip_dependencies_exec is optional, so a manifest written against an earlier
-    # schema still validates: its absence means every dependency is edit-time.
-    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.12.0"
+    # Dependencies.pip_dependencies_exec and execution_modules are both optional, so a manifest
+    # written against an earlier schema still validates: their absence means every dependency is
+    # edit-time and no module is execution-only.
+    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.13.0"
 
     name: str
     library_schema_version: str
@@ -290,6 +294,16 @@ class LibrarySchema(BaseModel):
     is_default_library: bool | None = None
     advanced_library_path: str | None = None
     widgets: list[WidgetDefinition] | None = None
+    # Modules that only ever run where nodes execute. Paths relative to this manifest; a
+    # directory means every `.py` beneath it.
+    #
+    # The declaration exists so heavy imports stop being an author's discipline problem. A module
+    # named here may import whatever it likes at module scope, because the orchestrator never
+    # imports it -- only a worker does, eagerly, at library load. Node modules reach it through
+    # `BaseNode.execution_module(...)` rather than importing it, and importing it from a node
+    # module is a reportable violation: that is what would drag execution dependencies onto the
+    # orchestrator's import path, which is the thing the edit/execution split exists to prevent.
+    execution_modules: list[str] | None = None
 
 
 class LibraryRegistry:
