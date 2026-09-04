@@ -9,7 +9,7 @@ The engine's own system defaults template is unnamed, and every collection inclu
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 from unittest.mock import Mock
 
 import pytest
@@ -26,7 +26,6 @@ from griptape_nodes.retained_mode.managers.diagnostics_manager import Diagnostic
 
 if TYPE_CHECKING:
     from griptape_nodes.common.diagnostics.report import ProjectDiagnostics
-    from griptape_nodes.retained_mode.engine import Engine
 
 _USERNAME = "samantha"
 
@@ -34,7 +33,7 @@ _USERNAME = "samantha"
 @pytest.fixture
 def manager() -> DiagnosticsManager:
     """A manager with a stand-in engine, since building one entry never reaches one."""
-    return DiagnosticsManager(Mock(), engine=cast("Engine", Mock()))
+    return DiagnosticsManager(Mock(), engine=Mock())
 
 
 def _entry(

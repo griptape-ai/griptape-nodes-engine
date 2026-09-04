@@ -17,7 +17,7 @@ from __future__ import annotations
 import io
 import json
 import zipfile
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 from unittest.mock import Mock
 
 import pytest
@@ -29,8 +29,6 @@ from griptape_nodes.retained_mode.managers.diagnostics_manager import Diagnostic
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-    from griptape_nodes.retained_mode.engine import Engine
 
 # Long enough to be searched for in free text, and distinctive enough that finding one
 # anywhere in a bundle is unambiguous rather than a coincidence of the machine it ran on.
@@ -86,7 +84,7 @@ def bundle(tmp_path: Path) -> _Bundle:
         "nodes": {"OpenAi": {"api_key": _ENV_SECRET}},
         "last_used_endpoint": f"https://api.example.com/v1?token={_ENV_SECRET}",
     }
-    manager = DiagnosticsManager(Mock(), engine=cast("Engine", engine))
+    manager = DiagnosticsManager(Mock(), engine=engine)
 
     redactor = Redactor(secret_values=[_ENV_SECRET, _WORKFLOW_SECRET])
     warnings: list[str] = []
