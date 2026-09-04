@@ -27,9 +27,8 @@ class _PendingRequest:
     # messages are handled on the transport loop while a request may have been issued from the
     # loop running a flow, and asyncio futures are single-loop objects: set_result schedules the
     # waiting task through `future._loop.call_soon`, which does not wake a loop it is not called
-    # from. Resolving across loops without this left the result sitting in the target loop's ready
-    # queue until something unrelated woke it -- a node stayed "running" for ~30s, and raising the
-    # log level "fixed" it because the extra log events did the waking.
+    # from. Without this the result sits in the target loop's ready queue until something
+    # unrelated wakes it.
     loop: asyncio.AbstractEventLoop
     # When True, EventResultFailure responses resolve the future with
     # the full payload dict instead of rejecting it with
