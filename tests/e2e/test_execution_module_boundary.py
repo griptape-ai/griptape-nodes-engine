@@ -167,6 +167,42 @@ class TestAWorkerImportsThemEagerly:
         )
         assert node.get_parameter_by_name("reported_version") is not None
 
+    def test_two_execution_modules_with_one_name_is_refused(self, tmp_path: Path) -> None:
+        """Modules are addressed by file name, and a directory declaration expands recursively.
+
+        Two files sharing a stem left the later import winning and the earlier module unreachable,
+        with the listing showing one name and no way to tell which had been bound. Only the author
+        knows which was meant, so this is refused rather than resolved -- and the library stays
+        editable, like any other execution-side failure.
+        """
+        current_engine().library_manager._is_worker = True
+        library_dir = tmp_path / "execution_module_library"
+        shutil.copytree(FIXTURE, library_dir)
+        nested = library_dir / "execution" / "nested"
+        nested.mkdir(parents=True, exist_ok=True)
+        (nested / "runner.py").write_text("VALUE = 'the other one'\n")
+        manifest_path = library_dir / "griptape_nodes_library.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["library_schema_version"] = LibrarySchema.LATEST_SCHEMA_VERSION
+        manifest["metadata"]["engine_version"] = engine_version
+        manifest_path.write_text(json.dumps(manifest, indent=2))
+
+        result = current_engine().handle_request(RegisterLibraryFromFileRequest(file_path=str(manifest_path)))
+        assert isinstance(result, RegisterLibraryFromFileResultSuccess), getattr(result, "result_details", result)
+
+        info = _library_info(str(manifest_path))
+        # Specifically the collision, not merely "some reason mentioning runner": this fixture's own
+        # runner.py also fails to import here (its execution dependency is not installed in this
+        # test), and asserting on the name alone passed with the guard removed.
+        assert info.execution_unavailable_reason is not None
+        assert "both named 'runner'" in info.execution_unavailable_reason, info.execution_unavailable_reason
+        # Only one of the two was bound, and neither is reachable, so nothing was silently chosen.
+        assert "runner" not in info.execution_modules
+        node = LibraryRegistry.create_node(
+            node_type="BoundaryNode", name="still_editable_on_collision", specific_library_name=LIBRARY
+        )
+        assert node.get_parameter_by_name("reported_version") is not None
+
     def test_reaching_a_module_that_failed_to_import_reports_the_import_failure(self, tmp_path: Path) -> None:
         """Not "no module by that name", which sends the author hunting for a manifest typo."""
         current_engine().library_manager._is_worker = True

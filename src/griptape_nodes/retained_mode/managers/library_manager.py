@@ -5059,6 +5059,28 @@ class LibraryManager(EngineScoped):
             return
 
         for path in paths:
+            # Modules are addressed by stem, and a directory declaration expands recursively, so
+            # execution/a/runner.py and execution/b/runner.py both answer to "runner". Left alone the
+            # later import won and the earlier module became unreachable, with get_execution_module
+            # listing one "runner" and no way to see which. Refused rather than resolved: only the
+            # author knows which was meant.
+            if path.stem in library_info.execution_modules:
+                library_info.execution_unavailable_reason = (
+                    f"two of its execution modules are both named '{path.stem}'. Execution modules "
+                    "are addressed by file name, so rename one of them."
+                )
+                # Cleared, not left half-built: get_execution_module reports the reason only when the
+                # name misses, so leaving the first-imported module bound would hand back whichever
+                # one rglob happened to reach first -- the silent wrong answer this refuses.
+                library_info.execution_modules.clear()
+                logger.error(
+                    "Library '%s' declares more than one execution module named '%s' (%s); "
+                    "the library stays editable but cannot run.",
+                    library_data.name,
+                    path.stem,
+                    path,
+                )
+                return
             try:
                 module = self._load_module_from_file(path, library_data.name)
             except Exception as exc:
