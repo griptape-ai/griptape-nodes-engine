@@ -249,9 +249,8 @@ class GriptapeNodes(metaclass=_EngineRootMeta):
 
     @classmethod
     def StaticFilesManager(cls) -> StaticFilesManager:
-        # Deliberately unguarded: a worker shares the workspace on disk and serves static
-        # files through the orchestrator's server URL, so its StaticFilesManager is real and
-        # its answers are correct. This is a decided exception, not an oversight.
+        # Unguarded: a worker shares the workspace on disk and serves static files through the
+        # orchestrator's server URL, so its StaticFilesManager answers correctly.
         return current_engine().static_files_manager
 
     @classmethod

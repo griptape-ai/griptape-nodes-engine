@@ -21,9 +21,8 @@ from rich.logging import RichHandler
 
 # Reaches managers through the ambient engine rather than the GriptapeNodes facade. This module
 # runs on uvicorn's thread, and the facade's worker guard keys off a PROCESS-WIDE
-# in-node-execution refcount rather than a contextvar -- so serving a workspace asset while any
-# node was executing raised, and a worker running its own static server would 500 on every
-# fetch. servers/** is TID251-allowlisted, so nothing would have flagged it.
+# in-node-execution refcount rather than a contextvar, so serving a workspace asset would raise
+# whenever any node happened to be executing.
 from griptape_nodes.retained_mode.engine import current_engine
 
 # Whether to enable the static server

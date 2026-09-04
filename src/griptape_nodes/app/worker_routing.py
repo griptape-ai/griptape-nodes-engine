@@ -226,26 +226,18 @@ def _carries_a_macro_path(payload: type) -> bool:
     and fails if a carrier appears elsewhere -- rather than this widening to the registry, where
     a false positive would silently answer a request in the wrong process.
     """
-    # Handles both annotation forms: a real class where the module evaluates annotations eagerly,
-    # and the text where `from __future__ import annotations` postponed it.
     return any("MacroPath" in _annotation_text(field.type) for field in dc_fields(payload))
 
 
-# Requests a worker must answer itself, derived rather than listed. Two independent reasons, and
-# both are derived from the CAUSE so that a request added later is covered without anyone
-# remembering this file:
+# Requests a worker must answer itself, derived from the CAUSE rather than listed, so a request
+# added later is covered without anyone remembering this file. Two independent reasons: filesystem
+# work, where the shared-on-disk workspace makes the worker's own answer the authoritative one and
+# forwarding a write corrupts it (`content` is `str | bytes` and the wire form resolves back to
+# `str`); and carrying a MacroPath, which cannot serialize at all.
 #
-#   1. Filesystem work. The workspace is shared on disk, so the worker's own answer is already the
-#      right one -- and forwarding a write corrupted it (`content` is `str | bytes`, and the wire
-#      form resolves back to `str`).
-#   2. Anything carrying a MacroPath in either module swept below. `os_events` was not the only
-#      one: the artifact preview requests carry one too, and are reached from a handler that a
-#      worker runs locally, so the first version of this derivation still let them forward and
-#      fail. A registry-wide test guards the case of a third module growing a carrier.
-#
-# OpenAssociatedFileRequest is the one filesystem request that is deliberately NOT local: it hands
-# a path to the OS to open in the user's default application, and that side effect belongs where
-# the user is, not in a headless subprocess. It carries no MacroPath, so nothing else claims it.
+# OpenAssociatedFileRequest is the one filesystem request deliberately NOT local: it hands a path to
+# the OS to open in the user's default application, and that side effect belongs where the user is,
+# not in a headless subprocess. It carries no MacroPath, so nothing else claims it.
 _FORWARDING_FILESYSTEM_REQUESTS: frozenset[type[RequestPayload]] = frozenset({os_events.OpenAssociatedFileRequest})
 
 
@@ -372,8 +364,8 @@ LOCAL_ONLY_REQUEST_TYPES: frozenset[type[RequestPayload]] = frozenset(
 class RemoteHandler:
     """Worker-side dispatch shim.
 
-    Registered in place of the original manager handler for types in
-    every registered type except LOCAL_ONLY_REQUEST_TYPES. Forwards to the orchestrator while the worker is
+    Registered in place of the original manager handler for every registered type except
+    LOCAL_ONLY_REQUEST_TYPES. Forwards to the orchestrator while the worker is
     inside a ``worker_node_execution_scope``; delegates to the original
     handler otherwise (so bootstrap / library-load paths keep running locally).
 

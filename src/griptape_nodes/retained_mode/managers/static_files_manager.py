@@ -469,16 +469,12 @@ class StaticFilesManager(EngineScoped):
         if not isinstance(self.storage_driver, LocalStorageDriver):
             return
 
-        # Checked ahead of the payload deliberately. A parent that set this is telling us it
-        # serves the shared workspace on a port that outlives this process, which is a strictly
-        # stronger signal than "some process serves it" -- and the host announces its own URL on
-        # the payload either way, so testing the payload first made this branch unreachable and
-        # the app repo the only thing standing between a worker and an ephemeral-port URL.
-        # Gated on being a worker: only a spawning orchestrator sets this variable on purpose,
-        # so in any other process it is a leaked shell export, and adopting it would silently
-        # point every asset URL at an address nothing here controls. The payload's own flag is
-        # the only race-free source: the engine-level worker flag is set by LibraryManager's
-        # listener for this same event, and listeners run concurrently in no defined order.
+        # The env var outranks the payload: a parent that set it serves the shared workspace on a
+        # port outliving this process, a stronger signal than "some process serves it". Gated on
+        # being a worker, because anywhere else the variable is a leaked shell export and adopting
+        # it would point every asset URL at an address nothing here controls. Read from the payload
+        # rather than the engine-level worker flag, which LibraryManager sets from a concurrent
+        # listener for this same event.
         if payload.is_worker and os.getenv(ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV):
             adopted = os.environ[ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV].rstrip("/")
             self._static_server_base_url = adopted
