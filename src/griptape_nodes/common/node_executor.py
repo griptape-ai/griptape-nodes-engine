@@ -352,6 +352,9 @@ class NodeExecutor(EngineScoped):
                 node.parameter_output_values[name] = value
         finally:
             current_executing_node_name.reset(token)
+            # A connection torn down while this node was running left its input value in place so the
+            # node could finish on it. Now that it has, drop it.
+            node.reset_deferred_input_values()
 
     def _resolve_variables_for_node(self, node_name: str) -> dict[str, str | int]:
         """Resolve the variable dict for a node's flow on the orchestrator.

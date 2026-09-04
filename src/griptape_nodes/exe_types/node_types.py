@@ -319,6 +319,7 @@ class BaseNode(ABC):
     )
     lock: bool = False  # When lock is true, the node is locked and can't be modified. When lock is false, the node is unlocked and can be modified.
     _cancellation_requested: threading.Event  # Event indicating if cancellation has been requested for this node
+    _inputs_to_reset_after_execution: set[str]  # Input values a connection teardown deferred until this node finishes
 
     @property
     def parameters(self) -> list[Parameter]:
@@ -347,6 +348,7 @@ class BaseNode(ABC):
         self.process_generator = None
         self._tracked_parameters = []
         self._cancellation_requested = threading.Event()
+        self._inputs_to_reset_after_execution = set()
         self._parent_group = None
         self.set_entry_control_parameter(None)
 
@@ -1139,6 +1141,27 @@ class BaseNode(ABC):
         else:
             err = f"Attempted to remove value for Parameter '{param_name}' but no value was set."
             raise KeyError(err)
+
+    def reset_input_value_after_execution(self, param_name: str) -> None:
+        """Reset this input to its default once the node stops executing, rather than right now.
+
+        Deleting a connection into an input that cannot hold a value on its own resets that input to
+        the parameter default. Doing that while the node is mid-`process` would make it finish on the
+        default instead of the value it is actually running on, so the reset waits until it is done.
+        """
+        self._inputs_to_reset_after_execution.add(param_name)
+
+    def reset_deferred_input_values(self) -> None:
+        """Apply any input resets that were deferred while this node was executing.
+
+        Called once execution ends, however it ends. A parameter whose value has gone away in the
+        meantime needs no reset and is not an error.
+        """
+        deferred_param_names = self._inputs_to_reset_after_execution
+        self._inputs_to_reset_after_execution = set()
+        for param_name in deferred_param_names:
+            if param_name in self.parameter_values:
+                self.remove_parameter_value(param_name)
 
     def get_next_control_output(self) -> Parameter | None:
         # The default behavior for nodes is to find the first control output found.

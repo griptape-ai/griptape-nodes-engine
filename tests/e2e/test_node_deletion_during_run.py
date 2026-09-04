@@ -413,13 +413,21 @@ async def test_deleting_a_resolved_upstream_leaves_its_running_successor_alone(
     await _wait_until_resolved(engine, "Upstream")
     await _wait_until_resolving(engine, "Downstream")
 
+    # Only events from the delete onward are interesting. Starting a run legitimately announces the
+    # node it is about to run as unresolved, and that happened long before the delete.
+    unresolved_before_delete = len(unresolved)
     await _delete_node(engine, flow_name, "Upstream")
-    unresolved_after_delete = list(unresolved)
+    unresolved_after_delete = unresolved[unresolved_before_delete:]
+
+    # Still parked in its gate, so it must still be holding the value it is running on.
+    downstream = engine.node_manager.get_node_by_name("Downstream")
+    assert downstream.parameter_values.get("linked_text") == "from upstream", (
+        "The connection teardown reset a running node's input out from under it."
+    )
 
     _open_gate(downstream_gate)
     await asyncio.wait_for(run, timeout=_RUN_TIMEOUT_SECONDS)
 
-    downstream = engine.node_manager.get_node_by_name("Downstream")
     assert downstream.state is NodeResolutionState.RESOLVED
     assert downstream.parameter_output_values.get("result") == "from upstream", (
         "Downstream was executing on the upstream value and finished on the parameter default "
@@ -429,6 +437,13 @@ async def test_deleting_a_resolved_upstream_leaves_its_running_successor_alone(
         "Downstream was announced unresolved while it was still executing, which the finishing run then contradicts."
     )
     assert engine.flow_manager.check_for_existing_running_flow() is False
+
+    # The reset was deferred, not cancelled. Now that the node is done, the input has to be back at
+    # its parameter default -- an input with no PROPERTY mode is invisible and unclearable in the
+    # editor, so a value left behind would keep being produced on every later run.
+    assert downstream.parameter_values.get("linked_text") == "", (
+        "The deferred reset never applied, so the node keeps a value from a connection that no longer exists."
+    )
 
 
 @requires_fixture_library

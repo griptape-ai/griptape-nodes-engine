@@ -37,7 +37,7 @@ from griptape_nodes.exe_types.node_types import (
     VariableReference,
 )
 from griptape_nodes.machines.control_flow import CompleteState, ControlFlowMachine
-from griptape_nodes.machines.dag_builder import DagBuilder, DagNodeCategories
+from griptape_nodes.machines.dag_builder import DagBuilder, DagNodeCategories, NodeState
 from griptape_nodes.node_library.library_registry import LibraryNameAndVersion, LibraryRegistry
 from griptape_nodes.node_library.workflow_registry import LibraryNameAndNodeType
 from griptape_nodes.retained_mode.engine import EngineScoped
@@ -1385,20 +1385,30 @@ class FlowManager(EngineScoped):
 
         # After the connection has been removed, if it doesn't have PROPERTY as a type, wipe the set parameter value and unresolve future nodes
         if ParameterMode.PROPERTY not in target_param.allowed_modes:
-            try:
-                # Only try to remove a value where one exists, otherwise it will generate errant warnings.
-                if target_param.name in target_node.parameter_values:
-                    target_node.remove_parameter_value(target_param.name)
-                # It removed it accurately
-                # Unresolve future nodes that depended on that value
+            if self._is_node_executing(target_node):
+                # The node is mid-execution on this very value. Resetting it now would make the node
+                # finish on its parameter default instead, and the run would report success with the
+                # wrong answer; marking the node unresolved would be a claim the finishing run
+                # immediately contradicts. Defer the reset until the node is done.
+                target_node.reset_input_value_after_execution(target_param.name)
+                # Consumers still need invalidating, and this pass only unresolves targets that are
+                # already RESOLVED, so it cannot disturb another node mid-flight either.
                 self._connections.unresolve_future_nodes(target_node)
-                target_node.make_node_unresolved(
-                    current_states_to_trigger_change_event=set(
-                        {NodeResolutionState.RESOLVED, NodeResolutionState.RESOLVING}
+            else:
+                try:
+                    # Only try to remove a value where one exists, otherwise it will generate errant warnings.
+                    if target_param.name in target_node.parameter_values:
+                        target_node.remove_parameter_value(target_param.name)
+                    # It removed it accurately
+                    # Unresolve future nodes that depended on that value
+                    self._connections.unresolve_future_nodes(target_node)
+                    target_node.make_node_unresolved(
+                        current_states_to_trigger_change_event=set(
+                            {NodeResolutionState.RESOLVED, NodeResolutionState.RESOLVING}
+                        )
                     )
-                )
-            except KeyError as e:
-                logger.warning(e)
+                except KeyError as e:
+                    logger.warning(e)
         # Let the source make any internal handling decisions now that the Connection has been REMOVED.
         source_node.after_outgoing_connection_removed(
             source_parameter=source_param, target_node=target_node, target_parameter=target_param
@@ -1421,6 +1431,16 @@ class FlowManager(EngineScoped):
 
         result = DeleteConnectionResultSuccess(result_details=details)
         return result
+
+    def _is_node_executing(self, node: BaseNode) -> bool:
+        """Whether a run is currently inside this node's process method.
+
+        Read from the live DAG rather than from `node.state`. The two are set in the same breath, but
+        only the DAG entry is guaranteed to be dropped when a run tears down, so a run that ends
+        badly cannot leave a node looking permanently busy and quietly change ordinary editing.
+        """
+        dag_node = self._global_dag_builder.node_to_reference.get(node.name)
+        return dag_node is not None and dag_node.node_state is NodeState.PROCESSING
 
     def on_package_nodes_as_serialized_flow_request(  # noqa: C901, PLR0911, PLR0912, PLR0915
         self, request: PackageNodesAsSerializedFlowRequest
