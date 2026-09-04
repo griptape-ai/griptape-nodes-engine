@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import json
 import pathlib
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
@@ -188,6 +190,39 @@ class TestResolvingAnAsset:
 
         assert fetched == ["DownloadModelRequest"], "a partial download must be refetched"
         assert (target / ".griptape-nodes-complete").exists(), "a successful fetch must mark completion"
+
+    def test_two_nodes_asking_at_once_download_once(self, tmp_path: Path) -> None:
+        """Node execution is concurrent, and the check-fetch-mark window is not atomic.
+
+        Both callers saw no marker, both downloaded into the same directory, and the first to return
+        marked it complete while the second was still writing -- so every later call short-circuited
+        on the marker and got a truncated model, the exact outcome the marker exists to prevent.
+        """
+        library = _register(tmp_path, {"weights": {"source": "hf:owner/repo", "revision": "abc123"}}, "raced")
+        manager = current_engine().library_manager
+        in_flight = 0
+        overlaps: list[int] = []
+        fetches = 0
+
+        def _slow_download(_request: object) -> object:
+            nonlocal in_flight, fetches
+            fetches += 1
+            in_flight += 1
+            overlaps.append(in_flight)
+            time.sleep(0.15)
+            in_flight -= 1
+            return DownloadModelResultSuccess(model_id="owner/repo", result_details="ok")
+
+        with (
+            patch.object(current_engine(), "handle_request", side_effect=_slow_download),
+            ThreadPoolExecutor(max_workers=2) as pool,
+        ):
+            futures = [pool.submit(manager.get_model_asset, library, "weights") for _ in range(2)]
+            paths = [future.result(timeout=30) for future in futures]
+
+        assert max(overlaps) == 1, f"two fetches overlapped in one directory: {overlaps}"
+        assert fetches == 1, f"expected a single download, got {fetches}"
+        assert len(set(paths)) == 1
 
 
 class TestHonestFailures:

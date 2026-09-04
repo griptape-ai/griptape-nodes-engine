@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import sysconfig
+import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -305,6 +306,11 @@ logger = logging.getLogger("griptape_nodes")
 
 # Directories to exclude when scanning for Python source files (in addition to any directory starting with '.')
 EXCLUDED_SCAN_DIRECTORIES = frozenset({"venv", "__pycache__"})
+
+# One in-flight fetch per model-asset directory. Module-level rather than per-manager because what
+# it guards is a directory on disk: two engines in one process resolving the same asset would
+# otherwise hold separate locks and race each other into it.
+_MODEL_ASSET_FETCH_LOCKS: dict[Path, threading.Lock] = {}
 
 TRegisteredEventData = TypeVar("TRegisteredEventData")
 
@@ -5246,32 +5252,50 @@ class LibraryManager(EngineScoped):
             )
             raise RuntimeError(msg)
 
-        logger.info(
-            "Fetching model asset '%s' for library '%s' from %s (revision %s)",
-            asset_id,
-            library_name,
-            reference,
-            asset.revision,
-        )
-        target.mkdir(parents=True, exist_ok=True)
-        result = self.engine.handle_request(
-            DownloadModelRequest(
-                model_id=reference,
-                local_dir=str(target),
-                revision=asset.revision,
-                allow_patterns=asset.files,
+        # Serialized per directory, and re-checked inside. Node execution is concurrent, so two
+        # nodes asking for one asset both passed the marker check above, both downloaded into the
+        # same directory, and the first to return marked it complete while the second was still
+        # writing -- after which every later call short-circuits on the marker and hands back a
+        # truncated model, which is the outcome the marker exists to prevent.
+        with self._model_asset_lock(target):
+            if complete_marker.exists():
+                logger.debug("Model asset '%s' for library '%s' was fetched while waiting", asset_id, library_name)
+                return target
+            logger.info(
+                "Fetching model asset '%s' for library '%s' from %s (revision %s)",
+                asset_id,
+                library_name,
+                reference,
+                asset.revision,
             )
-        )
-        if not isinstance(result, DownloadModelResultSuccess):
-            msg = (
-                f"Attempted to fetch model asset '{asset_id}' for library '{library_name}' from "
-                f"{reference}. Failed with: {result.result_details}"
+            target.mkdir(parents=True, exist_ok=True)
+            result = self.engine.handle_request(
+                DownloadModelRequest(
+                    model_id=reference,
+                    local_dir=str(target),
+                    revision=asset.revision,
+                    allow_patterns=asset.files,
+                )
             )
-            # isinstance here discriminates a result payload, the engine's universal idiom; the
-            # failure is a fetch failure, not a type error.
-            raise RuntimeError(msg)  # noqa: TRY004
-        complete_marker.touch()
+            if not isinstance(result, DownloadModelResultSuccess):
+                msg = (
+                    f"Attempted to fetch model asset '{asset_id}' for library '{library_name}' from "
+                    f"{reference}. Failed with: {result.result_details}"
+                )
+                # isinstance here discriminates a result payload, the engine's universal idiom; the
+                # failure is a fetch failure, not a type error.
+                raise RuntimeError(msg)  # noqa: TRY004
+            complete_marker.touch()
         return target
+
+    @staticmethod
+    def _model_asset_lock(target: Path) -> threading.Lock:
+        """The lock owning fetches into `target`, created on first ask.
+
+        `setdefault` needs no guard of its own: two callers may each build a Lock, but both receive
+        whichever one landed in the map.
+        """
+        return _MODEL_ASSET_FETCH_LOCKS.setdefault(target, threading.Lock())
 
     @staticmethod
     def _model_asset_path(library_name: str, asset_id: str, asset: ModelAsset) -> Path:
