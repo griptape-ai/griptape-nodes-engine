@@ -27,6 +27,7 @@ routing metadata.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from dataclasses import fields as dc_fields
@@ -163,6 +164,10 @@ class ActivateProjectRequest(RequestPayload, SkipTheLineMixin):
     """
 
     project_id: str
+    # Generation of the orchestrator's committed activation. The worker adopts strictly
+    # increasing generations only, which orders a switch fan-out against the registration
+    # reply deterministically -- the two arrive on different loops in arbitrary order.
+    generation: int = 0
 
 
 @dataclass
@@ -467,6 +472,14 @@ def register_broadcast_handlers(
             return RefreshSecretsResultFailure(result_details=details)
         return RefreshSecretsResultSuccess(result_details="Refreshed secrets from shared .env file.")
 
+    # Serializes adoptions against each other. The registration-reply adoption and a switch
+    # fan-out run as separate tasks on this loop, and without the lock an older activation can
+    # pass the staleness check, suspend at an await inside activation, and FINISH after a newer
+    # one -- leaving the worker on the older project while both replies report success. The
+    # staleness check must not be hoisted out of the lock: it reads the generation the previous
+    # holder records.
+    adoption_lock = asyncio.Lock()
+
     async def handle_activate_project(request: ActivateProjectRequest) -> ResultPayload:
         # A ReloadConfigRequest may land concurrently: a post-init orchestrator switch
         # persists project_file, which emits ConfigChanged -> ReloadConfigRequest to every
@@ -482,25 +495,34 @@ def register_broadcast_handlers(
         # the shared config and re-run registered-project discovery (engine-style) so the
         # worker learns it. Fail loud if the id is still unknown -- silently landing on a
         # stale project while reporting success is exactly the divergence we must avoid.
-        if not await project_manager.ensure_project_loaded(request.project_id):
-            details = (
-                f"Attempted to adopt orchestrator project '{request.project_id}'. "
-                f"Failed because the id is absent from the worker's registry even after "
-                f"reloading config and re-running registered-project discovery."
-            )
-            logger.error(details)
-            return ActivateProjectResultFailure(result_details=details)
+        async with adoption_lock:
+            if project_manager.is_stale_adoption(request.project_id, request.generation):
+                return ActivateProjectResultSuccess(
+                    result_details=(
+                        f"Skipped adopting project '{request.project_id}' (generation "
+                        f"{request.generation}): a newer activation was already adopted."
+                    )
+                )
+            if not await project_manager.ensure_project_loaded(request.project_id):
+                details = (
+                    f"Attempted to adopt orchestrator project '{request.project_id}'. "
+                    f"Failed because the id is absent from the worker's registry even after "
+                    f"reloading config and re-running registered-project discovery."
+                )
+                logger.error(details)
+                return ActivateProjectResultFailure(result_details=details)
 
-        set_result = await project_manager.on_set_current_project_request(
-            SetCurrentProjectRequest(project_id=request.project_id)
-        )
-        if set_result.failed():
-            details = (
-                f"Attempted to adopt orchestrator project '{request.project_id}'. "
-                f"Failed with result: {set_result.result_details}"
+            set_result = await project_manager.on_set_current_project_request(
+                SetCurrentProjectRequest(project_id=request.project_id)
             )
-            logger.error(details)
-            return ActivateProjectResultFailure(result_details=details)
+            if set_result.failed():
+                details = (
+                    f"Attempted to adopt orchestrator project '{request.project_id}'. "
+                    f"Failed with result: {set_result.result_details}"
+                )
+                logger.error(details)
+                return ActivateProjectResultFailure(result_details=details)
+            project_manager.record_adopted_generation(request.generation)
         return ActivateProjectResultSuccess(result_details=f"Adopted project from orchestrator: {request.project_id}.")
 
     event_manager.assign_manager_to_request_type(ReloadConfigRequest, handle_reload_config)

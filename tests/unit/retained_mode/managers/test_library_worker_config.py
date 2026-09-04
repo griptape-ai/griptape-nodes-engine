@@ -300,7 +300,7 @@ class TestExecuteWaitsForTheWorkerLibraryLoad:
         order: list[str] = []
 
         async def executes() -> None:
-            await mgr.wait_for_worker_library_load("Lib")
+            await mgr.wait_for_worker_ready("Lib")
             order.append("routed")
 
         async def worker_finishes_loading() -> None:
@@ -316,7 +316,7 @@ class TestExecuteWaitsForTheWorkerLibraryLoad:
         mgr = _make_library_manager()
         mgr._library_file_path_to_info["/some/path.json"] = self._spawned_info(loaded=True)
 
-        await mgr.wait_for_worker_library_load("Lib")
+        await mgr.wait_for_worker_ready("Lib")
 
     @pytest.mark.asyncio
     async def test_a_library_with_no_spawned_worker_does_not_wait(self) -> None:
@@ -325,7 +325,7 @@ class TestExecuteWaitsForTheWorkerLibraryLoad:
         info.worker_ready = None
         mgr._library_file_path_to_info["/some/path.json"] = info
 
-        await mgr.wait_for_worker_library_load("Lib")
+        await mgr.wait_for_worker_ready("Lib")
 
     @pytest.mark.asyncio
     async def test_the_timeout_names_the_library_and_the_ceiling(self) -> None:
@@ -335,7 +335,7 @@ class TestExecuteWaitsForTheWorkerLibraryLoad:
         mgr._engine.config_manager.get_config_value.return_value = 0.01
 
         with pytest.raises(RuntimeError, match="Lib"):
-            await mgr.wait_for_worker_library_load("Lib")
+            await mgr.wait_for_worker_ready("Lib")
 
     @pytest.mark.asyncio
     async def test_an_eviction_during_the_wait_releases_it(self) -> None:
@@ -343,10 +343,14 @@ class TestExecuteWaitsForTheWorkerLibraryLoad:
         mgr = _make_library_manager()
         info = self._spawned_info(loaded=False)
         mgr._library_file_path_to_info["/some/path.json"] = info
+        # A grace long enough that only the eviction can end the wait -- the point of the test is
+        # that the waiter is released early, not that it survives to the ceiling.
+        mgr._engine = MagicMock()  # type: ignore[assignment]
+        mgr._engine.config_manager.get_config_value.return_value = 30.0
         order: list[str] = []
 
         async def executes() -> None:
-            await mgr.wait_for_worker_library_load("Lib")
+            await mgr.wait_for_worker_ready("Lib")
             order.append("released")
 
         async def worker_dies() -> None:
@@ -424,6 +428,8 @@ class TestSpawnSkipForUnmetRequirements:
         manager = _make_library_manager()
         manager._engine = MagicMock()  # type: ignore[assignment]
         manager._engine.ahandle_request = AsyncMock()  # type: ignore[union-attr]
+        # No worker registered yet, which is what makes this a first spawn rather than a restart.
+        manager._engine.worker_manager.get_worker_for_key.return_value = None  # type: ignore[union-attr]
         info = LibraryManager.LibraryInfo(
             lifecycle_state=LibraryManager.LibraryLifecycleState.LOADED,
             fitness=LibraryManager.LibraryFitness.GOOD,
@@ -453,6 +459,26 @@ class TestSpawnSkipForUnmetRequirements:
         cast("MagicMock", manager._engine).ahandle_request.assert_not_awaited()
         info = manager._library_file_path_to_info["/some/path.json"]
         assert info.execution_unavailable_reason is not None, "the local refusal must survive"
+
+    @pytest.mark.asyncio
+    async def test_a_library_whose_worker_is_registered_keeps_its_readiness(self) -> None:
+        """_start_workers runs again per session join, and spawn_worker refuses the duplicate.
+
+        Replacing worker_ready here would leave nothing to set it, so every later run on a live,
+        loaded worker would wait out the whole startup grace and then blame its library load.
+        """
+        manager = self._manager(requires_worker=False, unmet=False)
+        cast("MagicMock", manager._engine).worker_manager.get_worker_for_key.return_value = ("w-1", "t/w-1")
+        info = manager._library_file_path_to_info["/some/path.json"]
+        already_ready = asyncio.Event()
+        already_ready.set()
+        info.worker_ready = already_ready
+
+        await manager._start_workers()
+
+        cast("MagicMock", manager._engine).ahandle_request.assert_not_awaited()
+        assert info.worker_ready is already_ready
+        assert info.worker_ready.is_set()
 
     @pytest.mark.asyncio
     async def test_legacy_worker_library_still_spawns_even_when_unmet(self) -> None:

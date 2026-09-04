@@ -554,9 +554,11 @@ class LibraryManager(EngineScoped):
         # exist so it can be handed over as PYTHONPATH before the worker imports anything.
         execution_env_ready: asyncio.Event | None = field(default=None, repr=False)
 
-        # The in-flight build itself. Held so the event loop's weak reference to tasks cannot
-        # collect an install mid-download.
-        execution_env_task: asyncio.Task | None = field(default=None, repr=False)
+        # Why the last `.venv-exec` build failed; None while a build is in flight or after one
+        # succeeds. Deliberately separate from execution_unavailable_reason, which _start_workers
+        # clears before every spawn attempt -- the spawn refusal reads THIS field after waiting
+        # for the build, so a pre-session failure must survive that clearing.
+        execution_env_failure: str | None = None
 
     class RegisterLibraryPrerequisites(NamedTuple):
         """Prerequisites established for library loading."""
@@ -628,7 +630,7 @@ class LibraryManager(EngineScoped):
     # Callbacks invoked immediately before all libraries are reloaded.
     _pre_reload_callbacks: list[Callable[[], Awaitable[None]]]
 
-    def __init__(
+    def __init__(  # noqa: PLR0915
         self, event_manager: EventManager, *, worker_manager: WorkerManager, engine: Engine | None = None
     ) -> None:
         super().__init__(engine)
@@ -667,6 +669,14 @@ class LibraryManager(EngineScoped):
         self._is_worker: bool = False
         # The libraries this process is restricted to loading (set on workers).
         self._target_library_names: list[str] | None = None
+        # In-flight `.venv-exec` builds, keyed by the venv directory they write. Manager-level
+        # rather than on LibraryInfo because the single-writer guarantee is per DIRECTORY: a full
+        # reload deletes and recreates the LibraryInfo while a multi-minute build keeps
+        # installing, and a handle stored on the old info would be unreachable exactly when the
+        # replacement registration needs to cancel it. Entries are left behind when a build
+        # finishes (done tasks are skipped); this also keeps a strong reference so the event
+        # loop cannot garbage-collect an install mid-download.
+        self._execution_env_builds: dict[str, asyncio.Task] = {}
 
         event_manager.assign_manager_to_request_type(
             ListRegisteredLibrariesRequest, self.on_list_registered_libraries_request
@@ -831,12 +841,72 @@ class LibraryManager(EngineScoped):
         immediately for a library with no execution dependencies, and after a failed build too: the
         reason is recorded, and refusing to spawn is decided by the caller.
         """
+        while True:
+            library_info = self.get_library_info_by_library_name(library_name)
+            if library_info is None or library_info.execution_env_ready is None:
+                return
+            ready_event = library_info.execution_env_ready
+            if not ready_event.is_set():
+                logger.info("Waiting for library '%s' execution environment before starting its worker", library_name)
+            await ready_event.wait()
+            if library_info.execution_env_ready is ready_event:
+                return
+            # A reload or project switch re-ran registration while we waited, so what released
+            # us was the superseded build (each build sets only its own event). Loop and wait
+            # on the replacement's.
+
+    async def wait_for_worker_ready(self, library_name: str) -> None:
+        """Block until the worker expected to serve this library has confirmed loading it.
+
+        A worker registers BEFORE it loads libraries -- registration is what carries the
+        orchestrator's project to it, and the project decides how libraries load -- so execution
+        routing sees a registered worker whose library may not be loaded yet, and forwarding into
+        that window fails node creation on the worker. Cannot hang: the event is set on every
+        terminal outcome (library loaded, spawn refused, spawn died, worker evicted), and
+        `get_worker_for_library` reports the failure reason afterward. Returns immediately for a
+        library with no spawn scheduled.
+        """
         library_info = self.get_library_info_by_library_name(library_name)
-        if library_info is None or library_info.execution_env_ready is None:
+        if library_info is None or library_info.worker_ready is None or library_info.worker_ready.is_set():
             return
-        if not library_info.execution_env_ready.is_set():
-            logger.info("Waiting for library '%s' execution environment before starting its worker", library_name)
-        await library_info.execution_env_ready.wait()
+
+        config_mgr = self.engine.config_manager
+        wait_seconds = config_mgr.get_config_value(WORKER_HEARTBEAT_STARTUP_GRACE_KEY, default=600.0, cast_type=float)
+        logger.info("Waiting for library '%s''s worker to finish loading before executing", library_name)
+        # Bounded even though every terminal outcome sets the event: "every" is a claim about code
+        # that will keep changing, and the cost of it being wrong once is a node that hangs forever
+        # with no diagnosis. A named timeout is a bug report; an unbounded wait is a mystery.
+        try:
+            with anyio.fail_after(wait_seconds):
+                await library_info.worker_ready.wait()
+        except TimeoutError:
+            msg = (
+                f"Attempted to run a node from library '{library_name}'. Failed because its worker "
+                f"process did not finish loading the library within {wait_seconds:.0f} seconds."
+            )
+            raise RuntimeError(msg) from None
+
+    def execution_env_failure_reason(self, library_name: str) -> str | None:
+        """Why this library's execution environment cannot be used, or None when it can.
+
+        Read by the spawn path after waiting for the build: a failed build records its reason and
+        leaves the venv directory behind, so directory existence alone says nothing. Spawning a
+        worker whose PYTHONPATH fronts a partial or stale site-packages would trade the recorded
+        uv error for a raw ModuleNotFoundError deep inside library load.
+        """
+        library_info = self.get_library_info_by_library_name(library_name)
+        if library_info is None:
+            return f"library '{library_name}' is not registered here."
+        if library_info.execution_env_failure is not None:
+            return library_info.execution_env_failure
+        # The edit-time install failing is just as disqualifying: the exec build resolves both
+        # sets together, but registration stops before scheduling it when the edit set fails,
+        # leaving only this marker behind.
+        if any(isinstance(problem, DependencyInstallationFailedProblem) for problem in library_info.problems):
+            return library_info.execution_unavailable_reason or (
+                f"the execution environment build for library '{library_name}' failed; details are in the engine log."
+            )
+        return None
 
     def execution_site_packages(self, library_name: str) -> str | None:
         """The library's execution site-packages directory, if it has been built.
@@ -848,8 +918,8 @@ class LibraryManager(EngineScoped):
         how a library that ships `safetensors` still hit `NameError: name 'safetensors' is not
         defined` from inside huggingface_hub.
 
-        Returns None when the library declares no execution dependencies, or when the build failed
-        -- spawn waits for the build, so a healthy library always has one by the time it is asked.
+        Returns None when the directory does not exist. A failed build leaves it behind, so
+        callers must consult `execution_env_failure_reason` before treating a path as usable.
         """
         library_info = self.get_library_info_by_library_name(library_name)
         if library_info is None:
@@ -898,37 +968,6 @@ class LibraryManager(EngineScoped):
                 raise RuntimeError(msg)
         return None
 
-    async def wait_for_worker_library_load(self, library_name: str) -> None:
-        """Block until this library's worker has reported the library fully loaded, if one is expected.
-
-        A worker registers with the orchestrator at process start, BEFORE it has loaded its
-        library -- so a node executed in that window would reach a worker that cannot create
-        it yet. The worker's LibraryLoadedNotification is what "loaded" means, exactly as it
-        did for legacy worker-mode libraries; this waits for it, bounded by the same startup
-        grace the boot-time wait uses. Returns immediately for a library with no spawned
-        worker. An eviction during the wait also releases it: the reason is recorded, and
-        get_worker_for_library reports it to the caller.
-
-        Raises:
-            RuntimeError: If the worker did not report the library loaded within the grace
-                period.
-        """
-        library_info = self.get_library_info_by_library_name(library_name)
-        if library_info is None or library_info.worker_ready is None or library_info.worker_ready.is_set():
-            return
-        config_mgr = self.engine.config_manager
-        wait_seconds = config_mgr.get_config_value(WORKER_HEARTBEAT_STARTUP_GRACE_KEY, default=600.0, cast_type=float)
-        logger.info("Waiting for library '%s' to finish loading in its worker before running the node", library_name)
-        try:
-            with anyio.fail_after(wait_seconds):
-                await library_info.worker_ready.wait()
-        except TimeoutError:
-            msg = (
-                f"Attempted to run a node from library '{library_name}'. Failed because its worker "
-                f"process did not finish loading the library within {wait_seconds:.0f} seconds."
-            )
-            raise RuntimeError(msg) from None
-
     async def _start_workers(self) -> None:
         """Issue StartWorkerRequest for every library that requires a dedicated worker.
 
@@ -962,7 +1001,8 @@ class LibraryManager(EngineScoped):
                 # placeholder nodes in any workflow using it. It still cannot execute, because the
                 # reset below preserves its refusal.
                 has_unmet_requirement = any(
-                    isinstance(problem, IncompatibleRequirementsProblem) for problem in library_info.problems
+                    isinstance(problem, (IncompatibleRequirementsProblem, DependencyInstallationFailedProblem))
+                    for problem in library_info.problems
                 )
                 if has_unmet_requirement and not library_info.requires_worker:
                     logger.info(
@@ -971,18 +1011,27 @@ class LibraryManager(EngineScoped):
                         library_info.execution_unavailable_reason,
                     )
                     continue
+                # A worker already serving this library makes the whole block below wrong, not
+                # merely redundant: spawn_worker refuses the duplicate without raising, so the
+                # reset event below would never be set again and every later run would wait out
+                # the startup grace against a live, loaded worker. Reached whenever _start_workers
+                # runs twice for one session -- a second GUI client joining is enough.
+                if self.engine.worker_manager.get_worker_for_key(library_info.library_name) is not None:
+                    logger.debug(
+                        "Not restarting a worker for library '%s': one is already registered.",
+                        library_info.library_name,
+                    )
+                    continue
                 # Legacy worker-mode libraries load AS the worker confirms (stubs meanwhile),
                 # so their lifecycle gates on the spawn. Exec-deps libraries loaded real
                 # nodes locally already: the worker gates execution availability only, and
                 # registration must not block on it.
                 if library_info.requires_worker:
                     library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.WORKER_PENDING
-                # Create (or reset) the worker_ready event for this spawn -- for EVERY spawned
-                # worker, not only legacy ones. A worker registers with the orchestrator at
-                # process start, BEFORE it has loaded its library, so registration alone cannot
-                # gate execution: a node routed in that window fails in the worker with
-                # "Library not found". This event is set by the worker's LibraryLoadedNotification,
-                # and the execute path waits on it (wait_for_worker_library_load).
+                # Create (or reset) the worker_ready event for this spawn. Every spawn gets
+                # one: a worker registers BEFORE it loads libraries, so execution routing
+                # waits on this to keep a run from racing the worker's library load. Only
+                # WORKER_PENDING (legacy) libraries block boot on it in _await_pending_workers.
                 library_info.worker_ready = asyncio.Event()
                 # A fresh attempt, so an account of a PREVIOUS one no longer describes the
                 # situation. Not conditioned on the result: StartWorkerRequest only SCHEDULES the
@@ -1009,12 +1058,6 @@ class LibraryManager(EngineScoped):
         library_info = self.get_library_info_by_library_name(library_name)
         if library_info is None:
             return
-        # Unblock any code awaiting this library's worker_ready event, whatever the
-        # lifecycle: an exec-deps library stays LOADED through an eviction, and a waiter
-        # on the execute path would otherwise hold on for the full grace period for a
-        # worker that is already gone.
-        if library_info.worker_ready is not None:
-            library_info.worker_ready.set()
         # Record WHY execution stopped being possible, for every library that routes execution
         # to a worker. Nothing respawns an evicted worker, so without this the next run reports
         # that the worker "may still be starting up" -- for the rest of the session.
@@ -1022,6 +1065,15 @@ class LibraryManager(EngineScoped):
             library_info.execution_unavailable_reason = (
                 "the worker process that runs it stopped responding and was shut down."
             )
+
+        # Release any waiter regardless of lifecycle state. Eviction is terminal -- nothing
+        # respawns the worker -- so a waiter that keeps waiting waits forever. This has to sit
+        # OUTSIDE the WORKER_PENDING branch below: an exec-dependencies library is LOADED, because
+        # its real node classes were imported on the orchestrator before any worker existed, so
+        # the branch never fires for exactly the libraries whose execution just died. The reason
+        # recorded above is what the next run reports instead.
+        if library_info.worker_ready is not None:
+            library_info.worker_ready.set()
 
         if library_info.lifecycle_state == LibraryManager.LibraryLifecycleState.WORKER_PENDING:
             library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.FAILURE
@@ -2780,6 +2832,15 @@ class LibraryManager(EngineScoped):
                             self._library_file_path_to_info[library_info.library_path] = library_info
                             return RegisterLibraryFromFileResultFailure(result_details=install_result.result_details)
 
+                        # Cleared on success for the same LibraryInfo-is-preserved reason the
+                        # failure branch replaces rather than appends: a marker left over from a
+                        # transient failure would keep refusing this library's worker spawns for
+                        # every later session, reporting a problem that no longer exists.
+                        library_info.problems = [
+                            problem
+                            for problem in library_info.problems
+                            if not isinstance(problem, DependencyInstallationFailedProblem)
+                        ]
                         library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.DEPENDENCIES_INSTALLED
 
                 case (
@@ -4813,10 +4874,9 @@ class LibraryManager(EngineScoped):
         the orchestrator ceiling stays aligned with the worker self-timeout; first-time
         installs of large libraries can easily exceed the default heartbeat timeout.
         """
-        # Only legacy WORKER_PENDING libraries gate BOOT: their nodes arrive as stubs from
-        # the worker, so nothing exists until it reports. An exec-deps library has real node
-        # classes locally and its worker gates execution only -- blocking startup on its
-        # worker's heavy imports would put torch back on the boot path.
+        # WORKER_PENDING only, matching the timeout loop below: exec-deps libraries also carry
+        # a worker_ready event (execution routing waits on it), but their nodes loaded locally
+        # already and boot must not block on their workers.
         pending_events = [
             info.worker_ready
             for info in self._library_file_path_to_info.values()
@@ -4849,6 +4909,11 @@ class LibraryManager(EngineScoped):
                 ):
                     info.lifecycle_state = LibraryManager.LibraryLifecycleState.FAILURE
                     info.fitness = LibraryManager.LibraryFitness.UNUSABLE
+                    # Released waiters need the reason too, or the next run falls through to
+                    # "the worker may still be starting up" for a worker already given up on.
+                    info.execution_unavailable_reason = (
+                        f"its worker process did not report a library load within {wait_seconds} seconds."
+                    )
                     info.worker_ready.set()
                     logger.warning(
                         "Worker for library '%s' timed out after %s seconds; marked as FAILURE.",
@@ -7679,14 +7744,12 @@ class LibraryManager(EngineScoped):
         if not self._is_worker and pip_dependencies_exec:
             library_info = self.get_library_info_by_library_name(library_name)
             if library_info is not None:
-                library_info.execution_env_ready = asyncio.Event()
-                library_info.execution_env_task = asyncio.create_task(
-                    self._build_execution_env(
-                        library_info=library_info,
-                        pip_dependencies=pip_dependencies,
-                        pip_dependencies_exec=pip_dependencies_exec,
-                        pip_install_flags=pip_install_flags,
-                    )
+                await self._replace_execution_env_build(
+                    library_name=library_name,
+                    library_info=library_info,
+                    pip_dependencies=pip_dependencies,
+                    pip_dependencies_exec=pip_dependencies_exec,
+                    pip_install_flags=pip_install_flags,
                 )
                 installed_exec_count = len(pip_dependencies_exec)
 
@@ -7732,9 +7795,13 @@ class LibraryManager(EngineScoped):
         if installed_total == 0:
             return f"Library '{library_name}' has no dependencies to install"
         if installed_exec:
+            # "building": the execution environment is scheduled as a background task at this
+            # point, not finished -- a torch install runs for minutes and can still fail. Saying
+            # "installed" here claimed an outcome nobody had yet.
             return (
-                f"Installed {installed_edit} edit-time and {installed_exec} execution "
-                f"dependencies for library '{library_name}'"
+                f"Installed {installed_edit} edit-time dependencies for library "
+                f"'{library_name}'; building its execution environment ({installed_exec} "
+                f"dependencies) in the background"
             )
         if declared_exec:
             return (
@@ -7809,6 +7876,67 @@ class LibraryManager(EngineScoped):
             return False
         return library_info.requires_worker
 
+    async def _replace_execution_env_build(
+        self,
+        *,
+        library_name: str,
+        library_info: LibraryInfo,
+        pip_dependencies: list[str],
+        pip_dependencies_exec: list[str],
+        pip_install_flags: list[str],
+    ) -> None:
+        """Take down any in-flight `.venv-exec` build for this library, then schedule a new one.
+
+        One writer per venv directory. A reload or project switch re-runs registration while a
+        previous multi-minute build may still be installing into the same path, and the recovery
+        path inside the build can rmtree the directory out from under the other writer. The
+        handle comes from a manager-level map keyed by the directory, because that is the level
+        the guarantee lives at: a reload recreates the LibraryInfo, and the orphaned build must
+        still be findable by the registration that replaces it.
+
+        The replacement event goes up BEFORE the cancel. A build sets only its own event, so a
+        spawn released by the superseded build's finally re-checks, finds this newer unset
+        event, and parks again -- instead of spawning into the gap while the replacement is
+        still installing.
+        """
+        venv_key = str(self._get_library_venv_path(library_name, library_info.library_path, execution=True))
+        ready_event = asyncio.Event()
+        library_info.execution_env_ready = ready_event
+        library_info.execution_env_failure = None
+        # Re-read after every await: this task suspends there, and a concurrent registration
+        # for the same library can schedule its own build meanwhile. Whoever reaches the map
+        # assignment last owns the directory; every build found on the way gets taken down
+        # first.
+        while True:
+            previous_build = self._execution_env_builds.get(venv_key)
+            if previous_build is None or previous_build.done():
+                break
+            previous_build.cancel()
+            try:
+                await previous_build
+            except asyncio.CancelledError:
+                # The superseded build's CancelledError propagates through this await; only a
+                # cancellation aimed at THIS task means registration itself is being cancelled.
+                # Then no replacement build is coming, so release anything parked on the event
+                # just installed, with the reason recorded.
+                task = asyncio.current_task()
+                if task is not None and task.cancelling() > 0:
+                    library_info.execution_env_failure = (
+                        f"registration of library '{library_name}' was cancelled before "
+                        "its execution environment could be rebuilt."
+                    )
+                    ready_event.set()
+                    raise
+        self._execution_env_builds[venv_key] = asyncio.create_task(
+            self._build_execution_env(
+                library_info=library_info,
+                pip_dependencies=pip_dependencies,
+                pip_dependencies_exec=pip_dependencies_exec,
+                pip_install_flags=pip_install_flags,
+                ready_event=ready_event,
+            )
+        )
+
     async def _build_execution_env(
         self,
         *,
@@ -7816,6 +7944,7 @@ class LibraryManager(EngineScoped):
         pip_dependencies: list[str],
         pip_dependencies_exec: list[str],
         pip_install_flags: list[str],
+        ready_event: asyncio.Event,
     ) -> None:
         """Build a library's `.venv-exec`, then release anything waiting to spawn its worker.
 
@@ -7827,17 +7956,27 @@ class LibraryManager(EngineScoped):
 
         A failure costs execution and nothing else: the library keeps its real node classes on the
         orchestrator and stays editable, and the reason is recorded so the refusal can say why.
+
+        `ready_event` is THIS build's event, passed in rather than read off library_info: by the
+        time a superseded build is cancelled, library_info already points at its replacement's
+        event, and setting that one would release spawns before the replacement finished.
         """
         try:
             library_name = library_info.library_name or "unknown"
-            failure = await self._install_dependency_set(
-                library_name=library_name,
-                library_file_path=library_info.library_path,
-                pip_dependencies=[*pip_dependencies, *pip_dependencies_exec],
-                pip_install_flags=pip_install_flags,
-                execution=True,
-            )
+            try:
+                failure = await self._install_dependency_set(
+                    library_name=library_name,
+                    library_file_path=library_info.library_path,
+                    pip_dependencies=[*pip_dependencies, *pip_dependencies_exec],
+                    pip_install_flags=pip_install_flags,
+                    execution=True,
+                )
+            # Broad by necessity: nothing retrieves this background task's exception, and an
+            # escaping one would open the spawn gate with no failure recorded.
+            except Exception as e:
+                failure = f"the execution environment build for library '{library_name}' stopped unexpectedly ({e})."
             if failure is not None:
+                library_info.execution_env_failure = failure
                 library_info.execution_unavailable_reason = failure
                 logger.error(
                     "Library '%s' cannot run: its execution environment could not be built. %s",
@@ -7847,8 +7986,7 @@ class LibraryManager(EngineScoped):
         finally:
             # Released on every path, including failure: a waiter that never wakes would hold the
             # spawn loop open for a library that is never going to be runnable.
-            if library_info.execution_env_ready is not None:
-                library_info.execution_env_ready.set()
+            ready_event.set()
 
     async def _install_dependency_set(  # noqa: PLR0911
         self,

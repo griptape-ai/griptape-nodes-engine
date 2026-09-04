@@ -983,7 +983,8 @@ class TestExecutionEnvironmentResolvesBothSets:
     async def test_the_execution_install_receives_the_union_of_both_sets(self, engine: Engine) -> None:
         mgr = engine.library_manager
         lib_info = _make_lib_info()
-        lib_info.execution_env_ready = asyncio.Event()
+        ready_event = asyncio.Event()
+        lib_info.execution_env_ready = ready_event
 
         with patch.object(mgr, "_install_dependency_set", new=AsyncMock(return_value=None)) as install:
             await mgr._build_execution_env(
@@ -991,6 +992,7 @@ class TestExecutionEnvironmentResolvesBothSets:
                 pip_dependencies=["fakeedit", "numpy"],
                 pip_dependencies_exec=["faketorch"],
                 pip_install_flags=["--no-index"],
+                ready_event=ready_event,
             )
 
         kwargs = install.call_args.kwargs
@@ -1003,7 +1005,8 @@ class TestExecutionEnvironmentResolvesBothSets:
         """Spawn waits on this event, so a build that never releases it holds the loop open."""
         mgr = engine.library_manager
         lib_info = _make_lib_info()
-        lib_info.execution_env_ready = asyncio.Event()
+        ready_event = asyncio.Event()
+        lib_info.execution_env_ready = ready_event
 
         with patch.object(mgr, "_install_dependency_set", new=AsyncMock(return_value="no solution found")):
             await mgr._build_execution_env(
@@ -1011,7 +1014,10 @@ class TestExecutionEnvironmentResolvesBothSets:
                 pip_dependencies=["fakeedit"],
                 pip_dependencies_exec=["faketorch"],
                 pip_install_flags=[],
+                ready_event=ready_event,
             )
 
-        assert lib_info.execution_env_ready.is_set()
+        assert ready_event.is_set()
+        # Both: the refusal to spawn reads execution_env_failure, the next run reports the other.
+        assert lib_info.execution_env_failure == "no solution found"
         assert lib_info.execution_unavailable_reason == "no solution found"
