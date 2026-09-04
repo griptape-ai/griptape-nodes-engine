@@ -2911,6 +2911,12 @@ class ProjectManager(EngineScoped):
                 )
         if workspace_changed:
             await self.engine.workflow_manager.refresh_workflow_registry()
+            # The rescan above rebuilds what it found in the workspace; library-owned entries
+            # survive it by design and so keep keys derived against the old workspace. Skipped
+            # when libraries reloaded, because unloading and loading each library already
+            # rebuilt those keys against the workspace as it is now.
+            if not library_config_changed:
+                await self.engine.library_manager.rekey_workflows_for_all_libraries()
         return None
 
     def _project_checkpoint_attributes(self, project_id: ProjectID, *, name: str | None = None) -> dict[str, Any]:

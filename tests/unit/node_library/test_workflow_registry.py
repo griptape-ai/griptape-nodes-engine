@@ -14,6 +14,8 @@ from griptape_nodes.files.path_utils import derive_registry_key
 from griptape_nodes.node_library.workflow_registry import Workflow, WorkflowRegistry
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from griptape_nodes.retained_mode.engine import Engine
 
 
@@ -251,6 +253,89 @@ class TestWorkflowRegistryOperations:
             pytest.raises(ValueError, match="requires a file_path"),
         ):
             WorkflowRegistry.generate_new_workflow(registry_key="my_workflow", metadata=mock_metadata)
+
+
+class TestWorkflowOwnership:
+    """Which library contributed a workflow, recorded when it is registered.
+
+    The registry holds two populations with different lifetimes: what the workspace scan found,
+    which goes away when the workspace changes, and what a library contributed, which goes away
+    when that library unloads. Recording the owner on write is what tells them apart -- the
+    metadata header cannot, because an author sets those flags and they survive the file being
+    copied out of the library into the workspace.
+    """
+
+    def _register(self, registry_key: str, library_name: str | None) -> None:
+        WorkflowRegistry.generate_new_workflow(
+            registry_key=registry_key,
+            metadata=MagicMock(),
+            file_path=f"{registry_key}.py",
+            library_name=library_name,
+        )
+
+    @pytest.fixture(autouse=True)
+    def _empty_registry(self) -> Iterator[None]:
+        with (
+            patch.dict(WorkflowRegistry._workflows, {}, clear=True),
+            patch.object(WorkflowRegistry, "get_complete_file_path", return_value="/workspace/my_workflow.py"),
+            patch.object(Path, "is_file", return_value=True),
+        ):
+            yield
+
+    def test_records_the_contributing_library(self) -> None:
+        self._register("lib_workflow", library_name="MyLib")
+
+        assert WorkflowRegistry.get_workflow_by_name("lib_workflow").library_name == "MyLib"
+
+    def test_a_workflow_registered_without_a_library_has_no_owner(self) -> None:
+        self._register("user_workflow", library_name=None)
+
+        assert WorkflowRegistry.get_workflow_by_name("user_workflow").library_name is None
+
+    def test_clear_scanned_workflows_keeps_library_workflows(self) -> None:
+        self._register("user_workflow", library_name=None)
+        self._register("lib_workflow", library_name="MyLib")
+
+        WorkflowRegistry.clear_scanned_workflows()
+
+        assert list(WorkflowRegistry._workflows) == ["lib_workflow"]
+
+    def test_clear_scanned_workflows_ignores_the_template_flags(self) -> None:
+        """A rescan must not decide ownership from the header.
+
+        A workflow flagged `is_griptape_provided` that no library contributed -- a template the
+        user copied into their workspace, most likely -- is the user's, and a rescan finds it
+        again. The old rule spared it, so the copy accumulated in the registry under a key the
+        rescan then registered a second time.
+        """
+        griptape_provided_metadata = MagicMock()
+        griptape_provided_metadata.is_griptape_provided = True
+        griptape_provided_metadata.is_template = True
+        WorkflowRegistry.generate_new_workflow(
+            registry_key="copied_template",
+            metadata=griptape_provided_metadata,
+            file_path="copied_template.py",
+        )
+
+        WorkflowRegistry.clear_scanned_workflows()
+
+        assert list(WorkflowRegistry._workflows) == []
+
+    def test_remove_workflows_from_library_takes_only_its_own_entries(self) -> None:
+        self._register("user_workflow", library_name=None)
+        self._register("mine", library_name="MyLib")
+        self._register("theirs", library_name="OtherLib")
+
+        removed = WorkflowRegistry.remove_workflows_from_library("MyLib")
+
+        assert removed == ["mine"]
+        assert sorted(WorkflowRegistry._workflows) == ["theirs", "user_workflow"]
+
+    def test_remove_workflows_from_library_reports_nothing_for_a_library_with_none(self) -> None:
+        self._register("user_workflow", library_name=None)
+
+        assert WorkflowRegistry.remove_workflows_from_library("MyLib") == []
+        assert list(WorkflowRegistry._workflows) == ["user_workflow"]
 
 
 class TestGetWorkflowMetadata:
