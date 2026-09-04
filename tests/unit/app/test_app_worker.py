@@ -45,9 +45,10 @@ class _FakeRequestClient:
     async def track_request(
         self, request_id: str, tag: str = "", *, resolve_failures_as_payload: bool = False
     ) -> asyncio.Future:
-        future: asyncio.Future = asyncio.Future()
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
         self._pending_requests[request_id] = _PendingRequest(
-            future, tag, resolve_failures_as_payload=resolve_failures_as_payload
+            future, tag, loop, resolve_failures_as_payload=resolve_failures_as_payload
         )
         return future
 
