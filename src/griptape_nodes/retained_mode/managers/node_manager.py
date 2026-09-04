@@ -3417,7 +3417,7 @@ class NodeManager(EngineScoped):
             # only inside aprocess. Worker-only: on the orchestrator route this process already
             # owns the context it just sent, and re-adopting it would be writing over the top of
             # its own stack.
-            if self.engine.library_manager.is_worker and request.workflow_name is not None:
+            if self.engine.library_manager.is_worker:
                 self.engine.context_manager.mirror_workflow_context(
                     request.workflow_name,
                     request.workflow_file_path,

@@ -482,15 +482,8 @@ class ContextManager(EngineScoped):
                 raise ValueError(msg) from e
         return self.ElementContext(self, element)
 
-    def mirror_workflow_context(self, name: str, file_path: str | None, working_directory: str | None) -> None:
+    def mirror_workflow_context(self, name: str | None, file_path: str | None, working_directory: str | None) -> None:
         """Adopt another engine's workflow context as this engine's own.
-
-        A worker never pushes this stack -- `push_workflow` is called on the orchestrator's run
-        path and nowhere else -- so every workflow question answers "there isn't one". That is not
-        loud: `workflow_dir` raises, the default `{outputs}` situation marks the reference optional
-        (`{workflow_dir?:/}outputs`), the raise is swallowed, and the path degrades from the
-        workflow's own folder to a workspace-relative one. The worker writes real files where the
-        orchestrator does not read, with no error at the divergence.
 
         A real stack entry rather than an override of the getters, because `has_current_workflow()`
         answers two questions at once -- "is identity resolvable" and "is there an entry to index"
@@ -498,11 +491,17 @@ class ContextManager(EngineScoped):
         `pop_flow`, and the context setters.
 
         Idempotent and never popped: this MIRRORS a peer's context rather than nesting under it, so
-        one entry is replaced in place. That is what keeps it safe while a worker runs nodes
-        concurrently -- there is no push/pop pair whose ordering could interleave, and concurrent
-        executions from one orchestrator carry the same workflow, so they reconcile to the same
-        value.
+        one entry is replaced in place. There is no push/pop pair whose ordering could interleave
+        while a worker runs nodes concurrently.
         """
+        if name is None:
+            # The peer has no workflow, so this engine must have none either. A mirror left from an
+            # earlier execution would resolve paths against that workflow's folder while the peer
+            # resolves them workspace-relative -- the divergence this mirror exists to prevent,
+            # reached from the other direction. Only a mirror is ever on a worker's stack.
+            self._workflow_stack.clear()
+            return
+
         state = self.WorkflowContextState(name=name, file_path=file_path, working_directory=working_directory)
         if not self._workflow_stack:
             self._workflow_stack.append(state)

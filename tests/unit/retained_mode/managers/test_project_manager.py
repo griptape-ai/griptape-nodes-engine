@@ -778,17 +778,34 @@ class TestProjectManagerBuiltinVariables:
         assert len(context_manager._workflow_stack) == 1
         assert context_manager.get_current_workflow_name() == "second"
 
+    def test_mirroring_an_empty_context_drops_the_previous_one(self) -> None:
+        """A peer with no workflow must leave this engine with none either.
+
+        The mirror is replaced in place and never popped, so skipping the empty case left the
+        previous execution's workflow installed: the worker resolved `{workflow_dir}` to that
+        folder while the orchestrator degraded to workspace-relative, and wrote a real file
+        where the orchestrator does not read.
+        """
+        from griptape_nodes.retained_mode.managers.context_manager import ContextManager
+
+        context_manager = ContextManager(event_manager=MagicMock(), engine=MagicMock())
+        context_manager.mirror_workflow_context("showA", "/a/showA.py", None)
+
+        context_manager.mirror_workflow_context(None, None, None)
+
+        assert context_manager.has_current_workflow() is False
+
     def test_dispatch_snapshot_is_empty_when_there_is_no_workflow(
         self,
         project_manager_with_template: ProjectManager,
     ) -> None:
-        """Nothing to lend, so the peer keeps its own context and both degrade identically."""
+        """Nothing to lend, so the peer must drop any mirror it holds and degrade identically."""
         mock_context_manager = Mock()
         mock_context_manager.has_current_workflow.return_value = False
         project_manager_with_template._engine = MagicMock()
         project_manager_with_template._engine.context_manager = mock_context_manager
 
-        assert project_manager_with_template.workflow_context_for_dispatch().is_empty()
+        assert project_manager_with_template.workflow_context_for_dispatch().name is None
 
     def test_dispatch_snapshot_carries_the_whole_context(
         self,
