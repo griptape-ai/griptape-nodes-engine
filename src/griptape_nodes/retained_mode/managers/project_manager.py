@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+import anyio
 from pydantic import ValidationError
 
 from griptape_nodes.common.macro_parser import (
@@ -3340,6 +3341,25 @@ class ProjectManager(EngineScoped):
             return True
         self._config_manager.load_configs()
         await self._load_registered_projects()
+        if project_id in self._successfully_loaded_project_templates:
+            return True
+        # Registered-project discovery only covers projects_to_register. A project the
+        # orchestrator holds via the persisted `project_file` -- which is how every install names
+        # its project after any prior activation -- is invisible to it, and that miss is exactly
+        # how a worker ended up running against a different workspace than its orchestrator. The
+        # id IS the canonical template path, so when a file exists there, load it directly with
+        # the same loader the orchestrator used; the resulting id matches by construction.
+        candidate = Path(project_id)
+        if await anyio.Path(candidate).is_file():
+            load_result = await self.on_load_project_template_request(
+                LoadProjectTemplateRequest(project_path=candidate)
+            )
+            if load_result.failed():
+                logger.error(
+                    "Attempted to load project '%s' by path during re-derivation. Failed with: %s",
+                    project_id,
+                    load_result.result_details,
+                )
         return project_id in self._successfully_loaded_project_templates
 
     def current_project_id(self) -> ProjectID:

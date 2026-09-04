@@ -88,6 +88,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
 )
 from griptape_nodes.retained_mode.events.project_events import (
     GetCurrentProjectRequest,
+    LoadProjectTemplateRequest,
     SetCurrentProjectRequest,
 )
 from griptape_nodes.retained_mode.events.workflow_events import (
@@ -106,6 +107,7 @@ SUPPORTED_REQUEST_EVENTS: dict[str, type[RequestPayload]] = {
     # instead of inferring it.
     "SetCurrentProjectRequest": SetCurrentProjectRequest,
     "GetCurrentProjectRequest": GetCurrentProjectRequest,
+    "LoadProjectTemplateRequest": LoadProjectTemplateRequest,
     # Workflows
     "RunWorkflowWithCurrentStateRequest": RunWorkflowWithCurrentStateRequest,
     "ListAllWorkflowsRequest": ListAllWorkflowsRequest,

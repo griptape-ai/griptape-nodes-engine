@@ -10640,6 +10640,31 @@ PACKAGING_PROJECT_YAML = """\
 """
 
 
+class TestEnsureProjectLoadedByPath:
+    """A worker adopting its orchestrator's project must find one known only via project_file.
+
+    Registered-project re-derivation covers projects_to_register alone. The orchestrator's
+    project usually arrives via the persisted `project_file` -- how every install names its
+    project after any activation -- and a worker whose re-derivation missed it refused adoption
+    and ran against a different workspace than its orchestrator. The id is the canonical template
+    path, so a readable file at that path is loadable directly.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_project_known_only_by_path_is_loaded(self, engine: Engine, tmp_path: Path) -> None:
+        project_yaml = _write_project_base_dir(tmp_path / "proj")
+        pm = engine.project_manager
+        project_id = str(project_yaml.resolve())
+        assert project_id not in pm._successfully_loaded_project_templates
+
+        assert await pm.ensure_project_loaded(project_id) is True
+        assert project_id in pm._successfully_loaded_project_templates
+
+    @pytest.mark.asyncio
+    async def test_a_nonexistent_id_still_reports_absent(self, engine: Engine, tmp_path: Path) -> None:
+        assert await engine.project_manager.ensure_project_loaded(str(tmp_path / "nope.yml")) is False
+
+
 def _write_project_base_dir(base_dir: Path, adjacent_config: dict | None = None) -> Path:
     """Write a minimal project base dir (template + adjacent config + an asset).
 
