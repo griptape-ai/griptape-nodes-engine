@@ -45,6 +45,7 @@ from griptape_nodes.common.project_templates import (
     schema_major_or_none,
     select_project_path,
 )
+from griptape_nodes.common.workflow_context_handoff import WorkflowContextSnapshot
 from griptape_nodes.files.derivation import DERIVATION_RULES, apply_derivation_rules
 from griptape_nodes.files.file import File, FileWriteError
 from griptape_nodes.files.path_utils import (
@@ -4780,6 +4781,26 @@ class ProjectManager(EngineScoped):
         # static analyzers (CodeQL) can prove the function never implicitly returns None.
         msg = f"Unknown builtin variable: {var_name}"
         raise ValueError(msg)
+
+    def workflow_context_for_dispatch(self) -> WorkflowContextSnapshot:
+        """This engine's workflow context, in the form another engine can adopt.
+
+        Raw context, not resolved paths: the adopting engine then derives every workflow-dependent
+        value through its own normal code paths, so the two cannot drift and a new derived value
+        needs no new handoff.
+
+        Empty when this process has no workflow -- there is nothing to lend, and the peer keeps
+        answering from its own equally-empty context, so both degrade identically.
+        """
+        context_manager = self.engine.context_manager
+        if not context_manager.has_current_workflow():
+            return WorkflowContextSnapshot()
+
+        return WorkflowContextSnapshot(
+            name=context_manager.get_current_workflow_name(),
+            file_path=context_manager.get_current_workflow_file_path(),
+            working_directory=context_manager.get_current_workflow_working_directory(),
+        )
 
     def _resolve_workflow_dir(self) -> str:
         """Resolve the `workflow_dir` builtin: the folder the current workflow belongs to.
