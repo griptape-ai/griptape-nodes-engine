@@ -874,25 +874,45 @@ class WorkerManager(EngineScoped):
         looks, with no error. Awaiting closes the window by construction instead of hoping the
         fan-out wins the race against the next dispatch.
 
-        Each worker gets its own request id so replies cannot be confused. One unreachable worker
-        does not abort the rest; the caller decides what a failure means.
+        Concurrent, and bounded per worker. Serially, a worker that is merely SLOW -- adoption runs a
+        full library reload, which can include installs -- kept every worker behind it from even
+        receiving the request, so the caller waited out the sum rather than the slowest. And
+        `route_to_worker` has no ceiling of its own: it argues liveness from the heartbeat, which
+        evicts a SILENT worker and says nothing about a busy one, so a user-facing switch could wait
+        forever. The bound is the startup grace, the same budget a worker's own slow startup gets.
+
+        Each worker gets its own request id so replies cannot be confused. One worker's failure does
+        not affect the others; the caller decides what a failure means.
         """
         if not self._workers:
             return []
 
-        failures: list[str] = []
-        for wid, registration in list(self._workers.items()):
+        async def ask(worker_engine_id: str, request_topic: str) -> str | None:
             per_worker = EventRequest(request=event.request)
             per_worker.request_id = str(uuid.uuid4())
             try:
-                raw = await self.route_to_worker(per_worker, wid, registration.request_topic)
+                raw = await asyncio.wait_for(
+                    self.route_to_worker(per_worker, worker_engine_id, request_topic),
+                    timeout=self.heartbeat_startup_grace_s,
+                )
+            except TimeoutError:
+                return f"{worker_engine_id}: no reply within {self.heartbeat_startup_grace_s:g} seconds"
             except Exception as e:
-                failures.append(f"{wid}: {type(e).__name__}: {e}")
-                continue
-            if "Success" not in str(raw.get("result_type", "")):
-                details = raw.get("result", {}).get("result_details", raw)
-                failures.append(f"{wid}: {details}")
-        return failures
+                return f"{worker_engine_id}: {type(e).__name__}: {e}"
+            # endswith rather than a substring test: every result payload ends in ResultSuccess or
+            # ResultFailure, and a substring match would read any type merely CONTAINING "Success"
+            # as one. The result may also be absent or not a dict, in which case the raw reply is
+            # the most informative thing to report.
+            if not str(raw.get("result_type", "")).endswith("ResultSuccess"):
+                result = raw.get("result")
+                details = result.get("result_details", raw) if isinstance(result, dict) else raw
+                return f"{worker_engine_id}: {details}"
+            return None
+
+        outcomes = await asyncio.gather(
+            *(ask(wid, registration.request_topic) for wid, registration in list(self._workers.items()))
+        )
+        return [failure for failure in outcomes if failure is not None]
 
     def schedule_broadcast(self, request_type: type[RequestPayload]) -> None:
         """Tell every registered worker to handle ``request_type`` locally.
