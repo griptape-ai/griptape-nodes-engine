@@ -5194,10 +5194,12 @@ class LibraryManager(EngineScoped):
     def get_model_asset(self, library_name: str, asset_id: str) -> Path:
         """Return the local directory holding a declared model asset, fetching it if needed.
 
-        Weights are not dependencies, and they are not a library-load concern either. This resolves
-        on demand, in whichever process asks -- which is the one about to run the model -- and
-        caches under an engine-owned root so two libraries wanting the same revision share it and
-        neither has to invent a location.
+        Weights are not dependencies, and they are not a library-load concern either. Resolved on
+        demand and cached under an engine-owned root, so no library has to invent a location.
+
+        The fetch itself is a request, so a worker asking mid-execution has the ORCHESTRATOR
+        download it; only the completion marker is written by the caller. That holds together
+        because both processes share the cache root, and stops holding the moment they do not.
 
         Raises:
             RuntimeError: If the library is unknown, declares no asset by that id, or the fetch

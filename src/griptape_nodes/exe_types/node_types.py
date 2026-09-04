@@ -1343,6 +1343,10 @@ class BaseNode(ABC):
         result = self.engine.handle_request(GetExecutionDeviceRequest())
         if isinstance(result, GetExecutionDeviceResultSuccess):
             return result.available
+        # A GPU-less machine still takes the success path above, so reaching here means detection
+        # itself failed. Logged because a node branching on this list would otherwise take its CPU
+        # path on an accelerated machine with nothing to show why.
+        logger.warning("Could not detect compute backends; reporting cpu only. %s", result.result_details)
         return ["cpu"]
 
     def model_asset(self, asset_id: str) -> Path:

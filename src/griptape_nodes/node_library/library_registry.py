@@ -91,10 +91,9 @@ class Dependencies(BaseModel):
 class ModelAsset(BaseModel):
     """Weight files a library needs on disk, declared rather than installed.
 
-    Weights are not dependencies. Libraries have been acquiring them three ways -- bundled inside a
-    pip-installed source tree, downloaded by a library-load hook, or fetched ad hoc by node code --
-    and only the last is even in the right process. A declaration lets the engine own fetching,
-    cache location, revision pinning and the entitlement gate, and lets a node ask for a path.
+    Declaring them, rather than installing them as dependencies, is what lets the engine own
+    fetching, cache location, revision pinning and the entitlement gate while a node only asks for
+    a path.
 
     Distinct from ``model_catalog``, which declares HOSTED models a node may invoke and the keys
     and terms that govern them. This is about bytes on local disk.
@@ -119,11 +118,8 @@ class ResourceRequirements(BaseModel):
     Specifies what system resources (OS, compute backends) the library needs.
     Example: {"platform": (["linux", "windows"], "has_any"), "arch": "x86_64", "compute": (["cuda", "cpu"], "has_all")}
 
-    ``required``: without this the library cannot run. Execution refuses with the reason, and
-    editing is unaffected -- SAM3 declares cuda-only and is still fully editable on a laptop.
-
-    There is deliberately no advisory tier. One was added and removed: nothing consumed it, so an
-    author who moved a declaration to it gave up the gate and gained nothing an artist could see.
+    ``required`` is the only tier: without it the library cannot run. Execution refuses with the
+    reason and editing is unaffected, so a cuda-only library stays fully editable on a laptop.
     """
 
     required: Requirements | None = None
