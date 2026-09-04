@@ -259,6 +259,18 @@ _SETTLED_NODE_STATES = frozenset({NodeState.DONE, NodeState.CANCELED, NodeState.
 _UNCOLLECTED_NODE_STATES = frozenset({NodeState.WAITING, NodeState.QUEUED})
 
 
+@dataclass
+class _FlowCancelOutcome:
+    """What deleting a node did to the workflow that was running, if any.
+
+    Both halves are worth reporting: a delete that could not stop the run has to fail, and a delete
+    that did stop it has to say so, or the run appears to stop for no stated reason.
+    """
+
+    failure: ResultPayload | None = None
+    cancelled_for_node_name: str | None = None
+
+
 class SerializedParameterValues(NamedTuple):
     """Result of serializing parameter output values.
 
@@ -1232,7 +1244,7 @@ class NodeManager(EngineScoped):
 
     async def cancel_conditionally(
         self, parent_flow: ControlFlow, parent_flow_name: str, node: BaseNode
-    ) -> ResultPayload | None:
+    ) -> _FlowCancelOutcome:
         """Cancel the running flow if deleting this node would take unfinished work away from it.
 
         Only genuine entanglement cancels. Sharing a connected component with something live is not
@@ -1251,22 +1263,27 @@ class NodeManager(EngineScoped):
             node: The base node that is trying to be deleted.
 
         Returns:
-            ResultPayload: A DeleteNodeResultFailure if cancellation was attempted but failed.
-            None: If no cancellation was needed or cancellation succeeded.
+            An outcome carrying a DeleteNodeResultFailure if cancellation was attempted but failed,
+            and the name of the live node the cancellation was for if one happened. Both are empty
+            when the delete took nothing away from the run.
 
         Note:
             This method also clears the flow queue regardless of whether cancellation occurred,
             to ensure the specified node is not processed in the future.
         """
-        if self.engine.flow_manager.check_for_existing_running_flow():
-            if self._find_entangled_live_node(node) is not None:
-                result = await self.engine.ahandle_request(CancelFlowRequest(flow_name=parent_flow_name))
-                if result.failed():
-                    details = f"Attempted to delete a Node '{node.name}'. Failed because running flow could not cancel."
-                    return DeleteNodeResultFailure(result_details=details)
-            # Clear the execution queue, because we don't want to hit this node eventually.
-            parent_flow.clear_execution_queue()
-        return None
+        if not self.engine.flow_manager.check_for_existing_running_flow():
+            return _FlowCancelOutcome()
+
+        entangled_node_name = self._find_entangled_live_node(node)
+        if entangled_node_name is not None:
+            result = await self.engine.ahandle_request(CancelFlowRequest(flow_name=parent_flow_name))
+            if result.failed():
+                details = f"Attempted to delete a Node '{node.name}'. Failed because running flow could not cancel."
+                return _FlowCancelOutcome(failure=DeleteNodeResultFailure(result_details=details))
+
+        # Clear the execution queue, because we don't want to hit this node eventually.
+        parent_flow.clear_execution_queue()
+        return _FlowCancelOutcome(cancelled_for_node_name=entangled_node_name)
 
     def _find_entangled_live_node(self, node: BaseNode) -> str | None:
         """Name the live node that deleting `node` would damage, or None if nothing would be.
@@ -1336,9 +1353,9 @@ class NodeManager(EngineScoped):
                 details = f"Attempted to delete a Node '{node_name}'. Error: {err}"
                 return DeleteNodeResultFailure(result_details=details)
 
-            cancel_result = await self.cancel_conditionally(parent_flow, parent_flow_name, node)
-            if cancel_result is not None:
-                return cancel_result
+            cancel_outcome = await self.cancel_conditionally(parent_flow, parent_flow_name, node)
+            if cancel_outcome.failure is not None:
+                return cancel_outcome.failure
 
             # The node is leaving, so the live DAG has to stop naming it: it is published to the
             # editor as an involved node, iterated on cancel, and checked before a node is allowed
@@ -1417,6 +1434,15 @@ class NodeManager(EngineScoped):
             self.engine.context_manager.pop_node()
 
         details = f"Successfully deleted Node '{node_name}'."
+        # Stopping a run the artist started is not something to do silently. Say it happened, and say
+        # which node still needed the deleted one, so the reason is not left to guesswork.
+        if cancel_outcome.cancelled_for_node_name == node_name:
+            details += " Cancelled the running workflow, because this Node was still running."
+        elif cancel_outcome.cancelled_for_node_name is not None:
+            details += (
+                f" Cancelled the running workflow, because Node '{cancel_outcome.cancelled_for_node_name}' "
+                f"was still waiting on it."
+            )
         return DeleteNodeResultSuccess(result_details=details)
 
     def on_move_node_to_new_flow_request(self, request: MoveNodeToNewFlowRequest) -> ResultPayload:  # noqa: PLR0911
