@@ -153,6 +153,24 @@ async def _wait_until_resolving(engine: Engine, node_name: str) -> None:
     pytest.fail(f"Node '{node_name}' never started executing, so the deletion could not land mid-run.")
 
 
+async def _wait_until_one_is_resolving(engine: Engine, *node_names: str) -> str:
+    """Block until exactly one of these nodes is executing, and name it.
+
+    Which one the scheduler picks is its own business, so a test that needs "one of these started
+    and the rest did not" has to ask rather than assume.
+    """
+    for _ in range(_POLL_ATTEMPTS):
+        resolving = [
+            name
+            for name in node_names
+            if engine.node_manager.get_node_by_name(name).state is NodeResolutionState.RESOLVING
+        ]
+        if len(resolving) == 1:
+            return resolving[0]
+        await asyncio.sleep(_POLL_SECONDS)
+    pytest.fail(f"None of {node_names} started executing on its own, so the deletion could not land mid-run.")
+
+
 async def _wait_until_resolved(engine: Engine, node_name: str) -> None:
     """Block until the node has finished and handed its outputs downstream."""
     for _ in range(_POLL_ATTEMPTS):
@@ -232,11 +250,18 @@ async def test_deleting_the_running_node_cancels_the_run(
     run = asyncio.create_task(engine.ahandle_request(ResolveNodeRequest(node_name="Runner")))
     await _wait_until_resolving(engine, "Runner")
 
-    await _delete_node(engine, flow_name, "Runner")
+    delete_result = await _delete_node(engine, flow_name, "Runner")
 
     # Open the gate so a run that ignored the cancel still terminates instead of hanging the suite.
     _open_gate(gate_file)
     await _drain_cancelled_run(run)
+
+    # Stopping someone's run is not something to do silently, and "it was still running" is the
+    # whole reason -- so the result has to say both.
+    assert "cancel" in str(delete_result.result_details).lower(), (
+        f"The delete stopped a running workflow without saying so: {delete_result.result_details}"
+    )
+    assert "still running" in str(delete_result.result_details), delete_result.result_details
 
     assert cancellations, "Deleting the running node cancelled the run but never told the editor."
     assert engine.flow_manager.check_for_existing_running_flow() is False, (
@@ -269,15 +294,93 @@ async def test_deleting_an_unresolved_upstream_cancels_the_run(
     run = asyncio.create_task(engine.ahandle_request(ResolveNodeRequest(node_name="Downstream")))
     await _wait_until_resolving(engine, "Upstream")
 
-    await _delete_node(engine, flow_name, "Upstream")
+    delete_result = await _delete_node(engine, flow_name, "Upstream")
 
     _open_gate(upstream_gate)
     await _drain_cancelled_run(run)
+
+    # Saying why is what makes the cancellation make sense to whoever pressed delete -- otherwise
+    # the run just stops for no stated reason. Here the deleted node was itself still parked in its
+    # gate, so it is its own reason.
+    assert "cancel" in str(delete_result.result_details).lower(), (
+        f"The delete stopped a running workflow without saying so: {delete_result.result_details}"
+    )
+    assert "still running" in str(delete_result.result_details), delete_result.result_details
 
     assert cancellations, "Deleting an unresolved upstream cancelled the run but never told the editor."
     assert engine.flow_manager.check_for_existing_running_flow() is False, (
         "Downstream is stranded on a dependency that can never arrive and the flow never ends."
     )
+
+
+@requires_fixture_library
+@pytest.mark.usefixtures("registered_library", "parallel_mode")
+@pytest.mark.asyncio
+async def test_deleting_a_finished_node_a_queued_consumer_still_needs_cancels_the_run(
+    tmp_path: Path,
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    create_node: Callable[..., str],
+    connect: Callable[..., None],
+) -> None:
+    """A node can be finished and *still* be needed, if a consumer has not been dispatched yet.
+
+    Nodes collect their inputs from upstream at the moment they are dispatched, not when the upstream
+    produces them. So a consumer still sitting in the queue has not received anything, and deleting
+    its supplier -- however finished that supplier looks -- leaves it to run on its parameter
+    defaults and the run to finish with the wrong answer and no complaint. That has to cancel.
+
+    A diamond with one node running at a time is what makes the state reachable: once the supplier is
+    done both consumers are ready, but only one can start, so the other is provably undispatched.
+    """
+    flow_name = _new_flow(engine, "delete_finished_node_queued_consumer_wf")
+    engine.config_manager.set_config_value("max_nodes_in_parallel", 1)
+
+    supplier_gate = tmp_path / "gates" / "supplier.gate"
+    consumer_gate = tmp_path / "gates" / "consumer.gate"
+
+    create_node(NODE_TYPE, "Supplier", flow_name, library_name=LIBRARY_NAME)
+    create_node(NODE_TYPE, "ConsumerA", flow_name, library_name=LIBRARY_NAME)
+    create_node(NODE_TYPE, "ConsumerB", flow_name, library_name=LIBRARY_NAME)
+    create_node(NODE_TYPE, "Sink", flow_name, library_name=LIBRARY_NAME)
+
+    connect("Supplier", "result", "ConsumerA", "linked_text")
+    connect("Supplier", "result", "ConsumerB", "linked_text")
+    # Two different inputs, so resolving Sink pulls both consumers into the same run.
+    connect("ConsumerA", "result", "Sink", "linked_text")
+    connect("ConsumerB", "result", "Sink", "text")
+
+    _configure(engine, "Supplier", text="from supplier", gate_file=supplier_gate)
+    _configure(engine, "ConsumerA", gate_file=consumer_gate)
+    _configure(engine, "ConsumerB", gate_file=consumer_gate)
+    _configure(engine, "Sink")
+
+    cancellations = _record_published(engine, monkeypatch, ControlFlowCancelledEvent, lambda _payload: True)
+
+    run = asyncio.create_task(engine.ahandle_request(ResolveNodeRequest(node_name="Sink")))
+
+    await _wait_until_resolving(engine, "Supplier")
+    _open_gate(supplier_gate)
+    await _wait_until_resolved(engine, "Supplier")
+
+    # One consumer is now executing; with a single slot, the other cannot have been dispatched.
+    running_consumer = await _wait_until_one_is_resolving(engine, "ConsumerA", "ConsumerB")
+    queued_consumer = "ConsumerB" if running_consumer == "ConsumerA" else "ConsumerA"
+
+    delete_result = await _delete_node(engine, flow_name, "Supplier")
+
+    _open_gate(consumer_gate)
+    await _drain_cancelled_run(run)
+
+    assert cancellations, (
+        f"'{queued_consumer}' had not collected Supplier's value yet, so deleting Supplier had to "
+        f"cancel rather than let it run on its defaults."
+    )
+    assert queued_consumer in str(delete_result.result_details), (
+        f"The cancellation never named the node that still needed the deleted one: {delete_result.result_details}"
+    )
+    assert "waiting on it" in str(delete_result.result_details), delete_result.result_details
+    assert engine.flow_manager.check_for_existing_running_flow() is False
 
 
 @requires_fixture_library
@@ -358,8 +461,14 @@ async def test_deleting_an_unrelated_node_does_not_interrupt_streaming(
     await _wait_until_resolving(engine, "Survivor")
     await _wait_for_progress(streamed, "Survivor", at_least=3)
 
-    await _delete_node(engine, flow_name, "Bystander")
+    delete_result = await _delete_node(engine, flow_name, "Bystander")
     chunks_at_delete = sum(1 for name in streamed if name == "Survivor")
+
+    # Nothing was cancelled, so the result must not say anything was. A delete that cries wolf is
+    # its own bug: the artist goes looking for a run that is still perfectly fine.
+    assert "cancel" not in str(delete_result.result_details).lower(), (
+        f"The delete claimed to cancel a run it left alone: {delete_result.result_details}"
+    )
 
     # Streaming has to keep going *across* the deletion, not merely resume by the time the run ends.
     await _wait_for_progress(streamed, "Survivor", at_least=chunks_at_delete + 3)
