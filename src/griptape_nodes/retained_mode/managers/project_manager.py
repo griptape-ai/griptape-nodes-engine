@@ -3066,10 +3066,8 @@ class ProjectManager(EngineScoped):
 
         # Push the switch to running workers so they adopt the orchestrator's project
         # even on a shallow switch (same workspace + library config) that would not
-        # restart them. Boot is handled separately (a worker boots like an engine and
-        # re-derives the same project), so emit only post-init and only when the
-        # project actually changed. A worker that boots like the orchestrator has the
-        # same registry, so the id resolves there too.
+        # restart them. A worker that starts after this adopts from its registration
+        # reply instead, so emit only post-init and only on an actual change.
         if self._initialization_complete and previous_project_id != resolved_project_id:
             self._event_manager.put_event(AppEvent(payload=CurrentProjectChanged(project_id=resolved_project_id)))
         return result

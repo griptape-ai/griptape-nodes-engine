@@ -378,22 +378,9 @@ class WorkerManager(EngineScoped):
                 execution_site_packages,
             )
 
-        # Deliberately NOT handing over the workspace here. Two reasons, and the second is why the
-        # obvious version of this is worse than nothing:
-        #
-        # The value would be wrong. Workers spawn at the end of library initialization, before any
-        # project has been resolved, so `workspace_path` is still the unconfigured Settings default
-        # -- `Path().cwd() / "GriptapeNodes"`, which resolves to a plausible adjacent directory
-        # because the worker shares this process's CWD.
-        #
-        # And the layer would be unfollowable. GTN_CONFIG_ outranks the runtime project override
-        # (see ConfigManager's workspace precedence), so a worker handed that variable could never
-        # follow its orchestrator onto a project's workspace again -- the placeholder would win for
-        # the life of the process.
-        #
-        # The workspace comes from the project instead, adopted from the registration reply before
-        # the worker loads a single library, and kept current afterwards by the project and config
-        # fan-outs.
+        # No workspace variable here: GTN_CONFIG_ outranks the runtime project override, so a worker
+        # handed one could never follow its orchestrator onto a project's workspace again. The
+        # workspace arrives with the project, adopted from the registration reply.
 
         # Hand the worker the URL of the static server the orchestrator is ALREADY serving
         # this workspace on. Without it the worker starts its own server, wins an arbitrary
