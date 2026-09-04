@@ -146,12 +146,9 @@ class ParallelResolutionContext(EngineScoped):
             if self.dag_builder:
                 for node in self.node_to_reference.values():
                     node.node_state = NodeState.CANCELED
-                    # Give the node back here as well as in ErrorState. A cancel bumps the
-                    # generation, and every was_reset_since guard in ExecuteDagState then abandons
-                    # the run by returning None -- without entering ErrorState at all. So whether
-                    # a cancelled node stopped claiming to be mid-resolution came down to a race
-                    # between the driver waking and this bump, and losing it left the editor
-                    # spinning on that node forever.
+                    # Given back here as well as in ErrorState: a cancel bumps the generation, and
+                    # the was_reset_since guards in ExecuteDagState then abandon the run by
+                    # returning None, so ErrorState is never entered to do it.
                     if node.node_reference.state is NodeResolutionState.RESOLVING:
                         node.node_reference.make_node_unresolved(
                             current_states_to_trigger_change_event={NodeResolutionState.RESOLVING}
@@ -859,21 +856,11 @@ class ErrorState(State):
             task_to_node.pop(task)
 
         if len(task_to_node) == 0:
-            # Give back every node this run left mid-flight. `state` is set to RESOLVING when a
-            # node is dispatched and to RESOLVED by handle_done_nodes when it finishes, and
-            # nothing sat between those two: a node that raised, or that was cancelled because
-            # a sibling raised, kept RESOLVING after the run was over. Since nothing else moves
-            # it -- this run is finishing right here -- the editor showed it spinning forever,
-            # and GetNodeResolutionStateRequest kept answering RESOLVING. A node that did not
-            # finish is UNRESOLVED: it holds no valid outputs and needs to run again.
-            #
-            # Done before the maps are cleared, which is the last moment the nodes are reachable.
-            # make_node_unresolved rather than a bare assignment, so the editor is told; the
-            # state filter keeps it quiet for nodes that never started.
-            # Only the ones still mid-flight. A node that finished before a sibling failed is
-            # RESOLVED with real outputs that downstream consumers may already hold, and
-            # make_node_unresolved assigns UNRESOLVED unconditionally -- its argument gates the
-            # event, not the write -- so calling it on everything would discard completed work.
+            # A node that did not finish is UNRESOLVED: it holds no valid outputs, and nothing else
+            # moves it once this run ends. Filtered to RESOLVING because make_node_unresolved writes
+            # unconditionally -- its argument gates only the event -- so calling it on a node that
+            # finished before a sibling failed would discard outputs consumers may already hold.
+            # Before the maps are cleared, the last moment these nodes are reachable.
             for dag_node in context.node_to_reference.values():
                 node = dag_node.node_reference
                 if node.state is NodeResolutionState.RESOLVING:
