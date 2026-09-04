@@ -3153,13 +3153,12 @@ class NodeManager(EngineScoped):
             # async ExecuteNodeRequest: ..." with advice to restart the engine, burying a message
             # written specifically for an artist. It is a node failure, so report it as one.
             #
-            # The wait comes first: a worker registers before it has loaded its library, and
-            # routing in that window fails in the worker with "Library not found". Waiting on the
-            # worker's LibraryLoadedNotification is immediate for any library without a spawned
-            # worker, and a timeout is the same kind of node failure as a missing worker.
+            # The wait comes first: a worker is routable the moment it registers, but it loads
+            # its library after registering, and forwarding into that window fails node creation
+            # over there. The event is set on every terminal outcome, so this cannot hang.
             try:
                 if library_name:
-                    await library_manager.wait_for_worker_library_load(library_name)
+                    await library_manager.wait_for_worker_ready(library_name)
                 worker = library_manager.get_worker_for_library(library_name) if library_name else None
             except RuntimeError as err:
                 return ExecuteNodeResultFailure(result_details=str(err), exception=err)

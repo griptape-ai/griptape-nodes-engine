@@ -51,6 +51,7 @@ class RegisterWorkerResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess)
 
     worker_engine_id: str
     current_project_id: str | None = None
+    project_generation: int = 0
 
 
 @dataclass

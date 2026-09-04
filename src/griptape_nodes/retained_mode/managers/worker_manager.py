@@ -234,12 +234,18 @@ class WorkerManager(EngineScoped):
         # None on the wire for system defaults, so the worker needs no sentinel knowledge: a
         # fresh worker IS on system defaults, and both processes derive that workspace from the
         # same config files, the same CWD, and the same inherited environment.
-        current_project_id = self.engine.project_manager.current_project_id()
+        # The COMMITTED pair, not the live id: `_current_project_id` is assigned before
+        # activation's fallible steps, so a registration handled mid-switch could otherwise name
+        # a project about to be rolled back. The generation lets the worker order this reply
+        # against a switch fan-out delivered concurrently -- newest committed activation wins,
+        # regardless of which message arrives first.
+        current_project_id, project_generation = self.engine.project_manager.committed_project()
         if current_project_id == SYSTEM_DEFAULTS_KEY:
             current_project_id = None
         return worker_events.RegisterWorkerResultSuccess(
             worker_engine_id=wid,
             current_project_id=current_project_id,
+            project_generation=project_generation,
             result_details="Worker registered successfully.",
         )
 
@@ -718,6 +724,28 @@ class WorkerManager(EngineScoped):
         # has to exist before the process starts. The orchestrator builds it in the background to
         # keep a torch install off the boot path; this is where the two meet.
         await self.engine.library_manager.wait_for_execution_env(library_name)
+        # A failed build records why and leaves the venv directory behind, so spawning anyway
+        # would put a partial or stale site-packages at the front of the worker's import path --
+        # the exact unpinned execution the edit/exec split exists to prevent -- and the raw
+        # ModuleNotFoundError would bury the recorded uv error. Refusing here keeps the reason
+        # as the thing the next run reports.
+        failed_env_reason = self.engine.library_manager.execution_env_failure_reason(library_name)
+        if failed_env_reason is not None:
+            logger.error(
+                "Not spawning a worker for library '%s': %s",
+                library_name,
+                failed_env_reason,
+            )
+            # Recorded the same way _log_spawn_error records its failures: _start_workers
+            # cleared execution_unavailable_reason before scheduling this spawn, so without
+            # this a run reports the worker "may still be starting up" for the whole session.
+            library_info = self.engine.library_manager.get_library_info_by_library_name(library_name)
+            if library_info is not None:
+                library_info.execution_unavailable_reason = failed_env_reason
+                # No worker is coming; anything waiting on it must be released to see the reason.
+                if library_info.worker_ready is not None:
+                    library_info.worker_ready.set()
+            return
         args = [
             sys.executable,
             "-m",
@@ -746,6 +774,9 @@ class WorkerManager(EngineScoped):
         library_info = self.engine.library_manager.get_library_info_by_library_name(library_name)
         if library_info is not None:
             library_info.execution_unavailable_reason = f"the worker process that runs it could not be started ({exc})."
+            # No worker is coming; anything waiting on it must be released to see the reason.
+            if library_info.worker_ready is not None:
+                library_info.worker_ready.set()
 
     def get_topics_to_subscribe(self, *, is_worker: bool) -> list[str]:
         """Build the list of topics to subscribe to at connection start.

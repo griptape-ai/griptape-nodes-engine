@@ -74,6 +74,10 @@ def worker_manager() -> WorkerManager:
     # spawn_worker builds the child env from the orchestrator's pre-project environ;
     # hand back a real dict so {**base_environ, ...} doesn't choke on a MagicMock.
     gtn.project_manager.get_pre_project_environ.return_value = {}
+    # Registration answers from the committed pair; a bare MagicMock cannot be unpacked.
+    gtn.project_manager.committed_project.return_value = ("<system-defaults>", 0)
+    # A MagicMock reads as a truthy failure reason and would refuse every spawn.
+    gtn.library_manager.execution_env_failure_reason.return_value = None
     # Spawn awaits the library's execution environment before starting the process; a bare
     # MagicMock is not awaitable.
     gtn.library_manager.wait_for_execution_env = AsyncMock()
@@ -145,13 +149,15 @@ class TestRegistrationCarriesTheProject:
         project -- so carrying it in the reply the worker already waits for is what makes the two
         workspaces match deterministically rather than by message-ordering luck.
         """
-        worker_manager.engine.project_manager.current_project_id.return_value = "proj-42"  # type: ignore[union-attr]
+        committed_generation = 7
+        worker_manager.engine.project_manager.committed_project.return_value = ("proj-42", committed_generation)  # type: ignore[union-attr]
         request = worker_events.RegisterWorkerRequest(worker_engine_id=_ENGINE, engine_version=engine_version)
 
         result = await worker_manager.handle_register_worker_request(request)
 
         assert isinstance(result, worker_events.RegisterWorkerResultSuccess)
         assert result.current_project_id == "proj-42"
+        assert result.project_generation == committed_generation
 
 
 class TestProjectSwitchWaitsForWorkers:

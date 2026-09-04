@@ -300,7 +300,7 @@ class TestExecuteWaitsForTheWorkerLibraryLoad:
         order: list[str] = []
 
         async def executes() -> None:
-            await mgr.wait_for_worker_library_load("Lib")
+            await mgr.wait_for_worker_ready("Lib")
             order.append("routed")
 
         async def worker_finishes_loading() -> None:
@@ -316,7 +316,7 @@ class TestExecuteWaitsForTheWorkerLibraryLoad:
         mgr = _make_library_manager()
         mgr._library_file_path_to_info["/some/path.json"] = self._spawned_info(loaded=True)
 
-        await mgr.wait_for_worker_library_load("Lib")
+        await mgr.wait_for_worker_ready("Lib")
 
     @pytest.mark.asyncio
     async def test_a_library_with_no_spawned_worker_does_not_wait(self) -> None:
@@ -325,7 +325,7 @@ class TestExecuteWaitsForTheWorkerLibraryLoad:
         info.worker_ready = None
         mgr._library_file_path_to_info["/some/path.json"] = info
 
-        await mgr.wait_for_worker_library_load("Lib")
+        await mgr.wait_for_worker_ready("Lib")
 
     @pytest.mark.asyncio
     async def test_the_timeout_names_the_library_and_the_ceiling(self) -> None:
@@ -335,7 +335,7 @@ class TestExecuteWaitsForTheWorkerLibraryLoad:
         mgr._engine.config_manager.get_config_value.return_value = 0.01
 
         with pytest.raises(RuntimeError, match="Lib"):
-            await mgr.wait_for_worker_library_load("Lib")
+            await mgr.wait_for_worker_ready("Lib")
 
     @pytest.mark.asyncio
     async def test_an_eviction_during_the_wait_releases_it(self) -> None:
@@ -343,10 +343,14 @@ class TestExecuteWaitsForTheWorkerLibraryLoad:
         mgr = _make_library_manager()
         info = self._spawned_info(loaded=False)
         mgr._library_file_path_to_info["/some/path.json"] = info
+        # A grace long enough that only the eviction can end the wait -- the point of the test is
+        # that the waiter is released early, not that it survives to the ceiling.
+        mgr._engine = MagicMock()  # type: ignore[assignment]
+        mgr._engine.config_manager.get_config_value.return_value = 30.0
         order: list[str] = []
 
         async def executes() -> None:
-            await mgr.wait_for_worker_library_load("Lib")
+            await mgr.wait_for_worker_ready("Lib")
             order.append("released")
 
         async def worker_dies() -> None:
