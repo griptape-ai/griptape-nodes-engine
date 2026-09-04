@@ -58,6 +58,7 @@ from griptape_nodes.retained_mode.events.project_events import (
     SetCurrentProjectRequest,
 )
 from griptape_nodes.retained_mode.events.resource_events import (
+    GetExecutionDeviceRequest,
     RegisterResourceTypeRequest,
 )
 from griptape_nodes.retained_mode.events.static_file_events import (
@@ -347,6 +348,12 @@ LOCAL_ONLY_REQUEST_TYPES: frozenset[type[RequestPayload]] = frozenset(
         GetSituationRequest,
         GetPathForMacroRequest,
         AttemptMapAbsolutePathToProjectRequest,
+        # resource_events: which device to run on describes the machine that will run the model,
+        # which is THIS one. Forwarding asked the orchestrator about its own hardware --
+        # indistinguishable while both processes share a machine, and wrong the moment a venue runs
+        # anywhere else. Detection is torch-free and reads local hardware, so the worker's answer is
+        # authoritative by construction.
+        GetExecutionDeviceRequest,
         # Two requests carry a live Python object in a field, and both were local under the
         # allowlist this exclusion list replaces -- the flip is what started forwarding them.
         # `_registers_a_python_class` does not catch either: it matches a `type[...]` annotation,

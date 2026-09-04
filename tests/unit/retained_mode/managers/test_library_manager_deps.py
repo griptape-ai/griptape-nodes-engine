@@ -72,8 +72,8 @@ class TestLibraryDependencyDeclaration:
         assert not hasattr(deps, "library_dependencies")
 
     def test_schema_version_bumped(self) -> None:
-        # 0.12.0 added Dependencies.pip_dependencies_exec.
-        assert LibrarySchema.LATEST_SCHEMA_VERSION == "0.12.0"
+        # 0.12.0 added Dependencies.pip_dependencies_exec; 0.13.0 added execution_modules.
+        assert LibrarySchema.LATEST_SCHEMA_VERSION == "0.13.0"
 
 
 class TestLibraryDependencyProblem:

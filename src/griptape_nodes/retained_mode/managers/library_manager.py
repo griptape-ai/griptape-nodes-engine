@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import sysconfig
+import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -56,6 +57,7 @@ from griptape_nodes.node_library.library_registry import (
     LibraryRegistry,
     LibraryRegistryError,
     LibrarySchema,
+    ModelAsset,
     NodeDefinition,
     NodeMetadata,
     WidgetDefinition,
@@ -186,6 +188,10 @@ from griptape_nodes.retained_mode.events.library_events import (
     UpdateLibraryResultSuccess,
     WidgetInfo,
 )
+from griptape_nodes.retained_mode.events.model_events import (
+    DownloadModelRequest,
+    DownloadModelResultSuccess,
+)
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.os_events import (
     DeleteFileRequest,
@@ -300,6 +306,11 @@ logger = logging.getLogger("griptape_nodes")
 
 # Directories to exclude when scanning for Python source files (in addition to any directory starting with '.')
 EXCLUDED_SCAN_DIRECTORIES = frozenset({"venv", "__pycache__"})
+
+# One in-flight fetch per model-asset directory. Module-level rather than per-manager because what
+# it guards is a directory on disk: two engines in one process resolving the same asset would
+# otherwise hold separate locks and race each other into it.
+_MODEL_ASSET_FETCH_LOCKS: dict[Path, threading.Lock] = {}
 
 TRegisteredEventData = TypeVar("TRegisteredEventData")
 
@@ -501,6 +512,13 @@ class LibraryManager(EngineScoped):
         # orchestrator never learns it -- the worker reports that itself when a run is attempted.
         # None means nothing is known to be wrong.
         execution_unavailable_reason: str | None = None
+        # Declared execution modules, imported and keyed by their file stem. Populated only in a
+        # worker: the orchestrator deliberately never imports these, so it holds an empty dict
+        # and `get_execution_module` refuses there.
+        execution_modules: dict[str, ModuleType] = field(default_factory=dict)
+        # Resolved absolute paths of the declared execution modules, kept so the boundary check
+        # can run from the module loader, which fires lazily and has no access to the schema.
+        declared_execution_module_paths: set[Path] = field(default_factory=set)
         # The path string the user wrote in `libraries_to_register` before workspace
         # resolution / `~`-expansion / symlink-following. Surfaced to the GUI so the
         # settings panel can match library metadata back to its config row using the
@@ -3078,7 +3096,7 @@ class LibraryManager(EngineScoped):
             if isinstance(result, ListCompatibleResourceInstancesResultSuccess) and not result.instance_ids:
                 system_capabilities = self._get_system_capabilities()
                 logger.warning(
-                    "Library '%s' OS requirements not met. Required: %s, System: %s",
+                    "Library '%s' required OS resources not met. Wanted: %s, System: %s",
                     library_name,
                     os_requirements,
                     system_capabilities,
@@ -3099,7 +3117,7 @@ class LibraryManager(EngineScoped):
             if isinstance(result, ListCompatibleResourceInstancesResultSuccess) and not result.instance_ids:
                 system_capabilities = self._get_system_capabilities()
                 logger.warning(
-                    "Library '%s' compute requirements not met. Required: %s, System: %s",
+                    "Library '%s' required compute resources not met. Wanted: %s, System: %s",
                     library_name,
                     compute_requirements,
                     system_capabilities,
@@ -3799,8 +3817,24 @@ class LibraryManager(EngineScoped):
         def load_module() -> ModuleType:
             module = cache.get("module")
             if module is None:
-                module = self._load_module_from_file(node_file_path, library_name)
+                # Checked around the import, the only moment a boundary violation is observable:
+                # node modules can load lazily, long after the library finished registering.
+                #
+                # Both outcomes matter. If the execution module imports cleanly the violation is
+                # SILENT, and the diff of sys.modules is the only evidence. If it does not -- the
+                # usual case, since its dependencies are absent here by design -- the node module
+                # fails with a bare ImportError naming a module the author did not write, and the
+                # traceback is where the evidence lives.
+                modules_before = set(sys.modules)
+                try:
+                    module = self._load_module_from_file(node_file_path, library_name)
+                except Exception as exc:
+                    self._check_execution_module_boundary(
+                        library_name, node_file_path, set(sys.modules) - modules_before, exc=exc
+                    )
+                    raise
                 cache["module"] = module
+                self._check_execution_module_boundary(library_name, node_file_path, set(sys.modules) - modules_before)
             return module
 
         return load_module
@@ -4988,6 +5022,333 @@ class LibraryManager(EngineScoped):
             library_info.problems.append(library_problem)
         return True
 
+    def _resolve_execution_module_paths(self, library_data: LibrarySchema, base_dir: Path) -> list[Path]:
+        """Expand the declared execution-module paths; a directory means every .py beneath it."""
+        resolved: list[Path] = []
+        for declared in library_data.execution_modules or []:
+            target = base_dir / declared
+            if target.is_dir():
+                resolved.extend(sorted(f for f in target.rglob("*.py") if f.name != "__init__.py"))
+            elif target.exists():
+                resolved.append(target)
+            else:
+                logger.warning(
+                    "Library '%s' declares execution module '%s', which does not exist at %s.",
+                    library_data.name,
+                    declared,
+                    target,
+                )
+        return resolved
+
+    def _load_execution_modules(self, library_data: LibrarySchema, base_dir: Path, library_info: LibraryInfo) -> None:
+        """Import a library's execution modules -- in a worker, and only there.
+
+        These modules exist so heavy imports have a home. They may import anything at module
+        scope, and the orchestrator's contract is that it never imports them: that is what keeps a
+        library's execution dependencies off the editing process's import path, without asking the
+        author to scatter deferred imports through node code and remember never to add one back.
+
+        A failure here does not fail the library. The nodes still load and stay editable; what is
+        lost is the ability to run them, recorded as the reason so the refusal can say why.
+        """
+        paths = self._resolve_execution_module_paths(library_data, base_dir)
+        library_info.declared_execution_module_paths = {path.resolve() for path in paths}
+        if not paths:
+            return
+        # Gated on running THIS library's nodes, not merely on being a worker. A worker also loads
+        # the libraries its own library declares as dependencies, and those get no execution
+        # environment of their own here -- so importing their execution modules would either fail
+        # with a traceback for a perfectly healthy library, or succeed by resolving against this
+        # library's pins, silently binding someone else's heavy imports to them.
+        if not (self._is_worker and self._is_one_of_my_target_libraries(library_data.name)):
+            logger.debug(
+                "Library '%s' declares %d execution module(s); not importing them here, because "
+                "this process does not run that library's nodes.",
+                library_data.name,
+                len(paths),
+            )
+            return
+
+        for path in paths:
+            # Modules are addressed by stem, and a directory declaration expands recursively, so
+            # execution/a/runner.py and execution/b/runner.py both answer to "runner". Left alone the
+            # later import won and the earlier module became unreachable, with get_execution_module
+            # listing one "runner" and no way to see which. Refused rather than resolved: only the
+            # author knows which was meant.
+            if path.stem in library_info.execution_modules:
+                library_info.execution_unavailable_reason = (
+                    f"two of its execution modules are both named '{path.stem}'. Execution modules "
+                    "are addressed by file name, so rename one of them."
+                )
+                # Cleared, not left half-built: get_execution_module reports the reason only when the
+                # name misses, so leaving the first-imported module bound would hand back whichever
+                # one rglob happened to reach first -- the silent wrong answer this refuses.
+                library_info.execution_modules.clear()
+                logger.error(
+                    "Library '%s' declares more than one execution module named '%s' (%s); "
+                    "the library stays editable but cannot run.",
+                    library_data.name,
+                    path.stem,
+                    path,
+                )
+                return
+            try:
+                module = self._load_module_from_file(path, library_data.name)
+            except Exception as exc:
+                library_info.execution_unavailable_reason = (
+                    f"its execution module '{path.name}' could not be imported ({exc})."
+                )
+                logger.exception(
+                    "Library '%s': execution module %s failed to import; the library stays editable but cannot run.",
+                    library_data.name,
+                    path,
+                )
+                return
+            library_info.execution_modules[path.stem] = module
+            # INFO, not debug: this is the record that a worker is ready to RUN this library, and
+            # the first thing to look for when it turns out it cannot.
+            logger.info("Library '%s': imported execution module '%s'", library_data.name, path.stem)
+
+    def _check_execution_module_boundary(
+        self,
+        library_name: str,
+        node_file_path: Path,
+        newly_imported: set[str],
+        *,
+        exc: BaseException | None = None,
+    ) -> None:
+        """Whether importing a node module pulled an execution module in with it.
+
+        Checked by FILE LOCATION rather than by scanning the node module's own import statements.
+        A direct import is the easy case; the one that actually happens is transitive -- two node
+        modules import a shared helper, and the helper imports the heavy dependency. A source scan
+        of the node modules calls them both clean.
+
+        Both outcomes are covered. A clean import of the execution module makes the violation
+        silent, and sys.modules is the evidence. A failed one -- the usual case, because the
+        dependencies are absent here by design -- surfaces as an ImportError naming a module the
+        author did not write, and the traceback is the evidence.
+
+        Records a library problem naming the offending file and both fixes.
+        """
+        library_info = self.get_library_info_by_library_name(library_name)
+        if library_info is None or not library_info.declared_execution_module_paths:
+            return
+
+        offender = self._execution_module_in_traceback(library_info, exc) if exc is not None else None
+        if offender is None:
+            offender = self._execution_module_among(library_info, newly_imported)
+        if offender is None:
+            return
+
+        message = (
+            f"Node module '{node_file_path.name}' imports execution module '{offender.name}', "
+            "directly or through a helper. Execution modules carry this library's execution-time "
+            "dependencies, so importing one here puts them on the editing process's import path -- "
+            "which is what the edit/execution split exists to prevent. Either reach it from "
+            "process() with self.execution_module(...), or move the dependency it needs into "
+            "pip_dependencies if instantiating the node genuinely requires it."
+        )
+        library_info.problems.append(
+            LibraryDependencyProblem(dependency_name="execution module boundary", error_message=message)
+        )
+        if library_info.fitness is LibraryManager.LibraryFitness.GOOD:
+            library_info.fitness = LibraryManager.LibraryFitness.FLAWED
+        logger.error(message)
+
+    @staticmethod
+    def _execution_module_in_traceback(library_info: LibraryInfo, exc: BaseException) -> Path | None:
+        """The execution module a failed import passed through, if any.
+
+        The import raised before the module reached sys.modules, so its frames are the evidence.
+        The whole chain is walked, not just this exception: `_load_module_from_file` re-raises as
+        its own ImportError, so the frames that actually touched the execution module sit on the
+        `__cause__` rather than on what the caller catches.
+        """
+        seen: set[int] = set()
+        current: BaseException | None = exc
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            tb = current.__traceback__
+            while tb is not None:
+                try:
+                    frame_file = Path(tb.tb_frame.f_code.co_filename).resolve()
+                except (OSError, ValueError):
+                    frame_file = None
+                if frame_file is not None and frame_file in library_info.declared_execution_module_paths:
+                    return frame_file
+                tb = tb.tb_next
+            current = current.__cause__ or current.__context__
+        return None
+
+    @staticmethod
+    def _execution_module_among(library_info: LibraryInfo, module_names: set[str]) -> Path | None:
+        """The execution module that landed in sys.modules, if any -- the silent-success case."""
+        for module_name in module_names:
+            module = sys.modules.get(module_name)
+            module_file = getattr(module, "__file__", None)
+            if not module_file:
+                continue
+            try:
+                resolved = Path(module_file).resolve()
+            except (OSError, ValueError):
+                continue
+            if resolved in library_info.declared_execution_module_paths:
+                return resolved
+        return None
+
+    def get_model_asset(self, library_name: str, asset_id: str) -> Path:
+        """Return the local directory holding a declared model asset, fetching it if needed.
+
+        Weights are not dependencies, and they are not a library-load concern either. Resolved on
+        demand and cached under an engine-owned root, so no library has to invent a location.
+
+        The fetch itself is a request, so a worker asking mid-execution has the ORCHESTRATOR
+        download it; only the completion marker is written by the caller. That holds together
+        because both processes share the cache root, and stops holding the moment they do not.
+
+        Raises:
+            RuntimeError: If the library is unknown, declares no asset by that id, or the fetch
+                fails. Each message says which of those it was.
+        """
+        # Read through the registry rather than LibraryInfo: the registry holds the schema and
+        # resolves library-local declarations correctly in both the orchestrator and a worker,
+        # which is the same route get_declared_models takes.
+        try:
+            library = LibraryRegistry.get_library(library_name)
+        except KeyError as err:
+            msg = f"No library named '{library_name}' is registered, so its model assets cannot be resolved."
+            raise RuntimeError(msg) from err
+
+        declared = library.get_library_data().model_assets or {}
+        asset = declared.get(asset_id)
+        if asset is None:
+            available = ", ".join(sorted(declared)) or "none"
+            msg = (
+                f"Library '{library_name}' declares no model asset named '{asset_id}'. "
+                f"Declared: {available}. Add it to the manifest's model_assets."
+            )
+            raise RuntimeError(msg)
+
+        target = self._model_asset_path(library_name, asset_id, asset)
+        # A marker written only after a fetch succeeds, rather than "the directory has something in
+        # it". The directory is created before the download starts, so an interrupted fetch -- a
+        # dropped connection, a cancelled run, a rate limit part-way through a repo -- leaves
+        # partial weights behind. Treating those as present handed back a truncated model from every
+        # later call, failing in a way that points at the model rather than the cache, with nothing
+        # but manual deletion to recover.
+        complete_marker = target / ".griptape-nodes-complete"
+        if complete_marker.exists():
+            logger.debug("Model asset '%s' for library '%s' is already present at %s", asset_id, library_name, target)
+            return target
+
+        scheme, _, reference = asset.source.partition(":")
+        supported_schemes = ("hf",)
+        if scheme not in supported_schemes:
+            msg = (
+                f"Model asset '{asset_id}' of library '{library_name}' declares source "
+                f"'{asset.source}'. Supported schemes: {', '.join(supported_schemes)} "
+                "(e.g. 'hf:owner/repo')."
+            )
+            raise RuntimeError(msg)
+
+        # Serialized per directory, and re-checked inside. Node execution is concurrent, so two
+        # nodes asking for one asset both passed the marker check above, both downloaded into the
+        # same directory, and the first to return marked it complete while the second was still
+        # writing -- after which every later call short-circuits on the marker and hands back a
+        # truncated model, which is the outcome the marker exists to prevent.
+        with self._model_asset_lock(target):
+            if complete_marker.exists():
+                logger.debug("Model asset '%s' for library '%s' was fetched while waiting", asset_id, library_name)
+                return target
+            logger.info(
+                "Fetching model asset '%s' for library '%s' from %s (revision %s)",
+                asset_id,
+                library_name,
+                reference,
+                asset.revision,
+            )
+            target.mkdir(parents=True, exist_ok=True)
+            result = self.engine.handle_request(
+                DownloadModelRequest(
+                    model_id=reference,
+                    local_dir=str(target),
+                    revision=asset.revision,
+                    allow_patterns=asset.files,
+                )
+            )
+            if not isinstance(result, DownloadModelResultSuccess):
+                msg = (
+                    f"Attempted to fetch model asset '{asset_id}' for library '{library_name}' from "
+                    f"{reference}. Failed with: {result.result_details}"
+                )
+                # isinstance here discriminates a result payload, the engine's universal idiom; the
+                # failure is a fetch failure, not a type error.
+                raise RuntimeError(msg)  # noqa: TRY004
+            complete_marker.touch()
+        return target
+
+    @staticmethod
+    def _model_asset_lock(target: Path) -> threading.Lock:
+        """The lock owning fetches into `target`, created on first ask.
+
+        `setdefault` needs no guard of its own: two callers may each build a Lock, but both receive
+        whichever one landed in the map.
+        """
+        return _MODEL_ASSET_FETCH_LOCKS.setdefault(target, threading.Lock())
+
+    @staticmethod
+    def _model_asset_path(library_name: str, asset_id: str, asset: ModelAsset) -> Path:
+        """Where a model asset lives. Keyed by revision so a re-pin does not overwrite the old one.
+
+        Engine-owned rather than library-adjacent: a library directory can be read-only, can be
+        reinstalled underneath the weights, and is the wrong place for gigabytes that two libraries
+        might share.
+        """
+        safe_library = "".join(char if char.isalnum() or char in "-_" else "_" for char in library_name)
+        return xdg_data_home() / "griptape_nodes" / "model_assets" / safe_library / asset_id / asset.revision
+
+    def get_execution_module(self, library_name: str, module_name: str) -> ModuleType:
+        """Return one of a library's execution modules, or explain why it is not available here.
+
+        The sanctioned way node code reaches execution-only code. A lookup rather than an import,
+        because the worker already imported it at library load; the orchestrator never did, and
+        says so rather than raising ImportError from a stack the node author did not write.
+        """
+        library_info = self.get_library_info_by_library_name(library_name)
+        if library_info is None:
+            msg = f"No library named '{library_name}' is registered, so its execution modules cannot be reached."
+            raise RuntimeError(msg)
+        if not self._is_worker:
+            msg = (
+                f"Execution module '{module_name}' of library '{library_name}' is not available in "
+                "this process. Execution modules are imported only where nodes execute, because "
+                "they carry the library's execution-time dependencies. Reach them from process(), "
+                "which runs there."
+            )
+            raise RuntimeError(msg)
+        module = library_info.execution_modules.get(module_name)
+        if module is None:
+            # An import failure during library load recorded WHY and then stopped importing the
+            # rest, so the "no module by that name" wording below sends the author hunting for a
+            # manifest typo when the real cause is an exception the worker already logged. The
+            # reason is worker-local, so this is the only place it can reach whoever called.
+            if library_info.execution_unavailable_reason:
+                msg = (
+                    f"Execution module '{module_name}' of library '{library_name}' is not "
+                    f"available: {library_info.execution_unavailable_reason} The full traceback is "
+                    "in this worker's log."
+                )
+                raise RuntimeError(msg)
+            available = ", ".join(sorted(library_info.execution_modules)) or "none"
+            msg = (
+                f"Library '{library_name}' has no execution module named '{module_name}'. "
+                f"Declared and imported: {available}. Names come from the file stem of each entry "
+                "in the manifest's execution_modules."
+            )
+            raise RuntimeError(msg)
+        return module
+
     def _attempt_load_nodes_from_library(  # noqa: PLR0912, PLR0915, C901
         self,
         library_data: LibrarySchema,
@@ -5009,6 +5370,11 @@ class LibraryManager(EngineScoped):
                 with a deferred loader and their modules are imported on first use instead.
         """
         any_nodes_loaded_successfully = False
+
+        # Execution modules first: a worker that cannot import them cannot run this library's
+        # nodes, and finding that out now -- at library load, with the failure attached to the
+        # library -- beats finding out on the first execution of some node deep in a graph.
+        self._load_execution_modules(library_data, base_dir, library_info)
 
         # Check if library is in old XDG location
         old_xdg_libraries_path = xdg_data_home() / "griptape_nodes" / "libraries"
@@ -5065,7 +5431,6 @@ class LibraryManager(EngineScoped):
                 node_registered = self._register_node_eager(
                     node_definition, node_file_path, library, library_info, module_loaders
                 )
-
             if node_registered:
                 any_nodes_loaded_successfully = True
 
