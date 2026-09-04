@@ -55,6 +55,7 @@ from griptape_nodes.exe_types.node_types import (
     aprocess_scope,
     sanctioned_parameter_mutation,
 )
+from griptape_nodes.machines.dag_builder import NodeState
 from griptape_nodes.node_library.library_declarations import (
     ArbitraryPythonExecutionNodeProperty,
     LifecycleStageLibraryProperty,
@@ -246,6 +247,16 @@ logger = logging.getLogger("griptape_nodes")
 # Sentinel for "key not present in node.parameter_values". Distinct from None
 # so a legitimately-stored None does not collide with "missing".
 _PARAM_MISSING = object()
+
+# A node in one of these states owes the running flow nothing further, so deleting it takes
+# nothing away from the run.
+_SETTLED_NODE_STATES = frozenset({NodeState.DONE, NodeState.CANCELED, NodeState.ERRORED})
+
+# A node in one of these states has not been dispatched yet. Dispatch is when a node collects
+# values from its upstream nodes (see ExecuteDagState.collect_values_from_upstream_nodes), so a
+# node still in one of these states has NOT received its inputs and would fall back to its
+# parameter defaults if an upstream disappeared first.
+_UNCOLLECTED_NODE_STATES = frozenset({NodeState.WAITING, NodeState.QUEUED})
 
 
 class SerializedParameterValues(NamedTuple):
@@ -1222,11 +1233,11 @@ class NodeManager(EngineScoped):
     async def cancel_conditionally(
         self, parent_flow: ControlFlow, parent_flow_name: str, node: BaseNode
     ) -> ResultPayload | None:
-        """Conditionally cancels a parent flow if it's currently executing nodes are connected to the specified node.
+        """Cancel the running flow if deleting this node would take unfinished work away from it.
 
-        This method checks if the parent flow is running, and if so, determines whether the currently
-        executing or resolving node is connected to the specified node. If a connection exists, the parent
-        flow is cancelled to prevent operations on the deleted node.
+        Only genuine entanglement cancels. Sharing a connected component with something live is not
+        enough: a node the run has already finished with, or one the run was never going to reach,
+        can be deleted while the run carries on.
 
         The cancel is awaited rather than dispatched synchronously. `on_cancel_flow_request` is an async
         handler that gathers the running node tasks, and those tasks belong to the engine's event loop.
@@ -1248,32 +1259,46 @@ class NodeManager(EngineScoped):
             to ensure the specified node is not processed in the future.
         """
         if self.engine.flow_manager.check_for_existing_running_flow():
-            # get the current node executing / resolving
-            # if it's in connected nodes, cancel flow.
-            # otherwise, leave it.
-            control_node_names, resolving_node_names, _ = self.engine.flow_manager.flow_state(parent_flow)
-            connected_nodes = parent_flow.get_all_connected_nodes(node)
-            cancelled = False
-            if control_node_names is not None:
-                for control_node_name in control_node_names:
-                    control_node = self.engine.object_manager.get_object_by_name(control_node_name)
-                    if control_node in connected_nodes:
-                        result = await self.engine.ahandle_request(CancelFlowRequest(flow_name=parent_flow_name))
-                        cancelled = True
-                        if result.failed():
-                            details = f"Attempted to delete a Node '{node.name}'. Failed because running flow could not cancel."
-                            return DeleteNodeResultFailure(result_details=details)
-            if resolving_node_names is not None and not cancelled:
-                for resolving_node_name in resolving_node_names:
-                    resolving_node = self.engine.object_manager.get_object_by_name(resolving_node_name)
-                    if resolving_node in connected_nodes:
-                        result = await self.engine.ahandle_request(CancelFlowRequest(flow_name=parent_flow_name))
-                        if result.failed():
-                            details = f"Attempted to delete a Node '{node.name}'. Failed because running flow could not cancel."
-                            return DeleteNodeResultFailure(result_details=details)
-                        break  # Only need to cancel once
+            if self._find_entangled_live_node(node) is not None:
+                result = await self.engine.ahandle_request(CancelFlowRequest(flow_name=parent_flow_name))
+                if result.failed():
+                    details = f"Attempted to delete a Node '{node.name}'. Failed because running flow could not cancel."
+                    return DeleteNodeResultFailure(result_details=details)
             # Clear the execution queue, because we don't want to hit this node eventually.
             parent_flow.clear_execution_queue()
+        return None
+
+    def _find_entangled_live_node(self, node: BaseNode) -> BaseNode | None:
+        """Find the live node that deleting `node` would damage, or None if nothing would be.
+
+        Two ways a delete can damage a run, and only these two:
+
+        1. The node is part of the live run and has not settled, so the run is still counting on it
+           to produce something.
+        2. A node in the live run has not been dispatched yet and is fed by this node. Dispatch is
+           when a node collects its inputs from upstream, so a consumer that has not been dispatched
+           has not received this node's outputs and would fall back to its parameter defaults --
+           finishing the run with the wrong answer and no indication anything went wrong.
+
+        A consumer that is already processing or done has its values, so it is not damaged. Control
+        connections count the same as data connections here: deleting a settled node whose control
+        output feeds a node that has not started truncates the chain and can strand it.
+
+        The live run is the DAG, not the flow. Nodes the run was never going to reach are absent
+        from it, which is what makes deleting a bystander or an unreached consumer free.
+        """
+        dag_nodes = self.engine.flow_manager.global_dag_builder.node_to_reference
+
+        own_dag_node = dag_nodes.get(node.name)
+        if own_dag_node is not None and own_dag_node.node_state not in _SETTLED_NODE_STATES:
+            return node
+
+        connections = self.engine.flow_manager.get_connections()
+        for connection in connections.get_all_outgoing_connections(node):
+            target_dag_node = dag_nodes.get(connection.target_node.name)
+            if target_dag_node is not None and target_dag_node.node_state in _UNCOLLECTED_NODE_STATES:
+                return connection.target_node
+
         return None
 
     async def on_delete_node_request(self, request: DeleteNodeRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915 (Complex logic, lots of edge cases)
