@@ -883,6 +883,29 @@ class LibraryManager(EngineScoped):
                 and library_info.library_name
                 and not self._is_worker
             ):
+                # A declared resource this machine does not have makes the whole spawn pointless:
+                # get_worker_for_library refuses on that reason before it ever consults a worker,
+                # so the process would resolve and download an entire execution environment --
+                # torch, gigabytes -- to serve nothing. Checked before the lifecycle moves below,
+                # because a legacy worker-mode library parked in WORKER_PENDING with no spawn
+                # coming would block boot for the whole startup grace.
+                #
+                # Only for libraries whose nodes already exist here. A legacy worker-mode library
+                # has none: the orchestrator skips its node modules entirely and its classes arrive
+                # as stubs from the worker's LibraryLoadedNotification. Skipping its spawn would
+                # leave the library with no node types at all -- an empty entry in the sidebar and
+                # placeholder nodes in any workflow using it. It still cannot execute, because the
+                # reset below preserves its refusal.
+                has_unmet_requirement = any(
+                    isinstance(problem, IncompatibleRequirementsProblem) for problem in library_info.problems
+                )
+                if has_unmet_requirement and not library_info.requires_worker:
+                    logger.info(
+                        "Not starting a worker for library '%s': %s",
+                        library_info.library_name,
+                        library_info.execution_unavailable_reason,
+                    )
+                    continue
                 # Legacy worker-mode libraries load AS the worker confirms (stubs meanwhile),
                 # so their lifecycle gates on the spawn. Exec-deps libraries loaded real
                 # nodes locally already: the worker gates execution availability only, and
@@ -896,12 +919,17 @@ class LibraryManager(EngineScoped):
                 # "Library not found". This event is set by the worker's LibraryLoadedNotification,
                 # and the execute path waits on it (wait_for_worker_library_load).
                 library_info.worker_ready = asyncio.Event()
-                # A fresh attempt, so whatever made execution unavailable before no longer
-                # describes the situation. Deliberately not conditioned on the result:
-                # StartWorkerRequest only SCHEDULES the spawn and always reports success, so a
-                # spawn that dies records its own reason from the task's exception handler
-                # (WorkerManager._log_spawn_error) rather than being inferred from here.
-                library_info.execution_unavailable_reason = None
+                # A fresh attempt, so an account of a PREVIOUS one no longer describes the
+                # situation. Not conditioned on the result: StartWorkerRequest only SCHEDULES the
+                # spawn and always reports success, so a spawn that dies records its own reason
+                # from the task's exception handler (WorkerManager._log_spawn_error).
+                #
+                # An unmet requirement is not an account of an attempt -- the machine still lacks
+                # the resource -- and it is the ONLY gate get_worker_for_library has. Clearing it
+                # would leave a legacy worker-mode library, whose spawn is deliberately not
+                # skipped above, dispatching to a worker that cannot load it.
+                if not has_unmet_requirement:
+                    library_info.execution_unavailable_reason = None
                 await self.engine.ahandle_request(StartWorkerRequest(library_name=library_info.library_name))
 
     def on_worker_evicted(self, worker_engine_id: str, library_name: str | None) -> None:
