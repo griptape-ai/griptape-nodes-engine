@@ -535,6 +535,46 @@ class TestLibraryDependencyResolution:
 
         assert manager._library_info_for_repo_name("griptape-nodes-library-openexr") is None
 
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "griptape-ai/griptape-nodes-library-openexr",
+            "griptape-ai/griptape-nodes-library-openexr@v1.2.0",
+            "https://github.com/griptape-ai/griptape-nodes-library-openexr.git",
+            "https://github.com/griptape-ai/griptape-nodes-library-openexr.git@v1.2.0",
+        ],
+    )
+    def test_every_spelling_of_a_declaration_url_yields_one_repo_name(self, url: str) -> None:
+        """Both callers of the resolver read the same field, so they must normalize it the same way.
+
+        A `@ref` suffix and a `.git` extension both change the final path segment. One call site
+        normalized and the other did not, so a pinned declaration resolved for the transitive
+        resolver and missed for the worker's target expansion -- and a miss only logs.
+        """
+        assert LibraryManager._repo_name_from_dependency_url(url) == "griptape-nodes-library-openexr"
+
+    def test_a_failed_duplicate_does_not_mask_the_copy_that_loaded(self) -> None:
+        """One path can hold a FAILURE record beside the copy that loaded.
+
+        Both callers need library_name, so answering with the failed entry reports "not installed
+        here" for a library that is.
+        """
+        manager = _make_library_manager()
+        path = "/libs/griptape-nodes-library-openexr/griptape-nodes-library.json"
+        manager._library_file_path_to_info[path + "#failed"] = LibraryManager.LibraryInfo(
+            lifecycle_state=LibraryManager.LibraryLifecycleState.FAILURE,
+            fitness=LibraryManager.LibraryFitness.UNUSABLE,
+            library_path=path,
+            is_sandbox=False,
+            library_name=None,
+        )
+        self._register(manager, path=path, library_name="OpenEXR Library")
+
+        info = manager._library_info_for_repo_name("griptape-nodes-library-openexr")
+
+        assert info is not None
+        assert info.library_name == "OpenEXR Library"
+
 
 class TestExpandTargetsWithLibraryDependencies:
     """A worker must load the libraries its library declares, or a feature works only while editing.
