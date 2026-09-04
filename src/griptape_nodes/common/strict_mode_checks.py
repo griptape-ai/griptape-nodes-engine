@@ -102,14 +102,28 @@ RULES: dict[str, StrictModeRule] = {
         correctness=False,
         description=(
             "A node called add_parameter or remove_parameter during "
-            "aprocess. On the worker these changes are local to the "
-            "transient node and do not sync back to the orchestrator."
+            "aprocess, which violates the structure contract: a "
+            "node's parameter structure must be a deterministic "
+            "function of its parameter values, created in __init__ or "
+            "by a value hook. Structure created anywhere else cannot "
+            "survive, because each execution builds a fresh copy from "
+            "the node class and only VALUES carry over (hydration "
+            "re-runs the hooks, which is how derived structure "
+            "reappears). A direct mutation during aprocess is local "
+            "to the transient copy and never syncs; the request-driven "
+            "path syncs to the orchestrator but is not readable back "
+            "on the executing copy, and does not reappear on later "
+            "executions either."
         ),
         remediation_template=(
             "Node '{node_name}' (type '{node_class}') mutated parameter "
             "'{parameter_name}' during aprocess via {mutation}. Emit "
             "AddParameterToNodeRequest or RemoveParameterFromNodeRequest "
-            "to propagate the change to the orchestrator."
+            "to propagate the change to the orchestrator. Note that the "
+            "change reaches the orchestrator's node, not this one: do "
+            "not read the parameter back locally. Each execution builds "
+            "a fresh copy from the node class, so the parameter exists "
+            "here only if __init__ or a value hook re-creates it."
         ),
     ),
     "worker-reach-into-orchestrator": StrictModeRule(

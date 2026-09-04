@@ -3429,24 +3429,9 @@ class NodeManager(EngineScoped):
         with scope_cm:
             # Rehydrate serialized artifacts that crossed the orchestrator->worker JSON boundary.
             parameter_values = hydrate_parameter_values(request.parameter_values)
-            for param_name, value in parameter_values.items():
-                # Skip when the node already holds this value. The local path
-                # calls ExecuteNodeRequest with dict(node.parameter_values) on
-                # the same in-memory instance, so every iteration would be a
-                # no-op mutation that still ran before/after_value_set hooks
-                # and emitted a lifecycle event -- observably breaking nodes
-                # like LoadImage. On the worker the node is fresh, so current
-                # is _PARAM_MISSING and the normal set path runs.
-                current = node.parameter_values.get(param_name, _PARAM_MISSING)
-                if current is value or current == value:
-                    continue
-                try:
-                    node.set_parameter_value(param_name, value)
-                except Exception as e:
-                    return ExecuteNodeResultFailure(
-                        result_details=f"Attempted to set parameter '{param_name}' on node '{node_name}'. Failed with error: {e}",
-                        exception=e,
-                    )
+            hydration_failure = self._apply_hydrated_values(node, node_name, parameter_values)
+            if hydration_failure is not None:
+                return hydration_failure
             # Materialize parameter defaults into parameter_values so that user
             # process() code reading self.parameter_values[name] directly (rather
             # than via get_parameter_value) sees the default. Newly-dropped nodes
@@ -3492,6 +3477,71 @@ class NodeManager(EngineScoped):
             parameter_output_values=dict(node.parameter_output_values),
             result_details=f"Node '{node_name}' executed successfully.",
         )
+
+    def _apply_hydrated_values(
+        self, node: BaseNode, node_name: str, parameter_values: dict[str, Any]
+    ) -> ExecuteNodeResultFailure | None:
+        """Apply hydrated parameter values to an executing node. Returns a failure or None.
+
+        Applied in passes until a fixpoint, because parameter STRUCTURE derives from values
+        (the authoring contract): setting a value fires the node's value hooks, and hooks are
+        where a node like the diffusers VAE decoder creates the parameters its other values
+        belong to. A fresh worker-side node starts with only its __init__ shape, so a value
+        for a derived parameter can arrive before the value that derives it -- hydration
+        order is dict order, which promises nothing. Each pass sets every value whose
+        parameter exists (running the derivations) and defers the rest; deferred values are
+        retried as long as a pass made progress, so a derivation CHAIN (provider creates
+        model, model creates options) hydrates fully no matter how the values were ordered.
+        Termination is guaranteed: a productive pass strictly shrinks the deferred set, and
+        an unproductive one ends the loop.
+
+        A value still unclaimed after both passes belongs to a parameter nothing on this copy
+        derives -- most often one added to the authoritative node by request (a user-added
+        parameter in the editor, or a node that added one mid-execution and expected it to
+        persist). Skipped rather than failed: the authoritative value is untouched on the
+        orchestrator, and failing here made any user-added parameter fatal to a worker-routed
+        node. The warning names the contract so the author of a node that MEANT this
+        parameter to exist knows what to change.
+        """
+        pending = parameter_values
+        deferred: dict[str, Any] = {}
+        made_progress = True
+        while pending and made_progress:
+            deferred = {}
+            made_progress = False
+            for param_name, value in pending.items():
+                if node.get_parameter_by_name(param_name) is None:
+                    deferred[param_name] = value
+                    continue
+                made_progress = True
+                # Skip when the node already holds this value. The local path calls
+                # ExecuteNodeRequest with dict(node.parameter_values) on the same in-memory
+                # instance, so every iteration would be a no-op mutation that still ran
+                # before/after_value_set hooks and emitted a lifecycle event -- observably
+                # breaking nodes like LoadImage. On the worker the node is fresh, so current
+                # is _PARAM_MISSING and the normal set path runs.
+                current = node.parameter_values.get(param_name, _PARAM_MISSING)
+                if current is value or current == value:
+                    continue
+                try:
+                    node.set_parameter_value(param_name, value)
+                except Exception as e:
+                    return ExecuteNodeResultFailure(
+                        result_details=f"Attempted to set parameter '{param_name}' on node '{node_name}'. Failed with error: {e}",
+                        exception=e,
+                    )
+            pending = deferred
+        for param_name in deferred:
+            logger.warning(
+                "Node '%s' received a value for parameter '%s', which does not exist on the "
+                "executing copy and was not created by its value hooks. The value was left "
+                "unapplied for this run. Parameter structure must derive from parameter "
+                "values (created in __init__ or by a value hook); a parameter added only by "
+                "request does not carry over to execution.",
+                node_name,
+                param_name,
+            )
+        return None
 
     @staticmethod
     def _unshippable_output_names(node: BaseNode) -> list[str]:

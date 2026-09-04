@@ -114,6 +114,15 @@
         "description": "Writes binary through File and verifies it survived",
         "display_name": "WriteBytesNode"
       }
+    },
+    {
+      "class_name": "DerivedStructureNode",
+      "file_path": "worker_behavior_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Derives parameter structure from a value",
+        "display_name": "DerivedStructureNode"
+      }
     }
   ]
 }
