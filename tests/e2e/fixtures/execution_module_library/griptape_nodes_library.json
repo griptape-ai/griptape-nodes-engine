@@ -1,0 +1,41 @@
+{
+  "name": "Execution Module Library",
+  "library_schema_version": "0.13.0",
+  "metadata": {
+    "author": "Test Fixture",
+    "description": "Library whose heavy imports live behind a declared execution-module boundary",
+    "library_version": "0.1.0",
+    "engine_version": "0.0.0",
+    "tags": [
+      "test"
+    ],
+    "dependencies": {
+      "pip_dependencies": [],
+      "pip_dependencies_exec": []
+    }
+  },
+  "categories": [
+    {
+      "test": {
+        "title": "test",
+        "description": "Test nodes",
+        "color": "border-gray-500",
+        "icon": "Folder"
+      }
+    }
+  ],
+  "execution_modules": [
+    "execution"
+  ],
+  "nodes": [
+    {
+      "class_name": "BoundaryNode",
+      "file_path": "boundary_node.py",
+      "metadata": {
+        "category": "test",
+        "description": "Reaches execution code through the engine",
+        "display_name": "Boundary Node"
+      }
+    }
+  ]
+}

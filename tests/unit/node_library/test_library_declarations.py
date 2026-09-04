@@ -402,9 +402,9 @@ class TestRequiresWorkerProcess:
 
 
 class TestSchemaVersion:
-    def test_latest_schema_version_is_0_12_0(self) -> None:
-        # 0.12.0 added Dependencies.pip_dependencies_exec.
-        assert LibrarySchema.LATEST_SCHEMA_VERSION == "0.12.0"
+    def test_latest_schema_version_is_0_13_0(self) -> None:
+        # 0.12.0 added Dependencies.pip_dependencies_exec; 0.13.0 added execution_modules.
+        assert LibrarySchema.LATEST_SCHEMA_VERSION == "0.13.0"
 
 
 # ---------- Model catalog ----------
