@@ -165,6 +165,27 @@ isolation is the same.
 pip resolution conflicts.** This is the most important guarantee on
 this page.
 
+#### Edit-time vs. execution dependencies
+
+A library can split its dependencies into two sets in its manifest:
+
+- `pip_dependencies` — **edit-time**: what's needed to show the
+    library's nodes in the editor, place them on the canvas, and
+    edit their parameters. Keep this set light.
+- `pip_dependencies_exec` — **execution**: the heavy packages
+    (torch, diffusers, and friends) that are only needed when a
+    node actually *runs*.
+
+Execution dependencies are installed into a separate environment
+(`.venv-exec`, next to the library's `.venv`) and are only loaded
+in the process where nodes execute — never in the main engine
+process. That means a library can depend on multi-gigabyte ML
+stacks while the editor stays light, and two libraries with
+clashing heavy pins can still be edited side by side.
+
+Declaring no `pip_dependencies_exec` is always safe: the library
+behaves exactly as it did before the split existed.
+
 ### Process isolation: the Isolated mode
 
 Running a library **Isolated** (in its own dedicated process,
