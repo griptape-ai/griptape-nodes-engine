@@ -80,23 +80,6 @@ Hydration-time mutations made from `before_value_set` /
 `RemoveParameterFromNodeRequest` so the mutation propagates to the
 authoritative orchestrator-side node.
 
-#### `worker-reach-into-orchestrator`
-
-A node running on a worker issued a request whose authoritative state
-lives on the orchestrator (flow graph, connections, parameter
-registry, config, secrets). The request is forwarded across the
-WebSocket bus; each call is a network round-trip and the returned
-view is stale-by-call.
-
-The rule fires for forwarded requests issued anywhere during a
-node's execution -- including from `before_value_set` /
-`after_value_set` during hydration -- not only from `aprocess`.
-
-**Remediation**: if this is an intentional write (e.g. publishing a
-parameter value), ignore the warning. If this is a read of flow /
-connection state, consider whether the data could be passed in via
-parameters instead of fetched per-call.
-
 #### `connection-hooks-inert-on-worker`
 
 A node class in a worker-hosted library overrides one or more
