@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -673,3 +674,32 @@ class TestAtomicWriteBytes:
         atomic_write_bytes(target, b"new")
 
         assert stat.S_IMODE(target.stat().st_mode) == expected_mode
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="symlink creation needs privileges on Windows")
+    def test_writes_through_symlink_destination(self, temp_dir: Path) -> None:
+        """A symlinked destination keeps the link and updates its target.
+
+        Matches in-place open(mode="w") semantics; a naive rename would replace
+        the link itself with a regular file and leave the target stale.
+        """
+        real_target = temp_dir / "real.bin"
+        real_target.write_bytes(b"old")
+        link = temp_dir / "link.bin"
+        link.symlink_to(real_target)
+
+        atomic_write_bytes(link, b"new")
+
+        assert link.is_symlink()
+        assert real_target.read_bytes() == b"new"
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="symlink creation needs privileges on Windows")
+    def test_dangling_symlink_creates_target(self, temp_dir: Path) -> None:
+        """Writing to a dangling link creates its target, as open() would."""
+        missing_target = temp_dir / "missing.bin"
+        link = temp_dir / "link.bin"
+        link.symlink_to(missing_target)
+
+        atomic_write_bytes(link, b"new")
+
+        assert link.is_symlink()
+        assert missing_target.read_bytes() == b"new"

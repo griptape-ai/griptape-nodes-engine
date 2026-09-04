@@ -215,6 +215,26 @@ class TestBlanketExceptionHandling:
         assert isinstance(result.result_details, ResultDetails)
         assert "i/o error" in result.result_details.result_details[0].message.lower()
 
+    def test_text_overwrite_translates_newlines_to_platform_linesep(
+        self, engine: Engine, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Str OVERWRITE keeps the text-mode newline translation open(mode="w") did.
+
+        The atomic write path emits raw bytes, so without explicit translation
+        every text save on Windows would silently switch from CRLF to bare LF.
+        """
+        import os as os_module
+
+        monkeypatch.setattr(os_module, "linesep", "\r\n")
+
+        file_path = temp_dir / "text.txt"
+        request = WriteFileRequest(file_path=str(file_path), content="line one\nline two\n")
+
+        result = engine.os_manager.on_write_file_request(request)
+
+        assert isinstance(result, WriteFileResultSuccess)
+        assert file_path.read_bytes() == b"line one\r\nline two\r\n"
+
     def test_disk_full_on_overwrite_maps_to_disk_full(self, engine: Engine, temp_dir: Path) -> None:
         """A full destination volume fails as DISK_FULL with an actionable message.
 

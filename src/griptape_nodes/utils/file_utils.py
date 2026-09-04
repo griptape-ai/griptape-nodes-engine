@@ -75,6 +75,12 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
         path: Destination file path. Its parent directory must already exist.
         data: Bytes to write.
     """
+    # Write THROUGH a symlinked destination, matching in-place open(mode="w")
+    # semantics: the link survives and its target gets the new content. Without
+    # this, the rename would replace the link itself with a regular file and
+    # leave the target stale. A dangling link creates its target, as open() would.
+    if path.is_symlink():
+        path = path.resolve()
     tmp_fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
     tmp_path = Path(tmp_name)
     try:
