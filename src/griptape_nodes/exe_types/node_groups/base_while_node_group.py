@@ -132,12 +132,10 @@ class BaseWhileNodeGroup(SubflowNodeGroup):
             iteration: The upcoming iteration number (1-based)
             flow_name: Name of the deserialized flow being executed
         """
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
         # Reset all nodes to UNRESOLVED so they re-execute. The DAG builder
         # skips RESOLVED upstream dependencies, so without this reset nodes
         # won't be added to the DAG and won't run on subsequent iterations.
-        GriptapeNodes.FlowManager().unresolve_all_nodes_in_flow(flow_name)
+        self.engine.flow_manager.unresolve_all_nodes_in_flow(flow_name)
 
     def _on_complete(self, *, condition_met: bool, iterations: int) -> None:  # noqa: ARG002
         """Called after all loop iterations are finished, before the node resolves.

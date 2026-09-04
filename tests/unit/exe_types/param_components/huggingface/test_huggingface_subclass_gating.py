@@ -57,7 +57,7 @@ def _stub(verdicts: list[ModelAccessVerdict]):  # noqa: ANN202
         msg = f"unexpected request: {type(request).__name__}"
         raise AssertionError(msg)
 
-    return patch(f"{_MODULE}.huggingface_model_parameter.GriptapeNodes.handle_request", side_effect=handle_request)
+    return patch("griptape_nodes.retained_mode.engine.Engine.handle_request", side_effect=handle_request)
 
 
 @pytest.fixture(autouse=True)

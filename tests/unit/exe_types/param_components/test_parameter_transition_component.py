@@ -44,9 +44,7 @@ from tests.unit.exe_types.mocks import MockNode
 
 # Patch target — GriptapeNodes is imported INTO the component module, so the
 # binding to patch is the module-local reference, not the global singleton.
-_HANDLE_REQUEST_TARGET = (
-    "griptape_nodes.exe_types.param_components.parameter_transition_component.GriptapeNodes.handle_request"
-)
+_HANDLE_REQUEST_TARGET = "griptape_nodes.retained_mode.engine.Engine.handle_request"
 
 
 # ---------------------------------------------------------------------------

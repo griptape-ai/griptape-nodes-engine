@@ -40,7 +40,6 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     AddParameterToNodeResultSuccess,
     RemoveParameterFromNodeRequest,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.traits.options import Options
 
 if TYPE_CHECKING:
@@ -99,7 +98,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             type=ParameterTypeBuiltin.STR,
             allowed_modes={ParameterMode.PROPERTY},
             default_value=LOCAL_EXECUTION,
-            traits={Options(choices=get_library_names_with_publish_handlers())},
+            traits={Options(choices=get_library_names_with_publish_handlers(self.engine))},
         )
         self.add_parameter(self.execution_environment)
         # Track mapping from proxy parameter name to (original_node, original_param_name)
@@ -144,7 +143,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             set_as_new_context=False,
             metadata=subflow_metadata,
         )
-        result = GriptapeNodes.handle_request(request)
+        result = self.engine.handle_request(request)
         if not isinstance(result, CreateFlowResultSuccess):
             # Drop the name we optimistically recorded: no such flow exists, and leaving it set
             # makes every later lookup point at a phantom flow.
@@ -175,7 +174,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 return enclosing_subflow_name
 
         # A group can be built with no Flow on the context stack, so this may find nothing.
-        context_manager = GriptapeNodes.ContextManager()
+        context_manager = self.engine.context_manager
         if not context_manager.has_current_flow():
             return None
         return context_manager.get_current_flow().name
@@ -191,7 +190,6 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         4. Stores metadata mapping execution environments to their parameters
         """
         from griptape_nodes.retained_mode.events.workflow_events import PublishWorkflowRequest
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         # Initialize metadata structure for execution environment mappings
         if self.metadata is None:
@@ -200,7 +198,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             self.metadata["execution_environment"] = {}
 
         # Get all libraries that have registered PublishWorkflowRequest handlers
-        library_manager = GriptapeNodes.LibraryManager()
+        library_manager = self.engine.library_manager
         event_handlers = library_manager.get_registered_event_handlers(PublishWorkflowRequest)
 
         # Process each registered library
@@ -327,7 +325,6 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             The newly created proxy parameter
         """
         # Clone the parameter with the new name
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         input_types = None
         output_type = None
@@ -346,7 +343,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             mode_allowed_output=True,
         )
         # Add with a request, because this will handle naming for us.
-        result = GriptapeNodes.handle_request(request)
+        result = self.engine.handle_request(request)
         if not isinstance(result, AddParameterToNodeResultSuccess):
             msg = "Failed to add parameter to node."
             raise TypeError(msg)
@@ -397,7 +394,6 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             # Store the existing connection so it can be recreated if needed.
         else:
             grouped_parameter = conn.source_parameter
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         request = DeleteConnectionRequest(
             conn.source_parameter.name,
@@ -405,7 +401,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             conn.source_node.name,
             conn.target_node.name,
         )
-        result = GriptapeNodes.handle_request(request)
+        result = self.engine.handle_request(request)
         if not isinstance(result, DeleteConnectionResultSuccess):
             return False
         proxy_parameter = self._create_proxy_parameter_for_connection(grouped_parameter, is_incoming=is_incoming)
@@ -416,7 +412,6 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
     def create_connections_for_proxy(
         self, proxy_parameter: Parameter, old_connection: Connection, *, is_incoming: bool
     ) -> None:
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         create_first_connection = CreateConnectionRequest(
             source_parameter_name=old_connection.source_parameter.name,
@@ -438,8 +433,8 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             self._proxy_param_to_connections[proxy_parameter.name] = 2
         else:
             self._proxy_param_to_connections[proxy_parameter.name] += 2
-        GriptapeNodes.handle_request(create_first_connection)
-        GriptapeNodes.handle_request(create_second_connection)
+        self.engine.handle_request(create_first_connection)
+        self.engine.handle_request(create_second_connection)
 
     def unmap_node_connections(self, node: BaseNode, connections: Connections) -> None:  # noqa: C901
         """Remove tracking of an external connection, restore original connection, and clean up proxy parameter.
@@ -448,8 +443,6 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             node: The node to unmap
             connections: The connections object
         """
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
         # For the node being removed - We need to figure out all of it's connections TO the node group. These connections need to be remapped.
         # If we delete connections from a proxy parameter, and it has no more connections, then the proxy parameter should be deleted unless it's user defined.
         # It will 1. not be in the proxy map. and 2. it will have a value of > 0
@@ -462,7 +455,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 # get old connections first, since this will delete the proxy
                 remap_connections = connections.get_outgoing_connections_from_parameter(self, proxy_parameter)
                 # Delete the internal connection
-                delete_result = GriptapeNodes.FlowManager().on_delete_connection_request(
+                delete_result = self.engine.flow_manager.on_delete_connection_request(
                     DeleteConnectionRequest(
                         source_parameter_name=parameter_name,
                         target_parameter_name=proxy_parameter.name,
@@ -476,7 +469,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
 
                 # Now create the new connection! We need to get the connections from the proxy parameter
                 for connection in remap_connections:
-                    create_result = GriptapeNodes.FlowManager().on_create_connection_request(
+                    create_result = self.engine.flow_manager.on_create_connection_request(
                         CreateConnectionRequest(
                             source_parameter_name=parameter_name,
                             target_parameter_name=connection.target_parameter.name,
@@ -497,7 +490,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 # Get the incoming connections to the proxy parameter
                 remap_connections = connections.get_incoming_connections_to_parameter(self, proxy_parameter)
                 # Delete the internal connection
-                delete_result = GriptapeNodes.FlowManager().on_delete_connection_request(
+                delete_result = self.engine.flow_manager.on_delete_connection_request(
                     DeleteConnectionRequest(
                         source_parameter_name=proxy_parameter.name,
                         target_parameter_name=parameter_name,
@@ -511,7 +504,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
 
                 # Now create the new connection! We need to get the connections to the proxy parameter
                 for connection in remap_connections:
-                    create_result = GriptapeNodes.FlowManager().on_create_connection_request(
+                    create_result = self.engine.flow_manager.on_create_connection_request(
                         CreateConnectionRequest(
                             source_parameter_name=connection.source_parameter.name,
                             target_parameter_name=parameter_name,
@@ -530,14 +523,12 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             proxy_parameter: The proxy parameter to potentially clean up
             metadata_key: The metadata key ('left_parameters' or 'right_parameters')
         """
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
         if proxy_parameter.name not in self._proxy_param_to_connections:
             return
 
         self._proxy_param_to_connections[proxy_parameter.name] -= 1
         if self._proxy_param_to_connections[proxy_parameter.name] == 0:
-            GriptapeNodes.NodeManager().on_remove_parameter_from_node_request(
+            self.engine.node_manager.on_remove_parameter_from_node_request(
                 request=RemoveParameterFromNodeRequest(node_name=self.name, parameter_name=proxy_parameter.name)
             )
             del self._proxy_param_to_connections[proxy_parameter.name]
@@ -551,8 +542,6 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             node: The node being added to the group
             connections: Connections object from FlowManager
         """
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
         outgoing_connections = connections.get_outgoing_connections_to_node(node, to_node=self)
         for parameter_name, outgoing_connection_list in outgoing_connections.items():
             for outgoing_connection in outgoing_connection_list:
@@ -568,7 +557,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 )
 
                 # Delete the connection from this node to proxy
-                delete_result = GriptapeNodes.FlowManager().on_delete_connection_request(
+                delete_result = self.engine.flow_manager.on_delete_connection_request(
                     DeleteConnectionRequest(
                         source_parameter_name=parameter_name,
                         target_parameter_name=proxy_parameter.name,
@@ -582,7 +571,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
 
                 # Create direct connections from this node to target nodes
                 for connection in remap_connections:
-                    create_result = GriptapeNodes.FlowManager().on_create_connection_request(
+                    create_result = self.engine.flow_manager.on_create_connection_request(
                         CreateConnectionRequest(
                             source_parameter_name=parameter_name,
                             target_parameter_name=connection.target_parameter.name,
@@ -597,7 +586,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 # Only delete outgoing connections from proxy and clean up if no other incoming connections exist
                 if not other_incoming_exists:
                     for connection in remap_connections:
-                        delete_result = GriptapeNodes.FlowManager().on_delete_connection_request(
+                        delete_result = self.engine.flow_manager.on_delete_connection_request(
                             DeleteConnectionRequest(
                                 source_parameter_name=connection.source_parameter.name,
                                 target_parameter_name=connection.target_parameter.name,
@@ -618,8 +607,6 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             node: The node being added to the group
             connections: Connections object from FlowManager
         """
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
         incoming_connections = connections.get_incoming_connections_from_node(node, from_node=self)
         for parameter_name, incoming_connection_list in incoming_connections.items():
             for incoming_connection in incoming_connection_list:
@@ -635,7 +622,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 )
 
                 # Delete the connection from proxy to this node
-                delete_result = GriptapeNodes.FlowManager().on_delete_connection_request(
+                delete_result = self.engine.flow_manager.on_delete_connection_request(
                     DeleteConnectionRequest(
                         source_parameter_name=proxy_parameter.name,
                         target_parameter_name=parameter_name,
@@ -649,7 +636,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
 
                 # Create direct connections from source nodes to this node
                 for connection in remap_connections:
-                    create_result = GriptapeNodes.FlowManager().on_create_connection_request(
+                    create_result = self.engine.flow_manager.on_create_connection_request(
                         CreateConnectionRequest(
                             source_parameter_name=connection.source_parameter.name,
                             target_parameter_name=parameter_name,
@@ -664,7 +651,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 # Only delete incoming connections to proxy and clean up if no other outgoing connections exist
                 if not other_outgoing_exists:
                     for connection in remap_connections:
-                        delete_result = GriptapeNodes.FlowManager().on_delete_connection_request(
+                        delete_result = self.engine.flow_manager.on_delete_connection_request(
                             DeleteConnectionRequest(
                                 source_parameter_name=connection.source_parameter.name,
                                 target_parameter_name=proxy_parameter.name,
@@ -765,7 +752,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                     self._discard_subflow_created_for_a_failed_add()
                 raise
 
-        connections = GriptapeNodes.FlowManager().get_connections()
+        connections = self.engine.flow_manager.get_connections()
         node_names_in_group = set(self.nodes.keys())
         self.metadata["node_names_in_group"] = list(node_names_in_group)
         self.remap_to_internal(nodes, connections)
@@ -911,7 +898,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         if subflow_name is None:
             return
 
-        subflow = GriptapeNodes.ObjectManager().attempt_get_object_by_name_as_type(subflow_name, ControlFlow)
+        subflow = self.engine.object_manager.attempt_get_object_by_name_as_type(subflow_name, ControlFlow)
         if subflow is None:
             self.metadata.pop("subflow_name", None)
             return
@@ -925,7 +912,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             )
             return
 
-        delete_result = GriptapeNodes.handle_request(DeleteFlowRequest(flow_name=subflow_name))
+        delete_result = self.engine.handle_request(DeleteFlowRequest(flow_name=subflow_name))
         if isinstance(delete_result, DeleteFlowResultFailure):
             # Not worth failing the add twice over: it is already failing, and the message the artist
             # gets should be why their nodes did not move, not a leftover flow they cannot see.
@@ -950,7 +937,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             NodeGroupMembershipError: If the engine refused the move, carrying the reason it gave
         """
         move_request = MoveNodeToNewFlowRequest(node_name=node.name, target_flow_name=flow_name)
-        move_result = GriptapeNodes.handle_request(move_request)
+        move_result = self.engine.handle_request(move_request)
         if not isinstance(move_result, MoveNodeToNewFlowResultSuccess):
             # Carry the engine's own reason rather than only logging it: this is the innermost thing
             # that knows why the move was refused, and the caller turns it into what the artist reads.
@@ -988,7 +975,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         # editor but loses its contents on save, so the caller has to hear about it. Both callers
         # turn this into a failure result (see NodeManager.on_add_nodes_to_node_group_request).
         try:
-            GriptapeNodes.FlowManager().reparent_flow(child_subflow_name, parent_subflow_name)
+            self.engine.flow_manager.reparent_flow(child_subflow_name, parent_subflow_name)
         except ValueError as err:
             msg = (
                 f"Attempted to change what group '{node.name}' belongs to. "
@@ -1054,8 +1041,6 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         if not conn_list:
             return
 
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
         # All connections share the same external parameter
         # For outgoing: the internal (source) parameter is shared
         # For incoming: the external (source) parameter is shared
@@ -1076,7 +1061,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 conn.source_node.name,
                 conn.target_node.name,
             )
-            result = GriptapeNodes.handle_request(request)
+            result = self.engine.handle_request(request)
             if not isinstance(result, DeleteConnectionResultSuccess):
                 logger.warning(
                     "%s failed to delete connection from %s.%s to %s.%s",
@@ -1118,9 +1103,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         Returns:
             The existing proxy parameter if found, None otherwise
         """
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        connections = GriptapeNodes.FlowManager().get_connections()
+        connections = self.engine.flow_manager.get_connections()
 
         # Determine which proxy parameters to check based on direction
         if is_incoming:
@@ -1154,8 +1137,6 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             old_connection: The original connection being remapped
             is_incoming: True if this is an incoming connection to the group
         """
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
         create_first_connection = CreateConnectionRequest(
             source_parameter_name=old_connection.source_parameter.name,
             target_parameter_name=proxy_parameter.name,
@@ -1177,8 +1158,8 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         else:
             self._proxy_param_to_connections[proxy_parameter.name] += 2
 
-        GriptapeNodes.handle_request(create_first_connection)
-        GriptapeNodes.handle_request(create_second_connection)
+        self.engine.handle_request(create_first_connection)
+        self.engine.handle_request(create_second_connection)
 
     def delete_nodes_from_group(self, nodes: list[BaseNode]) -> None:
         """Delete nodes from the group and untrack their connections.
@@ -1231,7 +1212,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             # Rolling back means going the way they came: into this group's subflow.
             self._relocate_nodes(nodes, destination_flow_name=parent_flow_name, rollback_flow_name=subflow_name)
 
-        connections = GriptapeNodes.FlowManager().get_connections()
+        connections = self.engine.flow_manager.get_connections()
         for node in nodes:
             node.parent_group = None
             self.nodes.pop(node.name)
@@ -1261,11 +1242,10 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             StartLocalSubflowRequest,
             StartLocalSubflowResultFailure,
         )
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         subflow = self.metadata.get("subflow_name")
         if subflow is not None and isinstance(subflow, str):
-            result = await GriptapeNodes.FlowManager().on_start_local_subflow_request(
+            result = await self.engine.flow_manager.on_start_local_subflow_request(
                 StartLocalSubflowRequest(flow_name=subflow)
             )
 
@@ -1285,9 +1265,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         For each right (output) proxy parameter, finds the internal node connected
         to it and copies the value to this group's parameter_output_values.
         """
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        connections = GriptapeNodes.FlowManager().get_connections()
+        connections = self.engine.flow_manager.get_connections()
 
         right_params = self.metadata.get(RIGHT_PARAMETERS_KEY, [])
         for proxy_param_name in right_params:
@@ -1330,9 +1308,9 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         self.remove_nodes_from_group(nodes_to_remove)
         subflow_name = self.metadata.get("subflow_name")
         if subflow_name is not None:
-            subflow = GriptapeNodes.ObjectManager().attempt_get_object_by_name_as_type(subflow_name, ControlFlow)
+            subflow = self.engine.object_manager.attempt_get_object_by_name_as_type(subflow_name, ControlFlow)
             if subflow is not None:
-                delete_result = GriptapeNodes.handle_request(DeleteFlowRequest(flow_name=subflow_name))
+                delete_result = self.engine.handle_request(DeleteFlowRequest(flow_name=subflow_name))
                 if isinstance(delete_result, DeleteFlowResultFailure):
                     # This will propagate up to DeleteNodeRequest, and prevent the node from deleting.
                     msg = f"Failed to delete subflow {subflow_name} when deleting node {self.name}"
@@ -1351,7 +1329,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         nowhere to put these nodes" rather than an error in itself.
         """
         try:
-            return GriptapeNodes.NodeManager().get_node_parent_flow_by_name(self.name)
+            return self.engine.node_manager.get_node_parent_flow_by_name(self.name)
         except KeyError:
             logger.warning("%s has no parent flow", self.name)
             return None

@@ -7,6 +7,7 @@ in particular the one axis on which the two are ALLOWED to differ: `refuse_unrec
 """
 
 import logging
+from collections.abc import Callable
 from dataclasses import FrozenInstanceError
 from unittest.mock import MagicMock, patch
 
@@ -26,7 +27,20 @@ from griptape_nodes.retained_mode.events.access_events import (
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
 from tests.unit.exe_types.param_components.probe_scope import constructing_under_probe
 
-_HANDLE = "griptape_nodes.exe_types.param_components.model_policy.GriptapeNodes.handle_request"
+
+def _engine(result: object | None = None, *, side_effect: Callable[[object], object] | None = None) -> MagicMock:
+    """A stand-in engine whose ``handle_request`` answers with a canned result.
+
+    ``query_model_policy`` takes the engine to ask, so these tests hand it one rather than
+    patching a process-wide accessor.
+    """
+    engine = MagicMock()
+    if side_effect is not None:
+        engine.handle_request.side_effect = side_effect
+    else:
+        engine.handle_request.return_value = result
+    return engine
+
 
 DENIED = "owner/denied"
 ALLOWED = "owner/allowed"
@@ -45,16 +59,16 @@ class TestQueryModelPolicy:
             ModelAccessVerdict(model_id="md_denied", provider_model_id=DENIED, denial=_DENIAL),
             ModelAccessVerdict(model_id="md_allowed", provider_model_id=ALLOWED, denial=None),
         ]
-        with patch(_HANDLE, return_value=_success(verdicts)):
-            snapshot = query_model_policy("SomeNode")
+        snapshot = query_model_policy(_engine(_success(verdicts)), "SomeNode")
         assert snapshot.denial_by_provider_id == {DENIED: _DENIAL}
         assert snapshot.catalog_ids_by_provider_id == {DENIED: ("md_denied",), ALLOWED: ("md_allowed",)}
         assert snapshot.failure_detail is None
         assert snapshot.has_unmatchable_entries is False
 
     def test_fail_closed_records_a_failure_detail(self) -> None:
-        with patch(_HANDLE, return_value=QueryModelAccessForNodeResultFailure(result_details="not found")):
-            snapshot = query_model_policy("SomeNode")
+        snapshot = query_model_policy(
+            _engine(QueryModelAccessForNodeResultFailure(result_details="not found")), "SomeNode"
+        )
         assert snapshot.failure_detail is not None
         assert snapshot.denial_for(ALLOWED) is not None
 
@@ -66,11 +80,10 @@ class TestQueryModelPolicy:
         them, and a registration problem worded as a licensing one sends them looking in the wrong
         place entirely.
         """
-        with (
-            caplog.at_level(logging.WARNING, logger="griptape_nodes"),
-            patch(_HANDLE, return_value=QueryModelAccessForNodeResultFailure(result_details="not registered")),
-        ):
-            snapshot = query_model_policy("SomeNode")
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            snapshot = query_model_policy(
+                _engine(QueryModelAccessForNodeResultFailure(result_details="not registered")), "SomeNode"
+            )
 
         detail = snapshot.failure_detail
         assert detail is not None
@@ -84,16 +97,16 @@ class TestQueryModelPolicy:
 
     def test_fail_open_records_nothing(self) -> None:
         """Auto-detect uses this: an unresolvable node means "has not adopted declarations"."""
-        with patch(_HANDLE, return_value=QueryModelAccessForNodeResultFailure(result_details="not found")):
-            snapshot = query_model_policy("SomeNode", fail_closed=False)
+        snapshot = query_model_policy(
+            _engine(QueryModelAccessForNodeResultFailure(result_details="not found")), "SomeNode", fail_closed=False
+        )
         assert snapshot.failure_detail is None
         assert snapshot.declares_models is False
 
     def test_a_model_without_a_provider_handle_is_declared_but_unmatchable(self) -> None:
         """`provider_model_id` is optional, and absence is NOT "unresolved"."""
         verdicts = [ModelAccessVerdict(model_id="md_no_handle", provider_model_id=None, denial=None)]
-        with patch(_HANDLE, return_value=_success(verdicts)):
-            snapshot = query_model_policy("SomeNode")
+        snapshot = query_model_policy(_engine(_success(verdicts)), "SomeNode")
         assert snapshot.has_unmatchable_entries is True
         assert snapshot.catalog_ids_by_provider_id == {}
         # Still counts as declaring models -- otherwise enforcement would silently switch off.
@@ -175,8 +188,7 @@ class TestAnUnattributableDenialIsNotDropped:
     """
 
     def test_the_whole_parameter_is_refused(self) -> None:
-        with patch(_HANDLE, return_value=_success([ModelAccessVerdict("md_flux_dev", None, _DENIAL)])):
-            snapshot = query_model_policy("SomeNode")
+        snapshot = query_model_policy(_engine(_success([ModelAccessVerdict("md_flux_dev", None, _DENIAL)])), "SomeNode")
         assert snapshot.unmatchable_denials == ("md_flux_dev",)
         denial = snapshot.denial_for(ALLOWED, refuse_unrecognized=True)
         assert denial is not None
@@ -187,16 +199,14 @@ class TestAnUnattributableDenialIsNotDropped:
 
     def test_a_permitted_handleless_entry_does_not_refuse_anything(self) -> None:
         """Only a DENIED unmatchable entry escalates; a permitted one is merely unmatchable."""
-        with patch(_HANDLE, return_value=_success([ModelAccessVerdict("md_no_handle", None, None)])):
-            snapshot = query_model_policy("SomeNode")
+        snapshot = query_model_policy(_engine(_success([ModelAccessVerdict("md_no_handle", None, None)])), "SomeNode")
         assert snapshot.unmatchable_denials == ()
         assert snapshot.has_unmatchable_entries is True
         assert snapshot.denial_for(ALLOWED, refuse_unrecognized=True) is None
 
     def test_it_applies_even_with_refuse_unrecognized_off(self) -> None:
         """A static dropdown must not run a model policy explicitly forbade either."""
-        with patch(_HANDLE, return_value=_success([ModelAccessVerdict("md_flux_dev", None, _DENIAL)])):
-            snapshot = query_model_policy("SomeNode")
+        snapshot = query_model_policy(_engine(_success([ModelAccessVerdict("md_flux_dev", None, _DENIAL)])), "SomeNode")
         assert snapshot.denial_for(ALLOWED) is not None
 
 
@@ -214,8 +224,7 @@ class TestASharedProviderModelIdIsNotLastWriteWins:
             ModelAccessVerdict(model_id="md_flux_byok", provider_model_id=shared, denial=_DENIAL),
             ModelAccessVerdict(model_id="md_flux_gtc", provider_model_id=shared, denial=None),
         ]
-        with patch(_HANDLE, return_value=_success(verdicts)):
-            snapshot = query_model_policy("SomeNode")
+        snapshot = query_model_policy(_engine(_success(verdicts)), "SomeNode")
         assert snapshot.denial_for(shared) is _DENIAL
 
     def test_every_catalog_id_behind_a_handle_is_retained(self) -> None:
@@ -225,8 +234,7 @@ class TestASharedProviderModelIdIsNotLastWriteWins:
             ModelAccessVerdict(model_id="md_flux_byok", provider_model_id=shared, denial=None),
             ModelAccessVerdict(model_id="md_flux_gtc", provider_model_id=shared, denial=None),
         ]
-        with patch(_HANDLE, return_value=_success(verdicts)):
-            snapshot = query_model_policy("SomeNode")
+        snapshot = query_model_policy(_engine(_success(verdicts)), "SomeNode")
         assert snapshot.catalog_ids_for(shared) == ("md_flux_byok", "md_flux_gtc")
 
     def test_an_unknown_handle_has_no_catalog_ids(self) -> None:
@@ -260,11 +268,7 @@ class TestBothComponentsAgreeOnAnUnattributableDenial:
         node = MockNode()
         parameter = Parameter(name="model", type="str", default_value="alpha", tooltip="m")
         node.add_parameter(parameter)
-        module = "griptape_nodes.exe_types.param_components"
-        with (
-            patch(f"{module}.model_policy.GriptapeNodes.handle_request", side_effect=handle),
-            patch(f"{module}.model_access_component.GriptapeNodes.handle_request", side_effect=handle),
-        ):
+        with patch("griptape_nodes.retained_mode.engine.Engine.handle_request", side_effect=handle):
             component = ModelAccessComponent(
                 node=node, parameter=parameter, model_choices=["alpha"], default_model="alpha"
             )
@@ -290,10 +294,10 @@ class TestConstructionDeferral:
     """
 
     def test_no_bus_request_while_constructing_under_a_probe_scope(self) -> None:
-        handle = MagicMock()
-        with patch(_HANDLE, handle), constructing_under_probe():
-            snapshot = query_model_policy("SomeNode")
-        handle.assert_not_called()
+        engine = _engine()
+        with constructing_under_probe():
+            snapshot = query_model_policy(engine, "SomeNode")
+        engine.handle_request.assert_not_called()
         assert snapshot.deferred is True
 
     def test_construction_outside_a_strict_mode_scope_queries_normally(self) -> None:
@@ -304,8 +308,8 @@ class TestConstructionDeferral:
         rows and the badge until the node ran.
         """
         verdicts = [ModelAccessVerdict(model_id="md_denied", provider_model_id=DENIED, denial=_DENIAL)]
-        with patch(_HANDLE, return_value=_success(verdicts)), LibraryRegistry.constructing_node():
-            snapshot = query_model_policy("SomeNode")
+        with LibraryRegistry.constructing_node():
+            snapshot = query_model_policy(_engine(_success(verdicts)), "SomeNode")
         assert snapshot.deferred is False
         assert snapshot.denial_for(DENIED) is _DENIAL
 
@@ -326,10 +330,10 @@ class TestConstructionDeferral:
 
     def test_the_query_goes_through_once_construction_ends(self) -> None:
         verdicts = [ModelAccessVerdict(model_id="md_denied", provider_model_id=DENIED, denial=_DENIAL)]
-        with patch(_HANDLE, return_value=_success(verdicts)):
-            with constructing_under_probe():
-                assert query_model_policy("SomeNode").deferred is True
-            snapshot = query_model_policy("SomeNode")
+        engine = _engine(_success(verdicts))
+        with constructing_under_probe():
+            assert query_model_policy(engine, "SomeNode").deferred is True
+        snapshot = query_model_policy(engine, "SomeNode")
         assert snapshot.deferred is False
         assert snapshot.denial_for(DENIED) is _DENIAL
 

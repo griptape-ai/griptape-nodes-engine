@@ -360,7 +360,7 @@ class NodeExecutor(EngineScoped):
         lazy fetch inside VariableResolver.get_variables_if_enabled fails with
         KeyError. Pre-seeding here lets the worker skip that path entirely.
         """
-        if not VariableResolver.is_substitution_enabled():
+        if not VariableResolver.is_substitution_enabled(self.engine):
             return {}
         try:
             flow_name = self.engine.node_manager.get_node_parent_flow_by_name(node_name)

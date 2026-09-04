@@ -18,6 +18,10 @@ import pytest
 from griptape_nodes.common.node_executor import NodeExecutor
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import TrackedParameterOutputValues
+from griptape_nodes.retained_mode.events.connection_events import (
+    ListConnectionsForNodeRequest,
+    ListConnectionsForNodeResultSuccess,
+)
 from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeResultSuccess
 from griptape_nodes.retained_mode.events.flow_events import (
     OriginalNodeParameter,
@@ -30,9 +34,9 @@ from tests.unit.exe_types.mocks import MockNode
 
 _EXPECTED_FRESH_OUTPUT_EMITS = 2
 
-# GriptapeNodes is lazy-imported inside the event emitters; patch it at the
-# source module so those imports pick up the mock at call time.
-_GN_PATCH = "griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes"
+# A node built without an engine resolves the ambient one; patch that resolution at the
+# source module so the property picks up the stand-in at call time.
+_CURRENT_ENGINE_PATCH = "griptape_nodes.retained_mode.engine.current_engine"
 
 
 def _make_executor() -> NodeExecutor:
@@ -158,7 +162,7 @@ def _make_end_mapping(
 
 
 def _gn_mock_with_variable(name: str = "SHOT") -> Any:
-    """A GN patch where `name` is a real, defined flow variable.
+    """A stand-in engine where `name` is a real, defined flow variable.
 
     `should_preserve_stored_template` confirms substitution would actually rewrite
     the stored text before declining a write, so these tests have to define a
@@ -167,20 +171,22 @@ def _gn_mock_with_variable(name: str = "SHOT") -> Any:
     return a non-ListVariablesResultSuccess and fall back to trusting the regex
     heuristic -- but then they would no longer be testing the intended path.
     """
-    mock_gn = MagicMock()
-    mock_gn.WorkflowManager.return_value.is_variable_substitution_enabled.return_value = True
-    mock_gn.NodeManager.return_value.get_node_parent_flow_by_name.return_value = "test_flow"
-    mock_gn.FlowManager.return_value.get_connections.return_value = MagicMock(incoming_index={})
-    mock_gn.handle_request.side_effect = lambda req: (
+    engine = MagicMock()
+    engine.workflow_manager.is_variable_substitution_enabled.return_value = True
+    engine.node_manager.get_node_parent_flow_by_name.return_value = "test_flow"
+    engine.handle_request.side_effect = lambda req: (
         ListVariablesResultSuccess(
             variables=[FlowVariable(name=name, owning_flow_name="test_flow", type="str", value="hyperreal")],
             layers=[VariableLayerKind.FLOW],
             result_details="ok",
         )
         if isinstance(req, ListVariablesRequest)
+        else ListConnectionsForNodeResultSuccess(incoming_connections=[], outgoing_connections=[], result_details="ok")
+        if isinstance(req, ListConnectionsForNodeRequest)
         else MagicMock()
     )
-    return patch(_GN_PATCH, mock_gn)
+    # The nodes under test are built without an engine, so they resolve the ambient one.
+    return patch(_CURRENT_ENGINE_PATCH, return_value=engine)
 
 
 class TestGroupCopyBackPreservesTemplate:

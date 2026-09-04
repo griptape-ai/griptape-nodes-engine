@@ -14,7 +14,6 @@ from griptape_nodes.exe_types.param_components.model_policy import (
 from griptape_nodes.exe_types.param_types.parameter_button import ParameterButton
 from griptape_nodes.exe_types.param_types.parameter_string import ParameterString
 from griptape_nodes.retained_mode.events.model_events import ListModelDownloadsRequest, ListModelDownloadsResultSuccess
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
 from griptape_nodes.retained_mode.managers.event_manager import reentrant_bus_in_init_would_report
 from griptape_nodes.traits.button import Button, ButtonDetailsMessagePayload, OnClickMessageResultPayload
@@ -81,7 +80,7 @@ class HuggingFaceModelParameter(ABC):
         # Repos hidden from the dropdown; read by `filter_choices`.
         self._deprecated_repos: list[str] = deprecated_repos or []
         # Cached at refresh time only — never fetched from inside a callback to
-        # avoid nested GriptapeNodes.handle_request() calls that cause recursion.
+        # avoid nested handle_request() calls that cause recursion.
         self._downloading_model_ids: set[str] = set()
 
         # License-policy state, and the only two pieces of it: `_gate_mode` is the caller's
@@ -394,7 +393,9 @@ class HuggingFaceModelParameter(ABC):
         ambiguous across two libraries, or mid-reload), and treating that as "allow everything"
         would let an admin's deny be bypassed by a lookup error.
         """
-        self._policy = query_model_policy(type(self._node).__name__, fail_closed=self._gate_mode is not False)
+        self._policy = query_model_policy(
+            self._node.engine, type(self._node).__name__, fail_closed=self._gate_mode is not False
+        )
 
     def _apply_denial_badge(self, parameter: Parameter, value: str | None = None) -> None:
         """Set or clear the parameter's badge for the current selection.
@@ -423,7 +424,7 @@ class HuggingFaceModelParameter(ABC):
         if reentrant_bus_in_init_would_report():
             self._downloading_model_ids = set()
             return
-        result = GriptapeNodes.handle_request(ListModelDownloadsRequest())
+        result = self._node.engine.handle_request(ListModelDownloadsRequest())
         if not isinstance(result, ListModelDownloadsResultSuccess):
             self._downloading_model_ids = set()
             return
