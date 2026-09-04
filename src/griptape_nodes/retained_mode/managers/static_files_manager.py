@@ -1,6 +1,7 @@
 import base64
 import binascii
 import logging
+import os
 import threading
 from pathlib import Path
 from typing import NamedTuple
@@ -52,7 +53,13 @@ from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
 from griptape_nodes.servers import bind_free_socket
-from griptape_nodes.servers.static import STATIC_SERVER_HOST, STATIC_SERVER_PORT, STATIC_SERVER_URL, start_static_server
+from griptape_nodes.servers.static import (
+    ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV,
+    STATIC_SERVER_HOST,
+    STATIC_SERVER_PORT,
+    STATIC_SERVER_URL,
+    start_static_server,
+)
 from griptape_nodes.utils.url_utils import uri_to_path
 
 logger = logging.getLogger("griptape_nodes")
@@ -472,6 +479,13 @@ class StaticFilesManager(EngineScoped):
             # Initialization can complete more than once per process: a workflow executor
             # broadcasts it for its own run. Where the workspace is served is already settled.
             logger.debug("Static server already settled at %s", self._static_server_base_url)
+        elif os.getenv(ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV):
+            # A worker: the orchestrator that spawned this process already serves the shared
+            # workspace, and its server outlives this one. Adopting it keeps asset URLs valid
+            # after this worker is evicted, where a URL on our own ephemeral port would not be.
+            adopted = os.environ[ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV].rstrip("/")
+            self._static_server_base_url = adopted
+            logger.debug("Adopted the orchestrator's static server at %s", adopted)
         else:
             # No host-provided server, so serve the workspace here.
             #

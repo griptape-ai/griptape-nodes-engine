@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from griptape_nodes.app.worker_routing import (
-    FORWARDED_REQUEST_TYPES,
+    LOCAL_ONLY_REQUEST_TYPES,
     RemoteHandler,
     register_remote_handlers,
 )
@@ -40,6 +40,16 @@ from griptape_nodes.retained_mode.managers.event_manager import EventManager
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.event_manager import ResultContext
+
+
+def _forwarded_sample() -> tuple[type, ...]:
+    """A few representative types that forward (i.e. are not local-only)."""
+    from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest
+    from griptape_nodes.retained_mode.events.parameter_events import AddParameterToNodeRequest
+
+    sample = (CreateNodeRequest, AddParameterToNodeRequest)
+    assert not set(sample) & LOCAL_ONLY_REQUEST_TYPES
+    return sample
 
 
 @dataclass(kw_only=True)
@@ -224,8 +234,8 @@ class TestWorkerReachIntoOrchestrator:
         ``register_remote_handlers`` swaps a real FORWARDED type's handler
         for a ``RemoteHandler`` shim, and dispatching that real type
         directly through the shim records the violation. Locks in the
-        ``FORWARDED_REQUEST_TYPES`` <-> ``RemoteHandler`` integration: if
-        a future change drops a type from ``FORWARDED_REQUEST_TYPES``,
+        ``LOCAL_ONLY_REQUEST_TYPES`` <-> ``RemoteHandler`` integration: if
+        a future change adds a type to ``LOCAL_ONLY_REQUEST_TYPES``,
         this test stays green only because
         ``ListConnectionsForNodeRequest`` is still a member.
         """
@@ -253,10 +263,9 @@ class TestWorkerReachIntoOrchestrator:
 
         event_manager.forward_to_orchestrator = fake_forward  # type: ignore[method-assign]
 
-        # register_remote_handlers requires every FORWARDED type to have an
-        # original handler registered first. Stub them all with a trivial
-        # local handler; the swap installs RemoteHandler in their place.
-        for request_type in FORWARDED_REQUEST_TYPES:
+        # register_remote_handlers swaps whatever is registered, so the type this test
+        # asserts on has to be registered first. Stub it plus a couple of representatives.
+        for request_type in (ListConnectionsForNodeRequest, *_forwarded_sample()):
 
             async def stub(_request: RequestPayload) -> ResultPayloadSuccess:
                 return ListConnectionsForNodeResultSuccess(

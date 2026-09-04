@@ -4,7 +4,7 @@ On a worker, a handful of request types must be serviced by the orchestrator
 because the authoritative state (flow graph, connections, node registry) lives
 there. This module provides:
 
-- ``FORWARDED_REQUEST_TYPES``: the flat list of request classes whose worker-
+- ``LOCAL_ONLY_REQUEST_TYPES``: the exclusion list of request classes whose worker-
   side handler should forward to the orchestrator.
 - ``RemoteHandler``: an async callable that replaces the original manager
   handler for those request types on the worker. While the worker is actively
@@ -41,51 +41,30 @@ from griptape_nodes.retained_mode.events.base_events import (
     SkipTheLineMixin,
     WorkflowNotAlteredMixin,
 )
-from griptape_nodes.retained_mode.events.config_events import (
-    ResetConfigRequest,
-    SetConfigCategoryRequest,
-    SetConfigValueRequest,
+from griptape_nodes.retained_mode.events.execution_events import (
+    CancelExecuteNodeRequest,
+    ExecuteNodeRequest,
 )
-from griptape_nodes.retained_mode.events.connection_events import (
-    CreateConnectionRequest,
-    DeleteConnectionRequest,
-    ListConnectionsForNodeRequest,
-)
-from griptape_nodes.retained_mode.events.flow_events import (
-    CreateFlowRequest,
-    DeleteFlowRequest,
-    ListFlowsInCurrentContextRequest,
-    ListFlowsInFlowRequest,
-    ListNodesInFlowRequest,
-)
-from griptape_nodes.retained_mode.events.node_events import (
-    CreateNodeRequest,
-    DeleteNodeRequest,
-    GetFlowForNodeRequest,
-    ListParametersOnNodeRequest,
-)
-from griptape_nodes.retained_mode.events.parameter_events import (
-    AddParameterToNodeRequest,
-    AlterParameterDetailsRequest,
-    GetConnectionsForParameterRequest,
-    GetParameterDetailsRequest,
-    GetParameterValueRequest,
-    RemoveParameterFromNodeRequest,
-    SetParameterValueRequest,
-)
+from griptape_nodes.retained_mode.events.library_events import ReloadAllLibrariesRequest
+from griptape_nodes.retained_mode.events.parameter_events import MigrateParameterRequest
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.events.project_events import (
     SetCurrentProjectRequest,
 )
-from griptape_nodes.retained_mode.events.secrets_events import (
-    DeleteSecretValueRequest,
-    SetSecretValueRequest,
+from griptape_nodes.retained_mode.events.resource_events import (
+    RegisterResourceTypeRequest,
 )
-from griptape_nodes.retained_mode.events.variable_events import (
-    GetVariablesRequest,
-    ListVariablesRequest,
-    ResolveSubstitutionRequest,
-    SetVariablesRequest,
+from griptape_nodes.retained_mode.events.static_file_events import (
+    CreateStaticFileDownloadUrlFromPathRequest,
+    CreateStaticFileDownloadUrlRequest,
+    CreateStaticFileRequest,
+    CreateStaticFileUploadUrlRequest,
+)
+from griptape_nodes.retained_mode.events.worker_events import (
+    RegisterWorkerRequest,
+    StartWorkerRequest,
+    UnregisterWorkerRequest,
+    WorkerHeartbeatRequest,
 )
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.utils.async_utils import call_function
@@ -100,48 +79,6 @@ if TYPE_CHECKING:
 
 
 HandlerCallback = "Callable[[RequestPayload], ResultPayload | Awaitable[ResultPayload]]"
-
-
-FORWARDED_REQUEST_TYPES: frozenset[type[RequestPayload]] = frozenset(
-    {
-        # connection_events
-        CreateConnectionRequest,
-        DeleteConnectionRequest,
-        ListConnectionsForNodeRequest,
-        # node_events
-        CreateNodeRequest,
-        DeleteNodeRequest,
-        ListParametersOnNodeRequest,
-        GetFlowForNodeRequest,
-        # parameter_events
-        AddParameterToNodeRequest,
-        RemoveParameterFromNodeRequest,
-        SetParameterValueRequest,
-        GetParameterDetailsRequest,
-        AlterParameterDetailsRequest,
-        GetParameterValueRequest,
-        GetConnectionsForParameterRequest,
-        # flow_events
-        CreateFlowRequest,
-        DeleteFlowRequest,
-        ListNodesInFlowRequest,
-        ListFlowsInCurrentContextRequest,
-        ListFlowsInFlowRequest,
-        # config_events
-        SetConfigValueRequest,
-        SetConfigCategoryRequest,
-        ResetConfigRequest,
-        # secrets_events
-        SetSecretValueRequest,
-        DeleteSecretValueRequest,
-        # variable_events
-        GetVariablesRequest,
-        ListVariablesRequest,
-        # DEPRECATED: forwarded only while the shims live. TODO(https://github.com/griptape-ai/griptape-nodes/issues/5143): remove with the shims.
-        ResolveSubstitutionRequest,
-        SetVariablesRequest,
-    }
-)
 
 
 @dataclass
@@ -235,12 +172,63 @@ class ActivateProjectResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure
     """Worker failed to adopt the orchestrator's current project."""
 
 
+LOCAL_ONLY_REQUEST_TYPES: frozenset[type[RequestPayload]] = frozenset(
+    {
+        # Requests a worker must answer ITSELF while executing a node. Everything else
+        # forwards to the orchestrator, which owns the authoritative state.
+        #
+        # This list is deliberately an exclusion list rather than an allowlist. With an
+        # allowlist, every newly added request type silently resolved against the worker's
+        # own managers -- a non-authoritative copy -- and every migration note that told
+        # authors to "use a request instead" was wrong for any type nobody remembered to
+        # add. Defaulting to forwarding makes that class of mistake impossible.
+        #
+        # execution_events: forwarding a worker's own execution request would send it
+        # straight back to the orchestrator, which would route it here again.
+        ExecuteNodeRequest,
+        CancelExecuteNodeRequest,
+        # static_file_events: the payload is bytes. A worker writes them to the shared
+        # workspace itself and forwards only the resulting registration; shipping a 4K
+        # video across the boundary is the one thing storage must never do.
+        CreateStaticFileRequest,
+        CreateStaticFileUploadUrlRequest,
+        CreateStaticFileDownloadUrlRequest,
+        CreateStaticFileDownloadUrlFromPathRequest,
+        # worker_events + broadcasts: these travel orchestrator -> worker. Sending them back
+        # is the same loop as execution.
+        RegisterWorkerRequest,
+        UnregisterWorkerRequest,
+        WorkerHeartbeatRequest,
+        StartWorkerRequest,
+        ReloadConfigRequest,
+        RefreshSecretsRequest,
+        ActivateProjectRequest,
+        # Adopting a project reloads this worker's libraries, and that reload must stay here. The
+        # orchestrator decides WHEN libraries reload -- it is mid-reload already, which is what sent
+        # the activation -- so forwarding would have the worker dictate to it. Worse, the
+        # orchestrator's pre-reload callback is reset_workers, which terminates the very worker that
+        # asked, mid-node. Reached because in_node_execution() is a process-wide refcount, so a
+        # reload dispatched by a broadcast handler forwards whenever any node happens to be running.
+        ReloadAllLibrariesRequest,
+        # Two requests carry a live Python object in a field, and both were local under the
+        # allowlist this exclusion list replaces -- the flip is what started forwarding them.
+        # `_registers_a_python_class` does not catch either: it matches a `type[...]` annotation,
+        # and these carry an INSTANCE (a ResourceType, a Callable). Forwarding puts the object
+        # through `json.dumps(default=str)`, so the orchestrator registers a string and the worker
+        # -- the process that needs it while running a node -- registers nothing, with no error on
+        # either side.
+        RegisterResourceTypeRequest,
+        MigrateParameterRequest,
+    }
+)
+
+
 @dataclass
 class RemoteHandler:
     """Worker-side dispatch shim.
 
     Registered in place of the original manager handler for types in
-    FORWARDED_REQUEST_TYPES. Forwards to the orchestrator while the worker is
+    every registered type except LOCAL_ONLY_REQUEST_TYPES. Forwards to the orchestrator while the worker is
     inside a ``worker_node_execution_scope``; delegates to the original
     handler otherwise (so bootstrap / library-load paths keep running locally).
 
@@ -285,25 +273,24 @@ def schedule_broadcast(broadcast_type: type[RequestPayload]) -> None:
 
 
 def register_remote_handlers(event_manager: EventManager) -> None:
-    """Swap every FORWARDED_REQUEST_TYPE handler for a RemoteHandler.
+    """Route requests made during node execution to the orchestrator.
 
-    Must be called after every manager that claims one of these request types
-    has finished registering (i.e. after ``GriptapeNodes()`` construction is
-    complete) AND after ``configure_worker_forwarding`` has supplied the
-    RequestClient / topic / loop references. See ``_run_worker`` in app.py.
+    Swaps a RemoteHandler in for every registered request type except those in
+    LOCAL_ONLY_REQUEST_TYPES. The handler forwards only while the worker is inside a
+    ``worker_node_execution_scope`` and delegates to the original handler otherwise, so
+    engine boot and library load -- which legitimately need this process's own managers --
+    are unaffected.
 
-    Raises RuntimeError if a forwarded request type has no registered owner;
-    that always indicates a bootstrap-order bug, not a runtime condition.
+    Must be called after every manager has finished registering (i.e. after the engine is
+    constructed) AND after ``configure_worker_forwarding`` has supplied the RequestClient,
+    topic, and loop references. See ``_run_worker`` in app.py.
     """
-    for request_type in FORWARDED_REQUEST_TYPES:
+    for request_type in event_manager.registered_request_types():
+        if request_type in LOCAL_ONLY_REQUEST_TYPES:
+            continue
         original = event_manager.get_manager_for_request_type(request_type)
         if original is None:
-            msg = (
-                f"register_remote_handlers: no manager registered for "
-                f"{request_type.__name__}. Worker bootstrap must finish manager "
-                f"registration before remote handlers are installed."
-            )
-            raise RuntimeError(msg)
+            continue
         remote = RemoteHandler(original=original, event_manager=event_manager)
         event_manager.remove_manager_from_request_type(request_type)
         event_manager.assign_manager_to_request_type(request_type, remote)
