@@ -5,9 +5,13 @@ per-setting reference (type, default, env var, description) cannot drift from th
 code. Run via `make docs/settings-reference`; `make docs` runs it before building.
 
 The page is grouped by the category attached to each Field (see the custom Field
-wrapper in settings.py). Only top-level scalar settings get a GTN_CONFIG_* env var
-column, because env-var parsing is a flat key lookup with no nesting support
-(config_manager._load_config_from_env_vars).
+wrapper in settings.py). A top-level scalar setting gets a `GTN_CONFIG_<NAME>` env var
+column. A nested setting (a model, e.g. worker/agent/library) gets one env var per scalar
+leaf found anywhere beneath it, named with the `__`-separated path
+config_manager._load_config_from_env_vars parses. A mapping-valued setting (`type: object`
+with `additionalProperties`, e.g. artifacts, project_workspaces) gets a `__<KEY>` template,
+since any individual entry can be set that way. Arrays get "n/a": there is no string form
+the Settings model accepts for a list.
 """
 
 import json
@@ -68,8 +72,8 @@ def _build_row(name: str, prop: dict, defs: dict, dumped_defaults: dict) -> Sett
     is_nested = _is_nested(prop, defs)
     type_label = _resolve_type_label(prop, defs)
     default_label = _resolve_default_label(name, dumped_defaults, is_nested=is_nested)
-    env_var_label = _resolve_env_var_label(name, is_nested=is_nested)
-    description = _resolve_description(prop, is_nested=is_nested)
+    env_var_label = _resolve_env_var_label(name, prop, defs, is_nested=is_nested)
+    description = _resolve_description(prop, defs, is_nested=is_nested)
 
     return SettingRow(
         name=name,
@@ -91,6 +95,52 @@ def _is_nested(prop: dict, defs: dict) -> bool:
         target = defs.get(ref, {})
         return "properties" in target
     return False
+
+
+def _is_scalar_leaf(prop: dict, defs: dict) -> bool:
+    """True when a sub-field is a single value rather than a nested model, list, or mapping.
+
+    An enum $ref has no "properties" key, so it counts as scalar. A union is scalar when any
+    non-null member is, since that member's string form is what an env var supplies: `str | None`
+    is settable, `list[str] | dict[str, str]` is not.
+    """
+    if prop.get("type") in {"object", "array"}:
+        return False
+
+    if (options := prop.get("anyOf")) is not None:
+        return any(option.get("type") != "null" and _is_scalar_leaf(option, defs) for option in options)
+
+    ref = _extract_ref(prop)
+    if ref is not None:
+        target = defs.get(ref, {})
+        return "properties" not in target
+    return True
+
+
+def _scalar_leaf_paths(ref: str, defs: dict, seen: frozenset[str] = frozenset()) -> list[str]:
+    """Collect the `__`-joined path to every scalar leaf beneath the model `ref` points at.
+
+    Recurses to full depth, so a scalar buried under an otherwise list-valued model (e.g.
+    app_events.on_app_initialization_complete.requires_engine) is still reported. `seen` guards
+    against a self-referential schema looping the docs build.
+    """
+    if ref in seen:
+        return []
+
+    paths = []
+    sub_properties = defs.get(ref, {}).get("properties", {})
+    for sub_name, sub_prop in sub_properties.items():
+        if _is_scalar_leaf(sub_prop, defs):
+            paths.append(sub_name.upper())
+            continue
+        sub_ref = _extract_ref(sub_prop)
+        if sub_ref is None:
+            continue
+        paths.extend(
+            f"{sub_name.upper()}__{nested_path}" for nested_path in _scalar_leaf_paths(sub_ref, defs, seen | {ref})
+        )
+
+    return paths
 
 
 def _resolve_type_label(prop: dict, defs: dict) -> str:
@@ -147,19 +197,53 @@ def _resolve_default_label(name: str, dumped_defaults: dict, *, is_nested: bool)
     return f"`{json.dumps(default_value)}`"
 
 
-def _resolve_env_var_label(name: str, *, is_nested: bool) -> str:
-    if is_nested:
-        return "n/a (nested; edit config file)"
-    return f"`GTN_CONFIG_{name.upper()}`"
+def _is_mapping(prop: dict) -> bool:
+    """True when a property is a mapping (`type: object` with `additionalProperties`).
+
+    Distinguishes a mapping from a nested model, which comes through a `$ref` to a def with
+    `properties` and never carries `additionalProperties` itself, and from an array
+    (`type: array`). A mapping's individual entries are settable via a `__<KEY>` env var path
+    (config_manager._load_config_from_env_vars splits on `__` and merges into a dict
+    regardless of whether the model declares that key), so it is not "n/a" the way an array is.
+    """
+    return prop.get("type") == "object" and "additionalProperties" in prop
 
 
-def _resolve_description(prop: dict, *, is_nested: bool) -> str:
+def _resolve_env_var_label(name: str, prop: dict, defs: dict, *, is_nested: bool) -> str:
+    if not is_nested:
+        return f"`GTN_CONFIG_{name.upper()}`"
+
+    if _is_mapping(prop):
+        return f"`GTN_CONFIG_{name.upper()}__<KEY>`"
+
+    ref = _extract_ref(prop)
+    if ref is None:
+        return "n/a (list/object; edit config file)"
+
+    leaf_paths = _scalar_leaf_paths(ref, defs)
+    if not leaf_paths:
+        return "n/a (list/object; edit config file)"
+
+    return ", ".join(f"`GTN_CONFIG_{name.upper()}__{leaf_path}`" for leaf_path in leaf_paths)
+
+
+def _resolve_description(prop: dict, defs: dict, *, is_nested: bool) -> str:
     description = _normalize_cell(prop.get("description", ""))
     if description:
         return description
-    if is_nested:
-        return "Nested settings; edit the sub-keys directly in a config file."
-    return ""
+    if not is_nested:
+        return ""
+
+    if _is_mapping(prop):
+        return (
+            "Nested settings; an entry can be set with a `GTN_CONFIG_<NAME>__<KEY>` env var "
+            "(only reaches an entry whose key is already lowercase), or edited directly in a config file."
+        )
+
+    ref = _extract_ref(prop)
+    if ref is not None and _scalar_leaf_paths(ref, defs):
+        return "Nested settings; the listed sub-keys can be set from the environment, and every sub-key can be edited directly in a config file."
+    return "Nested settings; edit the sub-keys directly in a config file."
 
 
 def _normalize_cell(text: str) -> str:
@@ -173,8 +257,11 @@ def _render_markdown(rows: list[SettingRow]) -> str:
     lines.append(
         "Every Griptape Nodes engine setting, grouped by category. Each setting can be placed in any "
         "`griptape_nodes_config.json` file (see [Engine Configuration](../guides/configuration.md) for the load "
-        "order). Settings with a `GTN_CONFIG_*` env var can also be overridden from the environment; "
-        "nested settings must be edited in a config file."
+        "order). Settings with a `GTN_CONFIG_*` env var, including the `GTN_CONFIG_<NAME>__<SUB_KEY>` form for a "
+        "nested setting's scalar sub-keys and the `GTN_CONFIG_<NAME>__<KEY>` form for a mapping-valued setting's "
+        "entries, can also be overridden from the environment; list-valued settings must be edited in a config "
+        "file. A mapping's keys are matched case-sensitively but the whole variable name is lowercased, so only "
+        "an already-lowercase key is reachable from the environment (see the guide for details)."
     )
     lines.append("")
 

@@ -3,7 +3,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 from pydantic import ValidationError
 from xdg_base_dirs import xdg_config_home
@@ -72,6 +72,27 @@ USER_CONFIG_PATH = xdg_config_home() / "griptape_nodes" / "griptape_nodes_config
 # would pin the resolved path above every config file and every project override.
 DEFAULT_LIBRARIES_ROOT_ENV_VAR = "GTN_DEFAULT_LIBRARIES_ROOT"
 
+# Prefix marking an environment variable as a config input, and the separator that splits the
+# remainder into a nested key path. A single underscore cannot serve as the separator because
+# setting names contain underscores themselves (`storage_backend`), so `WORKER_HEARTBEAT_TIMEOUT_S`
+# would be ambiguous.
+ENV_VAR_PREFIX = "GTN_CONFIG_"
+ENV_VAR_PATH_SEPARATOR = "__"
+
+
+class EnvVarOverride(NamedTuple):
+    """One GTN_CONFIG_ variable, with the config key and coerced value it resolves to."""
+
+    env_var_name: str
+    config_key: str
+    raw_value: str
+    value: Any
+
+
+# Outcomes of coercing an environment variable that no real config value can collide with.
+_REJECTED_BAD_VALUE = object()
+_REJECTED_UNKNOWN_KEY = object()
+
 
 class ConfigManager(EngineScoped):
     """A class to manage application configuration and file pathing.
@@ -84,8 +105,10 @@ class ConfigManager(EngineScoped):
     5. Environment variables with GTN_CONFIG_ prefix (highest priority)
 
     Environment variables starting with GTN_CONFIG_ are converted to config keys by removing the prefix
-    and converting to lowercase (e.g., GTN_CONFIG_FOO=bar becomes {"foo": "bar"}). That flow is
-    input-only: nothing here writes a GTN_CONFIG_ variable back out.
+    and converting to lowercase (e.g., GTN_CONFIG_FOO=bar becomes {"foo": "bar"}), with a double
+    underscore separating nested keys (GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S=30 becomes
+    {"worker": {"heartbeat_timeout_s": 30.0}}). That flow is input-only: nothing here writes a
+    GTN_CONFIG_ variable back out.
 
     The one variable this manager PUBLISHES is GTN_DEFAULT_LIBRARIES_ROOT, written once at
     construction so project templates can reference the engine's default libraries root. See
@@ -115,6 +138,11 @@ class ConfigManager(EngineScoped):
         self._workspace_config_path: Path | None = None
         self._workspace_dir_override: str | None = None
         self._libraries_root_override: str | None = None
+        # (variable name, value) pairs already reported as ignored. The env layer is re-read on
+        # every load_configs() and on each read_env_config() call, so without this a single bad
+        # variable warns repeatedly for the life of this manager. Other ConfigManagers built
+        # elsewhere in the process keep their own accounting.
+        self._reported_invalid_env_vars: set[tuple[str, str]] = set()
         self.load_configs()
 
         # Once per engine process, before any project YAML is read. See the method docstring for why
@@ -374,18 +402,138 @@ class ConfigManager(EngineScoped):
         GTN_CONFIG_FOO=bar becomes {"foo": "bar"}
         GTN_CONFIG_STORAGE_BACKEND=gtc becomes {"storage_backend": "gtc"}
 
+        A double underscore separates nested keys, so
+        GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S=30 becomes {"worker": {"heartbeat_timeout_s": 30.0}}.
+        Because the whole name is lowercased, this only reaches settings whose keys are lowercase:
+        case-sensitive trees such as `nodes.<Library>.<SECRET>` stay config-file-only.
+
         Returns:
             Dictionary containing config values from environment variables
         """
-        env_config = {}
-        for key, value in os.environ.items():
-            if key.startswith("GTN_CONFIG_"):
-                # Remove GTN_CONFIG_ prefix and convert to lowercase
-                config_key = key[11:].lower()  # len("GTN_CONFIG_") = 11
-                env_config[config_key] = value
-                logger.debug("Loaded config from env var: %s -> %s", key, config_key)
+        env_config: dict[str, Any] = {}
+        for override in self._collect_env_var_overrides():
+            set_dot_value(env_config, override.config_key, override.value)
+            logger.debug("Loaded config from env var: %s -> %s", override.env_var_name, override.config_key)
 
         return env_config
+
+    def _collect_env_var_overrides(self) -> list[EnvVarOverride]:
+        """Resolve the GTN_CONFIG_ variables to apply, reporting each one ignored along the way.
+
+        Four things get a variable ignored: a name with an empty path segment, a value the
+        setting's type rejects, a path that names no setting, and a path that is a strict prefix
+        of another surviving path.
+
+        The prefix case is last because it only has to separate overrides that are each valid on
+        their own. Exporting both GTN_CONFIG_ARTIFACTS__IMAGE and
+        GTN_CONFIG_ARTIFACTS__IMAGE__PREVIEW_FORMAT asks for `artifacts.image` to be a value and a
+        section at once, and `dict[str, Any]` accepts either, so something has to break the tie:
+        `set_dot_value` would otherwise honor whichever `os.environ` yielded last. The deeper path
+        wins because it carries strictly more of what was asked for. An override that fails
+        validation is not competing for anything, so it must be dropped before the tie is broken;
+        judging overlap first would let a typo like GTN_CONFIG_AGENT__SYSTEM_PROMPT__OOPS take a
+        correct neighbour down with it.
+
+        Returns:
+            The overrides to apply, in environment order.
+        """
+        coerced = []
+        for env_var_name, raw_value in os.environ.items():
+            if not env_var_name.startswith(ENV_VAR_PREFIX):
+                continue
+            config_key = env_var_name.removeprefix(ENV_VAR_PREFIX).lower().replace(ENV_VAR_PATH_SEPARATOR, ".")
+            if "" in config_key.split("."):
+                # A trailing, doubled, or leading separator. Nothing rejects it later: an empty key
+                # is a perfectly good key under a mapping or an undeclared tree, so it would
+                # validate, apply garbage at the highest-priority layer, and count as a longer path
+                # that discards its own correct prefix.
+                self._report_ignored_env_var(
+                    env_var_name, raw_value, "its name has an empty path segment, so the configured value stands"
+                )
+                continue
+            value = self._coerce_env_var_value(config_key, raw_value)
+            if value is _REJECTED_BAD_VALUE:
+                self._report_ignored_env_var(
+                    env_var_name,
+                    raw_value,
+                    f"'{raw_value}' is not a valid value for the '{config_key}' setting, "
+                    "so the configured value stands",
+                )
+                continue
+            if value is _REJECTED_UNKNOWN_KEY:
+                self._report_ignored_env_var(
+                    env_var_name, raw_value, f"there is no '{config_key}' setting, so it sets nothing"
+                )
+                continue
+            coerced.append(
+                EnvVarOverride(env_var_name=env_var_name, config_key=config_key, raw_value=raw_value, value=value)
+            )
+
+        applicable = []
+        for override in coerced:
+            deeper_keys = sorted(
+                other.config_key for other in coerced if other.config_key.startswith(f"{override.config_key}.")
+            )
+            if deeper_keys:
+                self._report_ignored_env_var(
+                    override.env_var_name,
+                    override.raw_value,
+                    f"'{override.config_key}' is also the start of a longer path "
+                    f"({', '.join(deeper_keys)}), which still applies",
+                )
+                continue
+            applicable.append(override)
+
+        return applicable
+
+    def _coerce_env_var_value(self, config_key: str, raw_value: str) -> Any:
+        """Coerce one environment variable's string to the type the Settings model declares for it.
+
+        Environment variables are always strings, so a bool, number, or enum setting would otherwise
+        reach read sites as text -- and "false" is truthy. Validating a single-key delta against
+        Settings (every field has a default, so a partial dict validates) both converts the value and
+        contains the damage from a bad one to that key.
+
+        A key the schema does not declare survives validation but not the dump, because a nested
+        model ignores sub-keys it does not know. Free-form keys never reach that state: an entry in a
+        mapping-valued setting and a path riding Settings' `extra="allow"` are both retained through
+        the dump. So an absent key means the path names nothing, as `worker.heartbeat_timeout` does
+        by dropping the `_s`.
+
+        Args:
+            config_key: The dot-notation key the variable maps to.
+            raw_value: The variable's string value.
+
+        Returns:
+            The coerced value, _REJECTED_BAD_VALUE when the model rejects the value, or
+            _REJECTED_UNKNOWN_KEY when the path names no setting.
+        """
+        candidate = set_dot_value({}, config_key, raw_value)
+
+        try:
+            validated = Settings.model_validate(candidate)
+        except ValidationError:
+            return _REJECTED_BAD_VALUE
+
+        return get_dot_value(validated.model_dump(), config_key, _REJECTED_UNKNOWN_KEY)
+
+    def _report_ignored_env_var(self, env_var_name: str, raw_value: str, reason: str) -> None:
+        """Warn that an environment override was ignored, once per variable and value.
+
+        Args:
+            env_var_name: The full environment variable name.
+            raw_value: The value it carried.
+            reason: Why it was ignored and what happens instead, phrased to complete
+                "Ignoring <var>: <reason>.". The consequence differs per reason, so it belongs
+                here rather than in a shared closing sentence: a dropped prefix is not falling
+                back to anything, since the longer path that displaced it still writes underneath.
+        """
+        report_key = (env_var_name, raw_value)
+        if report_key in self._reported_invalid_env_vars:
+            return
+
+        self._reported_invalid_env_vars.add(report_key)
+        logger.warning("Ignoring environment variable %s: %s.", env_var_name, reason)
 
     def _load_config_from_file(self, path: Path, label: str) -> dict:
         """Read and parse a JSON config file. Returns empty dict if missing or unparsable."""
