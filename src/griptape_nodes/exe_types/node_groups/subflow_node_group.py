@@ -339,10 +339,12 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         request = AddParameterToNodeRequest(
             node_name=self.name,
             parameter_name=original_param.name,
+            type=original_param.type,
             input_types=input_types,
             output_type=output_type,
             tooltip="",
             mode_allowed_input=True,
+            mode_allowed_property=False,
             mode_allowed_output=True,
         )
         # Add with a request, because this will handle naming for us.
