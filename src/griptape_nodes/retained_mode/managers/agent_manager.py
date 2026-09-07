@@ -515,10 +515,8 @@ class AgentManager(EngineScoped):
             self._thread_storage.update_thread_metadata(
                 result.thread_id, title=textwrap.shorten(request.input, width=50, placeholder="...")
             )
-        # Only record a run when an assistant message was actually persisted.
-        # Cancelled runs return the pre-run history length, so no response was saved.
-        # message_count >= 2 ensures there is at least one user + one assistant message.
-        if not result.cancelled and result.message_count > 1:
+        # A cancelled run persists nothing, so there is no response to record.
+        if not result.cancelled:
             resolved_provider = self._get_provider(request.provider_name)
             self._thread_storage.append_run_record(
                 result.thread_id,
