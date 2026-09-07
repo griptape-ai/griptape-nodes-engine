@@ -514,10 +514,9 @@ class AgentManager(EngineScoped):
         metadata_updates: dict[str, object] = {}
         if is_first_run:
             metadata_updates["title"] = textwrap.shorten(request.input, width=50, placeholder="...")
-        # Only record a run when an assistant message was actually persisted
-        # (message_count is even: each complete turn adds one user + one assistant message).
-        # An odd count means the run was cancelled before any response was saved.
-        if result.message_count > 0 and result.message_count % 2 == 0:
+        # Only record a run when an assistant message was actually persisted.
+        # Cancelled runs return the pre-run history length, so no response was saved.
+        if not result.cancelled and result.message_count > 0:
             existing_runs = self._thread_storage.get_thread_metadata(result.thread_id).get("runs", [])
             new_run = asdict(
                 RunRecord(
