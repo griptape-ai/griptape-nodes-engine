@@ -40,7 +40,14 @@ dependencies = [
   "truststore>=0.10.1",
   "cattrs>=26.1.0",
   "fileseq>=3.2.0",
-  "pydantic-ai-slim[mcp,openai]>=1.95.1",
+  # Floor at 2.29.0: that release ("Support FastMCP 4 and MCP SDK v2 in `MCPToolset` alongside
+  # FastMCP 3", pydantic/pydantic-ai#6738) is the first where the `[mcp]` extra's `fastmcp-slim`
+  # floor supports the mcp 2.x module layout our own `mcp>=2.0,<3` pin (above) resolves to.
+  # Below this, `pydantic_ai/mcp.py` imports symbols (e.g. `mcp.shared.context.RequestContext`)
+  # that mcp 2.x moved/renamed, so `agent_manager` fails to import at construction time.
+  # PR #5449 raised the `mcp` ceiling without checking this; PR #5493 papered over the fallout
+  # for pydantic-ai-skills but left this one. Lift no lower than this floor.
+  "pydantic-ai-slim[mcp,openai]>=2.29.0",
   # Ceiling below 2.0: that release removes the exclude_tools and auto_reload arguments
   # agents/pydantic_ai/runner.py passes to SkillsCapability, so an unbounded resolve breaks
   # the sidebar agent at construction time (see issue 5491). Lift once the call site is
