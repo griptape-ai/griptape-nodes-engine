@@ -312,6 +312,16 @@ class ListThreadsRequest(RequestPayload):
 
 
 @dataclass
+class RunRecord:
+    """Records the provider/model config used for a single agent run."""
+
+    message_index: int
+    provider_name: str
+    model: str
+    mcp_servers: list[str] = field(default_factory=list)
+
+
+@dataclass
 class ThreadMetadata:
     """Metadata for a conversation thread."""
 
@@ -322,6 +332,7 @@ class ThreadMetadata:
     message_count: int
     archived: bool
     local_id: str | None = None
+    runs: list[RunRecord] = field(default_factory=list)
 
 
 @dataclass

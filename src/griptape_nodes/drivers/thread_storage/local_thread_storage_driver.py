@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 
 from griptape_nodes.drivers.thread_storage.base_thread_storage_driver import BaseThreadStorageDriver
-from griptape_nodes.retained_mode.events.agent_events import ThreadMetadata
+from griptape_nodes.retained_mode.events.agent_events import RunRecord, ThreadMetadata
 from griptape_nodes.utils.file_utils import atomic_write_bytes
 
 if TYPE_CHECKING:
@@ -85,6 +85,8 @@ class LocalThreadStorageDriver(BaseThreadStorageDriver):
         for meta_file in self.threads_directory.glob("thread_*.meta.json"):
             thread_id = meta_file.stem.removeprefix("thread_").removesuffix(".meta")
             meta = self._read_meta(thread_id)
+            raw_runs = meta.get("runs", [])
+            runs = [RunRecord(**r) for r in raw_runs]
             threads.append(
                 ThreadMetadata(
                     thread_id=thread_id,
@@ -94,6 +96,7 @@ class LocalThreadStorageDriver(BaseThreadStorageDriver):
                     message_count=meta.get("message_count", 0),
                     archived=meta.get("archived", False),
                     local_id=meta.get("local_id"),
+                    runs=runs,
                 ),
             )
 

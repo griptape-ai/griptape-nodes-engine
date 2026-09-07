@@ -515,6 +515,20 @@ class AgentManager(EngineScoped):
                 result.thread_id, title=textwrap.shorten(request.input, width=50, placeholder="...")
             )
 
+        existing_runs = self._thread_storage.get_thread_metadata(result.thread_id).get("runs", [])
+        self._thread_storage.update_thread_metadata(
+            result.thread_id,
+            runs=[
+                *existing_runs,
+                {
+                    "message_index": result.message_count - 1,
+                    "provider_name": request.provider_name or self._active_provider_name,
+                    "model": request.model_name or "",
+                    "mcp_servers": request.additional_mcp_servers or [],
+                },
+            ],
+        )
+
         if result.cancelled:
             logger.info("Agent run for thread %s cancelled by request.", result.thread_id)
             return RunAgentResultSuccess(
