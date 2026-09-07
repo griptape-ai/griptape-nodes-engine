@@ -517,7 +517,8 @@ class AgentManager(EngineScoped):
             )
         # Only record a run when an assistant message was actually persisted.
         # Cancelled runs return the pre-run history length, so no response was saved.
-        if not result.cancelled and result.message_count > 0:
+        # message_count >= 2 ensures there is at least one user + one assistant message.
+        if not result.cancelled and result.message_count > 1:
             resolved_provider = self._get_provider(request.provider_name)
             self._thread_storage.append_run_record(
                 result.thread_id,
