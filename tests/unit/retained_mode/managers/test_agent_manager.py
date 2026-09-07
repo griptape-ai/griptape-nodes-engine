@@ -66,6 +66,7 @@ from griptape_nodes.retained_mode.events.agent_events import (
     RunAgentRequest,
     RunAgentRequestArtifact,
     RunAgentResultSuccess,
+    RunRecord,
     UpdateAgentProviderRequest,
     UpdateAgentProviderResultFailure,
     UpdateAgentProviderResultSuccess,
@@ -1269,7 +1270,7 @@ class TestRunAgentResultPayloadContract:
         manager._thread_storage = SimpleNamespace(  # type: ignore[assignment]
             load_history=lambda _t: [object()],
             update_thread_metadata=lambda _t, **_kw: {},
-            append_run_record=lambda _t, _r: None,
+            append_run_record=lambda thread_id, record: None,  # noqa: ARG005
         )
         monkeypatch.setattr(
             _AGENT_MANAGER_MODULE + "._compose_prompt",
@@ -1308,3 +1309,33 @@ class TestRunAgentResultPayloadContract:
         assert set(payload.output) == {"text", "message_count", "cancelled", "truncated", "generated_image_urls"}, (
             f"the {branch} branch's payload keys differ from the other branches'"
         )
+
+    @pytest.mark.asyncio
+    async def test_cancelled_run_does_not_append_run_record(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A cancelled run must not append a RunRecord — no assistant message was persisted."""
+        recorded: list[RunRecord] = []
+        result = AgentRunResult(thread_id="t1", output="partial", message_count=2, cancelled=True)
+        manager = self._manager(monkeypatch, result)
+        manager._thread_storage.append_run_record = lambda thread_id, record: recorded.append(record)  # noqa: ARG005
+
+        await manager._run_agent(_run_request())
+
+        assert recorded == [], "cancelled run must not record a RunRecord"
+
+    @pytest.mark.asyncio
+    async def test_normal_run_appends_run_record_with_resolved_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A successful run appends one RunRecord with the provider's resolved model."""
+        recorded: list[RunRecord] = []
+        result = AgentRunResult(thread_id="t1", output="done", message_count=2)
+        manager = self._manager(monkeypatch, result)
+        manager._thread_storage.append_run_record = lambda thread_id, record: recorded.append(record)  # noqa: ARG005
+
+        await manager._run_agent(_run_request())
+
+        assert len(recorded) == 1
+        record = recorded[0]
+        assert record.message_index == 1  # message_count - 1
+        # request.model_name is None; the provider's resolved default must be stored instead.
+        assert record.model is not None, "model must be resolved from the provider, not stored as None"
+        assert record.model != "", "model must be a non-empty string"
+        assert record.provider_name, "provider_name must be non-empty"
