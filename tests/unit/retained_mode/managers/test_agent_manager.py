@@ -1323,19 +1323,49 @@ class TestRunAgentResultPayloadContract:
         assert recorded == [], "cancelled run must not record a RunRecord"
 
     @pytest.mark.asyncio
-    async def test_normal_run_appends_run_record_with_resolved_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """A successful run appends one RunRecord with the provider's resolved model."""
+    async def test_normal_run_stores_provider_name_model_and_mcp_servers(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A successful run stores the resolved provider name, provider default model, and MCP servers."""
         recorded: list[RunRecord] = []
         result = AgentRunResult(thread_id="t1", output="done", message_count=2)
         manager = self._manager(monkeypatch, result)
+        manager._providers = [ProviderConfig(name="my-ollama", type="ollama", model="llama3")]
+        manager._active_provider_name = "my-ollama"
         manager._thread_storage.append_run_record = lambda thread_id, record: recorded.append(record)  # noqa: ARG005
 
-        await manager._run_agent(_run_request())
+        req = RunAgentRequest(
+            input="hello",
+            url_artifacts=[],
+            thread_id="t1",
+            provider_name="my-ollama",
+            additional_mcp_servers=["brave"],
+        )
+        await manager._run_agent(req)
 
         assert len(recorded) == 1
-        record = recorded[0]
-        assert record.message_index == 1  # message_count - 1
-        # request.model_name is None; the provider's resolved default must be stored instead.
-        assert record.model is not None, "model must be resolved from the provider, not stored as None"
-        assert record.model != "", "model must be a non-empty string"
-        assert record.provider_name, "provider_name must be non-empty"
+        r = recorded[0]
+        assert r.message_index == 1  # message_count - 1
+        assert r.provider_name == "my-ollama"
+        assert r.model == "llama3", "model must come from the provider default, not be None"
+        assert r.mcp_servers == ["brave"]
+
+    @pytest.mark.asyncio
+    async def test_normal_run_explicit_model_name_takes_precedence(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When request.model_name is set it overrides the provider's default model."""
+        recorded: list[RunRecord] = []
+        result = AgentRunResult(thread_id="t1", output="done", message_count=2)
+        manager = self._manager(monkeypatch, result)
+        manager._providers = [ProviderConfig(name="my-ollama", type="ollama", model="llama3")]
+        manager._active_provider_name = "my-ollama"
+        manager._thread_storage.append_run_record = lambda thread_id, record: recorded.append(record)  # noqa: ARG005
+
+        req = RunAgentRequest(
+            input="hello",
+            url_artifacts=[],
+            thread_id="t1",
+            provider_name="my-ollama",
+            model_name="gpt-4o",
+        )
+        await manager._run_agent(req)
+
+        assert len(recorded) == 1
+        assert recorded[0].model == "gpt-4o", "explicit model_name must take precedence over provider default"
