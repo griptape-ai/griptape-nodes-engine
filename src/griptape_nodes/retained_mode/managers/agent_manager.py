@@ -25,7 +25,7 @@ import mimetypes
 import os
 import textwrap
 import threading
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -116,6 +116,7 @@ from griptape_nodes.retained_mode.events.agent_events import (
     RunAgentRequestArtifact,
     RunAgentResultFailure,
     RunAgentResultSuccess,
+    RunRecord,
     UnarchiveThreadRequest,
     UnarchiveThreadResultFailure,
     UnarchiveThreadResultSuccess,
@@ -510,24 +511,25 @@ class AgentManager(EngineScoped):
         # A first run creates the thread; title it from the input even when the
         # turn is cancelled, so a quick send-then-cancel doesn't leave a
         # titleless orphan thread in the listing.
+        existing_meta = self._thread_storage.get_thread_metadata(result.thread_id)
+        metadata_updates: dict[str, object] = {}
         if is_first_run:
-            self._thread_storage.update_thread_metadata(
-                result.thread_id, title=textwrap.shorten(request.input, width=50, placeholder="...")
+            metadata_updates["title"] = textwrap.shorten(request.input, width=50, placeholder="...")
+        # Only record a run when an assistant message was actually persisted
+        # (message_count is even: each complete turn adds one user + one assistant message).
+        # An odd count means the run was cancelled before any response was saved.
+        if result.message_count > 0 and result.message_count % 2 == 0:
+            new_run = asdict(
+                RunRecord(
+                    message_index=result.message_count - 1,
+                    provider_name=request.provider_name or self._active_provider_name,
+                    model=request.model_name or "",
+                    mcp_servers=request.additional_mcp_servers or [],
+                )
             )
-
-        existing_runs = self._thread_storage.get_thread_metadata(result.thread_id).get("runs", [])
-        self._thread_storage.update_thread_metadata(
-            result.thread_id,
-            runs=[
-                *existing_runs,
-                {
-                    "message_index": result.message_count - 1,
-                    "provider_name": request.provider_name or self._active_provider_name,
-                    "model": request.model_name or "",
-                    "mcp_servers": request.additional_mcp_servers or [],
-                },
-            ],
-        )
+            metadata_updates["runs"] = [*existing_meta.get("runs", []), new_run]
+        if metadata_updates:
+            self._thread_storage.update_thread_metadata(result.thread_id, **metadata_updates)
 
         if result.cancelled:
             logger.info("Agent run for thread %s cancelled by request.", result.thread_id)

@@ -86,7 +86,12 @@ class LocalThreadStorageDriver(BaseThreadStorageDriver):
             thread_id = meta_file.stem.removeprefix("thread_").removesuffix(".meta")
             meta = self._read_meta(thread_id)
             raw_runs = meta.get("runs", [])
-            runs = [RunRecord(**r) for r in raw_runs]
+            runs = []
+            for r in raw_runs:
+                try:
+                    runs.append(RunRecord(**r))
+                except (TypeError, KeyError):
+                    logger.warning("Skipping malformed run record in thread %s: %s", thread_id, r)
             threads.append(
                 ThreadMetadata(
                     thread_id=thread_id,
