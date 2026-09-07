@@ -511,7 +511,6 @@ class AgentManager(EngineScoped):
         # A first run creates the thread; title it from the input even when the
         # turn is cancelled, so a quick send-then-cancel doesn't leave a
         # titleless orphan thread in the listing.
-        existing_meta = self._thread_storage.get_thread_metadata(result.thread_id)
         metadata_updates: dict[str, object] = {}
         if is_first_run:
             metadata_updates["title"] = textwrap.shorten(request.input, width=50, placeholder="...")
@@ -519,15 +518,16 @@ class AgentManager(EngineScoped):
         # (message_count is even: each complete turn adds one user + one assistant message).
         # An odd count means the run was cancelled before any response was saved.
         if result.message_count > 0 and result.message_count % 2 == 0:
+            existing_runs = self._thread_storage.get_thread_metadata(result.thread_id).get("runs", [])
             new_run = asdict(
                 RunRecord(
                     message_index=result.message_count - 1,
                     provider_name=request.provider_name or self._active_provider_name,
-                    model=request.model_name or "",
+                    model=request.model_name,
                     mcp_servers=request.additional_mcp_servers or [],
                 )
             )
-            metadata_updates["runs"] = [*existing_meta.get("runs", []), new_run]
+            metadata_updates["runs"] = [*existing_runs, new_run]
         if metadata_updates:
             self._thread_storage.update_thread_metadata(result.thread_id, **metadata_updates)
 

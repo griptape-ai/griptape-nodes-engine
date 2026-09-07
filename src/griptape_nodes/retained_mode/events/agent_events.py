@@ -317,7 +317,7 @@ class RunRecord:
 
     message_index: int
     provider_name: str
-    model: str
+    model: str | None
     mcp_servers: list[str] = field(default_factory=list)
 
 
