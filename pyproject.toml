@@ -41,7 +41,11 @@ dependencies = [
   "cattrs>=26.1.0",
   "fileseq>=3.2.0",
   "pydantic-ai-slim[mcp,openai]>=1.95.1",
-  "pydantic-ai-skills>=0.11.0",
+  # Ceiling below 2.0: that release removes the exclude_tools and auto_reload arguments
+  # agents/pydantic_ai/runner.py passes to SkillsCapability, so an unbounded resolve breaks
+  # the sidebar agent at construction time (see issue 5491). Lift once the call site is
+  # migrated to the 2.x API (see issue 5492).
+  "pydantic-ai-skills>=0.11.0,<2",
 ]
 
 [project.optional-dependencies]
