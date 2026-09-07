@@ -1263,8 +1263,13 @@ class TestRunAgentResultPayloadContract:
 
         monkeypatch.setattr(manager, "_validate_thread_for_run", lambda _thread_id: "t1")
         monkeypatch.setattr(manager, "_build_runner", lambda *_a, **_k: SimpleNamespace(run=fake_run))
-        # A non-empty history keeps `is_first_run` False, so no thread metadata write.
-        manager._thread_storage = SimpleNamespace(load_history=lambda _t: [object()])  # type: ignore[assignment]
+        manager._active_provider_name = "griptape_cloud"
+        # A non-empty history keeps `is_first_run` False, so the title update is skipped.
+        manager._thread_storage = SimpleNamespace(  # type: ignore[assignment]
+            load_history=lambda _t: [object()],
+            get_thread_metadata=lambda _t: {},
+            update_thread_metadata=lambda _t, **_kw: {},
+        )
         monkeypatch.setattr(
             _AGENT_MANAGER_MODULE + "._compose_prompt",
             _stub_compose_prompt,
