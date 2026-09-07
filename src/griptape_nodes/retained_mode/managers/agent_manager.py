@@ -25,7 +25,7 @@ import mimetypes
 import os
 import textwrap
 import threading
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass, replace
 from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -511,24 +511,23 @@ class AgentManager(EngineScoped):
         # A first run creates the thread; title it from the input even when the
         # turn is cancelled, so a quick send-then-cancel doesn't leave a
         # titleless orphan thread in the listing.
-        metadata_updates: dict[str, object] = {}
         if is_first_run:
-            metadata_updates["title"] = textwrap.shorten(request.input, width=50, placeholder="...")
+            self._thread_storage.update_thread_metadata(
+                result.thread_id, title=textwrap.shorten(request.input, width=50, placeholder="...")
+            )
         # Only record a run when an assistant message was actually persisted.
         # Cancelled runs return the pre-run history length, so no response was saved.
         if not result.cancelled and result.message_count > 0:
-            existing_runs = self._thread_storage.get_thread_metadata(result.thread_id).get("runs", [])
-            new_run = asdict(
+            resolved_provider = self._get_provider(request.provider_name)
+            self._thread_storage.append_run_record(
+                result.thread_id,
                 RunRecord(
                     message_index=result.message_count - 1,
-                    provider_name=request.provider_name or self._active_provider_name,
-                    model=request.model_name,
+                    provider_name=resolved_provider.name,
+                    model=request.model_name or resolved_provider.model,
                     mcp_servers=request.additional_mcp_servers or [],
-                )
+                ),
             )
-            metadata_updates["runs"] = [*existing_runs, new_run]
-        if metadata_updates:
-            self._thread_storage.update_thread_metadata(result.thread_id, **metadata_updates)
 
         if result.cancelled:
             logger.info("Agent run for thread %s cancelled by request.", result.thread_id)

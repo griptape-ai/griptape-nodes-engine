@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from dataclasses import asdict
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -76,6 +77,13 @@ class LocalThreadStorageDriver(BaseThreadStorageDriver):
         meta.setdefault("created_at", meta["updated_at"])
         self._write_meta(thread_id, meta)
         return meta
+
+    def append_run_record(self, thread_id: str, record: RunRecord) -> None:
+        meta = self._read_meta(thread_id)
+        meta.setdefault("runs", []).append(asdict(record))
+        meta["updated_at"] = datetime.now(UTC).isoformat()
+        meta.setdefault("created_at", meta["updated_at"])
+        self._write_meta(thread_id, meta)
 
     def list_threads(self) -> list[ThreadMetadata]:
         if not self.threads_directory.exists():

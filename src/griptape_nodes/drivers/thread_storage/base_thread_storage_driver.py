@@ -9,7 +9,7 @@ Griptape Cloud, etc.) but they all expose the same surface here.
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
-from griptape_nodes.retained_mode.events.agent_events import ThreadMetadata
+from griptape_nodes.retained_mode.events.agent_events import RunRecord, ThreadMetadata
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
 
@@ -97,6 +97,15 @@ class BaseThreadStorageDriver(ABC):
         Returns an empty list when the thread has no history yet (e.g. a brand
         new thread). The caller is responsible for handling missing threads
         via :meth:`thread_exists`.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def append_run_record(self, thread_id: str, record: RunRecord) -> None:
+        """Atomically append a RunRecord to the thread's metadata.
+
+        Implementations own the serialization format; callers pass a typed
+        record and never touch the on-disk shape directly.
         """
         raise NotImplementedError
 
