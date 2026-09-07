@@ -581,7 +581,7 @@ dependencies = [
 
 [[package]]
 name = "griptape-nodes-engine"
-version = "0.100.0"
+version = "0.100.2"
 source = { editable = "." }
 dependencies = [
     { name = "anyio" },
@@ -673,7 +673,7 @@ requires-dist = [
     { name = "portalocker", specifier = ">=2.10.0" },
     { name = "pydantic", specifier = ">=2.10.6" },
     { name = "pydantic-ai-skills", specifier = ">=0.11.0,<2" },
-    { name = "pydantic-ai-slim", extras = ["mcp", "openai"], specifier = ">=1.95.1" },
+    { name = "pydantic-ai-slim", extras = ["mcp", "openai"], specifier = ">=2.29.0" },
     { name = "python-dotenv", specifier = ">=1.0.1" },
     { name = "python-multipart", specifier = ">=0.0.20" },
     { name = "rich", specifier = ">=14.1.0" },
