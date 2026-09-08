@@ -1,5 +1,6 @@
 """Tests for inter-library dependency resolution (GH#4740)."""
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -29,7 +30,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     DependencyInstallationFailedProblem,
     LibraryDependencyProblem,
 )
-from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
+from griptape_nodes.retained_mode.managers.library_manager import DependencyInstallError, LibraryManager
 from griptape_nodes.retained_mode.managers.settings import LibraryDependencyInstallBehavior
 
 
@@ -965,3 +966,59 @@ class TestPipInstallFailureIsRecordedOnTheLibrary:
             )
 
         assert not [p for p in lib_info.problems if isinstance(p, LibraryDependencyProblem)]
+
+
+class TestExecutionEnvironmentResolvesBothSets:
+    """`.venv-exec` is resolved over the edit-time set AND the heavy one, in one resolution.
+
+    Resolved apart, uv can pick a different version of anything the two share -- numpy declared as
+    an edit-time dependency and numpy pulled in by torch -- and the worker would then run against
+    one version while the orchestrator built the node against another. Covered here rather than on
+    disk: a synchronous caller runs the handler under `asyncio.run`, so the loop closes before the
+    scheduled build can finish and no in-process test can inspect the directory.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_execution_install_receives_the_union_of_both_sets(self, engine: Engine) -> None:
+        mgr = engine.library_manager
+        lib_info = _make_lib_info()
+        ready_event = asyncio.Event()
+        lib_info.execution_env_ready = ready_event
+
+        with patch.object(mgr, "_install_dependency_set", new=AsyncMock(return_value=None)) as install:
+            await mgr._build_execution_env(
+                library_info=lib_info,
+                pip_dependencies=["fakeedit", "numpy"],
+                pip_dependencies_exec=["faketorch"],
+                pip_install_flags=["--no-index"],
+                ready_event=ready_event,
+            )
+
+        kwargs = install.call_args.kwargs
+        assert kwargs["pip_dependencies"] == ["fakeedit", "numpy", "faketorch"]
+        # Targets the execution venv, not the edit-time one the orchestrator imports from.
+        assert kwargs["execution"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_failed_build_records_the_reason_and_still_releases_waiters(self, engine: Engine) -> None:
+        """Spawn waits on this event, so a build that never releases it holds the loop open."""
+        mgr = engine.library_manager
+        lib_info = _make_lib_info()
+        ready_event = asyncio.Event()
+        lib_info.execution_env_ready = ready_event
+
+        with patch.object(
+            mgr, "_install_dependency_set", new=AsyncMock(side_effect=DependencyInstallError("no solution found"))
+        ):
+            await mgr._build_execution_env(
+                library_info=lib_info,
+                pip_dependencies=["fakeedit"],
+                pip_dependencies_exec=["faketorch"],
+                pip_install_flags=[],
+                ready_event=ready_event,
+            )
+
+        assert ready_event.is_set()
+        # Both: the refusal to spawn reads execution_env_failure, the next run reports the other.
+        assert lib_info.execution_env_failure == "no solution found"
+        assert lib_info.execution_unavailable_reason == "no solution found"

@@ -507,6 +507,16 @@ class ExecuteNodeRequest(RequestPayload):
             Workers carry this field because they have no access to VariablesManager
             or the workflow context; in-process nodes use it to skip the NodeManager
             lookup that would otherwise resolve the flow.
+        workflow_name / workflow_file_path / workflow_working_directory: the orchestrator's workflow
+            CONTEXT, which the worker adopts as its own before running the node. Sent for the same
+            reason as `variables` -- it lives in in-process state only the orchestrator has -- and
+            sent as context rather than as resolved paths so that everything derived from it
+            (`workflow_dir`, `workflow_name`, variable-substitution enablement, anything added
+            later) is answered by the worker's normal code paths. A worker without it answers "no
+            current workflow" to all of them, which silently degrades `{outputs}` from the
+            workflow's own folder to a workspace-relative path. These three mirror
+            ContextManager.WorkflowContextState exactly; workflow_name None means the orchestrator
+            had no workflow either, so there is nothing to adopt.
 
     Results: ExecuteNodeResultSuccess | ExecuteNodeResultFailure
     """
@@ -515,6 +525,9 @@ class ExecuteNodeRequest(RequestPayload):
     parameter_values: dict[str, Any] = field(default_factory=dict)
     node_metadata: NodeMetadata | None = None
     variables: dict[str, str | int] = field(default_factory=dict)
+    workflow_name: str | None = None
+    workflow_file_path: str | None = None
+    workflow_working_directory: str | None = None
 
 
 @dataclass
