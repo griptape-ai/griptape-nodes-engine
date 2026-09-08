@@ -12,7 +12,6 @@ from typing import Any
 
 from griptape_nodes.files.path_utils import parse_static_server_url
 from griptape_nodes.retained_mode.engine import current_engine
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +117,7 @@ def _upload_file_to_static_storage(file_path: Path, artifact_type: type[Any]) ->
     try:
         file_data = file_path.read_bytes()
         file_name = file_path.name
-        static_files_manager = GriptapeNodes.StaticFilesManager()
+        static_files_manager = current_engine().static_files_manager
         url = static_files_manager.save_static_file(file_data, file_name)
         return artifact_type(url)
     except Exception as e:
