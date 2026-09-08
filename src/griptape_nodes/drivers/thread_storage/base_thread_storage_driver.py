@@ -110,6 +110,15 @@ class BaseThreadStorageDriver(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def get_thread_metadata_full(self, thread_id: str) -> ThreadMetadata:
+        """Return full metadata for one thread, including its runs list.
+
+        list_threads() omits runs for performance; use this when the caller
+        actually needs per-run provider/model info (e.g. opening a thread).
+        """
+        raise NotImplementedError
+
+    @abstractmethod
     def save_history(self, thread_id: str, messages: list["ModelMessage"]) -> None:
         """Persist a Pydantic AI message history for a thread.
 

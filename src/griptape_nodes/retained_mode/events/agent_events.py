@@ -355,6 +355,40 @@ class ListThreadsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
+class GetThreadMetadataRequest(RequestPayload):
+    """Fetch full metadata for a single thread, including per-run provider/model info.
+
+    Use when: Opening a thread to display its message history and run details.
+
+    Args:
+        thread_id: ID of the thread to fetch.
+
+    Results: GetThreadMetadataResultSuccess | GetThreadMetadataResultFailure
+    """
+
+    thread_id: str
+
+
+@dataclass
+@PayloadRegistry.register
+class GetThreadMetadataResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Thread metadata retrieved successfully.
+
+    Args:
+        thread: Full thread metadata including per-run provider/model info.
+    """
+
+    thread: ThreadMetadata
+
+
+@dataclass
+@PayloadRegistry.register
+class GetThreadMetadataResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Thread metadata fetch failed. Common causes: thread not found, storage error."""
+
+
+@dataclass
+@PayloadRegistry.register
 class DeleteThreadRequest(RequestPayload):
     """Delete a conversation thread permanently.
 

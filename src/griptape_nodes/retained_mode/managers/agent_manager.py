@@ -97,6 +97,9 @@ from griptape_nodes.retained_mode.events.agent_events import (
     GetConversationMemoryRequest,
     GetConversationMemoryResultFailure,
     GetConversationMemoryResultSuccess,
+    GetThreadMetadataRequest,
+    GetThreadMetadataResultFailure,
+    GetThreadMetadataResultSuccess,
     ListAgentModelsRequest,
     ListAgentModelsResultSuccess,
     ListAgentProvidersRequest,
@@ -377,6 +380,9 @@ class AgentManager(EngineScoped):
                 GetConversationMemoryRequest, self.on_handle_get_conversation_memory_request
             )
             event_manager.assign_manager_to_request_type(CreateThreadRequest, self.on_handle_create_thread_request)
+            event_manager.assign_manager_to_request_type(
+                GetThreadMetadataRequest, self.on_handle_get_thread_metadata_request
+            )
             event_manager.assign_manager_to_request_type(ListThreadsRequest, self.on_handle_list_threads_request)
             event_manager.assign_manager_to_request_type(DeleteThreadRequest, self.on_handle_delete_thread_request)
             event_manager.assign_manager_to_request_type(RenameThreadRequest, self.on_handle_rename_thread_request)
@@ -616,6 +622,17 @@ class AgentManager(EngineScoped):
             details = f"Error creating thread: {e}"
             logger.exception(details)
             return CreateThreadResultFailure(result_details=details)
+
+    def on_handle_get_thread_metadata_request(self, request: GetThreadMetadataRequest) -> ResultPayload:
+        try:
+            thread = self._thread_storage.get_thread_metadata_full(request.thread_id)
+            return GetThreadMetadataResultSuccess(
+                thread=thread, result_details="Thread metadata retrieved successfully."
+            )
+        except Exception as e:
+            details = f"Error retrieving thread metadata: {e}"
+            logger.exception(details)
+            return GetThreadMetadataResultFailure(result_details=details)
 
     def on_handle_list_threads_request(self, _: ListThreadsRequest) -> ResultPayload:
         try:

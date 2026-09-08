@@ -85,21 +85,32 @@ class LocalThreadStorageDriver(BaseThreadStorageDriver):
         meta.setdefault("created_at", meta["updated_at"])
         self._write_meta(thread_id, meta)
 
+    def get_thread_metadata_full(self, thread_id: str) -> ThreadMetadata:
+        meta = self._read_meta(thread_id)
+        return ThreadMetadata(
+            thread_id=thread_id,
+            title=meta.get("title"),
+            created_at=meta.get("created_at", ""),
+            updated_at=meta.get("updated_at", ""),
+            message_count=meta.get("message_count", 0),
+            archived=meta.get("archived", False),
+            local_id=meta.get("local_id"),
+            runs=self._deserialize_runs(thread_id, meta),
+        )
+
     def list_threads(self) -> list[ThreadMetadata]:
+        import time  # TEMP profiling
+
         if not self.threads_directory.exists():
             return []
 
+        t0 = time.perf_counter()
+        total_bytes = 0
         threads: list[ThreadMetadata] = []
         for meta_file in self.threads_directory.glob("thread_*.meta.json"):
+            total_bytes += meta_file.stat().st_size  # TEMP profiling
             thread_id = meta_file.stem.removeprefix("thread_").removesuffix(".meta")
             meta = self._read_meta(thread_id)
-            raw_runs = meta.get("runs", [])
-            runs = []
-            for r in raw_runs:
-                try:
-                    runs.append(RunRecord(**r))
-                except (TypeError, KeyError):
-                    logger.warning("Skipping malformed run record in thread %s: %s", thread_id, r)
             threads.append(
                 ThreadMetadata(
                     thread_id=thread_id,
@@ -109,12 +120,27 @@ class LocalThreadStorageDriver(BaseThreadStorageDriver):
                     message_count=meta.get("message_count", 0),
                     archived=meta.get("archived", False),
                     local_id=meta.get("local_id"),
-                    runs=runs,
                 ),
             )
 
         threads.sort(key=lambda t: t.updated_at, reverse=True)
+        elapsed_ms = (time.perf_counter() - t0) * 1000  # TEMP profiling
+        logger.info(  # TEMP profiling
+            "list_threads: %d threads, %.1f KB meta, %.2f ms (runs omitted)",
+            len(threads),
+            total_bytes / 1024,
+            elapsed_ms,
+        )
         return threads
+
+    def _deserialize_runs(self, thread_id: str, meta: dict) -> list[RunRecord]:
+        runs = []
+        for r in meta.get("runs", []):
+            try:
+                runs.append(RunRecord(**r))
+            except (TypeError, KeyError):
+                logger.warning("Skipping malformed run record in thread %s: %s", thread_id, r)
+        return runs
 
     def delete_thread(self, thread_id: str) -> None:
         if not self.thread_exists(thread_id):
