@@ -3,6 +3,7 @@
 # ruff: noqa: PLR2004
 
 import asyncio
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -14,6 +15,7 @@ from griptape_nodes.machines.control_flow import ControlFlowMachine
 from griptape_nodes.machines.dag_builder import DagBuilder, DagNode, NodeState
 from griptape_nodes.machines.fsm import WorkflowState
 from griptape_nodes.machines.parallel_resolution import (
+    DagCompleteState,
     ErrorState,
     ExecuteDagState,
     ParallelResolutionContext,
@@ -491,6 +493,104 @@ class TestParallelResolutionNodeDoneWhenTaskCompletes:
         dag_builder.node_to_reference["n"] = DagNode(node_reference=node, node_state=NodeState.PROCESSING)
 
         return ParallelResolutionContext("flow", max_nodes_in_parallel=5, dag_builder=dag_builder)
+
+    @staticmethod
+    def _context_with_real_node_mid_flight() -> tuple[ParallelResolutionContext, BaseNode]:
+        """A context holding a REAL node left in RESOLVING, as a failed run leaves it.
+
+        A real node rather than a MagicMock: the point is what `state` ends up as, and a mock
+        would happily report whatever it was told regardless of whether the code did anything.
+        """
+        from tests.unit.exe_types.mocks import MockNode
+
+        node = MockNode(name="n", engine=MagicMock())
+        node.state = NodeResolutionState.RESOLVING
+
+        graph = DirectedGraph()
+        graph.add_node("n")
+        dag_builder = DagBuilder()
+        dag_builder.graphs["n"] = graph
+        dag_builder.node_to_reference["n"] = DagNode(node_reference=node, node_state=NodeState.ERRORED)
+
+        return ParallelResolutionContext("flow", max_nodes_in_parallel=5, dag_builder=dag_builder), node
+
+    @pytest.mark.asyncio
+    async def test_a_cancel_that_never_reaches_error_state_still_gives_nodes_back(self) -> None:
+        """The path a user-initiated cancel actually takes.
+
+        `cancel_flow_run` calls `reset(cancel=True)`, which bumps the generation; every
+        `was_reset_since` guard in ExecuteDagState then abandons the run by returning None,
+        without entering ErrorState. So the ErrorState reset never runs for this path, and a
+        cancelled node kept reporting RESOLVING -- the editor spinning on it indefinitely.
+        """
+        context, node = self._context_with_real_node_mid_flight()
+
+        context.reset(cancel=True)
+
+        assert node.state is NodeResolutionState.UNRESOLVED
+        assert context.workflow_state == WorkflowState.CANCELED
+
+    @pytest.mark.asyncio
+    async def test_a_failed_run_gives_its_nodes_back_to_unresolved(self) -> None:
+        """A node the run never finished must not be left claiming to be mid-resolution.
+
+        `state` goes to RESOLVING at dispatch and to RESOLVED in handle_done_nodes, with nothing
+        in between for the failure case. A node that raised, or that was cancelled because a
+        sibling raised, therefore kept RESOLVING after the run ended -- so the editor showed it
+        spinning forever and GetNodeResolutionStateRequest kept answering RESOLVING. Nothing
+        else would ever move it, because the run finishes here.
+        """
+        context, node = self._context_with_real_node_mid_flight()
+        context.error_message = "boom"
+
+        state = await ErrorState.on_update(context)
+
+        assert state is DagCompleteState
+        assert node.state is NodeResolutionState.UNRESOLVED
+        assert context.workflow_state == WorkflowState.ERRORED
+
+    @pytest.mark.asyncio
+    async def test_giving_a_node_back_tells_the_editor(self) -> None:
+        """The editor learns state from events, so a silent reset would leave the spinner up."""
+        from griptape_nodes.retained_mode.events.execution_events import NodeUnresolvedEvent
+
+        context, node = self._context_with_real_node_mid_flight()
+        engine = cast("MagicMock", node.engine)
+
+        await ErrorState.on_update(context)
+
+        payloads = [
+            call.args[0].wrapped_event.payload
+            for call in engine.event_manager.put_event.call_args_list
+            if hasattr(call.args[0], "wrapped_event")
+        ]
+        assert any(isinstance(payload, NodeUnresolvedEvent) and payload.node_name == "n" for payload in payloads)
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_run_also_gives_its_nodes_back(self) -> None:
+        """Cancelling is not resolving either, and a clean cancel must not strand the node."""
+        context, node = self._context_with_real_node_mid_flight()
+        context.error_message = None  # a user-initiated cancel, not an exception
+
+        state = await ErrorState.on_update(context)
+
+        assert state is DagCompleteState
+        assert node.state is NodeResolutionState.UNRESOLVED
+        assert context.workflow_state == WorkflowState.CANCELED
+
+    @pytest.mark.asyncio
+    async def test_an_already_resolved_node_is_left_alone(self) -> None:
+        """A node that finished before a sibling failed keeps its result.
+
+        Its outputs are real and downstream consumers may already hold them, so unresolving it
+        would discard work the run actually completed.
+        """
+        context, node = self._context_with_real_node_mid_flight()
+        node.state = NodeResolutionState.RESOLVED
+
+        await ErrorState.on_update(context)
+
+        assert node.state is NodeResolutionState.RESOLVED
 
     @pytest.mark.asyncio
     async def test_reaping_a_completed_task_marks_node_done(self, monkeypatch: pytest.MonkeyPatch) -> None:

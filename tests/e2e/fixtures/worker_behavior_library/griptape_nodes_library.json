@@ -123,6 +123,15 @@
         "description": "Saves through ProjectFileDestination and reports the macro it mapped back to",
         "display_name": "WriteProjectFileNode"
       }
+    },
+    {
+      "class_name": "DerivedStructureNode",
+      "file_path": "worker_behavior_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Derives parameter structure from a value",
+        "display_name": "DerivedStructureNode"
+      }
     }
   ]
 }
