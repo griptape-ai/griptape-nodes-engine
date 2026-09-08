@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 import httpx
-from pydantic_ai.exceptions import ModelHTTPError
+from pydantic_ai.exceptions import ModelHTTPError, ModelRetry, UnexpectedModelBehavior
 from pydantic_ai.messages import BinaryContent, ImageUrl, ModelMessagesTypeAdapter, ModelRequest, UserPromptPart
 from pydantic_ai.usage import UsageLimits
 from xdg_base_dirs import xdg_data_home
@@ -263,6 +263,36 @@ def _friendly_list_models_error(exc: Exception, base_url: str | None) -> str | N
     return None
 
 
+# Substring of Pydantic AI's UnexpectedModelBehavior text for a tool that spent
+# its retry budget. Matched rather than inferred from the exception's cause,
+# which other UnexpectedModelBehavior sites chain too.
+_TOOL_RETRIES_EXHAUSTED_MARKER = "exceeded max retries count of"
+
+
+def _explain_tool_retry_exhaustion(exc: Exception) -> str | None:
+    """Return a user-facing message when a tool call failed its way through its retry budget.
+
+    Pydantic AI ends the turn with ``UnexpectedModelBehavior`` once a tool has
+    spent its retries, and names an internal limit and links the Pydantic AI
+    docs. Neither means anything to the person chatting. The correction the tool
+    handed the model does (``load_capability`` answers an unknown skill with the
+    real ones), so lead with that.
+
+    Returns ``None`` for anything else so the caller keeps its own message.
+    """
+    if not isinstance(exc, UnexpectedModelBehavior):
+        return None
+    if _TOOL_RETRIES_EXHAUSTED_MARKER not in str(exc):
+        return None
+    detail = ""
+    if isinstance(exc.__cause__, ModelRetry):
+        detail = f" The tool reported: {exc.__cause__.message}"
+    return (
+        "Attempted to answer your message. The assistant kept calling one of its tools incorrectly and ran out of "
+        f"attempts.{detail} Send the message again, or reword it."
+    )
+
+
 # Cap each chat-sidebar turn so a runaway loop can't burn through credits or
 # wedge the conversation. The numbers are deliberately generous: 60 model
 # requests is enough for a complex multi-tool task while still protecting the
@@ -463,8 +493,12 @@ class AgentManager(EngineScoped):
         successfully and still be refused: Cloud evaluates an entitlement policy
         per request and answers HTTP 403. On its own that surfaces as a bare
         "Forbidden", which reads like a bug rather than a licensing decision, so
-        name the cause. Every other error keeps its original text.
+        name the cause. A tool that spends its retry budget gets the same
+        treatment. Every other error keeps its original text.
         """
+        retry_message = _explain_tool_retry_exhaustion(exc)
+        if retry_message is not None:
+            return retry_message
         if self._get_provider(provider_name).type != _PROTECTED_PROVIDER_NAME:
             return str(exc)
         cloud_host = urlsplit(os.environ.get("GT_CLOUD_BASE_URL") or GRIPTAPE_CLOUD_BASE_URL).hostname or ""

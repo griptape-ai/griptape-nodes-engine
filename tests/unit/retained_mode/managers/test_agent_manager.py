@@ -15,7 +15,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from pydantic_ai.exceptions import ModelHTTPError, ModelRetry
+from pydantic_ai.exceptions import ModelHTTPError, ModelRetry, UnexpectedModelBehavior
 from pydantic_ai.messages import BinaryContent, ImageUrl, ModelMessage, ModelRequest, UserPromptPart
 
 from griptape_nodes.agents.pydantic_ai.runner import (
@@ -1184,6 +1184,28 @@ class TestExplainAgentRunError:
         message = providers_manager._explain_agent_run_error(exc, "my-ollama")
 
         assert "not entitled" not in message
+
+    def test_tool_retry_exhaustion_drops_pydantic_ai_jargon(self, providers_manager: AgentManager) -> None:
+        """The retry limit and the pydantic-ai docs link mean nothing to the person chatting."""
+        cause = ModelRetry("Capability 'analysis' not found. Available: ['research'].")
+        exc = UnexpectedModelBehavior(
+            "Tool 'load_capability' exceeded max retries count of 3. Consider raising the retry limit, "
+            "or see the docs on tool retries: https://example.invalid/tool-retries"
+        )
+        exc.__cause__ = cause
+
+        message = providers_manager._explain_agent_run_error(exc, "my-ollama")
+
+        assert "max retries" not in message
+        assert "https://" not in message
+        assert "Available: ['research']." in message
+
+    def test_other_unexpected_model_behavior_keeps_original_message(self, providers_manager: AgentManager) -> None:
+        message = providers_manager._explain_agent_run_error(
+            UnexpectedModelBehavior("Received empty model response"), "my-ollama"
+        )
+
+        assert message == "Received empty model response"
 
 
 _CLOUD_HOST = "cloud.griptape.ai"

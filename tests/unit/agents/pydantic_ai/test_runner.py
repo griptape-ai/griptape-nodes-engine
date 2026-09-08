@@ -7,12 +7,14 @@ plumbing without hitting Griptape Cloud.
 from __future__ import annotations
 
 import asyncio
+import json
 from contextlib import asynccontextmanager
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 import pytest
 from pydantic_ai import Agent
+from pydantic_ai.exceptions import UnexpectedModelBehavior
 from pydantic_ai.messages import (
     BinaryContent,
     ImageUrl,
@@ -33,6 +35,7 @@ from griptape_nodes.agents.pydantic_ai.runner import (
     ToolCall,
     ToolResult,
 )
+from griptape_nodes.agents.pydantic_ai.tool_retries import DEFAULT_TOOL_MAX_RETRIES
 from griptape_nodes.drivers.cloud_models import MODEL_SETTINGS
 from griptape_nodes.drivers.thread_storage.local_thread_storage_driver import LocalThreadStorageDriver
 
@@ -603,3 +606,59 @@ def test_runner_explicit_settings_override_the_catalog(tmp_path: Path) -> None:
     )
 
     assert _model_settings_of(runner).get("max_tokens") == 1234  # noqa: PLR2004
+
+
+def _write_skill(workspace: Path) -> None:
+    """Create a skill, so the capability's tool gets registered."""
+    skill_dir = workspace / ".agents/skills/demo-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: demo-skill\ndescription: Demo skill description.\n---\n\nGuidance for the task."
+    )
+
+
+@dataclass
+class _RepeatedToolCall:
+    """A model that calls one tool with the same bad args every request, counting requests."""
+
+    tool_name: str
+    args: dict[str, Any] = field(default_factory=dict)
+    count: int = 0
+
+    async def stream(self, _messages: list[ModelMessage], _info: AgentInfo) -> AsyncIterator[Any]:
+        self.count += 1
+        yield {
+            0: DeltaToolCall(
+                name=self.tool_name,
+                json_args=json.dumps(self.args),
+                tool_call_id=f"call-{self.count}",
+            )
+        }
+
+
+@pytest.mark.asyncio
+async def test_load_capability_gets_more_than_one_retry(tmp_path: Path) -> None:
+    """`load_capability` gets several tries at a skill name before the turn dies.
+
+    Regression guard: pydantic-ai's default budget of one retry ended the whole
+    turn on the second bad capability id, and the user lost their reply.
+    """
+    workspace = tmp_path / "ws"
+    _write_skill(workspace)
+    storage = LocalThreadStorageDriver(tmp_path / "threads", config_manager=None, secrets_manager=None)  # type: ignore[arg-type]
+    runner = PydanticAgentRunner(
+        model_name="test",
+        api_key="dummy",
+        workspace_root=workspace,
+        storage=storage,
+    )
+
+    attempts = _RepeatedToolCall("load_capability", {"id": "no-such-skill"})
+
+    with (
+        runner.agent.override(model=FunctionModel(stream_function=attempts.stream)),
+        pytest.raises(UnexpectedModelBehavior),
+    ):
+        await runner.run("go")
+
+    assert attempts.count == DEFAULT_TOOL_MAX_RETRIES + 1

@@ -28,6 +28,8 @@ from typing import TYPE_CHECKING, Any
 from fastmcp.client.transports import SSETransport, StdioTransport, StreamableHttpTransport
 from pydantic_ai.mcp import MCPToolset
 
+from griptape_nodes.agents.pydantic_ai.tool_retries import DEFAULT_TOOL_MAX_RETRIES
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
@@ -38,16 +40,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("griptape_nodes")
 
-
-DEFAULT_TOOL_MAX_RETRIES = 3
-"""How many times Pydantic AI retries a single MCP tool call after a `ModelRetry`.
-
-The Pydantic AI default is 1, which is too tight: when an LLM (especially Claude)
-fumbles the args for a tool with a structured `list[dict]` parameter, it usually
-gets a validation error, sees the retry message, and corrects on the second
-attempt. With `max_retries=1` that second attempt is the last one, so a single
-schema misunderstanding kills the whole run.
-"""
 
 DEFAULT_CONNECT_TIMEOUT = 5.0
 """Initial-connection timeout (seconds) for HTTP-based transports."""
