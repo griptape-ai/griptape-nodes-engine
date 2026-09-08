@@ -224,5 +224,3 @@ def _build_surface_parameter(name: str, param_dict: dict, allowed_modes: set[Par
         allowed_modes=allowed_modes,
         ui_options=param_dict.get("ui_options"),
     )
-
-

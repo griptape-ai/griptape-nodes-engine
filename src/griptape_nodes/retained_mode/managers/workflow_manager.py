@@ -78,7 +78,7 @@ from griptape_nodes.retained_mode.events.app_events import (
 )
 
 # Runtime imports for ResultDetails since it's used at runtime
-from griptape_nodes.retained_mode.events.base_events import AppEvent, ResultDetail, ResultDetails
+from griptape_nodes.retained_mode.events.base_events import AppEvent, GriptapeNodeEvent, ResultDetail, ResultDetails
 from griptape_nodes.retained_mode.events.connection_events import (
     CreateConnectionRequest,
     DeleteConnectionRequest,
@@ -299,7 +299,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands, SetLockNodeStateRequest
-    from griptape_nodes.retained_mode.managers.event_manager import EventManager
+    from griptape_nodes.retained_mode.managers.event_manager import EventManager, ResultContext
     from griptape_nodes.retained_mode.managers.fitness_problems.workflows.workflow_problem import WorkflowProblem
 
 
@@ -7065,12 +7065,28 @@ class WorkflowManager(EngineScoped):
             existing_name,
             _get_subflow_or_none(existing_name) is not None if existing_name else "N/A",
         )
+
+        # Return immediately if the node already has a live inner flow tracked in metadata.
+        # Also handle the case where metadata was lost (e.g., after reload): scan for a flow
+        # with the canonical name and adopt it, preventing a de-duplicated suffix like "_inner_16".
+        canonical_child_name = f"{request.node_name}_inner"
         if existing_name is not None and _get_subflow_or_none(existing_name) is not None:
-            logger.info("OpenNodeInnerCanvas: returning existing flow '%s'", existing_name)
+            flow_to_return = existing_name
+            logger.info("OpenNodeInnerCanvas: returning existing flow '%s'", flow_to_return)
+        elif _get_subflow_or_none(canonical_child_name) is not None:
+            node.metadata[SUBFLOW_NAME_KEY] = canonical_child_name
+            flow_to_return = canonical_child_name
+            logger.info(
+                "OpenNodeInnerCanvas: adopted existing flow '%s' for '%s'", canonical_child_name, request.node_name
+            )
+        else:
+            flow_to_return = None
+
+        if flow_to_return is not None:
             return OpenNodeInnerCanvasResultSuccess(
-                child_flow_name=existing_name,
+                child_flow_name=flow_to_return,
                 created=False,
-                result_details=f"Inner canvas for '{request.node_name}' already exists.",
+                result_details=f"Inner canvas for '{request.node_name}' already exists as '{flow_to_return}'.",
             )
 
         flow_result = self.engine.handle_request(GetFlowForNodeRequest(node_name=request.node_name))
@@ -7082,20 +7098,7 @@ class WorkflowManager(EngineScoped):
             return OpenNodeInnerCanvasResultFailure(result_details=details)
 
         parent_flow_name = flow_result.flow_name
-        child_flow_name = f"{request.node_name}_inner"
-
-        # If a flow with the canonical name already exists (e.g., restored from a saved workflow
-        # but the node's subflow_name metadata was not persisted), adopt it rather than create a
-        # duplicate that would receive a de-duplicated suffix like "_inner_16".
-        maybe_existing = _get_subflow_or_none(child_flow_name)
-        if maybe_existing is not None:
-            node.metadata[SUBFLOW_NAME_KEY] = child_flow_name
-            logger.info("OpenNodeInnerCanvas: adopted existing flow '%s' for '%s'", child_flow_name, request.node_name)
-            return OpenNodeInnerCanvasResultSuccess(
-                child_flow_name=child_flow_name,
-                created=False,
-                result_details=f"Inner canvas for '{request.node_name}' reconnected to existing flow '{child_flow_name}'.",
-            )
+        child_flow_name = canonical_child_name
 
         create_result = self.engine.handle_request(
             CreateFlowRequest(
@@ -7662,7 +7665,9 @@ class WorkflowManager(EngineScoped):
             return ExportSubflowAsLockedResultFailure(result_details=details)
 
         child_flow_name = node.metadata.get(SUBFLOW_NAME_KEY)
-        logger.info("ExportSubflowAsLocked: child_flow_name=%r, metadata keys=%s", child_flow_name, list(node.metadata.keys()))
+        logger.info(
+            "ExportSubflowAsLocked: child_flow_name=%r, metadata keys=%s", child_flow_name, list(node.metadata.keys())
+        )
         if child_flow_name is None or _get_subflow_or_none(child_flow_name) is None:
             details = (
                 f"Attempted to export '{request.node_name}' as a locked subflow. "
@@ -7754,7 +7759,7 @@ class WorkflowManager(EngineScoped):
             description=node_type_name,
             display_name=node_type_name,
         )
-        self.engine.handle_request(GetAllInfoForLibraryRequest(library="Exported Subflows"))
+        await self._push_library_info_to_frontend("Exported Subflows")
 
         self._place_exported_node_on_canvas(
             original_node=node,
@@ -8105,7 +8110,7 @@ class WorkflowManager(EngineScoped):
             description=f"{node_type_name} v{request.version}",
             display_name=f"{node_type_name} v{request.version}",
         )
-        self.engine.handle_request(GetAllInfoForLibraryRequest(library="Live Subflows"))
+        await self._push_library_info_to_frontend("Live Subflows")
 
         self._place_exported_node_on_canvas(
             original_node=node,
@@ -8186,6 +8191,18 @@ class WorkflowManager(EngineScoped):
             display_name=display_name,
         )
         library.register_new_node_type(node_class, metadata=node_metadata)
+
+    async def _push_library_info_to_frontend(self, library_name: str) -> None:
+        """Push updated library info to the frontend so the sidebar refreshes immediately."""
+        session_id = self.engine.session_manager.active_session_id
+        if session_id is None:
+            return
+        result_context: ResultContext = {"response_topic": f"sessions/{session_id}/response"}
+        result_event = await self.engine._event_manager.ahandle_request(
+            GetAllInfoForLibraryRequest(library=library_name),
+            result_context=result_context,
+        )
+        await self.engine._event_manager.aput_event(GriptapeNodeEvent(wrapped_event=result_event))
 
     @staticmethod
     def _write_live_subflow_package(  # noqa: PLR0913, PLR0917
