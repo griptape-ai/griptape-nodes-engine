@@ -1,11 +1,8 @@
 """Unit tests for File and FileDestination."""
 
-from __future__ import annotations
-
 import base64
 from io import BytesIO
 from pathlib import Path
-from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
@@ -35,13 +32,12 @@ from griptape_nodes.retained_mode.events.project_events import (
     PathResolutionFailureReason,
 )
 
-if TYPE_CHECKING:
-    from griptape_nodes.retained_mode.engine import Engine
-
 HANDLE_REQUEST_PATH = "griptape_nodes.files.file.GriptapeNodes.handle_request"
 AHANDLE_REQUEST_PATH = "griptape_nodes.files.file.GriptapeNodes.ahandle_request"
+# These modules read the workspace off the engine they resolve, so the tests patch that
+# resolution and hand back a stand-in whose config_manager is the mock.
 CURRENT_ENGINE_PATH = "griptape_nodes.files.file.current_engine"
-STATIC_SERVER_CONFIG_MANAGER_PATH = "griptape_nodes.files.drivers.static_server_file_driver.GriptapeNodes.ConfigManager"
+STATIC_SERVER_CURRENT_ENGINE_PATH = "griptape_nodes.files.drivers.static_server_file_driver.current_engine"
 
 
 class TestFileConstructor:
@@ -1207,8 +1203,8 @@ class TestFileResolveUrls:
             mock_config_manager.return_value.config_manager.workspace_path = tmp_path
             resolved = File(url).resolve()
 
-        with patch(STATIC_SERVER_CONFIG_MANAGER_PATH) as mock_config_manager:
-            mock_config_manager.return_value.workspace_path = tmp_path
+        with patch(STATIC_SERVER_CURRENT_ENGINE_PATH) as mock_config_manager:
+            mock_config_manager.return_value.config_manager.workspace_path = tmp_path
             driver_path = driver._resolve_to_local_path(url)
 
         assert Path(resolved) == driver_path
@@ -1292,7 +1288,7 @@ def _jpeg_bytes() -> bytes:
 
 
 @pytest.fixture
-def _registered_providers(engine: Engine) -> None:
+def _registered_providers() -> None:
     """Ensure default artifact providers are registered with the ArtifactManager.
 
     Validation goes through ``ArtifactManager.sniff_extension``, which dispatches
@@ -1300,6 +1296,7 @@ def _registered_providers(engine: Engine) -> None:
     happens on ``AppInitializationComplete``, which doesn't fire in unit tests,
     so we register the default providers manually here.
     """
+    from griptape_nodes.retained_mode.engine import current_engine
     from griptape_nodes.retained_mode.events.artifact_events import RegisterArtifactProviderRequest
     from griptape_nodes.retained_mode.managers.artifact_providers import (
         AudioArtifactProvider,
@@ -1307,7 +1304,7 @@ def _registered_providers(engine: Engine) -> None:
         VideoArtifactProvider,
     )
 
-    artifact_manager = engine.artifact_manager
+    artifact_manager = current_engine().artifact_manager
     for provider_class in (ImageArtifactProvider, VideoArtifactProvider, AudioArtifactProvider):
         artifact_manager.on_handle_register_artifact_provider_request(
             RegisterArtifactProviderRequest(provider_class=provider_class)
