@@ -323,6 +323,10 @@ class NodeExecutor(EngineScoped):
                 await self.handle_loop_execution(node)
                 return
 
+            # Resolved here because only this process has workflow context to resolve it FROM;
+            # a worker would answer from an empty context and silently degrade the paths its node
+            # writes to. Harmless on the local route, where these are this process's own values.
+            workflow_context = self.engine.project_manager.workflow_context_for_dispatch()
             # Single entry point for both local and worker execution. The
             # ExecuteNodeRequest handler routes to a worker subprocess when the
             # node's library requires it, otherwise runs aprocess in-process.
@@ -332,6 +336,9 @@ class NodeExecutor(EngineScoped):
                     parameter_values=dict(node.parameter_values),
                     node_metadata=cast("NodeMetadata", dict(node.metadata)),
                     variables=self._resolve_variables_for_node(node.name),
+                    workflow_name=workflow_context.name,
+                    workflow_file_path=workflow_context.file_path,
+                    workflow_working_directory=workflow_context.working_directory,
                 )
             )
             if not isinstance(result, ExecuteNodeResultSuccess):

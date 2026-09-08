@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+import anyio
 from pydantic import ValidationError
 
 from griptape_nodes.common.macro_parser import (
@@ -44,6 +45,7 @@ from griptape_nodes.common.project_templates import (
     schema_major_or_none,
     select_project_path,
 )
+from griptape_nodes.common.workflow_context_handoff import WorkflowContextSnapshot
 from griptape_nodes.files.derivation import DERIVATION_RULES, apply_derivation_rules
 from griptape_nodes.files.file import File, FileWriteError
 from griptape_nodes.files.path_utils import (
@@ -169,7 +171,9 @@ logger = logging.getLogger("griptape_nodes")
 # the canonicalized project file path string as their id (the legacy bridge), so
 # the id-space is mixed (GUID/custom ids, legacy path-string ids, and the
 # synthetic SYSTEM_DEFAULTS_KEY). The on-disk file path is a separate locator.
-ProjectID = str
+# ProjectID lives in project_events (payloads annotate with it and pydantic needs the name
+# resolvable at runtime); re-exported here because this module is where most callers look.
+from griptape_nodes.retained_mode.events.project_events import ProjectID  # noqa: E402
 
 # Synthetic identifier for the system default project template
 SYSTEM_DEFAULTS_KEY: ProjectID = "<system-defaults>"
@@ -678,6 +682,17 @@ class ProjectManager(EngineScoped):
         # is selected. Any code path that previously cleared this to None now routes
         # back to system defaults via SetCurrentProjectRequest's default value.
         self._current_project_id: ProjectID = SYSTEM_DEFAULTS_KEY
+        # The last activation that fully SUCCEEDED, with a generation that increments on each.
+        # `_current_project_id` is assigned before activation's fallible steps, so reading it
+        # mid-switch can observe a project about to be rolled back; a worker registering in that
+        # window would adopt an abandoned project and never hear otherwise. The committed pair is
+        # what registration replies and fan-outs carry, and the generation is how a worker orders
+        # a registration reply against a concurrently-delivered switch fan-out.
+        self._committed_project_id: ProjectID = SYSTEM_DEFAULTS_KEY
+        self._project_generation: int = 0
+        # Worker-side: the highest generation this engine has adopted, so a stale activation
+        # (an older fan-out, or a registration reply racing a newer switch) is skipped.
+        self._last_adopted_generation: int = -1
         # Set to True at end of on_app_initialization_complete. Guards workspace switch
         # logic so expensive reloads don't fire during startup.
         self._initialization_complete: bool = False
@@ -3073,12 +3088,25 @@ class ProjectManager(EngineScoped):
 
         # Push the switch to running workers so they adopt the orchestrator's project
         # even on a shallow switch (same workspace + library config) that would not
-        # restart them. Boot is handled separately (a worker boots like an engine and
-        # re-derives the same project), so emit only post-init and only when the
-        # project actually changed. A worker that boots like the orchestrator has the
-        # same registry, so the id resolves there too.
-        if self._initialization_complete and previous_project_id != resolved_project_id:
-            self._event_manager.put_event(AppEvent(payload=CurrentProjectChanged(project_id=resolved_project_id)))
+        # restart them. Emitted on every actual change, including during boot: boot
+        # activations all precede worker spawn, so those emissions reach zero workers
+        # and are inert. Gating on initialization instead left a switch that landed after
+        # a worker registered but before init finished un-fanned-out for the session.
+        if previous_project_id != resolved_project_id:
+            # The generation is read here, with no await between the commit inside
+            # _activate_project and this line, so the (id, generation) pair is atomic. Reading
+            # it later -- in the fan-out handler -- can pair this id with a NEWER switch's
+            # generation, and this project would then beat that one on the workers.
+            changed = CurrentProjectChanged(project_id=resolved_project_id, generation=self._project_generation)
+            # The wire copy goes up first, still synchronous with the commit, so GUI clients
+            # see switches in commit order even when two overlap.
+            self._event_manager.put_event(AppEvent(payload=changed))
+            # The in-process listeners -- the worker fan-out -- are awaited BEFORE the switch
+            # reports success: the moment a caller sees the switch complete it may run a node,
+            # and a worker that has not yet adopted would run it against the old workspace.
+            # The queued copy above passes through these listeners a second time; the workers'
+            # generation guard skips that pass (or retries an adoption that failed here).
+            await self._event_manager.abroadcast_app_event(changed)
         return result
 
     def _refuse_unresolvable_declared_paths(
@@ -3249,6 +3277,10 @@ class ProjectManager(EngineScoped):
             if failure is not None:
                 return _ProjectActivationOutcome(failure=failure, workspace_changed=workspace_changed)
 
+        # Every path that reaches here established the project's layers completely: the
+        # requested switch, the boot seed, and the rollback re-activation all commit.
+        self._project_generation += 1
+        self._committed_project_id = resolved_project_id
         return _ProjectActivationOutcome(failure=None, workspace_changed=workspace_changed)
 
     async def _apply_workspace_and_libraries_layers(
@@ -3350,7 +3382,64 @@ class ProjectManager(EngineScoped):
             return True
         self._config_manager.load_configs()
         await self._load_registered_projects()
+        if project_id in self._successfully_loaded_project_templates:
+            return True
+        # Registered-project discovery only covers projects_to_register. A project the
+        # orchestrator holds via the persisted `project_file` -- which is how every install names
+        # its project after any prior activation -- is invisible to it, and that miss is exactly
+        # how a worker ended up running against a different workspace than its orchestrator. The
+        # id IS the canonical template path, so when a file exists there, load it directly with
+        # the same loader the orchestrator used; the resulting id matches by construction.
+        candidate = Path(project_id)
+        # Absolute only: the branch's premise is that the id IS the canonical template path. The
+        # id space also holds custom non-path ids, and probing those against this process's CWD
+        # could load an unrelated file that merely shares a relative name.
+        if candidate.is_absolute() and await anyio.Path(candidate).is_file():
+            load_result = await self.on_load_project_template_request(
+                LoadProjectTemplateRequest(project_path=candidate)
+            )
+            if load_result.failed():
+                logger.error(
+                    "Attempted to load project '%s' by path during re-derivation. Failed with: %s",
+                    project_id,
+                    load_result.result_details,
+                )
         return project_id in self._successfully_loaded_project_templates
+
+    def committed_project(self) -> tuple[ProjectID, int]:
+        """The last fully-successful activation, as (project id, generation).
+
+        This is what crosses to workers. `current_project_id` can name a project mid-switch that
+        is about to be rolled back; this pair only ever names one whose layers were established.
+        """
+        return (self._committed_project_id, self._project_generation)
+
+    def is_stale_adoption(self, project_id: ProjectID, generation: int) -> bool:
+        """True when `generation` is not newer than the last adoption this engine completed.
+
+        A worker receives activations from two racing sources -- the registration reply and the
+        switch fan-out. Ordering by generation is what makes the outcome deterministic: the
+        newest committed switch wins regardless of arrival order, and a stale one is skipped
+        before it can touch config layers. The generation is recorded separately, via
+        `record_adopted_generation` AFTER the activation succeeds, so a failed adoption does not
+        consume its generation and block a retry of the same switch. The flip side is accepted:
+        a FAILED newer adoption does not make an older in-flight one stale, so the worker can
+        land on the older project -- the orchestrator's loud log of the failed one is the signal
+        for that case.
+        """
+        if generation <= self._last_adopted_generation:
+            logger.info(
+                "Skipping adoption of project '%s' (generation %d): generation %d already adopted.",
+                project_id,
+                generation,
+                self._last_adopted_generation,
+            )
+            return True
+        return False
+
+    def record_adopted_generation(self, generation: int) -> None:
+        """Mark `generation` as adopted, once its activation has fully succeeded."""
+        self._last_adopted_generation = max(self._last_adopted_generation, generation)
 
     def on_get_current_project_request(
         self, _request: GetCurrentProjectRequest
@@ -4762,6 +4851,26 @@ class ProjectManager(EngineScoped):
         # static analyzers (CodeQL) can prove the function never implicitly returns None.
         msg = f"Unknown builtin variable: {var_name}"
         raise ValueError(msg)
+
+    def workflow_context_for_dispatch(self) -> WorkflowContextSnapshot:
+        """This engine's workflow context, in the form another engine can adopt.
+
+        Raw context, not resolved paths: the adopting engine then derives every workflow-dependent
+        value through its own normal code paths, so the two cannot drift and a new derived value
+        needs no new handoff.
+
+        Empty when this process has no workflow -- there is nothing to lend, and the peer keeps
+        answering from its own equally-empty context, so both degrade identically.
+        """
+        context_manager = self.engine.context_manager
+        if not context_manager.has_current_workflow():
+            return WorkflowContextSnapshot()
+
+        return WorkflowContextSnapshot(
+            name=context_manager.get_current_workflow_name(),
+            file_path=context_manager.get_current_workflow_file_path(),
+            working_directory=context_manager.get_current_workflow_working_directory(),
+        )
 
     def _resolve_workflow_dir(self) -> str:
         """Resolve the `workflow_dir` builtin: the folder the current workflow belongs to.
