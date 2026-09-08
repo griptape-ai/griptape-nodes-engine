@@ -104,7 +104,7 @@ Bundle nodes into libraries for sharing. Create `griptape_nodes_library.json`:
 - **settings**: Register secrets/API keys used by library nodes
     - Use `secrets_to_register` array to declare required secrets
     - Category should be `app_events.on_app_initialization_complete`
-    - Secrets are accessed via `GriptapeNodes.SecretsManager().get_secret()`
+    - Secrets are read with `GriptapeNodes.handle_request(GetSecretValueRequest(key=...))`
 - **metadata.dependencies**: PIP packages installed on library load
 - **metadata.declarations** / per-node **metadata.declarations**: typed identity properties (lifecycle stage, arbitrary Python execution) and a library-level model catalog plus per-node references into it. See [Library and Node Declarations](#library-and-node-declarations) below.
 - **widgets**: Register custom JS widget components (see [Custom Widgets](custom_widgets.md))

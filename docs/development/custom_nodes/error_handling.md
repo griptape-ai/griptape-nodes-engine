@@ -15,9 +15,13 @@ General best practices for production-quality nodes: secrets, imports, code qual
 
 ### Secrets Management
 
-Use `GriptapeNodes.SecretsManager()` to access API keys and secrets:
+Read secrets with `GetSecretValueRequest`:
 
 ```python
+from griptape_nodes.retained_mode.events.secrets_events import (
+    GetSecretValueRequest,
+    GetSecretValueResultSuccess,
+)
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 
@@ -26,16 +30,19 @@ class MyNode(DataNode):
     API_KEY_NAME = "MY_SERVICE_API_KEY"
 
     def _validate_api_key(self) -> str:
-        api_key = GriptapeNodes.SecretsManager().get_secret(self.API_KEY_NAME)
-        if not api_key:
+        result = GriptapeNodes.handle_request(GetSecretValueRequest(key=self.API_KEY_NAME))
+        if not isinstance(result, GetSecretValueResultSuccess) or not result.value:
             raise ValueError(f"Missing {self.API_KEY_NAME}")
-        return api_key
+        return result.value
 ```
 
 **Key Points:**
 
-- Import `GriptapeNodes` at module level, not inside functions
-- Use `SecretsManager().get_secret()` to retrieve secrets
+- Import at module level, not inside functions
+- Use a request rather than `GriptapeNodes.SecretsManager()`. The manager accessor is
+    **refused while a node executes in a worker**, and a helper like this is reachable from
+    both `process` (in the worker) and validation (in the orchestrator) — so the manager
+    version works in one caller and raises in the other. The request is correct in both.
 - Define `API_KEY_NAME` as a class constant for consistency
 - Always validate that the secret exists before using it
 
