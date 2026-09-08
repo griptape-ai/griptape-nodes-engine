@@ -238,6 +238,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointDenial,
     CheckpointSubjectType,
 )
+from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.retained_mode import RetainedMode
 from griptape_nodes.utils.exception_utils import readable_exception_message
 
@@ -3146,13 +3147,22 @@ class NodeManager(EngineScoped):
         # scope, not ours. Decide forwarding first; only open a local scope when
         # this process is actually going to execute the node.
         if not is_worker:
-            # The worker registers before it has loaded its library; routing in that window
-            # fails in the worker with "Library not found". Wait for the worker's
-            # LibraryLoadedNotification first -- immediate for any library without a
-            # spawned worker.
-            if library_name:
-                await library_manager.wait_for_worker_library_load(library_name)
-            worker = library_manager.get_worker_for_library(library_name) if library_name else None
+            # "This library cannot run right now" is an expected, recoverable state -- an evicted
+            # worker, or one that never started -- and get_worker_for_library reports it by raising.
+            # Left to propagate it came out of the handler as "Unhandled exception while processing
+            # async ExecuteNodeRequest: ..." with advice to restart the engine, burying a message
+            # written specifically for an artist. It is a node failure, so report it as one.
+            #
+            # The wait comes first: a worker registers before it has loaded its library, and
+            # routing in that window fails in the worker with "Library not found". Waiting on the
+            # worker's LibraryLoadedNotification is immediate for any library without a spawned
+            # worker, and a timeout is the same kind of node failure as a missing worker.
+            try:
+                if library_name:
+                    await library_manager.wait_for_worker_library_load(library_name)
+                worker = library_manager.get_worker_for_library(library_name) if library_name else None
+            except RuntimeError as err:
+                return ExecuteNodeResultFailure(result_details=str(err), exception=err)
             wm = self.engine.worker_manager
             if wm is not None and worker is not None:
                 return await self._execute_node_via_worker(request, wm, worker)
@@ -3226,9 +3236,58 @@ class NodeManager(EngineScoped):
                 specific_library_name=library_name,
             )
         except Exception as e:
-            return ExecuteNodeResultFailure(
-                result_details=f"Failed to create node '{node_name}' of type '{node_type}': {e}",
+            # In a worker, this almost always means the process could not load the one library
+            # it exists to run -- most often because an execution dependency would not install.
+            # The orchestrator holds that library perfectly well and is drawing its nodes on the
+            # canvas, so "Library not found" sends whoever reads it hunting for a missing library
+            # that is right in front of them. When this process knows better, say that instead.
+            reason = self._local_library_load_failure(library_name)
+            if reason is None:
+                return ExecuteNodeResultFailure(
+                    result_details=f"Failed to create node '{node_name}' of type '{node_type}': {e}"
+                )
+
+            # The library's own account of why -- resolver output, environment paths, version
+            # solving -- is for whoever maintains the library, and an artist cannot act on any of
+            # it. It goes to the log, the way a model-policy failure's diagnostic does, while the
+            # surfaced message stays about what happened and what still works.
+            logger.error(
+                "The worker for library '%s' could not load it, so node '%s' (%s) cannot run: %s (%s)",
+                library_name,
+                node_name,
+                node_type,
+                reason,
+                e,
             )
+            return ExecuteNodeResultFailure(
+                result_details=(
+                    f"Attempted to run '{node_name}' ({node_type}). Failed because the separate process "
+                    f"that runs '{library_name}' could not start it up. Editing the node still works and "
+                    f"your workflow keeps it. Ask whoever maintains '{library_name}' to check its "
+                    f"installation; the details are in the engine log."
+                )
+            )
+
+    def _local_library_load_failure(self, library_name: str | None) -> str | None:
+        """What THIS process recorded about failing to load ``library_name``, if anything.
+
+        Worker-only: on the orchestrator a library that failed to load has no nodes to execute
+        in the first place, so there is nothing to explain here.
+        """
+        library_manager = self.engine.library_manager
+        if not library_name or not library_manager.is_worker:
+            return None
+        library_info = library_manager.get_library_info_by_library_name(library_name)
+        if library_info is None:
+            return None
+        # Whether the library LOADED, not whether it has any problem. A library can be LOADED and
+        # FLAWED -- one node module of twenty failed to import, a duplicate node name -- and be
+        # running everything else perfectly well. Treating that as "the process could not start"
+        # would misattribute a single broken node type to the whole library. Note the state after
+        # a failed dependency install is EVALUATED, not FAILURE, so this cannot test for FAILURE.
+        if library_info.lifecycle_state is LibraryManager.LibraryLifecycleState.LOADED:
+            return None
+        return library_manager.get_collated_problems_for_library(library_name)
 
     async def _execute_node_via_worker(
         self,
@@ -3370,24 +3429,9 @@ class NodeManager(EngineScoped):
         with scope_cm:
             # Rehydrate serialized artifacts that crossed the orchestrator->worker JSON boundary.
             parameter_values = hydrate_parameter_values(request.parameter_values)
-            for param_name, value in parameter_values.items():
-                # Skip when the node already holds this value. The local path
-                # calls ExecuteNodeRequest with dict(node.parameter_values) on
-                # the same in-memory instance, so every iteration would be a
-                # no-op mutation that still ran before/after_value_set hooks
-                # and emitted a lifecycle event -- observably breaking nodes
-                # like LoadImage. On the worker the node is fresh, so current
-                # is _PARAM_MISSING and the normal set path runs.
-                current = node.parameter_values.get(param_name, _PARAM_MISSING)
-                if current is value or current == value:
-                    continue
-                try:
-                    node.set_parameter_value(param_name, value)
-                except Exception as e:
-                    return ExecuteNodeResultFailure(
-                        result_details=f"Attempted to set parameter '{param_name}' on node '{node_name}'. Failed with error: {e}",
-                        exception=e,
-                    )
+            hydration_failure = self._apply_hydrated_values(node, node_name, parameter_values)
+            if hydration_failure is not None:
+                return hydration_failure
             # Materialize parameter defaults into parameter_values so that user
             # process() code reading self.parameter_values[name] directly (rather
             # than via get_parameter_value) sees the default. Newly-dropped nodes
@@ -3433,6 +3477,71 @@ class NodeManager(EngineScoped):
             parameter_output_values=dict(node.parameter_output_values),
             result_details=f"Node '{node_name}' executed successfully.",
         )
+
+    def _apply_hydrated_values(
+        self, node: BaseNode, node_name: str, parameter_values: dict[str, Any]
+    ) -> ExecuteNodeResultFailure | None:
+        """Apply hydrated parameter values to an executing node. Returns a failure or None.
+
+        Applied in passes until a fixpoint, because parameter STRUCTURE derives from values
+        (the authoring contract): setting a value fires the node's value hooks, and hooks are
+        where a node like the diffusers VAE decoder creates the parameters its other values
+        belong to. A fresh worker-side node starts with only its __init__ shape, so a value
+        for a derived parameter can arrive before the value that derives it -- hydration
+        order is dict order, which promises nothing. Each pass sets every value whose
+        parameter exists (running the derivations) and defers the rest; deferred values are
+        retried as long as a pass made progress, so a derivation CHAIN (provider creates
+        model, model creates options) hydrates fully no matter how the values were ordered.
+        Termination is guaranteed: a productive pass strictly shrinks the deferred set, and
+        an unproductive one ends the loop.
+
+        A value still unclaimed after both passes belongs to a parameter nothing on this copy
+        derives -- most often one added to the authoritative node by request (a user-added
+        parameter in the editor, or a node that added one mid-execution and expected it to
+        persist). Skipped rather than failed: the authoritative value is untouched on the
+        orchestrator, and failing here made any user-added parameter fatal to a worker-routed
+        node. The warning names the contract so the author of a node that MEANT this
+        parameter to exist knows what to change.
+        """
+        pending = parameter_values
+        deferred: dict[str, Any] = {}
+        made_progress = True
+        while pending and made_progress:
+            deferred = {}
+            made_progress = False
+            for param_name, value in pending.items():
+                if node.get_parameter_by_name(param_name) is None:
+                    deferred[param_name] = value
+                    continue
+                made_progress = True
+                # Skip when the node already holds this value. The local path calls
+                # ExecuteNodeRequest with dict(node.parameter_values) on the same in-memory
+                # instance, so every iteration would be a no-op mutation that still ran
+                # before/after_value_set hooks and emitted a lifecycle event -- observably
+                # breaking nodes like LoadImage. On the worker the node is fresh, so current
+                # is _PARAM_MISSING and the normal set path runs.
+                current = node.parameter_values.get(param_name, _PARAM_MISSING)
+                if current is value or current == value:
+                    continue
+                try:
+                    node.set_parameter_value(param_name, value)
+                except Exception as e:
+                    return ExecuteNodeResultFailure(
+                        result_details=f"Attempted to set parameter '{param_name}' on node '{node_name}'. Failed with error: {e}",
+                        exception=e,
+                    )
+            pending = deferred
+        for param_name in deferred:
+            logger.warning(
+                "Node '%s' received a value for parameter '%s', which does not exist on the "
+                "executing copy and was not created by its value hooks. The value was left "
+                "unapplied for this run. Parameter structure must derive from parameter "
+                "values (created in __init__ or by a value hook); a parameter added only by "
+                "request does not carry over to execution.",
+                node_name,
+                param_name,
+            )
+        return None
 
     @staticmethod
     def _unshippable_output_names(node: BaseNode) -> list[str]:

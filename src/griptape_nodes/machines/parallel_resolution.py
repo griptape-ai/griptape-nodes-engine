@@ -146,6 +146,13 @@ class ParallelResolutionContext(EngineScoped):
             if self.dag_builder:
                 for node in self.node_to_reference.values():
                     node.node_state = NodeState.CANCELED
+                    # Given back here as well as in ErrorState: a cancel bumps the generation, and
+                    # the was_reset_since guards in ExecuteDagState then abandon the run by
+                    # returning None, so ErrorState is never entered to do it.
+                    if node.node_reference.state is NodeResolutionState.RESOLVING:
+                        node.node_reference.make_node_unresolved(
+                            current_states_to_trigger_change_event={NodeResolutionState.RESOLVING}
+                        )
         else:
             self.workflow_state = WorkflowState.NO_ERROR
             self.error_message = None
@@ -849,6 +856,16 @@ class ErrorState(State):
             task_to_node.pop(task)
 
         if len(task_to_node) == 0:
+            # A node that did not finish is UNRESOLVED: it holds no valid outputs, and nothing else
+            # moves it once this run ends. Filtered to RESOLVING because make_node_unresolved writes
+            # unconditionally -- its argument gates only the event -- so calling it on a node that
+            # finished before a sibling failed would discard outputs consumers may already hold.
+            # Before the maps are cleared, the last moment these nodes are reachable.
+            for dag_node in context.node_to_reference.values():
+                node = dag_node.node_reference
+                if node.state is NodeResolutionState.RESOLVING:
+                    node.make_node_unresolved(current_states_to_trigger_change_event={NodeResolutionState.RESOLVING})
+
             # ErrorState is entered either because a task raised an exception
             # (error_message is set) or because a task was cancelled via user-
             # initiated flow cancel (error_message is None). Distinguish here
