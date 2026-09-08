@@ -22,7 +22,7 @@ import logging
 import shutil
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import pytest
 
@@ -62,6 +62,7 @@ def _register(  # noqa: PLR0913 (a test-library builder; each knob is one manife
     name: str,
     exec_dependencies: list[str] | None = None,
     edit_dependencies: list[str] | None = None,
+    required_resources: dict[str, object] | None = None,
 ) -> str:
     """Register a fixture library, optionally declaring execution dependencies."""
     library_dir = tmp_path / name.replace(" ", "_")
@@ -83,6 +84,8 @@ def _register(  # noqa: PLR0913 (a test-library builder; each knob is one manife
             build_wheel(wheel_dir, dep, "1.0.0")
         dependencies["pip_install_flags"] = offline_install_flags(wheel_dir)
     schema["metadata"]["dependencies"] = dependencies
+    if required_resources is not None:
+        schema["metadata"]["resources"] = {"required": required_resources}
     library_json = library_dir / "griptape_nodes_library.json"
     library_json.write_text(json.dumps(schema, indent=2))
     shutil.copy(fixture_dir / node_file, library_dir / node_file)
@@ -369,6 +372,66 @@ class TestParameterBehaviorsSurviveOnRealClasses:
 
         assert not isinstance(result, SendNodeMessageResultSuccess)
         assert "no handler was available" in str(result.result_details)
+
+
+class TestUnmetResourcesCostExecutionNotLoading:
+    """A capability this machine lacks must not take the library away.
+
+    Nothing about a missing GPU stops the orchestrator importing base-clean node modules,
+    drawing their parameters, or saving a workflow that uses them. Refusing to REGISTER took
+    all of that away: fitness UNUSABLE, no node types, and placeholder nodes reading "Library
+    not found" on every machine that was only ever going to edit. This is the same rule the
+    engine applies to a dependency that will not install -- the capability gates the run.
+    """
+
+    IMPOSSIBLE_COMPUTE: ClassVar[dict[str, object]] = {"compute": [["definitely-not-a-real-backend"], "has_any"]}
+
+    def test_the_library_still_registers_and_its_nodes_still_load(self, tmp_path: Path) -> None:
+        library_json = _register(
+            tmp_path,
+            fixture_dir=BEHAVIOR_FIXTURE,
+            node_file="behavior_preservation_node.py",
+            name="Unmet Resources",
+            required_resources=self.IMPOSSIBLE_COMPUTE,
+        )
+
+        info = _library_info(library_json)
+        assert info.lifecycle_state is not LibraryManager.LibraryLifecycleState.FAILURE
+        assert info.fitness is LibraryManager.LibraryFitness.FLAWED
+        node = LibraryRegistry.create_node(
+            node_type="BehaviorPreservationNode", name="editable", specific_library_name="Unmet Resources"
+        )
+        assert node.get_parameter_by_name("mode") is not None
+
+    def test_execution_refuses_and_names_the_capability(self, tmp_path: Path) -> None:
+        _register(
+            tmp_path,
+            fixture_dir=BEHAVIOR_FIXTURE,
+            node_file="behavior_preservation_node.py",
+            name="Unmet Resources Refuses",
+            required_resources=self.IMPOSSIBLE_COMPUTE,
+        )
+
+        with pytest.raises(RuntimeError) as excinfo:
+            current_engine().library_manager.get_worker_for_library("Unmet Resources Refuses")
+
+        message = str(excinfo.value)
+        assert "definitely-not-a-real-backend" in message, "the artist is not told what is missing"
+        assert "Editing its nodes still works" in message
+
+    def test_a_library_whose_resources_are_met_is_unaffected(self, tmp_path: Path) -> None:
+        """The gate must not fire for a requirement this machine does satisfy."""
+        library_json = _register(
+            tmp_path,
+            fixture_dir=BEHAVIOR_FIXTURE,
+            node_file="behavior_preservation_node.py",
+            name="Met Resources",
+            required_resources={"compute": [["cpu"], "has_any"]},
+        )
+
+        info = _library_info(library_json)
+        assert info.execution_unavailable_reason is None
+        assert info.fitness is LibraryManager.LibraryFitness.GOOD
 
 
 class TestUnshippableOutputGuardrail:
