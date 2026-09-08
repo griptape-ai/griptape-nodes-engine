@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, ClassVar
+from typing import ClassVar
 
 from griptape_nodes.exe_types.core_types import Trait
 
@@ -47,15 +47,3 @@ class TraitRegistry:
             return None
 
         return walk(Trait)
-
-    @classmethod
-    def traits_from_states(cls, states: list[dict[str, Any]]) -> list[Trait]:
-        """Rebuild traits from serialized state, skipping any whose class cannot be found."""
-        traits: list[Trait] = []
-        for state in states:
-            trait_name = state.get("trait_name")
-            trait_class = cls.resolve(trait_name) if trait_name is not None else None
-            if trait_class is None:
-                continue
-            traits.append(trait_class.from_state(state.get("trait_state", {})))
-        return traits
