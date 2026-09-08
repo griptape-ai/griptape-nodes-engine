@@ -63,10 +63,6 @@ class MultiOptions(Trait):
 
     def converters_for_trait(self) -> list[Callable]:
         def converter(value: Any) -> Any:
-            # CRITICAL: This converter uses self.choices property (not _choices field)
-            # The property reads from ui_options first, ensuring we use post-deserialization
-            # choices data instead of stale trait field data.
-
             # Handle case where value is not a list (convert single values to list)
             if not isinstance(value, list):
                 if value is None:
@@ -90,9 +86,6 @@ class MultiOptions(Trait):
 
     def validators_for_trait(self) -> list[Callable[[Parameter, Any], Any]]:
         def validator(param: Parameter, value: Any) -> None:  # noqa: ARG001
-            # CRITICAL: This validator uses self.choices property (not _choices field)
-            # Same reasoning as converter - use live ui_options data after deserialization
-
             # Allow None or empty list as valid (no selection)
             if value is None or value == []:
                 return
