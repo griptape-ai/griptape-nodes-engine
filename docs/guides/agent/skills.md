@@ -6,21 +6,23 @@ Griptape Nodes ships with a built-in skill for building and running workflows. Y
 
 ## Where to put skills
 
-Create a `.agents/skills/` folder inside your workspace directory and drop skill files in there:
+Create a `.agents/skills/` folder inside your workspace directory and give each skill its own folder with a `SKILL.md` inside:
 
 ```
 <workspace_directory>/
 └── .agents/
     └── skills/
-        ├── my-skill.md
-        └── another-skill.md
+        ├── my-skill/
+        │   └── SKILL.md
+        └── another-skill/
+            └── SKILL.md
 ```
 
 The default workspace directory is `GriptapeNodes/` inside wherever you launched the engine. You can find the exact path in **Settings → File System → Workspace Directory**.
 
 ## Skill file format
 
-Each skill is a markdown file with a YAML frontmatter block:
+Each `SKILL.md` is a markdown file with a YAML frontmatter block:
 
 ```markdown
 ---
@@ -35,7 +37,7 @@ when this skill is relevant. Write in plain English — the agent reads this as
 part of its context.
 ```
 
-The `name` and `description` fields tell the agent what the skill is for and when to use it. The body can be as long or short as you need — code snippets, step-by-step instructions, reference tables, etc.
+The `name` must match the skill's folder name, and `description` tells the agent when to use the skill. The body can be as long or short as you need — code snippets, step-by-step instructions, reference tables, etc.
 
 ## Example: a house style guide
 
@@ -57,7 +59,7 @@ description: Apply our house style when drafting or editing text.
 
 !!! tip
 
-    Skills are picked up automatically — no engine restart needed. Drop a new `.md` file into `.agents/skills/`, and the very next message you send will use it.
+    Skills are picked up automatically — no engine restart needed. Add a new skill folder under `.agents/skills/`, and the very next message you send will use it.
 
 ## Related
 
