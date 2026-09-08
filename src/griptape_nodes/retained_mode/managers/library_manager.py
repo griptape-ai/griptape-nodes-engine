@@ -303,6 +303,14 @@ EXCLUDED_SCAN_DIRECTORIES = frozenset({"venv", "__pycache__"})
 TRegisteredEventData = TypeVar("TRegisteredEventData")
 
 
+class DependencyInstallError(Exception):
+    """A library's dependency set could not be installed into its environment.
+
+    Carries the artist-facing detail as its message, so a caller turning it into a result can pass
+    it straight through rather than rewording it.
+    """
+
+
 class StableNamespaceImportFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
     """Imports lazily registered library node modules on demand via their stable namespace.
 
@@ -510,6 +518,13 @@ class LibraryManager(EngineScoped):
         # parsed (discovery or lifecycle progression). Absence of the relevant
         # declarations falls through to False.
         requires_worker: bool = False
+        # True when this library's nodes EXECUTE in a dedicated worker process, for either
+        # reason: legacy worker-mode declarations (requires_worker above, which also skips
+        # orchestrator-side loading in favor of stubs) or execution dependencies
+        # (pip_dependencies_exec -- the library loads REAL nodes on the orchestrator and
+        # only its process() runs in the worker, where .venv-exec is on sys.path).
+        # Consumed by execution routing; never by load-time skips.
+        executes_in_worker: bool = False
         # Set when the library enters WORKER_PENDING state. The orchestrator waits on this
         # event before returning RegisterLibraryFromFileResultSuccess so callers see the real
         # fitness once the worker has loaded and reported back.
@@ -750,7 +765,10 @@ class LibraryManager(EngineScoped):
         # Register stub node classes from the worker-reported schemas so the orchestrator
         # can display nodes in the sidebar and recreate them during workflow loading.
         # Skip on the worker itself -- it already has the real node classes registered.
-        if notification.node_schemas and not self._is_worker:
+        # Exec-deps libraries registered REAL node classes locally at load; overwriting
+        # them with schema stubs would throw away converters/validators/traits/hooks.
+        # Only legacy worker-mode libraries (requires_worker) use stub registration.
+        if notification.node_schemas and not self._is_worker and library_info.requires_worker:
             self._register_nodes_from_worker_schemas(notification.library_name, notification.node_schemas)
         # Unblock any code awaiting this library's worker_ready event.
         if library_info.worker_ready is not None:
@@ -776,7 +794,7 @@ class LibraryManager(EngineScoped):
         """
         if library_name:
             library_info = self.get_library_info_by_library_name(library_name)
-            if library_info and library_info.requires_worker:
+            if library_info and library_info.executes_in_worker:
                 wm = self._worker_manager
                 if wm:
                     worker = wm.get_worker_for_key(library_name)
@@ -794,6 +812,37 @@ class LibraryManager(EngineScoped):
                 raise RuntimeError(msg)
         return None
 
+    async def wait_for_worker_library_load(self, library_name: str) -> None:
+        """Block until this library's worker has reported the library fully loaded, if one is expected.
+
+        A worker registers with the orchestrator at process start, BEFORE it has loaded its
+        library -- so a node executed in that window would reach a worker that cannot create
+        it yet. The worker's LibraryLoadedNotification is what "loaded" means, exactly as it
+        did for legacy worker-mode libraries; this waits for it, bounded by the same startup
+        grace the boot-time wait uses. Returns immediately for a library with no spawned
+        worker. An eviction during the wait also releases it: the reason is recorded, and
+        get_worker_for_library reports it to the caller.
+
+        Raises:
+            RuntimeError: If the worker did not report the library loaded within the grace
+                period.
+        """
+        library_info = self.get_library_info_by_library_name(library_name)
+        if library_info is None or library_info.worker_ready is None or library_info.worker_ready.is_set():
+            return
+        config_mgr = self.engine.config_manager
+        wait_seconds = config_mgr.get_config_value(WORKER_HEARTBEAT_STARTUP_GRACE_KEY, default=600.0, cast_type=float)
+        logger.info("Waiting for library '%s' to finish loading in its worker before running the node", library_name)
+        try:
+            with anyio.fail_after(wait_seconds):
+                await library_info.worker_ready.wait()
+        except TimeoutError:
+            msg = (
+                f"Attempted to run a node from library '{library_name}'. Failed because its worker "
+                f"process did not finish loading the library within {wait_seconds:.0f} seconds."
+            )
+            raise RuntimeError(msg) from None
+
     async def _start_workers(self) -> None:
         """Issue StartWorkerRequest for every library that requires a dedicated worker.
 
@@ -802,9 +851,19 @@ class LibraryManager(EngineScoped):
         that worker creation is always tied to an active session.
         """
         for library_info in self._library_file_path_to_info.values():
-            if library_info.requires_worker and library_info.library_name and not self._is_worker:
-                library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.WORKER_PENDING
-                # Create (or reset) the worker_ready event for this spawn.
+            if library_info.executes_in_worker and library_info.library_name and not self._is_worker:
+                # Legacy worker-mode libraries load AS the worker confirms (stubs meanwhile),
+                # so their lifecycle gates on the spawn. Exec-deps libraries loaded real
+                # nodes locally already: the worker gates execution availability only, and
+                # registration must not block on it.
+                if library_info.requires_worker:
+                    library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.WORKER_PENDING
+                # Create (or reset) the worker_ready event for this spawn -- for EVERY spawned
+                # worker, not only legacy ones. A worker registers with the orchestrator at
+                # process start, BEFORE it has loaded its library, so registration alone cannot
+                # gate execution: a node routed in that window fails in the worker with
+                # "Library not found". This event is set by the worker's LibraryLoadedNotification,
+                # and the execute path waits on it (wait_for_worker_library_load).
                 library_info.worker_ready = asyncio.Event()
                 await self.engine.ahandle_request(StartWorkerRequest(library_name=library_info.library_name))
 
@@ -820,12 +879,15 @@ class LibraryManager(EngineScoped):
         library_info = self.get_library_info_by_library_name(library_name)
         if library_info is None:
             return
+        # Unblock any code awaiting this library's worker_ready event, whatever the
+        # lifecycle: an exec-deps library stays LOADED through an eviction, and a waiter
+        # on the execute path would otherwise hold on for the full grace period for a
+        # worker that is already gone.
+        if library_info.worker_ready is not None:
+            library_info.worker_ready.set()
         if library_info.lifecycle_state == LibraryManager.LibraryLifecycleState.WORKER_PENDING:
             library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.FAILURE
             library_info.fitness = LibraryManager.LibraryFitness.UNUSABLE
-            # Unblock any code awaiting this library's worker_ready event.
-            if library_info.worker_ready is not None:
-                library_info.worker_ready.set()
             logger.warning(
                 "Worker '%s' evicted before confirming load of library '%s'; library marked as FAILURE.",
                 worker_engine_id,
@@ -2183,11 +2245,15 @@ class LibraryManager(EngineScoped):
                 )
 
                 # Update or create LibraryInfo
+                executes_in_worker = self._resolve_executes_in_worker(
+                    requires_worker=requires_worker, metadata=metadata_result.library_schema.metadata
+                )
                 if lib_info:
                     lib_info.library_name = library_name
                     lib_info.library_version = metadata_result.library_schema.metadata.library_version
                     lib_info.lifecycle_state = LibraryManager.LibraryLifecycleState.METADATA_LOADED
                     lib_info.requires_worker = requires_worker
+                    lib_info.executes_in_worker = executes_in_worker
                 else:
                     # Create new LibraryInfo since it doesn't exist yet
                     lib_info = LibraryManager.LibraryInfo(
@@ -2199,6 +2265,7 @@ class LibraryManager(EngineScoped):
                         fitness=LibraryManager.LibraryFitness.NOT_EVALUATED,
                         problems=[],
                         requires_worker=requires_worker,
+                        executes_in_worker=executes_in_worker,
                     )
                     self._library_file_path_to_info[file_path] = lib_info
             else:
@@ -2316,6 +2383,10 @@ class LibraryManager(EngineScoped):
                     library_info.requires_worker = self._resolve_requires_worker(
                         library_info.registered_path,
                         metadata_result.library_schema.metadata.declarations,
+                    )
+                    library_info.executes_in_worker = self._resolve_executes_in_worker(
+                        requires_worker=library_info.requires_worker,
+                        metadata=metadata_result.library_schema.metadata,
                     )
                     library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.METADATA_LOADED
 
@@ -2959,28 +3030,43 @@ class LibraryManager(EngineScoped):
 
         return capabilities
 
-    def _get_library_venv_path(self, library_name: str, library_file_path: str | None = None) -> Path:
-        """Get the path to the virtual environment directory for a library.
+    def _get_library_venv_path(
+        self, library_name: str, library_file_path: str | None = None, *, execution: bool = False
+    ) -> Path:
+        """Get the path to a virtual environment directory for a library.
+
+        A library has up to two environments. The edit-time environment (``.venv``) holds the
+        dependencies needed to import and instantiate nodes, and is the one a developer's
+        ``uv sync`` already produces, so it is deliberately left at the conventional name. The
+        execution environment (``.venv-exec``) holds the heavy dependencies only ``process``
+        needs and is put on ``sys.path`` solely where nodes execute.
 
         Args:
             library_name: Name of the library
             library_file_path: Optional path to the library JSON file
+            execution: Whether to return the execution environment instead of the edit-time one
 
         Returns:
             Path to the virtual environment directory
         """
+        venv_dir_name = ".venv-exec" if execution else ".venv"
         clean_library_name = library_name.replace(" ", "_").strip()
 
         if library_file_path is not None:
             # Create venv relative to the library.json file
             library_dir = Path(library_file_path).parent.absolute()
-            return library_dir / ".venv"
+            return library_dir / venv_dir_name
 
         # Create venv relative to the xdg data home
-        return xdg_data_home() / "griptape_nodes" / "libraries" / clean_library_name / ".venv"
+        return xdg_data_home() / "griptape_nodes" / "libraries" / clean_library_name / venv_dir_name
 
     async def _add_library_paths_to_sys_path(self, library_name: str, library_file_path: str, base_dir: Path) -> None:
         """Add a library's directory and venv site-packages to sys.path.
+
+        The edit-time environment is added everywhere, because importing node modules and
+        instantiating nodes needs it. The execution environment is added only in a worker
+        process: the orchestrator must never have a library's heavy dependencies on its import
+        path, since keeping them out is what stops one library's pins from shadowing another's.
 
         Args:
             library_name: Name of the library (for venv lookup)
@@ -2989,18 +3075,30 @@ class LibraryManager(EngineScoped):
         """
         sys.path.insert(0, str(base_dir))
 
-        venv_path = self._get_library_venv_path(library_name, library_file_path)
-        if await anyio.Path(venv_path).exists():
-            site_packages = str(
-                Path(
-                    sysconfig.get_path(
-                        "purelib",
-                        vars={"base": str(venv_path), "platbase": str(venv_path)},
-                    )
+        await self._add_library_venv_to_sys_path(library_name, library_file_path, execution=False)
+
+        if self._is_worker:
+            await self._add_library_venv_to_sys_path(library_name, library_file_path, execution=True)
+
+    async def _add_library_venv_to_sys_path(
+        self, library_name: str, library_file_path: str, *, execution: bool
+    ) -> None:
+        """Add one of a library's venv site-packages directories to sys.path, if it exists."""
+        venv_path = self._get_library_venv_path(library_name, library_file_path, execution=execution)
+        if not await anyio.Path(venv_path).exists():
+            return
+
+        site_packages = str(
+            Path(
+                sysconfig.get_path(
+                    "purelib",
+                    vars={"base": str(venv_path), "platbase": str(venv_path)},
                 )
             )
-            sys.path.insert(0, site_packages)
-            logger.debug("Added library '%s' venv to sys.path: %s", library_name, site_packages)
+        )
+        sys.path.insert(0, site_packages)
+        venv_kind = "execution" if execution else "edit-time"
+        logger.debug("Added library '%s' %s venv to sys.path: %s", library_name, venv_kind, site_packages)
 
     def _can_write_to_venv_location(self, venv_python_path: Path) -> bool:
         """Check if we can write to the venv location (either create it or modify existing).
@@ -4412,10 +4510,16 @@ class LibraryManager(EngineScoped):
         the orchestrator ceiling stays aligned with the worker self-timeout; first-time
         installs of large libraries can easily exceed the default heartbeat timeout.
         """
+        # Only legacy WORKER_PENDING libraries gate BOOT: their nodes arrive as stubs from
+        # the worker, so nothing exists until it reports. An exec-deps library has real node
+        # classes locally and its worker gates execution only -- blocking startup on its
+        # worker's heavy imports would put torch back on the boot path.
         pending_events = [
             info.worker_ready
             for info in self._library_file_path_to_info.values()
-            if info.worker_ready is not None and not info.worker_ready.is_set()
+            if info.worker_ready is not None
+            and not info.worker_ready.is_set()
+            and info.lifecycle_state == LibraryManager.LibraryLifecycleState.WORKER_PENDING
         ]
         if not pending_events:
             return
@@ -5088,6 +5192,14 @@ class LibraryManager(EngineScoped):
         registered node type to extract its parameter layout, so the orchestrator
         can create stub classes without importing the library's Python modules.
         """
+        # Only a legacy worker-mode library is stubbed on the orchestrator: an
+        # execution-dependency library is loaded there for real (its node modules are
+        # base-clean by contract), and stub registration is gated on `requires_worker`.
+        # The two stub-loss detectors below are gated on the same fact, or they warn that
+        # converters, traits and hooks "will not execute on the orchestrator stub" for a
+        # library that has no stub -- sending an author to fix code that is already correct.
+        library_info = self.get_library_info_by_library_name(library_name)
+        will_be_stubbed = library_info is None or library_info.requires_worker
         try:
             library = LibraryRegistry.get_library(library_name)
         except KeyError:
@@ -5131,8 +5243,9 @@ class LibraryManager(EngineScoped):
                 # Run the parameter-behavior-drop and inert-hook detectors
                 # inside the scope so warnings attach to the same LOAD_PROBE
                 # scope that owns the probe attempt.
-                self._report_parameter_behavior_losses(probe)
-                self._report_inert_worker_hooks(probe)
+                if will_be_stubbed:
+                    self._report_parameter_behavior_losses(probe)
+                    self._report_inert_worker_hooks(probe)
 
             # Drop the class only when a rule flagged drops_class_from_schema
             # fired. Severity is a logging concern; drops_class_from_schema is
@@ -5410,6 +5523,18 @@ class LibraryManager(EngineScoped):
 
         return manifest_default
 
+    @staticmethod
+    def _resolve_executes_in_worker(*, requires_worker: bool, metadata: LibraryMetadata) -> bool:
+        """Whether this library's nodes execute in a dedicated worker process.
+
+        True for legacy worker-mode libraries (requires_worker) and for libraries that
+        declare execution dependencies: their heavy packages live in .venv-exec, which is
+        only on sys.path in a worker, so process() can only run there.
+        """
+        dependencies = metadata.dependencies
+        has_exec_dependencies = bool(dependencies and dependencies.pip_dependencies_exec)
+        return requires_worker or has_exec_dependencies
+
     def _remove_missing_libraries_from_config(self, config_category: str) -> None:
         # Now remove all libraries that were missing from the user's config.
         config_mgr = self.engine.config_manager
@@ -5664,6 +5789,7 @@ class LibraryManager(EngineScoped):
         library_name = None
         library_version = None
         requires_worker = False
+        executes_in_worker = False
         lifecycle_state = LibraryManager.LibraryLifecycleState.DISCOVERED
 
         if isinstance(metadata_result, LoadLibraryMetadataFromFileResultSuccess):
@@ -5672,6 +5798,9 @@ class LibraryManager(EngineScoped):
             requires_worker = self._resolve_requires_worker(
                 registered_path,
                 metadata_result.library_schema.metadata.declarations,
+            )
+            executes_in_worker = self._resolve_executes_in_worker(
+                requires_worker=requires_worker, metadata=metadata_result.library_schema.metadata
             )
             lifecycle_state = LibraryManager.LibraryLifecycleState.METADATA_LOADED
 
@@ -5688,6 +5817,7 @@ class LibraryManager(EngineScoped):
             library_version=library_version,
             registered_path=registered_path,
             requires_worker=requires_worker,
+            executes_in_worker=executes_in_worker,
         )
 
     async def discover_libraries_request(
@@ -6855,14 +6985,13 @@ class LibraryManager(EngineScoped):
             result_details=details,
         )
 
-    async def install_library_dependencies_request(self, request: InstallLibraryDependenciesRequest) -> ResultPayload:  # noqa: PLR0911
-        """Install a library's dependencies, recovering from a corrupt reused venv.
+    async def install_library_dependencies_request(self, request: InstallLibraryDependenciesRequest) -> ResultPayload:
+        """Install a library's dependencies into its edit-time and execution environments.
 
-        Advanced library hooks (before_library_nodes_loaded) expect the venv to exist, so the
-        venv is always initialized even when there are no dependencies to install. When the
-        venv is reused from a previous session it may be corrupt (e.g. a dist-info directory
-        missing its METADATA file), which makes uv fail while planning the install; in that
-        case the venv is rebuilt once and the install retried against a clean environment.
+        Edit-time dependencies go into ``.venv``, which is always created even when there is
+        nothing to install, because advanced library hooks (before_library_nodes_loaded) expect
+        it to exist. Execution dependencies go into ``.venv-exec``, which exists only while the
+        library declares any: declaring none removes it.
         """
         library_file_path = request.library_file_path
 
@@ -6879,44 +7008,126 @@ class LibraryManager(EngineScoped):
         library_metadata = library_data.metadata
 
         pip_dependencies = []
+        pip_dependencies_exec = []
         pip_install_flags = []
         if library_metadata.dependencies:
             pip_dependencies = library_metadata.dependencies.pip_dependencies or []
+            pip_dependencies_exec = library_metadata.dependencies.pip_dependencies_exec or []
             pip_install_flags = library_metadata.dependencies.pip_install_flags or []
 
-        # Always initialize the venv, even if there are no dependencies to install.
-        # Advanced library hooks (before_library_nodes_loaded) expect the venv to exist.
-        venv_path = self._get_library_venv_path(library_name, library_file_path)
+        # Ahead of either install and outside every gate below: a manifest that stopped declaring
+        # execution dependencies must leave no execution environment behind. Which process installs
+        # that set, and when, changes further up this stack -- so keying the removal to one of those
+        # gates made it unreachable in precisely the case it exists for.
+        if not pip_dependencies_exec:
+            await self._retire_execution_env(library_name, library_file_path)
+
+        # One block around both: the edit-time set failing means the execution set is never
+        # attempted, which is the same short-circuit as handling them separately.
+        try:
+            await self._install_dependency_set(
+                library_name=library_name,
+                library_file_path=library_file_path,
+                pip_dependencies=pip_dependencies,
+                pip_install_flags=pip_install_flags,
+                execution=False,
+            )
+            await self._install_dependency_set(
+                library_name=library_name,
+                library_file_path=library_file_path,
+                pip_dependencies=pip_dependencies_exec,
+                pip_install_flags=pip_install_flags,
+                execution=True,
+            )
+        except DependencyInstallError as e:
+            return InstallLibraryDependenciesResultFailure(result_details=str(e))
+
+        installed_count = len(pip_dependencies) + len(pip_dependencies_exec)
+        if installed_count == 0:
+            details = f"Library '{library_name}' has no dependencies to install"
+        elif pip_dependencies_exec:
+            details = (
+                f"Installed {len(pip_dependencies)} edit-time and {len(pip_dependencies_exec)} "
+                f"execution dependencies for library '{library_name}'"
+            )
+        else:
+            details = f"Installed {len(pip_dependencies)} dependencies for library '{library_name}'"
+        logger.info(details)
+        return InstallLibraryDependenciesResultSuccess(
+            library_name=library_name, dependencies_installed=installed_count, result_details=details
+        )
+
+    async def _retire_execution_env(self, library_name: str, library_file_path: str) -> None:
+        """Remove an execution environment the library's manifest no longer declares.
+
+        The directory reaches a worker's import path by existing, so one built by an earlier manifest
+        would still be imported from, carrying pins nothing declares any more. On-disk layout follows
+        the manifest rather than the install history.
+        """
+        venv_path = self._get_library_venv_path(library_name, library_file_path, execution=True)
+        if not venv_path.exists():
+            return
+        try:
+            await asyncio.to_thread(shutil.rmtree, venv_path, onexc=OSManager.remove_readonly)
+        except OSError as e:
+            # Leaving it costs execution correctness; raising costs editing, and this runs on the
+            # registration path where that would cost the library its node types.
+            logger.warning(
+                "Attempted to remove the execution environment for library '%s' at %s, which its "
+                "manifest no longer declares. Failed due to: %s. Its nodes stay editable, but a "
+                "worker would still import from that directory.",
+                library_name,
+                venv_path,
+                e,
+            )
+
+    async def _install_dependency_set(
+        self,
+        *,
+        library_name: str,
+        library_file_path: str,
+        pip_dependencies: list[str],
+        pip_install_flags: list[str],
+        execution: bool,
+    ) -> None:
+        """Install one dependency set into its environment, creating the environment first.
+
+        The edit-time environment is created even with nothing to install, because advanced
+        library hooks expect it to exist. A library declaring no execution dependencies ends up
+        with no execution environment on disk, whether or not it ever had one.
+
+        Raises:
+            DependencyInstallError: With the artist-facing detail of what failed.
+        """
+        venv_kind = "execution" if execution else "edit-time"
+        if execution and not pip_dependencies:
+            return
+
+        venv_path = self._get_library_venv_path(library_name, library_file_path, execution=execution)
 
         try:
             venv_init = await self._init_library_venv(venv_path)
         except RuntimeError as e:
-            details = f"Attempted to prepare the environment for library '{library_name}'. Failed due to: {e}"
-            return InstallLibraryDependenciesResultFailure(result_details=details)
+            msg = f"Attempted to prepare the {venv_kind} environment for library '{library_name}'. Failed due to: {e}"
+            raise DependencyInstallError(msg) from e
         library_venv_python_path = venv_init.python_path
 
         if not self._can_write_to_venv_location(library_venv_python_path):
-            details = f"Attempted to set up the environment for library '{library_name}' at {venv_path}. Failed due to: the location is not writable."
-            logger.warning(details)
-            return InstallLibraryDependenciesResultFailure(result_details=details)
+            msg = f"Attempted to set up the {venv_kind} environment for library '{library_name}' at {venv_path}. Failed due to: the location is not writable."
+            logger.warning(msg)
+            raise DependencyInstallError(msg)
 
-        # Check disk space
         config_manager = self.engine.config_manager
         min_space_gb = config_manager.get_config_value("minimum_disk_space_gb_libraries")
         if not OSManager.check_available_disk_space(Path(venv_path), min_space_gb):
             error_msg = OSManager.format_disk_space_error(Path(venv_path))
-            details = f"Attempted to install the components required by library '{library_name}'. Failed due to insufficient disk space (requires {min_space_gb} GB): {error_msg}"
-            return InstallLibraryDependenciesResultFailure(result_details=details)
+            msg = f"Attempted to install the components required by library '{library_name}'. Failed due to insufficient disk space (requires {min_space_gb} GB): {error_msg}"
+            raise DependencyInstallError(msg)
 
         if not pip_dependencies:
-            details = f"Library '{library_name}' has no dependencies to install"
-            logger.info(details)
-            return InstallLibraryDependenciesResultSuccess(
-                library_name=library_name, dependencies_installed=0, result_details=details
-            )
+            return
 
-        # Install dependencies
-        logger.info("Installing %d dependencies for library '%s'", len(pip_dependencies), library_name)
+        logger.info("Installing %d %s dependencies for library '%s'", len(pip_dependencies), venv_kind, library_name)
         is_debug = config_manager.get_config_value("log_level").upper() == "DEBUG"
 
         try:
@@ -6940,19 +7151,11 @@ class LibraryManager(EngineScoped):
                 )
         except subprocess.CalledProcessError as e:
             reason = e.stderr or f"the installer exited with code {e.returncode}"
-            details = (
-                f"Attempted to install the components required by library '{library_name}'. Failed due to: {reason}"
-            )
-            return InstallLibraryDependenciesResultFailure(result_details=details)
+            msg = f"Attempted to install the components required by library '{library_name}'. Failed due to: {reason}"
+            raise DependencyInstallError(msg) from e
         except RuntimeError as e:
-            details = f"Attempted to rebuild the environment for library '{library_name}'. Failed due to: {e}"
-            return InstallLibraryDependenciesResultFailure(result_details=details)
-
-        details = f"Installed {len(pip_dependencies)} dependencies for library '{library_name}'"
-        logger.info(details)
-        return InstallLibraryDependenciesResultSuccess(
-            library_name=library_name, dependencies_installed=len(pip_dependencies), result_details=details
-        )
+            msg = f"Attempted to rebuild the {venv_kind} environment for library '{library_name}'. Failed due to: {e}"
+            raise DependencyInstallError(msg) from e
 
     async def _install_deps_with_recovery(
         self,
