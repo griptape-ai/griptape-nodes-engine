@@ -65,7 +65,7 @@ from griptape_nodes.retained_mode.managers.settings import (
     WORKFLOWS_TO_REGISTER_KEY,
     Settings,
 )
-from griptape_nodes.utils.dict_utils import get_dot_value, merge_dicts, set_dot_value
+from griptape_nodes.utils.dict_utils import drop_blank_values, get_dot_value, merge_dicts, set_dot_value
 from griptape_nodes.utils.file_utils import DEFAULT_MAX_SEARCH_DEPTH
 
 logger = logging.getLogger("griptape_nodes")
@@ -864,7 +864,11 @@ class ConfigManager(EngineScoped):
             raw_values[override.env_var_name] = override.raw_value
             logger.debug("Loaded config from env var: %s -> %s", override.env_var_name, override.config_key)
 
-        return EnvVarLayer(values=values, var_names=var_names, raw_values=raw_values)
+        # An exported-but-empty variable is the env layer's way of holding a blank, and it reads
+        # as absent from this layer for the same reason a blank in a config file does. The variable
+        # stays in `var_names` so `config_layers()` can still report that it was seen; provenance
+        # only consults it for a path the layer's values own, which a dropped key no longer is.
+        return EnvVarLayer(values=drop_blank_values(values), var_names=var_names, raw_values=raw_values)
 
     def _collect_env_var_overrides(self) -> list[EnvVarOverride]:
         """Resolve the GTN_CONFIG_ variables to apply, reporting each one ignored along the way.
@@ -994,11 +998,21 @@ class ConfigManager(EngineScoped):
             logger.debug("No %s config file loaded", label)
             return LoadedConfigFile(contents={}, parse_error=None)
         try:
-            return LoadedConfigFile(contents=json.loads(path.read_text(encoding="utf-8")), parse_error=None)
+            loaded = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
             error = f"{type(e).__name__}: {e}"
             logger.error("Error parsing %s config file: %s", label, e)
             return LoadedConfigFile(contents={}, parse_error=error)
+
+        # A layer has to be a mapping of settings to merge. Anything else parsed cleanly but
+        # configures nothing, so it is reported as this layer's parse error rather than handed
+        # on as contents no merge step can use.
+        if not isinstance(loaded, dict):
+            error = f"expected a JSON object, got {type(loaded).__name__}"
+            logger.error("Error parsing %s config file: %s", label, error)
+            return LoadedConfigFile(contents={}, parse_error=error)
+
+        return LoadedConfigFile(contents=loaded, parse_error=None)
 
     def _load_file_layer(self, layer: ConfigLayerName, path: Path | None, label: str) -> dict:
         """Load one file-backed config layer and record its parse error under `layer`.
@@ -1014,8 +1028,8 @@ class ConfigManager(EngineScoped):
             label: Human-readable layer name for the log lines.
 
         Returns:
-            This layer's own parsed contents, unmerged. `{}` when there is no file, the file
-            is missing, or it failed to parse.
+            This layer's own parsed contents, unmerged and without its blank-string entries.
+            `{}` when there is no file, the file is missing, or it failed to parse.
         """
         if path is None:
             self._layer_parse_errors[layer] = None
@@ -1023,7 +1037,10 @@ class ConfigManager(EngineScoped):
 
         loaded = self._load_config_from_file(path, label)
         self._layer_parse_errors[layer] = loaded.parse_error
-        return loaded.contents
+        # A blank string means this layer states nothing about that setting, so the key is dropped
+        # here and the next layer down (or the built-in default) supplies the value. Dropping it as
+        # the layer loads is what keeps `merged_config` and provenance agreeing with the read path.
+        return drop_blank_values(loaded.contents)
 
     def load_configs(self) -> None:
         """Load and merge configs from all sources in priority order.
@@ -1768,11 +1785,18 @@ class ConfigManager(EngineScoped):
         one leaf, because writing nothing into a category a higher layer owns is still a write
         that layer outranks.
 
+        A blank string returns None too. Layer loading drops blank entries, so a cleared setting
+        is absent from the merge by design and reading it back can never return the blank that was
+        written. Comparing values would report every clear as a value the engine refused.
+
         Args:
             path: Key segments `value` was written to.
             value: The written value, descended into when it is a dict.
         """
         if isinstance(value, dict) and not value:
+            return None
+
+        if isinstance(value, str) and not value.strip():
             return None
 
         if not isinstance(value, dict):
