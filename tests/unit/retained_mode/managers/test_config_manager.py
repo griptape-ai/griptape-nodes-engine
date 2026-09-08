@@ -965,6 +965,79 @@ class TestConfigManager:
 @pytest.mark.skipif(
     platform.system() == "Windows", reason="xdg_base_dirs cannot find XDG_CONFIG_HOME on Windows on GitHub Actions"
 )
+class TestConfigManagerBlankValues:
+    """A blank string resolves to the caller's default instead of reading as a configured value.
+
+    Clearing a setting in the editor writes `""`, and every consumer that distinguishes
+    "configured" from "unset" reads that through get_config_value. Without this, a cleared
+    `static_server_base_url` is advertised verbatim and media URLs come out relative.
+    """
+
+    @pytest.mark.parametrize("blank_value", ["", "   ", "\t\n"])
+    def test_blank_optional_setting_reads_as_unset(self, blank_value: str) -> None:
+        """A blank optional setting resolves to None, so the consumer derives its default."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_dir = Path(temp_dir)
+            (workspace_dir / "griptape_nodes_config.json").write_text(
+                json.dumps({"static_server_base_url": blank_value})
+            )
+
+            with patch.dict(os.environ, {}, clear=True):
+                manager = ConfigManager()
+                manager.load_workspace_config(workspace_dir)
+
+                assert manager.get_config_value("static_server_base_url") is None
+
+    def test_blank_value_resolves_to_the_callers_default(self) -> None:
+        """A caller whose setting is a plain string keeps getting a string, not None."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_dir = Path(temp_dir)
+            (workspace_dir / "griptape_nodes_config.json").write_text(json.dumps({"ffmpeg_directory": ""}))
+
+            with patch.dict(os.environ, {}, clear=True):
+                manager = ConfigManager()
+                manager.load_workspace_config(workspace_dir)
+
+                assert manager.get_config_value("ffmpeg_directory", default="") == ""
+
+    def test_blank_nested_setting_reads_as_unset(self) -> None:
+        """Dot-notation reads coalesce too: the rule is about the value, not the key's depth."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_dir = Path(temp_dir)
+            (workspace_dir / "griptape_nodes_config.json").write_text(json.dumps({"agent": {"system_prompt": "  "}}))
+
+            with patch.dict(os.environ, {}, clear=True):
+                manager = ConfigManager()
+                manager.load_workspace_config(workspace_dir)
+
+                assert manager.get_config_value("agent.system_prompt") is None
+
+    def test_configured_value_is_untouched(self) -> None:
+        """Only blank values coalesce; a real value passes through unchanged, whitespace included."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_dir = Path(temp_dir)
+            (workspace_dir / "griptape_nodes_config.json").write_text(
+                json.dumps({"static_server_base_url": " https://my-tunnel.ngrok.io "})
+            )
+
+            with patch.dict(os.environ, {}, clear=True):
+                manager = ConfigManager()
+                manager.load_workspace_config(workspace_dir)
+
+                assert manager.get_config_value("static_server_base_url") == " https://my-tunnel.ngrok.io "
+
+    def test_blank_env_var_reads_as_unset(self) -> None:
+        """An exported-but-empty env var is the other way a setting arrives blank."""
+        with patch.dict(os.environ, {"GTN_CONFIG_STATIC_SERVER_BASE_URL": ""}, clear=True):
+            manager = ConfigManager()
+            manager.load_configs()
+
+            assert manager.get_config_value("static_server_base_url") is None
+
+
+@pytest.mark.skipif(
+    platform.system() == "Windows", reason="xdg_base_dirs cannot find XDG_CONFIG_HOME on Windows on GitHub Actions"
+)
 class TestConfigManagerEventEmission:
     """Test that ConfigManager emits ConfigChanged events when config values change."""
 

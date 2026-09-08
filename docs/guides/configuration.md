@@ -50,6 +50,7 @@ Griptape Nodes employs a specific search order to load settings from environment
     - Settings loaded from the first found configuration file override the built-in default values.
     - If no configuration file is found in any of the search paths, the application uses only the built-in defaults.
     - One key default is `workspace_directory`, which defaults to `<current_working_directory>/GriptapeNodes` if not specified in a loaded configuration file.
+    - Clearing a setting is the same as never having set it. An empty value reads as unset, so the default applies again and you don't need to delete the setting from the file.
 
 1. **Runtime Management (`ConfigManager`)**
     After initial settings are loaded, the `ConfigManager` handles runtime operations using the final resolved configuration, particularly the workspace directory. It's responsible for saving user-specific changes, like registered workflows, back to a configuration file within the workspace.
@@ -272,7 +273,7 @@ You'll need to configure `static_server_base_url` in these scenarios:
 
 ### How to Configure
 
-The static server base URL is configured using the `static_server_base_url` setting in the Griptape Nodes UI Settings dialog. If not explicitly set, it defaults to `http://localhost:8124` (or respects `STATIC_SERVER_HOST` and `STATIC_SERVER_PORT` environment variables if they are set).
+The static server base URL is configured using the `static_server_base_url` setting in the Griptape Nodes UI Settings dialog. If not explicitly set, it defaults to `http://localhost:8124` (or respects `STATIC_SERVER_HOST` and `STATIC_SERVER_PORT` environment variables if they are set). To go back to the default, clear the field — an empty value reads as unset.
 
 After updating this setting, you'll need to restart the Griptape Nodes engine for the changes to take effect.
 

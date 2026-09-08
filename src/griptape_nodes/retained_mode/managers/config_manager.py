@@ -796,12 +796,15 @@ class ConfigManager(EngineScoped):
 
         If `should_load_env_var_if_detected` is True (default), and the value starts with a $, it will be pulled from the environment variables.
 
+        A blank or whitespace-only string is treated as if the key were absent, so it resolves to
+        `default` rather than being handed back as a configured value.
+
         Args:
             key: The configuration key to get. Can use dot notation for nested keys (e.g., 'category.subcategory.key').
                  If the key refers to a category (dictionary), returns the entire category.
             should_load_env_var_if_detected: If True, and the value starts with a $, it will be pulled from the environment variables.
             config_source: The source of the configuration to use. Can be 'user_config', 'project_config', 'default_config', or 'merged_config'.
-            default: The default value to return if the key is not found in the configuration.
+            default: The default value to return if the key is not found, or holds a blank string.
             cast_type: Optional type to coerce the value to (bool, int, float, or str). Useful for environment
                        variables which are always strings (e.g., "false" -> False when cast_type=bool).
 
@@ -817,6 +820,12 @@ class ConfigManager(EngineScoped):
         }
         config = config_source_map.get(config_source, self.merged_config)
         value = get_dot_value(config, key, default)
+
+        # A blank string carries no configuration, so it reads as an absent key: a cleared
+        # setting behaves the same as one that was never set, and each caller's own default
+        # decides what that means.
+        if isinstance(value, str) and not value.strip():
+            value = default
 
         if value is None:
             msg = f"Config key '{key}' not found in config file."
