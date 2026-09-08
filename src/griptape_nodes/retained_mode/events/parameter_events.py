@@ -45,6 +45,8 @@ class AddParameterToNodeRequest(RequestPayload):
         is_user_defined: Whether this is a user-defined parameter (affects serialization)
         parent_container_name: Name of parent container if nested
         parent_element_name: Name of parent element if nested
+        traits: Trait identity and state, as [{"trait_name": str, "trait_state": dict}]
+        value_callbacks: Converter and validator method names on the owning node
         initial_setup: Skip setup work when loading from file
         settable: Whether parameter can be set directly by the user or not
         allow_variable_substitution: Whether {VAR} tokens in this parameter's value are substituted at execution time

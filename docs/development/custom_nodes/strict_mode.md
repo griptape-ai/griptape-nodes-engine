@@ -133,3 +133,23 @@ are not flagged.
 **Remediation**: keep value hooks to value transformation. If the
 node needs editor-time reactivity (adjusting parameters as values
 change), run the library in Shared mode.
+
+### Save-time rule (logged, not scoped)
+
+The rule below shares its remediation text with the rest of the
+catalog, but it does not behave like the rules above: it is logged
+directly when a workflow is saved, not raised through the strict-mode
+scope during `aprocess` or the worker schema probe. It never elevates
+a result to a failure and has no worker-escalation behavior.
+
+#### `callback-cannot-be-saved`
+
+A run-time parameter attached a callback (a trait's `on_click`, or a
+converter/validator) that saving cannot record. Saving writes down the
+name of a method on the owning node; a lambda or a local function has
+no name to resolve, so the behavior is dropped when the workflow
+reloads.
+
+**Remediation**: pass a method of the node (`self.my_handler`) rather
+than a lambda or a local function, so the saved workflow can find it
+again on load.

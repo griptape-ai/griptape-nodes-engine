@@ -40,6 +40,8 @@ Add functionality via `add_trait()`:
 
 For the full list of traits, the widgets they render, and the `ui_options` keys they manage, see the [Parameter UI Reference](parameter_ui_reference.md).
 
+**Saving callbacks**: a `Button`'s `on_click`/`get_button_state`, and a parameter's `converters`/`validators`, must be bound methods of the node (`self.my_handler`) to survive a save. Saving records the method's name and resolves it back against the node on load; a lambda or a local function has no name to resolve, so it loads without that behavior and a warning is logged.
+
 ## Parameter helper constructs (`ParameterString`, `ParameterInt`, ...)
 
 Griptape Nodes includes a set of convenience Parameter subclasses under `griptape_nodes.exe_types.param_types.*`.
