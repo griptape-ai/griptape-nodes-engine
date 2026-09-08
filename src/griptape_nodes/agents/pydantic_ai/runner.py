@@ -245,18 +245,56 @@ class PydanticAgentRunner:
         gated shell tool and skills here ship no scripts.
 
         Returns an empty list when skills are disabled, the directory is absent,
-        or a skill on disk is unreadable, so the run proceeds without skills
-        instead of failing on one bad ``SKILL.md``.
+        or no skill in it loads, so the run proceeds without skills instead of
+        failing on a bad ``SKILL.md``.
         """
         skills_dir = self._skills_library()
         if skills_dir is None:
             return []
-        try:
-            capability = SkillsCapability(directories=[skills_dir], scripts=False)
-        except ValueError as e:
-            logger.warning("Attempted to load skills from %s. Failed because of: %s", skills_dir, e)
+        capability = self._load_skills(skills_dir)
+        if capability is None:
+            capability = self._load_usable_skills(skills_dir)
+        if capability is None:
             return []
         return [capability]
+
+    def _load_skills(self, skills_dir: Path, include: list[str] | None = None) -> SkillsCapability | None:
+        """Build a capability over ``skills_dir``, or ``None`` when the loader rejects a skill.
+
+        The loader validates every selected skill while constructing and raises on the
+        first one it rejects, so this succeeds only when all of them load. ``ValueError``
+        is a frontmatter report and ``OSError`` an unreadable ``SKILL.md``; both cost
+        skills rather than the run.
+        """
+        try:
+            return SkillsCapability(directories=[skills_dir], scripts=False, include=include)
+        except (ValueError, OSError) as e:
+            logger.warning(
+                "Attempted to load skills %s from %s. Failed because of: %s",
+                include if include is not None else "(all)",
+                skills_dir,
+                e,
+            )
+            return None
+
+    def _load_usable_skills(self, skills_dir: Path) -> SkillsCapability | None:
+        """Build a capability over only the skills in ``skills_dir`` that load on their own.
+
+        One rejected ``SKILL.md`` fails the whole library, so probe each skill by name
+        first: ``include`` filters before the loader parses anything, which pins a
+        rejection to the skill that caused it and keeps the others. Returns ``None`` when
+        nothing survives.
+        """
+        try:
+            candidates = sorted(entry.name for entry in skills_dir.iterdir() if (entry / "SKILL.md").is_file())
+        except OSError as e:
+            logger.warning("Attempted to list the skills in %s. Failed because of: %s", skills_dir, e)
+            return None
+
+        usable = [name for name in candidates if self._load_skills(skills_dir, include=[name]) is not None]
+        if not usable:
+            return None
+        return self._load_skills(skills_dir, include=usable)
 
     @property
     def agent(self) -> Agent[Any, str]:

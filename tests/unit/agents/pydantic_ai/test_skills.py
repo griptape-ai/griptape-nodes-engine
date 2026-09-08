@@ -3,20 +3,21 @@
 Skill discovery and progressive disclosure are owned by `pydantic-ai-skills`;
 these tests cover only the runner's contract: when a capability is built, what
 it discovers, which tools it exposes, and what a broken skill costs.
+
+The skills reaching the model on a run is covered in `test_runner.py`, which is
+where a `FunctionModel` can observe the offered tools.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from pydantic_ai.toolsets import FunctionToolset
 
 from griptape_nodes.agents.pydantic_ai.runner import PydanticAgentRunner
 from griptape_nodes.drivers.thread_storage.local_thread_storage_driver import LocalThreadStorageDriver
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 def _runner(workspace: Path, threads_dir: Path, *, auto_load_skills: bool = True) -> PydanticAgentRunner:
@@ -86,8 +87,31 @@ def test_excludes_script_tool(workspace: Path, tmp_path: Path) -> None:
     assert "run_skill_script" not in toolset.tools
 
 
-def test_broken_skill_costs_skills_not_the_run(workspace: Path, tmp_path: Path) -> None:
-    """A `SKILL.md` the loader rejects yields no capability rather than raising."""
+def test_broken_skill_costs_only_itself(workspace: Path, tmp_path: Path) -> None:
+    """A `SKILL.md` the loader rejects is skipped; the valid skills beside it still load."""
+    _write_skill(workspace, "good-skill")
+    broken = workspace / ".agents/skills/broken-skill"
+    broken.mkdir(parents=True)
+    (broken / "SKILL.md").write_text("no frontmatter at all\n")
+    runner = _runner(workspace, tmp_path / "threads")
+
+    capabilities = runner._build_skills_capabilities()
+
+    assert len(capabilities) == 1
+    assert capabilities[0].skill_names == ["good-skill"]
+
+
+def test_unreadable_skill_costs_skills_not_the_run(workspace: Path, tmp_path: Path) -> None:
+    """A `SKILL.md` that cannot be read yields no capability rather than raising."""
+    skill_dir = _write_skill(workspace, "demo-skill")
+    runner = _runner(workspace, tmp_path / "threads")
+    with patch.object(Path, "read_text", side_effect=PermissionError(13, "Permission denied")):
+        assert runner._build_skills_capabilities() == []
+    assert (skill_dir / "SKILL.md").is_file()
+
+
+def test_no_capability_when_every_skill_is_broken(workspace: Path, tmp_path: Path) -> None:
+    """A library where nothing loads yields no capability rather than an empty one."""
     broken = workspace / ".agents/skills/broken-skill"
     broken.mkdir(parents=True)
     (broken / "SKILL.md").write_text("no frontmatter at all\n")

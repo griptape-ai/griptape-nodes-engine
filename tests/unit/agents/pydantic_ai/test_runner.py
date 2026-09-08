@@ -240,6 +240,33 @@ async def test_tool_call_round_trips_through_runner(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_workspace_skill_reaches_the_model_on_a_run(tmp_path: Path) -> None:
+    """A skill in the workspace is offered to the model, so the run wiring is not silently dropped."""
+    workspace = tmp_path / "ws"
+    skill_dir = workspace / ".agents/skills/demo-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: demo-skill\ndescription: Demo skill description.\n---\n\nGuidance for the task."
+    )
+    threads_dir = tmp_path / "threads"
+
+    offered: list[AgentInfo] = []
+
+    async def stream(_messages: list[ModelMessage], info: AgentInfo) -> AsyncIterator[str]:
+        offered.append(info)
+        yield "Done."
+
+    runner = _runner_with_function_model(workspace, threads_dir, stream)
+    await runner.run("Use the demo skill.")
+
+    assert len(offered) == 1
+    # Each skill is a deferred capability: the model sees it in the catalog instructions
+    # and pulls its guidance in with `load_capability`.
+    assert "load_capability" in {tool.name for tool in offered[0].function_tools}
+    assert "demo-skill" in (offered[0].instructions or "")
+
+
+@pytest.mark.asyncio
 async def test_run_captures_generate_image_urls(tmp_path: Path) -> None:
     """URLs returned by the `generate_image` tool surface on the run result."""
     workspace = tmp_path / "ws"
