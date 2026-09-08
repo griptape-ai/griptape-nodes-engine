@@ -337,3 +337,66 @@ class TestMisdeclaredTraitDegradesTheSaveInsteadOfFailingIt:
         broken_command = commands["broken"]
         assert broken_command.traits == [{"trait_name": "_UndeclaredCallbackTrait", "trait_state": {}}]
         assert any("on_ping" in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+
+
+class _RequiredCallbackTrait(Trait):
+    """Stands in for a third-party trait whose saved state is short a required constructor argument.
+
+    ``to_state()`` omits ``on_ping`` because it is an undeclared callback (see
+    ``TestMisdeclaredTraitDegradesTheSaveInsteadOfFailingIt``), but here ``on_ping`` is also
+    required, so the resulting saved state can never satisfy this constructor on load.
+    """
+
+    def __init__(self, on_ping, *, label: str = "hi") -> None:  # noqa: ANN001
+        super().__init__(element_id="_RequiredCallbackTrait")
+        self.on_ping = on_ping
+        self.label = label
+
+    def ui_options_for_trait(self) -> dict:
+        return {}
+
+    @classmethod
+    def get_trait_keys(cls) -> list[str]:
+        return ["required_callback"]
+
+
+class TestTraitStateMissingARequiredArgument:
+    """A saved state short a required constructor argument loads without that trait, not a crash."""
+
+    def test_the_parameter_loads_without_the_trait(self, engine: Engine) -> None:
+        target = _add_node(engine, "target")
+
+        result = engine.handle_request(
+            AddParameterToNodeRequest(
+                node_name=target.name,
+                parameter_name="model",
+                tooltip="t",
+                type="str",
+                traits=[{"trait_name": "_RequiredCallbackTrait", "trait_state": {"label": "x"}}],
+            )
+        )
+
+        assert isinstance(result, AddParameterToNodeResultSuccess)
+        parameter = target.get_parameter_by_name("model")
+        assert parameter is not None
+        assert parameter.trait_states() == []
+
+    def test_a_warning_is_logged(self, engine: Engine, caplog: pytest.LogCaptureFixture) -> None:
+        target = _add_node(engine, "target")
+        caplog.set_level(logging.WARNING, logger="griptape_nodes")
+
+        engine.handle_request(
+            AddParameterToNodeRequest(
+                node_name=target.name,
+                parameter_name="model",
+                tooltip="t",
+                type="str",
+                traits=[{"trait_name": "_RequiredCallbackTrait", "trait_state": {"label": "x"}}],
+            )
+        )
+
+        assert any(
+            "_RequiredCallbackTrait" in record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.WARNING
+        )

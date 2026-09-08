@@ -4399,7 +4399,18 @@ class NodeManager(EngineScoped):
                     trait_name,
                 )
                 continue
-            parameter.add_trait(trait_class.from_state(state))
+            try:
+                trait = trait_class.from_state(state)
+            except TypeError:
+                logger.warning(
+                    "Parameter '%s' was saved with the '%s' trait, but its saved state is missing "
+                    "something the trait requires. The parameter will load without it. Check that the "
+                    "library providing it is up to date.",
+                    parameter.name,
+                    trait_name,
+                )
+                continue
+            parameter.add_trait(trait)
 
     @staticmethod
     def _apply_trait_callbacks(parameter: Parameter, trait_states: list[dict[str, Any]]) -> None:
