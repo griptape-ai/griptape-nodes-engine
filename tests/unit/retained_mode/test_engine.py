@@ -184,6 +184,7 @@ class TestEngineScope:
             assert GriptapeNodes.get_instance() is scoped
             assert GriptapeNodes.FlowManager() is scoped.flow_manager
             assert GriptapeNodes.ObjectManager() is scoped.object_manager
+            assert GriptapeNodes.BudgetManager() is scoped.budget_manager
 
     @pytest.mark.asyncio
     async def test_task_created_inside_the_scope_inherits_the_binding(self) -> None:
