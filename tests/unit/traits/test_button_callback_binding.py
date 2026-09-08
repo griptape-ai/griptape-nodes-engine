@@ -157,3 +157,28 @@ class TestRebindingCallbacks:
         )
 
         assert _button_of(parameter).on_click_callback is live_callback
+
+
+class TestApplyStateRecomputesDerivedCallbacks:
+    """apply_state overwrites button_link directly; on_click_callback must follow it."""
+
+    def test_a_changed_button_link_rebuilds_the_handler(self) -> None:
+        button = Button(label="Docs", button_link="https://example.test/old")
+
+        button.apply_state({"button_link": "https://example.test/new"})
+
+        callback = button.on_click_callback
+        assert callback is not None
+        result = callback(button, button.get_button_details())
+        assert result is not None
+        href = getattr(result.response, "href", None)
+        assert href == "https://example.test/new"
+
+    def test_a_constructor_supplied_on_click_survives_apply_state(self) -> None:
+        node = ButtonNode(name="survives")
+        button = Button(label="Refresh", on_click=node.refresh)
+        before = button.on_click_callback
+
+        button.apply_state({})
+
+        assert button.on_click_callback is before
