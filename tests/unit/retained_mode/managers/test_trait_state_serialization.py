@@ -9,7 +9,7 @@ from collections.abc import Generator
 
 import pytest
 
-from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
+from griptape_nodes.exe_types.core_types import Parameter, ParameterMode, Trait
 from griptape_nodes.exe_types.node_types import BaseNode, sanctioned_parameter_mutation
 from griptape_nodes.node_library.library_registry import (
     LibraryMetadata,
@@ -268,3 +268,72 @@ class TestSerializeThenReplay:
         )
         assert unsaveable_button.on_click_callback is None
         assert unsaveable_button.label == "Lambda"
+
+
+class _UndeclaredCallbackTrait(Trait):
+    """Stands in for a third-party trait that forgot to declare STATE_EXCLUDE."""
+
+    def __init__(self, *, on_ping: object = None) -> None:
+        super().__init__(element_id="_UndeclaredCallbackTrait")
+        self.on_ping = on_ping
+
+    def ui_options_for_trait(self) -> dict:
+        return {}
+
+    @classmethod
+    def get_trait_keys(cls) -> list[str]:
+        return ["undeclared_callback"]
+
+
+class _MisdeclaredTraitNode(BaseNode):
+    """A node that grows a parameter with a trait a third-party library forgot to declare correctly."""
+
+    def process(self) -> None:
+        return None
+
+    def discover(self) -> None:
+        with sanctioned_parameter_mutation():
+            self.add_parameter(
+                Parameter(
+                    name="broken",
+                    type="str",
+                    default_value="",
+                    tooltip="t",
+                    user_defined=True,
+                    allowed_modes={ParameterMode.PROPERTY},
+                    traits={_UndeclaredCallbackTrait(on_ping=lambda: None)},
+                )
+            )
+
+
+@pytest.fixture(autouse=True)
+def _registered_misdeclared_node_type(_registered_node_type: None) -> None:
+    """Register _MisdeclaredTraitNode alongside _ModelPicker under the same test library."""
+    library = LibraryRegistry.get_library(_LIBRARY_NAME)
+    library.register_new_node_type(
+        _MisdeclaredTraitNode, NodeMetadata(category="t", description="d", display_name="Misdeclared Trait Node")
+    )
+
+
+class TestMisdeclaredTraitDegradesTheSaveInsteadOfFailingIt:
+    """A library author's forgotten STATE_EXCLUDE costs one callback, not the whole save."""
+
+    def test_serializing_still_succeeds(self, engine: Engine, caplog: pytest.LogCaptureFixture) -> None:
+        context = engine.handle_request(
+            EnsureWorkflowAndFlowRequest(workflow_name="trait_state_test", display_name="trait_state_test")
+        )
+        assert isinstance(context, EnsureWorkflowAndFlowResultSuccess)
+        node = _MisdeclaredTraitNode(
+            name="broken_node", metadata={"library": _LIBRARY_NAME, "node_type": _MisdeclaredTraitNode.__name__}
+        )
+        engine.object_manager.add_object_by_name("broken_node", node)
+        node.discover()
+        caplog.set_level(logging.WARNING, logger="griptape_nodes")
+
+        result = engine.node_manager.on_serialize_node_to_commands(SerializeNodeToCommandsRequest(node_name=node.name))
+
+        assert isinstance(result, SerializeNodeToCommandsResultSuccess)
+        commands = _added_parameter_commands(result.serialized_node_commands.element_modification_commands)
+        broken_command = commands["broken"]
+        assert broken_command.traits == [{"trait_name": "_UndeclaredCallbackTrait", "trait_state": {}}]
+        assert any("on_ping" in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)

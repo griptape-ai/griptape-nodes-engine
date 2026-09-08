@@ -3268,23 +3268,38 @@ class Trait(ABC, BaseNodeElement):
         restoring goes back through the real constructor and keeps whatever invariants
         it enforces. A parameter declared in ``STATE_EXCLUDE`` may hold a callable; that
         callback is carried separately, by name, through ``callback_names``.
+
+        A parameter this trait cannot account for, whether missing its attribute or
+        holding an undeclared callback, is logged and omitted rather than raised. This
+        runs on every save; failing the whole save over one misdeclared trait would cost
+        the artist their work for a library-authoring mistake they cannot fix.
         """
         state: dict[str, Any] = {}
         for name in self._state_parameter_names():
             attribute_name = self.STATE_ALIASES.get(name, name)
             if not hasattr(self, attribute_name):
-                msg = (
-                    f"Trait '{type(self).__name__}' takes '{name}' but stores no matching attribute. "
-                    f"Declare STATE_ALIASES = {{'{name}': '<attribute>'}} so its value can be saved."
+                logger.warning(
+                    "Trait '%s' takes '%s' but stores no matching attribute. "
+                    "Declare STATE_ALIASES = {'%s': '<attribute>'} so its value can be saved. "
+                    "The parameter will load without this trait's '%s'.",
+                    type(self).__name__,
+                    name,
+                    name,
+                    name,
                 )
-                raise AttributeError(msg)
+                continue
             value = getattr(self, attribute_name)
             if callable(value):
-                msg = (
-                    f"Trait '{type(self).__name__}' takes '{name}' but it holds a callback, not state. "
-                    f"Declare STATE_EXCLUDE = {{'{name}', ...}} so it is carried by name instead of saved as data."
+                logger.warning(
+                    "Trait '%s' takes '%s' but it holds a callback, not state. "
+                    "Declare STATE_EXCLUDE = {'%s', ...} so it is carried by name instead of "
+                    "saved as data. The parameter will load without this trait's '%s'.",
+                    type(self).__name__,
+                    name,
+                    name,
+                    name,
                 )
-                raise TypeError(msg)
+                continue
             state[name] = value
         return state
 
