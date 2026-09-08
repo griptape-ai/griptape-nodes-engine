@@ -709,6 +709,124 @@ class TestProjectManagerBuiltinVariables:
         assert "project_name not yet implemented" in str(result.result_details)
 
     @patch("griptape_nodes.retained_mode.managers.project_manager.WorkflowRegistry")
+    def test_mirrored_workflow_context_resolves_the_lenders_folder(
+        self,
+        mock_workflow_registry: Mock,
+        project_manager_with_template: ProjectManager,
+    ) -> None:
+        """After adopting a peer's context, workflow builtins resolve through the NORMAL path.
+
+        Unadopted, a worker's resolver raises, the optional `{workflow_dir?:/}` in the default
+        `{outputs}` template swallows it, and the path degrades to workspace-relative -- so the
+        worker writes where the orchestrator does not read, with no error at the divergence.
+        """
+        from griptape_nodes.common.macro_parser import ParsedMacro
+        from griptape_nodes.retained_mode.managers.context_manager import ContextManager
+
+        # A real ContextManager with an empty stack: exactly a worker before adopting.
+        context_manager = ContextManager(event_manager=MagicMock(), engine=MagicMock())
+        project_manager_with_template._engine = MagicMock()
+        project_manager_with_template._engine.context_manager = context_manager
+
+        dir_request = GetPathForMacroRequest(parsed_macro=ParsedMacro("{workflow_dir}/output.txt"), variables={})
+        name_request = GetPathForMacroRequest(parsed_macro=ParsedMacro("{workflow_name}.txt"), variables={})
+
+        # Unadopted: the folder is unresolvable, which is what silently degrades the path.
+        assert not isinstance(
+            project_manager_with_template.on_get_path_for_macro_request(dir_request),
+            GetPathForMacroResultSuccess,
+        )
+
+        context_manager.mirror_workflow_context("my_show", "/orchestrator/shows/my_show/my_show.py", None)
+
+        resolved_dir = project_manager_with_template.on_get_path_for_macro_request(dir_request)
+        resolved_name = project_manager_with_template.on_get_path_for_macro_request(name_request)
+
+        assert isinstance(resolved_dir, GetPathForMacroResultSuccess)
+        assert resolved_dir.resolved_path == Path("/orchestrator/shows/my_show/output.txt")
+        # workflow_name is the same defect, fixed by the same adoption rather than a second handoff.
+        assert isinstance(resolved_name, GetPathForMacroResultSuccess)
+        assert resolved_name.resolved_path.name == "my_show.txt"
+        mock_workflow_registry.get_workflow_by_name.assert_not_called()
+
+    def test_mirroring_keeps_the_stack_indexable(self) -> None:
+        """Adoption installs a REAL entry, so stack-indexing readers stay safe.
+
+        `has_current_workflow()` also means "there is an entry to index", so answering it True
+        without one raises IndexError in has_current_flow, push_flow, pop_flow and the setters.
+        """
+        from griptape_nodes.retained_mode.managers.context_manager import ContextManager
+
+        context_manager = ContextManager(event_manager=MagicMock(), engine=MagicMock())
+        context_manager.mirror_workflow_context("w", "/a/b/w.py", None)
+
+        assert context_manager.has_current_workflow() is True
+        assert context_manager.has_current_flow() is False
+        assert context_manager.get_current_workflow_name() == "w"
+        assert context_manager.get_current_workflow_file_path() == "/a/b/w.py"
+
+    def test_mirroring_replaces_rather_than_stacks(self) -> None:
+        """A mirror tracks ONE peer context; stacking would leave a stale workflow to be read."""
+        from griptape_nodes.retained_mode.managers.context_manager import ContextManager
+
+        context_manager = ContextManager(event_manager=MagicMock(), engine=MagicMock())
+        context_manager.mirror_workflow_context("first", "/a/first.py", None)
+        context_manager.mirror_workflow_context("second", "/b/second.py", None)
+        # Re-adopting the same context must not grow the stack either.
+        context_manager.mirror_workflow_context("second", "/b/second.py", None)
+
+        assert len(context_manager._workflow_stack) == 1
+        assert context_manager.get_current_workflow_name() == "second"
+
+    def test_mirroring_an_empty_context_drops_the_previous_one(self) -> None:
+        """A peer with no workflow must leave this engine with none either.
+
+        The mirror is replaced in place and never popped, so skipping the empty case left the
+        previous execution's workflow installed: the worker resolved `{workflow_dir}` to that
+        folder while the orchestrator degraded to workspace-relative, and wrote a real file
+        where the orchestrator does not read.
+        """
+        from griptape_nodes.retained_mode.managers.context_manager import ContextManager
+
+        context_manager = ContextManager(event_manager=MagicMock(), engine=MagicMock())
+        context_manager.mirror_workflow_context("showA", "/a/showA.py", None)
+
+        context_manager.mirror_workflow_context(None, None, None)
+
+        assert context_manager.has_current_workflow() is False
+
+    def test_dispatch_snapshot_is_empty_when_there_is_no_workflow(
+        self,
+        project_manager_with_template: ProjectManager,
+    ) -> None:
+        """Nothing to lend, so the peer must drop any mirror it holds and degrade identically."""
+        mock_context_manager = Mock()
+        mock_context_manager.has_current_workflow.return_value = False
+        project_manager_with_template._engine = MagicMock()
+        project_manager_with_template._engine.context_manager = mock_context_manager
+
+        assert project_manager_with_template.workflow_context_for_dispatch().name is None
+
+    def test_dispatch_snapshot_carries_the_whole_context(
+        self,
+        project_manager_with_template: ProjectManager,
+    ) -> None:
+        """Raw context, not a resolved path: derived values are then computed by the peer."""
+        mock_context_manager = Mock()
+        mock_context_manager.has_current_workflow.return_value = True
+        mock_context_manager.get_current_workflow_name.return_value = "my_show"
+        mock_context_manager.get_current_workflow_file_path.return_value = "/shows/my_show/my_show.py"
+        mock_context_manager.get_current_workflow_working_directory.return_value = "/shows/my_show"
+        project_manager_with_template._engine = MagicMock()
+        project_manager_with_template._engine.context_manager = mock_context_manager
+
+        snapshot = project_manager_with_template.workflow_context_for_dispatch()
+
+        assert snapshot.name == "my_show"
+        assert snapshot.file_path == "/shows/my_show/my_show.py"
+        assert snapshot.working_directory == "/shows/my_show"
+
+    @patch("griptape_nodes.retained_mode.managers.project_manager.WorkflowRegistry")
     def test_builtin_workflow_dir_resolves_correctly(
         self,
         mock_workflow_registry: Mock,
@@ -2095,6 +2213,7 @@ situations:
     def pm(self) -> ProjectManager:
         mock_event_manager = Mock()
         mock_event_manager.evaluate_authorization_checkpoint.return_value = None
+        mock_event_manager.abroadcast_app_event = AsyncMock()
         mock_config_manager = Mock()
         mock_config_manager.project_config = {}
         mock_config_manager.env_config = {}
@@ -2782,6 +2901,7 @@ name: Modern Project
     def pm(self) -> ProjectManager:
         mock_event_manager = Mock()
         mock_event_manager.evaluate_authorization_checkpoint.return_value = None
+        mock_event_manager.abroadcast_app_event = AsyncMock()
         mock_config_manager = Mock()
         mock_config_manager.project_config = {}
         mock_config_manager.env_config = {}
@@ -2842,6 +2962,7 @@ name: Legacy Project
     def pm(self) -> ProjectManager:
         mock_event_manager = Mock()
         mock_event_manager.evaluate_authorization_checkpoint.return_value = None
+        mock_event_manager.abroadcast_app_event = AsyncMock()
         mock_config_manager = Mock()
         mock_config_manager.project_config = {}
         mock_config_manager.env_config = {}
@@ -5021,6 +5142,7 @@ class TestProjectManagerProjectWorkspaces:
 
         mock_event_manager = Mock()
         mock_event_manager.evaluate_authorization_checkpoint.return_value = None
+        mock_event_manager.abroadcast_app_event = AsyncMock()
         mock_secrets = Mock()
         pm = ProjectManager(mock_event_manager, mock_config, mock_secrets)
 
@@ -5370,6 +5492,7 @@ class TestProjectManagerProjectWorkspaces:
         )
         mock_event_manager = Mock()
         mock_event_manager.evaluate_authorization_checkpoint.return_value = None
+        mock_event_manager.abroadcast_app_event = AsyncMock()
         pm = ProjectManager(mock_event_manager, mock_config, Mock())
         pm._read_overlay = fake_read_overlay  # type: ignore[method-assign]
         pm._resolve_registered_entry_paths = lambda _entries: [_canon(parent_file), _canon(child_file)]  # type: ignore[method-assign]
@@ -9777,6 +9900,7 @@ situations:
     def pm(self) -> ProjectManager:
         mock_event_manager = Mock()
         mock_event_manager.evaluate_authorization_checkpoint.return_value = None
+        mock_event_manager.abroadcast_app_event = AsyncMock()
         mock_config_manager = Mock()
         mock_config_manager.project_config = {}
         mock_config_manager.env_config = {}
@@ -10110,6 +10234,7 @@ parent_project_id: "ghost-parent-id"
     def pm(self, tmp_path: Path) -> ProjectManager:
         mock_event_manager = Mock()
         mock_event_manager.evaluate_authorization_checkpoint.return_value = None
+        mock_event_manager.abroadcast_app_event = AsyncMock()
         mock_config_manager = Mock()
         mock_config_manager.project_config = {}
         mock_config_manager.env_config = {}
@@ -10643,6 +10768,31 @@ PACKAGING_PROJECT_YAML = """\
   "outputs":
     "path_macro": "outputs"
 """
+
+
+class TestEnsureProjectLoadedByPath:
+    """A worker adopting its orchestrator's project must find one known only via project_file.
+
+    Registered-project re-derivation covers projects_to_register alone. The orchestrator's
+    project usually arrives via the persisted `project_file` -- how every install names its
+    project after any activation -- and a worker whose re-derivation missed it refused adoption
+    and ran against a different workspace than its orchestrator. The id is the canonical template
+    path, so a readable file at that path is loadable directly.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_project_known_only_by_path_is_loaded(self, engine: Engine, tmp_path: Path) -> None:
+        project_yaml = _write_project_base_dir(tmp_path / "proj")
+        pm = engine.project_manager
+        project_id = str(project_yaml.resolve())
+        assert project_id not in pm._successfully_loaded_project_templates
+
+        assert await pm.ensure_project_loaded(project_id) is True
+        assert project_id in pm._successfully_loaded_project_templates
+
+    @pytest.mark.asyncio
+    async def test_a_nonexistent_id_still_reports_absent(self, engine: Engine, tmp_path: Path) -> None:
+        assert await engine.project_manager.ensure_project_loaded(str(tmp_path / "nope.yml")) is False
 
 
 def _write_project_base_dir(base_dir: Path, adjacent_config: dict | None = None) -> Path:
@@ -11529,16 +11679,14 @@ class TestImportProject:
         """Path-typed request fields arriving as wire strings round-trip cleanly.
 
         project_events declares destination_path/archive_path/target_directory as
-        Path. Over the WebSocket they arrive as plain JSON strings. Because
-        project_events imports Path at runtime, cattrs coerces those fields to Path
-        for the preview/import requests (verified below). ExportProjectRequest is
-        the exception: it also carries project_id: ProjectID, a TYPE_CHECKING-only
-        forward reference (project_events cannot import project_manager at runtime
-        without a cycle), so get_type_hints() raises NameError for the whole class
-        and cattrs falls back to a no-coercion structure. destination_path stays a
-        str there, so on_export_project_request coerces it at the boundary. Either
-        way the handler must not crash on a wire string; this exercises the real
-        converter path end to end.
+        Path. Over the WebSocket they arrive as plain JSON strings, and cattrs
+        coerces them to Path for every request here -- including
+        ExportProjectRequest, whose project_id: ProjectID annotation used to be a
+        TYPE_CHECKING-only forward reference that made get_type_hints() raise for
+        the whole class and dropped it to a no-coercion structure. ProjectID now
+        lives in project_events at runtime (pydantic consumers need the name
+        resolvable too), so the exception is gone. The handler still coerces at
+        the boundary, which keeps it safe for any payload that arrives unconverted.
         """
         from griptape_nodes.retained_mode.events.event_converter import converter
         from griptape_nodes.retained_mode.events.project_events import (
@@ -11562,8 +11710,8 @@ class TestImportProject:
             {"project_id": load_result.project_id, "destination_path": str(destination)},
             ExportProjectRequest,
         )
-        # ProjectID forward ref blocks coercion for this class; the field stays str.
-        assert isinstance(export_request.destination_path, str)
+        # ProjectID resolves at runtime now, so this class coerces like the others.
+        assert isinstance(export_request.destination_path, Path)
         export_result = pm.on_export_project_request(export_request)
         assert isinstance(export_result, ExportProjectResultSuccess)
 
@@ -12716,9 +12864,6 @@ class TestCurrentProjectChangedReachesClients:
 
         project_id = self._load(engine, tmp_path)
         original_workspace = engine.config_manager.workspace_path
-        # The broadcast is gated on initialization being complete; a real engine has
-        # finished booting long before a user switches projects.
-        engine.project_manager._initialization_complete = True
 
         published: list[Any] = []
         try:
@@ -12729,7 +12874,6 @@ class TestCurrentProjectChangedReachesClients:
             assert len(changes) == 1, "a project switch must publish exactly one CurrentProjectChanged"
             assert changes[0].project_id == project_id
         finally:
-            engine.project_manager._initialization_complete = False
             engine.handle_request(SetCurrentProjectRequest(project_id=None))
             engine.config_manager.workspace_path = original_workspace
 
@@ -12739,7 +12883,6 @@ class TestCurrentProjectChangedReachesClients:
 
         project_id = self._load(engine, tmp_path)
         original_workspace = engine.config_manager.workspace_path
-        engine.project_manager._initialization_complete = True
 
         published: list[Any] = []
         try:
@@ -12749,6 +12892,5 @@ class TestCurrentProjectChangedReachesClients:
 
             assert self._published_project_changes(published) == []
         finally:
-            engine.project_manager._initialization_complete = False
             engine.handle_request(SetCurrentProjectRequest(project_id=None))
             engine.config_manager.workspace_path = original_workspace
