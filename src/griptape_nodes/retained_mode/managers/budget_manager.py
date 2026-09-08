@@ -43,9 +43,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("griptape_nodes")
 
-# Matches the Cloud parser's MAX_CHAIN_LENGTH (griptape-cloud#2225). Truncating lower would
-# not be conservative: the parser flags a truncated chain as mangled because budget paths are
-# root-anchored, so dropping ancestors client-side costs matches the Cloud would have made.
+# Matches the Cloud parser's MAX_CHAIN_LENGTH. Truncating lower would not be conservative: the
+# parser flags a truncated chain as mangled because budget paths are root-anchored, so dropping
+# ancestors client-side costs matches the Cloud would have made.
 _MAX_PROJECT_CHAIN_ENTRIES = 32
 
 # base64 inflates 4:3, so 4096 decoded bytes encode to at most 5464 -- inside the 5.5 KB raw
@@ -80,8 +80,8 @@ def _build_attribution_payload(facts: _AttributionFacts) -> dict[str, Any]:
     """Build the decoded payload, omitting every key the engine could not determine.
 
     Every dimension lives under `tags`; the Cloud parser reads nothing else, and there is no
-    second namespace beside it (griptape-cloud#2225). `tags` itself is omitted when the engine
-    could determine nothing, rather than sent empty.
+    second namespace beside it. `tags` itself is omitted when the engine could determine
+    nothing, rather than sent empty.
     """
     tags: dict[str, Any] = {}
     if facts.project_chain:
