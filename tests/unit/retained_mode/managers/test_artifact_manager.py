@@ -1018,6 +1018,60 @@ class TestGeneratePreview:
         assert isinstance(metadata.preview_generator_parameters, dict)
 
     @pytest.mark.asyncio
+    async def test_generator_exception_returns_failure(
+        self, artifact_manager: ArtifactManager, test_macro_path: MacroPath
+    ) -> None:
+        """A generator that raises produces a failure result, not an unhandled error."""
+        from unittest.mock import AsyncMock
+
+        request = GeneratePreviewRequest(
+            macro_path=test_macro_path,
+            artifact_provider_name="Image",
+            generate_preview_metadata_json=True,
+            preview_generator_parameters={"max_width": 50, "max_height": 50},
+        )
+        with patch.object(
+            ImageArtifactProvider,
+            "attempt_generate_preview",
+            new=AsyncMock(side_effect=RuntimeError("codec exploded")),
+        ):
+            result = await artifact_manager.on_handle_generate_preview_request(request)
+
+        assert isinstance(result, GeneratePreviewResultFailure)
+        assert "codec exploded" in str(result.result_details)
+
+    @pytest.mark.asyncio
+    async def test_source_vanishing_mid_generation_keeps_preview(
+        self, artifact_manager: ArtifactManager, test_macro_path: MacroPath, test_image_path: Path
+    ) -> None:
+        """A source deleted while its preview renders keeps the generated preview.
+
+        The post-generation verification stat can't run against a vanished file;
+        the loop keeps what it produced rather than failing a completed generation.
+        """
+        generation_calls = 0
+        original = ImageArtifactProvider.attempt_generate_preview
+
+        async def generate_then_delete_source(provider_self: ImageArtifactProvider, **kwargs: object) -> object:
+            nonlocal generation_calls
+            generation_calls += 1
+            result = await original(provider_self, **kwargs)  # type: ignore[arg-type]
+            await anyio.Path(test_image_path).unlink()
+            return result
+
+        request = GeneratePreviewRequest(
+            macro_path=test_macro_path,
+            artifact_provider_name="Image",
+            generate_preview_metadata_json=True,
+            preview_generator_parameters={"max_width": 50, "max_height": 50},
+        )
+        with patch.object(ImageArtifactProvider, "attempt_generate_preview", generate_then_delete_source):
+            result = await artifact_manager.on_handle_generate_preview_request(request)
+
+        assert isinstance(result, GeneratePreviewResultSuccess)
+        assert generation_calls == 1
+
+    @pytest.mark.asyncio
     async def test_source_changed_mid_generation_retries_once(
         self, artifact_manager: ArtifactManager, test_macro_path: MacroPath, test_image_path: Path
     ) -> None:

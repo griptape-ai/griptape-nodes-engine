@@ -790,6 +790,37 @@ class TestStaticFilesManagerCreateDownloadUrlFromPath:
         assert any("Preview unavailable" in m for m in warning_messages)
 
     @pytest.mark.asyncio
+    async def test_preview_generation_exception_falls_back_with_reason(
+        self, mock_static_files_manager: StaticFilesManager, tmp_path: Path
+    ) -> None:
+        """An exception escaping preview generation still serves the original, with the reason."""
+        from griptape_nodes.retained_mode.events.static_file_events import (
+            CreateStaticFileDownloadUrlFromPathRequest,
+            CreateStaticFileDownloadUrlFromPathResultSuccess,
+        )
+
+        source_file = tmp_path / "image.png"
+        source_file.write_bytes(b"not a real png")
+
+        mock_static_files_manager.storage_driver.create_signed_download_url.return_value = "http://signed-url.com"
+        mock_static_files_manager.storage_driver.get_asset_url.return_value = "http://asset-url.com"
+
+        request = CreateStaticFileDownloadUrlFromPathRequest(file_path=str(source_file), preview=True)
+
+        with patch.object(
+            mock_static_files_manager,
+            "_generate_preview_if_needed",
+            AsyncMock(side_effect=RuntimeError("provider blew up")),
+        ):
+            result = await mock_static_files_manager.on_handle_create_static_file_download_url_from_path_request(
+                request
+            )
+
+        assert isinstance(result, CreateStaticFileDownloadUrlFromPathResultSuccess)
+        assert result.preview_failure_reason == "provider blew up"
+        mock_static_files_manager.storage_driver.create_signed_download_url.assert_called_once_with(source_file)
+
+    @pytest.mark.asyncio
     async def test_preview_success_has_no_failure_reason(
         self, mock_static_files_manager: StaticFilesManager, tmp_path: Path
     ) -> None:

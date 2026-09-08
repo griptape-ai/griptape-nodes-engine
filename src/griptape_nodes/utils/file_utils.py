@@ -122,12 +122,13 @@ def _fsync_directory_best_effort(directory: Path) -> None:
     """
     try:
         dir_fd = os.open(directory, os.O_RDONLY)
-    except OSError:
+    except OSError as e:
+        logger.debug("Could not open directory %s for fsync: %s", directory, e)
         return
     try:
         os.fsync(dir_fd)
-    except OSError:
-        pass
+    except OSError as e:
+        logger.debug("Could not fsync directory %s: %s", directory, e)
     finally:
         with contextlib.suppress(OSError):
             os.close(dir_fd)

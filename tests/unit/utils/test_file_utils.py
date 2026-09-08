@@ -17,6 +17,7 @@ from griptape_nodes.utils.file_utils import (
     DEFAULT_MAX_SEARCH_DEPTH,
     _arecurse_find,
     _AsyncWalkParams,
+    _fsync_directory_best_effort,
     atomic_write_bytes,
     find_all_files_in_directory,
     find_file_in_directory,
@@ -646,6 +647,7 @@ class TestAtomicWriteBytes:
         assert target.read_bytes() == b"original"
         assert sorted(p.name for p in temp_dir.iterdir()) == ["data.bin"]
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits are not representable on Windows")
     def test_preserves_existing_file_mode(self, temp_dir: Path) -> None:
         """Overwriting keeps the destination's permissions.
 
@@ -703,3 +705,28 @@ class TestAtomicWriteBytes:
 
         assert link.is_symlink()
         assert missing_target.read_bytes() == b"new"
+
+
+class TestFsyncDirectoryBestEffort:
+    """The directory sync must never fail a write that already completed."""
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        """Create a temporary directory for testing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    def test_unopenable_directory_is_swallowed(self, temp_dir: Path) -> None:
+        """A directory that cannot be opened for sync is logged and skipped."""
+        _fsync_directory_best_effort(temp_dir / "does-not-exist")
+
+    def test_fsync_failure_is_swallowed(self, temp_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An fsync error (unsupported filesystem) is logged and skipped."""
+
+        def failing_fsync(_fd: int) -> None:
+            msg = "fsync not supported here"
+            raise OSError(msg)
+
+        monkeypatch.setattr("griptape_nodes.utils.file_utils.os.fsync", failing_fsync)
+
+        _fsync_directory_best_effort(temp_dir)

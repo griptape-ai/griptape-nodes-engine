@@ -235,6 +235,47 @@ class TestBlanketExceptionHandling:
         assert isinstance(result, WriteFileResultSuccess)
         assert file_path.read_bytes() == b"line one\r\nline two\r\n"
 
+    def test_unencodable_text_overwrite_maps_to_encoding_error(self, engine: Engine, temp_dir: Path) -> None:
+        """Text that cannot be represented in the requested encoding fails as ENCODING_ERROR."""
+        file_path = temp_dir / "text.txt"
+        request = WriteFileRequest(file_path=str(file_path), content="naïve café", encoding="ascii")
+
+        result = engine.os_manager.on_write_file_request(request)
+
+        assert isinstance(result, WriteFileResultFailure)
+        assert result.failure_reason == FileIOFailureReason.ENCODING_ERROR
+        assert not file_path.exists()
+
+    def test_directory_destination_on_overwrite_maps_to_is_directory(self, engine: Engine, temp_dir: Path) -> None:
+        """An overwrite whose destination is a directory fails as IS_DIRECTORY."""
+        request = WriteFileRequest(file_path=str(temp_dir / "some.txt"), content="Content")
+
+        with patch(
+            "griptape_nodes.retained_mode.managers.os_manager.atomic_write_bytes",
+            side_effect=IsADirectoryError("that is a directory"),
+        ):
+            result = engine.os_manager.on_write_file_request(request)
+
+        assert isinstance(result, WriteFileResultFailure)
+        assert result.failure_reason == FileIOFailureReason.IS_DIRECTORY
+
+    def test_windows_sharing_violation_maps_to_file_locked(self, engine: Engine, temp_dir: Path) -> None:
+        """A Windows sharing violation on the rename reports FILE_LOCKED, not PERMISSION_DENIED."""
+        locked_error = PermissionError("The process cannot access the file")
+        locked_error.winerror = 32  # ERROR_SHARING_VIOLATION  # type: ignore[attr-defined]
+
+        request = WriteFileRequest(file_path=str(temp_dir / "held.png"), content=b"payload")
+
+        with patch(
+            "griptape_nodes.retained_mode.managers.os_manager.atomic_write_bytes",
+            side_effect=locked_error,
+        ):
+            result = engine.os_manager.on_write_file_request(request)
+
+        assert isinstance(result, WriteFileResultFailure)
+        assert result.failure_reason == FileIOFailureReason.FILE_LOCKED
+        assert "in use by another process" in str(result.result_details)
+
     def test_disk_full_on_overwrite_maps_to_disk_full(self, engine: Engine, temp_dir: Path) -> None:
         """A full destination volume fails as DISK_FULL with an actionable message.
 

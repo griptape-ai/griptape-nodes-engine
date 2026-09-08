@@ -6,6 +6,8 @@ import asyncio
 import threading
 import time
 
+import pytest
+
 from griptape_nodes.utils.keyed_mutex import KeyedMutex
 
 
@@ -109,5 +111,46 @@ class TestKeyedMutex:
                 assert "key" in mutex._entries
 
         asyncio.run(use_it())
+
+        assert mutex._entries == {}
+
+    def test_cancelled_waiter_checks_in_and_holds_nothing(self) -> None:
+        """A waiter cancelled while polling drops its registry reference and never takes the lock.
+
+        Cancellation can only land at the sleep between acquisition attempts, where
+        nothing is held — so the holder is undisturbed and the entry's refcount
+        returns to the holder's alone.
+        """
+        mutex = KeyedMutex()
+
+        async def scenario() -> None:
+            holder_entered = asyncio.Event()
+            release_holder = asyncio.Event()
+
+            async def holder() -> None:
+                async with mutex.locked("key"):
+                    holder_entered.set()
+                    await release_holder.wait()
+
+            async def waiter() -> None:
+                async with mutex.locked("key"):
+                    pytest.fail("cancelled waiter must never enter the critical section")
+
+            holder_task = asyncio.create_task(holder())
+            await holder_entered.wait()
+
+            waiter_task = asyncio.create_task(waiter())
+            await asyncio.sleep(0.05)  # let the waiter reach its polling sleep
+            waiter_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter_task
+
+            # Only the holder's reference remains; the waiter checked in on cancel.
+            assert mutex._entries["key"].refcount == 1
+
+            release_holder.set()
+            await holder_task
+
+        asyncio.run(scenario())
 
         assert mutex._entries == {}
