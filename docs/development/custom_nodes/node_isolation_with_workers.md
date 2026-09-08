@@ -148,14 +148,13 @@ Two practical implications:
     during execution.** Reading connection or peer-node state from
     inside `process` (or from `before_value_set` /
     `after_value_set`, which run during input hydration on the same
-    scope) works but is expensive and surfaces as the
-    [`worker-reach-into-orchestrator`](strict_mode.md) warning.
-- **Intentional writes are sanctioned**, not penalized. Emit the
-    corresponding request (`SetParameterValueRequest`,
-    `AddParameterToNodeRequest`, `RemoveParameterFromNodeRequest`,
-    etc.) and the engine handles the round-trip correctly. The strict-
-    mode rule's remediation explicitly flags writes as fine to
-    ignore.
+    scope) works, but each read is a round-trip to the orchestrator
+    and the answer is stale as soon as it arrives.
+- **Requests are the sanctioned boundary**, for reads and writes
+    alike. Emit the corresponding request
+    (`SetParameterValueRequest`, `AddParameterToNodeRequest`,
+    `RemoveParameterFromNodeRequest`, etc.) and the engine handles
+    the round-trip correctly.
 
 Requests issued **outside** node execution (during library load or
 bootstrap) are not forwarded — the worker is not connected to the
@@ -418,7 +417,7 @@ from, prefixed with `Worker-<engine-id>` so you can tell it apart
 from orchestrator output. Look for both **WARNING** and **ERROR**
 entries.
 
-The six rules and their actual severities:
+The five rules and their actual severities:
 
 | Rule                                                      | Orchestrator | Worker  | Notes                                                                                                                                                                                                         |
 | --------------------------------------------------------- | ------------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -427,10 +426,8 @@ The six rules and their actual severities:
 | [`connection-hooks-inert-on-worker`](strict_mode.md)      | WARNING      | WARNING | Fires during library load when a node class overrides a connection lifecycle hook. Those hooks run on the orchestrator against the stub, so the override never runs. Does not escalate.                       |
 | [`value-hooks-execute-only-on-worker`](strict_mode.md)    | WARNING      | WARNING | Fires during library load when a node class overrides `before_value_set` / `after_value_set`. Value transformation still works; editor-time reactivity and parameter-list mutation do not. Does not escalate. |
 | [`parameter-mutation-during-aprocess`](strict_mode.md)    | WARNING      | ERROR   | Promotes the node's result to a failure on the worker.                                                                                                                                                        |
-| [`worker-reach-into-orchestrator`](strict_mode.md)        | n/a          | WARNING | Fires anywhere during node execution including hydration. Does not escalate; intentional writes are explicitly fine to ignore.                                                                                |
 
 If a strict-mode line fires, the rule's remediation message names
 exactly which guideline above was violated and how to fix it. A
-worker log free of strict-mode WARNING and ERROR entries (apart from
-the explicitly-fine-to-ignore writes flagged by
-`worker-reach-into-orchestrator`) is the bar for "isolation-ready."
+worker log free of strict-mode WARNING and ERROR entries is the bar
+for "isolation-ready."
