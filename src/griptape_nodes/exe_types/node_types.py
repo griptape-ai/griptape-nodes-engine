@@ -836,9 +836,6 @@ class BaseNode(ABC):
             if traits:
                 trait = traits[0]  # Take the first Options trait
                 trait.choices = choices
-                # Update the manually set UI options to include the new simple_dropdown
-                if hasattr(parameter, "_ui_options") and parameter._ui_options:
-                    parameter._ui_options["simple_dropdown"] = choices
 
                 if default in choices:
                     parameter.default_value = default
