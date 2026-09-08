@@ -182,3 +182,23 @@ class TestApplyStateRecomputesDerivedCallbacks:
         button.apply_state({})
 
         assert button.on_click_callback is before
+
+    def test_a_saved_link_on_a_bare_button_builds_a_handler(self) -> None:
+        """A button built with neither button_link nor on_click has no callback to preserve."""
+        button = Button(label="Docs")
+
+        button.apply_state({"button_link": "https://example.test/new"})
+
+        callback = button.on_click_callback
+        assert callback is not None
+        result = callback(button, button.get_button_details())
+        assert result is not None
+        href = getattr(result.response, "href", None)
+        assert href == "https://example.test/new"
+
+    def test_a_cleared_link_removes_the_handler(self) -> None:
+        button = Button(label="Docs", button_link="https://example.test/old")
+
+        button.apply_state({"button_link": None})
+
+        assert button.on_click_callback is None
