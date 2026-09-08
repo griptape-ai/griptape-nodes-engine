@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from griptape_nodes.files.path_utils import parse_static_server_url
+from griptape_nodes.retained_mode.engine import current_engine
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 logger = logging.getLogger(__name__)
@@ -54,7 +55,7 @@ def _resolve_file_path(file_path: str) -> Path | None:  # noqa: PLR0911
 
     # Get workspace path (can raise exceptions from ConfigManager)
     try:
-        workspace_path = GriptapeNodes.ConfigManager().workspace_path
+        workspace_path = current_engine().config_manager.workspace_path
     except (AttributeError, RuntimeError, KeyError) as e:
         logger.debug("Failed to get workspace path: %s", e)
         return None
