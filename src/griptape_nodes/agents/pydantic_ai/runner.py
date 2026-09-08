@@ -272,8 +272,9 @@ class PydanticAgentRunner:
         is a frontmatter report and ``OSError`` an unreadable ``SKILL.md``; both cost
         skills rather than the run.
 
-        ``index_resources=False`` skips indexing bundled files, which a probe does not
-        need and which is what makes probing expensive.
+        ``index_resources=False`` skips indexing bundled *resources*, which a probe does
+        not need and which is the bulk of what makes probing expensive. Scripts are still
+        discovered, so a library shipping them pays more per probe than one that does not.
         """
         exclude_resources = None if index_resources else ["*"]
         try:
@@ -300,9 +301,10 @@ class PydanticAgentRunner:
         rejection to the skill that caused it and keeps the others. Returns ``None`` when
         nothing survives.
 
-        Probing costs a construction per skill, and every construction indexes the whole
-        library's bundled files, so probes skip that indexing: a probe only has to answer
-        whether the frontmatter parses, and the survivors are indexed by the build below.
+        Probing costs a construction per skill, and every construction walks the whole
+        library's bundled files, so probes skip indexing its resources: a probe only has
+        to answer whether the frontmatter parses, and the survivors' resources are indexed
+        by the build below.
         """
         try:
             candidates = sorted(entry.name for entry in skills_dir.iterdir() if (entry / "SKILL.md").is_file())
