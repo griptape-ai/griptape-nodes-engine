@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import threading
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from griptape_nodes.utils.async_utils import to_thread
-
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
+
+# How long a waiter sleeps between acquisition attempts. Contention on a key means
+# duplicate requests for one resource whose critical section does real work (file
+# I/O, media decoding), so tens of milliseconds of wake-up latency is noise there,
+# while the sleep keeps waiting nearly free for the event loop.
+_ACQUIRE_POLL_INTERVAL_SECONDS = 0.02
 
 
 @dataclass
@@ -35,9 +40,16 @@ class KeyedMutex:
     problem, and it may be released from a different thread than the one that
     acquired it, which the ThreadRunner dispatch pattern requires.
 
-    Acquisition happens via ``to_thread`` so a waiting coroutine never blocks
-    its event loop: two coroutines on ONE loop contending for a raw
-    ``threading.Lock`` would otherwise deadlock the loop.
+    Waiters poll with a non-blocking acquire plus an async sleep rather than
+    blocking in a thread. Parking each waiter in the shared ``to_thread`` pool
+    would deadlock under exactly the fan-in this class exists to tame: enough
+    same-key waiters exhaust the pool's bounded workers, and the HOLDER --
+    which needs a worker from that same pool to run its critical section --
+    can never finish to release them. Polling costs a waiter at most one
+    interval of latency and consumes no thread at all. It also makes
+    cancellation trivially safe: the lock is only ever taken by a synchronous
+    successful acquire with no await between it and the try/finally that
+    releases, so there is no window where cancellation can strand a held lock.
 
     Entries are refcounted and removed when the last holder or waiter checks
     in, so the registry does not grow with every key ever seen.
@@ -52,39 +64,20 @@ class KeyedMutex:
     async def locked(self, key: str) -> AsyncIterator[None]:
         """Hold the key's lock for the duration of the ``async with`` block.
 
-        Each waiter parks a worker in the shared ``to_thread`` pool for the whole
-        time the current holder runs its critical section. That is acceptable here
-        because waiters on one key are by definition duplicate requests for the
-        same resource — bounded by how many components display one artifact — not
-        general fan-out. If a caller ever serializes high-fan-in work on hot keys,
-        it needs its own executor rather than this class as-is.
-
         Args:
             key: The identity to serialize on. Callers should canonicalize paths
                 (``canonicalize_for_identity``) before using them as keys so two
                 spellings of one file collide.
         """
         entry = self._checkout(key)
-        # Set from inside the worker thread, immediately after the acquire
-        # returns, so it is ground truth for whether WE hold the lock — the
-        # only thing that decides whether the failure path below may release.
-        # Releasing on any weaker evidence risks unlocking another holder's
-        # critical section, which would silently break mutual exclusion.
-        acquired = threading.Event()
-
-        def acquire_and_record() -> None:
-            entry.lock.acquire()
-            acquired.set()
-
         try:
-            await to_thread(acquire_and_record)
+            # ASYNC110 wants an asyncio.Event here, but an asyncio primitive is
+            # exactly what this class cannot use: waiters live on different event
+            # loops (and threads), and an Event binds to one loop. See class docstring.
+            while not entry.lock.acquire(blocking=False):  # noqa: ASYNC110
+                await asyncio.sleep(_ACQUIRE_POLL_INTERVAL_SECONDS)
         except BaseException:
-            # to_thread waits for its worker thread even when the awaiting
-            # coroutine is cancelled, so by the time cancellation surfaces here
-            # the acquire has normally completed — but only the flag knows for
-            # sure (the task may also have died before the thread ran).
-            if acquired.is_set():
-                entry.lock.release()
+            # Cancellation can only surface at the sleep, where nothing is held.
             self._checkin(key)
             raise
         try:
