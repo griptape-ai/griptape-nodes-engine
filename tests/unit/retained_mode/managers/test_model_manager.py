@@ -5,13 +5,19 @@ Covers:
 - `on_handle_search_models_request` — search result handling
 - `on_handle_declare_model_invocation_request` — clears a declared invocation past the pre-dispatch chain
 - `_download_model_task` — the spawned subprocess targets a runnable module
+- `_load_status_file` — status file reads survive a concurrent status file write
 """
 
 import importlib.util
+import io
+import json
 import sys
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
+import portalocker
 import pytest
 
 from griptape_nodes.exe_types.node_types import BaseNode
@@ -25,12 +31,20 @@ from griptape_nodes.retained_mode.events.model_events import (
     GetModelInfoRequest,
     GetModelInfoResultFailure,
     GetModelInfoResultSuccess,
+    ListModelDownloadsRequest,
+    ListModelDownloadsResultSuccess,
     SearchModelsRequest,
     SearchModelsResultFailure,
     SearchModelsResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
-from griptape_nodes.retained_mode.managers.model_manager import DownloadParams, ModelManager
+from griptape_nodes.retained_mode.managers.model_manager import (
+    _STATUS_READ_LOCK_ATTEMPTS,
+    _STATUS_READ_TORN_ATTEMPTS,
+    DownloadParams,
+    ModelManager,
+    _load_status_file,
+)
 
 
 @pytest.fixture
@@ -536,6 +550,134 @@ class TestDownloadModelTaskSubprocess:
 
         assert captured_cmd[3] == "download"
         assert "org/model" in captured_cmd
+
+
+# ---------------------------------------------------------------------------
+# _load_status_file — reads that land on a status file being written
+# ---------------------------------------------------------------------------
+
+
+_COMPLETED_RECORD = {
+    "model_id": "depth-anything/DA3-SMALL",
+    "status": "completed",
+    "started_at": "2026-09-03T11:12:30+00:00",
+    "updated_at": "2026-09-03T11:13:02+00:00",
+    "completed_at": "2026-09-03T11:13:02+00:00",
+    "total_bytes": 100,
+    "downloaded_bytes": 100,
+    "progress_percent": 100.0,
+}
+
+
+class TestStatusFileReadsSurviveConcurrentWrites:
+    """A status file mid-write must not turn a poll into a reported failure.
+
+    The terminal `"completed"` write holds the lock while the editor polls for progress.
+    """
+
+    @pytest.fixture
+    def status_file(self, tmp_path: Path) -> Path:
+        path = tmp_path / "depth-anything--DA3-SMALL.json"
+        path.write_text(json.dumps(_COMPLETED_RECORD), encoding="utf-8")
+        return path
+
+    def test_retries_past_a_locked_file(self, status_file: Path) -> None:
+        real_open = Path.open
+        attempts = []
+
+        def open_locked_once(self_path: Path, *args: Any, **kwargs: Any) -> Any:
+            attempts.append(self_path)
+            if len(attempts) == 1:
+                raise PermissionError(13, "Permission denied")
+            return real_open(self_path, *args, **kwargs)
+
+        with patch.object(Path, "open", open_locked_once):
+            data = _load_status_file(status_file)
+
+        # The failed read plus the retry that got the value.
+        assert attempts == [status_file, status_file]
+        assert data == _COMPLETED_RECORD
+
+    def test_retries_past_a_half_written_file(self, status_file: Path) -> None:
+        # Advisory flock does not stop the reader, so it can see the rewrite at zero bytes.
+        real_open = Path.open
+        attempts = []
+
+        def open_truncated_once(self_path: Path, *args: Any, **kwargs: Any) -> Any:
+            attempts.append(self_path)
+            if len(attempts) == 1:
+                return io.StringIO("")
+            return real_open(self_path, *args, **kwargs)
+
+        with patch.object(Path, "open", open_truncated_once):
+            data = _load_status_file(status_file)
+
+        # The failed read plus the retry that got the value.
+        assert attempts == [status_file, status_file]
+        assert data == _COMPLETED_RECORD
+
+    def test_a_file_that_never_frees_up_is_dropped_not_raised(self, status_file: Path) -> None:
+        with patch.object(Path, "open", side_effect=PermissionError(13, "Permission denied")) as locked_open:
+            assert _load_status_file(status_file) is None
+
+        assert locked_open.call_count == _STATUS_READ_LOCK_ATTEMPTS
+
+    def test_a_permanently_malformed_file_does_not_pay_the_lock_budget(self, status_file: Path) -> None:
+        # Nothing distinguishes this from a torn read, and a poll cannot afford to wait on
+        # every corrupt file in the directory once per second.
+        status_file.write_text("{ truncated", encoding="utf-8")
+        real_open = Path.open
+        attempts = []
+
+        def count_attempts(self_path: Path, *args: Any, **kwargs: Any) -> Any:
+            attempts.append(self_path)
+            return real_open(self_path, *args, **kwargs)
+
+        with patch.object(Path, "open", count_attempts):
+            assert _load_status_file(status_file) is None
+
+        assert len(attempts) == _STATUS_READ_TORN_ATTEMPTS
+
+    def test_missing_file_reads_as_no_status(self, tmp_path: Path) -> None:
+        assert _load_status_file(tmp_path / "never-downloaded.json") is None
+
+    def test_a_real_write_lock_is_contained(self, status_file: Path) -> None:
+        # The lock os_manager takes for every status file write, mode included: `"w"` is what
+        # makes portalocker truncate under the lock, which is the window a POSIX reader sees.
+        with portalocker.Lock(
+            str(status_file),
+            mode="w",
+            timeout=0,
+            flags=portalocker.LockFlags.EXCLUSIVE | portalocker.LockFlags.NON_BLOCKING,
+        ):
+            # Windows fails the read on the locked range; POSIX reads the truncated file.
+            assert _load_status_file(status_file) is None
+
+        status_file.write_text(json.dumps(_COMPLETED_RECORD), encoding="utf-8")
+        assert _load_status_file(status_file) == _COMPLETED_RECORD
+
+    @pytest.mark.asyncio
+    async def test_list_downloads_still_succeeds_when_a_read_fails(
+        self, model_manager: ModelManager, status_file: Path
+    ) -> None:
+        with (
+            patch.object(model_manager, "_get_status_directory", return_value=status_file.parent),
+            patch.object(Path, "open", side_effect=PermissionError(13, "Permission denied")),
+        ):
+            result = await model_manager.on_handle_list_model_downloads_request(ListModelDownloadsRequest())
+
+        # An unreadable record drops out of the list; it does not fail the request.
+        assert isinstance(result, ListModelDownloadsResultSuccess)
+        assert result.downloads == []
+
+    @pytest.mark.asyncio
+    async def test_list_downloads_reads_a_settled_file(self, model_manager: ModelManager, status_file: Path) -> None:
+        with patch.object(model_manager, "_get_status_directory", return_value=status_file.parent):
+            result = await model_manager.on_handle_list_model_downloads_request(ListModelDownloadsRequest())
+
+        assert isinstance(result, ListModelDownloadsResultSuccess)
+        assert [download.model_id for download in result.downloads] == ["depth-anything/DA3-SMALL"]
+        assert result.downloads[0].status == "completed"
 
 
 class TestAppInitializationCompleteWorkerGuard:
