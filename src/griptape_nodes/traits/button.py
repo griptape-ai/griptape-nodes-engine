@@ -191,10 +191,13 @@ class Button(Trait):
     def _recompute_derived_state(self) -> None:
         """Rebuild ``on_click_callback`` from a changed ``button_link``.
 
-        Only touches the callback when it is itself derived from state: a node-supplied
-        ``on_click`` set by the constructor must survive ``apply_state`` untouched.
+        Only touches the callback when it is itself derived from state, or absent, so a
+        node-supplied ``on_click`` set by the constructor survives ``apply_state`` untouched.
+        A plain ``None`` cannot represent that intent (there is nothing to preserve), so it is
+        treated the same as derived: otherwise a button built with no ``button_link`` and no
+        ``on_click`` would gain a saved link with no handler to fire it.
         """
-        if not is_derived_from_state(self.on_click_callback):
+        if self.on_click_callback is not None and not is_derived_from_state(self.on_click_callback):
             return
         if self.button_link is None:
             self.on_click_callback = None
