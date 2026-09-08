@@ -7,6 +7,7 @@ import pickle
 import re
 import sys
 from collections import defaultdict
+from contextlib import nullcontext
 from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -78,6 +79,7 @@ from griptape_nodes.retained_mode.events.library_events import (
     ListRegisteredLibrariesRequest,
     ListRegisteredLibrariesResultSuccess,
     RegisterLibraryFromFileRequest,
+    RegisterLibraryFromFileResultFailure,
 )
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.os_events import (
@@ -199,6 +201,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     WorkflowInfoSummary,
     WorkflowStatus,
 )
+from griptape_nodes.retained_mode.managers.event_manager import EventSuppressionContext
 from griptape_nodes.retained_mode.managers.fitness_problems.workflows import (
     InvalidDependencyVersionStringProblem,
     InvalidLibraryVersionStringProblem,
@@ -373,10 +376,18 @@ class WorkflowManager(EngineScoped):
     _referenced_workflow_stack: list[str] = field(default_factory=list)
 
     class WorkflowExecutionResult(NamedTuple):
-        """Result of a workflow execution."""
+        """Result of a workflow execution.
+
+        `unresolved_libraries` names the declared libraries that would not register, one
+        user-facing message each. It is populated whether or not the run succeeded: a
+        library that never loads is reported as a warning on an otherwise-successful load
+        (its nodes come back as placeholders), and is the likeliest explanation when the
+        load fails outright.
+        """
 
         execution_successful: bool
         execution_details: str
+        unresolved_libraries: tuple[str, ...] = ()
 
     class SaveWorkflowScenario(StrEnum):
         """Scenarios for saving workflows."""
@@ -871,6 +882,7 @@ class WorkflowManager(EngineScoped):
         # Resolve path using utility function
         workspace_path = self.engine.config_manager.workspace_path
         complete_file_path = resolve_workspace_path(Path(relative_file_path), workspace_path)
+        unresolved_libraries: list[str] = []
         try:
             async with await anyio.open_file(Path(complete_file_path), encoding="utf-8") as file:
                 workflow_content = await file.read()
@@ -879,53 +891,74 @@ class WorkflowManager(EngineScoped):
             # The metadata header lists every library the workflow uses; each must
             # be registered (discovery is triggered if needed) so node construction
             # inside the script can succeed.
-            library_resolution_error = await self._ensure_libraries_for_workflow(
+            unresolved_libraries = await self._ensure_libraries_for_workflow(
                 relative_file_path=relative_file_path,
                 complete_file_path=complete_file_path,
             )
-            if library_resolution_error is not None:
-                return library_resolution_error
 
-            # Execute the workflow module with a dedicated namespace so `__file__` resolves
-            # to the workflow path and the `if __name__ == "__main__"` guard does not fire
-            # (which would try to spin up a second event loop via asyncio.run).
-            namespace: dict[str, Any] = {
-                "__file__": str(complete_file_path),
-                "__name__": "__gtn_workflow__",
-            }
-            exec(workflow_content, namespace)  # noqa: S102
+            # _generate_workflow_run_prerequisite_code emits one registration per header entry,
+            # so each library we just failed to register is about to fail again on a request the
+            # GUI would toast -- that equivalence is what makes suppressing the type here safe.
+            # It is conditional because an unreadable header pre-registers nothing: there the
+            # in-file failures are the only record of what the workflow needs.
+            duplicate_library_failures = (
+                EventSuppressionContext(self.engine.event_manager, {RegisterLibraryFromFileResultFailure})
+                if unresolved_libraries
+                else nullcontext()
+            )
+            with duplicate_library_failures:
+                # Execute the workflow module with a dedicated namespace so `__file__` resolves
+                # to the workflow path and the `if __name__ == "__main__"` guard does not fire
+                # (which would try to spin up a second event loop via asyncio.run).
+                namespace: dict[str, Any] = {
+                    "__file__": str(complete_file_path),
+                    "__name__": "__gtn_workflow__",
+                }
+                exec(workflow_content, namespace)  # noqa: S102
 
-            # New-style workflows wrap graph-building requests in `async def build_workflow()`
-            # so the module is inert at import time. Await it here. Legacy workflows without
-            # build_workflow() have already executed their requests top-to-bottom during exec().
-            workflow_builder = namespace.get("build_workflow")
-            if workflow_builder is not None and iscoroutinefunction(workflow_builder):
-                await workflow_builder()
+                # New-style workflows wrap graph-building requests in `async def build_workflow()`
+                # so the module is inert at import time. Await it here. Legacy workflows without
+                # build_workflow() have already executed their requests top-to-bottom during exec().
+                workflow_builder = namespace.get("build_workflow")
+                if workflow_builder is not None and iscoroutinefunction(workflow_builder):
+                    await workflow_builder()
 
-            # After workflow execution, ensure there's always a current context by pushing
-            # the top-level flow if the context is empty. This fixes regressions where
-            # with Workflow Schema version 0.6.0+ workflows expect context to be established.
-            await self._ensure_workflow_context_established()
+                # After workflow execution, ensure there's always a current context by pushing
+                # the top-level flow if the context is empty. This fixes regressions where
+                # with Workflow Schema version 0.6.0+ workflows expect context to be established.
+                await self._ensure_workflow_context_established()
 
         except Exception as e:
             return WorkflowManager.WorkflowExecutionResult(
                 execution_successful=False,
                 execution_details=f"Failed to run workflow on path '{complete_file_path}'. Exception: {e}",
+                unresolved_libraries=tuple(unresolved_libraries),
             )
         return WorkflowManager.WorkflowExecutionResult(
             execution_successful=True,
             execution_details=f"Succeeded in running workflow on path '{complete_file_path}'.",
+            unresolved_libraries=tuple(unresolved_libraries),
         )
 
-    async def _ensure_libraries_for_workflow(
-        self, *, relative_file_path: str, complete_file_path: Path
-    ) -> WorkflowExecutionResult | None:
-        """Ensure every library the workflow declares is registered before exec.
+    async def _ensure_libraries_for_workflow(self, *, relative_file_path: str, complete_file_path: Path) -> list[str]:
+        """Register every library the workflow declares before exec, tolerating the ones that won't.
 
         Reads node_libraries_referenced from the workflow's TOML metadata header
         and dispatches a RegisterLibraryFromFileRequest for each entry via
-        ahandle_request. Returns a failure WorkflowExecutionResult if a library
-        cannot be resolved; None on success.
+        ahandle_request. Returns one user-facing message per library that would
+        not register; an empty list when every library resolved.
+
+        A library that cannot be registered does not by itself stop the load. The
+        nodes it owns come back from CreateNodeRequest as ErrorProxyNode placeholders
+        that carry the reason and preserve the graph's values and connections, so the
+        rest of the workflow stays open and editable and only execution is lost.
+        Refusing the load instead would deny the artist the one view that shows
+        which nodes need the library (issue #5505).
+
+        The load can still fail downstream for a reason the missing library causes:
+        a parameter value whose CLASS the library declares is emitted as a hard
+        import inside build_workflow() (see _build_deferred_import_statements), and
+        that raises before any node is created. Only the node types are recoverable.
 
         The engine (not the workflow file itself) owns library registration
         because worker-backed libraries spin up a dedicated subprocess when they
@@ -944,15 +977,16 @@ class WorkflowManager(EngineScoped):
             # Fall through to exec without pre-registering libraries; the engine
             # startup path may have already loaded them. This mirrors prior
             # behavior where a missing prereq block was survivable.
-            return None
+            return []
+        unresolved_libraries: list[str] = []
         for lib_ref in load_metadata_result.metadata.node_libraries_referenced:
             register_result = await self.engine.ahandle_request(
                 RegisterLibraryFromFileRequest(
                     library_name=lib_ref.library_name,
                     perform_discovery_if_not_found=True,
-                    # The outer RunWorkflowFromRegistry failure already names the missing library
-                    # in a user-readable form; suppressing this inner result keeps the GUI from
-                    # showing a duplicate `RegisterLibraryFromFile Failed` toast on top of it.
+                    # The run result carries this library in a user-readable form already;
+                    # suppressing this inner result keeps the GUI from showing a
+                    # `RegisterLibraryFromFile Failed` toast on top of it.
                     failure_log_level=logging.DEBUG,
                 )
             )
@@ -965,15 +999,43 @@ class WorkflowManager(EngineScoped):
                 )
                 version_suffix = f" v{lib_ref.library_version}" if has_real_version else ""
                 inner_details = getattr(register_result, "result_details", "")
-                details = (
-                    f"Workflow '{complete_file_path.name}' requires library "
+                # Stated as the fact alone. Whether its nodes actually became placeholders
+                # depends on the load surviving, which only the caller knows, so
+                # _execution_result_details adds that outcome on the success path.
+                unresolved_libraries.append(
+                    f"Workflow '{complete_file_path.name}' references library "
                     f"'{lib_ref.library_name}'{version_suffix}, which is not loaded. {inner_details}"
                 )
-                return WorkflowManager.WorkflowExecutionResult(
-                    execution_successful=False,
-                    execution_details=details,
-                )
-        return None
+        return unresolved_libraries
+
+    @staticmethod
+    def _execution_result_details(
+        execution_result: WorkflowExecutionResult, *, level: int, message: str | None = None
+    ) -> list[ResultDetail]:
+        """One warning per unresolved library, ahead of the run's detail (or `message` in its place).
+
+        The libraries come first: they explain both the placeholders on a successful load and,
+        on a failed one, the most likely reason the file could not be replayed. Every handler
+        that consumes a WorkflowExecutionResult reports them, or the load looks clean to the
+        caller while its graph is quietly full of placeholders.
+
+        Only a load that survived has placeholders to point at -- a failed one cleared the
+        canvas -- so the outcome is appended here rather than baked into the reason.
+        """
+        outcome = (
+            "Its nodes opened as placeholders that cannot run until the library is available."
+            if execution_result.execution_successful
+            else ""
+        )
+        details = [
+            # The reason ends in whatever the library manager left there -- a period, a paren,
+            # or the trailing newline of a subprocess's stderr -- so normalize before appending
+            # rather than emitting a run-on sentence or an orphan line break.
+            ResultDetail(message=f"{library.rstrip().rstrip('.')}. {outcome}".rstrip(), level=logging.WARNING)
+            for library in execution_result.unresolved_libraries
+        ]
+        details.append(ResultDetail(message=message or execution_result.execution_details, level=level))
+        return details
 
     async def on_run_workflow_from_scratch_request(self, request: RunWorkflowFromScratchRequest) -> ResultPayload:
         # Squelch any ResultPayloads that indicate the workflow was changed, because we are loading it into a blank slate.
@@ -995,10 +1057,14 @@ class WorkflowManager(EngineScoped):
             # Run the file, goddamn it
             execution_result = await self.run_workflow(relative_file_path=relative_file_path)
             if execution_result.execution_successful:
-                return RunWorkflowFromScratchResultSuccess(result_details=execution_result.execution_details)
+                return RunWorkflowFromScratchResultSuccess(
+                    result_details=ResultDetails(*self._execution_result_details(execution_result, level=logging.DEBUG))
+                )
 
             logger.error(execution_result.execution_details)
-            return RunWorkflowFromScratchResultFailure(result_details=execution_result.execution_details)
+            return RunWorkflowFromScratchResultFailure(
+                result_details=ResultDetails(*self._execution_result_details(execution_result, level=logging.ERROR))
+            )
 
     async def on_run_workflow_with_current_state_request(
         self, request: RunWorkflowWithCurrentStateRequest
@@ -1011,9 +1077,13 @@ class WorkflowManager(EngineScoped):
         execution_result = await self.run_workflow(relative_file_path=relative_file_path)
 
         if execution_result.execution_successful:
-            return RunWorkflowWithCurrentStateResultSuccess(result_details=execution_result.execution_details)
+            return RunWorkflowWithCurrentStateResultSuccess(
+                result_details=ResultDetails(*self._execution_result_details(execution_result, level=logging.DEBUG))
+            )
         logger.error(execution_result.execution_details)
-        return RunWorkflowWithCurrentStateResultFailure(result_details=execution_result.execution_details)
+        return RunWorkflowWithCurrentStateResultFailure(
+            result_details=ResultDetails(*self._execution_result_details(execution_result, level=logging.ERROR))
+        )
 
     async def on_run_workflow_from_registry_request(self, request: RunWorkflowFromRegistryRequest) -> ResultPayload:
         await self._workflows_loading_complete.wait()
@@ -1065,7 +1135,7 @@ class WorkflowManager(EngineScoped):
                 result_messages = []
                 if context_warning:
                     result_messages.append(ResultDetail(message=context_warning, level=logging.WARNING))
-                result_messages.append(ResultDetail(message=execution_result.execution_details, level=logging.ERROR))
+                result_messages.extend(self._execution_result_details(execution_result, level=logging.ERROR))
 
                 # Attempt to clear everything out, as we modified the engine state getting here.
                 clear_all_request = ClearAllObjectStateRequest(i_know_what_im_doing=True)
@@ -1078,7 +1148,7 @@ class WorkflowManager(EngineScoped):
         result_messages = []
         if context_warning:
             result_messages.append(ResultDetail(message=context_warning, level=logging.WARNING))
-        result_messages.append(ResultDetail(message=execution_result.execution_details, level=logging.DEBUG))
+        result_messages.extend(self._execution_result_details(execution_result, level=logging.DEBUG))
         return RunWorkflowFromRegistryResultSuccess(result_details=ResultDetails(*result_messages))
 
     def _persist_external_workflow_registration(self, full_path: str) -> None:
@@ -6038,7 +6108,11 @@ class WorkflowManager(EngineScoped):
 
         if not workflow_result.execution_successful:
             details = f"Attempted to import workflow '{request.workflow_name}' as referenced sub flow. Failed because workflow execution failed: {workflow_result.execution_details}"
-            return ImportWorkflowAsReferencedSubFlowResultFailure(result_details=details)
+            return ImportWorkflowAsReferencedSubFlowResultFailure(
+                result_details=ResultDetails(
+                    *self._execution_result_details(workflow_result, level=logging.ERROR, message=details)
+                )
+            )
 
         # Get flows after importing to find the new referenced sub flow
         flows_after = set(obj_manager.get_filtered_subset(type=ControlFlow).keys())
@@ -6070,8 +6144,13 @@ class WorkflowManager(EngineScoped):
         details = (
             f"Successfully imported workflow '{request.workflow_name}' as referenced sub flow '{created_flow_name}'"
         )
+        # A referenced subflow's libraries are not in the importing workflow's own header, so this
+        # is the only result that can name them -- the outer load has nothing to report.
         return ImportWorkflowAsReferencedSubFlowResultSuccess(
-            created_flow_name=created_flow_name, result_details=details
+            created_flow_name=created_flow_name,
+            result_details=ResultDetails(
+                *self._execution_result_details(workflow_result, level=logging.DEBUG, message=details)
+            ),
         )
 
     @staticmethod

@@ -2697,12 +2697,16 @@ class TestLibraryResolutionOnLoad:
                 )
             )
 
-        assert result is None
+        assert result == []
         assert [r.library_name for r in dispatched] == ["Example Library", "Other Library"]
         assert all(r.perform_discovery_if_not_found for r in dispatched)
 
-    def test_ensure_libraries_returns_failure_when_registration_fails(self, engine: Engine) -> None:
-        """A failed library registration short-circuits with a WorkflowExecutionResult failure."""
+    def test_ensure_libraries_reports_the_library_instead_of_refusing_the_load(self, engine: Engine) -> None:
+        """A failed library registration is reported, not fatal: the caller still execs the file.
+
+        A library that will not register costs execution, never editing (issue #5505). The nodes
+        it owns come back as placeholders, which is only possible if the load continues.
+        """
         from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
         from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
         from griptape_nodes.retained_mode.events.library_events import RegisterLibraryFromFileResultFailure
@@ -2734,12 +2738,68 @@ class TestLibraryResolutionOnLoad:
                 )
             )
 
-        assert result is not None
-        assert result.execution_successful is False
-        assert "Missing Library" in result.execution_details
+        assert len(result) == 1
+        assert "Missing Library" in result[0]
+        # The inner reason travels with it so the reader isn't sent hunting.
+        assert "not found" in result[0]
 
-    def test_ensure_libraries_failure_message_uses_filename_and_renders_semver(self, engine: Engine) -> None:
-        """Failure message uses the workflow file name (not full path) and renders v<version> for semver values."""
+    def test_ensure_libraries_attempts_every_library_after_one_fails(self, engine: Engine) -> None:
+        """One unresolvable library does not stop the others from registering.
+
+        Short-circuiting here would strand libraries later in the list, turning their perfectly
+        loadable nodes into placeholders too.
+        """
+        from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
+        from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
+        from griptape_nodes.retained_mode.events.library_events import (
+            RegisterLibraryFromFileRequest,
+            RegisterLibraryFromFileResultFailure,
+            RegisterLibraryFromFileResultSuccess,
+        )
+        from griptape_nodes.retained_mode.events.workflow_events import LoadWorkflowMetadataResultSuccess
+
+        workflow_manager = engine.workflow_manager
+        metadata = WorkflowMetadata(
+            name="t",
+            schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
+            engine_version_created_with="0.0.0",
+            node_libraries_referenced=[
+                LibraryNameAndVersion(library_name="Missing Library", library_version="0.1.0"),
+                LibraryNameAndVersion(library_name="Present Library", library_version="0.2.0"),
+                LibraryNameAndVersion(library_name="Also Missing Library", library_version="0.3.0"),
+            ],
+        )
+        load_result = LoadWorkflowMetadataResultSuccess(metadata=metadata, result_details="ok")
+
+        dispatched: list[RegisterLibraryFromFileRequest] = []
+
+        async def fake_ahandle_request(request: object) -> object:
+            dispatched.append(request)  # type: ignore[arg-type]
+            library_name = request.library_name  # type: ignore[attr-defined]
+            if library_name == "Present Library":
+                return RegisterLibraryFromFileResultSuccess(library_name=library_name, result_details="ok")
+            return RegisterLibraryFromFileResultFailure(result_details="not found")
+
+        with (
+            patch.object(workflow_manager, "on_load_workflow_metadata_request", AsyncMock(return_value=load_result)),
+            patch.object(engine, "ahandle_request", side_effect=fake_ahandle_request),
+        ):
+            result = asyncio.run(
+                workflow_manager._ensure_libraries_for_workflow(
+                    relative_file_path="whatever.py",
+                    complete_file_path=Path("whatever.py"),
+                )
+            )
+
+        assert [r.library_name for r in dispatched] == ["Missing Library", "Present Library", "Also Missing Library"]
+        assert len(result) == 2  # noqa: PLR2004
+        assert "Missing Library" in result[0]
+        assert "Also Missing Library" in result[1]
+        # The library that loaded is not reported as a problem.
+        assert not any("Present Library" in message for message in result)
+
+    def test_ensure_libraries_message_uses_filename_and_renders_semver(self, engine: Engine) -> None:
+        """The report uses the workflow file name (not full path) and renders v<version> for semver values."""
         import logging as _logging
 
         from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
@@ -2778,19 +2838,19 @@ class TestLibraryResolutionOnLoad:
                 )
             )
 
-        assert result is not None
-        assert result.execution_successful is False
+        assert len(result) == 1
+        message = result[0]
         # Filename only, not the absolute path
-        assert "corridorKey.py" in result.execution_details
-        assert "/abs/path/to" not in result.execution_details
+        assert "corridorKey.py" in message
+        assert "/abs/path/to" not in message
         # Semver version renders with v-prefix
-        assert "v1.2.3" in result.execution_details
-        assert "Missing Library" in result.execution_details
+        assert "v1.2.3" in message
+        assert "Missing Library" in message
         # Inner request is suppressed at DEBUG so the GUI doesn't double-toast.
         assert len(dispatched) == 1
         assert dispatched[0].failure_log_level == _logging.DEBUG
 
-    def test_ensure_libraries_failure_message_omits_non_semver_version(self, engine: Engine) -> None:
+    def test_ensure_libraries_message_omits_non_semver_version(self, engine: Engine) -> None:
         """Non-semver `library_version` values (e.g. unavailable-library placeholder) are not rendered as v<...>."""
         from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
         from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
@@ -2824,14 +2884,14 @@ class TestLibraryResolutionOnLoad:
                 )
             )
 
-        assert result is not None
-        assert result.execution_successful is False
-        assert "Missing Library" in result.execution_details
+        assert len(result) == 1
+        message = result[0]
+        assert "Missing Library" in message
         # Placeholder must not leak into the user-facing message in any form
-        assert placeholder not in result.execution_details
-        assert " v" not in result.execution_details.split("Missing Library", 1)[1]
+        assert placeholder not in message
+        assert " v" not in message.split("Missing Library", 1)[1]
 
-    def test_ensure_libraries_failure_message_omits_empty_version(self, engine: Engine) -> None:
+    def test_ensure_libraries_message_omits_empty_version(self, engine: Engine) -> None:
         """An empty `library_version` falls through the semver check and renders no version suffix."""
         from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
         from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
@@ -2864,13 +2924,12 @@ class TestLibraryResolutionOnLoad:
                 )
             )
 
-        assert result is not None
-        assert result.execution_successful is False
-        assert "Missing Library" in result.execution_details
-        assert " v" not in result.execution_details.split("Missing Library", 1)[1]
+        assert len(result) == 1
+        assert "Missing Library" in result[0]
+        assert " v" not in result[0].split("Missing Library", 1)[1]
 
     def test_ensure_libraries_is_noop_when_metadata_missing(self, engine: Engine) -> None:
-        """If metadata can't be loaded, _ensure_libraries_for_workflow returns None (tolerant fallback)."""
+        """If metadata can't be loaded, _ensure_libraries_for_workflow reports nothing (tolerant fallback)."""
         from griptape_nodes.retained_mode.events.workflow_events import LoadWorkflowMetadataResultFailure
 
         workflow_manager = engine.workflow_manager
@@ -2888,8 +2947,98 @@ class TestLibraryResolutionOnLoad:
                 )
             )
 
-        assert result is None
+        assert result == []
         ahandle_spy.assert_not_awaited()
+
+
+class TestRunResultRendering:
+    """Unresolved libraries reach the caller as warnings, ahead of the run's own detail."""
+
+    _PLACEHOLDERS = "Its nodes opened as placeholders that cannot run until the library is available."
+
+    def _result(self, *, successful: bool, unresolved: tuple[str, ...]) -> WorkflowManager.WorkflowExecutionResult:
+        return WorkflowManager.WorkflowExecutionResult(
+            execution_successful=successful,
+            execution_details="ran the file",
+            unresolved_libraries=unresolved,
+        )
+
+    def test_each_unresolved_library_precedes_the_run_detail_as_a_warning(self, engine: Engine) -> None:
+        details = engine.workflow_manager._execution_result_details(
+            self._result(successful=True, unresolved=("Library A is gone.", "Library B is gone.")),
+            level=logging.DEBUG,
+        )
+
+        assert [(detail.level, detail.message) for detail in details] == [
+            (logging.WARNING, f"Library A is gone. {self._PLACEHOLDERS}"),
+            (logging.WARNING, f"Library B is gone. {self._PLACEHOLDERS}"),
+            (logging.DEBUG, "ran the file"),
+        ]
+
+    def test_a_failed_load_is_not_told_its_nodes_became_placeholders(self, engine: Engine) -> None:
+        """Nothing opened, so promising placeholders next to an ERROR would misinform.
+
+        The failure branch of on_run_workflow_from_registry_request clears all object state, so
+        the canvas the message would be describing does not exist.
+        """
+        details = engine.workflow_manager._execution_result_details(
+            self._result(successful=False, unresolved=("Library A is gone.",)), level=logging.ERROR
+        )
+
+        assert [(detail.level, detail.message) for detail in details] == [
+            (logging.WARNING, "Library A is gone."),
+            (logging.ERROR, "ran the file"),
+        ]
+
+    @pytest.mark.parametrize(
+        ("case_name", "reason", "expected_lead"),
+        [
+            (
+                "ends_with_paren",
+                "Library 'A' not found (discovery was attempted)",
+                "Library 'A' not found (discovery was attempted)",
+            ),
+            ("ends_with_period", "Check the log for more details.", "Check the log for more details"),
+            ("ends_with_alnum", "Library 'A' is in FAILURE state", "Library 'A' is in FAILURE state"),
+            ("ends_with_stderr_newline", "Install failed: stderr=boom\n", "Install failed: stderr=boom"),
+            # Only the sentence-final period goes; punctuation inside the reason is left alone.
+            ("ends_with_quoted_period", "Saw 'A.B.'.", "Saw 'A.B.'"),
+        ],
+    )
+    def test_the_outcome_reads_as_its_own_sentence(
+        self, engine: Engine, case_name: str, reason: str, expected_lead: str
+    ) -> None:
+        """Reasons arrive from the library manager however it left them; the join must still read.
+
+        A period-ending reason is the common one, and without normalization it renders a
+        double period; a subprocess's stderr leaves a trailing newline mid-message.
+        """
+        del case_name
+        details = engine.workflow_manager._execution_result_details(
+            self._result(successful=True, unresolved=(reason,)), level=logging.DEBUG
+        )
+
+        assert details[0].message == f"{expected_lead}. {self._PLACEHOLDERS}"
+
+    def test_a_clean_run_renders_only_its_own_detail(self, engine: Engine) -> None:
+        details = engine.workflow_manager._execution_result_details(
+            self._result(successful=True, unresolved=()), level=logging.DEBUG
+        )
+
+        assert [(detail.level, detail.message) for detail in details] == [(logging.DEBUG, "ran the file")]
+
+    def test_an_explicit_message_replaces_the_run_detail(self, engine: Engine) -> None:
+        """A wrapping handler keeps its own wording and still reports the libraries."""
+        details = engine.workflow_manager._execution_result_details(
+            self._result(successful=True, unresolved=("Library A is gone.",)),
+            level=logging.DEBUG,
+            message="Successfully imported workflow 'x' as referenced sub flow 'y'",
+        )
+
+        assert [(detail.level, detail.message) for detail in details] == [
+            (logging.WARNING, f"Library A is gone. {self._PLACEHOLDERS}"),
+            (logging.DEBUG, "Successfully imported workflow 'x' as referenced sub flow 'y'"),
+        ]
 
 
 class TestWorkflowsLoadingGate:
