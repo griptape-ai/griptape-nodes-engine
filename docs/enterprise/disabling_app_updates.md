@@ -27,41 +27,12 @@ The app does not create the directory or the file. Create both manually or
 through an imaging or device-management system before the user first launches
 the app. If the app is already running, quit it first.
 
-On macOS:
-
-```bash
-sudo mkdir -p "/Library/Application Support/ai.griptape.nodes.desktop"
-sudo tee "/Library/Application Support/ai.griptape.nodes.desktop/policy.json" >/dev/null <<'EOF'
-{ "disableUpdates": true }
-EOF
-```
-
-On Linux:
-
-```bash
-sudo mkdir -p /etc/griptape-nodes-desktop
-sudo tee /etc/griptape-nodes-desktop/policy.json >/dev/null <<'EOF'
-{ "disableUpdates": true }
-EOF
-```
-
-On Windows, run this from an elevated PowerShell prompt:
-
-```powershell
-$dir = "$env:ProgramData\GriptapeNodes"
-New-Item -ItemType Directory -Force -Path $dir | Out-Null
-Set-Content -Path "$dir\policy.json" -Value '{ "disableUpdates": true }'
-```
-
-Then [restrict write access to the folder](#restrict-the-folder-on-windows). A
-standard user can replace the file until the folder permissions are changed.
-
 The app reads the policy once at launch. Changes to the file take effect the
 next time the app starts.
 
-`disableUpdates` is the only setting the policy file supports.
-
 ## What users see
+
+![The Updates section of App Settings with the message "Updates are disabled by your organization" above the disabled Check for Updates button, Update Behavior menu, and Release Channel menu](../assets/img/enterprise/disabling_app_updates-updates_disabled.png)
 
 App Settings shows **Updates are disabled by your organization**. The following
 controls are disabled:
@@ -99,58 +70,6 @@ app. The Updates section uses the machine's previous **Update Behavior** and
 Only a literal `true` disables updates. A missing file, invalid JSON, or any
 other value leaves updates under user control. An unmanaged machine does not
 need a policy file.
-
-## Restrict the folder on Windows
-
-Only administrators should have write access to the directory containing
-`policy.json`. The macOS and Linux paths require root access by default.
-
-Standard users can write to `%ProgramData%` on Windows. Until
-`GriptapeNodes\` has administrator-only write permissions, a user can create the
-directory or replace its `policy.json`. The directory needs full control for
-Administrators and SYSTEM, read-only access for other users, and no inherited
-entries that grant additional access.
-
-The following PowerShell example sets those permissions:
-
-```powershell
-$dir = "$env:ProgramData\GriptapeNodes"
-icacls $dir /inheritance:r `
-  /grant "*S-1-5-32-544:(OI)(CI)F" `
-  /grant "*S-1-5-18:(OI)(CI)F" `
-  /grant "*S-1-5-11:(OI)(CI)RX"
-```
-
-`/inheritance:r` removes permissions inherited from `%ProgramData%`. The SIDs
-identify the built-in Administrators group, SYSTEM, and Authenticated Users, so
-the command does not depend on the machine's display language.
-
-Run `icacls $dir` to inspect the result. No group available to a standard user
-should have write access. If your organization has its own permissions policy
-for machine-wide folders, use that policy instead.
-
-Until write access is restricted, treat the Windows policy as advisory.
-
-## Check the policy
-
-App Settings shows whether updates are disabled. You can also confirm the
-policy in the application log. Enable **Write application logs to file** under
-[Logging and Diagnostics](../guides/desktop/app_settings.md#logging-and-diagnostics),
-restart the app, and export the log.
-
-A valid policy logs the path and result:
-
-```text
-Policy: /Library/Application Support/ai.griptape.nodes.desktop/policy.json read, app updates disabled
-```
-
-Invalid JSON leaves updates enabled and produces this message:
-
-```text
-Policy: /etc/griptape-nodes-desktop/policy.json is not valid JSON, ignoring
-```
-
-The app writes no policy log line when the file does not exist.
 
 ## Related
 
