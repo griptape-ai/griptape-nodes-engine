@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.artifact_manager import ArtifactManager
     from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
     from griptape_nodes.retained_mode.managers.context_manager import ContextManager
+    from griptape_nodes.retained_mode.managers.diagnostics_manager import DiagnosticsManager
     from griptape_nodes.retained_mode.managers.engine_identity_manager import EngineIdentityManager
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
@@ -169,6 +170,7 @@ class Engine:
     _project_manager: ProjectManager
     _artifact_manager: ArtifactManager
     _manifest_manager: ManifestManager
+    _diagnostics_manager: DiagnosticsManager
     _worker_manager: WorkerManager
 
     def __init__(self) -> None:  # noqa: PLR0915
@@ -180,6 +182,7 @@ class Engine:
         from griptape_nodes.retained_mode.managers.artifact_manager import ArtifactManager
         from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
         from griptape_nodes.retained_mode.managers.context_manager import ContextManager
+        from griptape_nodes.retained_mode.managers.diagnostics_manager import DiagnosticsManager
         from griptape_nodes.retained_mode.managers.engine_identity_manager import EngineIdentityManager
         from griptape_nodes.retained_mode.managers.event_manager import EventManager
         from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
@@ -245,6 +248,7 @@ class Engine:
         )
         self._artifact_manager = ArtifactManager(self._event_manager, engine=self)
         self._manifest_manager = ManifestManager(self._event_manager, engine=self)
+        self._diagnostics_manager = DiagnosticsManager(self._event_manager, engine=self)
 
         # Assign handlers now that these are created.
         self._event_manager.assign_manager_to_request_type(GetEngineVersionRequest, self.handle_engine_version_request)
@@ -359,6 +363,10 @@ class Engine:
         return self._manifest_manager
 
     @property
+    def diagnostics_manager(self) -> DiagnosticsManager:
+        return self._diagnostics_manager
+
+    @property
     def worker_manager(self) -> WorkerManager:
         return self._worker_manager
 
@@ -447,6 +455,9 @@ class Engine:
 
     def ManifestManager(self) -> ManifestManager:
         return self._manifest_manager
+
+    def DiagnosticsManager(self) -> DiagnosticsManager:
+        return self._diagnostics_manager
 
     def WorkerManager(self) -> WorkerManager:
         return self._worker_manager

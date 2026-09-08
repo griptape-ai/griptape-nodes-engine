@@ -76,7 +76,9 @@ Subcommands:
 
 - `uninstall` - Uninstall the CLI, removing its configuration and data directories and the installed executable
 - `version` - Display the current version of the CLI
-- `info` - Print a system information report for debugging: engine version and install source, platform and Python details, configuration paths, the full merged configuration, and every registered library with its version. Useful to paste into a bug report
+- `info` - Print a system information report for debugging: engine version and install source, platform and Python details, configuration paths, the settings in effect, which API keys are set, every registered library with its version, and any project templates. Safe to paste into a bug report — API keys and other credentials are removed, home directory paths become `~`, and your username becomes `<user>`. A count of what was removed is printed at the end, so a setting that looks empty can be told apart from one that was hidden
+    - `--show-identity` - Keep real home directory paths and your username instead of `~` and `<user>`. Credentials are still removed
+    - To collect the same information *and* your logs as one shareable file, use [`diagnostics collect`](#diagnostics)
 
 ### `libraries`
 
@@ -124,14 +126,56 @@ Subcommands:
 
 ### `doctor`
 
-Run health checks against your Griptape Nodes installation and print a
-pass/fail table (for example, whether the engine's WebSocket connection is
-reachable). Exits with a nonzero status if any check fails, so it's safe to
-use in scripts.
+Check your Griptape Nodes installation and print a table of what it found,
+with a fix for anything that needs one.
 
 ```
 griptape-nodes doctor
 ```
+
+Each check comes back as **PASS**, **WARN** (it works, but something will bite
+you later), or **FAIL** (something is broken now). What gets checked:
+
+- **Workspace** - your workspace directory exists and can be written to
+- **Disk Space** - there is room on the workspace drive to save workflows and install libraries
+- **Libraries** - every registered library loaded, and none of them loaded with missing nodes
+- **Secrets** - every API key a library asked for has a value
+- **Log Capture** - engine logs are being written, so they can be collected later
+- **Cloud Connection** - this machine can reach Griptape Cloud, which the editor needs to talk to the engine
+
+Exits with a nonzero status when a check **fails**, so it's safe to use in
+scripts. A warning on its own exits zero.
+
+The same results are saved as `doctor.json` inside a diagnostics bundle, so
+whoever reads your bug report sees exactly what you saw.
+
+### `diagnostics`
+
+Collect everything needed to troubleshoot this installation into a single zip
+file you can attach to a bug report.
+
+```
+griptape-nodes diagnostics SUBCOMMAND
+```
+
+Subcommands:
+
+- `collect` - Write a diagnostics bundle: your logs, the settings in effect, every library and project and how it loaded, and the health checks from [`doctor`](#doctor)
+    - `--output`, `-o` - Where to write the bundle. A directory gets a generated file name; defaults to the current directory
+    - `--skip-logs` - Leave the engine's log files out of the bundle
+    - `--skip-libraries` - Do not load libraries first. Faster, but the bundle cannot say which ones fail to load
+    - `--show-identity` - Keep real home directory paths and your username instead of `~` and `<user>`
+
+Nothing is uploaded anywhere. The file is written to your machine and it is
+yours to share or not.
+
+The bundle is written by the engine, which knows its own API keys, so it finds
+and removes them from every file it collects — along with anything else shaped
+like a credential. `manifest.json` inside the bundle counts every removal, and
+`README.md` explains each file in plain language.
+
+For the editor and desktop equivalents, see
+[Exporting engine logs](../troubleshooting.md#exporting-engine-logs).
 
 ## Configuration
 

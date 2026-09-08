@@ -29,6 +29,10 @@ DEFAULT_LIBRARIES_DIRECTORY = "libraries"
 LIBRARY_DEPENDENCY_INSTALL_BEHAVIOR_KEY = "library.dependency_install_behavior"
 LIBRARY_MINIMUM_RELEASE_AGE_KEY = "library.minimum_release_age"
 LIBRARY_LAZY_NODE_LOADING_KEY = "library.lazy_node_loading"
+LOG_TO_FILE_KEY = "logging.log_to_file"
+LOG_DIRECTORY_KEY = "logging.log_directory"
+LOG_RETENTION_DAYS_KEY = "logging.log_retention_days"
+SESSION_LOG_BUFFER_LINES_KEY = "logging.session_log_buffer_lines"
 
 
 class Category(BaseModel):
@@ -54,6 +58,7 @@ STATIC_SERVER = Category(name="Static Server", description="Static file server c
 ARTIFACTS = Category(name="Artifacts", description="Settings for artifact providers and preview generation")
 AGENT = Category(name="Agent", description="Agent behavior and system prompt")
 LIBRARIES = Category(name="Libraries", description="Settings for library management and dependency installation")
+LOGGING = Category(name="Logging", description="Where engine logs are kept and how much history is retained")
 
 
 def Field(category: str | Category = "General", **kwargs) -> Any:
@@ -346,6 +351,31 @@ class LibrarySettings(BaseModel):
         return LibraryDependencyInstallBehavior.ALWAYS
 
 
+class LoggingSettings(BaseModel):
+    """Settings for engine log capture, used when reporting a problem."""
+
+    log_to_file: bool = Field(
+        category=LOGGING,
+        default=True,
+        description="Write engine logs to a file as well as to the console. Each engine process writes its own file, rolling over at 10 MB and keeping 5 rollovers, so the total size per process is capped. Turn this off if you only ever need the logs from the session that is running right now.",
+    )
+    log_directory: str = Field(
+        category=LOGGING,
+        default="",
+        description="Absolute path to the directory holding engine log files. Like ffmpeg_directory, this is never interpreted relative to the workspace: logs belong to the machine, not to a workspace, so every workspace and project shares one location. A relative value is ignored with a warning. Empty (the default) means `<XDG_DATA_HOME>/griptape_nodes/logs`.",
+    )
+    log_retention_days: int = Field(
+        category=LOGGING,
+        default=7,
+        description="Delete engine log files that have not been written to for this many days. Checked when the engine starts, and again whenever a logging setting changes. The log file the engine is currently writing is never deleted, however old it is. Set to 0 to keep log files forever.",
+    )
+    session_log_buffer_lines: int = Field(
+        category=LOGGING,
+        default=5000,
+        description="How many of the most recent log lines the engine keeps in memory for the current session, so a problem report includes what just happened without you having to reproduce it. These lines carry whatever log_level allows, so raise log_level to DEBUG before reproducing a problem if you need debug detail in the report. Set to 0 to disable, which means a problem report can only include whatever reached the log files.",
+    )
+
+
 class Settings(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -382,6 +412,10 @@ class Settings(BaseModel):
         category=EXECUTION,
         default=LogLevel.INFO,
         description="Logging verbosity for the engine. One of CRITICAL, ERROR, WARNING, INFO, or DEBUG, from least to most verbose.",
+    )
+    logging: LoggingSettings = Field(
+        category=LOGGING,
+        default_factory=LoggingSettings,
     )
     workflow_execution_mode: WorkflowExecutionMode = Field(
         category=EXECUTION,
