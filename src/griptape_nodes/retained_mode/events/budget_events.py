@@ -66,9 +66,10 @@ class GetAttributionContextResultSuccess(WorkflowNotAlteredMixin, ResultPayloadS
 
     `header_value` is `base64url(utf-8 JSON)` with padding kept. Every dimension sits under a
     single `tags` object -- the Cloud parser reads no other namespace. The decoded payload omits
-    any key the engine could not determine, so an absent key means "unknown" and never "none". Two
-    values are real rather than omissions: `<system-defaults>` in the project chain means no
-    project is open, and `<unsaved>` as the workflow means it has never been saved.
+    any key the engine could not determine, so an absent key means "unknown" and never "none".
+    `<unsaved>` as the workflow is a real value rather than an omission: it means the workflow has
+    never been saved. `<system-defaults>` never travels -- the Cloud reserves that string for its
+    own default and rejects a client copy, so an unprojected call simply omits `project`.
 
     The structured fields are populated from the same encoding pass as `header_value`, so a
     consumer reading them and the Cloud reading the header cannot disagree.

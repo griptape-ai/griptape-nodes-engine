@@ -35,6 +35,7 @@ from griptape_nodes.retained_mode.events.budget_events import (
     GetAttributionContextResultFailure,
     GetAttributionContextResultSuccess,
 )
+from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
@@ -223,13 +224,19 @@ class BudgetManager(EngineScoped):
 
         `ProjectChainEntry.name` is dropped here -- the single place the chain is consumed --
         so no user-authored project label can reach the payload by construction.
+
+        `<system-defaults>` is dropped with it. The Cloud reserves that exact string as its own
+        marker for unattributed spend, so its parser discards a client copy and counts the call
+        as degraded. Working outside a project is ordinary rather than exceptional, so sending it
+        would put a permanent noise floor under the platform's client-health metric for no gain:
+        omitting the key lands the spend in the same default bucket, silently.
         """
         try:
             chain = self.engine.project_manager.get_project_chain()
         except Exception:
             logger.warning("Could not resolve the project chain for budget attribution.", exc_info=True)
             return []
-        return [entry.id for entry in chain]
+        return [entry.id for entry in chain if entry.id != SYSTEM_DEFAULTS_KEY]
 
     def _resolve_workflow_name(self) -> str | None:
         """Resolve the current workflow's registry key, or None when it cannot be determined.

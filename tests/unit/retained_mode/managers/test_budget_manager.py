@@ -140,7 +140,8 @@ class TestAttributionPayloadShape:
         assert _decode(result)["v"] == ATTRIBUTION_SCHEMA_VERSION
         tags = _tags(result)
         assert tags["node_type"] == "GriptapeProxyImage"
-        assert tags["project"] == result.project_chain
+        # No project is selected on a bare engine, so the key is absent rather than empty.
+        assert tags.get("project", []) == result.project_chain
 
     def test_padding_round_trips(self, engine: Engine) -> None:
         """Padding is kept so the Cloud can decode without re-padding."""
@@ -186,12 +187,24 @@ class TestProjectChain:
         mock_engine.project_manager = project_manager
         return BudgetManager(MagicMock(), engine=mock_engine)
 
-    def test_chain_is_system_defaults_when_no_project_selected(self) -> None:
-        """The `<system-defaults>` sentinel passes through verbatim, like any other id."""
+    def test_system_defaults_never_reaches_the_wire(self) -> None:
+        """The Cloud reserves `<system-defaults>` and counts a client copy as degraded."""
         project_manager = ProjectManager(Mock(), Mock(), Mock())
         result = _succeed(self._manager_on(project_manager))
 
-        assert _tags(result)["project"] == [SYSTEM_DEFAULTS_KEY]
+        assert "project" not in _tags(result)
+        assert result.project_chain == []
+        assert SYSTEM_DEFAULTS_KEY not in json.dumps(_decode(result))
+
+    def test_system_defaults_is_dropped_from_a_real_chain(self) -> None:
+        """Filtered wherever it appears, not only when it is the whole chain."""
+        project_manager = ProjectManager(Mock(), Mock(), Mock())
+        _register_project(project_manager, "leaf", name="Shot 020", parent_id=SYSTEM_DEFAULTS_KEY)
+        project_manager._current_project_id = "leaf"
+
+        result = _succeed(self._manager_on(project_manager))
+
+        assert _tags(result)["project"] == ["leaf"]
 
     def test_nested_chain_is_ids_only(self) -> None:
         """Project display names must not reach the payload by any route."""
