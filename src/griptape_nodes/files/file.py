@@ -18,6 +18,7 @@ from griptape_nodes.files.path_utils import (
     resolve_file_path,
     resolve_path_safely,
 )
+from griptape_nodes.retained_mode.engine import current_engine
 from griptape_nodes.retained_mode.events.os_events import (
     ExistingFilePolicy,
     FileIOFailureReason,
@@ -221,7 +222,7 @@ def _resolve_plain_path(path_str: str) -> str:
     if local_path is not None:
         path_str = local_path
 
-    workspace_path = GriptapeNodes.ConfigManager().workspace_path
+    workspace_path = current_engine().config_manager.workspace_path
 
     if is_url(path_str):
         static_server_path = parse_static_server_url(path_str, workspace_path)
