@@ -84,6 +84,10 @@ from griptape_nodes.retained_mode.events.connection_events import (
     ListConnectionsForNodeResultSuccess,
     OutgoingConnection,
 )
+from griptape_nodes.retained_mode.events.context_events import (
+    EnsureWorkflowAndFlowRequest,
+    EnsureWorkflowAndFlowResultSuccess,
+)
 from griptape_nodes.retained_mode.events.event_converter import converter, safe_unstructure
 from griptape_nodes.retained_mode.events.execution_events import (
     CancelExecuteNodeRequest,
@@ -722,10 +726,14 @@ class NodeManager(EngineScoped):
         if parent_flow_name is None:
             # Try to get the current context flow
             if not self.engine.context_manager.has_current_flow():
-                details = (
-                    "Attempted to create Node in the Current Context. Failed because the Current Context was empty."
-                )
-                return CreateNodeResultFailure(result_details=details)
+                # Auto-bootstrap a workflow+flow context so interactive node creation
+                # (e.g. drag-and-drop from the sidebar) works even on a blank canvas.
+                ensure_result = self.engine.handle_request(EnsureWorkflowAndFlowRequest())
+                if not isinstance(ensure_result, EnsureWorkflowAndFlowResultSuccess):
+                    details = (
+                        "Attempted to create Node in the Current Context. Failed because the Current Context was empty."
+                    )
+                    return CreateNodeResultFailure(result_details=details)
             parent_flow = self.engine.context_manager.get_current_flow()
             parent_flow_name = parent_flow.name
 

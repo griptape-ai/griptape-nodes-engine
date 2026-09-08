@@ -5135,7 +5135,7 @@ class WorkflowManager(EngineScoped):
             or len(serialized_flow_commands.serialized_variable_commands) > 0
         )
 
-    def _generate_node_creation_code(  # noqa: C901, PLR0912
+    def _generate_node_creation_code(  # noqa: C901, PLR0912, PLR0915
         self,
         serialized_node_command: SerializedNodeCommands,
         node_index: int,
@@ -5148,6 +5148,7 @@ class WorkflowManager(EngineScoped):
         import_recorder.add_from_import("griptape_nodes.node_library.library_registry", "NodeDeprecationMetadata")
         import_recorder.add_from_import("griptape_nodes.node_library.library_registry", "IconVariant")
         import_recorder.add_from_import("griptape_nodes.retained_mode.events.node_events", "CreateNodeRequest")
+        import_recorder.add_from_import("griptape_nodes.retained_mode.events.node_events", "CreateNodeResultSuccess")
         import_recorder.add_from_import(
             "griptape_nodes.retained_mode.events.parameter_events", "AddParameterToNodeRequest"
         )
@@ -5177,6 +5178,11 @@ class WorkflowManager(EngineScoped):
                 if field_value != field.default:
                     # Skip subflow_name field - we'll handle it separately from metadata
                     if field.name == "subflow_name":
+                        continue
+                    # Skip create_error_proxy_on_failure - it's a runtime error-handling policy,
+                    # not node configuration. Omitting it lets the default (True) apply when loading,
+                    # so a failed node creation gracefully produces an ErrorProxyNode placeholder.
+                    if field.name == "create_error_proxy_on_failure":
                         continue
                     # Special handling for node_names_to_add - these are now UUIDs, convert to variable references
                     if field_value is create_node_request.node_names_to_add and field_value:
@@ -5226,24 +5232,79 @@ class WorkflowManager(EngineScoped):
 
         # Get the actual request class name (CreateNodeRequest)
         request_class_name = type(create_node_request).__name__
-        # Handle the create node command and assign to node name
-        create_node_call_ast = ast.Assign(
-            targets=[ast.Name(id=node_variable_name, ctx=ast.Store(), lineno=1, col_offset=0)],
-            value=ast.Attribute(
-                value=ast.Await(
-                    value=ast.Call(
-                        func=ast.Attribute(
-                            value=ast.Name(id="GriptapeNodes", ctx=ast.Load(), lineno=1, col_offset=0),
-                            attr="ahandle_request",
-                            ctx=ast.Load(),
+        result_var_name = f"_create_result_{node_variable_name}"
+        node_name_attr = "node_name" if request_class_name == "CreateNodeRequest" else "node_group_name"
+
+        # Statement 1: _create_result_nodeN_name = await GriptapeNodes.ahandle_request(CreateNodeRequest(...))
+        result_assign_ast = ast.Assign(
+            targets=[ast.Name(id=result_var_name, ctx=ast.Store(), lineno=1, col_offset=0)],
+            value=ast.Await(
+                value=ast.Call(
+                    func=ast.Attribute(
+                        value=ast.Name(id="GriptapeNodes", ctx=ast.Load(), lineno=1, col_offset=0),
+                        attr="ahandle_request",
+                        ctx=ast.Load(),
+                        lineno=1,
+                        col_offset=0,
+                    ),
+                    args=[
+                        ast.Call(
+                            func=ast.Name(id=request_class_name, ctx=ast.Load(), lineno=1, col_offset=0),
+                            args=[],
+                            keywords=create_node_request_args,
                             lineno=1,
                             col_offset=0,
-                        ),
+                        )
+                    ],
+                    keywords=[],
+                    lineno=1,
+                    col_offset=0,
+                ),
+                lineno=1,
+                col_offset=0,
+            ),
+            lineno=1,
+            col_offset=0,
+        )
+
+        # Statement 2: guard — raise RuntimeError if the request failed
+        check_ast = ast.If(
+            test=ast.UnaryOp(
+                op=ast.Not(),
+                operand=ast.Call(
+                    func=ast.Name(id="isinstance", ctx=ast.Load(), lineno=1, col_offset=0),
+                    args=[
+                        ast.Name(id=result_var_name, ctx=ast.Load(), lineno=1, col_offset=0),
+                        ast.Name(id="CreateNodeResultSuccess", ctx=ast.Load(), lineno=1, col_offset=0),
+                    ],
+                    keywords=[],
+                    lineno=1,
+                    col_offset=0,
+                ),
+                lineno=1,
+                col_offset=0,
+            ),
+            body=[
+                ast.Raise(
+                    exc=ast.Call(
+                        func=ast.Name(id="RuntimeError", ctx=ast.Load(), lineno=1, col_offset=0),
                         args=[
-                            ast.Call(
-                                func=ast.Name(id=request_class_name, ctx=ast.Load(), lineno=1, col_offset=0),
-                                args=[],
-                                keywords=create_node_request_args,
+                            ast.JoinedStr(
+                                values=[
+                                    ast.Constant(value=f"Failed to create node '{create_node_request.node_type}': "),
+                                    ast.FormattedValue(
+                                        value=ast.Attribute(
+                                            value=ast.Name(id=result_var_name, ctx=ast.Load(), lineno=1, col_offset=0),
+                                            attr="result_details",
+                                            ctx=ast.Load(),
+                                            lineno=1,
+                                            col_offset=0,
+                                        ),
+                                        conversion=-1,
+                                        lineno=1,
+                                        col_offset=0,
+                                    ),
+                                ],
                                 lineno=1,
                                 col_offset=0,
                             )
@@ -5252,10 +5313,22 @@ class WorkflowManager(EngineScoped):
                         lineno=1,
                         col_offset=0,
                     ),
+                    cause=None,
                     lineno=1,
                     col_offset=0,
-                ),
-                attr="node_name" if request_class_name == "CreateNodeRequest" else "node_group_name",
+                )
+            ],
+            orelse=[],
+            lineno=1,
+            col_offset=0,
+        )
+
+        # Statement 3: nodeN_name = _create_result_nodeN_name.node_name
+        name_assign_ast = ast.Assign(
+            targets=[ast.Name(id=node_variable_name, ctx=ast.Store(), lineno=1, col_offset=0)],
+            value=ast.Attribute(
+                value=ast.Name(id=result_var_name, ctx=ast.Load(), lineno=1, col_offset=0),
+                attr=node_name_attr,
                 ctx=ast.Load(),
                 lineno=1,
                 col_offset=0,
@@ -5264,7 +5337,9 @@ class WorkflowManager(EngineScoped):
             col_offset=0,
         )
 
-        node_creation_ast.append(create_node_call_ast)
+        node_creation_ast.append(result_assign_ast)
+        node_creation_ast.append(check_ast)
+        node_creation_ast.append(name_assign_ast)
 
         # Only add the 'with' statement if there are element_modification_commands
         if serialized_node_command.element_modification_commands:
@@ -6984,7 +7059,14 @@ class WorkflowManager(EngineScoped):
             return OpenNodeInnerCanvasResultFailure(result_details=details)
 
         existing_name = node.metadata.get(SUBFLOW_NAME_KEY)
+        logger.info(
+            "OpenNodeInnerCanvas: node='%s', existing_name=%r, flow_found=%s",
+            request.node_name,
+            existing_name,
+            _get_subflow_or_none(existing_name) is not None if existing_name else "N/A",
+        )
         if existing_name is not None and _get_subflow_or_none(existing_name) is not None:
+            logger.info("OpenNodeInnerCanvas: returning existing flow '%s'", existing_name)
             return OpenNodeInnerCanvasResultSuccess(
                 child_flow_name=existing_name,
                 created=False,
@@ -7000,7 +7082,21 @@ class WorkflowManager(EngineScoped):
             return OpenNodeInnerCanvasResultFailure(result_details=details)
 
         parent_flow_name = flow_result.flow_name
-        child_flow_name = f"{request.node_name}_subflow"
+        child_flow_name = f"{request.node_name}_inner"
+
+        # If a flow with the canonical name already exists (e.g., restored from a saved workflow
+        # but the node's subflow_name metadata was not persisted), adopt it rather than create a
+        # duplicate that would receive a de-duplicated suffix like "_inner_16".
+        maybe_existing = _get_subflow_or_none(child_flow_name)
+        if maybe_existing is not None:
+            node.metadata[SUBFLOW_NAME_KEY] = child_flow_name
+            logger.info("OpenNodeInnerCanvas: adopted existing flow '%s' for '%s'", child_flow_name, request.node_name)
+            return OpenNodeInnerCanvasResultSuccess(
+                child_flow_name=child_flow_name,
+                created=False,
+                result_details=f"Inner canvas for '{request.node_name}' reconnected to existing flow '{child_flow_name}'.",
+            )
+
         create_result = self.engine.handle_request(
             CreateFlowRequest(
                 parent_flow_name=parent_flow_name,
@@ -7016,6 +7112,12 @@ class WorkflowManager(EngineScoped):
             return OpenNodeInnerCanvasResultFailure(result_details=details)
 
         node.metadata[SUBFLOW_NAME_KEY] = create_result.flow_name
+        logger.info(
+            "OpenNodeInnerCanvas: created new flow '%s' (requested '%s', parent '%s')",
+            create_result.flow_name,
+            child_flow_name,
+            parent_flow_name,
+        )
         return OpenNodeInnerCanvasResultSuccess(
             child_flow_name=create_result.flow_name,
             created=True,
@@ -7242,9 +7344,7 @@ class WorkflowManager(EngineScoped):
                 ext_src_node_obj.get_parameter_by_name(ext_src_param) if ext_src_node_obj is not None else None
             )
             tgt_node_obj = obj_mgr.attempt_get_object_by_name_as_type(tgt_node, BaseNode)
-            tgt_param_obj = (
-                tgt_node_obj.get_parameter_by_name(tgt_param) if tgt_node_obj is not None else None
-            )
+            tgt_param_obj = tgt_node_obj.get_parameter_by_name(tgt_param) if tgt_node_obj is not None else None
 
             output_type = ext_src_param_obj.output_type if ext_src_param_obj is not None else None
             input_types = tgt_param_obj.input_types if tgt_param_obj is not None else None
@@ -7308,9 +7408,7 @@ class WorkflowManager(EngineScoped):
             outgoing_bridge_map.append((src_node, src_param, ext_tgt_node, ext_tgt_param, bridge_name))
 
             src_node_obj = obj_mgr.attempt_get_object_by_name_as_type(src_node, BaseNode)
-            src_param_obj = (
-                src_node_obj.get_parameter_by_name(src_param) if src_node_obj is not None else None
-            )
+            src_param_obj = src_node_obj.get_parameter_by_name(src_param) if src_node_obj is not None else None
             ext_tgt_node_obj = obj_mgr.attempt_get_object_by_name_as_type(ext_tgt_node, BaseNode)
             ext_tgt_param_obj = (
                 ext_tgt_node_obj.get_parameter_by_name(ext_tgt_param) if ext_tgt_node_obj is not None else None
@@ -7428,9 +7526,7 @@ class WorkflowManager(EngineScoped):
             SerializeFlowToCommandsRequest(flow_name=flow_name, include_create_flow_command=True)
         )
         if not isinstance(serialized_result, SerializeFlowToCommandsResultSuccess):
-            details = (
-                f"Attempted to export flow '{flow_name}'. Failed because the flow could not be serialized."
-            )
+            details = f"Attempted to export flow '{flow_name}'. Failed because the flow could not be serialized."
             return ExportFlowAsLibraryNodeResultFailure(result_details=details)
 
         serialized_commands = serialized_result.serialized_flow_commands
@@ -7497,14 +7593,29 @@ class WorkflowManager(EngineScoped):
         library_data.setdefault("name", "Exported Subflows")
         library_data.setdefault("library_schema_version", "0.11.0")
         library_data.setdefault("version", "0.1.0")
-        library_data.setdefault("metadata", {
-            "author": "User",
-            "description": "Subflows exported from the canvas.",
-            "library_version": "0.1.0",
-            "engine_version": "0.1.0",
-            "tags": ["subflow"],
-        })
-        library_data.setdefault("categories", [{"subflows": {"title": "Subflows", "description": "Exported subflow nodes", "color": "border-blue-500", "icon": "Layers"}}])
+        library_data.setdefault(
+            "metadata",
+            {
+                "author": "User",
+                "description": "Subflows exported from the canvas.",
+                "library_version": "0.1.0",
+                "engine_version": "0.1.0",
+                "tags": ["subflow"],
+            },
+        )
+        library_data.setdefault(
+            "categories",
+            [
+                {
+                    "subflows": {
+                        "title": "Subflows",
+                        "description": "Exported subflow nodes",
+                        "color": "border-blue-500",
+                        "icon": "Layers",
+                    }
+                }
+            ],
+        )
         library_data.setdefault("nodes", [])
         workflow_nodes: list = library_data.setdefault("workflow_nodes", [])
 
@@ -7533,27 +7644,35 @@ class WorkflowManager(EngineScoped):
     # Subflow Node: Export as Locked
     # ------------------------------------------------------------------
 
-    async def on_export_subflow_as_locked_request(self, request: ExportSubflowAsLockedRequest) -> ResultPayload:  # noqa: PLR0911
+    async def on_export_subflow_as_locked_request(self, request: ExportSubflowAsLockedRequest) -> ResultPayload:  # noqa: PLR0911, PLR0915
+        logger.info("ExportSubflowAsLocked: starting export for node '%s'", request.node_name)
         node = self.engine.object_manager.attempt_get_object_by_name_as_type(request.node_name, BaseNode)
         if node is None:
-            details = f"Attempted to export '{request.node_name}' as a locked subflow. Failed because the node was not found."
+            details = (
+                f"Attempted to export '{request.node_name}' as a locked subflow. Failed because the node was not found."
+            )
+            logger.warning("ExportSubflowAsLocked: %s", details)
             return ExportSubflowAsLockedResultFailure(result_details=details)
         if not isinstance(node, SubflowNode):
             details = (
                 f"Attempted to export '{request.node_name}' as a locked subflow. "
                 "Failed because the node is not a SubflowNode."
             )
+            logger.warning("ExportSubflowAsLocked: %s", details)
             return ExportSubflowAsLockedResultFailure(result_details=details)
 
         child_flow_name = node.metadata.get(SUBFLOW_NAME_KEY)
+        logger.info("ExportSubflowAsLocked: child_flow_name=%r, metadata keys=%s", child_flow_name, list(node.metadata.keys()))
         if child_flow_name is None or _get_subflow_or_none(child_flow_name) is None:
             details = (
                 f"Attempted to export '{request.node_name}' as a locked subflow. "
                 "Failed because the node has no inner canvas. "
                 "Open the node to build the inner flow first."
             )
+            logger.warning("ExportSubflowAsLocked: %s", details)
             return ExportSubflowAsLockedResultFailure(result_details=details)
 
+        logger.info("ExportSubflowAsLocked: extracting workflow shape for flow '%s'", child_flow_name)
         try:
             shape_dict = self.extract_workflow_shape(workflow_name=request.node_name, flow_name=child_flow_name)
         except ValueError as err:
@@ -7562,15 +7681,19 @@ class WorkflowManager(EngineScoped):
                 f"Failed because the inner canvas has no Start Flow or End Flow nodes: {err}. "
                 "Add Start Flow and End Flow nodes before exporting."
             )
+            logger.warning("ExportSubflowAsLocked: %s", details)
             return ExportSubflowAsLockedResultFailure(result_details=details)
 
         workflow_shape = WorkflowShape(inputs=shape_dict["input"], outputs=shape_dict["output"])
+        logger.info("ExportSubflowAsLocked: serializing flow '%s'", child_flow_name)
         serialized_result = await self.engine.ahandle_request(
             SerializeFlowToCommandsRequest(flow_name=child_flow_name, include_create_flow_command=True)
         )
         if not isinstance(serialized_result, SerializeFlowToCommandsResultSuccess):
             details = f"Attempted to export '{request.node_name}' as a locked subflow. Failed because the inner canvas could not be serialized."
+            logger.warning("ExportSubflowAsLocked: %s", details)
             return ExportSubflowAsLockedResultFailure(result_details=details)
+        logger.info("ExportSubflowAsLocked: serialization succeeded, writing files")
 
         serialized_commands = serialized_result.serialized_flow_commands
         if isinstance(serialized_commands.flow_initialization_command, CreateFlowRequest):
@@ -7619,8 +7742,10 @@ class WorkflowManager(EngineScoped):
             library_json_path=library_json_path,
             node_type_name=node_type_name,
         )
+        logger.info("ExportSubflowAsLocked: files written, registering library at '%s'", library_json_path)
 
         await self.engine.ahandle_request(RegisterLibraryFromFileRequest(file_path=str(library_json_path)))
+        logger.info("ExportSubflowAsLocked: library registered, hot-registering node type '%s'", node_type_name)
         self._hot_register_workflow_node(
             library_name="Exported Subflows",
             node_type_name=node_type_name,
@@ -7731,8 +7856,7 @@ class WorkflowManager(EngineScoped):
         child_flow_name = source_node.metadata.get(SUBFLOW_NAME_KEY)
         if child_flow_name is None or _get_subflow_or_none(child_flow_name) is None:
             return (
-                f"Failed because '{source_node.name}' has no inner canvas. "
-                "Open the node to build the inner flow first."
+                f"Failed because '{source_node.name}' has no inner canvas. Open the node to build the inner flow first."
             )
 
         serialized_result = await self.engine.ahandle_request(
@@ -7813,7 +7937,9 @@ class WorkflowManager(EngineScoped):
         created_flow_name = import_result.created_flow_name
         new_node = self.engine.object_manager.attempt_get_object_by_name_as_type(new_node_name, SubflowNode)
         if new_node is None:
-            return f"Failed because the newly created {new_node_type} '{new_node_name}' could not be found after creation."
+            return (
+                f"Failed because the newly created {new_node_type} '{new_node_name}' could not be found after creation."
+            )
 
         new_node.metadata[SUBFLOW_NAME_KEY] = created_flow_name
         new_node.metadata.pop(IS_LOCKED_KEY, None)
@@ -7841,7 +7967,9 @@ class WorkflowManager(EngineScoped):
     ) -> ResultPayload:
         node = self.engine.object_manager.attempt_get_object_by_name_as_type(request.node_name, BaseNode)
         if node is None:
-            details = f"Attempted to make an editable copy of '{request.node_name}'. Failed because the node was not found."
+            details = (
+                f"Attempted to make an editable copy of '{request.node_name}'. Failed because the node was not found."
+            )
             return MakeEditableCopyOfSubflowNodeResultFailure(result_details=details)
         if not isinstance(node, SubflowNode):
             details = (
@@ -7932,7 +8060,9 @@ class WorkflowManager(EngineScoped):
                 workflow_shape=workflow_shape,
             )
         except Exception as err:
-            details = f"Attempted to publish Live Subflow '{request.node_name}'. Failed during metadata generation: {err}"
+            details = (
+                f"Attempted to publish Live Subflow '{request.node_name}'. Failed during metadata generation: {err}"
+            )
             return PublishLiveSubflowResultFailure(result_details=details)
 
         workflow_metadata.is_live = True
@@ -7946,7 +8076,9 @@ class WorkflowManager(EngineScoped):
                 workflow_metadata=workflow_metadata,
             )
         except Exception as err:
-            details = f"Attempted to publish Live Subflow '{request.node_name}'. Failed during file content generation: {err}"
+            details = (
+                f"Attempted to publish Live Subflow '{request.node_name}'. Failed during file content generation: {err}"
+            )
             return PublishLiveSubflowResultFailure(result_details=details)
 
         library_json_path = destination_folder / "griptape_nodes_library.json"
@@ -8135,9 +8267,7 @@ class WorkflowManager(EngineScoped):
     # Live Subflow Node: Update to latest version
     # ------------------------------------------------------------------
 
-    def on_update_live_subflow_to_latest_request(
-        self, request: UpdateLiveSubflowToLatestRequest
-    ) -> ResultPayload:
+    def on_update_live_subflow_to_latest_request(self, request: UpdateLiveSubflowToLatestRequest) -> ResultPayload:
         node = self.engine.object_manager.attempt_get_object_by_name_as_type(request.node_name, BaseNode)
         if node is None:
             details = f"Attempted to update '{request.node_name}' to the latest version. Failed because the node was not found."
@@ -8185,9 +8315,7 @@ class WorkflowManager(EngineScoped):
     # Live Subflow Node: Lock to specific version
     # ------------------------------------------------------------------
 
-    def on_lock_live_subflow_to_version_request(
-        self, request: LockLiveSubflowToVersionRequest
-    ) -> ResultPayload:
+    def on_lock_live_subflow_to_version_request(self, request: LockLiveSubflowToVersionRequest) -> ResultPayload:
         node = self.engine.object_manager.attempt_get_object_by_name_as_type(request.node_name, BaseNode)
         if node is None:
             details = f"Attempted to lock '{request.node_name}' to version '{request.version}'. Failed because the node was not found."
@@ -8245,8 +8373,7 @@ class WorkflowManager(EngineScoped):
             return MakeLiveSubflowEditableResultFailure(result_details=details)
         if not isinstance(node, LiveSubflowNode):
             details = (
-                f"Attempted to make '{request.node_name}' editable. "
-                "Failed because the node is not a LiveSubflowNode."
+                f"Attempted to make '{request.node_name}' editable. Failed because the node is not a LiveSubflowNode."
             )
             return MakeLiveSubflowEditableResultFailure(result_details=details)
 
@@ -8254,7 +8381,9 @@ class WorkflowManager(EngineScoped):
         if child_flow_name is not None and _get_subflow_or_none(child_flow_name) is not None:
             node.metadata[IS_LOCALLY_OVERRIDDEN_KEY] = True
             node.metadata.pop(IS_LOCKED_KEY, None)
-            details = f"'{request.node_name}' is now editable. Inner canvas '{child_flow_name}' is open for local changes."
+            details = (
+                f"'{request.node_name}' is now editable. Inner canvas '{child_flow_name}' is open for local changes."
+            )
             return MakeLiveSubflowEditableResultSuccess(
                 node_name=request.node_name,
                 child_flow_name=child_flow_name,
@@ -8345,7 +8474,9 @@ class WorkflowManager(EngineScoped):
     ) -> ResultPayload:
         node = self.engine.object_manager.attempt_get_object_by_name_as_type(request.node_name, BaseNode)
         if node is None:
-            details = f"Attempted to create an editable copy of '{request.node_name}'. Failed because the node was not found."
+            details = (
+                f"Attempted to create an editable copy of '{request.node_name}'. Failed because the node was not found."
+            )
             return CreateEditableCopyOfLiveSubflowResultFailure(result_details=details)
         if not isinstance(node, LiveSubflowNode):
             details = (
@@ -8396,9 +8527,7 @@ class WorkflowManager(EngineScoped):
         return re.sub(r"_v\d+(?:_\d+)*$", "", file_stem)
 
     @staticmethod
-    def _find_latest_live_subflow_version(
-        search_dir: Path, base_name: str
-    ) -> tuple[Path | None, str]:
+    def _find_latest_live_subflow_version(search_dir: Path, base_name: str) -> tuple[Path | None, str]:
         """Find the highest-versioned .py file matching {base_name}_vX_Y.py.
 
         Returns (path, version_string) or (None, "") if none found.

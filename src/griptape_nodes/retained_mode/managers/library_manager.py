@@ -3507,10 +3507,17 @@ class LibraryManager(EngineScoped):
                 details = f"Hot reloaded module: {module_name} from {file_path}"
                 logger.debug(details)
             except Exception as e:
-                # Restore the old module in case of failure
+                # Restore the old module in case of failure and keep using it.
+                # This handles the case where the engine runs from a published package
+                # but the bundled library's entry file imports from a dev-only module
+                # (e.g. griptape_nodes.exe_types.subflow_node added on a feature branch).
+                # Raising here would turn all affected nodes into ErrorProxyNodes even
+                # though the previous import still works fine.
                 sys.modules[module_name] = old_module
                 msg = f"Error reloading module {module_name} from {file_path}: {e}"
-                raise ImportError(msg) from e
+                logger.warning("%s — keeping previously loaded version", msg)
+                self._register_stable_module_alias(module_name, stable_namespace, old_module, library_name)
+                return old_module
 
         # Load it for the first time
         else:
@@ -5515,7 +5522,9 @@ class LibraryManager(EngineScoped):
             self._is_initializing = False
 
     async def _run_reload_libraries(self, request: ReloadAllLibrariesRequest) -> ResultPayload:  # noqa: ARG002
-        logger.warning("DEBUG: _run_reload_libraries STARTED — current libraries: %r", list(LibraryRegistry._libraries.keys()))
+        logger.warning(
+            "DEBUG: _run_reload_libraries STARTED — current libraries: %r", list(LibraryRegistry._libraries.keys())
+        )
         # Start with a clean slate.
         clear_all_request = ClearAllObjectStateRequest(i_know_what_im_doing=True)
         clear_all_result = await self.engine.ahandle_request(clear_all_request)
@@ -5580,7 +5589,10 @@ class LibraryManager(EngineScoped):
             details = "Reloaded libraries but reconcile reported problem(s): " + "; ".join(reconcile_failures)
             return ReloadAllLibrariesResultFailure(result_details=details)
 
-        logger.warning("DEBUG: _run_reload_libraries COMPLETE — libraries after reload: %r", list(LibraryRegistry._libraries.keys()))
+        logger.warning(
+            "DEBUG: _run_reload_libraries COMPLETE — libraries after reload: %r",
+            list(LibraryRegistry._libraries.keys()),
+        )
         details = (
             "Successfully reloaded all libraries. All object state was cleared and previous libraries were unloaded."
         )
@@ -6841,7 +6853,7 @@ class LibraryManager(EngineScoped):
             result_details=details,
         )
 
-    async def install_library_dependencies_request(self, request: InstallLibraryDependenciesRequest) -> ResultPayload:  # noqa: PLR0911
+    async def install_library_dependencies_request(self, request: InstallLibraryDependenciesRequest) -> ResultPayload:  # noqa: C901, PLR0911
         """Install a library's dependencies, recovering from a corrupt reused venv.
 
         Advanced library hooks (before_library_nodes_loaded) expect the venv to exist, so the
@@ -6870,7 +6882,17 @@ class LibraryManager(EngineScoped):
             pip_dependencies = library_metadata.dependencies.pip_dependencies or []
             pip_install_flags = library_metadata.dependencies.pip_install_flags or []
 
-        # Always initialize the venv, even if there are no dependencies to install.
+        # Skip venv creation entirely when there are no pip dependencies and no advanced
+        # library (the only caller that needs the venv to exist at hook time). This avoids
+        # a slow `uv venv` subprocess for lightweight libraries such as "Exported Subflows".
+        has_advanced_library = bool(library_data.advanced_library_path)
+        if not pip_dependencies and not has_advanced_library:
+            details = f"Library '{library_name}' has no dependencies to install"
+            logger.info(details)
+            return InstallLibraryDependenciesResultSuccess(
+                library_name=library_name, dependencies_installed=0, result_details=details
+            )
+
         # Advanced library hooks (before_library_nodes_loaded) expect the venv to exist.
         venv_path = self._get_library_venv_path(library_name, library_file_path)
 

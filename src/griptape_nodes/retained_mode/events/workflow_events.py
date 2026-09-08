@@ -1307,7 +1307,7 @@ class OpenNodeInnerCanvasRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class OpenNodeInnerCanvasResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
+class OpenNodeInnerCanvasResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Node inner canvas opened successfully.
 
     Args:

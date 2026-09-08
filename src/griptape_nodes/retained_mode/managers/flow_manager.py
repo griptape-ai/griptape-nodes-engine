@@ -857,6 +857,12 @@ class FlowManager(EngineScoped):
             obj_mgr = self.engine.object_manager
             flow = obj_mgr.attempt_get_object_by_name_as_type(flow_name, ControlFlow)
         if flow is None:
+            all_flows = [k for k, v in self.engine.object_manager._name_to_objects.items() if isinstance(v, ControlFlow)]
+            logger.error(
+                "ListNodesInFlow: flow '%s' not found. Known flows: %s",
+                flow_name,
+                all_flows,
+            )
             details = (
                 f"Attempted to list Nodes in Flow '{flow_name}'. Failed because no Flow with that name could be found."
             )
