@@ -4365,10 +4365,7 @@ class NodeManager(EngineScoped):
             locations.append(f"{count} {kind[:-1] if count == 1 else kind}")
         if not locations:
             return
-        STRICT_MODE.report(
-            rule_id=rule.rule_id,
-            message=rule.render(parameter_name=parameter.name, location="; ".join(locations)),
-        )
+        logger.warning(rule.render(parameter_name=parameter.name, location="; ".join(locations)))
 
     @staticmethod
     def _apply_trait_states(parameter: Parameter, trait_states: list[dict[str, Any]]) -> None:

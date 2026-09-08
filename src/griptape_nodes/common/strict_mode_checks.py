@@ -96,6 +96,9 @@ RULES: dict[str, StrictModeRule] = {
         # for an ergonomics warning.
         worker_escalation=False,
     ),
+    # Rendered and logged directly at save time (NodeManager._report_unsaveable_callbacks),
+    # not reported through a strict-mode scope: serialization opens no scope, so
+    # default_severity and worker_escalation below are inert for this entry.
     "callback-cannot-be-saved": StrictModeRule(
         rule_id="callback-cannot-be-saved",
         default_severity=StrictModeSeverity.WARNING,
