@@ -939,6 +939,15 @@ class EventManager(EngineScoped):
         """Return the currently-registered handler callback for a request type, or None."""
         return self._request_type_to_manager.get(request_type)
 
+    def registered_request_types(self) -> list[type[RequestPayload]]:
+        """Every request type that currently has a handler.
+
+        A worker uses this to route requests made during node execution to the orchestrator
+        by default, rather than maintaining a list of types to forward that silently goes
+        stale whenever a new request type is added.
+        """
+        return list(self._request_type_to_manager.keys())
+
     async def forward_to_orchestrator(
         self,
         request: RP,
