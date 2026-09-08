@@ -3266,8 +3266,8 @@ class Trait(ABC, BaseNodeElement):
 
         Derived from ``__init__``'s signature rather than the dataclass fields, so
         restoring goes back through the real constructor and keeps whatever invariants
-        it enforces. Callable values are omitted: a bound closure cannot be written to
-        a file, and naming it is a separate concern from carrying trait state.
+        it enforces. A parameter declared in ``STATE_EXCLUDE`` may hold a callable; that
+        callback is carried separately, by name, through ``callback_names``.
         """
         state: dict[str, Any] = {}
         for name in self._state_parameter_names():
@@ -3280,14 +3280,13 @@ class Trait(ABC, BaseNodeElement):
                 raise AttributeError(msg)
             value = getattr(self, attribute_name)
             if callable(value):
-                continue
+                msg = (
+                    f"Trait '{type(self).__name__}' takes '{name}' but it holds a callback, not state. "
+                    f"Declare STATE_EXCLUDE = {{'{name}', ...}} so it is carried by name instead of saved as data."
+                )
+                raise TypeError(msg)
             state[name] = value
         return state
-
-    @classmethod
-    def from_state(cls, state: dict[str, Any]) -> Self:
-        """Rebuild a trait from ``to_state`` output by calling the real constructor."""
-        return cls(**state)
 
     def apply_state(self, state: dict[str, Any]) -> None:
         """Overwrite this trait's state in place.
@@ -3299,6 +3298,7 @@ class Trait(ABC, BaseNodeElement):
         """
         for name, value in state.items():
             setattr(self, self.STATE_ALIASES.get(name, name), value)
+        self._recompute_derived_state()
 
     def callback_names(self, owner: BaseNode | None) -> dict[str, str]:
         """Return each attached callback as the name of a method on ``owner``.
@@ -3349,6 +3349,20 @@ class Trait(ABC, BaseNodeElement):
             callback = resolve_callback(method_name, owner, described_as=described_as)
             if callback is not None:
                 setattr(self, attribute_name, callback)
+
+    def _recompute_derived_state(self) -> None:
+        """Rebuild an attribute ``apply_state``'s raw ``setattr`` cannot restore on its own.
+
+        Some traits derive one attribute from another, such as ``Button`` deriving
+        ``on_click_callback`` from ``button_link``. ``apply_state`` only overwrites what was
+        saved, so a changed ``button_link`` would otherwise leave the old handler in place.
+        No-op by default; a trait overrides this where such a derived attribute exists.
+        """
+
+    @classmethod
+    def from_state(cls, state: dict[str, Any]) -> Self:
+        """Rebuild a trait from ``to_state`` output by calling the real constructor."""
+        return cls(**state)
 
     @classmethod
     def _state_parameter_names(cls) -> list[str]:

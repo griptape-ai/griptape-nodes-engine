@@ -2,7 +2,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar, Literal, get_args
 
-from griptape_nodes.exe_types.callback_binding import mark_derived_from_state
+from griptape_nodes.exe_types.callback_binding import is_derived_from_state, mark_derived_from_state
 from griptape_nodes.exe_types.core_types import NodeMessagePayload, NodeMessageResult, Trait
 
 if TYPE_CHECKING:
@@ -187,6 +187,19 @@ class Button(Trait):
 
         # Rebuilt from button_link, which is saved as state, so this handler needs no name.
         return mark_derived_from_state(handler)
+
+    def _recompute_derived_state(self) -> None:
+        """Rebuild ``on_click_callback`` from a changed ``button_link``.
+
+        Only touches the callback when it is itself derived from state: a node-supplied
+        ``on_click`` set by the constructor must survive ``apply_state`` untouched.
+        """
+        if not is_derived_from_state(self.on_click_callback):
+            return
+        if self.button_link is None:
+            self.on_click_callback = None
+            return
+        self.on_click_callback = self._create_button_link_handler(self.button_link)
 
     @classmethod
     def get_trait_keys(cls) -> list[str]:
