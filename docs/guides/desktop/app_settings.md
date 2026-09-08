@@ -153,14 +153,23 @@ launch.
 
 **Update Behavior** controls what happens when an update is found:
 
-| Setting               | What it does                                                                  |
-| --------------------- | ----------------------------------------------------------------------------- |
-| **Auto-Update**       | Downloads and installs updates automatically on startup.                      |
-| **Prompt for Update** | Shows a notification banner when an update is available. This is the default. |
-| **Silence Updates**   | Doesn't check for or notify you about updates.                                |
+| Setting               | What it does                                                                            |
+| --------------------- | --------------------------------------------------------------------------------------- |
+| **Auto-Update**       | Downloads and installs updates automatically on startup.                                |
+| **Prompt for Update** | Shows a notification banner when an update is available. This is the default.           |
+| **Silence Updates**   | Doesn't check on its own or notify you. **Check for Updates** still works when you ask. |
 
 **Show release notes after updates** displays a summary of what changed
 after the app updates itself.
+
+!!! note "Updates are disabled by your organization"
+
+    On a machine your organization manages, this section can be locked:
+    everything but **Show release notes after updates** is disabled and the
+    section says so. An administrator has turned updates off with a policy
+    file on the machine, and new versions arrive the way the rest of your
+    software does. See
+    [Disabling App Updates](../../enterprise/disabling_app_updates.md).
 
 ### Release channels
 
