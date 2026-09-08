@@ -41,6 +41,9 @@ from griptape_nodes.retained_mode.events.base_events import (
     SkipTheLineMixin,
     WorkflowNotAlteredMixin,
 )
+from griptape_nodes.retained_mode.events.budget_events import (
+    GetAttributionContextRequest,
+)
 from griptape_nodes.retained_mode.events.config_events import (
     ResetConfigRequest,
     SetConfigCategoryRequest,
@@ -104,6 +107,11 @@ HandlerCallback = "Callable[[RequestPayload], ResultPayload | Awaitable[ResultPa
 
 FORWARDED_REQUEST_TYPES: frozenset[type[RequestPayload]] = frozenset(
     {
+        # budget_events
+        # A worker has its own engine id and no workflow context, so answering locally would
+        # report the wrong engine and omit the workflow. The orchestrator holds the
+        # authoritative project chain and workflow name.
+        GetAttributionContextRequest,
         # connection_events
         CreateConnectionRequest,
         DeleteConnectionRequest,
