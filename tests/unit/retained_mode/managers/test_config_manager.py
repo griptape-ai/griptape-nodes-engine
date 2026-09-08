@@ -966,11 +966,16 @@ class TestConfigManager:
     platform.system() == "Windows", reason="xdg_base_dirs cannot find XDG_CONFIG_HOME on Windows on GitHub Actions"
 )
 class TestConfigManagerBlankValues:
-    """A blank string resolves to the caller's default instead of reading as a configured value.
+    """A blank string means the layer holding it does not set that setting.
 
     Clearing a setting in the editor writes `""`, and every consumer that distinguishes
-    "configured" from "unset" reads that through get_config_value. Without this, a cleared
+    "configured" from "unset" reads that through the merged config. Without this, a cleared
     `static_server_base_url` is advertised verbatim and media URLs come out relative.
+
+    Dropping the key as the layer loads (rather than coalescing on read) is what keeps the
+    layering intact: the next layer down still gets its say, the built-in defaults layer is
+    never stripped so a setting declared `""` keeps reporting it, and the stored
+    `merged_config` agrees with what `get_config_value` returns.
     """
 
     @pytest.mark.parametrize("blank_value", ["", "   ", "\t\n"])
@@ -988,8 +993,60 @@ class TestConfigManagerBlankValues:
 
                 assert manager.get_config_value("static_server_base_url") is None
 
-    def test_blank_value_resolves_to_the_callers_default(self) -> None:
-        """A caller whose setting is a plain string keeps getting a string, not None."""
+    def test_blank_layer_falls_through_to_the_layer_below(self, isolate_user_config: Path) -> None:
+        """Clearing a setting in one file exposes the next layer's value, not the built-in default."""
+        isolate_user_config.write_text(json.dumps({"static_server_base_url": "http://localhost:9999"}))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_dir = Path(temp_dir)
+            (workspace_dir / "griptape_nodes_config.json").write_text(json.dumps({"static_server_base_url": ""}))
+
+            with patch.dict(os.environ, {}, clear=True):
+                manager = ConfigManager()
+                manager.load_workspace_config(workspace_dir)
+
+                assert manager.get_config_value("static_server_base_url") == "http://localhost:9999"
+
+    def test_blank_is_absent_from_both_the_layer_and_the_merged_config(self) -> None:
+        """The key is dropped as the layer loads, so no consumer of either dict sees the blank.
+
+        `gtn config` prints `merged_config` verbatim, so a read-time fix would leave it
+        disagreeing with a keyed read.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_dir = Path(temp_dir)
+            (workspace_dir / "griptape_nodes_config.json").write_text(json.dumps({"static_server_base_url": ""}))
+
+            with patch.dict(os.environ, {}, clear=True):
+                manager = ConfigManager()
+                manager.load_workspace_config(workspace_dir)
+
+                assert "static_server_base_url" not in manager.workspace_config
+                assert manager.merged_config["static_server_base_url"] is None
+
+    def test_blank_keeps_a_non_blank_declared_default(self) -> None:
+        """A setting with a non-blank declared default keeps it, read with no `default=` argument.
+
+        The read sites that path-join or `.upper()` this class of setting pass no default, so a
+        blank must not reach them as None. `SyncManager` path-joins `synced_workflows_directory`
+        in its constructor, which runs during `Engine.__init__`.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_dir = Path(temp_dir)
+            (workspace_dir / "griptape_nodes_config.json").write_text(json.dumps({"synced_workflows_directory": ""}))
+
+            with patch.dict(os.environ, {}, clear=True):
+                manager = ConfigManager()
+                manager.load_workspace_config(workspace_dir)
+
+                assert manager.get_config_value("synced_workflows_directory") == "synced_workflows"
+
+    def test_declared_blank_default_is_still_reported(self) -> None:
+        """A setting whose own default is blank reports that blank rather than None.
+
+        `ffmpeg_directory` ships `default=""`, so the defaults layer must not be stripped or a
+        fresh install would report the setting as missing.
+        """
         with tempfile.TemporaryDirectory() as temp_dir:
             workspace_dir = Path(temp_dir)
             (workspace_dir / "griptape_nodes_config.json").write_text(json.dumps({"ffmpeg_directory": ""}))
@@ -998,10 +1055,10 @@ class TestConfigManagerBlankValues:
                 manager = ConfigManager()
                 manager.load_workspace_config(workspace_dir)
 
-                assert manager.get_config_value("ffmpeg_directory", default="") == ""
+                assert manager.get_config_value("ffmpeg_directory") == ""
 
-    def test_blank_nested_setting_reads_as_unset(self) -> None:
-        """Dot-notation reads coalesce too: the rule is about the value, not the key's depth."""
+    def test_blank_nested_setting_is_dropped(self) -> None:
+        """Nested keys drop too: the rule is about the value, not the key's depth."""
         with tempfile.TemporaryDirectory() as temp_dir:
             workspace_dir = Path(temp_dir)
             (workspace_dir / "griptape_nodes_config.json").write_text(json.dumps({"agent": {"system_prompt": "  "}}))
@@ -1010,10 +1067,23 @@ class TestConfigManagerBlankValues:
                 manager = ConfigManager()
                 manager.load_workspace_config(workspace_dir)
 
-                assert manager.get_config_value("agent.system_prompt") is None
+                assert manager.get_config_value("agent.system_prompt") == ""
+
+    def test_blank_undeclared_key_falls_back_to_caller_default(self) -> None:
+        """A key the Settings model never declares has no default below it but the caller's."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_dir = Path(temp_dir)
+            (workspace_dir / "griptape_nodes_config.json").write_text(json.dumps({"some_library": {"api_base": ""}}))
+
+            with patch.dict(os.environ, {}, clear=True):
+                manager = ConfigManager()
+                manager.load_workspace_config(workspace_dir)
+
+                assert manager.get_config_value("some_library.api_base") is None
+                assert manager.get_config_value("some_library.api_base", default="fallback") == "fallback"
 
     def test_configured_value_is_untouched(self) -> None:
-        """Only blank values coalesce; a real value passes through unchanged, whitespace included."""
+        """Only blank values drop; a real value passes through unchanged, surrounding space included."""
         with tempfile.TemporaryDirectory() as temp_dir:
             workspace_dir = Path(temp_dir)
             (workspace_dir / "griptape_nodes_config.json").write_text(
@@ -1027,12 +1097,23 @@ class TestConfigManagerBlankValues:
                 assert manager.get_config_value("static_server_base_url") == " https://my-tunnel.ngrok.io "
 
     def test_blank_env_var_reads_as_unset(self) -> None:
-        """An exported-but-empty env var is the other way a setting arrives blank."""
+        """An exported-but-empty variable is how the env layer holds a blank."""
         with patch.dict(os.environ, {"GTN_CONFIG_STATIC_SERVER_BASE_URL": ""}, clear=True):
             manager = ConfigManager()
             manager.load_configs()
 
+            assert "static_server_base_url" not in manager.env_config
             assert manager.get_config_value("static_server_base_url") is None
+
+    def test_blank_env_var_falls_through_to_a_config_file(self, isolate_user_config: Path) -> None:
+        """The env layer drops a blank like any other, so the file below it still applies."""
+        isolate_user_config.write_text(json.dumps({"static_server_base_url": "http://localhost:9999"}))
+
+        with patch.dict(os.environ, {"GTN_CONFIG_STATIC_SERVER_BASE_URL": ""}, clear=True):
+            manager = ConfigManager()
+            manager.load_configs()
+
+            assert manager.get_config_value("static_server_base_url") == "http://localhost:9999"
 
 
 @pytest.mark.skipif(

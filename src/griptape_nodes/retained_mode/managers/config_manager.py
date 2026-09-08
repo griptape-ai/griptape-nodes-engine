@@ -59,7 +59,7 @@ from griptape_nodes.retained_mode.managers.settings import (
     WORKFLOWS_TO_REGISTER_KEY,
     Settings,
 )
-from griptape_nodes.utils.dict_utils import get_dot_value, merge_dicts, set_dot_value
+from griptape_nodes.utils.dict_utils import drop_blank_values, get_dot_value, merge_dicts, set_dot_value
 from griptape_nodes.utils.file_utils import DEFAULT_MAX_SEARCH_DEPTH
 
 logger = logging.getLogger("griptape_nodes")
@@ -415,7 +415,9 @@ class ConfigManager(EngineScoped):
             set_dot_value(env_config, override.config_key, override.value)
             logger.debug("Loaded config from env var: %s -> %s", override.env_var_name, override.config_key)
 
-        return env_config
+        # An exported-but-empty variable is the env layer's way of holding a blank, and it reads
+        # as absent from this layer for the same reason a blank in a config file does.
+        return drop_blank_values(env_config)
 
     def _collect_env_var_overrides(self) -> list[EnvVarOverride]:
         """Resolve the GTN_CONFIG_ variables to apply, reporting each one ignored along the way.
@@ -536,15 +538,25 @@ class ConfigManager(EngineScoped):
         logger.warning("Ignoring environment variable %s: %s.", env_var_name, reason)
 
     def _load_config_from_file(self, path: Path, label: str) -> dict:
-        """Read and parse a JSON config file. Returns empty dict if missing or unparsable."""
+        """Read and parse a JSON config file. Returns empty dict if missing or unparsable.
+
+        Blank-string entries are dropped, so a setting cleared in this file reads as absent from
+        this layer and the next layer down (or the built-in default) supplies the value.
+        """
         if not path.exists():
             logger.debug("No %s config file loaded", label)
             return {}
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            loaded = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
             logger.error("Error parsing %s config file: %s", label, e)
             return {}
+
+        if not isinstance(loaded, dict):
+            logger.error("Error parsing %s config file: expected an object, got %s", label, type(loaded).__name__)
+            return {}
+
+        return drop_blank_values(loaded)
 
     def load_configs(self) -> None:
         """Load and merge configs from all sources in priority order.
@@ -796,15 +808,12 @@ class ConfigManager(EngineScoped):
 
         If `should_load_env_var_if_detected` is True (default), and the value starts with a $, it will be pulled from the environment variables.
 
-        A blank or whitespace-only string is treated as if the key were absent, so it resolves to
-        `default` rather than being handed back as a configured value.
-
         Args:
             key: The configuration key to get. Can use dot notation for nested keys (e.g., 'category.subcategory.key').
                  If the key refers to a category (dictionary), returns the entire category.
             should_load_env_var_if_detected: If True, and the value starts with a $, it will be pulled from the environment variables.
             config_source: The source of the configuration to use. Can be 'user_config', 'project_config', 'default_config', or 'merged_config'.
-            default: The default value to return if the key is not found, or holds a blank string.
+            default: The default value to return if the key is not found in the configuration.
             cast_type: Optional type to coerce the value to (bool, int, float, or str). Useful for environment
                        variables which are always strings (e.g., "false" -> False when cast_type=bool).
 
@@ -820,12 +829,6 @@ class ConfigManager(EngineScoped):
         }
         config = config_source_map.get(config_source, self.merged_config)
         value = get_dot_value(config, key, default)
-
-        # A blank string carries no configuration, so it reads as an absent key: a cleared
-        # setting behaves the same as one that was never set, and each caller's own default
-        # decides what that means.
-        if isinstance(value, str) and not value.strip():
-            value = default
 
         if value is None:
             msg = f"Config key '{key}' not found in config file."
