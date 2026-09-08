@@ -42,9 +42,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("griptape_nodes")
 
-# The Cloud truncates the chain at this depth anyway; matching it client-side keeps both ends
-# in agreement.
-_MAX_PROJECT_CHAIN_ENTRIES = 10
+# Matches the Cloud parser's MAX_CHAIN_LENGTH (griptape-cloud#2225). Truncating lower would
+# not be conservative: the parser flags a truncated chain as mangled because budget paths are
+# root-anchored, so dropping ancestors client-side costs matches the Cloud would have made.
+_MAX_PROJECT_CHAIN_ENTRIES = 32
 
 # base64 inflates 4:3, so 4096 decoded bytes encode to at most 5464 -- inside the 5.5 KB raw
 # ceiling, itself well under nginx's 8 KB default.
@@ -77,22 +78,27 @@ class _AttributionEncoding(NamedTuple):
 def _build_attribution_payload(facts: _AttributionFacts) -> dict[str, Any]:
     """Build the decoded payload, omitting every key the engine could not determine.
 
-    `tags` is omitted entirely on an empty chain: an empty list would assert "belongs to zero
-    projects", a claim we cannot make.
+    Every dimension lives under `tags`; the Cloud parser reads nothing else, and there is no
+    second namespace beside it (griptape-cloud#2225). `tags` itself is omitted when the engine
+    could determine nothing, rather than sent empty.
     """
-    payload: dict[str, Any] = {"v": ATTRIBUTION_SCHEMA_VERSION}
+    tags: dict[str, Any] = {}
     if facts.project_chain:
-        payload["tags"] = {"project": list(facts.project_chain)}
+        tags["project"] = list(facts.project_chain)
     if facts.workflow_name is not None:
-        payload["workflow"] = facts.workflow_name
+        tags["workflow"] = facts.workflow_name
     if facts.node_type is not None:
-        payload["node_type"] = facts.node_type
+        tags["node_type"] = facts.node_type
     if facts.engine_id is not None:
-        payload["engine_id"] = facts.engine_id
+        tags["engine_id"] = facts.engine_id
     if facts.orchestrator_engine_id is not None:
-        payload["orchestrator_engine_id"] = facts.orchestrator_engine_id
+        tags["orchestrator_engine_id"] = facts.orchestrator_engine_id
     if facts.session_id is not None:
-        payload["session_id"] = facts.session_id
+        tags["session_id"] = facts.session_id
+
+    payload: dict[str, Any] = {"v": ATTRIBUTION_SCHEMA_VERSION}
+    if tags:
+        payload["tags"] = tags
     return payload
 
 

@@ -64,8 +64,9 @@ class GetAttributionContextRequest(RequestPayload):
 class GetAttributionContextResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """An attribution header value is available; attach it to the outbound request.
 
-    `header_value` is `base64url(utf-8 JSON)` with padding kept. The decoded payload omits any
-    key the engine could not determine, so an absent key means "unknown" and never "none". Two
+    `header_value` is `base64url(utf-8 JSON)` with padding kept. Every dimension sits under a
+    single `tags` object -- the Cloud parser reads no other namespace. The decoded payload omits
+    any key the engine could not determine, so an absent key means "unknown" and never "none". Two
     values are real rather than omissions: `<system-defaults>` in the project chain means no
     project is open, and `<unsaved>` as the workflow means it has never been saved.
 

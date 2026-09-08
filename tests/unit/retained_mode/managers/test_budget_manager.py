@@ -36,11 +36,11 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
 
 # The complete set of keys v1 is allowed to put on the wire. A new field must consciously
-# update this list, which is the point: `node_id` is absent by decision, and `BaseNode.name`
+# update these, which is the point: `node_id` is absent by decision, and `BaseNode.name`
 # must never appear under any key.
-ALLOWED_PAYLOAD_KEYS = {
-    "v",
-    "tags",
+ALLOWED_ENVELOPE_KEYS = {"v", "tags"}
+ALLOWED_TAG_KEYS = {
+    "project",
     "workflow",
     "node_type",
     "engine_id",
@@ -52,6 +52,11 @@ ALLOWED_PAYLOAD_KEYS = {
 def _decode(result: GetAttributionContextResultSuccess) -> dict[str, Any]:
     """Decode a Success payload's header value back into the dict the Cloud will read."""
     return json.loads(base64.urlsafe_b64decode(result.header_value))
+
+
+def _tags(result: GetAttributionContextResultSuccess) -> dict[str, Any]:
+    """The `tags` object the Cloud reads every dimension out of, or {} when none was sent."""
+    return _decode(result).get("tags", {})
 
 
 def _dispatch(manager: BudgetManager, **kwargs: Any) -> ResultPayload:
@@ -132,10 +137,10 @@ class TestAttributionPayloadShape:
         result = engine.handle_request(GetAttributionContextRequest(node_type="GriptapeProxyImage"))
         assert isinstance(result, GetAttributionContextResultSuccess)
 
-        decoded = _decode(result)
-        assert decoded["v"] == ATTRIBUTION_SCHEMA_VERSION
-        assert decoded["node_type"] == "GriptapeProxyImage"
-        assert decoded["tags"]["project"] == result.project_chain
+        assert _decode(result)["v"] == ATTRIBUTION_SCHEMA_VERSION
+        tags = _tags(result)
+        assert tags["node_type"] == "GriptapeProxyImage"
+        assert tags["project"] == result.project_chain
 
     def test_padding_round_trips(self, engine: Engine) -> None:
         """Padding is kept so the Cloud can decode without re-padding."""
@@ -152,8 +157,9 @@ class TestAttributionPayloadShape:
         assert isinstance(result, GetAttributionContextResultSuccess)
 
         decoded = _decode(result)
-        assert set(decoded) <= ALLOWED_PAYLOAD_KEYS
-        assert "node_id" not in decoded
+        assert set(decoded) <= ALLOWED_ENVELOPE_KEYS
+        assert set(decoded["tags"]) <= ALLOWED_TAG_KEYS
+        assert "node_id" not in decoded["tags"]
 
     def test_structured_fields_agree_with_the_header(self, budget_manager: BudgetManager) -> None:
         """A consumer reading the result must see exactly what the header encodes."""
@@ -164,12 +170,12 @@ class TestAttributionPayloadShape:
         mock_engine.session_manager.active_session_id = "sess-1"
 
         result = _succeed(budget_manager, node_type="NodeT")
-        decoded = _decode(result)
+        tags = _tags(result)
 
-        assert decoded.get("workflow") == result.workflow_name
-        assert decoded["node_type"] == result.node_type
-        assert decoded["engine_id"] == result.engine_id
-        assert decoded["session_id"] == result.session_id
+        assert tags.get("workflow") == result.workflow_name
+        assert tags["node_type"] == result.node_type
+        assert tags["engine_id"] == result.engine_id
+        assert tags["session_id"] == result.session_id
 
 
 class TestProjectChain:
@@ -185,7 +191,7 @@ class TestProjectChain:
         project_manager = ProjectManager(Mock(), Mock(), Mock())
         result = _succeed(self._manager_on(project_manager))
 
-        assert _decode(result)["tags"]["project"] == [SYSTEM_DEFAULTS_KEY]
+        assert _tags(result)["project"] == [SYSTEM_DEFAULTS_KEY]
 
     def test_nested_chain_is_ids_only(self) -> None:
         """Project display names must not reach the payload by any route."""
@@ -204,10 +210,10 @@ class TestProjectChain:
             assert name not in serialized
             assert name not in result.header_value
 
-    def test_chain_deeper_than_ten_truncates_from_the_leaf(self) -> None:
-        """v1 caps the chain at 10 entries, keeping the leaf end, and says that it did."""
+    def test_chain_deeper_than_the_cap_truncates_from_the_leaf(self) -> None:
+        """The chain is capped at the Cloud's own MAX_CHAIN_LENGTH, keeping the leaf end."""
         project_manager = ProjectManager(Mock(), Mock(), Mock())
-        ids = [f"p{index:02d}" for index in range(15)]
+        ids = [f"p{index:02d}" for index in range(40)]
         # ids[0] is the leaf; each entry's parent is the next one along.
         for index, project_id in enumerate(ids):
             parent = ids[index + 1] if index + 1 < len(ids) else None
@@ -216,8 +222,8 @@ class TestProjectChain:
 
         result = _succeed(self._manager_on(project_manager))
 
-        assert _decode(result)["tags"]["project"] == ids[:10]
-        assert result.project_chain == ids[:10]
+        assert _tags(result)["project"] == ids[:32]
+        assert result.project_chain == ids[:32]
         assert result.chain_truncated is True
 
     def test_unregistered_parent_id_is_still_surfaced(self) -> None:
@@ -228,7 +234,7 @@ class TestProjectChain:
 
         result = _succeed(self._manager_on(project_manager))
 
-        assert _decode(result)["tags"]["project"] == ["shot-6", "swx"]
+        assert _tags(result)["project"] == ["shot-6", "swx"]
 
     def test_second_dispatch_reflects_a_project_switch(self) -> None:
         """The chain is read per invocation, never cached at workflow open."""
@@ -242,14 +248,17 @@ class TestProjectChain:
         project_manager._current_project_id = "after"
         second = _succeed(manager)
 
-        assert _decode(first)["tags"]["project"] == ["before"]
-        assert _decode(second)["tags"]["project"] == ["after"]
+        assert _tags(first)["project"] == ["before"]
+        assert _tags(second)["project"] == ["after"]
 
-    def test_empty_chain_omits_tags_entirely(self) -> None:
+    def test_empty_chain_omits_the_project_key(self) -> None:
         """`[]` would assert 'belongs to zero projects', which is a claim we cannot make."""
         manager = BudgetManager(MagicMock(), engine=_mock_engine())
+        result = _succeed(manager)
 
-        assert "tags" not in _decode(_succeed(manager))
+        assert "project" not in _tags(result)
+        # The other dimensions still ship; only the chain is unknown.
+        assert "engine_id" in _tags(result)
 
 
 class TestWorkflowName:
@@ -264,7 +273,7 @@ class TestWorkflowName:
             assert isinstance(result, GetAttributionContextResultSuccess)
 
             decoded = _decode(result)
-            assert decoded["workflow"] == UNSAVED_WORKFLOW_SENTINEL
+            assert decoded["tags"]["workflow"] == UNSAVED_WORKFLOW_SENTINEL
             assert result.workflow_name == UNSAVED_WORKFLOW_SENTINEL
             # The uuid must not leak by any other route, encoded or decoded.
             assert "unsaved:" not in json.dumps(decoded)
@@ -280,9 +289,9 @@ class TestWorkflowName:
             result = engine.handle_request(GetAttributionContextRequest())
             assert isinstance(result, GetAttributionContextResultSuccess)
 
-            decoded = _decode(result)
-            assert decoded["workflow"] == "shots/sh020/lighting"
-            assert not decoded["workflow"].startswith("unsaved:")
+            workflow = _tags(result)["workflow"]
+            assert workflow == "shots/sh020/lighting"
+            assert not workflow.startswith("unsaved:")
         finally:
             engine.context_manager.pop_workflow()
 
@@ -293,7 +302,7 @@ class TestWorkflowName:
         result = engine.handle_request(GetAttributionContextRequest())
         assert isinstance(result, GetAttributionContextResultSuccess)
 
-        assert "workflow" not in _decode(result)
+        assert "workflow" not in _tags(result)
         assert result.workflow_name is None
 
 
@@ -317,7 +326,7 @@ class TestOrchestratorEngineId:
 
         result = _succeed(budget_manager)
 
-        assert _decode(result)["orchestrator_engine_id"] == "eng-orch"
+        assert _tags(result)["orchestrator_engine_id"] == "eng-orch"
         assert result.orchestrator_engine_id == "eng-orch"
 
     def test_orchestrator_engine_id_absent_on_the_orchestrator(
@@ -327,7 +336,7 @@ class TestOrchestratorEngineId:
 
         result = _succeed(budget_manager)
 
-        assert "orchestrator_engine_id" not in _decode(result)
+        assert "orchestrator_engine_id" not in _tags(result)
         assert result.orchestrator_engine_id is None
 
 
@@ -344,7 +353,7 @@ class TestDegradation:
     @pytest.mark.parametrize(
         ("break_field", "absent_key"),
         [
-            ("project_chain", "tags"),
+            ("project_chain", "project"),
             ("workflow", "workflow"),
             ("engine_id", "engine_id"),
             ("session_id", "session_id"),
@@ -370,7 +379,7 @@ class TestDegradation:
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
             result = _succeed(manager)
 
-        assert absent_key not in _decode(result)
+        assert absent_key not in _tags(result)
         assert any(record.levelno == logging.WARNING for record in caplog.records)
 
     def test_no_workflow_context_is_not_an_error(self) -> None:
@@ -380,7 +389,7 @@ class TestDegradation:
 
         result = _succeed(manager)
 
-        assert "workflow" not in _decode(result)
+        assert "workflow" not in _tags(result)
 
 
 class TestSizeCap:
@@ -403,10 +412,10 @@ class TestSizeCap:
         ):
             result = _succeed(manager, node_type="GriptapeProxyImage")
 
-        decoded = _decode(result)
-        assert decoded["tags"]["project"] == ["leaf"]
-        assert "workflow" not in decoded
-        assert "node_type" not in decoded
+        tags = _tags(result)
+        assert tags["project"] == ["leaf"]
+        assert "workflow" not in tags
+        assert "node_type" not in tags
         # The structured fields have to agree with the reduced header, not the pre-encode values.
         assert result.workflow_name is None
         assert result.node_type is None
