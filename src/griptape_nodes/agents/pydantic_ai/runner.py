@@ -258,16 +258,31 @@ class PydanticAgentRunner:
             return []
         return [capability]
 
-    def _load_skills(self, skills_dir: Path, include: list[str] | None = None) -> SkillsCapability | None:
+    def _load_skills(
+        self,
+        skills_dir: Path,
+        include: list[str] | None = None,
+        *,
+        index_resources: bool = True,
+    ) -> SkillsCapability | None:
         """Build a capability over ``skills_dir``, or ``None`` when the loader rejects a skill.
 
         The loader validates every selected skill while constructing and raises on the
         first one it rejects, so this succeeds only when all of them load. ``ValueError``
         is a frontmatter report and ``OSError`` an unreadable ``SKILL.md``; both cost
         skills rather than the run.
+
+        ``index_resources=False`` skips indexing bundled files, which a probe does not
+        need and which is what makes probing expensive.
         """
+        exclude_resources = None if index_resources else ["*"]
         try:
-            return SkillsCapability(directories=[skills_dir], scripts=False, include=include)
+            return SkillsCapability(
+                directories=[skills_dir],
+                scripts=False,
+                include=include,
+                exclude_resources=exclude_resources,
+            )
         except (ValueError, OSError) as e:
             logger.warning(
                 "Attempted to load skills %s from %s. Failed because of: %s",
@@ -284,6 +299,10 @@ class PydanticAgentRunner:
         first: ``include`` filters before the loader parses anything, which pins a
         rejection to the skill that caused it and keeps the others. Returns ``None`` when
         nothing survives.
+
+        Probing costs a construction per skill, and every construction indexes the whole
+        library's bundled files, so probes skip that indexing: a probe only has to answer
+        whether the frontmatter parses, and the survivors are indexed by the build below.
         """
         try:
             candidates = sorted(entry.name for entry in skills_dir.iterdir() if (entry / "SKILL.md").is_file())
@@ -291,7 +310,11 @@ class PydanticAgentRunner:
             logger.warning("Attempted to list the skills in %s. Failed because of: %s", skills_dir, e)
             return None
 
-        usable = [name for name in candidates if self._load_skills(skills_dir, include=[name]) is not None]
+        usable = [
+            name
+            for name in candidates
+            if self._load_skills(skills_dir, include=[name], index_resources=False) is not None
+        ]
         if not usable:
             return None
         return self._load_skills(skills_dir, include=usable)

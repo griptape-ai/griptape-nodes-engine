@@ -89,7 +89,9 @@ def test_excludes_script_tool(workspace: Path, tmp_path: Path) -> None:
 
 def test_broken_skill_costs_only_itself(workspace: Path, tmp_path: Path) -> None:
     """A `SKILL.md` the loader rejects is skipped; the valid skills beside it still load."""
-    _write_skill(workspace, "good-skill")
+    skill_dir = _write_skill(workspace, "good-skill")
+    (skill_dir / "references").mkdir()
+    (skill_dir / "references/notes.md").write_text("Reference material.")
     broken = workspace / ".agents/skills/broken-skill"
     broken.mkdir(parents=True)
     (broken / "SKILL.md").write_text("no frontmatter at all\n")
@@ -99,6 +101,8 @@ def test_broken_skill_costs_only_itself(workspace: Path, tmp_path: Path) -> None
 
     assert len(capabilities) == 1
     assert capabilities[0].skill_names == ["good-skill"]
+    # Probes skip bundled-file indexing; the surviving skill's files must not skip it too.
+    assert [resource.name for resource in capabilities[0].packages["good-skill"].resources] == ["references/notes.md"]
 
 
 def test_unreadable_skill_costs_skills_not_the_run(workspace: Path, tmp_path: Path) -> None:
