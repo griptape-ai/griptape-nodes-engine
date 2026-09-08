@@ -2,7 +2,7 @@
 
 Skill discovery and progressive disclosure are owned by `pydantic-ai-skills`;
 these tests cover only the runner's contract: when a capability is built, what
-it discovers, and which tools it exposes.
+it discovers, which tools it exposes, and what a broken skill costs.
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import pytest
+from pydantic_ai.toolsets import FunctionToolset
 
 from griptape_nodes.agents.pydantic_ai.runner import PydanticAgentRunner
 from griptape_nodes.drivers.thread_storage.local_thread_storage_driver import LocalThreadStorageDriver
@@ -30,11 +31,12 @@ def _runner(workspace: Path, threads_dir: Path, *, auto_load_skills: bool = True
     )
 
 
-def _write_skill(workspace: Path, name: str, body: str = "Guidance for the task.") -> None:
+def _write_skill(workspace: Path, name: str, body: str = "Guidance for the task.") -> Path:
     """Create a minimal valid `.agents/skills/<name>/SKILL.md` under `workspace`."""
     skill_dir = workspace / ".agents/skills" / name
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text(f"---\nname: {name}\ndescription: {name} description\n---\n\n{body}")
+    return skill_dir
 
 
 @pytest.fixture
@@ -58,15 +60,48 @@ def test_no_capability_when_disabled(workspace: Path, tmp_path: Path) -> None:
     assert runner._build_skills_capabilities() == []
 
 
-def test_discovers_skill_and_excludes_script_tool(workspace: Path, tmp_path: Path) -> None:
-    """A present skill is discovered; `run_skill_script` is excluded from the tools."""
+def test_discovers_skill(workspace: Path, tmp_path: Path) -> None:
+    """A present skill is discovered and exposed to the model by name."""
     _write_skill(workspace, "demo-skill")
     runner = _runner(workspace, tmp_path / "threads")
 
     capabilities = runner._build_skills_capabilities()
     assert len(capabilities) == 1
+    assert capabilities[0].skill_names == ["demo-skill"]
 
-    toolset = capabilities[0].toolset
-    assert "demo-skill" in toolset.skills
+
+def test_excludes_script_tool(workspace: Path, tmp_path: Path) -> None:
+    """A skill shipping both kinds of files gets the resource tool but not the script tool."""
+    skill_dir = _write_skill(workspace, "demo-skill")
+    (skill_dir / "references").mkdir()
+    (skill_dir / "references/notes.md").write_text("Reference material.")
+    (skill_dir / "scripts").mkdir()
+    (skill_dir / "scripts/go.py").write_text("print('hi')\n")
+    runner = _runner(workspace, tmp_path / "threads")
+
+    toolset = runner._build_skills_capabilities()[0].get_toolset()
+
+    assert isinstance(toolset, FunctionToolset)
+    assert "read_skill_resource" in toolset.tools
     assert "run_skill_script" not in toolset.tools
-    assert {"list_skills", "load_skill"} <= set(toolset.tools)
+
+
+def test_broken_skill_costs_skills_not_the_run(workspace: Path, tmp_path: Path) -> None:
+    """A `SKILL.md` the loader rejects yields no capability rather than raising."""
+    broken = workspace / ".agents/skills/broken-skill"
+    broken.mkdir(parents=True)
+    (broken / "SKILL.md").write_text("no frontmatter at all\n")
+    runner = _runner(workspace, tmp_path / "threads")
+
+    assert runner._build_skills_capabilities() == []
+
+
+def test_rebuilds_snapshot_per_call(workspace: Path, tmp_path: Path) -> None:
+    """Discovery is a snapshot, so a skill added after the first build still lands."""
+    _write_skill(workspace, "first-skill")
+    runner = _runner(workspace, tmp_path / "threads")
+    assert runner._build_skills_capabilities()[0].skill_names == ["first-skill"]
+
+    _write_skill(workspace, "second-skill")
+
+    assert runner._build_skills_capabilities()[0].skill_names == ["first-skill", "second-skill"]
