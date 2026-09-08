@@ -176,9 +176,9 @@ def _print_config_layers() -> None:
             )
             if layer.parse_error:
                 console.print(f"    [red]parse error: {layer.parse_error}[/red]")
-            if layer.layer == "env" and layer.values:
-                for key, value in layer.values.items():
-                    console.print(f"    GTN_CONFIG_{key.upper()} = {value}")
+            if layer.env_vars:
+                for env_var_name, raw_value in layer.env_vars.items():
+                    console.print(f"    {env_var_name} = {raw_value}")
             if layer.layer == "runtime" and layer.values:
                 for key, value in layer.values.items():
                     console.print(f"    {key} = {value}  [dim](pinned by the active project)[/dim]")

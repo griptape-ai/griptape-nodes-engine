@@ -1809,6 +1809,22 @@ class TestConfigProvenance:
         assert source.env_var == "GTN_CONFIG_LOG_LEVEL"
         assert source.path is None
 
+    def test_value_source_names_a_nested_env_var_as_it_is_spelled(self) -> None:
+        """A nested key names the `__` variable that set it, not a `_`-joined name nobody exported.
+
+        The name is the actionable half of the report: the settings UI shows it as "unset or update
+        this variable", so a reconstructed name sends the user after a variable that does not exist
+        and, if they set it, a key the engine refuses as unknown.
+        """
+        with patch.dict(os.environ, {"GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S": "30"}, clear=True):
+            manager = ConfigManager()
+            source = manager.value_source("worker.heartbeat_timeout_s")
+            category_source = manager.category_sources("worker")["worker.heartbeat_timeout_s"]
+
+        assert source.layer == "env"
+        assert source.env_var == "GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S"
+        assert category_source.env_var == "GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S"
+
     def test_value_source_runtime_pin_wins_over_config_files(self, tmp_path: Path, isolate_user_config: Path) -> None:
         """A project's workspace pin owns `workspace_directory`, and no file holds it.
 
@@ -2000,6 +2016,18 @@ class TestConfigProvenance:
         assert sources[LIBRARIES_TO_REGISTER_KEY].layer == "project"
         assert not any(k.startswith(f"{LIBRARIES_TO_REGISTER_KEY}.") for k in sources)
 
+    def test_value_source_names_no_env_var_for_a_category_above_the_one_that_is_set(self) -> None:
+        """Asking who owns `worker` when only a leaf under it is set names the layer but no variable.
+
+        No single variable owns the category, so `env_var` is None and a caller falls back to
+        naming the layer alone.
+        """
+        with patch.dict(os.environ, {"GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S": "30"}, clear=True):
+            source = ConfigManager().value_source("worker")
+
+        assert source.layer == "env"
+        assert source.env_var is None
+
     # -- config_layers: fixed six-layer stack, and a malformed layer surfaces parse_error --
 
     def test_config_layers_returns_six_entries_in_fixed_order(self) -> None:
@@ -2022,6 +2050,15 @@ class TestConfigProvenance:
         assert layers["project"].path is None
         assert layers["project"].present is False
         assert layers["project"].parse_error is None
+
+    def test_config_layers_reports_env_vars_under_their_real_names_and_raw_values(self) -> None:
+        """`values` cannot express a nested variable's name, so `env_vars` carries it verbatim."""
+        env = {"GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S": "30", "GTN_CONFIG_LOG_LEVEL": "DEBUG"}
+        with patch.dict(os.environ, env, clear=True):
+            layers = {layer.layer: layer for layer in ConfigManager().config_layers()}
+
+        assert layers["env"].env_vars == env
+        assert layers["user"].env_vars == {}
 
     def test_config_layers_surfaces_parse_error_for_malformed_project_config(self, tmp_path: Path) -> None:
         """A file that exists but fails to parse must be visible as `parse_error`, not just a log line.

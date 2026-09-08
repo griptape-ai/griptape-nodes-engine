@@ -75,6 +75,15 @@ class ConfigLayer(BaseModel):
         default_factory=dict,
         description="This layer's own parsed contents, unmerged with any other layer.",
     )
+    env_vars: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "The GTN_CONFIG_ variables this layer applied, under their real names, mapped to "
+            "their uncoerced string values. Empty for every layer but 'env'. Recorded at parse "
+            "time because a name is not recoverable from a config key: nested segments are "
+            "joined by '__', which also appears inside segment names."
+        ),
+    )
 
 
 @dataclass

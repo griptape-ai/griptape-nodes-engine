@@ -104,6 +104,19 @@ class EnvVarOverride(NamedTuple):
     value: Any
 
 
+class EnvVarLayer(NamedTuple):
+    """The env-var layer's merged contents plus the variable each key came from.
+
+    `var_names` is keyed by key segments (`("worker", "heartbeat_timeout_s")`) so provenance can
+    name the variable exactly as it is spelled. `raw_values` keeps each variable's uncoerced
+    string, for a debug report that should show what was set rather than what it became.
+    """
+
+    values: dict[str, Any]
+    var_names: dict[tuple[str, ...], str]
+    raw_values: dict[str, str]
+
+
 # Outcomes of coercing an environment variable that no real config value can collide with.
 _REJECTED_BAD_VALUE = object()
 _REJECTED_UNKNOWN_KEY = object()
@@ -289,6 +302,15 @@ class ConfigManager(EngineScoped):
         # variable warns repeatedly for the life of this manager. Other ConfigManagers built
         # elsewhere in the process keep their own accounting.
         self._reported_invalid_env_vars: set[tuple[str, str]] = set()
+        # The GTN_CONFIG_ variable each env-layer key came from, recorded by load_configs as the
+        # names are parsed and keyed by key segments. A name cannot be rebuilt from a config key:
+        # segments are separated by ENV_VAR_PATH_SEPARATOR, so a rebuilt name is wrong for every
+        # nested key, and pointing a user at a variable that does not exist is worse than pointing
+        # at none.
+        self._env_var_names: dict[tuple[str, ...], str] = {}
+        # Each applied GTN_CONFIG_ variable's uncoerced string, keyed by variable name, for
+        # config_layers() to report what was actually set.
+        self._env_var_raw_values: dict[str, str] = {}
         # Parse error for the most recent load of each file layer, set by load_configs via
         # _load_file_layer. None means the file either doesn't exist or parsed fine;
         # config_layers() distinguishes those with `present`. Deliberately left alone by the
@@ -591,10 +613,31 @@ class ConfigManager(EngineScoped):
             if self._layer_value_at(probe.values, path) is _KEY_NOT_IN_LAYER:
                 continue
             if probe.layer == "env":
-                return ConfigValueSource(layer=probe.layer, env_var=f"GTN_CONFIG_{'_'.join(path).upper()}")
+                return ConfigValueSource(layer=probe.layer, env_var=self._env_var_name_at(path))
             layer_path = str(probe.path) if probe.path is not None else None
             return ConfigValueSource(layer=probe.layer, path=layer_path)
         return ConfigValueSource(layer="default")
+
+    def _env_var_name_at(self, path: tuple[str, ...]) -> str | None:
+        """The GTN_CONFIG_ variable supplying `path`, spelled as it is in the environment.
+
+        Read from the names recorded at parse time, never rebuilt from `path`: nested segments are
+        joined by ENV_VAR_PATH_SEPARATOR, so a rebuilt name would misname every nested key and
+        round-trip to a variable nobody set.
+
+        Walks up to the nearest recorded ancestor, so a leaf under a subtree that one variable set
+        names that variable. None when no ancestor is recorded, which is a `path` shallower than
+        any variable: asking who owns `worker` when only `worker.heartbeat_timeout_s` is set names
+        no single variable.
+
+        Args:
+            path: Key segments from the config root, e.g. ("worker", "heartbeat_timeout_s").
+        """
+        for depth in range(len(path), 0, -1):
+            name = self._env_var_names.get(path[:depth])
+            if name is not None:
+                return name
+        return None
 
     def _layer_value_at(self, values: dict, path: tuple[str, ...]) -> Any:
         """Return the value at `path` in one layer's own dict, or `_KEY_NOT_IN_LAYER`.
@@ -723,6 +766,9 @@ class ConfigManager(EngineScoped):
 
         `runtime` is the one layer no file backs: it carries the active project's workspace pin,
         so its `path` is always None and its `values` hold at most `workspace_directory`.
+
+        `env` additionally carries `env_vars`, the variables it applied under their real names,
+        which `values` cannot express: a nested key's name is not recoverable from its segments.
         """
         workspace_config_path = self._workspace_layer_path()
         runtime_pin_values = self._runtime_pin_values()
@@ -768,6 +814,7 @@ class ConfigManager(EngineScoped):
                 present=bool(self.env_config),
                 parse_error=None,
                 values=self.env_config,
+                env_vars=self._env_var_raw_values,
             ),
         ]
 
@@ -798,12 +845,26 @@ class ConfigManager(EngineScoped):
         Returns:
             Dictionary containing config values from environment variables
         """
-        env_config: dict[str, Any] = {}
+        return self._load_env_var_layer().values
+
+    def _load_env_var_layer(self) -> EnvVarLayer:
+        """Build the env-var layer: its merged contents, its variable names, and their raw values.
+
+        See `_load_config_from_env_vars` for how a name becomes a key. The name each key came from
+        is kept here rather than derived later, because the mapping is not reversible: a key's
+        segments are joined by ENV_VAR_PATH_SEPARATOR, not by the single underscore that also
+        appears inside segment names.
+        """
+        values: dict[str, Any] = {}
+        var_names: dict[tuple[str, ...], str] = {}
+        raw_values: dict[str, str] = {}
         for override in self._collect_env_var_overrides():
-            set_dot_value(env_config, override.config_key, override.value)
+            set_dot_value(values, override.config_key, override.value)
+            var_names[tuple(override.config_key.split("."))] = override.env_var_name
+            raw_values[override.env_var_name] = override.raw_value
             logger.debug("Loaded config from env var: %s -> %s", override.env_var_name, override.config_key)
 
-        return env_config
+        return EnvVarLayer(values=values, var_names=var_names, raw_values=raw_values)
 
     def _collect_env_var_overrides(self) -> list[EnvVarOverride]:
         """Resolve the GTN_CONFIG_ variables to apply, reporting each one ignored along the way.
@@ -990,7 +1051,10 @@ class ConfigManager(EngineScoped):
         if self._workspace_dir_override is not None:
             merged_config["workspace_directory"] = self._workspace_dir_override
 
-        self.env_config = self._load_config_from_env_vars()
+        env_layer = self._load_env_var_layer()
+        self.env_config = env_layer.values
+        self._env_var_names = env_layer.var_names
+        self._env_var_raw_values = env_layer.raw_values
         if self.env_config:
             merged_config = merge_dicts(merged_config, self.env_config)
             logger.debug("Merged config from environment variables: %s", list(self.env_config.keys()))
