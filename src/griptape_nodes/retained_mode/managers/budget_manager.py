@@ -160,10 +160,11 @@ class BudgetManager(EngineScoped):
     def _resolve_project_chain(self) -> list[str] | None:
         """Resolve the current project's ancestry as ids, leaf-first, or None when unreadable.
 
-        None and [] are different answers and must not collapse. [] means no project is open,
-        which the Cloud reads off the bare `{"v": 1}` as a positive fact. A peer that raised
-        knows nothing about whether a project is open, so reporting [] would send that fact
-        anyway -- the same arrives-looking-intact failure this module exists to avoid.
+        None and [] are different answers and must not collapse. [] means no project is open;
+        a peer that raised knows nothing of the kind. The far end cannot tell the two apart --
+        a bare `{"v": 1}` and no header at all parse to equal objects -- so this buys nothing
+        on the wire. It buys the engine not asserting a fact it does not have, and a caller
+        that gets a Failure it can act on instead of a Success carrying an empty chain.
 
         The id rather than the name, because it survives a rename -- a name would re-point that
         project's spend the moment a user edited it. But an id is not opaque: `ProjectTemplate.id`

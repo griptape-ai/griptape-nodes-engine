@@ -30,7 +30,8 @@ class GetAttributionContextRequest(RequestPayload):
 
     Best-effort: nothing here raises, because the caller is about to spend money and an
     unattributed call beats a blocked one. A chain that cannot be read yields a Failure rather
-    than an empty chain -- an empty one would claim no project is open.
+    than an empty chain -- an empty one would assert that no project is open, which is not
+    something the engine knows at that point.
 
     Use when: A node or driver is about to make a credit-consuming call and wants the spend
     attributed to the project the user is working in.

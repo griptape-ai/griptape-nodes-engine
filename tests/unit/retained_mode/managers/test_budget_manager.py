@@ -190,10 +190,11 @@ class TestAttributionPayloadShape:
         assert _tags(result)["project"] == result.project_chain
 
     def test_a_chainless_envelope_is_still_sent(self, budget_manager: BudgetManager) -> None:
-        """`{"v": 1}` says "no project open"; sending nothing says "client does not attribute".
+        """An empty chain is never a reason to withhold the header.
 
-        The Cloud parser distinguishes the two, so the bare envelope carries a real fact and
-        an empty chain is never a reason to withhold the header.
+        The envelope says nothing the far end can read today -- a bare `{"v": 1}` and an absent
+        header parse to equal objects -- so this pins the shape, not a signal. It is sent for
+        forward-compatibility: a `client_attributed` flag would make it one without a release.
         """
         result = _succeed(budget_manager)
 
@@ -466,11 +467,10 @@ class TestDegradation:
     ) -> None:
         """An unreadable chain is not the same fact as an empty one, and must not borrow it.
 
-        `{"v": 1}` is a positive claim -- the Cloud reads a missing `tags` as "no project open
-        on a client that attributes". A project manager that raised knows nothing about whether
-        a project is open, so sending that envelope would attribute an artist's spend to the
-        default budget while recording no degradation on either side. No header at all reads as
-        "this client did not attribute", which is true.
+        `{"v": 1}` asserts that no project is open. A project manager that raised knows nothing
+        about whether one is. The far end reads the envelope and an absent header identically,
+        so nothing downstream moves either way -- what this pins is that the engine stops short
+        of the claim, and that the caller gets a Failure rather than an empty-chain Success.
         """
         mock_engine = _mock_engine()
         mock_engine.project_manager.get_project_chain.side_effect = RuntimeError("peer exploded")
