@@ -1,7 +1,7 @@
 """How many times a tool call gets retried after a `ModelRetry`.
 
-One knob for every tool the chat agent can call: the agent's own tools, MCP
-toolsets, and the skills capability's bundled-file tools.
+One knob for every tool the chat agent can call: the agent's own tools, the
+skills capability's, and MCP toolsets.
 """
 
 from __future__ import annotations
