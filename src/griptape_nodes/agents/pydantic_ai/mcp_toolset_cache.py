@@ -9,10 +9,12 @@ so a cached toolset speaks to a server launched from the *old* config forever.
 
 This cache makes the trade explicitly: entries are keyed by server name and
 carry a fingerprint of the config, so an unchanged server keeps its warm
-subprocess and an edited one is torn down and rebuilt. Rebuilding on a
-fingerprint change rather than on a config-change event means edits made
-outside the event system - a hand-edited config file, another process writing
-the same file - are picked up just the same.
+subprocess and an edited one is torn down and rebuilt. Comparing a fingerprint
+per run rather than subscribing to a config-change event means the cache stays
+correct however the config came to be different, including a change that
+arrives with no event attached - though note that a config *file* edited behind
+the engine's back is not picked up at all, because nothing re-reads the file
+until something calls ``load_configs``.
 
 Not every edit needs a restart, though, and restarting on the ones that don't
 is expensive: respawning a subprocess costs hundreds of milliseconds where
