@@ -54,6 +54,9 @@ from griptape_nodes.retained_mode.events.agent_events import (
     DeleteAgentProviderResultSuccess,
     GetAgentConfigRequest,
     GetAgentConfigResultSuccess,
+    GetThreadMetadataRequest,
+    GetThreadMetadataResultFailure,
+    GetThreadMetadataResultSuccess,
     ListAgentModelsRequest,
     ListAgentModelsResultSuccess,
     ListAgentProvidersRequest,
@@ -67,6 +70,7 @@ from griptape_nodes.retained_mode.events.agent_events import (
     RunAgentRequestArtifact,
     RunAgentResultSuccess,
     RunRecord,
+    ThreadMetadata,
     UpdateAgentProviderRequest,
     UpdateAgentProviderResultFailure,
     UpdateAgentProviderResultSuccess,
@@ -1369,3 +1373,38 @@ class TestRunAgentResultPayloadContract:
 
         assert len(recorded) == 1
         assert recorded[0].model == "gpt-4o", "explicit model_name must take precedence over provider default"
+
+
+class TestGetThreadMetadataHandler:
+    """`on_handle_get_thread_metadata_request` routing and guard behaviour."""
+
+    @staticmethod
+    def _manager(thread_exists: bool, metadata: object = None) -> AgentManager:  # noqa: FBT001
+        manager = AgentManager.__new__(AgentManager)
+        manager._thread_storage = SimpleNamespace(  # type: ignore[assignment]
+            thread_exists=lambda _tid: thread_exists,
+            get_thread_metadata=lambda _tid: metadata,
+        )
+        return manager
+
+    def test_missing_thread_returns_failure(self) -> None:
+        """A thread_id that doesn't exist must return GetThreadMetadataResultFailure."""
+        manager = self._manager(thread_exists=False)
+        result = manager.on_handle_get_thread_metadata_request(GetThreadMetadataRequest(thread_id="does-not-exist"))
+        assert isinstance(result, GetThreadMetadataResultFailure)
+
+    def test_existing_thread_returns_success_with_metadata(self) -> None:
+        """A valid thread_id must return GetThreadMetadataResultSuccess carrying the metadata."""
+        thread = ThreadMetadata(
+            thread_id="t1",
+            title="hello",
+            created_at="2024-01-01T00:00:00+00:00",
+            updated_at="2024-01-01T00:00:00+00:00",
+            message_count=2,
+            archived=False,
+            runs=[RunRecord(message_index=1, provider_name="griptape_cloud", model="gpt-4o")],
+        )
+        manager = self._manager(thread_exists=True, metadata=thread)
+        result = manager.on_handle_get_thread_metadata_request(GetThreadMetadataRequest(thread_id="t1"))
+        assert isinstance(result, GetThreadMetadataResultSuccess)
+        assert result.thread is thread

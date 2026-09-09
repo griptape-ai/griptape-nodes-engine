@@ -332,6 +332,7 @@ class ThreadMetadata:
     message_count: int
     archived: bool
     local_id: str | None = None
+    # None means runs were not fetched (e.g. from list_threads); [] means fetched and empty.
     runs: list[RunRecord] | None = None
 
 

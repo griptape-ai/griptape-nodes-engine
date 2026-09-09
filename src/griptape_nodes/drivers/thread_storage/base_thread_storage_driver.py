@@ -99,7 +99,7 @@ class BaseThreadStorageDriver(ABC):
 
     @abstractmethod
     def append_run_record(self, thread_id: str, record: RunRecord) -> None:
-        """Atomically append a RunRecord to the thread's metadata.
+        """Append a RunRecord for this thread.
 
         Implementations own the serialization format; callers pass a typed
         record and never touch the on-disk shape directly.

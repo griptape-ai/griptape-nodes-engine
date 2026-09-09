@@ -77,7 +77,14 @@ class LocalThreadStorageDriver(BaseThreadStorageDriver):
 
     def append_run_record(self, thread_id: str, record: RunRecord) -> None:
         runs_path = self._runs_path(thread_id)
-        raw: list[dict] = json.loads(runs_path.read_text()) if runs_path.exists() else []
+        if runs_path.exists():
+            try:
+                raw: list[dict] = json.loads(runs_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                logger.exception("Failed to read runs file for thread %s; starting fresh.", thread_id)
+                raw = []
+        else:
+            raw = []
         raw.append(asdict(record))
         atomic_write_bytes(runs_path, json.dumps(raw, indent=2).encode("utf-8"))
 
@@ -125,7 +132,7 @@ class LocalThreadStorageDriver(BaseThreadStorageDriver):
         if not runs_path.exists():
             return []
         try:
-            raw: list[dict] = json.loads(runs_path.read_text())
+            raw: list[dict] = json.loads(runs_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             logger.exception("Failed to read runs file for thread %s.", thread_id)
             return []
@@ -133,7 +140,7 @@ class LocalThreadStorageDriver(BaseThreadStorageDriver):
         for r in raw:
             try:
                 runs.append(RunRecord(**r))
-            except (TypeError, KeyError):
+            except TypeError:
                 logger.warning("Skipping malformed run record in thread %s: %s", thread_id, r)
         return runs
 
