@@ -17,15 +17,26 @@ combinators rather than hand-rolled logic:
 
 Connection handling is left to Pydantic AI: if a server is unreachable the
 run fails. Graceful per-server degradation can be layered on later.
+
+**Transport lifetime.** Pydantic AI enters and exits a toolset once per
+``Agent.run``, but that is not the lifetime of the server. ``StdioTransport``
+defaults to ``keep_alive=True``, so exiting a session leaves the subprocess
+running and the next run reuses it. A toolset therefore pins one subprocess,
+launched from the config the transport was *built* with, for as long as the
+toolset is held. Whoever caches a toolset owns calling
+:func:`disconnect_transport` when the config behind it changes; otherwise the
+edit cannot take effect and the old subprocess is never reaped. See
+:class:`~griptape_nodes.agents.pydantic_ai.mcp_toolset_cache.MCPToolsetCache`.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from fastmcp.client.transports import SSETransport, StdioTransport, StreamableHttpTransport
+from fastmcp.client.transports import ClientTransport, SSETransport, StdioTransport, StreamableHttpTransport
 from pydantic_ai.mcp import MCPToolset
 
 if TYPE_CHECKING:
@@ -60,7 +71,22 @@ that want to hide specific tools (e.g. tests, alternate harnesses).
 """
 
 
-def mcp_server_from_config(name: str, config: Mapping[str, Any]) -> AbstractToolset[Any] | None:  # noqa: PLR0911
+@dataclass(frozen=True)
+class BuiltMCPServer:
+    """A composed MCP toolset paired with the transport it speaks over.
+
+    The transport is carried alongside the toolset because whoever caches the
+    toolset also owns tearing it down, and reaching the transport back through
+    the toolset means walking Pydantic AI and FastMCP internals
+    (``toolset.wrapped.client.transport``). Returning it explicitly keeps that
+    coupling in one place.
+    """
+
+    toolset: AbstractToolset[Any]
+    transport: ClientTransport
+
+
+def mcp_server_from_config(name: str, config: Mapping[str, Any]) -> BuiltMCPServer | None:  # noqa: PLR0911
     """Build a Pydantic AI MCP toolset from an engine ``MCPServerConfig``.
 
     Returns ``None`` and logs a warning when the config is missing required
@@ -80,7 +106,10 @@ def mcp_server_from_config(name: str, config: Mapping[str, Any]) -> AbstractTool
             env=_stdio_env(config.get("env")),
             cwd=config.get("cwd"),
         )
-        return _compose(name, MCPToolset(client, max_retries=DEFAULT_TOOL_MAX_RETRIES))
+        return BuiltMCPServer(
+            toolset=_compose(name, MCPToolset(client, max_retries=DEFAULT_TOOL_MAX_RETRIES)),
+            transport=client,
+        )
 
     if transport == "sse":
         url = config.get("url")
@@ -88,9 +117,12 @@ def mcp_server_from_config(name: str, config: Mapping[str, Any]) -> AbstractTool
             logger.warning("MCP server %r: sse transport requires `url`; skipping.", name)
             return None
         client = SSETransport(url=url, headers=dict(config.get("headers") or {}))
-        return _compose(
-            name,
-            MCPToolset(client, max_retries=DEFAULT_TOOL_MAX_RETRIES, init_timeout=_connect_timeout(config)),
+        return BuiltMCPServer(
+            toolset=_compose(
+                name,
+                MCPToolset(client, max_retries=DEFAULT_TOOL_MAX_RETRIES, init_timeout=_connect_timeout(config)),
+            ),
+            transport=client,
         )
 
     if transport == "streamable_http":
@@ -99,13 +131,35 @@ def mcp_server_from_config(name: str, config: Mapping[str, Any]) -> AbstractTool
             logger.warning("MCP server %r: %s transport requires `url`; skipping.", name, transport)
             return None
         client = StreamableHttpTransport(url=url, headers=dict(config.get("headers") or {}))
-        return _compose(
-            name,
-            MCPToolset(client, max_retries=DEFAULT_TOOL_MAX_RETRIES, init_timeout=_connect_timeout(config)),
+        return BuiltMCPServer(
+            toolset=_compose(
+                name,
+                MCPToolset(client, max_retries=DEFAULT_TOOL_MAX_RETRIES, init_timeout=_connect_timeout(config)),
+            ),
+            transport=client,
         )
 
     logger.warning("MCP server %r: unsupported transport %r; skipping.", name, transport)
     return None
+
+
+async def disconnect_transport(name: str, transport: ClientTransport) -> None:
+    """Tear down ``transport``, if its kind holds anything to tear down.
+
+    Only :class:`StdioTransport` owns a long-lived resource: it defaults to
+    ``keep_alive=True``, so its subprocess outlives each session and survives
+    until something disconnects it explicitly. The HTTP transports expose no
+    ``disconnect`` at all and hold no process, so for them this is a no-op
+    rather than a missing case.
+    """
+    if not isinstance(transport, StdioTransport):
+        return
+    try:
+        await transport.disconnect()
+    # Teardown must not fail the caller: a server that will not shut down
+    # cleanly is a warning, not a reason to abandon the run that outlived it.
+    except Exception as e:
+        logger.warning("Attempted to shut down MCP server '%s'. Failed because of: %s", name, e)
 
 
 def streamable_http_local(url: str, *, name: str | None = None) -> AbstractToolset[Any]:
