@@ -25,6 +25,7 @@ import mimetypes
 import os
 import textwrap
 import threading
+import time
 from dataclasses import dataclass, replace
 from http import HTTPStatus
 from pathlib import Path
@@ -39,7 +40,11 @@ from xdg_base_dirs import xdg_data_home
 
 from griptape_nodes.agents.pydantic_ai.image_tools import GRIPTAPE_CLOUD_BASE_URL, ImageGenerationToolsetConfig
 from griptape_nodes.agents.pydantic_ai.mcp_servers import streamable_http_local
-from griptape_nodes.agents.pydantic_ai.mcp_toolset_cache import MCPToolsetCache, MCPToolsetLease
+from griptape_nodes.agents.pydantic_ai.mcp_toolset_cache import (
+    TIMING_LOG_PREFIX,
+    MCPToolsetCache,
+    MCPToolsetLease,
+)
 from griptape_nodes.agents.pydantic_ai.runner import (
     DEFAULT_SKILLS_DIRECTORY,
     PydanticAgentRunner,
@@ -1142,7 +1147,13 @@ class AgentManager(EngineScoped):
         an edited one is restarted, and one that has been deleted or disabled is
         shut down here rather than lingering for the session.
         """
+        started = time.monotonic()
         enabled = self._lookup_enabled_mcp_servers()
+        logger.info(
+            "%s read MCP server config in %.1f ms",
+            TIMING_LOG_PREFIX,
+            (time.monotonic() - started) * 1000,
+        )
         if enabled is None:
             return _MCPAttachment(lease=await self._mcp_toolsets.acquire([]), instructions="")
 
@@ -1158,6 +1169,12 @@ class AgentManager(EngineScoped):
 
         configs = [{**enabled[name], "name": name} for name in server_names if name in enabled]
         lease = await self._mcp_toolsets.acquire(configs)
+        logger.info(
+            "%s attached %s in %.1f ms total",
+            TIMING_LOG_PREFIX,
+            ", ".join(f"{server.name}@{server.digest}" for server in lease.resolved) or "no servers",
+            (time.monotonic() - started) * 1000,
+        )
         return _MCPAttachment(lease=lease, instructions=_compose_server_rules(configs))
 
     def _lookup_enabled_mcp_servers(self) -> Mapping[str, Mapping[str, Any]] | None:
