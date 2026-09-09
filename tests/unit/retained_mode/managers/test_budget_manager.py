@@ -2,7 +2,7 @@
 
 The attribution header is the one thing E1 produces, so most of these assert on the
 *decoded* payload rather than on the manager's internals: that dict is the contract the
-Cloud reads, and the Success payload's structured fields have to agree with it.
+Cloud reads, and the Success payload's `project_chain` has to agree with it.
 """
 
 from __future__ import annotations
@@ -10,10 +10,9 @@ from __future__ import annotations
 import base64
 import json
 import logging
-import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
-from unittest.mock import MagicMock, Mock, PropertyMock, patch
+from unittest.mock import MagicMock, Mock
 
 import pytest
 
@@ -22,13 +21,9 @@ from griptape_nodes.common.project_templates.default_project_template import DEF
 from griptape_nodes.retained_mode.events.budget_events import (
     ATTRIBUTION_HEADER_NAME,
     ATTRIBUTION_SCHEMA_VERSION,
-    UNSAVED_WORKFLOW_SENTINEL,
     GetAttributionContextRequest,
     GetAttributionContextResultFailure,
     GetAttributionContextResultSuccess,
-)
-from griptape_nodes.retained_mode.events.context_events import (
-    SetWorkflowContextRequest,
 )
 from griptape_nodes.retained_mode.managers import budget_manager as budget_manager_module
 from griptape_nodes.retained_mode.managers.budget_manager import BudgetManager
@@ -43,18 +38,11 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
 
-# The complete set of keys allowed on the wire. A new field must consciously
-# update these, which is the point: `node_id` is absent by decision, and `BaseNode.name`
-# must never appear under any key.
+# The complete set of keys allowed on the wire. A new field must consciously update these,
+# which is the point: `project` is the only dimension Griptape Cloud matches budgets against,
+# so it is the only one the engine sends, and `BaseNode.name` must never appear under any key.
 ALLOWED_ENVELOPE_KEYS = {"v", "tags"}
-ALLOWED_TAG_KEYS = {
-    "project",
-    "workflow",
-    "node_type",
-    "engine_id",
-    "orchestrator_engine_id",
-    "session_id",
-}
+ALLOWED_TAG_KEYS = {"project"}
 
 
 def _decode(result: GetAttributionContextResultSuccess) -> dict[str, Any]:
@@ -63,7 +51,7 @@ def _decode(result: GetAttributionContextResultSuccess) -> dict[str, Any]:
 
 
 def _tags(result: GetAttributionContextResultSuccess) -> dict[str, Any]:
-    """The `tags` object the Cloud reads every dimension out of, or {} when none was sent."""
+    """The `tags` object the Cloud reads the project chain out of, or {} when none was sent."""
     return _decode(result).get("tags", {})
 
 
@@ -80,16 +68,13 @@ def _succeed(manager: BudgetManager, **kwargs: Any) -> GetAttributionContextResu
 
 
 def _mock_engine() -> MagicMock:
-    """A stand-in engine whose peers answer with JSON-encodable values.
+    """A stand-in engine whose project manager answers with a JSON-encodable value.
 
-    A bare MagicMock hands back MagicMocks, which `json.dumps` cannot encode -- so every
-    peer a resolver reads is given a real value here and overridden per test.
+    A bare MagicMock hands back MagicMocks, which `json.dumps` cannot encode -- so the one
+    peer the resolver reads is given a real value here and overridden per test.
     """
     mock_engine = MagicMock()
     mock_engine.project_manager.get_project_chain.return_value = []
-    mock_engine.context_manager.has_current_workflow.return_value = False
-    mock_engine.engine_identity_manager.engine_id = "eng-1"
-    mock_engine.session_manager.active_session_id = "sess-1"
     return mock_engine
 
 
@@ -97,8 +82,8 @@ def _entry(project_id: str, name: str | None) -> ProjectChainEntry:
     """A chain entry whose id and name never match, so an assertion cannot pass on the wrong one.
 
     The real type rather than a Mock: `name` is reserved on `Mock`, so `Mock(name="x").name`
-    is a Mock rather than a string, and a mocked chain would answer the nameless branch with
-    something that is neither a name nor `None`.
+    is a Mock rather than a string, and a mocked chain would answer with something that is
+    neither a name nor `None`.
     """
     return ProjectChainEntry(id=project_id, name=name)
 
@@ -139,7 +124,7 @@ class TestAttributionPayloadShape:
 
     def test_request_dispatches_through_the_engine(self, engine: Engine) -> None:
         """The request reaches BudgetManager over the real bus and comes back usable."""
-        result = engine.handle_request(GetAttributionContextRequest(node_type="GriptapeProxyImage"))
+        result = engine.handle_request(GetAttributionContextRequest())
 
         assert isinstance(result, GetAttributionContextResultSuccess)
         assert result.header_value
@@ -148,14 +133,12 @@ class TestAttributionPayloadShape:
 
     def test_header_value_decodes_to_documented_payload(self, engine: Engine) -> None:
         """base64url of compact UTF-8 JSON, leaf-first chain, schema version 1."""
-        result = engine.handle_request(GetAttributionContextRequest(node_type="GriptapeProxyImage"))
+        result = engine.handle_request(GetAttributionContextRequest())
         assert isinstance(result, GetAttributionContextResultSuccess)
 
         assert _decode(result)["v"] == ATTRIBUTION_SCHEMA_VERSION
-        tags = _tags(result)
-        assert tags["node_type"] == "GriptapeProxyImage"
         # No project is selected on a bare engine, so the key is absent rather than empty.
-        assert tags.get("project", []) == result.project_chain
+        assert _tags(result).get("project", []) == result.project_chain
 
     def test_padding_round_trips(self, engine: Engine) -> None:
         """Padding is kept so the Cloud can decode without re-padding."""
@@ -166,38 +149,52 @@ class TestAttributionPayloadShape:
         base64.urlsafe_b64decode(result.header_value)
         assert len(result.header_value) % 4 == 0
 
-    def test_payload_key_allowlist(self, engine: Engine) -> None:
-        """No key ships that has not been consciously added, and `node_id` is not one of them."""
-        result = engine.handle_request(GetAttributionContextRequest(node_type="Anything"))
-        assert isinstance(result, GetAttributionContextResultSuccess)
+    def test_payload_key_allowlist(self, engine: Engine, budget_manager: BudgetManager) -> None:
+        """No key ships that has not been consciously added, chain or no chain.
 
-        decoded = _decode(result)
-        assert set(decoded) <= ALLOWED_ENVELOPE_KEYS
-        assert set(decoded["tags"]) <= ALLOWED_TAG_KEYS
-        assert "node_id" not in decoded["tags"]
+        Both shapes are checked because they exercise different halves of the builder: the
+        real engine has no project open and emits a bare envelope, while the mocked one emits
+        the `tags` object that a new dimension would be smuggled into.
+        """
+        cast("MagicMock", budget_manager.engine).project_manager.get_project_chain.return_value = [
+            _entry("leaf", "Leaf")
+        ]
+
+        for result in (engine.handle_request(GetAttributionContextRequest()), _succeed(budget_manager)):
+            assert isinstance(result, GetAttributionContextResultSuccess)
+            assert set(_decode(result)) <= ALLOWED_ENVELOPE_KEYS
+            assert set(_tags(result)) <= ALLOWED_TAG_KEYS
+
+        assert _tags(_succeed(budget_manager)) == {"project": ["leaf"]}
 
     def test_structured_fields_agree_with_the_header(self, budget_manager: BudgetManager) -> None:
         """A consumer reading the result must see exactly what the header encodes."""
-        mock_engine = cast("MagicMock", budget_manager.engine)
-        mock_engine.project_manager.get_project_chain.return_value = []
-        mock_engine.context_manager.has_current_workflow.return_value = False
-        mock_engine.engine_identity_manager.engine_id = "eng-1"
-        mock_engine.session_manager.active_session_id = "sess-1"
+        cast("MagicMock", budget_manager.engine).project_manager.get_project_chain.return_value = [
+            _entry("leaf", "Leaf"),
+            _entry("root", "Root"),
+        ]
 
-        result = _succeed(budget_manager, node_type="NodeT")
-        tags = _tags(result)
+        result = _succeed(budget_manager)
 
-        assert tags.get("workflow") == result.workflow_name
-        assert tags["node_type"] == result.node_type
-        assert tags["engine_id"] == result.engine_id
-        assert tags["session_id"] == result.session_id
+        assert _tags(result)["project"] == result.project_chain
+
+    def test_a_chainless_envelope_is_still_sent(self, budget_manager: BudgetManager) -> None:
+        """`{"v": 1}` says "no project open"; sending nothing says "client does not attribute".
+
+        The Cloud parser distinguishes the two, so the bare envelope carries a real fact and
+        an empty chain is never a reason to withhold the header.
+        """
+        result = _succeed(budget_manager)
+
+        assert _decode(result) == {"v": ATTRIBUTION_SCHEMA_VERSION}
+        assert result.header_value
 
 
 class TestProjectChain:
-    """`tags.project` carries project names, ordered leaf-first.
+    """`tags.project` carries project ids, ordered leaf-first.
 
-    The name is the wire value because `tags.project` is the only dimension the Cloud
-    matches budgets against, and a budget admin has to be able to author it into a rule.
+    The id is the wire value because it is what identifies a project across a rename -- the
+    name would silently re-point that project's spend the moment a user edited it.
     """
 
     def _manager_on(self, project_manager: ProjectManager) -> BudgetManager:
@@ -206,10 +203,7 @@ class TestProjectChain:
         return BudgetManager(MagicMock(), engine=mock_engine)
 
     def test_system_defaults_never_reaches_the_wire(self) -> None:
-        """The Cloud reserves `<system-defaults>` and counts a client copy as degraded.
-
-        Nor does its *name* travel in the sentinel's place -- see the next test.
-        """
+        """The Cloud reserves `<system-defaults>` and counts a client copy as degraded."""
         project_manager = ProjectManager(Mock(), Mock(), Mock())
         result = _succeed(self._manager_on(project_manager))
 
@@ -218,12 +212,11 @@ class TestProjectChain:
         assert SYSTEM_DEFAULTS_KEY not in json.dumps(_decode(result))
 
     def test_the_default_templates_name_never_stands_in_for_the_sentinel(self) -> None:
-        """Skipping `<system-defaults>` is keyed on its id, because it does have a name.
+        """Skipping `<system-defaults>` is keyed on its id, and its name is not sent either.
 
         The rest state is registered with the shipped `DEFAULT_PROJECT_TEMPLATE`, whose name
         is "Default Project" -- a generic string that would collide across every user in an
-        org and match any budget rule unlucky enough to be written against it. Filtering on
-        the name alone would let it through.
+        org and match any budget rule unlucky enough to be written against it.
         """
         project_manager = ProjectManager(Mock(), Mock(), Mock())
         project_manager._load_system_defaults()
@@ -241,43 +234,10 @@ class TestProjectChain:
 
         result = _succeed(self._manager_on(project_manager))
 
-        assert _tags(result)["project"] == ["Shot 020"]
+        assert _tags(result)["project"] == ["leaf"]
 
-    @pytest.mark.parametrize(
-        "reserved_name",
-        [
-            SYSTEM_DEFAULTS_KEY,
-            f" {SYSTEM_DEFAULTS_KEY} ",
-            # Only becomes the reserved value once cut to the 256-char cap.
-            SYSTEM_DEFAULTS_KEY + " " * 239 + "x",
-        ],
-    )
-    def test_a_project_actually_named_system_defaults_drops_the_chain(
-        self, reserved_name: str, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """A name collision with the Cloud's reserved value costs the whole chain.
-
-        Nothing stops a user typing the reserved string into `name:`. The Cloud discards a
-        client copy, which would drop that entry and promote its parent to leaf -- billing a
-        real project for spend it never incurred. Neither padding nor length disguises it: the
-        far end strips, cuts to its value cap, and strips again before it tests the reserved
-        value, so the comparison here runs on that same form.
-        """
-        project_manager = ProjectManager(Mock(), Mock(), Mock())
-        _register_project(project_manager, "grandparent", name="Acme Studios")
-        _register_project(project_manager, "leaf", name=reserved_name, parent_id="grandparent")
-        project_manager._current_project_id = "leaf"
-
-        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
-            result = _succeed(self._manager_on(project_manager))
-
-        assert "project" not in _tags(result)
-        assert result.project_chain == []
-        assert "Acme Studios" not in result.header_value
-        assert any(record.levelno == logging.WARNING for record in caplog.records)
-
-    def test_nested_chain_carries_every_name_leaf_first(self) -> None:
-        """The whole ancestry travels, and nothing but names does."""
+    def test_nested_chain_carries_every_id_leaf_first(self) -> None:
+        """The whole ancestry travels, and nothing but ids does."""
         project_manager = ProjectManager(Mock(), Mock(), Mock())
         _register_project(project_manager, "grandparent", name="Acme Studios")
         _register_project(project_manager, "parent", name="Feature Film", parent_id="grandparent")
@@ -287,11 +247,11 @@ class TestProjectChain:
         result = _succeed(self._manager_on(project_manager))
         decoded = _decode(result)
 
-        assert decoded["tags"]["project"] == ["Shot 020", "Feature Film", "Acme Studios"]
+        assert decoded["tags"]["project"] == ["leaf", "parent", "grandparent"]
         serialized = json.dumps(decoded)
-        for project_id in ("grandparent", "parent", "leaf"):
-            assert project_id not in serialized
-            assert project_id not in result.header_value
+        for name in ("Acme Studios", "Feature Film", "Shot 020"):
+            assert name not in serialized
+            assert name not in result.header_value
 
     def test_a_chain_deeper_than_the_cloud_keeps_still_travels_whole(self) -> None:
         """Depth is the Cloud's to judge, not ours -- and judging it here is what hides it.
@@ -309,60 +269,48 @@ class TestProjectChain:
             _register_project(project_manager, project_id, name=f"Name {project_id}", parent_id=parent)
         project_manager._current_project_id = ids[0]
 
-        names = [f"Name {project_id}" for project_id in ids]
         result = _succeed(self._manager_on(project_manager))
 
-        assert _tags(result)["project"] == names
-        assert result.project_chain == names
-        assert result.chain_truncated is False
+        assert _tags(result)["project"] == ids
+        assert result.project_chain == ids
 
-    def test_an_unregistered_parent_drops_the_chain_and_never_falls_back_to_its_id(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """A nameless ancestor is neither swapped for its id nor quietly cut away.
+    def test_a_chain_of_path_shaped_ids_travels_whole(self) -> None:
+        """The realistic worst case for size, and it is not close to a problem.
 
-        Its registry key is not something a budget rule mentions, so emitting it adds one
-        unmatchable string. Keeping just the leaf is worse: paths are root-anchored, so
-        `["Shot 6"]` presents a nested project as a root and bills an unrelated top-level
-        "Shot 6" if the org has one.
+        A project created before ids existed has the canonical path to its file written in as
+        its id, so a deep chain of legacy projects is the longest header the engine can
+        plausibly produce. Thirty-two of them encode to roughly 4 KB -- inside the Cloud's own
+        raw-header cap and half of a default nginx header buffer -- so there is nothing here
+        worth shortening, and shortening it would arrive looking intact anyway.
+        """
+        project_manager = ProjectManager(Mock(), Mock(), Mock())
+        ids = [f"/Users/alice/Documents/projects/acme/season-02/shot-{index:03d}/project.yml" for index in range(32)]
+        for index, project_id in enumerate(ids):
+            parent = ids[index + 1] if index + 1 < len(ids) else None
+            _register_project(project_manager, project_id, name=f"Shot {index}", parent_id=parent)
+        project_manager._current_project_id = ids[0]
+
+        result = _succeed(self._manager_on(project_manager))
+
+        assert _tags(result)["project"] == ids
+        assert len(result.header_value) < 5632  # noqa: PLR2004 -- the Cloud's MAX_RAW_HEADER_LENGTH
+
+    def test_an_unregistered_parent_still_contributes_its_id(self) -> None:
+        """The walk ends at an unregistered ancestor, but its id is a fact and travels.
+
+        `get_project_chain` surfaces the id it could not resolve a template for and stops
+        there. That id is what the parent is called everywhere else in the engine, so sending
+        it is honest; deciding it is unmatchable and dropping the chain over it would be the
+        engine judging on the Cloud's behalf.
         """
         project_manager = ProjectManager(Mock(), Mock(), Mock())
         _register_project(project_manager, "shot-6", name="Shot 6", parent_id="swx")
         project_manager._current_project_id = "shot-6"
 
-        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
-            result = _succeed(self._manager_on(project_manager))
+        result = _succeed(self._manager_on(project_manager))
 
-        assert "project" not in _tags(result)
-        assert "swx" not in result.header_value
+        assert _tags(result)["project"] == ["shot-6", "swx"]
         assert "Shot 6" not in result.header_value
-        assert any(record.levelno == logging.WARNING for record in caplog.records)
-
-    @pytest.mark.parametrize("blank_at", ["root", "middle"])
-    def test_a_blank_name_drops_the_chain_wherever_it_sits(
-        self, blank_at: str, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """A blank name reads as nameless, and position cannot tell it from a failed load.
-
-        `ProjectTemplate.name` has no `min_length` and `get_project_chain` maps any falsy name
-        to None, so a loaded blank-named template is indistinguishable from an unresolvable
-        one -- including at the root, where it is nameless *and* last. Hence both ends: a rule
-        reading "nameless and last means the walk ended" returns `["Shot 020"]` for a project
-        three deep and presents it to the Cloud as a root.
-        """
-        names = {"root": {"acme": "", "mid": "Mid"}, "middle": {"acme": "Acme Studios", "mid": ""}}[blank_at]
-        project_manager = ProjectManager(Mock(), Mock(), Mock())
-        _register_project(project_manager, "acme", name=names["acme"])
-        _register_project(project_manager, "mid", name=names["mid"], parent_id="acme")
-        _register_project(project_manager, "shot-020", name="Shot 020", parent_id="mid")
-        project_manager._current_project_id = "shot-020"
-
-        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
-            result = _succeed(self._manager_on(project_manager))
-
-        assert "project" not in _tags(result)
-        assert "Shot 020" not in result.header_value
-        assert any(record.levelno == logging.WARNING for record in caplog.records)
 
     def test_second_dispatch_reflects_a_project_switch(self) -> None:
         """The chain is read per invocation, never cached at workflow open."""
@@ -376,8 +324,8 @@ class TestProjectChain:
         project_manager._current_project_id = "after"
         second = _succeed(manager)
 
-        assert _tags(first)["project"] == ["Before"]
-        assert _tags(second)["project"] == ["After"]
+        assert _tags(first)["project"] == ["before"]
+        assert _tags(second)["project"] == ["after"]
 
     def test_empty_chain_omits_the_project_key(self) -> None:
         """`[]` would assert 'belongs to zero projects', which is a claim we cannot make."""
@@ -385,221 +333,86 @@ class TestProjectChain:
         result = _succeed(manager)
 
         assert "project" not in _tags(result)
-        # The other dimensions still ship; only the chain is unknown.
-        assert "engine_id" in _tags(result)
+        assert result.project_chain == []
 
 
-class TestWorkflowName:
-    """An absent `workflow` means unknown; `<unsaved>` means scratch. They differ."""
+class TestValuesTravelVerbatim:
+    """Nothing here repairs an id. The Cloud reports what it had to repair; the engine does not.
 
-    def test_unsaved_workflow_reports_the_sentinel(self, engine: Engine) -> None:
-        """Never the per-session `unsaved:<uuid4>` key, which has unbounded cardinality."""
-        set_result = engine.handle_request(SetWorkflowContextRequest(display_name="Untitled"))
-        assert set_result.succeeded()
-        try:
-            result = engine.handle_request(GetAttributionContextRequest())
-            assert isinstance(result, GetAttributionContextResultSuccess)
-
-            decoded = _decode(result)
-            assert decoded["tags"]["workflow"] == UNSAVED_WORKFLOW_SENTINEL
-            assert result.workflow_name == UNSAVED_WORKFLOW_SENTINEL
-            # The uuid must not leak by any other route, encoded or decoded.
-            assert "unsaved:" not in json.dumps(decoded)
-            assert "unsaved:" not in base64.urlsafe_b64decode(result.header_value).decode("utf-8")
-        finally:
-            while engine.context_manager.has_current_workflow():
-                engine.context_manager.pop_workflow()
-
-    def test_saved_workflow_reports_its_registry_key(self, engine: Engine) -> None:
-        """A saved workflow's key is the workspace-relative path minus extension."""
-        engine.context_manager.push_workflow("shots/sh020/lighting")
-        try:
-            result = engine.handle_request(GetAttributionContextRequest())
-            assert isinstance(result, GetAttributionContextResultSuccess)
-
-            workflow = _tags(result)["workflow"]
-            assert workflow == "shots/sh020/lighting"
-            assert not workflow.startswith("unsaved:")
-        finally:
-            engine.context_manager.pop_workflow()
-
-    def test_missing_workflow_context_omits_workflow(self, engine: Engine) -> None:
-        """No workflow pushed -> the key is absent, which is distinct from the scratch bucket."""
-        assert not engine.context_manager.has_current_workflow()
-
-        result = engine.handle_request(GetAttributionContextRequest())
-        assert isinstance(result, GetAttributionContextResultSuccess)
-
-        assert "workflow" not in _tags(result)
-        assert result.workflow_name is None
-
-
-class TestOrchestratorEngineId:
-    """Pins the resolver, not a shipping behavior.
-
-    The orchestrator answers every attribution request and has no parent, so production never
-    populates this key. It is not evidence that worker spend is joinable to its orchestrator.
+    An id has no enforced shape -- no pattern, no length cap -- so it can carry anything a user
+    typed or a filesystem produced. Every shape below is one the Cloud would strip, cut, or
+    refuse to store, and every one of them still goes out exactly as the project stores it:
+    a value repaired here arrives looking intact, which is the one thing the far end cannot
+    detect and the one outcome worse than no attribution.
     """
 
-    @pytest.fixture
-    def budget_manager(self) -> BudgetManager:
-        return BudgetManager(MagicMock(), engine=_mock_engine())
-
-    def test_orchestrator_engine_id_present_when_the_env_var_is_set(
-        self, budget_manager: BudgetManager, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setenv("GTN_ORCHESTRATOR_ENGINE_ID", "eng-orch")
-
-        result = _succeed(budget_manager)
-
-        assert _tags(result)["orchestrator_engine_id"] == "eng-orch"
-        assert result.orchestrator_engine_id == "eng-orch"
-
-    def test_orchestrator_engine_id_absent_on_the_orchestrator(
-        self, budget_manager: BudgetManager, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.delenv("GTN_ORCHESTRATOR_ENGINE_ID", raising=False)
-
-        result = _succeed(budget_manager)
-
-        assert "orchestrator_engine_id" not in _tags(result)
-        assert result.orchestrator_engine_id is None
-
-
-class TestDegradation:
-    """The caller is about to spend money: degrade to a missing key, never raise."""
-
-    def _manager(self) -> BudgetManager:
+    def _manager_with(self, *ids: str) -> BudgetManager:
         mock_engine = _mock_engine()
-        mock_engine.project_manager.get_project_chain.return_value = [_entry("leaf", "Leaf")]
-        mock_engine.context_manager.has_current_workflow.return_value = True
-        mock_engine.context_manager.get_current_workflow_name.return_value = "shots/sh020"
+        mock_engine.project_manager.get_project_chain.return_value = [
+            _entry(project_id, f"Name {index}") for index, project_id in enumerate(ids)
+        ]
         return BudgetManager(MagicMock(), engine=mock_engine)
 
-    @pytest.mark.parametrize(
-        ("break_field", "absent_key"),
-        [
-            ("project_chain", "project"),
-            ("workflow", "workflow"),
-            ("engine_id", "engine_id"),
-            ("session_id", "session_id"),
-        ],
-    )
-    def test_peer_failure_degrades_one_field_not_the_header(
-        self, break_field: str, absent_key: str, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """One unhappy peer costs one key, not the whole attribution."""
-        manager = self._manager()
-        mock_engine = cast("MagicMock", manager.engine)
-        boom = RuntimeError("peer exploded")
+    def test_a_control_character_travels_unfiltered(self) -> None:
+        """The Cloud drops an entry it cannot store, promotes its parent to leaf, and reports it.
 
-        if break_field == "project_chain":
-            mock_engine.project_manager.get_project_chain.side_effect = boom
-        elif break_field == "workflow":
-            mock_engine.context_manager.get_current_workflow_name.side_effect = boom
-        elif break_field == "engine_id":
-            type(mock_engine.engine_identity_manager).engine_id = PropertyMock(side_effect=boom)
-        elif break_field == "session_id":
-            type(mock_engine.session_manager).active_session_id = PropertyMock(side_effect=boom)
+        Withholding the chain here would trade that reported drop for a silent absence, and
+        the engine cannot tell an id a user meant to type from one they pasted a newline into.
+        """
+        result = _succeed(self._manager_with("acme\nstudios", "root"))
+
+        assert _tags(result)["project"] == ["acme\nstudios", "root"]
+
+    def test_a_padded_id_travels_unstripped(self) -> None:
+        """An id is an identifier, so it goes out as the project spells it.
+
+        Stripping would be cheap and invisible, which is exactly the problem: `project_chain`
+        would then report a string the engine cannot look the project up by.
+        """
+        result = _succeed(self._manager_with("  season-02-a3f9c1  "))
+
+        assert _tags(result)["project"] == ["  season-02-a3f9c1  "]
+        assert result.project_chain == ["  season-02-a3f9c1  "]
+
+    def test_an_id_past_the_clouds_value_cap_travels_uncut(self) -> None:
+        """Cutting is the far end's job, and doing it here would hide that it happened.
+
+        The Cloud truncates a value past its 256-character cap, marks the chain mangled, and
+        stops matching it against admin-authored paths. Pre-cutting hands it a prefix that
+        looks intact, so it matches -- and two sibling projects sharing their first 256
+        characters silently collapse onto one budget with nothing recorded.
+        """
+        long_id = "s" * 300
+        result = _succeed(self._manager_with(long_id, "root"))
+
+        assert _tags(result)["project"] == [long_id, "root"]
+        assert result.project_chain == [long_id, "root"]
+
+    def test_an_unencodable_id_costs_the_whole_header(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The one thing the wire physically cannot carry, and the module's only failure.
+
+        A project created before ids existed carries the canonical path to its file as its id,
+        so a path whose bytes are not valid UTF-8 arrives holding lone surrogates from
+        `surrogateescape` -- and `str.encode` refuses them. There is no honest partial form to
+        send instead: dropping just that entry would promote its parent to leaf and bill a
+        real ancestor for spend it never incurred. So the header is given up and the call goes
+        out unattributed.
+        """
+        manager = self._manager_with("renders-\udce9", "root")
 
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
-            result = _succeed(manager)
+            result = _dispatch(manager)
 
-        assert absent_key not in _tags(result)
+        assert isinstance(result, GetAttributionContextResultFailure)
+        assert "attribution" in str(result.result_details).lower()
         assert any(record.levelno == logging.WARNING for record in caplog.records)
 
-    def test_no_workflow_context_is_not_an_error(self) -> None:
-        """`has_current_workflow()` returning False is an ordinary state, not a degradation."""
-        manager = self._manager()
-        cast("MagicMock", manager.engine).context_manager.has_current_workflow.return_value = False
+    def test_the_encoder_returns_none_instead_of_raising(self) -> None:
+        """Pinned on the module function, because the cost of raising is paid per metered call.
 
-        result = _succeed(manager)
-
-        assert "workflow" not in _tags(result)
-
-
-class TestSizeCap:
-    """Reduction sheds the cheapest dimensions first, then the chain, then fails."""
-
-    def _manager(self) -> BudgetManager:
-        """Short names, so the byte caps in each test below bracket the reduction rung it means to exercise."""
-        mock_engine = _mock_engine()
-        mock_engine.project_manager.get_project_chain.return_value = [
-            _entry("leaf", "Leaf"),
-            _entry("parent", "Parent"),
-        ]
-        mock_engine.context_manager.has_current_workflow.return_value = True
-        mock_engine.context_manager.get_current_workflow_name.return_value = "shots/sh020/lighting"
-        return BudgetManager(MagicMock(), engine=mock_engine)
-
-    def test_a_header_too_large_for_the_ingress_sheds_the_chain(self, caplog: pytest.LogCaptureFixture) -> None:
-        """The only reduction left, run against the real bound rather than a patched one.
-
-        A 4200-character name encodes to 5888 bytes with its parent, past the 5632 the ingress
-        will carry. Nothing is repaired to get under that -- the name is not cut and the chain
-        is not shortened, because either would arrive looking intact. The chain goes whole and
-        the spend lands in the default budget, which is the same place the Cloud would have put
-        it once it saw a mangled chain.
-        """
-        mock_engine = _mock_engine()
-        mock_engine.project_manager.get_project_chain.return_value = [
-            _entry("leaf", "S" * 4200),
-            _entry("root", "Acme Studios"),
-        ]
-        mock_engine.context_manager.has_current_workflow.return_value = True
-        mock_engine.context_manager.get_current_workflow_name.return_value = "shots/sh020/lighting"
-        manager = BudgetManager(MagicMock(), engine=mock_engine)
-
-        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
-            result = _succeed(manager, node_type="GriptapeProxyImage")
-
-        tags = _tags(result)
-        assert "project" not in tags
-        assert result.project_chain == []
-        # Empty *and* flagged: the chain was shed. Empty and unflagged means no project open.
-        assert result.chain_truncated is True
-        # Only the chain is given up. The labels run tens of bytes against a 5632-byte bound,
-        # so shedding them alongside would cost a dashboard row and buy nothing.
-        assert tags["workflow"] == "shots/sh020/lighting"
-        assert tags["node_type"] == "GriptapeProxyImage"
-        # The structured fields have to agree with the reduced header, not the pre-encode values.
-        assert result.workflow_name == "shots/sh020/lighting"
-        assert any(record.levelno == logging.WARNING for record in caplog.records)
-
-    def test_an_enormous_chain_is_shed_whole_rather_than_in_part(self) -> None:
-        """There is no partial rung between the whole chain and none of it.
-
-        Thirty-two names at 300 characters encode to 13192 bytes, twice the bound and past
-        nginx's own header buffer, so this is the shape that most tempts a prefix. Sending one
-        would present a nested project as a root: budget paths are root-anchored, so a partial
-        chain matches an unrelated top-level project of the same name at worst and nothing at
-        best, and neither end records that it happened.
-        """
-        mock_engine = _mock_engine()
-        mock_engine.project_manager.get_project_chain.return_value = [
-            _entry(f"p{index}", "N" * 300) for index in range(32)
-        ]
-        mock_engine.context_manager.has_current_workflow.return_value = True
-        mock_engine.context_manager.get_current_workflow_name.return_value = "shots/sh020/lighting"
-        manager = BudgetManager(MagicMock(), engine=mock_engine)
-
-        result = _succeed(manager, node_type="GriptapeProxyImage")
-
-        tags = _tags(result)
-        assert "project" not in tags
-        assert result.project_chain == []
-        assert result.chain_truncated is True
-        assert tags["workflow"] == "shots/sh020/lighting"
-
-    def test_the_utf8_backstop_returns_none_instead_of_raising(self) -> None:
-        """The one path no dispatch can reach, tested directly because it still has to hold.
-
-        Every dimension is filtered through `_transmissible_or_none` before it gets here, so
-        the encoder should never see an unencodable payload -- but if one ever slips past, the
-        cost of letting `str.encode` raise is an ERROR with a traceback on every metered call,
-        because a handler exception becomes a `GenericResultFailure` that ignores
-        `failure_log_level`. Called on the module function, since the guard is unreachable
-        through the manager by construction.
+        A handler exception becomes a `GenericResultFailure`, which ignores `failure_log_level`
+        and logs an ERROR with a traceback -- once for every credit-consuming call the artist
+        makes.
         """
         payload = {"v": 1, "tags": {"project": ["\udce9"]}}
 
@@ -608,244 +421,22 @@ class TestSizeCap:
 
         assert budget_manager_module._encode_attribution_payload(payload) is None
 
-    def test_a_header_that_does_not_fit_even_chainless_fails(self) -> None:
-        """The floor: no usable header value exists, so Success would be a lie."""
-        manager = self._manager()
 
-        with patch.object(budget_manager_module, "_MAX_ENCODED_HEADER_BYTES", 1):
-            result = _dispatch(manager)
+class TestDegradation:
+    """The caller is about to spend money: degrade to a missing key, never raise."""
 
-        assert isinstance(result, GetAttributionContextResultFailure)
-        assert "attribution" in str(result.result_details).lower()
-
-    def test_an_unencodable_envelope_fails_rather_than_raising(self) -> None:
-        """The second backstop, tested directly for the same reason as the first.
-
-        Every dimension outside the chain is filtered through `_transmissible_or_none` and every
-        name through `_resolve_project_chain`, so the chainless envelope is unencodable only if
-        one of those filters has been broken. If that ever happens the cost of raising here is
-        an ERROR with a traceback on every metered call, so it returns None and the handler
-        answers Failure.
-        """
-        facts = budget_manager_module._AttributionFacts(
-            project_chain=["Leaf"],
-            workflow_name=None,
-            node_type=None,
-            engine_id=None,
-            orchestrator_engine_id=None,
-            session_id=None,
-        )
-
-        with patch.object(budget_manager_module, "_encode_attribution_payload", return_value=None):
-            assert budget_manager_module._encode_attribution_header(facts) is None
-
-    def test_a_chainless_payload_over_the_bound_fails_without_retrying_itself(self) -> None:
-        """With no chain there is nothing to give up, so the second attempt is not made.
-
-        Same Failure either way; the point is that the reduction path does not re-encode an
-        identical payload and log a warning about shedding a chain that was never there.
-        """
+    def test_peer_failure_degrades_the_key_not_the_header(self, caplog: pytest.LogCaptureFixture) -> None:
+        """An unhappy project manager costs the project key, not the whole attribution."""
         mock_engine = _mock_engine()
-        mock_engine.project_manager.get_project_chain.return_value = []
-        manager = BudgetManager(MagicMock(), engine=mock_engine)
-
-        with patch.object(budget_manager_module, "_MAX_ENCODED_HEADER_BYTES", 1):
-            result = _dispatch(manager)
-
-        assert isinstance(result, GetAttributionContextResultFailure)
-
-
-class TestTransmissibility:
-    """A value the Cloud cannot store is dropped here rather than sent and discarded there.
-
-    Now that the chain carries names, the plausible offender is a user typing or pasting one:
-    a project name is free text from a YAML file, and a pasted newline survives the schema.
-    The surrogate case belongs to the path-derived values -- the workflow key, and identifiers
-    `os.getenv` decodes with `surrogateescape` -- but a name read off disk can carry one too,
-    so both shapes are parametrized against the same filter.
-    """
-
-    # A pasted line break in a project name. Legal in YAML, encodes fine here, and dropped
-    # by the Cloud's storability check.
-    CONTROL_CHAR_NAME = "Acme\nStudios"
-    # A name read from a file whose bytes are not valid UTF-8 carries a lone surrogate.
-    SURROGATE_NAME = "Renders \udce9"
-    # Truthy here, so `get_project_chain` hands it over as a name, but it strips to empty at
-    # the far end -- which drops the entry and promotes its parent to leaf.
-    WHITESPACE_NAME = "  "
-    NBSP_NAME = "\u00a0"
-
-    @pytest.mark.parametrize("bad_name", [CONTROL_CHAR_NAME, SURROGATE_NAME, WHITESPACE_NAME, NBSP_NAME])
-    def test_an_untransmissible_name_drops_the_whole_chain(
-        self, bad_name: str, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """The chain goes as a unit: a partial chain bills an ancestor for the leaf's spend.
-
-        Budget paths are root-anchored, so a chain missing a link matches nothing either way.
-        Dropping only the offending entry would promote its parent to leaf and charge a real
-        project for spend it never incurred, which is worse than no attribution at all.
-        """
-        mock_engine = _mock_engine()
-        mock_engine.project_manager.get_project_chain.return_value = [
-            _entry("leaf", "Leaf"),
-            _entry("parent", bad_name),
-        ]
+        mock_engine.project_manager.get_project_chain.side_effect = RuntimeError("peer exploded")
         manager = BudgetManager(MagicMock(), engine=mock_engine)
 
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
             result = _succeed(manager)
 
         assert "project" not in _tags(result)
-        assert result.project_chain == []
+        assert _decode(result) == {"v": ATTRIBUTION_SCHEMA_VERSION}
         assert any(record.levelno == logging.WARNING for record in caplog.records)
-
-    def test_an_ordinary_human_name_still_travels(self) -> None:
-        """The filter targets unstorable bytes, not punctuation -- names are meant to read like names."""
-        mock_engine = _mock_engine()
-        mock_engine.project_manager.get_project_chain.return_value = [_entry("leaf", "Acme Studios / S02 \u2014 v3")]
-        manager = BudgetManager(MagicMock(), engine=mock_engine)
-
-        assert _tags(_succeed(manager))["project"] == ["Acme Studios / S02 \u2014 v3"]
-
-    def test_a_padded_name_travels_in_the_form_the_far_end_stores(self) -> None:
-        """Normalize here or the result describes a string budgets never match.
-
-        The Cloud strips what it keeps, so `" Acme Studios "` is stored as `"Acme Studios"`.
-        Sending the padded form would leave `project_chain` reporting a value that no budget
-        rule can be written against.
-        """
-        mock_engine = _mock_engine()
-        mock_engine.project_manager.get_project_chain.return_value = [_entry("leaf", "  Acme Studios  ")]
-        manager = BudgetManager(MagicMock(), engine=mock_engine)
-
-        result = _succeed(manager)
-
-        assert _tags(result)["project"] == ["Acme Studios"]
-        assert result.project_chain == ["Acme Studios"]
-
-    def test_a_padded_workflow_key_travels_unstripped(self) -> None:
-        """A registry key is an identifier, so it goes out as the engine spells it.
-
-        `derive_registry_key` builds the key from a workspace-relative path, and a directory
-        or filename may legally begin or end with a space on macOS and Linux. Trimming it
-        would report a string that no longer names any workflow the engine can look up --
-        the opposite of the project-name case, where normalizing is what makes the value
-        matchable.
-        """
-        mock_engine = _mock_engine()
-        mock_engine.context_manager.has_current_workflow.return_value = True
-        mock_engine.context_manager.get_current_workflow_name.return_value = "shots/sh020 /lighting"
-        manager = BudgetManager(MagicMock(), engine=mock_engine)
-
-        result = _succeed(manager)
-
-        assert _tags(result)["workflow"] == "shots/sh020 /lighting"
-        assert result.workflow_name == "shots/sh020 /lighting"
-
-    def test_a_name_longer_than_the_value_cap_travels_uncut(self) -> None:
-        """Cutting is the far end's job, and doing it here would hide that it happened.
-
-        The Cloud truncates an over-long name rather than dropping it, then marks the chain
-        mangled and stops matching it against admin-authored paths. Pre-cutting hands it a
-        prefix that looks intact, so it matches -- and two sibling projects sharing their
-        first 256 characters silently collapse onto one budget with nothing recorded.
-        Stripping stays, because the far end strips too and flags nothing when it does.
-        """
-        mock_engine = _mock_engine()
-        mock_engine.project_manager.get_project_chain.return_value = [_entry("leaf", "  " + "S" * 300 + "  ")]
-        manager = BudgetManager(MagicMock(), engine=mock_engine)
-
-        result = _succeed(manager)
-
-        assert _tags(result)["project"] == ["S" * 300]
-        assert result.project_chain == ["S" * 300]
-
-    def test_an_unstorable_byte_past_the_value_cap_does_not_cost_the_chain(self) -> None:
-        """Judge the kept form, or the engine refuses a name the far end would have stored.
-
-        The cut happens before the storability test on the far end, so a control character
-        sitting past the cap is gone by the time anything looks at it. Testing the whole
-        string here would drop a chain over a byte that never arrives -- and the name still
-        travels uncut, because the far end is the one that should decide it was too long.
-        """
-        mock_engine = _mock_engine()
-        mock_engine.project_manager.get_project_chain.return_value = [
-            _entry("leaf", "S" * 300 + "\n" + "S" * 20),
-            _entry("root", "Acme Studios"),
-        ]
-        manager = BudgetManager(MagicMock(), engine=mock_engine)
-
-        result = _succeed(manager)
-
-        assert _tags(result)["project"] == ["S" * 300 + "\n" + "S" * 20, "Acme Studios"]
-
-    def test_a_surrogate_past_the_value_cap_drops_the_chain(self, caplog: pytest.LogCaptureFixture) -> None:
-        """Encodability is the one property judged on the whole name rather than the kept form.
-
-        A lone surrogate past the cap is invisible to the Cloud -- its own truncation removes
-        the byte before it decides storability -- so the kept form passes every other test. But
-        the name that would travel cannot be encoded, and the cut form that could is a repair
-        arriving intact. The chain is dropped instead, which is the same abstention any other
-        unsendable name earns.
-        """
-        mock_engine = _mock_engine()
-        mock_engine.project_manager.get_project_chain.return_value = [
-            _entry("leaf", "S" * 300 + "\udce9"),
-            _entry("root", "Acme Studios"),
-        ]
-        manager = BudgetManager(MagicMock(), engine=mock_engine)
-
-        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
-            result = _succeed(manager)
-
-        assert "project" not in _tags(result)
-        assert result.project_chain == []
-        # Not the size path: nothing was shed to fit, so the flag stays down.
-        assert result.chain_truncated is False
-        assert any(record.levelno == logging.WARNING for record in caplog.records)
-
-    def test_an_untransmissible_workflow_key_is_omitted_without_touching_the_chain(self) -> None:
-        """One unusable dimension costs its own key and nothing else."""
-        mock_engine = _mock_engine()
-        mock_engine.project_manager.get_project_chain.return_value = [_entry("leaf", "Leaf")]
-        mock_engine.context_manager.has_current_workflow.return_value = True
-        mock_engine.context_manager.get_current_workflow_name.return_value = "shots/sh020\udce9/lighting"
-        manager = BudgetManager(MagicMock(), engine=mock_engine)
-
-        result = _succeed(manager)
-
-        tags = _tags(result)
-        assert "workflow" not in tags
-        assert tags["project"] == ["Leaf"]
-        assert result.workflow_name is None
-
-    def test_an_untransmissible_node_type_is_omitted(self) -> None:
-        """`node_type` is caller-supplied, so it gets the same check as the engine's own facts."""
-        manager = BudgetManager(MagicMock(), engine=_mock_engine())
-
-        result = _succeed(manager, node_type="Griptape\udce9Image")
-
-        assert "node_type" not in _tags(result)
-        assert result.node_type is None
-
-    def test_an_unencodable_identifier_costs_its_own_key_and_nothing_else(self) -> None:
-        """An identifier gets the same per-field filter every other dimension gets.
-
-        `os.getenv` decodes with `surrogateescape`, so `orchestrator_engine_id` can arrive
-        holding a lone surrogate that `str.encode` refuses. Filtering at the read spends one
-        key on the documented "could not determine this" degradation; letting it reach the
-        encoder costs the whole header, and blames size for a problem that is not size.
-        """
-        mock_engine = _mock_engine()
-        manager = BudgetManager(MagicMock(), engine=mock_engine)
-
-        with patch.dict(os.environ, {"GTN_ORCHESTRATOR_ENGINE_ID": "eng-orch\udce9"}):
-            result = _succeed(manager)
-
-        tags = _tags(result)
-        assert "orchestrator_engine_id" not in tags
-        assert result.orchestrator_engine_id is None
-        assert tags["engine_id"] == mock_engine.engine_identity_manager.engine_id
 
 
 class TestConfidentiality:
@@ -859,26 +450,30 @@ class TestConfidentiality:
         """Pins `field(..., kw_only=True)` against a future bare redeclaration.
 
         The base payload is `kw_only=True` but this subclass is a plain `@dataclass`, so a
-        bare `broadcast_result = False` would re-register it as the second positional
-        parameter -- and a caller passing `node_type` positionally could then flip
-        broadcasting back on by accident.
+        bare `broadcast_result = False` would re-register it as the first positional
+        parameter -- and broadcasting the header on every metered call is not something a
+        stray positional argument should be able to turn on.
         """
-        assert GetAttributionContextRequest("GriptapeProxyImage").node_type == "GriptapeProxyImage"
         with pytest.raises(TypeError):
-            GetAttributionContextRequest("GriptapeProxyImage", True)  # type: ignore[misc]
+            GetAttributionContextRequest(True)  # type: ignore[misc]
 
     def test_header_value_is_never_logged(self, engine: Engine, caplog: pytest.LogCaptureFixture) -> None:
         """Neither the log stream nor `result_details`, which is logged as well as broadcast."""
         with caplog.at_level(logging.DEBUG, logger="griptape_nodes"):
-            result = engine.handle_request(GetAttributionContextRequest(node_type="GriptapeProxyImage"))
+            result = engine.handle_request(GetAttributionContextRequest())
         assert isinstance(result, GetAttributionContextResultSuccess)
 
         assert result.header_value not in caplog.text
         assert result.header_value not in str(result.result_details)
 
-    def test_node_label_never_appears(self, engine: Engine) -> None:
-        """`BaseNode.name` is user-authored and forbidden; no key named `name` at any depth."""
-        result = engine.handle_request(GetAttributionContextRequest(node_type="GriptapeProxyImage"))
+    def test_no_user_authored_label_appears(self, engine: Engine) -> None:
+        """`BaseNode.name` and `ProjectTemplate.name` are user-authored and never travel.
+
+        Ids are the only strings the payload carries now, so no key named `name` at any depth
+        -- and the guard stays even though the builder makes it near-tautological, because it
+        is what a future dimension would trip over.
+        """
+        result = engine.handle_request(GetAttributionContextRequest())
         assert isinstance(result, GetAttributionContextResultSuccess)
 
         def walk(value: Any) -> None:
@@ -891,6 +486,22 @@ class TestConfidentiality:
                     walk(child)
 
         walk(_decode(result))
+
+    def test_a_project_name_never_reaches_the_payload(self) -> None:
+        """Every chain entry carries a name; none of them is ever sent."""
+        mock_engine = _mock_engine()
+        mock_engine.project_manager.get_project_chain.return_value = [
+            _entry("leaf", "Acme Studios"),
+            _entry("root", "Feature Film"),
+        ]
+        manager = BudgetManager(MagicMock(), engine=mock_engine)
+
+        result = _succeed(manager)
+
+        assert _tags(result)["project"] == ["leaf", "root"]
+        for name in ("Acme Studios", "Feature Film"):
+            assert name not in json.dumps(_decode(result))
+            assert name not in result.header_value
 
 
 class TestWiring:

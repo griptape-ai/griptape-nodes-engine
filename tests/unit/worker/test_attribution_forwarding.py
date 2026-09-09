@@ -36,8 +36,7 @@ def _orchestrator_answer() -> GetAttributionContextResultSuccess:
     """A result only the orchestrator could have produced, so its origin is unambiguous."""
     return GetAttributionContextResultSuccess(
         header_value="from-the-orchestrator",
-        workflow_name="shots/sh020/lighting",
-        engine_id="orchestrator-engine",
+        project_chain=["orchestrator-project"],
         result_details="ok",
     )
 
@@ -65,7 +64,7 @@ class TestAttributionIsForwardedFromWorkers:
         assert result_event.succeeded()
         assert isinstance(result_event.result, GetAttributionContextResultSuccess)
         assert result_event.result.header_value == "from-the-orchestrator"
-        assert result_event.result.workflow_name == "shots/sh020/lighting"
+        assert result_event.result.project_chain == ["orchestrator-project"]
 
     @pytest.mark.asyncio
     async def test_attribution_is_local_outside_node_execution(self) -> None:

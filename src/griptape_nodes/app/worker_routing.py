@@ -108,9 +108,9 @@ HandlerCallback = "Callable[[RequestPayload], ResultPayload | Awaitable[ResultPa
 FORWARDED_REQUEST_TYPES: frozenset[type[RequestPayload]] = frozenset(
     {
         # budget_events
-        # A worker has its own engine id and no workflow context, so answering locally would
-        # report the wrong engine and omit the workflow. The orchestrator holds the
-        # authoritative project chain and workflow name.
+        # A worker's project manager is a replica populated by broadcast, so it can serve a
+        # stale chain. The orchestrator holds the authoritative one, and asking it costs the
+        # orchestrator path -- which is all shipping traffic today -- nothing.
         GetAttributionContextRequest,
         # connection_events
         CreateConnectionRequest,
