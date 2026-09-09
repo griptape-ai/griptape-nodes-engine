@@ -332,7 +332,7 @@ class ThreadMetadata:
     message_count: int
     archived: bool
     local_id: str | None = None
-    runs: list[RunRecord] = field(default_factory=list)
+    runs: list[RunRecord] | None = None
 
 
 @dataclass

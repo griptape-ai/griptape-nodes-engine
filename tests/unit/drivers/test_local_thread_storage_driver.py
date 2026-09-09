@@ -158,6 +158,7 @@ def test_append_run_record_appears_in_get_thread_metadata(storage: LocalThreadSt
     storage.append_run_record(thread_id, record)
 
     thread = storage.get_thread_metadata(thread_id)
+    assert thread.runs is not None
     assert len(thread.runs) == 1
     assert thread.runs[0] == record
 
@@ -169,6 +170,7 @@ def test_append_run_record_accumulates_across_turns(storage: LocalThreadStorageD
     storage.append_run_record(thread_id, RunRecord(message_index=3, provider_name="griptape_cloud", model="gpt-4o"))
 
     thread = storage.get_thread_metadata(thread_id)
+    assert thread.runs is not None
     assert len(thread.runs) == 2  # noqa: PLR2004
     assert thread.runs[0].message_index == 1
     assert thread.runs[1].message_index == 3  # noqa: PLR2004
@@ -180,7 +182,7 @@ def test_list_threads_omits_runs(storage: LocalThreadStorageDriver) -> None:
     storage.append_run_record(thread_id, RunRecord(message_index=1, provider_name="ollama", model="llama3"))
 
     thread = next(t for t in storage.list_threads() if t.thread_id == thread_id)
-    assert thread.runs == [], "list_threads must not deserialize runs"
+    assert thread.runs is None, "list_threads must not deserialize runs"
 
 
 def test_get_thread_metadata_skips_malformed_run_records(storage: LocalThreadStorageDriver) -> None:
@@ -197,5 +199,6 @@ def test_get_thread_metadata_skips_malformed_run_records(storage: LocalThreadSto
     )
 
     thread = storage.get_thread_metadata(thread_id)
+    assert thread.runs is not None
     assert len(thread.runs) == 1
     assert thread.runs[0].message_index == 1
