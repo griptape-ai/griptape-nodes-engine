@@ -44,22 +44,29 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("griptape_nodes")
 
-# Matches the Cloud parser's MAX_CHAIN_LENGTH. Truncating lower would not be conservative: the
-# parser flags a truncated chain as mangled because budget paths are root-anchored, so dropping
-# ancestors client-side costs matches the Cloud would have made.
+# The four constants below mirror the Cloud parser, and each was read off it rather than agreed
+# in a doc: `control_plane/api/griptapecloud/components/spend/attribution.py` in the
+# griptape-cloud repo (PR #2225). Diverging from any of them costs attribution silently, so
+# check that file before changing one.
+
+# The parser's MAX_CHAIN_LENGTH. Truncating lower would not be conservative: it flags a
+# truncated chain as mangled because budget paths are root-anchored, so dropping ancestors
+# client-side costs matches the Cloud would have made.
 _MAX_PROJECT_CHAIN_ENTRIES = 32
 
-# base64 inflates 4:3, so 4096 decoded bytes encode to at most 5464 -- inside the 5.5 KB raw
-# ceiling, itself well under nginx's 8 KB default.
+# The parser's MAX_DECODED_LENGTH, measured the same way -- on the decoded bytes. base64
+# inflates 4:3, so 4096 decoded bytes encode to at most 5464, inside its MAX_RAW_HEADER_LENGTH
+# of 5632 and well under nginx's 8 KB default.
 _MAX_DECODED_PAYLOAD_BYTES = 4096
 
-# C0 and C1 control characters, mirroring the Cloud parser's storability rule. A value
+# C0 and C1 control characters, the parser's `_is_storable` rule written as a class. A value
 # containing one is stored nowhere on the far end, so sending it buys nothing and costs
 # something -- see `_is_transmissible`.
 _UNSTORABLE_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
-# Matches the Cloud parser's MAX_VALUE_LENGTH -- the length it cuts a tag value down to before
-# it decides anything about that value. Applied to project names only; see `_as_the_cloud_keeps_it`.
+# The parser's MAX_VALUE_LENGTH, and a cap on *characters*: it compares `len(value)` and slices
+# `value[:MAX_VALUE_LENGTH]` on a `str`, never on encoded bytes. Applied to project names only;
+# see `_as_the_cloud_keeps_it`.
 _MAX_VALUE_CHARS = 256
 
 
@@ -188,7 +195,9 @@ def _build_attribution_payload(facts: _AttributionFacts) -> dict[str, Any]:
 def _encode_attribution_payload(payload: dict[str, Any]) -> str | None:
     """Encode a payload as base64url, or None when it cannot be encoded or exceeds the cap.
 
-    Padding is kept so the Cloud can call `urlsafe_b64decode` without re-padding.
+    Padding is kept because the payload is `base64.b64encode`'s natural output and stripping it
+    would buy nothing: the parser re-pads whatever it receives before decoding, so both forms
+    arrive intact.
 
     The UTF-8 guard is a backstop -- every dimension is filtered through `_transmissible_or_none`
     upstream, which costs one key where returning None here costs the whole header. It stays
