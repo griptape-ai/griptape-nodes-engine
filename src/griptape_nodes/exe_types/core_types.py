@@ -1790,6 +1790,11 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         GUI event payload, and this is save-only. ``children`` already carries trait
         dicts, but they hold rendered ui_options rather than constructor arguments.
 
+        ``trait_module`` is the class's raw import path. A library trait's module name is
+        only stable for the process that loaded it; ``NodeManager`` rewrites it to the
+        library's stable namespace before it is saved, so ``TraitRegistry.resolve`` can find
+        the same class again on load.
+
         Callbacks are recorded as the name of a method on the owning node, never as the
         callback itself. A trait with no nameable callbacks omits the key.
         """
@@ -1798,6 +1803,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         for trait in self.find_elements_by_type(Trait):
             state: dict[str, Any] = {
                 "trait_name": type(trait).__name__,
+                "trait_module": type(trait).__module__,
                 "trait_state": trait.to_state(),
             }
             callback_names = trait.callback_names(owner)
