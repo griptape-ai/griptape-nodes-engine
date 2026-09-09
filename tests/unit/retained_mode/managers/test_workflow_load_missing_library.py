@@ -72,8 +72,12 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     RegisterWorkflowResultSuccess,
     RunWorkflowFromRegistryRequest,
     RunWorkflowFromRegistryResultSuccess,
+    RunWorkflowFromScratchRequest,
+    RunWorkflowFromScratchResultSuccess,
     SaveWorkflowFileFromSerializedFlowResultSuccess,
+    WorkflowStatus,
 )
+from griptape_nodes.retained_mode.managers.fitness_problems.workflows import LibraryNotRegisteredProblem
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.utils.version_utils import engine_version
 
@@ -349,13 +353,24 @@ class TestWorkflowOpensWithoutItsLibrary:
         reopened = _rebuild_engine_without_library(tmp_path, disabled=True)
         result = _run(reopened, relative_path)
 
-        assert len(result.unresolved_libraries) == 1
-        message = result.unresolved_libraries[0]
-        assert _UNAVAILABLE_LIBRARY in message
-        # The library that loaded is not mentioned; only the one that needs attention is.
-        assert _AVAILABLE_LIBRARY not in message
-        # The reason travels with it, so "it's disabled" is not left for the reader to guess.
-        assert "disabled in libraries_to_register" in message
+        assert [type(problem) for problem in result.problems] == [LibraryNotRegisteredProblem]
+        problem = result.problems[0]
+        assert problem.library_name == _UNAVAILABLE_LIBRARY
+        # The reason travels with it, so "it's disabled" is not left for the reader to guess --
+        # the library is on disk and named in the user's config, just switched off.
+        assert problem.reason is not None
+        assert "disabled in libraries_to_register" in problem.reason
+
+    def test_a_load_with_placeholders_is_flawed_not_good(self, engine: Engine, tmp_path: Path) -> None:
+        """The status is what a caller gates on without parsing prose."""
+        del engine
+        relative_path = _save_two_library_workflow(tmp_path)
+
+        reopened = _rebuild_engine_without_library(tmp_path, disabled=True)
+        result = _run(reopened, relative_path)
+
+        assert result.execution_successful
+        assert result.status is WorkflowStatus.FLAWED
 
     def test_placeholder_names_the_library_and_node_type_it_stands_in_for(self, engine: Engine, tmp_path: Path) -> None:
         del engine
@@ -426,8 +441,10 @@ class TestEveryLibraryUnavailable:
         result = _run(reopened, relative_path)
 
         assert result.execution_successful, result.execution_details
-        # One warning per library, not one per node.
-        assert len(result.unresolved_libraries) == 2  # noqa: PLR2004
+        # One problem per library, not one per node...
+        assert {problem.library_name for problem in result.problems} == {_AVAILABLE_LIBRARY, _UNAVAILABLE_LIBRARY}
+        # ...and both collate into a single warning, because they are the same problem type.
+        assert len(reopened.workflow_manager.collate_problems_for_display(result.problems)) == 1
         assert isinstance(_node(reopened, "Kept"), ErrorProxyNode)
         assert isinstance(_node(reopened, "Vanishing"), ErrorProxyNode)
         # The flow itself is engine-owned, so it is there to hold them.
@@ -456,7 +473,8 @@ class TestPlaceholdersRoundTripBackToRealNodes:
         result = _run(restored, resaved_path)
 
         assert result.execution_successful, result.execution_details
-        assert result.unresolved_libraries == ()
+        assert result.status is WorkflowStatus.GOOD
+        assert result.problems == ()
         # The placeholder was a stand-in, not a replacement: the real node comes back.
         assert not isinstance(_node(restored, "Vanishing"), ErrorProxyNode)
         assert _get_value(restored, "Vanishing", "value2") == "vanishing value"
@@ -541,7 +559,7 @@ class TestDuplicateLibraryFailureIsNotBroadcast:
         result, visible_failures = _visible_register_failures(reopened, relative_path)
 
         assert result.execution_successful
-        assert result.unresolved_libraries != ()
+        assert result.problems != ()
         assert visible_failures == [], f"unexpected RegisterLibraryFromFile failure on the wire: {visible_failures}"
 
     def test_failure_is_broadcast_when_the_header_cannot_be_read(self, engine: Engine, tmp_path: Path) -> None:
@@ -553,7 +571,7 @@ class TestDuplicateLibraryFailureIsNotBroadcast:
         result, visible_failures = _visible_register_failures(reopened, relative_path)
 
         # Nothing could be pre-registered, so the engine has nothing of its own to report...
-        assert result.unresolved_libraries == ()
+        assert result.problems == ()
         # ...and the file's own registration failure stays visible as the sole signal.
         assert len(visible_failures) == 1
         assert _UNAVAILABLE_LIBRARY in visible_failures[0]
@@ -626,3 +644,65 @@ class TestOpenWorkflowRequest:
             if level == logging.WARNING and _UNAVAILABLE_LIBRARY in message
         ]
         assert len(warnings) == 1, result.result_details
+
+
+class TestHeadlessLoadRefusesPlaceholders:
+    """The tolerance is the editor's trade, not the executor's.
+
+    An artist can see placeholders on a canvas and decide what to do. A headless run has
+    nobody to see them, so proceeding would produce output from a graph that is missing nodes.
+    `LocalWorkflowExecutor` is the only sender of `RunWorkflowFromScratchRequest`.
+    """
+
+    def test_a_flawed_load_is_reported_on_the_result_payload(self, engine: Engine, tmp_path: Path) -> None:
+        """The status rides on the payload, so a caller gates without parsing prose."""
+        del engine
+        relative_path = _save_two_library_workflow(tmp_path)
+        reopened = _rebuild_engine_without_library(tmp_path, disabled=True)
+
+        result = asyncio.run(reopened.ahandle_request(RunWorkflowFromScratchRequest(file_path=relative_path)))
+
+        assert isinstance(result, RunWorkflowFromScratchResultSuccess), result
+        assert result.status is WorkflowStatus.FLAWED
+
+    def test_a_clean_load_reports_good(self, engine: Engine, tmp_path: Path) -> None:
+        """The gate has to distinguish, so a healthy load must not be refused."""
+        del engine
+        relative_path = _save_two_library_workflow(tmp_path)
+        restored = _restart_engine(tmp_path)
+        _register(restored, tmp_path / "libraries" / "AvailableNode" / "griptape_nodes_library.json")
+        _register(restored, tmp_path / "libraries" / "UnavailableNode" / "griptape_nodes_library.json")
+
+        result = asyncio.run(restored.ahandle_request(RunWorkflowFromScratchRequest(file_path=relative_path)))
+
+        assert isinstance(result, RunWorkflowFromScratchResultSuccess), result
+        assert result.status is WorkflowStatus.GOOD
+
+    def test_the_executor_refuses_a_flawed_load(self, engine: Engine, tmp_path: Path) -> None:
+        """The graph loaded, but the executor must not run it."""
+        del engine
+        from griptape_nodes.bootstrap.workflow_executors.local_workflow_executor import (
+            LocalExecutorError,
+            LocalWorkflowExecutor,
+        )
+
+        relative_path = _save_two_library_workflow(tmp_path)
+        reopened = _rebuild_engine_without_library(tmp_path, disabled=True)
+        del reopened
+
+        with pytest.raises(LocalExecutorError, match="FLAWED"):
+            asyncio.run(LocalWorkflowExecutor()._load_workflow_from_path(relative_path))
+
+    def test_the_executor_accepts_a_clean_load(self, engine: Engine, tmp_path: Path) -> None:
+        """The refusal must key on the status, not on merely having gone through this path."""
+        del engine
+        from griptape_nodes.bootstrap.workflow_executors.local_workflow_executor import LocalWorkflowExecutor
+
+        relative_path = _save_two_library_workflow(tmp_path)
+        restored = _restart_engine(tmp_path)
+        _register(restored, tmp_path / "libraries" / "AvailableNode" / "griptape_nodes_library.json")
+        _register(restored, tmp_path / "libraries" / "UnavailableNode" / "griptape_nodes_library.json")
+
+        asyncio.run(LocalWorkflowExecutor()._load_workflow_from_path(relative_path))
+
+        assert not isinstance(_node(restored, "Vanishing"), ErrorProxyNode)

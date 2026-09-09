@@ -226,7 +226,7 @@ from griptape_nodes.utils.file_utils import find_files_recursive
 from griptape_nodes.utils.string_utils import normalize_display_name
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Iterable, Sequence
     from types import TracebackType
 
     from griptape_nodes.exe_types.core_types import Parameter
@@ -378,16 +378,21 @@ class WorkflowManager(EngineScoped):
     class WorkflowExecutionResult(NamedTuple):
         """Result of a workflow execution.
 
-        `unresolved_libraries` names the declared libraries that would not register, one
-        user-facing message each. It is populated whether or not the run succeeded: a
-        library that never loads is reported as a warning on an otherwise-successful load
-        (its nodes come back as placeholders), and is the likeliest explanation when the
-        load fails outright.
+        `status` and `problems` mirror WorkflowInfo's fields, so a load's fitness is described
+        the same way whether it was assessed from the metadata header or observed while
+        replaying the file. Both are populated whether or not the run succeeded: a library that
+        never loads leaves the load FLAWED (its nodes come back as placeholders), and is the
+        likeliest explanation when the load fails outright.
+
+        Keeping the problems typed rather than pre-rendered lets a caller decide per problem
+        class -- an executor can refuse a FLAWED load that the editor is happy to open -- and
+        leaves the wording to each problem's own collate_problems_for_display.
         """
 
         execution_successful: bool
         execution_details: str
-        unresolved_libraries: tuple[str, ...] = ()
+        status: WorkflowStatus = WorkflowStatus.GOOD
+        problems: tuple[WorkflowProblem, ...] = ()
 
     class SaveWorkflowScenario(StrEnum):
         """Scenarios for saving workflows."""
@@ -703,7 +708,7 @@ class WorkflowManager(EngineScoped):
 
         return find_metadata_blocks(workflow_content, block_name)
 
-    def print_workflow_load_status(self, min_status: WorkflowStatus = WorkflowStatus.FLAWED) -> None:  # noqa: PLR0915
+    def print_workflow_load_status(self, min_status: WorkflowStatus = WorkflowStatus.FLAWED) -> None:
         workflow_file_paths = self.get_workflows_attempted_to_load()
         workflow_infos = []
         for workflow_file_path in workflow_file_paths:
@@ -787,16 +792,7 @@ class WorkflowManager(EngineScoped):
             if not wf_info.problems:
                 problems = "No problems detected."
             else:
-                # Group problems by type
-                problems_by_type = defaultdict(list)
-                for problem in wf_info.problems:
-                    problems_by_type[type(problem)].append(problem)
-
-                # Collate each group
-                collated_strings = []
-                for problem_class, instances in problems_by_type.items():
-                    collated_display = problem_class.collate_problems_for_display(instances)
-                    collated_strings.append(collated_display)
+                collated_strings = self.collate_problems_for_display(wf_info.problems)
 
                 # Format for display
                 if len(collated_strings) == 1:
@@ -882,7 +878,7 @@ class WorkflowManager(EngineScoped):
         # Resolve path using utility function
         workspace_path = self.engine.config_manager.workspace_path
         complete_file_path = resolve_workspace_path(Path(relative_file_path), workspace_path)
-        unresolved_libraries: list[str] = []
+        problems: list[WorkflowProblem] = []
         try:
             async with await anyio.open_file(Path(complete_file_path), encoding="utf-8") as file:
                 workflow_content = await file.read()
@@ -891,10 +887,7 @@ class WorkflowManager(EngineScoped):
             # The metadata header lists every library the workflow uses; each must
             # be registered (discovery is triggered if needed) so node construction
             # inside the script can succeed.
-            unresolved_libraries = await self._ensure_libraries_for_workflow(
-                relative_file_path=relative_file_path,
-                complete_file_path=complete_file_path,
-            )
+            problems = await self._ensure_libraries_for_workflow(relative_file_path=relative_file_path)
 
             # _generate_workflow_run_prerequisite_code emits one registration per header entry,
             # so each library we just failed to register is about to fail again on a request the
@@ -903,7 +896,7 @@ class WorkflowManager(EngineScoped):
             # in-file failures are the only record of what the workflow needs.
             duplicate_library_failures = (
                 EventSuppressionContext(self.engine.event_manager, {RegisterLibraryFromFileResultFailure})
-                if unresolved_libraries
+                if problems
                 else nullcontext()
             )
             with duplicate_library_failures:
@@ -932,21 +925,27 @@ class WorkflowManager(EngineScoped):
             return WorkflowManager.WorkflowExecutionResult(
                 execution_successful=False,
                 execution_details=f"Failed to run workflow on path '{complete_file_path}'. Exception: {e}",
-                unresolved_libraries=tuple(unresolved_libraries),
+                status=WorkflowStatus.UNUSABLE,
+                problems=tuple(problems),
             )
         return WorkflowManager.WorkflowExecutionResult(
             execution_successful=True,
             execution_details=f"Succeeded in running workflow on path '{complete_file_path}'.",
-            unresolved_libraries=tuple(unresolved_libraries),
+            # A problem that did not stop the load leaves it recoverable: the graph is on the
+            # canvas, with placeholders where the missing library's nodes belong.
+            status=WorkflowStatus.FLAWED if problems else WorkflowStatus.GOOD,
+            problems=tuple(problems),
         )
 
-    async def _ensure_libraries_for_workflow(self, *, relative_file_path: str, complete_file_path: Path) -> list[str]:
+    async def _ensure_libraries_for_workflow(self, *, relative_file_path: str) -> list[WorkflowProblem]:
         """Register every library the workflow declares before exec, tolerating the ones that won't.
 
         Reads node_libraries_referenced from the workflow's TOML metadata header
         and dispatches a RegisterLibraryFromFileRequest for each entry via
-        ahandle_request. Returns one user-facing message per library that would
-        not register; an empty list when every library resolved.
+        ahandle_request. Returns a LibraryNotRegisteredProblem per library that
+        would not register; an empty list when every library resolved. That is the
+        same problem type on_load_workflow_metadata_request records for the same
+        condition, so the two paths describe it identically.
 
         A library that cannot be registered does not by itself stop the load. The
         nodes it owns come back from CreateNodeRequest as ErrorProxyNode placeholders
@@ -978,7 +977,7 @@ class WorkflowManager(EngineScoped):
             # startup path may have already loaded them. This mirrors prior
             # behavior where a missing prereq block was survivable.
             return []
-        unresolved_libraries: list[str] = []
+        problems: list[WorkflowProblem] = []
         for lib_ref in load_metadata_result.metadata.node_libraries_referenced:
             register_result = await self.engine.ahandle_request(
                 RegisterLibraryFromFileRequest(
@@ -991,49 +990,61 @@ class WorkflowManager(EngineScoped):
                 )
             )
             if not register_result.succeeded():
-                # `library_version` may carry a non-semver placeholder (e.g. when the workflow was
-                # saved while the library was already unavailable, see node_manager._serialize_node_to_commands).
-                # Only render the version suffix when the stored value parses as semver.
-                has_real_version = bool(lib_ref.library_version) and semver.VersionInfo.is_valid(
-                    lib_ref.library_version
+                # The declared version is deliberately not reported. A library that never
+                # registered has no version to compare against, which is why the not-registered
+                # problem carries none -- the version-mismatch problems cover the case where a
+                # library IS present at the wrong version. It also keeps the non-semver
+                # placeholder a workflow stores when saved without its library (see
+                # node_manager._serialize_node_to_commands) from ever reaching the reader.
+                problems.append(
+                    LibraryNotRegisteredProblem(
+                        library_name=lib_ref.library_name,
+                        reason=str(getattr(register_result, "result_details", "")) or None,
+                    )
                 )
-                version_suffix = f" v{lib_ref.library_version}" if has_real_version else ""
-                inner_details = getattr(register_result, "result_details", "")
-                # Stated as the fact alone. Whether its nodes actually became placeholders
-                # depends on the load surviving, which only the caller knows, so
-                # _execution_result_details adds that outcome on the success path.
-                unresolved_libraries.append(
-                    f"Workflow '{complete_file_path.name}' references library "
-                    f"'{lib_ref.library_name}'{version_suffix}, which is not loaded. {inner_details}"
-                )
-        return unresolved_libraries
+        return problems
 
     @staticmethod
-    def _execution_result_details(
-        execution_result: WorkflowExecutionResult, *, level: int, message: str | None = None
-    ) -> list[ResultDetail]:
-        """One warning per unresolved library, ahead of the run's detail (or `message` in its place).
+    def collate_problems_for_display(problems: Iterable[WorkflowProblem]) -> list[str]:
+        """Group problems by type and let each type render its own instances, one string per group.
 
-        The libraries come first: they explain both the placeholders on a successful load and,
+        Every problem class owns its wording and its singular/plural form, so grouping is what
+        lets a workflow with five unregistered libraries say so once instead of five times.
+        """
+        problems_by_type: dict[type, list[WorkflowProblem]] = defaultdict(list)
+        for problem in problems:
+            problems_by_type[type(problem)].append(problem)
+        return [
+            problem_class.collate_problems_for_display(instances)
+            for problem_class, instances in problems_by_type.items()
+        ]
+
+    @classmethod
+    def _execution_result_details(
+        cls, execution_result: WorkflowExecutionResult, *, level: int, message: str | None = None
+    ) -> list[ResultDetail]:
+        """The run's problems as warnings, ahead of its detail (or `message` in its place).
+
+        The problems come first: they explain both the placeholders on a successful load and,
         on a failed one, the most likely reason the file could not be replayed. Every handler
         that consumes a WorkflowExecutionResult reports them, or the load looks clean to the
         caller while its graph is quietly full of placeholders.
-
-        Only a load that survived has placeholders to point at -- a failed one cleared the
-        canvas -- so the outcome is appended here rather than baked into the reason.
         """
-        outcome = (
-            "Its nodes opened as placeholders that cannot run until the library is available."
-            if execution_result.execution_successful
-            else ""
-        )
         details = [
-            # The reason ends in whatever the library manager left there -- a period, a paren,
-            # or the trailing newline of a subprocess's stderr -- so normalize before appending
-            # rather than emitting a run-on sentence or an orphan line break.
-            ResultDetail(message=f"{library.rstrip().removesuffix('.')}. {outcome}".rstrip(), level=logging.WARNING)
-            for library in execution_result.unresolved_libraries
+            ResultDetail(message=problem, level=logging.WARNING)
+            for problem in cls.collate_problems_for_display(execution_result.problems)
         ]
+        # Only a load that survived has placeholders to point at; a failed one cleared the
+        # canvas. Said once for the whole load rather than per problem, which is what keeps
+        # the problems' own wording intact.
+        if execution_result.problems and execution_result.execution_successful:
+            details.append(
+                ResultDetail(
+                    message="Nodes from the libraries above opened as placeholders. "
+                    "They preserve the graph but cannot run until their library is available.",
+                    level=logging.WARNING,
+                )
+            )
         details.append(ResultDetail(message=message or execution_result.execution_details, level=level))
         return details
 
@@ -1058,7 +1069,10 @@ class WorkflowManager(EngineScoped):
             execution_result = await self.run_workflow(relative_file_path=relative_file_path)
             if execution_result.execution_successful:
                 return RunWorkflowFromScratchResultSuccess(
-                    result_details=ResultDetails(*self._execution_result_details(execution_result, level=logging.DEBUG))
+                    status=execution_result.status,
+                    result_details=ResultDetails(
+                        *self._execution_result_details(execution_result, level=logging.DEBUG)
+                    ),
                 )
 
             logger.error(execution_result.execution_details)
@@ -1078,7 +1092,8 @@ class WorkflowManager(EngineScoped):
 
         if execution_result.execution_successful:
             return RunWorkflowWithCurrentStateResultSuccess(
-                result_details=ResultDetails(*self._execution_result_details(execution_result, level=logging.DEBUG))
+                status=execution_result.status,
+                result_details=ResultDetails(*self._execution_result_details(execution_result, level=logging.DEBUG)),
             )
         logger.error(execution_result.execution_details)
         return RunWorkflowWithCurrentStateResultFailure(
@@ -1149,7 +1164,9 @@ class WorkflowManager(EngineScoped):
         if context_warning:
             result_messages.append(ResultDetail(message=context_warning, level=logging.WARNING))
         result_messages.extend(self._execution_result_details(execution_result, level=logging.DEBUG))
-        return RunWorkflowFromRegistryResultSuccess(result_details=ResultDetails(*result_messages))
+        return RunWorkflowFromRegistryResultSuccess(
+            status=execution_result.status, result_details=ResultDetails(*result_messages)
+        )
 
     def _persist_external_workflow_registration(self, full_path: str) -> None:
         """Persist an out-of-workspace workflow path to global config so it survives restarts.
@@ -1509,13 +1526,7 @@ class WorkflowManager(EngineScoped):
 
     def _build_workflow_info_payload(self, wf_info: WorkflowInfo) -> WorkflowInfoSummary:
         """Build a WorkflowInfoSummary from a WorkflowInfo, collating problems for display."""
-        problems_by_type: dict[type, list] = defaultdict(list)
-        for problem in wf_info.problems:
-            problems_by_type[type(problem)].append(problem)
-        collated_problems = [
-            problem_class.collate_problems_for_display(instances)
-            for problem_class, instances in problems_by_type.items()
-        ]
+        collated_problems = self.collate_problems_for_display(wf_info.problems)
         return WorkflowInfoSummary(
             status=wf_info.status,
             workflow_name=wf_info.workflow_name,
