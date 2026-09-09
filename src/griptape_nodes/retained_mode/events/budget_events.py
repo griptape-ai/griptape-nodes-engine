@@ -83,8 +83,10 @@ class GetAttributionContextResultSuccess(WorkflowNotAlteredMixin, ResultPayloadS
             to touch a vendored client copy.
         schema_version: The payload schema version encoded in `header_value`
         project_chain: The project names the call is attributed to, ordered leaf-first. Never
-            partial -- budget paths are root-anchored, so a chain missing a link would present
-            a nested project as a root. Empty whenever the full ancestry cannot be described.
+            partial and never shortened -- budget paths are root-anchored, so a chain missing a
+            link would present a nested project as a root, and a name cut here would arrive
+            looking intact. Depth and length are the Cloud's to judge, and it reports what it
+            had to repair. Empty whenever the full ancestry cannot be described or sent.
         workflow_name: The current workflow's registry key, or `<unsaved>`
         node_type: The node type the caller passed back, unchanged
         engine_id: The id of the engine that answered
@@ -92,9 +94,11 @@ class GetAttributionContextResultSuccess(WorkflowNotAlteredMixin, ResultPayloadS
             forwarded to the orchestrator, which has no parent, so this is always absent
             today -- do not build a consumer-side join on it
         session_id: The active session id
-        chain_truncated: Whether anything was trimmed off `project_chain` to fit the header.
-            Read with the list: non-empty means ancestors were dropped for size, empty means
-            the whole chain was. Empty and unflagged means there was no chain to begin with.
+        chain_truncated: Whether a chain the engine had resolved was given up to fit the
+            header. Only ever set with an empty `project_chain`, because the chain is shed
+            whole or not at all -- there is no partial form. Empty and unflagged means either
+            no project is open or the chain could not be described; both send no `project`
+            key, and neither is a size problem.
     """
 
     header_value: str
@@ -114,8 +118,8 @@ class GetAttributionContextResultSuccess(WorkflowNotAlteredMixin, ResultPayloadS
 class GetAttributionContextResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """No attribution header value could be produced.
 
-    In practice the only cause is a payload still over the header size limit after being reduced
-    to its smallest form; every other degradation returns Success with a key omitted. An
+    In practice the only cause is a header still over the size the ingress will carry even with
+    the project chain given up; every other degradation returns Success with a key omitted. An
     unencodable payload lands here too, but every field that could carry one is filtered first,
     so that path is a backstop. The caller should proceed and send no attribution header -- the
     spend lands in the default budget.

@@ -44,20 +44,25 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("griptape_nodes")
 
-# The four constants below mirror Griptape Cloud's attribution-header parser, and each was read
+# The three constants below mirror Griptape Cloud's attribution-header parser, and each was read
 # off that parser rather than agreed in a doc. Diverging from any of them costs attribution
 # silently, so re-check them against it before changing one; the PR description says where it
 # lives.
+#
+# Only the first is enforced. The others describe what the far end will do with a value so the
+# engine can tell a value it would drop from one it would merely repair -- never so the engine
+# can repair it first. See `_encode_attribution_header`.
 
-# The parser's MAX_CHAIN_LENGTH. Truncating lower would not be conservative: it flags a
-# truncated chain as mangled because budget paths are root-anchored, so dropping ancestors
-# client-side costs matches the Cloud would have made.
-_MAX_PROJECT_CHAIN_ENTRIES = 32
-
-# The parser's MAX_DECODED_LENGTH, measured the same way -- on the decoded bytes. base64
-# inflates 4:3, so 4096 decoded bytes encode to at most 5464, inside its MAX_RAW_HEADER_LENGTH
-# of 5632 and well under nginx's 8 KB default.
-_MAX_DECODED_PAYLOAD_BYTES = 4096
+# The parser's MAX_RAW_HEADER_LENGTH, measured the same way -- on the encoded header, before
+# any decoding. It is the only size this module enforces, and it is an ingress concern rather
+# than an attribution one. Past it the Cloud reports OVERSIZE without decoding, so a larger
+# header buys no further diagnosis while eating into nginx's 8 KB header buffer -- and a header
+# the ingress rejects kills the API call itself, not merely its attribution.
+#
+# Deliberately not the parser's MAX_DECODED_LENGTH of 4096. A payload over that is discarded by
+# the Cloud *and reported* as OVERSIZE; shrinking it here to slip under would trade a spend the
+# platform knows it could not attribute for one it believes it attributed correctly.
+_MAX_ENCODED_HEADER_BYTES = 5632
 
 # C0 and C1 control characters, the parser's `_is_storable` rule written as a class. A value
 # containing one is stored nowhere on the far end, so sending it buys nothing and costs
@@ -66,9 +71,8 @@ _UNSTORABLE_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 # The parser's MAX_VALUE_LENGTH, and a cap on *characters*: it compares `len(value)` and slices
 # `value[:MAX_VALUE_LENGTH]` on a `str`, never on encoded bytes. Used to judge project names
-# (`_is_transmissible`), and to cut them only on the rungs between shedding the labels and
-# shedding the chain (`_encode_attribution_header`) -- never on the ordinary path, which sends
-# them whole.
+# (`_is_transmissible`). Only ever used to judge a name, never to cut the one that travels: a
+# name cut here arrives looking intact, which is the one thing the far end cannot detect.
 _MAX_VALUE_CHARS = 256
 
 
@@ -95,14 +99,6 @@ class _AttributionEncoding(NamedTuple):
     chain_truncated: bool
 
 
-class _ReductionStage(NamedTuple):
-    """One rung of the size-reduction ladder, ordered most informative first."""
-
-    facts: _AttributionFacts
-    # None on the unreduced rung; otherwise what this rung gives up, for the warning log.
-    reduction_note: str | None
-
-
 def _as_the_cloud_keeps_it(name: str) -> str:
     """Reduce a project name to the form the Cloud actually stores.
 
@@ -112,43 +108,27 @@ def _as_the_cloud_keeps_it(name: str) -> str:
     parent-billed-for-its-child failure again. And it has to run before the byte checks, or a
     control character sitting past the cap drops a whole chain the far end would have stored.
 
-    For deciding only. What actually travels is `_project_name_for_the_wire`, which is a
-    different string for an over-long name and for a good reason.
+    For deciding only -- nothing here is ever sent. The question it answers is whether the
+    Cloud would store an entry for this name at all: if it would, the whole name travels and
+    the Cloud cuts it itself, flagging the cut; if it would not, the entry would be dropped
+    there and its parent promoted, so the chain goes instead.
     """
     return name.strip()[:_MAX_VALUE_CHARS].strip()
 
 
-def _project_name_for_the_wire(name: str) -> str:
-    """Which form of a project name to send: the full one whenever it can travel.
+def _is_encodable(value: str) -> bool:
+    """Whether a string can be put on the wire at all.
 
-    Stripping here is free, because the far end strips too and records nothing when it does.
-    Cutting here is not. The parser marks a chain it had to cut as mangled and stops matching
-    it against admin-authored paths -- which is what keeps two sibling projects sharing a
-    256-character prefix from collapsing onto one budget. Handing it a pre-cut name presents
-    that prefix as an intact one: it reports no degradation, emits no metric, and matches. The
-    substitution then goes unrecorded on both sides, since `chain_truncated` on the result is
-    about the length of the chain, not of a name in it.
-
-    Whether a prefix match beats falling to the default budget is the Cloud's call to make on
-    its own data. Sending the full name leaves it able to make it.
-
-    One exception, and it is a real trade rather than a preference: a lone surrogate past the
-    cap survives the strip and makes the payload unencodable, costing the whole header. The cut
-    form drops that byte, so it goes instead -- one name's truncation signal for every other
-    dimension on the call.
-
-    The size ladder holds the other exception, and it is not this function's call to make: names
-    long enough to push the payload past the cap never reach the far end at all, so
-    `_encode_attribution_header` cuts them there rather than shed the chain. That costs nothing
-    this function was protecting -- a chain shed client-side arrives as no chain, and no chain
-    carries no truncation signal either.
+    A project name is free text and a workflow registry key is derived from a filesystem path,
+    so either can carry a byte the wire cannot hold: a path whose bytes are not valid UTF-8
+    comes back from the OS carrying lone surrogates from `surrogateescape`, which `str.encode`
+    refuses. Unguarded that raises out of the encoder and costs the whole header, not one key.
     """
-    stripped = name.strip()
     try:
-        stripped.encode("utf-8")
+        value.encode("utf-8")
     except UnicodeEncodeError:
-        return _as_the_cloud_keeps_it(name)
-    return stripped
+        return False
+    return True
 
 
 def _is_transmissible(value: str) -> bool:
@@ -157,26 +137,21 @@ def _is_transmissible(value: str) -> bool:
     Judged on the stored form, not the given one: the far end normalizes before it decides
     storability, so a value that passes here raw and is discarded there costs an entry,
     promotes its parent to leaf, and bills a real ancestor for spend it never had. Stripping
-    covers that for every dimension. Project names are cut to length as well, and arrive
-    already normalized by `_as_the_cloud_keeps_it`.
+    covers that for every dimension. A project name is judged on the cut form as well, since
+    the far end cuts before it decides -- the caller passes `_as_the_cloud_keeps_it(name)`.
+    That is about what to judge, never about what to send; the whole name still travels.
 
-    Three ways a value does not survive. A project name is free text and a workflow registry
-    key is derived from a filesystem path, so either can carry a byte the wire cannot hold: a
-    path whose bytes are not valid UTF-8 comes back from the OS carrying lone surrogates from
-    `surrogateescape`, which `str.encode` refuses. A pasted line break, or a directory name
-    that legally contains a control character, encodes here and is discarded there. And a name
-    that is nothing but whitespace strips to empty, which the far end will not store.
+    Three ways a value does not survive. A pasted line break, or a directory name that legally
+    contains a control character, encodes here and is discarded there. A name that is nothing
+    but whitespace strips to empty, which the far end will not store. And the value may not be
+    encodable at all -- see `_is_encodable`.
     """
     stripped = value.strip()
     if not stripped:
         return False
     if _UNSTORABLE_CHARACTERS.search(stripped):
         return False
-    try:
-        stripped.encode("utf-8")
-    except UnicodeEncodeError:
-        return False
-    return True
+    return _is_encodable(stripped)
 
 
 def _transmissible_or_none(value: str | None) -> str | None:
@@ -227,7 +202,10 @@ def _build_attribution_payload(facts: _AttributionFacts) -> dict[str, Any]:
 
 
 def _encode_attribution_payload(payload: dict[str, Any]) -> str | None:
-    """Encode a payload as base64url, or None when it cannot be encoded or exceeds the cap.
+    """Encode a payload as base64url, or None when it cannot be encoded at all.
+
+    Size is not judged here. What has to fit is the header, not the payload, and the caller is
+    the only one that knows what it is willing to give up to make it fit.
 
     Padding is kept because the payload is `base64.b64encode`'s natural output and stripping it
     would buy nothing: the parser re-pads whatever it receives before decoding, so both forms
@@ -247,126 +225,62 @@ def _encode_attribution_payload(payload: dict[str, Any]) -> str | None:
             exc_info=True,
         )
         return None
-    if len(raw) > _MAX_DECODED_PAYLOAD_BYTES:
-        return None
     return base64.urlsafe_b64encode(raw).decode("ascii")
 
 
-def _reduce(
-    facts: _AttributionFacts,
-    *,
-    cut_names: bool = False,
-    drop_labels: bool = False,
-    drop_chain: bool = False,
-) -> _AttributionFacts:
-    """Apply one rung's own set of reductions to the unreduced facts.
-
-    Every rung is built from the full facts and names what it gives up, so no rung inherits its
-    neighbour's reductions. That is not tidiness: deriving a rung from the one above it is how
-    this ladder twice ended up shedding the labels to pay for an overage the rung's own reduction
-    already covered.
-
-    `drop_chain` subsumes `cut_names` -- there is nothing left to cut -- so no rung passes both.
-    """
-    project_chain = list(facts.project_chain)
-    if drop_chain:
-        project_chain = []
-    elif cut_names:
-        project_chain = [_as_the_cloud_keeps_it(name) for name in project_chain]
-
-    workflow_name = facts.workflow_name
-    node_type = facts.node_type
-    if drop_labels:
-        workflow_name = None
-        node_type = None
-
-    return facts._replace(project_chain=project_chain, workflow_name=workflow_name, node_type=node_type)
-
-
 def _encode_attribution_header(facts: _AttributionFacts) -> _AttributionEncoding | None:
-    """Encode the attribution header, shedding dimensions in stages until it fits.
+    """Encode the attribution header, shedding the project chain only if the ingress demands it.
 
-    The chain is always truncated to `_MAX_PROJECT_CHAIN_ENTRIES` from the leaf -- a standing
-    rule, not a size response. If the result does not fit, six rungs are tried in order of what
-    each gives up and the first that fits is sent: nothing, the labels, cut project names, both of
-    those, the chain, then the chain and the labels together.
+    Nothing here repairs a tag. The engine cannot tell a name that is too long from one that is
+    wrong, and Griptape Cloud can: it truncates an over-long name, truncates an over-deep chain,
+    reports each as a degradation metric, and -- the part that decides this function -- marks a
+    chain it had to repair `mangled`, which takes it out of budget matching entirely. Damage the
+    far end can see is damage it refuses to bill against. So facts travel as the engine found
+    them, and judging them is the Cloud's job.
 
-    Ordered by cost, not by being successively smaller -- rung three puts back the labels rung two
-    shed. Each rung states its own reductions against the full facts rather than trimming the rung
-    above it, so none gives up more than its own overage needs. Shedding the chain frees thousands
-    of bytes and the labels are worth tens, so a rung that bundled them would cost a dashboard row
-    for nothing. `_reduce` is what keeps that structural rather than remembered.
+    Repairing them here would invert that. A chain cut to `MAX_CHAIN_LENGTH` before sending, or a
+    name cut to `MAX_VALUE_LENGTH`, arrives looking intact: no reason is recorded, no metric
+    fires, `mangled` stays false, and the Cloud matches a budget against a chain missing its root
+    or a name sharing a prefix with its siblings. That bills the wrong project silently, and it is strictly
+    worse than the loud non-billing the Cloud would have produced on its own.
 
-    The chain goes last because it is the only dimension the Cloud matches budgets against.
-    Shedding it first would trade the billable dimension for audit-only labels, even when an
-    oversized `workflow` was what pushed the payload over. The labels go before any cutting
-    because sending a name whole is what buys a truncation signal on the far end, and that signal
-    is what keeps two siblings sharing a 256-character prefix off one budget -- worth more than an
-    audit-only dimension.
+    The one size this enforces is `_MAX_ENCODED_HEADER_BYTES`, and it is not an attribution rule.
+    A payload past the Cloud's own decode cap is discarded *and reported* as OVERSIZE, which is a
+    fine outcome -- the spend goes unattributed and the platform knows it did. A header past the
+    ingress buffer is not: it fails the whole request with a 4xx, and the artist loses the call
+    rather than its attribution. So the header is bounded where the ingress bounds it, and the
+    only thing given up to get under that bound is the chain.
 
-    Cutting is worth reaching at all because a payload over the cap never arrives to carry that
-    signal. Shedding the chain instead lands the spend in the default bucket with `reasons` empty:
-    no metric fires, and it reads as an engine that never attributed anything. Cutting keeps the
-    match, and gives up the signal only where the signal was already gone.
+    When the chain goes, all of it goes -- never a prefix, never cut entries. Budget paths are
+    root-anchored, so a partial chain matches nothing at best and an unrelated top-level project
+    of the same name at worst. Same rule `_resolve_project_chain` applies to a name it cannot
+    describe, and for the same reason: an incomplete claim is worse than no claim.
 
-    When the chain does go, all of it goes. Budget paths are root-anchored, so keeping the leaf buys
-    no narrower match; it presents a nested project as a root, which matches nothing at best
-    and bills an unrelated top-level project of the same name at worst. Same rule
-    `_resolve_project_chain` applies to a name it cannot describe.
-
-    None means the payload did not fit even with no chain and no labels, leaving only the
-    schema version and a few guids -- unreachable short of a cap under a hundred bytes.
+    None means even the chainless envelope does not fit, or does not encode -- the first
+    unreachable short of a header bound under a hundred bytes, the second a backstop for a
+    payload every dimension of which was already filtered.
     """
-    chain_truncated = len(facts.project_chain) > _MAX_PROJECT_CHAIN_ENTRIES
-    full_facts = facts._replace(project_chain=list(facts.project_chain[:_MAX_PROJECT_CHAIN_ENTRIES]))
+    with_chain = _encode_attribution_payload(_build_attribution_payload(facts))
+    if with_chain is not None and len(with_chain) <= _MAX_ENCODED_HEADER_BYTES:
+        return _AttributionEncoding(header_value=with_chain, facts=facts, chain_truncated=False)
 
-    stages = (
-        _ReductionStage(facts=full_facts, reduction_note=None),
-        _ReductionStage(
-            facts=_reduce(full_facts, drop_labels=True),
-            reduction_note="the workflow and node type will not be attributed for this call",
-        ),
-        _ReductionStage(
-            facts=_reduce(full_facts, cut_names=True),
-            reduction_note="long project names will be attributed cut to the form the Cloud stores",
-        ),
-        _ReductionStage(
-            facts=_reduce(full_facts, cut_names=True, drop_labels=True),
-            reduction_note=(
-                "long project names will be attributed cut to the form the Cloud stores, and the "
-                "workflow and node type not at all"
-            ),
-        ),
-        _ReductionStage(
-            facts=_reduce(full_facts, drop_chain=True),
-            reduction_note="no project will be attributed for this call",
-        ),
-        _ReductionStage(
-            facts=_reduce(full_facts, drop_chain=True, drop_labels=True),
-            reduction_note="no project, workflow, or node type will be attributed for this call",
-        ),
+    if not facts.project_chain:
+        return None
+
+    chainless_facts = facts._replace(project_chain=[])
+    chainless = _encode_attribution_payload(_build_attribution_payload(chainless_facts))
+    if chainless is None:
+        return None
+    if len(chainless) > _MAX_ENCODED_HEADER_BYTES:
+        return None
+
+    logger.warning(
+        "The attribution header would exceed %d bytes, so no project is attributed for this call "
+        "and Griptape Cloud will bill the spend to the default budget. This needs a project chain "
+        "thousands of characters long; shorten the project names to attribute their spend.",
+        _MAX_ENCODED_HEADER_BYTES,
     )
-
-    for stage in stages:
-        header_value = _encode_attribution_payload(_build_attribution_payload(stage.facts))
-        if header_value is None:
-            continue
-        if stage.reduction_note is not None:
-            logger.warning(
-                "Attribution payload exceeded %d bytes; reducing it so %s.",
-                _MAX_DECODED_PAYLOAD_BYTES,
-                stage.reduction_note,
-            )
-        return _AttributionEncoding(
-            header_value=header_value,
-            facts=stage.facts,
-            # Derived, never asserted. `chain_truncated` means ancestors were dropped, so it has
-            # to describe what this stage actually shed: a payload pushed over the cap by an
-            # oversized `node_type` can reach a later stage without the chain losing anything.
-            chain_truncated=chain_truncated or len(stage.facts.project_chain) < len(full_facts.project_chain),
-        )
-
-    return None
+    return _AttributionEncoding(header_value=chainless, facts=chainless_facts, chain_truncated=True)
 
 
 class BudgetManager(EngineScoped):
@@ -394,8 +308,8 @@ class BudgetManager(EngineScoped):
         """Describe the current engine context as an encoded attribution header.
 
         Every resolver degrades to a missing key rather than a failure: the caller is about to
-        spend money, and a partial attribution beats none. The one failure is a payload that
-        will not fit in a header even after being reduced.
+        spend money, and a partial attribution beats none. The one failure is a header still
+        too large for the ingress even with the project chain given up.
         """
         facts = _AttributionFacts(
             project_chain=self._resolve_project_chain(),
@@ -411,13 +325,13 @@ class BudgetManager(EngineScoped):
             return GetAttributionContextResultFailure(
                 result_details=(
                     "Attempted to describe an outbound request for budget attribution. Failed because "
-                    "the attribution payload could not be encoded into a header, even after being reduced "
-                    "to its smallest form. The request can proceed, but this spend will not be attributed."
+                    "the description could not be fitted into a request header, even with the project left "
+                    "out of it. The request can proceed, but this spend will not be attributed."
                 )
             )
 
-        # From `encoding.facts`, never `facts`: the reduction step can drop values, and these
-        # fields must describe exactly what the header encodes.
+        # From `encoding.facts`, never `facts`: the encoder may have given up the chain, and
+        # these fields must describe exactly what the header encodes.
         encoded = encoding.facts
         return GetAttributionContextResultSuccess(
             header_value=encoding.header_value,
@@ -477,10 +391,17 @@ class BudgetManager(EngineScoped):
                 )
                 return []
             # Judged on the form the far end keeps, so both tests below see the string it
-            # will see -- not on the form that travels, which for an over-long name is the
-            # uncut one.
+            # will see. That is deliberately more forgiving than judging the whole name: a
+            # control character past the value cap is one the Cloud's own truncation removes
+            # before it decides storability, so it costs a truncation flag over there rather
+            # than a chain over here.
+            #
+            # Encodability is the exception, and is judged on the whole name, because it is
+            # the one property of a name that is ours rather than the Cloud's -- a name the
+            # cut form could encode and the whole one cannot has no honest wire form. Sending
+            # the cut form would be a repair arriving intact.
             kept = _as_the_cloud_keeps_it(entry.name)
-            if not _is_transmissible(kept):
+            if not _is_transmissible(kept) or not _is_encodable(entry.name):
                 logger.warning(
                     "Dropping project attribution for this call: a project name in the chain cannot "
                     "be transmitted intact. Rename the project using ordinary text to attribute its "
@@ -496,7 +417,9 @@ class BudgetManager(EngineScoped):
                     SYSTEM_DEFAULTS_KEY,
                 )
                 return []
-            project_names.append(_project_name_for_the_wire(entry.name))
+            # Stripped, never cut. Stripping is free -- the far end strips too and records
+            # nothing when it does -- while cutting is the repair this module refuses to make.
+            project_names.append(entry.name.strip())
 
         return project_names
 

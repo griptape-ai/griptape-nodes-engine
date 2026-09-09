@@ -293,8 +293,14 @@ class TestProjectChain:
             assert project_id not in serialized
             assert project_id not in result.header_value
 
-    def test_chain_deeper_than_the_cap_truncates_from_the_leaf(self) -> None:
-        """The chain is capped at the Cloud's own MAX_CHAIN_LENGTH, keeping the leaf end."""
+    def test_a_chain_deeper_than_the_cloud_keeps_still_travels_whole(self) -> None:
+        """Depth is the Cloud's to judge, not ours -- and judging it here is what hides it.
+
+        Forty entries is past the parser's MAX_CHAIN_LENGTH of 32, so the Cloud truncates,
+        records CHAIN_TRUNCATED, and marks the chain mangled, which takes it out of budget
+        matching entirely. Cutting to 32 before sending would suppress all three: the chain
+        arrives looking intact and matches a budget written against the wrong root.
+        """
         project_manager = ProjectManager(Mock(), Mock(), Mock())
         ids = [f"p{index:02d}" for index in range(40)]
         # ids[0] is the leaf; each entry's parent is the next one along.
@@ -306,9 +312,9 @@ class TestProjectChain:
         names = [f"Name {project_id}" for project_id in ids]
         result = _succeed(self._manager_on(project_manager))
 
-        assert _tags(result)["project"] == names[:32]
-        assert result.project_chain == names[:32]
-        assert result.chain_truncated is True
+        assert _tags(result)["project"] == names
+        assert result.project_chain == names
+        assert result.chain_truncated is False
 
     def test_an_unregistered_parent_drops_the_chain_and_never_falls_back_to_its_id(
         self, caplog: pytest.LogCaptureFixture
@@ -526,65 +532,14 @@ class TestSizeCap:
         mock_engine.context_manager.get_current_workflow_name.return_value = "shots/sh020/lighting"
         return BudgetManager(MagicMock(), engine=mock_engine)
 
-    def test_oversized_payload_reduces_to_minimum(self, caplog: pytest.LogCaptureFixture) -> None:
-        """Over the cap even without labels: the chain goes whole, and the call still succeeds.
+    def test_a_header_too_large_for_the_ingress_sheds_the_chain(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The only reduction left, run against the real bound rather than a patched one.
 
-        Not down to the leaf -- paths are root-anchored, so `["Leaf"]` for a nested project
-        buys no narrower match than sending nothing and risks billing an unrelated top-level
-        "Leaf".
-        """
-        manager = self._manager()
-
-        with (
-            patch.object(budget_manager_module, "_MAX_DECODED_PAYLOAD_BYTES", 80),
-            caplog.at_level(logging.WARNING, logger="griptape_nodes"),
-        ):
-            result = _succeed(manager, node_type="GriptapeProxyImage")
-
-        tags = _tags(result)
-        assert "project" not in tags
-        assert "workflow" not in tags
-        assert "node_type" not in tags
-        # The structured fields have to agree with the reduced header, not the pre-encode values.
-        assert result.workflow_name is None
-        assert result.node_type is None
-        assert result.project_chain == []
-        # Empty *and* flagged: the chain was shed. Empty and unflagged means no project open.
-        assert result.chain_truncated is True
-        assert any(record.levelno == logging.WARNING for record in caplog.records)
-
-    def test_labels_are_shed_before_the_chain(self, caplog: pytest.LogCaptureFixture) -> None:
-        """An oversized payload gives up the workflow and node type before any ancestor.
-
-        The chain is the only dimension the Cloud matches budgets against, and its paths are
-        root-anchored, so an ancestor dropped to make room for an audit-only label costs every
-        match the Cloud would have made. Sized so the full payload is over the cap but the
-        chain survives without the labels: shedding the chain here would be pure loss.
-        """
-        manager = self._manager()
-
-        with (
-            patch.object(budget_manager_module, "_MAX_DECODED_PAYLOAD_BYTES", 100),
-            caplog.at_level(logging.WARNING, logger="griptape_nodes"),
-        ):
-            result = _succeed(manager, node_type="GriptapeProxyImage")
-
-        tags = _tags(result)
-        assert tags["project"] == ["Leaf", "Parent"]
-        assert "workflow" not in tags
-        assert "node_type" not in tags
-        assert result.project_chain == ["Leaf", "Parent"]
-        assert result.chain_truncated is False
-        assert any(record.levelno == logging.WARNING for record in caplog.records)
-
-    def test_names_are_cut_before_the_chain_is_shed(self, caplog: pytest.LogCaptureFixture) -> None:
-        """Past the cap, cutting a name costs a signal that was already gone.
-
-        Sending names whole buys one thing: the far end sees it had to truncate and stops
-        matching the chain. A payload over the cap never reaches the far end to carry that,
-        so shedding the chain here lands the spend in the default bucket with nothing recorded
-        on either side. The cut form matches instead. Run against the real cap, because the
-        band this rung exists for starts near 3948 characters and nowhere else.
+        A 4200-character name encodes to 5888 bytes with its parent, past the 5632 the ingress
+        will carry. Nothing is repaired to get under that -- the name is not cut and the chain
+        is not shortened, because either would arrive looking intact. The chain goes whole and
+        the spend lands in the default budget, which is the same place the Cloud would have put
+        it once it saw a mangled chain.
         """
         mock_engine = _mock_engine()
         mock_engine.project_manager.get_project_chain.return_value = [
@@ -599,49 +554,30 @@ class TestSizeCap:
             result = _succeed(manager, node_type="GriptapeProxyImage")
 
         tags = _tags(result)
-        assert tags["project"] == ["S" * 256, "Acme Studios"]
-        assert result.project_chain == ["S" * 256, "Acme Studios"]
-        # Names were cut, not ancestors dropped. The flag says the latter.
-        assert result.chain_truncated is False
-        # The rung that cuts keeps the labels. Cutting this name frees thousands of bytes and
-        # the labels are worth tens, so shedding them alongside would cost a dashboard row for
-        # an overage the cut already covered.
+        assert "project" not in tags
+        assert result.project_chain == []
+        # Empty *and* flagged: the chain was shed. Empty and unflagged means no project open.
+        assert result.chain_truncated is True
+        # Only the chain is given up. The labels run tens of bytes against a 5632-byte bound,
+        # so shedding them alongside would cost a dashboard row and buy nothing.
         assert tags["workflow"] == "shots/sh020/lighting"
         assert tags["node_type"] == "GriptapeProxyImage"
-        assert any("cut" in record.getMessage() for record in caplog.records)
+        # The structured fields have to agree with the reduced header, not the pre-encode values.
+        assert result.workflow_name == "shots/sh020/lighting"
+        assert any(record.levelno == logging.WARNING for record in caplog.records)
 
-    def test_labels_are_shed_alongside_a_cut_only_when_cutting_alone_is_not_enough(self) -> None:
-        """The fourth rung exists, and nothing reaches it that the third could have served.
+    def test_an_enormous_chain_is_shed_whole_rather_than_in_part(self) -> None:
+        """There is no partial rung between the whole chain and none of it.
 
-        A long project name and an oversized workflow key together stay over the cap even with
-        every name cut, so this is the one shape that legitimately loses both.
+        Thirty-two names at 300 characters encode to 13192 bytes, twice the bound and past
+        nginx's own header buffer, so this is the shape that most tempts a prefix. Sending one
+        would present a nested project as a root: budget paths are root-anchored, so a partial
+        chain matches an unrelated top-level project of the same name at worst and nothing at
+        best, and neither end records that it happened.
         """
         mock_engine = _mock_engine()
         mock_engine.project_manager.get_project_chain.return_value = [
-            _entry("leaf", "S" * 4200),
-            _entry("root", "Acme Studios"),
-        ]
-        mock_engine.context_manager.has_current_workflow.return_value = True
-        mock_engine.context_manager.get_current_workflow_name.return_value = "w" * 4000
-        manager = BudgetManager(MagicMock(), engine=mock_engine)
-
-        result = _succeed(manager, node_type="GriptapeProxyImage")
-
-        tags = _tags(result)
-        assert tags["project"] == ["S" * 256, "Acme Studios"]
-        assert "workflow" not in tags
-        assert "node_type" not in tags
-        assert result.chain_truncated is False
-
-    def test_a_chain_too_long_even_cut_is_still_shed_whole(self) -> None:
-        """The new rung is a rung, not a floor: it does not rescue every oversized chain.
-
-        Thirty-two entries at the value cap encode past 4096 bytes even after cutting, so the
-        ladder still falls through to no chain rather than sending a partial one.
-        """
-        mock_engine = _mock_engine()
-        mock_engine.project_manager.get_project_chain.return_value = [
-            _entry(f"p{index}", "N" * 300) for index in range(budget_manager_module._MAX_PROJECT_CHAIN_ENTRIES)
+            _entry(f"p{index}", "N" * 300) for index in range(32)
         ]
         mock_engine.context_manager.has_current_workflow.return_value = True
         mock_engine.context_manager.get_current_workflow_name.return_value = "shots/sh020/lighting"
@@ -653,53 +589,7 @@ class TestSizeCap:
         assert "project" not in tags
         assert result.project_chain == []
         assert result.chain_truncated is True
-        # Losing the chain does not cost the labels. Shedding it frees thousands of bytes; the
-        # labels are worth tens, and the audit row is all that is left to say who spent this.
         assert tags["workflow"] == "shots/sh020/lighting"
-        assert tags["node_type"] == "GriptapeProxyImage"
-
-    def test_the_floor_sheds_the_labels_only_when_losing_the_chain_is_not_enough(self) -> None:
-        """The sixth rung, and the only shape that reaches it without a patched cap.
-
-        An oversized workflow key is itself what pushed the payload over, so shedding the chain
-        leaves it still over and the labels have to go too. Anything short of that keeps them.
-        """
-        mock_engine = _mock_engine()
-        mock_engine.project_manager.get_project_chain.return_value = [
-            _entry(f"p{index}", "N" * 300) for index in range(budget_manager_module._MAX_PROJECT_CHAIN_ENTRIES)
-        ]
-        mock_engine.context_manager.has_current_workflow.return_value = True
-        mock_engine.context_manager.get_current_workflow_name.return_value = "w" * 4000
-        manager = BudgetManager(MagicMock(), engine=mock_engine)
-
-        result = _succeed(manager, node_type="GriptapeProxyImage")
-
-        tags = _tags(result)
-        assert "project" not in tags
-        assert "workflow" not in tags
-        assert "node_type" not in tags
-        assert result.chain_truncated is True
-
-    def test_reduction_of_a_single_entry_chain_does_not_claim_truncation(self) -> None:
-        """Reducing an oversized payload cuts nothing when the chain is already one deep.
-
-        `chain_truncated` says ancestors were dropped. A caller passing a huge `node_type`
-        can force the reduction step without the chain having anything to lose, and a
-        consumer reading the flag to decide whether project attribution is incomplete
-        would otherwise get a false positive.
-        """
-        mock_engine = _mock_engine()
-        mock_engine.project_manager.get_project_chain.return_value = [_entry("only", "Only")]
-        mock_engine.context_manager.has_current_workflow.return_value = True
-        mock_engine.context_manager.get_current_workflow_name.return_value = "shots/sh020"
-        manager = BudgetManager(MagicMock(), engine=mock_engine)
-
-        with patch.object(budget_manager_module, "_MAX_DECODED_PAYLOAD_BYTES", 80):
-            result = _succeed(manager, node_type="GriptapeProxyImage")
-
-        assert _tags(result)["project"] == ["Only"]
-        assert result.project_chain == ["Only"]
-        assert result.chain_truncated is False
 
     def test_the_utf8_backstop_returns_none_instead_of_raising(self) -> None:
         """The one path no dispatch can reach, tested directly because it still has to hold.
@@ -718,15 +608,51 @@ class TestSizeCap:
 
         assert budget_manager_module._encode_attribution_payload(payload) is None
 
-    def test_unencodable_payload_fails_without_raising(self) -> None:
+    def test_a_header_that_does_not_fit_even_chainless_fails(self) -> None:
         """The floor: no usable header value exists, so Success would be a lie."""
         manager = self._manager()
 
-        with patch.object(budget_manager_module, "_MAX_DECODED_PAYLOAD_BYTES", 1):
+        with patch.object(budget_manager_module, "_MAX_ENCODED_HEADER_BYTES", 1):
             result = _dispatch(manager)
 
         assert isinstance(result, GetAttributionContextResultFailure)
         assert "attribution" in str(result.result_details).lower()
+
+    def test_an_unencodable_envelope_fails_rather_than_raising(self) -> None:
+        """The second backstop, tested directly for the same reason as the first.
+
+        Every dimension outside the chain is filtered through `_transmissible_or_none` and every
+        name through `_resolve_project_chain`, so the chainless envelope is unencodable only if
+        one of those filters has been broken. If that ever happens the cost of raising here is
+        an ERROR with a traceback on every metered call, so it returns None and the handler
+        answers Failure.
+        """
+        facts = budget_manager_module._AttributionFacts(
+            project_chain=["Leaf"],
+            workflow_name=None,
+            node_type=None,
+            engine_id=None,
+            orchestrator_engine_id=None,
+            session_id=None,
+        )
+
+        with patch.object(budget_manager_module, "_encode_attribution_payload", return_value=None):
+            assert budget_manager_module._encode_attribution_header(facts) is None
+
+    def test_a_chainless_payload_over_the_bound_fails_without_retrying_itself(self) -> None:
+        """With no chain there is nothing to give up, so the second attempt is not made.
+
+        Same Failure either way; the point is that the reduction path does not re-encode an
+        identical payload and log a warning about shedding a chain that was never there.
+        """
+        mock_engine = _mock_engine()
+        mock_engine.project_manager.get_project_chain.return_value = []
+        manager = BudgetManager(MagicMock(), engine=mock_engine)
+
+        with patch.object(budget_manager_module, "_MAX_ENCODED_HEADER_BYTES", 1):
+            result = _dispatch(manager)
+
+        assert isinstance(result, GetAttributionContextResultFailure)
 
 
 class TestTransmissibility:
@@ -853,11 +779,14 @@ class TestTransmissibility:
 
         assert _tags(result)["project"] == ["S" * 300 + "\n" + "S" * 20, "Acme Studios"]
 
-    def test_a_surrogate_past_the_value_cap_falls_back_to_the_cut_form(self) -> None:
-        """One name's truncation signal is worth less than every other dimension on the call.
+    def test_a_surrogate_past_the_value_cap_drops_the_chain(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Encodability is the one property judged on the whole name rather than the kept form.
 
-        A lone surrogate survives the strip and cannot be UTF-8 encoded, so sending the uncut
-        name would cost the entire header. The cut form drops the byte, which is the trade.
+        A lone surrogate past the cap is invisible to the Cloud -- its own truncation removes
+        the byte before it decides storability -- so the kept form passes every other test. But
+        the name that would travel cannot be encoded, and the cut form that could is a repair
+        arriving intact. The chain is dropped instead, which is the same abstention any other
+        unsendable name earns.
         """
         mock_engine = _mock_engine()
         mock_engine.project_manager.get_project_chain.return_value = [
@@ -866,9 +795,14 @@ class TestTransmissibility:
         ]
         manager = BudgetManager(MagicMock(), engine=mock_engine)
 
-        result = _succeed(manager)
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            result = _succeed(manager)
 
-        assert _tags(result)["project"] == ["S" * 256, "Acme Studios"]
+        assert "project" not in _tags(result)
+        assert result.project_chain == []
+        # Not the size path: nothing was shed to fit, so the flag stays down.
+        assert result.chain_truncated is False
+        assert any(record.levelno == logging.WARNING for record in caplog.records)
 
     def test_an_untransmissible_workflow_key_is_omitted_without_touching_the_chain(self) -> None:
         """One unusable dimension costs its own key and nothing else."""
