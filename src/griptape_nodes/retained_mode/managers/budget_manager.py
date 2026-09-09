@@ -93,32 +93,43 @@ class _ReductionStage(NamedTuple):
 def _is_transmissible(value: str) -> bool:
     """Whether a value survives the trip to the Cloud intact.
 
-    Two ways it does not. A project name is free text and a workflow registry key is derived
-    from a filesystem path, so either can carry a byte the wire cannot hold. A path whose bytes
-    are not valid UTF-8 comes back from the OS carrying lone surrogates from `surrogateescape`,
-    which `str.encode` refuses. A pasted line break, or a directory name that legally contains
-    a control character, encodes here and is then discarded by the Cloud's storability check.
+    Judged on `value.strip()`, because that is what the Cloud decides on: it strips before
+    testing storability, so a value this passes unstripped and the far end then discards costs
+    an entry, promotes its parent to leaf, and bills a real ancestor for spend it never had.
+
+    Three ways a value does not survive. A project name is free text and a workflow registry
+    key is derived from a filesystem path, so either can carry a byte the wire cannot hold: a
+    path whose bytes are not valid UTF-8 comes back from the OS carrying lone surrogates from
+    `surrogateescape`, which `str.encode` refuses. A pasted line break, or a directory name
+    that legally contains a control character, encodes here and is discarded there. And a name
+    that is nothing but whitespace strips to empty, which the far end will not store.
     """
-    if _UNSTORABLE_CHARACTERS.search(value):
+    stripped = value.strip()
+    if not stripped:
+        return False
+    if _UNSTORABLE_CHARACTERS.search(stripped):
         return False
     try:
-        value.encode("utf-8")
+        stripped.encode("utf-8")
     except UnicodeEncodeError:
         return False
     return True
 
 
 def _transmissible_or_none(value: str | None) -> str | None:
-    """Pass a value through, or None when it cannot reach the Cloud intact.
+    """Normalize a value the way the Cloud will, or None when it cannot reach it intact.
 
-    Omitting the key says "the engine could not determine this", which is honest: a value
-    the far end would discard is one the engine cannot express.
+    Returns the stripped form rather than the original, because the far end strips what it
+    stores -- sending the stripped value keeps the result's structured fields describing what
+    budgets actually match against. Omitting the key instead says "the engine could not
+    determine this", which is honest: a value the far end would discard is one the engine
+    cannot express.
     """
     if value is None:
         return None
     if not _is_transmissible(value):
         return None
-    return value
+    return value.strip()
 
 
 def _build_attribution_payload(facts: _AttributionFacts) -> dict[str, Any]:
@@ -309,23 +320,16 @@ class BudgetManager(EngineScoped):
         project's spend, because the Cloud matches on the string alone and has no way to know
         the two names are the same project.
 
-        A nameless entry costs the whole chain, wherever it sits. `get_project_chain` maps any
-        falsy name to None, so an entry is nameless either because its template did not load or
-        because it loaded with an empty `name` -- nothing in the schema forbids the empty
-        string. The two are indistinguishable here and need not be distinguished: both leave a
-        link no budget rule can name.
+        Any link the Cloud cannot match costs the *whole* chain, not just its own entry --
+        whether it is nameless, reserved, or untransmissible. Budget paths are root-anchored,
+        so a chain missing a link already matches nothing, and dropping just the offender is
+        worse than sending none: it promotes that entry's parent to leaf and bills a real
+        ancestor for spend it never incurred. A nameless entry can sit anywhere, since
+        `get_project_chain` maps any falsy name to None and the schema permits `name: ""`.
 
-        The synthetic `<system-defaults>` rest state is skipped by *id*, before its name is
-        read. It does have a template -- the shipped default one -- so it does have a name,
-        and that name is "Default Project", which is exactly the kind of generic string that
-        would collide across every user in an org. It is also not a project the Cloud models
-        at all: it is the root sentinel, never a real ancestor, so skipping it leaves a chain
-        the Cloud can still match rather than a truncated one.
-
-        A name the Cloud cannot store costs the *whole* chain, not just its own entry. Budget
-        paths are root-anchored, so a chain missing any link already matches nothing -- and
-        dropping only the offending entry is worse than sending none, because it promotes that
-        entry's parent to leaf and bills a real ancestor project for spend it never incurred.
+        The `<system-defaults>` rest state is the one exception, skipped by *id* before its
+        name is read. It is the root sentinel rather than an ancestor the Cloud models, so
+        skipping it leaves a matchable chain instead of a truncated one.
         """
         try:
             chain = self.engine.project_manager.get_project_chain()
@@ -344,28 +348,26 @@ class BudgetManager(EngineScoped):
                     "attribute its spend."
                 )
                 return []
-            project_names.append(entry.name)
+            name = _transmissible_or_none(entry.name)
+            if name is None:
+                logger.warning(
+                    "Dropping project attribution for this call: a project name in the chain cannot "
+                    "be transmitted intact. Rename the project using ordinary text to attribute its "
+                    "spend."
+                )
+                return []
+            # Compared after normalizing, because the Cloud strips before testing the reserved
+            # value: `" <system-defaults> "` is the same claim as the bare string. Separate from
+            # the sentinel *id* skipped above -- this is a real project a user named that.
+            if name == SYSTEM_DEFAULTS_KEY:
+                logger.warning(
+                    "Dropping project attribution for this call: a project is named '%s', which Griptape "
+                    "Cloud reserves for its own use. Rename the project to attribute its spend.",
+                    SYSTEM_DEFAULTS_KEY,
+                )
+                return []
+            project_names.append(name)
 
-        # A real project *named* `<system-defaults>`, separate from the sentinel id skipped
-        # above. Nothing stops a user typing the reserved string into `name:`. The Cloud
-        # reserves it and discards a client copy, which would drop that entry and bill its
-        # parent for spend it never incurred, so the chain goes nowhere instead.
-        if SYSTEM_DEFAULTS_KEY in project_names:
-            logger.warning(
-                "Dropping project attribution for this call: a project is named '%s', which Griptape "
-                "Cloud reserves for its own use. Rename the project to attribute its spend.",
-                SYSTEM_DEFAULTS_KEY,
-            )
-            return []
-
-        untransmissible_count = sum(1 for name in project_names if not _is_transmissible(name))
-        if untransmissible_count > 0:
-            logger.warning(
-                "Dropping project attribution for this call: %d project name(s) in the chain cannot be "
-                "transmitted intact. This spend will land in the default budget.",
-                untransmissible_count,
-            )
-            return []
         return project_names
 
     def _resolve_workflow_name(self) -> str | None:
@@ -397,10 +399,9 @@ class BudgetManager(EngineScoped):
             return None
 
     def _resolve_orchestrator_engine_id(self) -> str | None:
-        """Resolve the parent engine's id, set at spawn on workers and unset on the orchestrator.
+        """Resolve the parent engine's id, set at spawn on workers, unset on the orchestrator.
 
-        No guard: reading an environment variable cannot raise. In practice the key is always
-        absent, since worker requests are forwarded to the orchestrator, which has no parent.
+        Unguarded because `os.getenv` cannot raise.
         """
         return os.getenv("GTN_ORCHESTRATOR_ENGINE_ID")
 

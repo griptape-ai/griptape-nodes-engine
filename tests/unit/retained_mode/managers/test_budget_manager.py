@@ -243,16 +243,20 @@ class TestProjectChain:
 
         assert _tags(result)["project"] == ["Shot 020"]
 
-    def test_a_project_actually_named_system_defaults_drops_the_chain(self, caplog: pytest.LogCaptureFixture) -> None:
+    @pytest.mark.parametrize("reserved_name", [SYSTEM_DEFAULTS_KEY, f" {SYSTEM_DEFAULTS_KEY} "])
+    def test_a_project_actually_named_system_defaults_drops_the_chain(
+        self, reserved_name: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
         """A name collision with the Cloud's reserved value costs the whole chain.
 
         Nothing stops a user typing the reserved string into `name:`. The Cloud discards a
         client copy, which would drop that entry and promote its parent to leaf -- billing a
-        real project for spend it never incurred.
+        real project for spend it never incurred. Padding does not disguise it: the far end
+        strips before it tests the reserved value, so the comparison here has to strip too.
         """
         project_manager = ProjectManager(Mock(), Mock(), Mock())
         _register_project(project_manager, "grandparent", name="Acme Studios")
-        _register_project(project_manager, "leaf", name=SYSTEM_DEFAULTS_KEY, parent_id="grandparent")
+        _register_project(project_manager, "leaf", name=reserved_name, parent_id="grandparent")
         project_manager._current_project_id = "leaf"
 
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
@@ -416,12 +420,10 @@ class TestWorkflowName:
 
 
 class TestOrchestratorEngineId:
-    """Pins the resolver, NOT a shipping behavior.
+    """Pins the resolver, not a shipping behavior.
 
-    Under the forwarding design the orchestrator answers every attribution request, and the
-    orchestrator has no parent, so production never populates this key. Nobody should later
-    read these tests as evidence that worker spend is joinable to its orchestrator: it is
-    not, and it does not need to be, because budgets match on the project chain alone.
+    The orchestrator answers every attribution request and has no parent, so production never
+    populates this key. It is not evidence that worker spend is joinable to its orchestrator.
     """
 
     @pytest.fixture
@@ -613,8 +615,12 @@ class TestTransmissibility:
     CONTROL_CHAR_NAME = "Acme\nStudios"
     # A name read from a file whose bytes are not valid UTF-8 carries a lone surrogate.
     SURROGATE_NAME = "Renders \udce9"
+    # Truthy here, so `get_project_chain` hands it over as a name, but it strips to empty at
+    # the far end -- which drops the entry and promotes its parent to leaf.
+    WHITESPACE_NAME = "  "
+    NBSP_NAME = "\u00a0"
 
-    @pytest.mark.parametrize("bad_name", [CONTROL_CHAR_NAME, SURROGATE_NAME])
+    @pytest.mark.parametrize("bad_name", [CONTROL_CHAR_NAME, SURROGATE_NAME, WHITESPACE_NAME, NBSP_NAME])
     def test_an_untransmissible_name_drops_the_whole_chain(
         self, bad_name: str, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -645,6 +651,22 @@ class TestTransmissibility:
         manager = BudgetManager(MagicMock(), engine=mock_engine)
 
         assert _tags(_succeed(manager))["project"] == ["Acme Studios / S02 \u2014 v3"]
+
+    def test_a_padded_name_travels_in_the_form_the_far_end_stores(self) -> None:
+        """Normalize here or the result describes a string budgets never match.
+
+        The Cloud strips what it keeps, so `" Acme Studios "` is stored as `"Acme Studios"`.
+        Sending the padded form would leave `project_chain` reporting a value that no budget
+        rule can be written against.
+        """
+        mock_engine = _mock_engine()
+        mock_engine.project_manager.get_project_chain.return_value = [_entry("leaf", "  Acme Studios  ")]
+        manager = BudgetManager(MagicMock(), engine=mock_engine)
+
+        result = _succeed(manager)
+
+        assert _tags(result)["project"] == ["Acme Studios"]
+        assert result.project_chain == ["Acme Studios"]
 
     def test_an_untransmissible_workflow_key_is_omitted_without_touching_the_chain(self) -> None:
         """One unusable dimension costs its own key and nothing else."""
