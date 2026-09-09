@@ -16,7 +16,8 @@ from typing import Any
 import pytest
 from fastmcp.client.transports import StdioTransport
 
-from griptape_nodes.agents.pydantic_ai.mcp_servers import BuiltMCPServer, mcp_server_from_config
+from griptape_nodes.agents.pydantic_ai import mcp_servers
+from griptape_nodes.agents.pydantic_ai.mcp_servers import BuiltMCPServer
 from griptape_nodes.agents.pydantic_ai.mcp_toolset_cache import (
     CONNECTION_KEYS,
     DIGEST_LENGTH,
@@ -230,12 +231,22 @@ class TestConnectionFingerprint:
         assert connection_fingerprint(config) != connection_fingerprint({**config, key: value})
 
     def test_it_covers_what_the_builder_reads(self) -> None:
-        # Guards the pair going out of sync: if `mcp_server_from_config` learns a
-        # new transport field, this fails until `CONNECTION_KEYS` learns it too.
-        source = inspect.getsource(mcp_server_from_config)
-        read_by_builder = set(re.findall(r"""config\.get\(["'](\w+)["']""", source))
+        """Guards `CONNECTION_KEYS` against drifting from the code that builds a server.
 
-        assert read_by_builder <= CONNECTION_KEYS
+        A key the builder reads but this set omits is the #5459 bug all over
+        again: editing that field would silently never take effect. The whole
+        builder module is scanned, not just `mcp_server_from_config`, because
+        `timeout` is read one level down in `_connect_timeout` - scanning only
+        the entry point would have missed it, and would miss the next helper too.
+        """
+        source = inspect.getsource(mcp_servers)
+        read_from_config = set(re.findall(r"""config(?:_env)?\.get\(["'](\w+)["']""", source))
+
+        assert read_from_config, "regex matched nothing - it has drifted from the source"
+        assert read_from_config <= CONNECTION_KEYS, (
+            f"{sorted(read_from_config - CONNECTION_KEYS)} are read when building a server but are not "
+            f"declared in CONNECTION_KEYS, so editing them would not restart it"
+        )
 
 
 class TestRetireWhileInUse:
