@@ -1,15 +1,18 @@
 """Local filesystem thread storage driver, backed by Pydantic AI message history.
 
-Each thread lives in two files inside ``threads_directory``:
+Each thread lives in three files inside ``threads_directory``:
 
   * ``thread_{id}.json``       - the message history, encoded by
     :class:`pydantic_ai.messages.ModelMessagesTypeAdapter`.
   * ``thread_{id}.meta.json``  - a small metadata dict (title, timestamps,
     archived flag, optional ``local_id``).
+  * ``thread_{id}.runs.json``  - per-run provider/model records; absent until
+    the first run completes (old threads without this file are unaffected).
 
-Splitting the two keeps history reads cheap when listing threads (we don't
-deserialize messages we never show) and keeps metadata writes atomic when the
-agent isn't actually saving any new messages.
+Splitting the files keeps history reads cheap when listing threads (we don't
+deserialize messages we never show), keeps metadata writes atomic when the
+agent isn't saving new messages, and keeps run records out of the listing hot
+path (loaded only via ``get_thread_metadata``).
 """
 
 from __future__ import annotations
