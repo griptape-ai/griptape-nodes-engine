@@ -73,16 +73,34 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
     if path.is_symlink():
         path = path.resolve()
 
-    # Dot-prefixed and self-identifying: the scratch name is hidden from artists
-    # browsing the destination directory, and if a power loss strands one, the
-    # name says what left it there. Created with an explicit 0o666 so the KERNEL
-    # applies the process umask — same default open(mode="w") produces — instead
-    # of reading the umask ourselves, which would require mutating global state.
-    tmp_path = path.parent / f".gtn-write-partial-{uuid.uuid4().hex}{path.suffix}"
+    # Dot-prefixed and self-identifying: hidden from artists browsing the
+    # directory, and if a power loss strands one, the name says what left it
+    # there. The fixed ".partial" terminator matters as much as the dot:
+    # pathlib.glob matches dotfiles, and pollers glob extension patterns over
+    # directories this function writes into — a scratch name ending in the
+    # destination's own suffix would read as a second record mid-write.
+    tmp_path = path.parent / f".gtn-write-partial-{uuid.uuid4().hex}{path.suffix}.partial"
+
+    # The scratch must never expose content at a looser mode than the
+    # destination it replaces, even for the duration of the write — think a
+    # 0600 .env of API keys. So: create at a 0600 floor, align to the
+    # destination's exact mode while the scratch is still EMPTY, and only then
+    # write bytes. A brand-new destination instead gets 0o666 with the kernel
+    # applying the process umask — the same default open(mode="w") produces.
+    try:
+        destination_mode = stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        destination_mode = None
+    creation_mode = 0o600 if destination_mode is not None else 0o666
     open_flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
-    tmp_fd = os.open(tmp_path, open_flags, mode=0o666)
+    tmp_fd = os.open(tmp_path, open_flags, mode=creation_mode)
     try:
         with os.fdopen(tmp_fd, "wb") as tmp_file:
+            if destination_mode is not None:
+                # chmod is not umask-masked the way os.open's mode is, so this
+                # is what preserves a destination mode looser than the 0600
+                # creation floor. No content has been written yet.
+                tmp_path.chmod(destination_mode)
             tmp_file.write(data)
             # flush() drains Python's userspace BufferedWriter into the kernel;
             # fsync() then pushes the kernel's buffers to disk. fsync alone is
@@ -92,14 +110,6 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
             # rename can promote the temp file into the destination name.
             tmp_file.flush()
             os.fsync(tmp_file.fileno())
-        # Preserve an existing destination's permissions: the temp file's fresh
-        # umask-derived mode would otherwise supplant whatever mode the file had.
-        try:
-            file_mode = stat.S_IMODE(path.stat().st_mode)
-            tmp_path.chmod(file_mode)
-        except FileNotFoundError:
-            # New destination: the kernel-applied umask default already matches.
-            pass
         tmp_path.replace(path)
     except OSError:
         tmp_path.unlink(missing_ok=True)

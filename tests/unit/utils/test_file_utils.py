@@ -651,8 +651,9 @@ class TestAtomicWriteBytes:
     def test_preserves_existing_file_mode(self, temp_dir: Path) -> None:
         """Overwriting keeps the destination's permissions.
 
-        mkstemp creates the temp file as 0600; without the chmod, every atomic
-        overwrite would silently tighten a shared file's permissions.
+        The scratch file is aligned to the destination's exact mode before any
+        content is written; without that, every atomic overwrite would reset a
+        shared file's permissions to the process default.
         """
         import stat
 
@@ -663,6 +664,67 @@ class TestAtomicWriteBytes:
         atomic_write_bytes(target, b"new")
 
         assert stat.S_IMODE(target.stat().st_mode) == 0o604  # noqa: PLR2004
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits are not representable on Windows")
+    def test_scratch_never_looser_than_strict_destination(
+        self, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A 0600 destination's content is never on disk at a looser mode, even mid-write.
+
+        The scratch is created at a 0600 floor and aligned to the destination's
+        mode while still empty — a secrets file being rewritten must not have its
+        payload readable by other local users during the write window.
+        """
+        import stat
+
+        target = temp_dir / "secrets.env"
+        target.write_bytes(b"OPENAI_API_KEY=old")
+        target.chmod(0o600)
+
+        observed_modes: list[int] = []
+        real_fsync = os.fsync
+
+        def spying_fsync(fd: int) -> None:
+            observed_modes.extend(
+                stat.S_IMODE(scratch.stat().st_mode) for scratch in temp_dir.glob(".gtn-write-partial-*")
+            )
+            real_fsync(fd)
+
+        monkeypatch.setattr("griptape_nodes.utils.file_utils.os.fsync", spying_fsync)
+
+        atomic_write_bytes(target, b"OPENAI_API_KEY=new")
+
+        assert observed_modes  # the spy saw the scratch while content was on disk
+        assert all(mode == 0o600 for mode in observed_modes)  # noqa: PLR2004
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600  # noqa: PLR2004
+
+    def test_scratch_never_matches_destination_extension_glob(
+        self, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Mid-write, an extension glob over the directory sees only real records.
+
+        pathlib.glob matches dotfiles, and pollers glob patterns like *.json over
+        directories this function writes into — the scratch name must never end
+        in the destination's own suffix or it reads as a second record.
+        """
+        target = temp_dir / "record.json"
+        target.write_bytes(b"{}")
+
+        mid_write_glob: list[str] = []
+        real_fsync = os.fsync
+
+        def spying_fsync(fd: int) -> None:
+            mid_write_glob.extend(p.name for p in temp_dir.glob("*.json"))
+            real_fsync(fd)
+
+        monkeypatch.setattr("griptape_nodes.utils.file_utils.os.fsync", spying_fsync)
+
+        atomic_write_bytes(target, b'{"updated": true}')
+
+        # The spy fires for the payload fsync and again for the directory fsync;
+        # neither observation may include the scratch file.
+        assert mid_write_glob
+        assert set(mid_write_glob) == {"record.json"}
 
     def test_new_file_gets_umask_default_mode(self, temp_dir: Path) -> None:
         """A brand-new file gets the same mode open(mode="w") would have produced."""
