@@ -55,6 +55,38 @@ class TestTraitUIOptionOwnership:
         assert "simple_dropdown" not in parameter.authored_ui_options()
 
 
+class TestAnEchoedMergedViewCannotBecomeStoredState:
+    """The editor is handed the merged view, so writing it back must not store trait keys."""
+
+    def test_echoing_the_merged_view_back_stores_only_authored_options(self) -> None:
+        parameter = _slider_parameter()
+        parameter.hide = True
+
+        # What the editor received, with one authored option flipped and sent back.
+        echoed = parameter.to_dict()["ui_options"]
+        echoed["hide"] = False
+        parameter.ui_options = echoed
+
+        assert parameter.authored_ui_options() == {"hide": False}
+
+    def test_the_trait_still_owns_its_keys_after_an_echo(self) -> None:
+        slider = Slider(min_val=1, max_val=50)
+        parameter = Parameter(name="steps", type="int", tooltip="Sampling steps", traits={slider})
+
+        parameter.ui_options = parameter.to_dict()["ui_options"]
+        slider.max = 10
+
+        # Would report the echoed copy's max of 50 if the echo had been stored.
+        assert parameter.ui_options["slider"] == {"min_val": 1, "max_val": 10}
+
+    def test_a_parameter_with_no_traits_stores_what_it_is_given(self) -> None:
+        parameter = Parameter(name="steps", type="int", tooltip="Sampling steps")
+
+        parameter.ui_options = {"hide": True, "display_name": "Steps"}
+
+        assert parameter.authored_ui_options() == {"hide": True, "display_name": "Steps"}
+
+
 class TestClearingAUIOption:
     """Unsetting an option goes through the same authored view as setting one."""
 

@@ -1998,7 +1998,20 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
     @ui_options.setter
     @BaseNodeElement.emits_update_on_write
     def ui_options(self, value: dict) -> None:
-        self._ui_options = value
+        self._ui_options = self._without_trait_owned_keys(value)
+
+    def _without_trait_owned_keys(self, value: dict) -> dict:
+        """Drop the keys an attached trait renders, so stored options stay authored-only.
+
+        The editor is handed the merged ``ui_options``, so an inbound write echoing it back
+        would otherwise store every trait's rendered options as though the parameter had
+        authored them, where the copy then shadows the trait that owns it. Filtering in the
+        setter makes that unrepresentable, rather than something every caller must avoid.
+        """
+        trait_owned: set[str] = set()
+        for trait in self.find_elements_by_type(Trait):
+            trait_owned.update(trait.ui_options_for_trait())
+        return {key: option for key, option in value.items() if key not in trait_owned}
 
     @property
     def hide(self) -> bool:
@@ -2763,7 +2776,7 @@ class ParameterList(ParameterContainer):
         base_ui_options = {
             k: v for k, v in value.items() if k not in ["display", "columns", "collapsed", "child_prefix"]
         }
-        self._ui_options = base_ui_options
+        self._ui_options = self._without_trait_owned_keys(base_ui_options)
 
     def to_dict(self) -> dict[str, Any]:
         """Override to_dict to use the merged ui_options."""
