@@ -1031,7 +1031,7 @@ class WorkflowManager(EngineScoped):
             # The reason ends in whatever the library manager left there -- a period, a paren,
             # or the trailing newline of a subprocess's stderr -- so normalize before appending
             # rather than emitting a run-on sentence or an orphan line break.
-            ResultDetail(message=f"{library.rstrip().rstrip('.')}. {outcome}".rstrip(), level=logging.WARNING)
+            ResultDetail(message=f"{library.rstrip().removesuffix('.')}. {outcome}".rstrip(), level=logging.WARNING)
             for library in execution_result.unresolved_libraries
         ]
         details.append(ResultDetail(message=message or execution_result.execution_details, level=level))
