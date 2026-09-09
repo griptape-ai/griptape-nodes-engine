@@ -358,13 +358,15 @@ authors = [
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "griptape-nodes-engine",
     "requests",
-    # Add other dependencies
+    # Add other packages your nodes import at runtime
 ]
 
+[dependency-groups]
+dev = ["griptape-nodes-engine", "pytest", "pyright", "ruff"]
+
 [tool.uv.sources]
-griptape-nodes-engine = { git = "https://github.com/griptape-ai/griptape-nodes", rev="latest"}
+griptape-nodes-engine = { git = "https://github.com/griptape-ai/griptape-nodes-engine", rev = "latest" }
 
 [tool.hatch.build.targets.wheel]
 packages = ["library_name"]
@@ -373,6 +375,20 @@ packages = ["library_name"]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 ```
+
+#### Do not list the engine as a runtime dependency
+
+The engine is the host that loads your library, not a package your library pulls in. Keep `griptape-nodes-engine` out of `[project] dependencies`:
+
+- Installing your library would otherwise install a **second engine**. The engine puts a library's virtual environment at the front of its own import path, so that second copy can shadow the engine that is actually running, and the resulting errors look like engine bugs rather than library ones.
+- `[dependency-groups] dev` still gives your tests, type checker, and editor an engine to resolve against, because `uv sync` installs dev groups by default. Your development workflow is unchanged.
+- The engine version your library needs belongs in `engine_version` in your library JSON. That is the value the engine actually checks when it loads you; the pyproject specifier is never consulted at load time.
+
+Declaring it in both places means maintaining the same fact twice, and the two drift.
+
+!!! note "This changes with library packaging"
+
+    Once libraries are resolved as packages into their own environments, the engine becomes a normal bounded dependency (`griptape-nodes-engine>=X,<Y`) and that single resolution replaces the `engine_version` check. Use the layout above until that ships.
 
 ### Library Configuration (inside subdirectory)
 
