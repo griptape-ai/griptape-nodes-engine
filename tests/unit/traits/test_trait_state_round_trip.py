@@ -2,6 +2,8 @@
 
 import json
 import logging
+from dataclasses import dataclass
+from typing import Any
 
 import pytest
 
@@ -103,3 +105,97 @@ class TestMisdeclaredTraitStateDegradesInsteadOfFailingTheSave:
         assert state == {}
         assert "threshold" in caplog.text
         assert "STATE_ALIASES" in caplog.text
+
+
+@dataclass(eq=False)
+class _InheritedConstructorBase(Trait):
+    """A trait meant to be subclassed, contributing one constructor argument."""
+
+    low: Any = 0
+
+    def __init__(self, *, low: Any = 0) -> None:
+        super().__init__()
+        self.low = low
+
+    @classmethod
+    def get_trait_keys(cls) -> list[str]:
+        return ["inherited_base"]
+
+
+@dataclass(eq=False)
+class _ForwardingSubclass(_InheritedConstructorBase):
+    """Declares one argument of its own and forwards the rest to its base."""
+
+    high: Any = 10
+
+    def __init__(self, *, high: Any = 10, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.high = high
+
+    @classmethod
+    def get_trait_keys(cls) -> list[str]:
+        return ["forwarding"]
+
+
+@dataclass(eq=False)
+class _NarrowingSubclass(_InheritedConstructorBase):
+    """Fixes its base's argument instead of forwarding it, so it takes none of its own."""
+
+    def __init__(self) -> None:
+        super().__init__(low=7)
+
+    @classmethod
+    def get_trait_keys(cls) -> list[str]:
+        return ["narrowing"]
+
+
+@dataclass(eq=False)
+class _NoConstructorTrait(Trait):
+    """Declares no __init__, so @dataclass generates one over inherited element fields."""
+
+    @classmethod
+    def get_trait_keys(cls) -> list[str]:
+        return ["no_constructor"]
+
+
+class TestInheritedConstructorArguments:
+    """State comes from every constructor the authors wrote, not just the nearest one."""
+
+    def test_a_forwarded_base_argument_is_saved(self) -> None:
+        trait = _ForwardingSubclass(high=99, low=5)
+
+        assert trait.to_state() == {"high": 99, "low": 5}
+
+    def test_a_forwarded_base_argument_survives_a_round_trip(self) -> None:
+        source = _ForwardingSubclass(high=99, low=5)
+
+        restored = _ForwardingSubclass.from_state(source.to_state())
+
+        assert restored.high == source.high
+        assert restored.low == source.low
+        assert restored.to_state() == source.to_state()
+
+    def test_a_base_argument_the_subclass_cannot_forward_is_not_saved(self) -> None:
+        # Without **kwargs there is no way to pass 'low' back in, so saving it would
+        # produce state from_state() could not replay.
+        trait = _NarrowingSubclass()
+
+        assert trait.to_state() == {}
+        # The constructor fixes 'low', so restoring reproduces it without carrying it.
+        assert _NarrowingSubclass.from_state(trait.to_state()).low == trait.low
+
+
+class TestGeneratedConstructorsAreNotState:
+    """A @dataclass-generated __init__ says nothing about what the author considers state."""
+
+    def test_a_trait_declaring_no_constructor_has_no_state(self) -> None:
+        assert _NoConstructorTrait().to_state() == {}
+
+    def test_engine_internals_never_appear_in_state(self) -> None:
+        state = _NoConstructorTrait().to_state()
+
+        for internal in ("_children", "_parent", "element_id", "element_type"):
+            assert internal not in state
+
+    def test_compare_declares_no_constructor_and_stays_empty(self) -> None:
+        assert Compare().to_state() == {}
