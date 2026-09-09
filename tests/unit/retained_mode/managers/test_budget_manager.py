@@ -577,6 +577,49 @@ class TestSizeCap:
         assert result.chain_truncated is False
         assert any(record.levelno == logging.WARNING for record in caplog.records)
 
+    def test_names_are_cut_before_the_chain_is_shed(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Past the cap, cutting a name costs a signal that was already gone.
+
+        Sending names whole buys one thing: the far end sees it had to truncate and stops
+        matching the chain. A payload over the cap never reaches the far end to carry that,
+        so shedding the chain here lands the spend in the default bucket with nothing recorded
+        on either side. The cut form matches instead. Run against the real cap, because the
+        band this rung exists for starts near 3948 characters and nowhere else.
+        """
+        mock_engine = _mock_engine()
+        mock_engine.project_manager.get_project_chain.return_value = [
+            _entry("leaf", "S" * 4200),
+            _entry("root", "Acme Studios"),
+        ]
+        manager = BudgetManager(MagicMock(), engine=mock_engine)
+
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            result = _succeed(manager)
+
+        assert _tags(result)["project"] == ["S" * 256, "Acme Studios"]
+        assert result.project_chain == ["S" * 256, "Acme Studios"]
+        # Names were cut, not ancestors dropped. The flag says the latter.
+        assert result.chain_truncated is False
+        assert any("cut" in record.getMessage() for record in caplog.records)
+
+    def test_a_chain_too_long_even_cut_is_still_shed_whole(self) -> None:
+        """The new rung is a rung, not a floor: it does not rescue every oversized chain.
+
+        Thirty-two entries at the value cap encode past 4096 bytes even after cutting, so the
+        ladder still falls through to no chain rather than sending a partial one.
+        """
+        mock_engine = _mock_engine()
+        mock_engine.project_manager.get_project_chain.return_value = [
+            _entry(f"p{index}", "N" * 300) for index in range(budget_manager_module._MAX_PROJECT_CHAIN_ENTRIES)
+        ]
+        manager = BudgetManager(MagicMock(), engine=mock_engine)
+
+        result = _succeed(manager)
+
+        assert "project" not in _tags(result)
+        assert result.project_chain == []
+        assert result.chain_truncated is True
+
     def test_reduction_of_a_single_entry_chain_does_not_claim_truncation(self) -> None:
         """Reducing an oversized payload cuts nothing when the chain is already one deep.
 

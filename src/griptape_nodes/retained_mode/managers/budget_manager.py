@@ -65,8 +65,9 @@ _MAX_DECODED_PAYLOAD_BYTES = 4096
 _UNSTORABLE_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 # The parser's MAX_VALUE_LENGTH, and a cap on *characters*: it compares `len(value)` and slices
-# `value[:MAX_VALUE_LENGTH]` on a `str`, never on encoded bytes. Used to judge project names,
-# not to cut them -- see `_project_name_for_the_wire`.
+# `value[:MAX_VALUE_LENGTH]` on a `str`, never on encoded bytes. Used to judge project names
+# (`_is_transmissible`), and to cut them only on the last rung before the chain is shed
+# (`_encode_attribution_header`) -- never on the ordinary path, which sends them whole.
 _MAX_VALUE_CHARS = 256
 
 
@@ -134,6 +135,12 @@ def _project_name_for_the_wire(name: str) -> str:
     cap survives the strip and makes the payload unencodable, costing the whole header. The cut
     form drops that byte, so it goes instead -- one name's truncation signal for every other
     dimension on the call.
+
+    The size ladder holds the other exception, and it is not this function's call to make: names
+    long enough to push the payload past the cap never reach the far end at all, so
+    `_encode_attribution_header` cuts them there rather than shed the chain. That costs nothing
+    this function was protecting -- a chain shed client-side arrives as no chain, and no chain
+    carries no truncation signal either.
     """
     stripped = name.strip()
     try:
@@ -255,7 +262,15 @@ def _encode_attribution_header(facts: _AttributionFacts) -> _AttributionEncoding
     Shedding it first would trade the billable dimension for audit-only labels, even when an
     oversized `workflow` was what pushed the payload over.
 
-    When it does go, all of it goes. Budget paths are root-anchored, so keeping the leaf buys
+    One rung rewrites rather than sheds, and sits just above that: project names cut to the form
+    the Cloud stores. Sending them whole is the rule and `_project_name_for_the_wire` says why,
+    but what that rule buys is a truncation signal on the far end, and a payload over the cap
+    never gets there to carry one. Shedding the chain instead lands the spend in the default
+    bucket with `reasons` empty -- indistinguishable from an engine that never attributed
+    anything. Cutting keeps the match. It gives up the signal only where the signal was already
+    lost.
+
+    When the chain does go, all of it goes. Budget paths are root-anchored, so keeping the leaf buys
     no narrower match; it presents a nested project as a root, which matches nothing at best
     and bills an unrelated top-level project of the same name at worst. Same rule
     `_resolve_project_chain` applies to a name it cannot describe.
@@ -266,6 +281,9 @@ def _encode_attribution_header(facts: _AttributionFacts) -> _AttributionEncoding
     chain_truncated = len(facts.project_chain) > _MAX_PROJECT_CHAIN_ENTRIES
     full_facts = facts._replace(project_chain=list(facts.project_chain[:_MAX_PROJECT_CHAIN_ENTRIES]))
     without_labels = full_facts._replace(workflow_name=None, node_type=None)
+    cut_names = without_labels._replace(
+        project_chain=[_as_the_cloud_keeps_it(name) for name in without_labels.project_chain]
+    )
     no_chain = without_labels._replace(project_chain=[])
 
     stages = (
@@ -273,6 +291,10 @@ def _encode_attribution_header(facts: _AttributionFacts) -> _AttributionEncoding
         _ReductionStage(
             facts=without_labels,
             reduction_note="the workflow and node type will not be attributed for this call",
+        ),
+        _ReductionStage(
+            facts=cut_names,
+            reduction_note="long project names will be attributed cut to the form the Cloud stores",
         ),
         _ReductionStage(
             facts=no_chain,
