@@ -46,7 +46,7 @@ from pydantic_ai.messages import (
     ToolCallPart,
     UserPromptPart,
 )
-from pydantic_ai_skills import SkillsCapability
+from pydantic_ai_harness import Skills
 
 from griptape_nodes.agents.pydantic_ai.image_tools import (
     IMAGE_TOOL_NAME,
@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from pydantic_ai._run_context import RunContext
+    from pydantic_ai.capabilities import AbstractCapability
     from pydantic_ai.messages import ModelMessage, UserContent
     from pydantic_ai.settings import ModelSettings
     from pydantic_ai.toolsets import AbstractToolset
@@ -235,14 +236,12 @@ class PydanticAgentRunner:
             return None
         return skills_dir
 
-    def _build_skills_capabilities(self) -> list[SkillsCapability]:
+    def _build_skills_capabilities(self) -> list[Skills]:
         """Build the skills capability exposing ``.agents/skills`` to the agent.
 
         Built per run rather than per runner: discovery is a construction-time
         snapshot, so rebuilding it each turn is what makes an edited skill land
-        without restarting the engine. ``scripts=False`` leaves
-        ``run_skill_script`` unregistered because the workspace already exposes a
-        gated shell tool and skills here ship no scripts.
+        without restarting the engine.
 
         Returns an empty list when skills are disabled, the directory is absent,
         or no skill in it loads, so the run proceeds without skills instead of
@@ -258,32 +257,18 @@ class PydanticAgentRunner:
             return []
         return [capability]
 
-    def _load_skills(
-        self,
-        skills_dir: Path,
-        include: list[str] | None = None,
-        *,
-        index_resources: bool = True,
-    ) -> SkillsCapability | None:
+    def _load_skills(self, skills_dir: Path, include: list[str] | None = None) -> Skills | None:
         """Build a capability over ``skills_dir``, or ``None`` when the loader rejects a skill.
 
         The loader validates every selected skill while constructing and raises on the
         first one it rejects, so this succeeds only when all of them load. ``ValueError``
         is a frontmatter report and ``OSError`` an unreadable ``SKILL.md``; both cost
         skills rather than the run.
-
-        ``index_resources=False`` skips indexing bundled *resources*, which a probe does
-        not need and which is the bulk of what makes probing expensive. Scripts are still
-        discovered, so a library shipping them pays more per probe than one that does not.
         """
-        exclude_resources = None if index_resources else ["*"]
         try:
-            return SkillsCapability(
-                directories=[skills_dir],
-                scripts=False,
-                include=include,
-                exclude_resources=exclude_resources,
-            )
+            if include is None:
+                return Skills(skills_dir)
+            return Skills(skills_dir, include=include)
         except (ValueError, OSError) as e:
             logger.warning(
                 "Attempted to load skills %s from %s. Failed because of: %s",
@@ -293,18 +278,14 @@ class PydanticAgentRunner:
             )
             return None
 
-    def _load_usable_skills(self, skills_dir: Path) -> SkillsCapability | None:
+    def _load_usable_skills(self, skills_dir: Path) -> Skills | None:
         """Build a capability over only the skills in ``skills_dir`` that load on their own.
 
         One rejected ``SKILL.md`` fails the whole library, so probe each skill by name
         first: ``include`` filters before the loader parses anything, which pins a
         rejection to the skill that caused it and keeps the others. Returns ``None`` when
-        nothing survives.
-
-        Probing costs a construction per skill, and every construction walks the whole
-        library's bundled files, so probes skip indexing its resources: a probe only has
-        to answer whether the frontmatter parses, and the survivors' resources are indexed
-        by the build below.
+        nothing survives. Costs a construction per skill, each of which reads one
+        ``SKILL.md``.
         """
         try:
             candidates = sorted(entry.name for entry in skills_dir.iterdir() if (entry / "SKILL.md").is_file())
@@ -312,11 +293,7 @@ class PydanticAgentRunner:
             logger.warning("Attempted to list the skills in %s. Failed because of: %s", skills_dir, e)
             return None
 
-        usable = [
-            name
-            for name in candidates
-            if self._load_skills(skills_dir, include=[name], index_resources=False) is not None
-        ]
+        usable = [name for name in candidates if self._load_skills(skills_dir, include=[name]) is not None]
         if not usable:
             return None
         return self._load_skills(skills_dir, include=usable)
@@ -392,7 +369,7 @@ class PydanticAgentRunner:
             run_id,
             self.model_name,
             len(history),
-            [name for capability in capabilities for name in capability.skill_names],
+            _skill_names(capabilities),
             _prompt_preview(prompt),
         )
         started = time.monotonic()
@@ -516,6 +493,23 @@ class PydanticAgentRunner:
         with contextlib.suppress(asyncio.CancelledError):
             await run_task
         return None
+
+
+def _skill_names(capabilities: Sequence[Skills]) -> list[str]:
+    """The names of the skills ``capabilities`` offers the model, for logging.
+
+    ``Skills`` keeps its per-skill capabilities private, so walk each tree the way
+    Pydantic AI does and read the leaf ids, which are the skill names.
+    """
+    names: list[str] = []
+
+    def collect(leaf: AbstractCapability[Any]) -> None:
+        if leaf.id is not None:
+            names.append(leaf.id)
+
+    for capability in capabilities:
+        capability.apply(collect)
+    return names
 
 
 @dataclass

@@ -39,6 +39,8 @@ part of its context.
 
 The `name` must match the skill's folder name, and `description` tells the agent when to use the skill. The body can be as long or short as you need — code snippets, step-by-step instructions, reference tables, etc.
 
+Only `SKILL.md` is read. Files bundled beside it, such as `references/` or `scripts/`, are neither read nor run, so put everything the agent needs in the body.
+
 ## Example: a house style guide
 
 ```markdown
