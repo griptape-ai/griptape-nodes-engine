@@ -153,14 +153,11 @@ def _encode_attribution_payload(payload: dict[str, Any]) -> str | None:
 
     Padding is kept so the Cloud can call `urlsafe_b64decode` without re-padding.
 
-    The UTF-8 guard covers the identifier fields, which are not filtered individually the way
-    the chain, workflow, and node type are: `orchestrator_engine_id` is read from the
-    environment, and `os.getenv` decodes with `surrogateescape`, so a non-UTF-8 value reaches
-    here as a lone surrogate. Letting that raise would escape the handler as a
-    `GenericResultFailure`, which ignores `failure_log_level` (`event_manager.py:1088-1094`)
-    and would therefore log an ERROR with a traceback on every metered call. Returning None
-    instead degrades to the documented outcome: no header, and the spend lands in the default
-    budget.
+    The UTF-8 guard is a backstop -- every dimension is filtered through `_transmissible_or_none`
+    upstream, which costs one key where returning None here costs the whole header. It stays
+    because letting `str.encode` raise would escape the handler as a `GenericResultFailure`,
+    which ignores `failure_log_level` (`event_manager.py:1088-1094`) and would log an ERROR with
+    a traceback on every metered call.
     """
     try:
         raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -182,19 +179,22 @@ def _encode_attribution_header(facts: _AttributionFacts) -> _AttributionEncoding
     rule, not a size response. If the result does not fit, dimensions are shed in order of increasing
     value: the workflow and node type first, and only then the chain's ancestors.
 
-    The chain goes last because it is the only dimension the Cloud matches budgets against, and
-    budget paths are root-anchored, so a chain reduced to its leaf matches nothing at all.
-    Shedding it first would trade the billable dimension for audit-only labels -- and would do
-    so even when an oversized `workflow` was what pushed the payload over, leaving the chain to
-    pay for room it was not using.
+    The chain goes last because it is the only dimension the Cloud matches budgets against.
+    Shedding it first would trade the billable dimension for audit-only labels, even when an
+    oversized `workflow` was what pushed the payload over.
 
-    None means even a leaf-only payload did not fit, which needs a single project name larger
-    than the whole cap.
+    When it does go, all of it goes. Budget paths are root-anchored, so keeping the leaf buys
+    no narrower match; it presents a nested project as a root, which matches nothing at best
+    and bills an unrelated top-level project of the same name at worst. Same rule
+    `_resolve_project_chain` applies to a name it cannot describe.
+
+    None means the payload did not fit even with no chain and no labels, leaving only the
+    schema version and a few guids -- unreachable short of a cap under a hundred bytes.
     """
     chain_truncated = len(facts.project_chain) > _MAX_PROJECT_CHAIN_ENTRIES
     full_facts = facts._replace(project_chain=list(facts.project_chain[:_MAX_PROJECT_CHAIN_ENTRIES]))
     without_labels = full_facts._replace(workflow_name=None, node_type=None)
-    leaf_only = without_labels._replace(project_chain=without_labels.project_chain[:1])
+    no_chain = without_labels._replace(project_chain=[])
 
     stages = (
         _ReductionStage(facts=full_facts, reduction_note=None),
@@ -203,8 +203,8 @@ def _encode_attribution_header(facts: _AttributionFacts) -> _AttributionEncoding
             reduction_note="the workflow and node type will not be attributed for this call",
         ),
         _ReductionStage(
-            facts=leaf_only,
-            reduction_note="only the leaf project will be attributed for this call",
+            facts=no_chain,
+            reduction_note="no project will be attributed for this call",
         ),
     )
 
@@ -262,9 +262,9 @@ class BudgetManager(EngineScoped):
             project_chain=self._resolve_project_chain(),
             workflow_name=self._resolve_workflow_name(),
             node_type=_transmissible_or_none(request.node_type),
-            engine_id=self._resolve_engine_id(),
-            orchestrator_engine_id=self._resolve_orchestrator_engine_id(),
-            session_id=self._resolve_session_id(),
+            engine_id=_transmissible_or_none(self._resolve_engine_id()),
+            orchestrator_engine_id=_transmissible_or_none(self._resolve_orchestrator_engine_id()),
+            session_id=_transmissible_or_none(self._resolve_session_id()),
         )
 
         encoding = _encode_attribution_header(facts)
@@ -272,8 +272,8 @@ class BudgetManager(EngineScoped):
             return GetAttributionContextResultFailure(
                 result_details=(
                     "Attempted to describe an outbound request for budget attribution. Failed because "
-                    "the attribution payload exceeded the maximum header size even after being reduced. "
-                    "The request can proceed, but this spend will not be attributed."
+                    "the attribution payload could not be encoded into a header, even after being reduced "
+                    "to its smallest form. The request can proceed, but this spend will not be attributed."
                 )
             )
 
@@ -309,10 +309,11 @@ class BudgetManager(EngineScoped):
         project's spend, because the Cloud matches on the string alone and has no way to know
         the two names are the same project.
 
-        A nameless entry ends the chain rather than contributing anything in its place. There is
-        nothing to put there that a budget rule could match, and it costs nothing to stop:
-        `get_project_chain` breaks its walk at the first entry whose template did not load, so a
-        nameless entry is always the last one -- an unregistered ancestor.
+        A nameless entry costs the whole chain, wherever it sits. `get_project_chain` maps any
+        falsy name to None, so an entry is nameless either because its template did not load or
+        because it loaded with an empty `name` -- nothing in the schema forbids the empty
+        string. The two are indistinguishable here and need not be distinguished: both leave a
+        link no budget rule can name.
 
         The synthetic `<system-defaults>` rest state is skipped by *id*, before its name is
         read. It does have a template -- the shipped default one -- so it does have a name,
@@ -337,7 +338,12 @@ class BudgetManager(EngineScoped):
             if entry.id == SYSTEM_DEFAULTS_KEY:
                 continue
             if entry.name is None:
-                break
+                logger.warning(
+                    "Dropping project attribution for this call: a project in the chain has no "
+                    "usable name, so the chain cannot be described. Give every project a name to "
+                    "attribute its spend."
+                )
+                return []
             project_names.append(entry.name)
 
         # A real project *named* `<system-defaults>`, separate from the sentinel id skipped

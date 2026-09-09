@@ -82,8 +82,9 @@ class GetAttributionContextResultSuccess(WorkflowNotAlteredMixin, ResultPayloadS
         header_name: The header to send it under. Shipped on the result so a rename never has
             to touch a vendored client copy.
         schema_version: The payload schema version encoded in `header_value`
-        project_chain: The project names the call is attributed to, ordered leaf-first. A
-            project whose template did not load has no name and ends the chain.
+        project_chain: The project names the call is attributed to, ordered leaf-first. Never
+            partial -- budget paths are root-anchored, so a chain missing a link would present
+            a nested project as a root. Empty whenever the full ancestry cannot be described.
         workflow_name: The current workflow's registry key, or `<unsaved>`
         node_type: The node type the caller passed back, unchanged
         engine_id: The id of the engine that answered
@@ -91,7 +92,9 @@ class GetAttributionContextResultSuccess(WorkflowNotAlteredMixin, ResultPayloadS
             forwarded to the orchestrator, which has no parent, so this is always absent
             today -- do not build a consumer-side join on it
         session_id: The active session id
-        chain_truncated: Whether ancestors were dropped from `project_chain`
+        chain_truncated: Whether anything was trimmed off `project_chain` to fit the header.
+            Read with the list: non-empty means ancestors were dropped for size, empty means
+            the whole chain was. Empty and unflagged means there was no chain to begin with.
     """
 
     header_value: str
@@ -111,7 +114,9 @@ class GetAttributionContextResultSuccess(WorkflowNotAlteredMixin, ResultPayloadS
 class GetAttributionContextResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """No attribution header value could be produced.
 
-    The only cause is a payload still over the header size limit after being reduced to its
-    smallest form; every other degradation returns Success with a key omitted. The caller
-    should proceed and send no attribution header -- the spend lands in the default budget.
+    In practice the only cause is a payload still over the header size limit after being reduced
+    to its smallest form; every other degradation returns Success with a key omitted. An
+    unencodable payload lands here too, but every field that could carry one is filtered first,
+    so that path is a backstop. The caller should proceed and send no attribution header -- the
+    spend lands in the default budget.
     """

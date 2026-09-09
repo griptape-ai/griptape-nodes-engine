@@ -297,22 +297,53 @@ class TestProjectChain:
         assert result.project_chain == names[:32]
         assert result.chain_truncated is True
 
-    def test_an_unregistered_parent_ends_the_chain_without_falling_back_to_its_id(self) -> None:
-        """A nameless ancestor is dropped, not swapped for its id.
+    def test_an_unregistered_parent_drops_the_chain_and_never_falls_back_to_its_id(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A nameless ancestor is neither swapped for its id nor quietly cut away.
 
-        `get_project_chain` still surfaces an unresolvable parent, but with no template it
-        has no name -- and its registry key is not something a budget rule mentions. Emitting
-        that would put one unmatchable string in the list; the leaf alone at least matches a
-        rule written against the leaf.
+        Its registry key is not something a budget rule mentions, so emitting it adds one
+        unmatchable string. Keeping just the leaf is worse: paths are root-anchored, so
+        `["Shot 6"]` presents a nested project as a root and bills an unrelated top-level
+        "Shot 6" if the org has one.
         """
         project_manager = ProjectManager(Mock(), Mock(), Mock())
         _register_project(project_manager, "shot-6", name="Shot 6", parent_id="swx")
         project_manager._current_project_id = "shot-6"
 
-        result = _succeed(self._manager_on(project_manager))
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            result = _succeed(self._manager_on(project_manager))
 
-        assert _tags(result)["project"] == ["Shot 6"]
+        assert "project" not in _tags(result)
         assert "swx" not in result.header_value
+        assert "Shot 6" not in result.header_value
+        assert any(record.levelno == logging.WARNING for record in caplog.records)
+
+    @pytest.mark.parametrize("blank_at", ["root", "middle"])
+    def test_a_blank_name_drops_the_chain_wherever_it_sits(
+        self, blank_at: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A blank name reads as nameless, and position cannot tell it from a failed load.
+
+        `ProjectTemplate.name` has no `min_length` and `get_project_chain` maps any falsy name
+        to None, so a loaded blank-named template is indistinguishable from an unresolvable
+        one -- including at the root, where it is nameless *and* last. Hence both ends: a rule
+        reading "nameless and last means the walk ended" returns `["Shot 020"]` for a project
+        three deep and presents it to the Cloud as a root.
+        """
+        names = {"root": {"acme": "", "mid": "Mid"}, "middle": {"acme": "Acme Studios", "mid": ""}}[blank_at]
+        project_manager = ProjectManager(Mock(), Mock(), Mock())
+        _register_project(project_manager, "acme", name=names["acme"])
+        _register_project(project_manager, "mid", name=names["mid"], parent_id="acme")
+        _register_project(project_manager, "shot-020", name="Shot 020", parent_id="mid")
+        project_manager._current_project_id = "shot-020"
+
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            result = _succeed(self._manager_on(project_manager))
+
+        assert "project" not in _tags(result)
+        assert "Shot 020" not in result.header_value
+        assert any(record.levelno == logging.WARNING for record in caplog.records)
 
     def test_second_dispatch_reflects_a_project_switch(self) -> None:
         """The chain is read per invocation, never cached at workflow open."""
@@ -485,7 +516,12 @@ class TestSizeCap:
         return BudgetManager(MagicMock(), engine=mock_engine)
 
     def test_oversized_payload_reduces_to_minimum(self, caplog: pytest.LogCaptureFixture) -> None:
-        """Over the cap: drop workflow and node type, keep the leaf, still succeed."""
+        """Over the cap even without labels: the chain goes whole, and the call still succeeds.
+
+        Not down to the leaf -- paths are root-anchored, so `["Leaf"]` for a nested project
+        buys no narrower match than sending nothing and risks billing an unrelated top-level
+        "Leaf".
+        """
         manager = self._manager()
 
         with (
@@ -495,13 +531,14 @@ class TestSizeCap:
             result = _succeed(manager, node_type="GriptapeProxyImage")
 
         tags = _tags(result)
-        assert tags["project"] == ["Leaf"]
+        assert "project" not in tags
         assert "workflow" not in tags
         assert "node_type" not in tags
         # The structured fields have to agree with the reduced header, not the pre-encode values.
         assert result.workflow_name is None
         assert result.node_type is None
-        assert result.project_chain == ["Leaf"]
+        assert result.project_chain == []
+        # Empty *and* flagged: the chain was shed. Empty and unflagged means no project open.
         assert result.chain_truncated is True
         assert any(record.levelno == logging.WARNING for record in caplog.records)
 
@@ -633,22 +670,24 @@ class TestTransmissibility:
         assert "node_type" not in _tags(result)
         assert result.node_type is None
 
-    def test_an_unencodable_identifier_degrades_instead_of_raising(self) -> None:
-        """The encoder floor: identifiers are not filtered individually, so it must not raise.
+    def test_an_unencodable_identifier_costs_its_own_key_and_nothing_else(self) -> None:
+        """An identifier gets the same per-field filter every other dimension gets.
 
         `os.getenv` decodes with `surrogateescape`, so `orchestrator_engine_id` can arrive
-        holding a lone surrogate. Raising out of the handler would return `GenericResultFailure`,
-        which ignores `failure_log_level` and would log an ERROR with a traceback on every
-        metered call rather than degrading quietly.
+        holding a lone surrogate that `str.encode` refuses. Filtering at the read spends one
+        key on the documented "could not determine this" degradation; letting it reach the
+        encoder costs the whole header, and blames size for a problem that is not size.
         """
         mock_engine = _mock_engine()
         manager = BudgetManager(MagicMock(), engine=mock_engine)
 
         with patch.dict(os.environ, {"GTN_ORCHESTRATOR_ENGINE_ID": "eng-orch\udce9"}):
-            result = _dispatch(manager)
+            result = _succeed(manager)
 
-        assert isinstance(result, GetAttributionContextResultFailure)
-        assert "attribution" in str(result.result_details).lower()
+        tags = _tags(result)
+        assert "orchestrator_engine_id" not in tags
+        assert result.orchestrator_engine_id is None
+        assert tags["engine_id"] == mock_engine.engine_identity_manager.engine_id
 
 
 class TestConfidentiality:
