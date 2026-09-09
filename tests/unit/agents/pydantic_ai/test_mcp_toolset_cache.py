@@ -9,15 +9,19 @@ they were disconnected.
 
 from __future__ import annotations
 
+import inspect
+import re
 from typing import Any
 
 import pytest
 from fastmcp.client.transports import StdioTransport
 
-from griptape_nodes.agents.pydantic_ai.mcp_servers import BuiltMCPServer
+from griptape_nodes.agents.pydantic_ai.mcp_servers import BuiltMCPServer, mcp_server_from_config
 from griptape_nodes.agents.pydantic_ai.mcp_toolset_cache import (
+    CONNECTION_KEYS,
     DIGEST_LENGTH,
     MCPToolsetCache,
+    connection_fingerprint,
     digest_config,
     fingerprint_config,
 )
@@ -41,7 +45,9 @@ def _stub_builder(built: list[_StubTransport]) -> Any:
     def build(name: str, config: dict[str, Any]) -> BuiltMCPServer | None:
         if config.get("broken"):
             return None
-        transport = _StubTransport(tag=f"{name}:{config.get('tag')}")
+        # Tagged from `args`, a connection key, so a transport's tag identifies
+        # the config it was actually launched from.
+        transport = _StubTransport(tag=f"{name}:{''.join(config.get('args') or [])}")
         built.append(transport)
         return BuiltMCPServer(toolset=object(), transport=transport)  # type: ignore[arg-type]
 
@@ -59,8 +65,9 @@ def transports(monkeypatch: pytest.MonkeyPatch) -> list[_StubTransport]:
     return built
 
 
-def _config(name: str, tag: str = "v1") -> dict[str, Any]:
-    return {"name": name, "transport": "stdio", "command": "run", "tag": tag}
+def _config(name: str, tag: str = "v1", rules: str = "") -> dict[str, Any]:
+    """A server config. ``tag`` varies a connection key; ``rules`` varies a prompt-side one."""
+    return {"name": name, "transport": "stdio", "command": "run", "args": [tag], "rules": rules}
 
 
 class TestFingerprintAndDigest:
@@ -115,7 +122,7 @@ class TestWarmReuse:
 
 
 class TestConfigChange:
-    """An edited server is restarted; its neighbours are left alone."""
+    """A server whose *connection* changed is restarted; its neighbours are left alone."""
 
     @pytest.mark.asyncio
     async def test_edited_server_is_disconnected_and_rebuilt(self, transports: list[_StubTransport]) -> None:
@@ -143,6 +150,92 @@ class TestConfigChange:
         assert set(by_tag) == {"alpha:v1", "alpha:v2", "beta:v1"}
         assert by_tag["alpha:v1"].disconnected
         assert not by_tag["beta:v1"].disconnected
+
+
+class TestPromptSideEditsKeepTheConnection:
+    """A field that can't reach the transport must not cost a reconnect.
+
+    Editing a server's Rules is the common case: the text is passed as run
+    instructions every run regardless, so respawning the subprocess for it buys
+    nothing and costs a process spawn.
+    """
+
+    @pytest.mark.asyncio
+    async def test_editing_only_the_rules_reuses_the_server(self, transports: list[_StubTransport]) -> None:
+        cache = MCPToolsetCache()
+
+        async with await cache.acquire([_config("alpha", rules="be terse")]) as first:
+            first_toolsets = first.toolsets
+        async with await cache.acquire([_config("alpha", rules="reply in spanish")]) as second:
+            assert second.toolsets == first_toolsets
+
+        assert len(transports) == 1
+        assert not transports[0].disconnected
+
+    @pytest.mark.asyncio
+    async def test_the_reused_server_still_reports_the_new_config(self, transports: list[_StubTransport]) -> None:
+        edited = _config("alpha", rules="reply in spanish")
+
+        cache = MCPToolsetCache()
+        async with await cache.acquire([_config("alpha", rules="be terse")]):
+            pass
+        async with await cache.acquire([edited]) as lease:
+            resolved = lease.resolved
+
+        # Same subprocess, but the run record must name the config that produced
+        # the answer - not the one the subprocess happened to be started with.
+        assert len(transports) == 1
+        assert resolved[0].digest == digest_config(edited)
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_new_field_does_not_restart_the_server(self, transports: list[_StubTransport]) -> None:
+        # A field this cache has never heard of is assumed prompt-side. Anything
+        # that truly reaches the transport has to be added to `CONNECTION_KEYS`.
+        config = _config("alpha")
+
+        cache = MCPToolsetCache()
+        async with await cache.acquire([config]):
+            pass
+        async with await cache.acquire([{**config, "description": "now documented"}]):
+            pass
+
+        assert len(transports) == 1
+        assert not transports[0].disconnected
+
+
+class TestConnectionFingerprint:
+    """Only the keys baked in at build time are compared."""
+
+    def test_prompt_side_fields_are_ignored(self) -> None:
+        assert connection_fingerprint(_config("alpha", rules="a")) == connection_fingerprint(
+            _config("alpha", rules="b")
+        )
+
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            ("command", "other"),
+            ("args", ["--flag"]),
+            ("env", {"TOKEN": "x"}),
+            ("cwd", "/opt/servers"),
+            ("url", "https://example.com/mcp"),
+            ("headers", {"Authorization": "Bearer x"}),
+            ("timeout", 30),
+            ("transport", "streamable_http"),
+        ],
+    )
+    def test_every_connection_key_changes_the_fingerprint(self, key: str, value: Any) -> None:
+        config = _config("alpha")
+
+        assert connection_fingerprint(config) != connection_fingerprint({**config, key: value})
+
+    def test_it_covers_what_the_builder_reads(self) -> None:
+        # Guards the pair going out of sync: if `mcp_server_from_config` learns a
+        # new transport field, this fails until `CONNECTION_KEYS` learns it too.
+        source = inspect.getsource(mcp_server_from_config)
+        read_by_builder = set(re.findall(r"""config\.get\(["'](\w+)["']""", source))
+
+        assert read_by_builder <= CONNECTION_KEYS
 
 
 class TestRetireWhileInUse:

@@ -12,6 +12,11 @@ Changes you make to an MCP server take effect on your **next message** — you d
 
 Send another message after saving and the agent uses the updated server. Your conversation history is kept, so you can simply ask again.
 
-A server you didn't change keeps its existing connection, so editing one server won't slow down or interrupt the others. The server you edited reconnects on the next message, which can add a moment before the agent's first tool call.
+A server you didn't change keeps its existing connection, so editing one server won't slow down or interrupt the others.
+
+Whether the server you edited has to reconnect depends on what you changed:
+
+- Editing its **Rules** takes effect immediately with no reconnection, because the rules are sent to the agent fresh on every message.
+- Editing how Griptape Nodes reaches the server — its command, arguments, environment variables, working directory, URL, headers, or timeout — reconnects it on your next message, since those are fixed when the connection is opened. This can add a moment before the agent's first tool call.
 
 If a server is switched off or deleted, the agent stops using it from your next message onward, and Griptape Nodes shuts down the connection to it.
