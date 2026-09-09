@@ -24,8 +24,11 @@ defaults to ``keep_alive=True``, so exiting a session leaves the subprocess
 running and the next run reuses it. A toolset therefore pins one subprocess,
 launched from the config the transport was *built* with, for as long as the
 toolset is held. Whoever caches a toolset owns calling
-:func:`disconnect_transport` when the config behind it changes; otherwise the
-edit cannot take effect and the old subprocess is never reaped. See
+:func:`disconnect_transport` when the *connection* behind it changes; otherwise
+the edit cannot take effect and the old subprocess is never reaped. Which
+config keys those are is recorded as
+:data:`~griptape_nodes.agents.pydantic_ai.mcp_toolset_cache.CONNECTION_KEYS`,
+so a new transport field read here has to be added there too. See
 :class:`~griptape_nodes.agents.pydantic_ai.mcp_toolset_cache.MCPToolsetCache`.
 """
 

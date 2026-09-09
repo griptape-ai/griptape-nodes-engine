@@ -8,20 +8,28 @@ args, env, cwd, url and headers are baked into the transport when it is built,
 so a cached toolset speaks to a server launched from the *old* config forever.
 
 This cache makes the trade explicitly: entries are keyed by server name and
-carry a fingerprint of the resolved config, so an unchanged server keeps its
-warm subprocess and an edited one is torn down and rebuilt. Rebuilding on a
+carry a fingerprint of the config, so an unchanged server keeps its warm
+subprocess and an edited one is torn down and rebuilt. Rebuilding on a
 fingerprint change rather than on a config-change event means edits made
 outside the event system - a hand-edited config file, another process writing
 the same file - are picked up just the same.
 
-Two values are derived from each config, and the difference matters:
+Not every edit needs a restart, though, and restarting on the ones that don't
+is expensive: respawning a subprocess costs hundreds of milliseconds where
+reuse costs none. So two different questions are asked of each config, and the
+difference between them matters:
 
-* ``fingerprint`` - the full canonical form. It contains ``env`` and
-  ``headers``, so it holds secrets. It lives in memory as a comparison key and
-  must never be logged or persisted.
-* ``digest`` - a short hash of the fingerprint. It is opaque and safe to write
-  to disk or send to a client, which is what lets a run record say *which*
-  configuration of a server a response was produced with.
+* *Do we have to reconnect?* - answered by :func:`connection_fingerprint`, over
+  only the keys baked into the transport at build time. A ``rules`` edit is
+  prompt-side and leaves this untouched, so the server keeps its subprocess.
+* *Which configuration did this run use?* - answered by :func:`digest_config`
+  over the whole config, because ``rules`` genuinely change the answer the
+  model gives even though they don't change the connection.
+
+Both are derived from :func:`fingerprint_config` output, which contains ``env``
+and ``headers`` and so holds secrets: a fingerprint lives in memory as a
+comparison key and must never be logged or persisted. Only the short digest is
+opaque enough to write to disk or send to a client.
 """
 
 from __future__ import annotations
@@ -68,6 +76,34 @@ DIGEST_LENGTH = 12
 Long enough that two configurations of one server won't collide in practice,
 short enough to read in a log line or a thread's metadata.
 """
+
+
+CONNECTION_KEYS: frozenset[str] = frozenset({"transport", "command", "args", "env", "cwd", "url", "headers", "timeout"})
+"""Config keys that are baked in when a toolset is built, and so require a restart.
+
+Everything `mcp_server_from_config` reads to construct a transport, plus
+``timeout``, which becomes the toolset's ``init_timeout``. A change to any of
+them cannot reach a server that is already running, so the only way to apply it
+is to tear the server down and build a new one.
+
+Every *other* key - ``rules``, ``description``, ``enabled``, and anything added
+later - is prompt-side or bookkeeping and is re-read from the config on each
+run, so editing it must not cost a reconnect. Adding a field here is therefore a
+deliberate choice to trade warm reuse for correctness; the default of leaving it
+out is only wrong if the field ends up passed to `mcp_server_from_config`.
+"""
+
+
+def connection_fingerprint(config: Mapping[str, Any]) -> str:
+    """Return the comparison form of only the parts of ``config`` a connection depends on.
+
+    Two configs with the same connection fingerprint can share one running
+    server, however much the rest of them differs. Like
+    :func:`fingerprint_config`, the result embeds ``env`` and ``headers``: treat
+    it as a secret.
+    """
+    connection = {key: value for key, value in config.items() if key in CONNECTION_KEYS}
+    return fingerprint_config(connection)
 
 
 def fingerprint_config(config: Mapping[str, Any]) -> str:
@@ -157,7 +193,14 @@ class _Entry:
     name: str
     toolset: AbstractToolset[Any]
     transport: ClientTransport
-    fingerprint: str
+    # What the running server was launched from: if this changes, the server has
+    # to be replaced, because there is no way to tell a live subprocess about it.
+    connection_fingerprint: str
+    # The whole config this entry was last acquired with, as a persistable
+    # digest. Unlike the fingerprint above it is updated in place when a
+    # prompt-side field changes, so a run record names the config that actually
+    # produced the answer rather than the one the server was started with.
+    digest: str
     # Runs currently inside `async with toolset`. A transport cannot be
     # disconnected out from under a live session, so eviction waits for zero.
     users: int = 0
@@ -237,14 +280,18 @@ class MCPToolsetCache:
                 await self._retire(name)
 
     async def _entry_for(self, name: str, config: Mapping[str, Any]) -> _Entry | None:
-        """Return a usable entry for ``name``, rebuilding it if its config changed."""
-        fingerprint = fingerprint_config(config)
+        """Return a usable entry for ``name``, rebuilding it only if its connection changed."""
+        connection = connection_fingerprint(config)
+        digest = digest_config(config)
         cached = self._entries.get(name)
-        if cached is not None and cached.fingerprint == fingerprint:
+        if cached is not None and cached.connection_fingerprint == connection:
+            # The connection is still valid, so the subprocess is kept - but the
+            # rest of the config may have moved, and the digest has to follow it.
+            cached.digest = digest
             logger.info("%s server '%s' warm, reusing its connection", TIMING_LOG_PREFIX, name)
             return cached
         if cached is not None:
-            logger.info("MCP server '%s' configuration changed; restarting it for this run.", name)
+            logger.info("MCP server '%s' connection settings changed; restarting it for this run.", name)
             await self._retire(name)
         started = time.monotonic()
         built = mcp_server_from_config(name, config)
@@ -254,7 +301,8 @@ class MCPToolsetCache:
             name=name,
             toolset=TimedToolset(wrapped=built.toolset, server_name=name),
             transport=built.transport,
-            fingerprint=fingerprint,
+            connection_fingerprint=connection,
+            digest=digest,
         )
         self._entries[name] = entry
         logger.info(
@@ -262,7 +310,7 @@ class MCPToolsetCache:
             TIMING_LOG_PREFIX,
             name,
             (time.monotonic() - started) * 1000,
-            digest_of_fingerprint(fingerprint),
+            digest,
         )
         return entry
 
@@ -310,10 +358,7 @@ class MCPToolsetLease:
     @property
     def resolved(self) -> list[ResolvedMCPServer]:
         """Which servers, at which configuration, this run actually got."""
-        return [
-            ResolvedMCPServer(name=entry.name, digest=digest_of_fingerprint(entry.fingerprint))
-            for entry in self.entries
-        ]
+        return [ResolvedMCPServer(name=entry.name, digest=entry.digest) for entry in self.entries]
 
     async def __aenter__(self) -> Self:
         return self
