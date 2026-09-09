@@ -35,8 +35,6 @@ from typing import TYPE_CHECKING, Any
 from fastmcp.client.transports import ClientTransport, SSETransport, StdioTransport, StreamableHttpTransport
 from pydantic_ai.mcp import MCPToolset
 
-from griptape_nodes.agents.pydantic_ai.tool_retries import DEFAULT_TOOL_MAX_RETRIES
-
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
@@ -87,6 +85,10 @@ def mcp_server_from_config(name: str, config: Mapping[str, Any]) -> BuiltMCPServ
     Never raises: returns ``None`` and logs a warning for any config it cannot
     build from, so one bad server doesn't stop the others being attached. The
     returned toolset is prefixed with ``name``.
+
+    No toolset sets ``max_retries``, so every MCP tool inherits the agent's
+    budget: one knob (``PydanticAgentRunner.retries``) covers every tool the chat
+    agent can call.
     """
     transport = config.get("transport", "stdio")
 
@@ -116,7 +118,7 @@ def _stdio_server_from_config(name: str, config: Mapping[str, Any]) -> BuiltMCPS
         cwd=config.get("cwd"),
     )
     return BuiltMCPServer(
-        toolset=_compose(name, MCPToolset(client, max_retries=DEFAULT_TOOL_MAX_RETRIES)),
+        toolset=_compose(name, MCPToolset(client)),
         transport=client,
     )
 
@@ -143,7 +145,7 @@ def _http_server_from_config(name: str, config: Mapping[str, Any], transport: st
     return BuiltMCPServer(
         toolset=_compose(
             name,
-            MCPToolset(client, max_retries=DEFAULT_TOOL_MAX_RETRIES, init_timeout=_connect_timeout(config)),
+            MCPToolset(client, init_timeout=_connect_timeout(config)),
         ),
         transport=client,
     )
@@ -170,7 +172,7 @@ def streamable_http_local(url: str, *, name: str | None = None) -> AbstractTools
     server_name = name or "GriptapeNodes"
     return _compose(
         server_name,
-        MCPToolset(StreamableHttpTransport(url=url), max_retries=DEFAULT_TOOL_MAX_RETRIES),
+        MCPToolset(StreamableHttpTransport(url=url)),
         tool_blocklist=DEFAULT_GTN_TOOL_BLOCKLIST,
     )
 
