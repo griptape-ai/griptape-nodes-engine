@@ -180,11 +180,9 @@ class PydanticAgentRunner:
     def __post_init__(self) -> None:
         toolsets: list[Any] = list(self.mcp_servers)
         instructions = self._build_instructions()
-        capabilities = self._build_skills_capabilities()
         agent_kwargs: dict[str, Any] = {
             "instructions": instructions,
             "toolsets": toolsets or None,
-            "capabilities": capabilities or None,
         }
         if self.system_prompt:
             agent_kwargs["system_prompt"] = self.system_prompt
@@ -206,13 +204,13 @@ class PydanticAgentRunner:
             self._image_toolset = register_image_tools(self._agent, self.image_config, self.static_files_manager)
         resolved_settings = model.settings or {}
         logger.info(
-            "PydanticAgentRunner ready: model=%s workspace=%s mcp_servers=%d image_tool=%s skills=%d "
+            "PydanticAgentRunner ready: model=%s workspace=%s mcp_servers=%d image_tool=%s skills_library=%s "
             "usage_limits=%s max_tokens=%s",
             self.model_name,
             self.workspace_root,
             len(self.mcp_servers),
             self._image_toolset is not None,
-            len(capabilities),
+            self._skills_library(),
             self.usage_limits,
             # "provider default" is the honest description of sending no
             # max_tokens: the ceiling exists, we just don't choose it.
@@ -222,33 +220,106 @@ class PydanticAgentRunner:
     def _build_instructions(self) -> str | None:
         """Compose the instruction string from the user's input.
 
-        Skill guidance is injected separately by :class:`SkillsCapability` via
-        its own ``get_instructions`` hook, so it is not concatenated here.
+        Each skill is its own deferred capability, so its guidance reaches the
+        model through Pydantic AI's ``load_capability`` tool rather than being
+        concatenated here.
         """
         return self.instructions or None
+
+    def _skills_library(self) -> Path | None:
+        """The skills directory to scan, or ``None`` when there is nothing to scan."""
+        if not self.auto_load_skills:
+            return None
+        skills_dir = self.workspace_root / self.skills_directory
+        if not skills_dir.is_dir():
+            return None
+        return skills_dir
 
     def _build_skills_capabilities(self) -> list[SkillsCapability]:
         """Build the skills capability exposing ``.agents/skills`` to the agent.
 
-        Returns an empty list when skills are disabled or the skills directory
-        is absent so the agent is created without a skills capability rather
-        than an empty one. ``run_skill_script`` is excluded because the workspace
-        already exposes a gated shell tool and skills here ship no scripts;
-        ``auto_reload`` re-scans the directory before each run so edits land
-        without restarting the engine.
+        Built per run rather than per runner: discovery is a construction-time
+        snapshot, so rebuilding it each turn is what makes an edited skill land
+        without restarting the engine. ``scripts=False`` leaves
+        ``run_skill_script`` unregistered because the workspace already exposes a
+        gated shell tool and skills here ship no scripts.
+
+        Returns an empty list when skills are disabled, the directory is absent,
+        or no skill in it loads, so the run proceeds without skills instead of
+        failing on a bad ``SKILL.md``.
         """
-        if not self.auto_load_skills:
+        skills_dir = self._skills_library()
+        if skills_dir is None:
             return []
-        skills_dir = self.workspace_root / self.skills_directory
-        if not skills_dir.is_dir():
+        capability = self._load_skills(skills_dir)
+        if capability is None:
+            capability = self._load_usable_skills(skills_dir)
+        if capability is None:
             return []
-        return [
-            SkillsCapability(
+        return [capability]
+
+    def _load_skills(
+        self,
+        skills_dir: Path,
+        include: list[str] | None = None,
+        *,
+        index_resources: bool = True,
+    ) -> SkillsCapability | None:
+        """Build a capability over ``skills_dir``, or ``None`` when the loader rejects a skill.
+
+        The loader validates every selected skill while constructing and raises on the
+        first one it rejects, so this succeeds only when all of them load. ``ValueError``
+        is a frontmatter report and ``OSError`` an unreadable ``SKILL.md``; both cost
+        skills rather than the run.
+
+        ``index_resources=False`` skips indexing bundled *resources*, which a probe does
+        not need and which is the bulk of what makes probing expensive. Scripts are still
+        discovered, so a library shipping them pays more per probe than one that does not.
+        """
+        exclude_resources = None if index_resources else ["*"]
+        try:
+            return SkillsCapability(
                 directories=[skills_dir],
-                exclude_tools={"run_skill_script"},
-                auto_reload=True,
+                scripts=False,
+                include=include,
+                exclude_resources=exclude_resources,
             )
+        except (ValueError, OSError) as e:
+            logger.warning(
+                "Attempted to load skills %s from %s. Failed because of: %s",
+                include if include is not None else "(all)",
+                skills_dir,
+                e,
+            )
+            return None
+
+    def _load_usable_skills(self, skills_dir: Path) -> SkillsCapability | None:
+        """Build a capability over only the skills in ``skills_dir`` that load on their own.
+
+        One rejected ``SKILL.md`` fails the whole library, so probe each skill by name
+        first: ``include`` filters before the loader parses anything, which pins a
+        rejection to the skill that caused it and keeps the others. Returns ``None`` when
+        nothing survives.
+
+        Probing costs a construction per skill, and every construction walks the whole
+        library's bundled files, so probes skip indexing its resources: a probe only has
+        to answer whether the frontmatter parses, and the survivors' resources are indexed
+        by the build below.
+        """
+        try:
+            candidates = sorted(entry.name for entry in skills_dir.iterdir() if (entry / "SKILL.md").is_file())
+        except OSError as e:
+            logger.warning("Attempted to list the skills in %s. Failed because of: %s", skills_dir, e)
+            return None
+
+        usable = [
+            name
+            for name in candidates
+            if self._load_skills(skills_dir, include=[name], index_resources=False) is not None
         ]
+        if not usable:
+            return None
+        return self._load_skills(skills_dir, include=usable)
 
     @property
     def agent(self) -> Agent[Any, str]:
@@ -313,11 +384,15 @@ class PydanticAgentRunner:
             model_history = await history_rehydrator(history)
         run_id = thread_id[:8]
 
+        # Rebuilt every run so skill edits land without an engine restart.
+        capabilities = self._build_skills_capabilities()
+
         logger.info(
-            "[run %s] start: model=%s history_len=%d prompt=%r",
+            "[run %s] start: model=%s history_len=%d skills=%s prompt=%r",
             run_id,
             self.model_name,
             len(history),
+            [name for capability in capabilities for name in capability.skill_names],
             _prompt_preview(prompt),
         )
         started = time.monotonic()
@@ -336,6 +411,7 @@ class PydanticAgentRunner:
                 message_history=model_history,
                 usage_limits=self.usage_limits,
                 event_stream_handler=event_handler,
+                capabilities=capabilities or None,
             )
         )
         try:
