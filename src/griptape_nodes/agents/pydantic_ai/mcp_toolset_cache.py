@@ -49,8 +49,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger("griptape_nodes")
 
 
-TIMING_LOG_PREFIX = "[mcp-timing]"
+TIMING_LOG_PREFIX = "MCP-TIMING"
 """Marker on the temporary per-run MCP timing lines.
+
+No square brackets: the engine's log handler is a `RichHandler` built with
+`markup=True`, which parses `[mcp-timing]` as a style tag and silently drops it,
+leaving the lines unfindable in the very logs they exist to annotate.
 
 TODO(#5459): remove `TimedToolset` and every log line carrying this prefix once
 we have confirmed in the field that per-run attachment costs what we measured
