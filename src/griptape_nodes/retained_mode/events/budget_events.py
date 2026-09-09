@@ -29,8 +29,11 @@ UNSAVED_WORKFLOW_SENTINEL = "<unsaved>"
 class GetAttributionContextRequest(RequestPayload):
     """Describe the current engine context so an outbound call can be attributed to a project.
 
-    Everything in the result is descriptive rather than secret: project ids, a workflow key,
-    a node type, and engine/session guids. It carries no credential and no user-authored label.
+    Everything in the result is descriptive rather than secret: project names, a workflow key,
+    a node type, and engine/session guids. It carries no credential.
+
+    It does carry user-authored strings. `tags.project` holds project names, and the workflow
+    key is a workspace-relative path. Both are visible to an SSL-inspecting egress proxy.
 
     Attribution is best-effort. Anything the engine cannot determine is omitted rather than
     guessed at or raised, because the caller is about to spend money and a missing dimension
@@ -79,8 +82,8 @@ class GetAttributionContextResultSuccess(WorkflowNotAlteredMixin, ResultPayloadS
         header_name: The header to send it under. Shipped on the result so a rename never has
             to touch a vendored client copy.
         schema_version: The payload schema version encoded in `header_value`
-        project_chain: The project ids the call is attributed to, ordered leaf-first. Ids only;
-            project names are never included.
+        project_chain: The project names the call is attributed to, ordered leaf-first. A
+            project whose template did not load has no name and ends the chain.
         workflow_name: The current workflow's registry key, or `<unsaved>`
         node_type: The node type the caller passed back, unchanged
         engine_id: The id of the engine that answered

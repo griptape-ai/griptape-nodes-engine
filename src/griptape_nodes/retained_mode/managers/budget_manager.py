@@ -93,12 +93,11 @@ class _ReductionStage(NamedTuple):
 def _is_transmissible(value: str) -> bool:
     """Whether a value survives the trip to the Cloud intact.
 
-    Two ways it does not, and both arrive by the same route -- a legacy project's id is its
-    canonical filesystem path (`project_manager.py:795`), and the workflow registry key is
-    derived from one. A path whose bytes are not valid UTF-8 comes back from the OS carrying
-    lone surrogates from `surrogateescape`, which `str.encode` refuses. A directory name may
-    legally contain a control character, which encodes here and is then discarded by the
-    Cloud's storability check.
+    Two ways it does not. A project name is free text and a workflow registry key is derived
+    from a filesystem path, so either can carry a byte the wire cannot hold. A path whose bytes
+    are not valid UTF-8 comes back from the OS carrying lone surrogates from `surrogateescape`,
+    which `str.encode` refuses. A pasted line break, or a directory name that legally contains
+    a control character, encodes here and is then discarded by the Cloud's storability check.
     """
     if _UNSTORABLE_CHARACTERS.search(value):
         return False
@@ -179,8 +178,8 @@ def _encode_attribution_payload(payload: dict[str, Any]) -> str | None:
 def _encode_attribution_header(facts: _AttributionFacts) -> _AttributionEncoding | None:
     """Encode the attribution header, shedding dimensions in stages until it fits.
 
-    The chain is always truncated to `_MAX_PROJECT_CHAIN_ENTRIES` from the leaf -- the v1 rule,
-    not a size response. If the result does not fit, dimensions are shed in order of increasing
+    The chain is always truncated to `_MAX_PROJECT_CHAIN_ENTRIES` from the leaf -- a standing
+    rule, not a size response. If the result does not fit, dimensions are shed in order of increasing
     value: the workflow and node type first, and only then the chain's ancestors.
 
     The chain goes last because it is the only dimension the Cloud matches budgets against, and
@@ -189,7 +188,7 @@ def _encode_attribution_header(facts: _AttributionFacts) -> _AttributionEncoding
     so even when an oversized `workflow` was what pushed the payload over, leaving the chain to
     pay for room it was not using.
 
-    None means even a leaf-only payload did not fit, which needs a single project id larger
+    None means even a leaf-only payload did not fit, which needs a single project name larger
     than the whole cap.
     """
     chain_truncated = len(facts.project_chain) > _MAX_PROJECT_CHAIN_ENTRIES
@@ -297,28 +296,35 @@ class BudgetManager(EngineScoped):
         )
 
     def _resolve_project_chain(self) -> list[str]:
-        """Resolve the current project's ancestry as ids, leaf-first, or [] when unavailable.
+        """Resolve the current project's ancestry as names, leaf-first, or [] when unavailable.
 
-        `ProjectChainEntry.name` is dropped here -- the single place the chain is consumed --
-        so a project's *display name* never travels. That is weaker than "no user-authored
-        string travels", and the difference matters: a legacy project predating the explicit
-        `id` field uses its canonical file path as its id (`project_manager.py:795`), and a
-        user may set any unique string as one, so `tags.project` can carry a filesystem path
-        or a chosen label. Ids still go out verbatim, because the Cloud matches them against
-        admin-authored budget paths -- hashing or dropping one would silently unbudget that
-        project rather than protect it. Disclosed on the PR; see the id-space contract at
-        `project_manager.py:163-172`.
+        `tags.project` is the only dimension the Cloud matches budgets against, so whatever
+        goes here has to be something a budget admin can author into a rule. The project name
+        is that: required by the schema, so always present, and the same string on every
+        machine that opens the project.
 
-        An id the Cloud cannot store costs the *whole* chain, not just its own entry. Budget
+        Two costs come with it, both accepted deliberately. A user-authored string rides in a
+        header that SSL-inspecting egress proxies log, so a project name discloses whatever the
+        user put in it -- a client name, typically. And a rename silently re-points that
+        project's spend, because the Cloud matches on the string alone and has no way to know
+        the two names are the same project.
+
+        A nameless entry ends the chain rather than contributing anything in its place. There is
+        nothing to put there that a budget rule could match, and it costs nothing to stop:
+        `get_project_chain` breaks its walk at the first entry whose template did not load, so a
+        nameless entry is always the last one -- an unregistered ancestor.
+
+        The synthetic `<system-defaults>` rest state is skipped by *id*, before its name is
+        read. It does have a template -- the shipped default one -- so it does have a name,
+        and that name is "Default Project", which is exactly the kind of generic string that
+        would collide across every user in an org. It is also not a project the Cloud models
+        at all: it is the root sentinel, never a real ancestor, so skipping it leaves a chain
+        the Cloud can still match rather than a truncated one.
+
+        A name the Cloud cannot store costs the *whole* chain, not just its own entry. Budget
         paths are root-anchored, so a chain missing any link already matches nothing -- and
         dropping only the offending entry is worse than sending none, because it promotes that
         entry's parent to leaf and bills a real ancestor project for spend it never incurred.
-
-        `<system-defaults>` is dropped with it. The Cloud reserves that exact string as its own
-        marker for unattributed spend, so its parser discards a client copy and counts the call
-        as degraded. Working outside a project is ordinary rather than exceptional, so sending it
-        would put a permanent noise floor under the platform's client-health metric for no gain:
-        omitting the key lands the spend in the same default bucket, silently.
         """
         try:
             chain = self.engine.project_manager.get_project_chain()
@@ -326,16 +332,35 @@ class BudgetManager(EngineScoped):
             logger.warning("Could not resolve the project chain for budget attribution.", exc_info=True)
             return []
 
-        project_ids = [entry.id for entry in chain if entry.id != SYSTEM_DEFAULTS_KEY]
-        untransmissible_count = sum(1 for project_id in project_ids if not _is_transmissible(project_id))
+        project_names: list[str] = []
+        for entry in chain:
+            if entry.id == SYSTEM_DEFAULTS_KEY:
+                continue
+            if entry.name is None:
+                break
+            project_names.append(entry.name)
+
+        # A real project *named* `<system-defaults>`, separate from the sentinel id skipped
+        # above. Nothing stops a user typing the reserved string into `name:`. The Cloud
+        # reserves it and discards a client copy, which would drop that entry and bill its
+        # parent for spend it never incurred, so the chain goes nowhere instead.
+        if SYSTEM_DEFAULTS_KEY in project_names:
+            logger.warning(
+                "Dropping project attribution for this call: a project is named '%s', which Griptape "
+                "Cloud reserves for its own use. Rename the project to attribute its spend.",
+                SYSTEM_DEFAULTS_KEY,
+            )
+            return []
+
+        untransmissible_count = sum(1 for name in project_names if not _is_transmissible(name))
         if untransmissible_count > 0:
             logger.warning(
-                "Dropping project attribution for this call: %d project id(s) in the chain cannot be "
+                "Dropping project attribution for this call: %d project name(s) in the chain cannot be "
                 "transmitted intact. This spend will land in the default budget.",
                 untransmissible_count,
             )
             return []
-        return project_ids
+        return project_names
 
     def _resolve_workflow_name(self) -> str | None:
         """Resolve the current workflow's registry key, or None when it cannot be determined.
@@ -343,7 +368,7 @@ class BudgetManager(EngineScoped):
         An unsaved workflow is registered under an `unsaved:<uuid4>` key that is fresh every
         session, so the sentinel goes out instead: one low-cardinality bucket for scratch spend,
         still distinguishable from an absent key. A saved key is workspace-path-derived, so it
-        carries the same transmissibility risk as a project id and gets the same check.
+        carries the same transmissibility risk as a project name and gets the same check.
         """
         try:
             if not self.engine.context_manager.has_current_workflow():
