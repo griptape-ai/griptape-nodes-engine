@@ -25,7 +25,6 @@ import mimetypes
 import os
 import textwrap
 import threading
-import time
 from dataclasses import dataclass, replace
 from http import HTTPStatus
 from pathlib import Path
@@ -41,7 +40,6 @@ from xdg_base_dirs import xdg_data_home
 from griptape_nodes.agents.pydantic_ai.image_tools import GRIPTAPE_CLOUD_BASE_URL, ImageGenerationToolsetConfig
 from griptape_nodes.agents.pydantic_ai.mcp_servers import streamable_http_local
 from griptape_nodes.agents.pydantic_ai.mcp_toolset_cache import (
-    TIMING_LOG_PREFIX,
     MCPToolsetCache,
     MCPToolsetLease,
 )
@@ -1150,13 +1148,7 @@ class AgentManager(EngineScoped):
         an edited one is restarted, and one that has been deleted or disabled is
         shut down here rather than lingering for the session.
         """
-        started = time.monotonic()
         enabled = self._lookup_enabled_mcp_servers()
-        logger.info(
-            "%s read MCP server config in %.1f ms",
-            TIMING_LOG_PREFIX,
-            (time.monotonic() - started) * 1000,
-        )
         if enabled is None:
             return _MCPAttachment(lease=await self._mcp_toolsets.acquire([]), instructions="")
 
@@ -1172,24 +1164,15 @@ class AgentManager(EngineScoped):
 
         configs = [{**enabled[name], "name": name} for name in server_names if name in enabled]
         lease = await self._mcp_toolsets.acquire(configs)
-        logger.info(
-            "%s attached %s in %.1f ms total",
-            TIMING_LOG_PREFIX,
-            ", ".join(f"{server.name}@{server.digest}" for server in lease.resolved) or "no servers",
-            (time.monotonic() - started) * 1000,
-        )
         instructions = _compose_server_rules(configs)
-        # Which servers carry a `rules` string at all, so an empty result can be
-        # told apart from a rule the model simply didn't follow. The rules text
-        # itself is deliberately not logged: it is free-form user input that can
-        # contain anything they pasted into the box, and engine logs get attached
-        # to support reports.
-        with_rules = [str(config["name"]) for config in configs if str(config.get("rules") or "").strip()]
-        logger.info(
-            "%s rules from %s -> run instructions (%d chars)",
-            TIMING_LOG_PREFIX,
-            ", ".join(with_rules) or "no servers",
-            len(instructions),
+        # Servers with their config digests, which is what answers "an edit
+        # didn't take effect" reports: a digest that moved between two runs says
+        # the run really did read the new config. The rules text itself is
+        # deliberately never logged - it is a free-text box, so whatever the user
+        # pasted into it would end up in logs attached to support reports.
+        logger.debug(
+            "Agent run attached MCP server(s) %s",
+            ", ".join(f"{server.name}@{server.digest}" for server in lease.resolved) or "none",
         )
         return _MCPAttachment(lease=lease, instructions=instructions)
 

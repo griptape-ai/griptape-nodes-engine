@@ -40,11 +40,8 @@ import asyncio
 import hashlib
 import json
 import logging
-import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Self
-
-from pydantic_ai.toolsets import WrapperToolset
 
 from griptape_nodes.agents.pydantic_ai.mcp_servers import disconnect_transport, mcp_server_from_config
 
@@ -52,23 +49,9 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping, Sequence
 
     from fastmcp.client.transports import ClientTransport
-    from pydantic_ai import RunContext
-    from pydantic_ai.toolsets import AbstractToolset, ToolsetTool
+    from pydantic_ai.toolsets import AbstractToolset
 
 logger = logging.getLogger("griptape_nodes")
-
-
-TIMING_LOG_PREFIX = "MCP-TIMING"
-"""Marker on the temporary per-run MCP timing lines.
-
-No square brackets: the engine's log handler is a `RichHandler` built with
-`markup=True`, which parses `[mcp-timing]` as a style tag and silently drops it,
-leaving the lines unfindable in the very logs they exist to annotate.
-
-TODO(#5459): remove `TimedToolset` and every log line carrying this prefix once
-we have confirmed in the field that per-run attachment costs what we measured
-locally. Grep for the prefix to find all of it.
-"""
 
 
 DIGEST_LENGTH = 12
@@ -125,54 +108,6 @@ def digest_config(config: Mapping[str, Any]) -> str:
 def digest_of_fingerprint(fingerprint: str) -> str:
     """Hash an already-computed fingerprint, so callers holding one needn't rebuild it."""
     return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:DIGEST_LENGTH]
-
-
-@dataclass
-class TimedToolset(WrapperToolset[Any]):
-    """Temporary instrumentation: times the work `Agent.run` does on a toolset.
-
-    Most of the per-run cost of an MCP server is not in our code - it is the
-    connect and ``tools/list`` that happen when the agent enters the toolset. A
-    wrapper is the only place we can see them from.
-
-    TODO(#5459): delete this class along with the rest of the timing logs.
-    """
-
-    server_name: str = ""
-
-    async def __aenter__(self) -> Self:
-        started = time.monotonic()
-        await super().__aenter__()
-        logger.info(
-            "%s server '%s' connect took %.1f ms",
-            TIMING_LOG_PREFIX,
-            self.server_name,
-            (time.monotonic() - started) * 1000,
-        )
-        return self
-
-    async def __aexit__(self, *args: object) -> bool | None:
-        started = time.monotonic()
-        result = await super().__aexit__(*args)
-        logger.info(
-            "%s server '%s' release took %.1f ms",
-            TIMING_LOG_PREFIX,
-            self.server_name,
-            (time.monotonic() - started) * 1000,
-        )
-        return result
-
-    async def get_tools(self, ctx: RunContext[Any]) -> dict[str, ToolsetTool[Any]]:
-        started = time.monotonic()
-        tools = await super().get_tools(ctx)
-        logger.info(
-            "%s server '%s' listed %d tool(s) in %.1f ms",
-            TIMING_LOG_PREFIX,
-            self.server_name,
-            len(tools),
-            (time.monotonic() - started) * 1000,
-        )
-        return tools
 
 
 @dataclass
@@ -235,7 +170,6 @@ class MCPToolsetCache:
         The returned lease holds a use count on every toolset it names, so it
         must be released - use it as an async context manager.
         """
-        started = time.monotonic()
         entries: list[_Entry] = []
         async with self._lock:
             # Two passes on purpose. Resolving an entry can raise, and there is
@@ -249,13 +183,6 @@ class MCPToolsetCache:
                     entries.append(entry)
             for entry in entries:
                 entry.users += 1
-        logger.info(
-            "%s acquired %d of %d server(s) in %.1f ms",
-            TIMING_LOG_PREFIX,
-            len(entries),
-            len(configs),
-            (time.monotonic() - started) * 1000,
-        )
         return MCPToolsetLease(cache=self, entries=entries)
 
     async def retain_only(self, names: Iterable[str]) -> None:
@@ -266,18 +193,12 @@ class MCPToolsetCache:
         process alive, so it is torn down here.
         """
         keep = set(names)
-        started = time.monotonic()
         async with self._lock:
             dropped = [n for n in self._entries if n not in keep]
             for name in dropped:
                 await self._retire(name)
         if dropped:
-            logger.info(
-                "%s shut down %s in %.1f ms",
-                TIMING_LOG_PREFIX,
-                ", ".join(sorted(dropped)),
-                (time.monotonic() - started) * 1000,
-            )
+            logger.debug("Shut down MCP server(s) no longer enabled: %s", ", ".join(sorted(dropped)))
 
     async def aclose(self) -> None:
         """Disconnect every cached server.
@@ -301,30 +222,21 @@ class MCPToolsetCache:
             # The connection is still valid, so the subprocess is kept - but the
             # rest of the config may have moved, and the digest has to follow it.
             cached.digest = digest
-            logger.info("%s server '%s' warm, reusing its connection", TIMING_LOG_PREFIX, name)
             return cached
         if cached is not None:
             logger.info("MCP server '%s' connection settings changed; restarting it for this run.", name)
             await self._retire(name)
-        started = time.monotonic()
         built = mcp_server_from_config(name, config)
         if built is None:
             return None
         entry = _Entry(
             name=name,
-            toolset=TimedToolset(wrapped=built.toolset, server_name=name),
+            toolset=built.toolset,
             transport=built.transport,
             connection_fingerprint=connection,
             digest=digest,
         )
         self._entries[name] = entry
-        logger.info(
-            "%s server '%s' built in %.1f ms (digest %s)",
-            TIMING_LOG_PREFIX,
-            name,
-            (time.monotonic() - started) * 1000,
-            digest,
-        )
         return entry
 
     async def _retire(self, name: str) -> None:
