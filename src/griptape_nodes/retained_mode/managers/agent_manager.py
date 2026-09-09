@@ -625,7 +625,12 @@ class AgentManager(EngineScoped):
 
     def on_handle_get_thread_metadata_request(self, request: GetThreadMetadataRequest) -> ResultPayload:
         try:
-            thread = self._thread_storage.get_thread_metadata_full(request.thread_id)
+            if not self._thread_storage.thread_exists(request.thread_id):
+                details = f"Thread {request.thread_id} not found"
+                logger.error(details)
+                return GetThreadMetadataResultFailure(result_details=details)
+
+            thread = self._thread_storage.get_thread_metadata(request.thread_id)
             return GetThreadMetadataResultSuccess(
                 thread=thread, result_details="Thread metadata retrieved successfully."
             )
@@ -682,8 +687,8 @@ class AgentManager(EngineScoped):
                 logger.error(details)
                 return ArchiveThreadResultFailure(result_details=details)
 
-            meta = self._thread_storage.get_thread_metadata(request.thread_id)
-            if meta.get("archived", False):
+            thread = self._thread_storage.get_thread_metadata(request.thread_id)
+            if thread.archived:
                 details = f"Thread {request.thread_id} is already archived"
                 logger.error(details)
                 return ArchiveThreadResultFailure(result_details=details)
@@ -706,8 +711,8 @@ class AgentManager(EngineScoped):
                 logger.error(details)
                 return UnarchiveThreadResultFailure(result_details=details)
 
-            meta = self._thread_storage.get_thread_metadata(request.thread_id)
-            if not meta.get("archived", False):
+            thread = self._thread_storage.get_thread_metadata(request.thread_id)
+            if not thread.archived:
                 details = f"Thread {request.thread_id} is not archived"
                 logger.error(details)
                 return UnarchiveThreadResultFailure(result_details=details)
@@ -1129,8 +1134,8 @@ class AgentManager(EngineScoped):
             new_id, _ = self._thread_storage.create_thread()
             return new_id
 
-        meta = self._thread_storage.get_thread_metadata(thread_id)
-        if meta.get("archived", False):
+        thread = self._thread_storage.get_thread_metadata(thread_id)
+        if thread.archived:
             details = f"Cannot run agent on archived thread {thread_id}. Unarchive it first."
             raise ValueError(details)
         return thread_id

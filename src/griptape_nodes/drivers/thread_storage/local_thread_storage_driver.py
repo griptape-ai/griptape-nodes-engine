@@ -65,9 +65,6 @@ class LocalThreadStorageDriver(BaseThreadStorageDriver):
         atomic_write_bytes(self._history_path(thread_id), b"[]")
         return thread_id, meta
 
-    def get_thread_metadata(self, thread_id: str) -> dict:
-        return self._read_meta(thread_id)
-
     def update_thread_metadata(self, thread_id: str, **updates: object) -> dict:
         meta = self._read_meta(thread_id)
         for key, value in updates.items():
@@ -79,13 +76,12 @@ class LocalThreadStorageDriver(BaseThreadStorageDriver):
         return meta
 
     def append_run_record(self, thread_id: str, record: RunRecord) -> None:
-        meta = self._read_meta(thread_id)
-        meta.setdefault("runs", []).append(asdict(record))
-        meta["updated_at"] = datetime.now(UTC).isoformat()
-        meta.setdefault("created_at", meta["updated_at"])
-        self._write_meta(thread_id, meta)
+        runs_path = self._runs_path(thread_id)
+        raw: list[dict] = json.loads(runs_path.read_text()) if runs_path.exists() else []
+        raw.append(asdict(record))
+        atomic_write_bytes(runs_path, json.dumps(raw, indent=2).encode("utf-8"))
 
-    def get_thread_metadata_full(self, thread_id: str) -> ThreadMetadata:
+    def get_thread_metadata(self, thread_id: str) -> ThreadMetadata:
         meta = self._read_meta(thread_id)
         return ThreadMetadata(
             thread_id=thread_id,
@@ -95,7 +91,7 @@ class LocalThreadStorageDriver(BaseThreadStorageDriver):
             message_count=meta.get("message_count", 0),
             archived=meta.get("archived", False),
             local_id=meta.get("local_id"),
-            runs=self._deserialize_runs(thread_id, meta),
+            runs=self._load_runs(thread_id),
         )
 
     def list_threads(self) -> list[ThreadMetadata]:
@@ -121,9 +117,20 @@ class LocalThreadStorageDriver(BaseThreadStorageDriver):
         threads.sort(key=lambda t: t.updated_at, reverse=True)
         return threads
 
-    def _deserialize_runs(self, thread_id: str, meta: dict) -> list[RunRecord]:
+    def _runs_path(self, thread_id: str) -> Path:
+        return self.threads_directory / f"thread_{thread_id}.runs.json"
+
+    def _load_runs(self, thread_id: str) -> list[RunRecord]:
+        runs_path = self._runs_path(thread_id)
+        if not runs_path.exists():
+            return []
+        try:
+            raw: list[dict] = json.loads(runs_path.read_text())
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            logger.exception("Failed to read runs file for thread %s.", thread_id)
+            return []
         runs = []
-        for r in meta.get("runs", []):
+        for r in raw:
             try:
                 runs.append(RunRecord(**r))
             except (TypeError, KeyError):
@@ -142,6 +149,7 @@ class LocalThreadStorageDriver(BaseThreadStorageDriver):
 
         self._history_path(thread_id).unlink(missing_ok=True)
         self._meta_path(thread_id).unlink(missing_ok=True)
+        self._runs_path(thread_id).unlink(missing_ok=True)
 
     def thread_exists(self, thread_id: str) -> bool:
         return self._meta_path(thread_id).exists()

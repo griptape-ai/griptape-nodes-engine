@@ -44,14 +44,11 @@ class BaseThreadStorageDriver(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def get_thread_metadata(self, thread_id: str) -> dict:
-        """Get metadata for a thread.
+    def get_thread_metadata(self, thread_id: str) -> ThreadMetadata:
+        """Return typed metadata for one thread, including its runs list.
 
-        Args:
-            thread_id: The thread identifier.
-
-        Returns:
-            Metadata dictionary.
+        list_threads() omits runs for performance; use this when the caller
+        needs per-run provider/model info (e.g. opening a thread).
         """
         raise NotImplementedError
 
@@ -106,15 +103,6 @@ class BaseThreadStorageDriver(ABC):
 
         Implementations own the serialization format; callers pass a typed
         record and never touch the on-disk shape directly.
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    def get_thread_metadata_full(self, thread_id: str) -> ThreadMetadata:
-        """Return full metadata for one thread, including its runs list.
-
-        list_threads() omits runs for performance; use this when the caller
-        actually needs per-run provider/model info (e.g. opening a thread).
         """
         raise NotImplementedError
 

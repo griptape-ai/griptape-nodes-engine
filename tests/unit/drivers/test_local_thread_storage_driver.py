@@ -148,16 +148,16 @@ def test_update_thread_metadata_rename(storage: LocalThreadStorageDriver) -> Non
     thread_id, _ = storage.create_thread(title="old name")
     updated = storage.update_thread_metadata(thread_id, title="new name")
     assert updated["title"] == "new name"
-    assert storage.get_thread_metadata(thread_id)["title"] == "new name"
+    assert storage.get_thread_metadata(thread_id).title == "new name"
 
 
-def test_append_run_record_appears_in_get_thread_metadata_full(storage: LocalThreadStorageDriver) -> None:
-    """append_run_record persists a RunRecord that get_thread_metadata_full returns."""
+def test_append_run_record_appears_in_get_thread_metadata(storage: LocalThreadStorageDriver) -> None:
+    """append_run_record persists a RunRecord that get_thread_metadata returns."""
     thread_id, _ = storage.create_thread(title="conversation")
     record = RunRecord(message_index=1, provider_name="griptape_cloud", model="claude-sonnet-5", mcp_servers=["brave"])
     storage.append_run_record(thread_id, record)
 
-    thread = storage.get_thread_metadata_full(thread_id)
+    thread = storage.get_thread_metadata(thread_id)
     assert len(thread.runs) == 1
     assert thread.runs[0] == record
 
@@ -168,14 +168,14 @@ def test_append_run_record_accumulates_across_turns(storage: LocalThreadStorageD
     storage.append_run_record(thread_id, RunRecord(message_index=1, provider_name="ollama", model="llama3"))
     storage.append_run_record(thread_id, RunRecord(message_index=3, provider_name="griptape_cloud", model="gpt-4o"))
 
-    thread = storage.get_thread_metadata_full(thread_id)
+    thread = storage.get_thread_metadata(thread_id)
     assert len(thread.runs) == 2  # noqa: PLR2004
     assert thread.runs[0].message_index == 1
     assert thread.runs[1].message_index == 3  # noqa: PLR2004
 
 
 def test_list_threads_omits_runs(storage: LocalThreadStorageDriver) -> None:
-    """list_threads does not load runs — use get_thread_metadata_full for that."""
+    """list_threads does not load runs — use get_thread_metadata for that."""
     thread_id, _ = storage.create_thread(title="fast-list")
     storage.append_run_record(thread_id, RunRecord(message_index=1, provider_name="ollama", model="llama3"))
 
@@ -183,17 +183,19 @@ def test_list_threads_omits_runs(storage: LocalThreadStorageDriver) -> None:
     assert thread.runs == [], "list_threads must not deserialize runs"
 
 
-def test_get_thread_metadata_full_skips_malformed_run_records(storage: LocalThreadStorageDriver) -> None:
-    """A malformed run record in meta.json is skipped without crashing get_thread_metadata_full."""
+def test_get_thread_metadata_skips_malformed_run_records(storage: LocalThreadStorageDriver) -> None:
+    """A malformed run record in runs.json is skipped without crashing get_thread_metadata."""
     thread_id, _ = storage.create_thread(title="resilient")
-    meta_path = storage.threads_directory / f"thread_{thread_id}.meta.json"
-    meta = json.loads(meta_path.read_text())
-    meta["runs"] = [
-        {"bad_field": "value"},  # missing required fields — must be skipped
-        {"message_index": 1, "provider_name": "ollama", "model": "llama3", "mcp_servers": []},
-    ]
-    meta_path.write_text(json.dumps(meta))
+    runs_path = storage.threads_directory / f"thread_{thread_id}.runs.json"
+    runs_path.write_text(
+        json.dumps(
+            [
+                {"bad_field": "value"},  # missing required fields — must be skipped
+                {"message_index": 1, "provider_name": "ollama", "model": "llama3", "mcp_servers": []},
+            ]
+        )
+    )
 
-    thread = storage.get_thread_metadata_full(thread_id)
+    thread = storage.get_thread_metadata(thread_id)
     assert len(thread.runs) == 1
     assert thread.runs[0].message_index == 1
