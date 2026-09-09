@@ -643,12 +643,41 @@ class TestSizeCap:
         mock_engine.project_manager.get_project_chain.return_value = [
             _entry(f"p{index}", "N" * 300) for index in range(budget_manager_module._MAX_PROJECT_CHAIN_ENTRIES)
         ]
+        mock_engine.context_manager.has_current_workflow.return_value = True
+        mock_engine.context_manager.get_current_workflow_name.return_value = "shots/sh020/lighting"
         manager = BudgetManager(MagicMock(), engine=mock_engine)
 
-        result = _succeed(manager)
+        result = _succeed(manager, node_type="GriptapeProxyImage")
 
-        assert "project" not in _tags(result)
+        tags = _tags(result)
+        assert "project" not in tags
         assert result.project_chain == []
+        assert result.chain_truncated is True
+        # Losing the chain does not cost the labels. Shedding it frees thousands of bytes; the
+        # labels are worth tens, and the audit row is all that is left to say who spent this.
+        assert tags["workflow"] == "shots/sh020/lighting"
+        assert tags["node_type"] == "GriptapeProxyImage"
+
+    def test_the_floor_sheds_the_labels_only_when_losing_the_chain_is_not_enough(self) -> None:
+        """The sixth rung, and the only shape that reaches it without a patched cap.
+
+        An oversized workflow key is itself what pushed the payload over, so shedding the chain
+        leaves it still over and the labels have to go too. Anything short of that keeps them.
+        """
+        mock_engine = _mock_engine()
+        mock_engine.project_manager.get_project_chain.return_value = [
+            _entry(f"p{index}", "N" * 300) for index in range(budget_manager_module._MAX_PROJECT_CHAIN_ENTRIES)
+        ]
+        mock_engine.context_manager.has_current_workflow.return_value = True
+        mock_engine.context_manager.get_current_workflow_name.return_value = "w" * 4000
+        manager = BudgetManager(MagicMock(), engine=mock_engine)
+
+        result = _succeed(manager, node_type="GriptapeProxyImage")
+
+        tags = _tags(result)
+        assert "project" not in tags
+        assert "workflow" not in tags
+        assert "node_type" not in tags
         assert result.chain_truncated is True
 
     def test_reduction_of_a_single_entry_chain_does_not_claim_truncation(self) -> None:

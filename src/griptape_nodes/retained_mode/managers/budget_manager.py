@@ -252,18 +252,50 @@ def _encode_attribution_payload(payload: dict[str, Any]) -> str | None:
     return base64.urlsafe_b64encode(raw).decode("ascii")
 
 
+def _reduce(
+    facts: _AttributionFacts,
+    *,
+    cut_names: bool = False,
+    drop_labels: bool = False,
+    drop_chain: bool = False,
+) -> _AttributionFacts:
+    """Apply one rung's own set of reductions to the unreduced facts.
+
+    Every rung is built from the full facts and names what it gives up, so no rung inherits its
+    neighbour's reductions. That is not tidiness: deriving a rung from the one above it is how
+    this ladder twice ended up shedding the labels to pay for an overage the rung's own reduction
+    already covered.
+
+    `drop_chain` subsumes `cut_names` -- there is nothing left to cut -- so no rung passes both.
+    """
+    project_chain = list(facts.project_chain)
+    if drop_chain:
+        project_chain = []
+    elif cut_names:
+        project_chain = [_as_the_cloud_keeps_it(name) for name in project_chain]
+
+    workflow_name = facts.workflow_name
+    node_type = facts.node_type
+    if drop_labels:
+        workflow_name = None
+        node_type = None
+
+    return facts._replace(project_chain=project_chain, workflow_name=workflow_name, node_type=node_type)
+
+
 def _encode_attribution_header(facts: _AttributionFacts) -> _AttributionEncoding | None:
     """Encode the attribution header, shedding dimensions in stages until it fits.
 
     The chain is always truncated to `_MAX_PROJECT_CHAIN_ENTRIES` from the leaf -- a standing
-    rule, not a size response. If the result does not fit, five rungs are tried in order of what
-    each gives up and the first that fits is sent: nothing, the labels, cut project names, both,
-    the chain.
+    rule, not a size response. If the result does not fit, six rungs are tried in order of what
+    each gives up and the first that fits is sent: nothing, the labels, cut project names, both of
+    those, the chain, then the chain and the labels together.
 
     Ordered by cost, not by being successively smaller -- rung three puts back the labels rung two
-    shed. Each rung is its own set of reductions rather than a further trim of the one above, so
-    none gives up more than its own overage needs. Cutting one long name frees thousands of bytes
-    where the labels are worth tens, and bundling the two would cost a dashboard row for nothing.
+    shed. Each rung states its own reductions against the full facts rather than trimming the rung
+    above it, so none gives up more than its own overage needs. Shedding the chain frees thousands
+    of bytes and the labels are worth tens, so a rung that bundled them would cost a dashboard row
+    for nothing. `_reduce` is what keeps that structural rather than remembered.
 
     The chain goes last because it is the only dimension the Cloud matches budgets against.
     Shedding it first would trade the billable dimension for audit-only labels, even when an
@@ -287,31 +319,31 @@ def _encode_attribution_header(facts: _AttributionFacts) -> _AttributionEncoding
     """
     chain_truncated = len(facts.project_chain) > _MAX_PROJECT_CHAIN_ENTRIES
     full_facts = facts._replace(project_chain=list(facts.project_chain[:_MAX_PROJECT_CHAIN_ENTRIES]))
-    without_labels = full_facts._replace(workflow_name=None, node_type=None)
-    cut_names = full_facts._replace(project_chain=[_as_the_cloud_keeps_it(name) for name in full_facts.project_chain])
-    cut_names_without_labels = cut_names._replace(workflow_name=None, node_type=None)
-    no_chain = without_labels._replace(project_chain=[])
 
     stages = (
         _ReductionStage(facts=full_facts, reduction_note=None),
         _ReductionStage(
-            facts=without_labels,
+            facts=_reduce(full_facts, drop_labels=True),
             reduction_note="the workflow and node type will not be attributed for this call",
         ),
         _ReductionStage(
-            facts=cut_names,
+            facts=_reduce(full_facts, cut_names=True),
             reduction_note="long project names will be attributed cut to the form the Cloud stores",
         ),
         _ReductionStage(
-            facts=cut_names_without_labels,
+            facts=_reduce(full_facts, cut_names=True, drop_labels=True),
             reduction_note=(
                 "long project names will be attributed cut to the form the Cloud stores, and the "
                 "workflow and node type not at all"
             ),
         ),
         _ReductionStage(
-            facts=no_chain,
+            facts=_reduce(full_facts, drop_chain=True),
             reduction_note="no project will be attributed for this call",
+        ),
+        _ReductionStage(
+            facts=_reduce(full_facts, drop_chain=True, drop_labels=True),
+            reduction_note="no project, workflow, or node type will be attributed for this call",
         ),
     )
 
