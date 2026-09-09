@@ -1,11 +1,9 @@
 """Worker-side attribution is answered by the orchestrator, not locally.
 
-A worker process has its own engine id and no workflow context, so composing the
-attribution header there would report the wrong engine and omit the workflow. The
-orchestrator holds the authoritative project chain and workflow name, so
-`GetAttributionContextRequest` joins `FORWARDED_REQUEST_TYPES` and a worker-side
-`RemoteHandler` forwards it -- but only inside a `worker_node_execution_scope`, which is
-the only time a node spends credits.
+A worker's project manager is a replica populated by broadcast, so it can serve a stale
+chain; the orchestrator holds the authoritative one. So `GetAttributionContextRequest`
+joins `FORWARDED_REQUEST_TYPES` and a worker-side `RemoteHandler` forwards it -- but only
+inside a `worker_node_execution_scope`, which is the only time a node spends credits.
 
 No shipping library runs worker-hosted today; a `worker_mode_override` config entry can
 flip one, which is why this is wired now rather than deferred.

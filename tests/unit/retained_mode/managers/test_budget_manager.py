@@ -18,6 +18,7 @@ import pytest
 
 from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
 from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
+from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.budget_events import (
     ATTRIBUTION_HEADER_NAME,
     ATTRIBUTION_SCHEMA_VERSION,
@@ -113,6 +114,16 @@ def _register_project(
         parsed_situation_schemas={},
         parsed_directory_schemas={},
     )
+
+
+def _assert_warns_not_errors(manager: BudgetManager) -> None:
+    """Assert a dispatch fails, and that its details are logged at WARNING rather than ERROR."""
+    result = _dispatch(manager)
+
+    assert isinstance(result, GetAttributionContextResultFailure)
+    details = result.result_details
+    assert isinstance(details, ResultDetails)
+    assert [detail.level for detail in details.result_details] == [logging.WARNING]
 
 
 class TestAttributionPayloadShape:
@@ -328,7 +339,11 @@ class TestProjectChain:
         assert _tags(second)["project"] == ["after"]
 
     def test_empty_chain_omits_the_project_key(self) -> None:
-        """`[]` would assert 'belongs to zero projects', which is a claim we cannot make."""
+        """`[]` would assert 'belongs to zero projects', which is a claim we cannot make.
+
+        The envelope still goes out: no project open is a fact. An unreadable chain is not,
+        and takes the Failure path instead -- see `TestDegradation`.
+        """
         manager = BudgetManager(MagicMock(), engine=_mock_engine())
         result = _succeed(manager)
 
@@ -410,9 +425,8 @@ class TestValuesTravelVerbatim:
     def test_the_encoder_returns_none_instead_of_raising(self) -> None:
         """Pinned on the module function, because the cost of raising is paid per metered call.
 
-        A handler exception becomes a `GenericResultFailure`, which ignores `failure_log_level`
-        and logs an ERROR with a traceback -- once for every credit-consuming call the artist
-        makes.
+        A handler exception becomes a `GenericResultFailure`, which ignores `failure_log_level`;
+        the explicit Failure returned instead can be quieted by a caller making many of these.
         """
         payload = {"v": 1, "tags": {"project": ["\udce9"]}}
 
@@ -423,20 +437,49 @@ class TestValuesTravelVerbatim:
 
 
 class TestDegradation:
-    """The caller is about to spend money: degrade to a missing key, never raise."""
+    """The caller is about to spend money: never raise, and never guess on its behalf."""
 
-    def test_peer_failure_degrades_the_key_not_the_header(self, caplog: pytest.LogCaptureFixture) -> None:
-        """An unhappy project manager costs the project key, not the whole attribution."""
+    def test_peer_failure_sends_no_header_rather_than_claiming_no_project(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An unreadable chain is not the same fact as an empty one, and must not borrow it.
+
+        `{"v": 1}` is a positive claim -- the Cloud reads a missing `tags` as "no project open
+        on a client that attributes". A project manager that raised knows nothing about whether
+        a project is open, so sending that envelope would attribute an artist's spend to the
+        default budget while recording no degradation on either side. No header at all reads as
+        "this client did not attribute", which is true.
+        """
         mock_engine = _mock_engine()
         mock_engine.project_manager.get_project_chain.side_effect = RuntimeError("peer exploded")
         manager = BudgetManager(MagicMock(), engine=mock_engine)
 
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
-            result = _succeed(manager)
+            result = _dispatch(manager)
 
-        assert "project" not in _tags(result)
-        assert _decode(result) == {"v": ATTRIBUTION_SCHEMA_VERSION}
+        assert isinstance(result, GetAttributionContextResultFailure)
+        assert "attribution" in str(result.result_details).lower()
         assert any(record.levelno == logging.WARNING for record in caplog.records)
+
+    def test_an_unreadable_chain_does_not_log_at_error(self) -> None:
+        """A bare `result_details` string defaults to ERROR; both sites pass ResultDetails instead.
+
+        Neither failure condition clears on its own -- a legacy project keeps its unencodable id,
+        an unhappy peer stays unhappy -- so an ERROR would repeat once per metered call for
+        something the artist cannot act on and that did not stop the work. Pinned on both paths
+        because the ERROR default is silent.
+        """
+        mock_engine = _mock_engine()
+        mock_engine.project_manager.get_project_chain.side_effect = RuntimeError("peer exploded")
+
+        _assert_warns_not_errors(BudgetManager(MagicMock(), engine=mock_engine))
+
+    def test_an_unencodable_id_does_not_log_at_error(self) -> None:
+        """The other failure path, same reason."""
+        mock_engine = _mock_engine()
+        mock_engine.project_manager.get_project_chain.return_value = [_entry("renders-\udce9", "leaf")]
+
+        _assert_warns_not_errors(BudgetManager(MagicMock(), engine=mock_engine))
 
 
 class TestConfidentiality:

@@ -14,7 +14,8 @@ worker forwarding puts the Success payload on the response topic by construction
 module can do it does -- `header_value` never reaches `result_details`, which is logged.
 
 `Engine.handle_request` turns a raised handler exception into a `ResultPayloadFailure`, so there
-is no blanket try/except here; the resolver guards its own peer read.
+is no blanket try/except here; the resolver guards its own peer read and reports the failure
+rather than swallowing it.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from griptape_nodes.retained_mode.engine import EngineScoped
+from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.budget_events import (
     ATTRIBUTION_SCHEMA_VERSION,
     GetAttributionContextRequest,
@@ -62,13 +64,16 @@ def _encode_attribution_payload(payload: dict[str, Any]) -> str | None:
     Cloud, which beats shrinking it here and having it arrive looking complete. Padding is kept
     because the parser re-pads anyway, so both forms arrive intact.
 
-    The UTF-8 guard is the module's only failure path and fires by design. A legacy project's id
-    is the path to its file, and a path whose bytes are not valid UTF-8 carries lone surrogates
-    from `surrogateescape` that `str.encode` refuses. That costs the whole header: it is the one
-    thing the wire cannot carry, so there is no honest partial form. Returning None rather than
-    raising, because a handler exception becomes a `GenericResultFailure`, which ignores
-    `failure_log_level` (`event_manager.py:1088-1094`) and logs an ERROR with a traceback on
-    every metered call.
+    A legacy project's id is the path to its file, and a path whose bytes are not valid UTF-8
+    carries lone surrogates from `surrogateescape` that `str.encode` refuses. That costs the whole
+    header: it is the one thing the wire cannot carry, so there is no honest partial form.
+
+    Returning None rather than raising, because a handler exception becomes a
+    `GenericResultFailure`, which ignores `failure_log_level` (`event_manager.py:1088-1094`).
+
+    This warning is the engineer-facing half of the pair and the artist-facing message is the
+    other; the traceback stays because `UnicodeEncodeError` names the offending codepoint and its
+    position, which is the only pointer to which entry of a deep chain is the bad one.
     """
     try:
         raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -102,18 +107,39 @@ class BudgetManager(EngineScoped):
     ) -> GetAttributionContextResultSuccess | GetAttributionContextResultFailure:
         """Describe the current project as an encoded attribution header.
 
-        An unresolvable chain degrades to an empty one rather than a failure: the caller is
-        about to spend money, and an unattributed call beats a blocked one. The one failure is
-        an id the wire cannot carry.
+        Both failures send no header at all, which the Cloud reads as "this client did not
+        attribute" -- the honest answer, and distinct from the `{"v": 1}` a client sends to say
+        no project is open. Neither blocks the caller: it is about to spend money, and an
+        unattributed call beats a blocked one.
+
+        Both are logged at WARNING rather than the ERROR a bare `result_details` string would
+        default to. Neither condition clears on its own -- a legacy project keeps its unencodable
+        id -- so an ERROR would repeat once per metered call for something the artist cannot act
+        on and that did not stop the work.
         """
         project_chain = self._resolve_project_chain()
+        if project_chain is None:
+            return GetAttributionContextResultFailure(
+                result_details=ResultDetails(
+                    message=(
+                        "Attempted to describe an outbound request for budget attribution. Failed because the "
+                        "current project's ancestry could not be read. The request can proceed, but this spend "
+                        "will not be attributed."
+                    ),
+                    level=logging.WARNING,
+                )
+            )
+
         header_value = _encode_attribution_payload(_build_attribution_payload(project_chain))
         if header_value is None:
             return GetAttributionContextResultFailure(
-                result_details=(
-                    "Attempted to describe an outbound request for budget attribution. Failed because a "
-                    "project id contains characters that cannot be sent in a request header. The request "
-                    "can proceed, but this spend will not be attributed."
+                result_details=ResultDetails(
+                    message=(
+                        "Attempted to describe an outbound request for budget attribution. Failed because a "
+                        "project id contains characters that cannot be sent in a request header. The request "
+                        "can proceed, but this spend will not be attributed."
+                    ),
+                    level=logging.WARNING,
                 )
             )
 
@@ -126,8 +152,13 @@ class BudgetManager(EngineScoped):
             ),
         )
 
-    def _resolve_project_chain(self) -> list[str]:
-        """Resolve the current project's ancestry as ids, leaf-first, or [] when unavailable.
+    def _resolve_project_chain(self) -> list[str] | None:
+        """Resolve the current project's ancestry as ids, leaf-first, or None when unreadable.
+
+        None and [] are different answers and must not collapse. [] means no project is open,
+        which the Cloud reads off the bare `{"v": 1}` as a positive fact. A peer that raised
+        knows nothing about whether a project is open, so reporting [] would send that fact
+        anyway -- the same arrives-looking-intact failure this module exists to avoid.
 
         The id rather than the name, because it survives a rename -- a name would re-point that
         project's spend the moment a user edited it. But an id is not opaque: `ProjectTemplate.id`
@@ -142,6 +173,6 @@ class BudgetManager(EngineScoped):
             chain = self.engine.project_manager.get_project_chain()
         except Exception:
             logger.warning("Could not resolve the project chain for budget attribution.", exc_info=True)
-            return []
+            return None
 
         return [entry.id for entry in chain if entry.id != SYSTEM_DEFAULTS_KEY]

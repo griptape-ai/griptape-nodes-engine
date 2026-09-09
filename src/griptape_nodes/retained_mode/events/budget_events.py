@@ -28,8 +28,9 @@ class GetAttributionContextRequest(RequestPayload):
     slug of the project name, replaceable with any string, and a filesystem path on a project
     created before ids existed -- and all of it is visible to an SSL-inspecting egress proxy.
 
-    Best-effort: an unresolvable chain is omitted rather than raised, because the caller is about
-    to spend money and an unattributed call beats a blocked one.
+    Best-effort: nothing here raises, because the caller is about to spend money and an
+    unattributed call beats a blocked one. A chain that cannot be read yields a Failure rather
+    than an empty chain -- an empty one would claim no project is open.
 
     Use when: A node or driver is about to make a credit-consuming call and wants the spend
     attributed to the project the user is working in.
@@ -69,8 +70,8 @@ class GetAttributionContextResultSuccess(WorkflowNotAlteredMixin, ResultPayloadS
         project_chain: The project ids the call is attributed to, leaf-first, each exactly as
             stored -- unstripped, uncut, never repaired, because a repaired value arrives looking
             intact and the Cloud reports what it had to repair itself. Populated from the same
-            pass that built `header_value`, so the two cannot disagree. Empty when no project is
-            open or the chain could not be read.
+            pass that built `header_value`, so the two cannot disagree. Empty only when no
+            project is open; a chain that could not be read yields a Failure instead.
     """
 
     header_value: str
@@ -82,10 +83,14 @@ class GetAttributionContextResultSuccess(WorkflowNotAlteredMixin, ResultPayloadS
 @dataclass
 @PayloadRegistry.register
 class GetAttributionContextResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
-    """No attribution header value could be produced.
+    """No attribution header value could be produced; send no header and make the call anyway.
 
-    The only cause is a project id the wire cannot carry: an id derived from a filesystem path
-    whose bytes are not valid UTF-8 arrives holding lone surrogates, which cannot be encoded at
-    all. There is no honest partial form, so the whole header is given up. The caller should
-    proceed without it -- the spend lands in the default budget.
+    Two causes, and both mean the engine cannot describe the spend truthfully. The project chain
+    could not be read, so whether a project is open is unknown. Or a project id cannot be encoded
+    at all: an id derived from a filesystem path whose bytes are not valid UTF-8 arrives holding
+    lone surrogates that the wire cannot carry.
+
+    Sending nothing is the honest answer -- the Cloud reads a missing header as "this client did
+    not attribute", where `{"v": 1}` would assert no project is open. Either way the spend lands
+    in the default budget.
     """
