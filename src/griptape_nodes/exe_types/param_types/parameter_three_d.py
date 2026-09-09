@@ -189,9 +189,7 @@ class Parameter3D(Parameter):
         if value:
             self.update_ui_options_key("pulse_on_run", value)
         else:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("pulse_on_run", None)
-            self.ui_options = ui_options
+            self.remove_ui_options_key("pulse_on_run")
 
     @property
     def clickable_file_browser(self) -> bool:
@@ -212,9 +210,7 @@ class Parameter3D(Parameter):
         if value:
             self.update_ui_options_key("clickable_file_browser", value)
         else:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("clickable_file_browser", None)
-            self.ui_options = ui_options
+            self.remove_ui_options_key("clickable_file_browser")
 
     @property
     def expander(self) -> bool:
@@ -235,6 +231,4 @@ class Parameter3D(Parameter):
         if value:
             self.update_ui_options_key("expander", value)
         else:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("expander", None)
-            self.ui_options = ui_options
+            self.remove_ui_options_key("expander")
