@@ -53,3 +53,42 @@ class TestTraitUIOptionOwnership:
 
         assert parameter.ui_options["simple_dropdown"] == ["sdxl", "sd3"]
         assert "simple_dropdown" not in parameter.authored_ui_options()
+
+
+class TestClearingAUIOption:
+    """Unsetting an option goes through the same authored view as setting one."""
+
+    def test_clearing_one_option_does_not_capture_trait_options(self) -> None:
+        parameter = _slider_parameter()
+        parameter.display_name = "Steps"
+
+        parameter.display_name = None
+
+        assert parameter.authored_ui_options() == {}
+        assert parameter.ui_options["slider"] == {"min_val": 1, "max_val": 50}
+
+    def test_a_trait_change_still_reaches_the_ui_after_a_clear(self) -> None:
+        slider = Slider(min_val=1, max_val=50)
+        parameter = Parameter(name="steps", type="int", tooltip="Sampling steps", traits={slider})
+        parameter.display_name = "Steps"
+        parameter.display_name = None
+
+        slider.max = 10
+
+        assert parameter.ui_options["slider"] == {"min_val": 1, "max_val": 10}
+
+    def test_clearing_leaves_the_other_authored_options_alone(self) -> None:
+        parameter = _slider_parameter()
+        parameter.hide = True
+        parameter.display_name = "Steps"
+
+        parameter.display_name = None
+
+        assert parameter.authored_ui_options() == {"hide": True}
+
+    def test_clearing_an_option_that_was_never_set_is_harmless(self) -> None:
+        parameter = _slider_parameter()
+
+        parameter.display_name = None
+
+        assert parameter.authored_ui_options() == {}

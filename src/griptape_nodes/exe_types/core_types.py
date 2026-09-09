@@ -736,6 +736,16 @@ class UIOptionsMixin:
             )
             logger.warning(msg)
 
+    def authored_ui_options(self) -> dict[str, Any]:
+        """Return only the UI options authored on this element, with nothing derived.
+
+        This is the save view, and the base every read-modify-write below starts from. A
+        subclass whose ``ui_options`` getter merges in options derived from live state (a
+        trait's rendered options, a container's layout) must leave those out of here, and
+        must add back any authored option it holds outside ``_ui_options``.
+        """
+        return dict(self._ui_options)  # type: ignore[attr-defined]
+
     def update_ui_options_key(self, key: str, value: Any) -> None:
         """Update a single UI option key."""
         self.update_ui_options({key: value})
@@ -743,15 +753,26 @@ class UIOptionsMixin:
     def update_ui_options(self, updates: dict[str, Any]) -> None:
         """Update multiple UI options at once.
 
-        Reads from ``_ui_options`` rather than the ``ui_options`` getter. On ``Parameter``
-        that getter is a merge of trait-derived options with stored ones, so writing it
-        back would copy every trait's rendered options into stored state, permanently
-        detaching them from the trait that owns them. Assignment still goes through the
-        setter so the update event is emitted.
+        Reads the authored view rather than the ``ui_options`` getter. On ``Parameter`` that
+        getter is a merge of trait-derived options with authored ones, so writing it back
+        would copy every trait's rendered options into stored state, permanently detaching
+        them from the trait that owns them. Assignment still goes through the setter so the
+        update event is emitted.
         """
-        stored = dict(self._ui_options)  # type: ignore[attr-defined]
-        stored.update(updates)
-        self.ui_options = stored  # type: ignore[attr-defined]
+        authored = self.authored_ui_options()
+        authored.update(updates)
+        self.ui_options = authored  # type: ignore[attr-defined]
+
+    def remove_ui_options_key(self, key: str) -> None:
+        """Drop a single UI option key, so whatever its absence means applies again.
+
+        The counterpart to ``update_ui_options_key``, and it exists for the same reason:
+        popping the key out of the merged ``ui_options`` getter and writing that back would
+        store every derived option alongside it.
+        """
+        authored = self.authored_ui_options()
+        authored.pop(key, None)
+        self.ui_options = authored  # type: ignore[attr-defined]
 
 
 class ParameterMessage(BaseNodeElement, UIOptionsMixin):
@@ -1373,9 +1394,7 @@ class ParameterButtonGroup(BaseNodeElement, UIOptionsMixin):
     @BaseNodeElement.emits_update_on_write
     def display_name(self, value: str | None) -> None:
         if value is None:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("display_name", None)
-            self.ui_options = ui_options
+            self.remove_ui_options_key("display_name")
         else:
             self.update_ui_options_key("display_name", value)
 
@@ -1963,21 +1982,12 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         Traits win over stored values: a trait is live code and its options are derived
         from its current state, while a stored value may be a copy saved before that state
         changed. The result is a flat dict because that is what the editor consumes; only
-        ``_ui_options`` is ever persisted (see ``authored_ui_options``).
+        the authored options are ever persisted (see ``authored_ui_options``).
         """
-        ui_options = dict(self._ui_options)
+        ui_options = self.authored_ui_options()
         for trait in self.find_elements_by_type(Trait):
             ui_options = ui_options | trait.ui_options_for_trait()
         return ui_options
-
-    def authored_ui_options(self) -> dict:
-        """Return only the UI options set on this parameter, with no trait-derived keys.
-
-        This is the save view. Persisting the merged ``ui_options`` would write each
-        trait's rendered options into the file, and reloading that file would place them in
-        stored state, so the saved copy would shadow the trait from then on.
-        """
-        return dict(self._ui_options)
 
     @ui_options.setter
     @BaseNodeElement.emits_update_on_write
@@ -2059,9 +2069,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
             value: Display name string, or None to use the default (parameter name)
         """
         if value is None:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("display_name", None)
-            self.ui_options = ui_options
+            self.remove_ui_options_key("display_name")
         else:
             self.update_ui_options_key("display_name", value)
 
@@ -2692,11 +2700,27 @@ class ParameterList(ParameterContainer):
     @property
     def ui_options(self) -> dict:
         """Override ui_options to merge convenience parameters in real-time."""
-        # Get base ui_options from parent
-        base_ui_options = super().ui_options
+        return {
+            **super().ui_options,
+            **self._convenience_ui_options(),
+        }
 
-        # Build convenience options from instance parameters
-        convenience_options = {}
+    def authored_ui_options(self) -> dict[str, Any]:
+        """Include the layout options this class holds outside ``_ui_options``.
+
+        ``collapsed``, ``child_prefix``, and the grid keys are authored, not derived: they
+        come from constructor arguments and the properties above. Leaving them out would
+        drop a list's layout from the save, and would make any other UI option write erase
+        it, since the setter below reads grid mode back out of the dict it is handed.
+        """
+        return {
+            **super().authored_ui_options(),
+            **self._convenience_ui_options(),
+        }
+
+    def _convenience_ui_options(self) -> dict[str, Any]:
+        """Render the layout fields kept as attributes as the ui_options keys they map to."""
+        convenience_options: dict[str, Any] = {}
 
         if self._collapsed is not None:
             convenience_options["collapsed"] = self._collapsed
@@ -2704,17 +2728,12 @@ class ParameterList(ParameterContainer):
         if self._child_prefix is not None:
             convenience_options["child_prefix"] = self._child_prefix
 
-        if self._grid is not None and self._grid:
+        if self._grid:
             convenience_options["display"] = "grid"
+            if self._grid_columns is not None:
+                convenience_options["columns"] = self._grid_columns
 
-        if self._grid_columns is not None and self._grid:
-            convenience_options["columns"] = self._grid_columns
-
-        # Merge convenience options with base ui_options
-        return {
-            **base_ui_options,
-            **convenience_options,
-        }
+        return convenience_options
 
     @ui_options.setter
     @BaseNodeElement.emits_update_on_write

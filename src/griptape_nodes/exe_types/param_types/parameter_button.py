@@ -324,9 +324,7 @@ class ParameterButton(Parameter):
         """Set the button icon."""
         self._get_button_trait().icon = value
         if value is None:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("button_icon", None)
-            self.ui_options = ui_options
+            self.remove_ui_options_key("button_icon")
         else:
             self.update_ui_options_key("button_icon", value)
 
@@ -340,9 +338,7 @@ class ParameterButton(Parameter):
         """Set the button icon class."""
         self._get_button_trait().icon_class = value
         if value is None:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("icon_class", None)
-            self.ui_options = ui_options
+            self.remove_ui_options_key("icon_class")
         else:
             self.update_ui_options_key("icon_class", value)
 
@@ -356,9 +352,7 @@ class ParameterButton(Parameter):
         """Set the button icon position."""
         self._get_button_trait().icon_position = value
         if value is None:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("iconPosition", None)
-            self.ui_options = ui_options
+            self.remove_ui_options_key("iconPosition")
         else:
             self.update_ui_options_key("iconPosition", value)
 
@@ -383,9 +377,7 @@ class ParameterButton(Parameter):
         """Set the loading label."""
         self._get_button_trait().loading_label = value
         if value is None:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("loading_label", None)
-            self.ui_options = ui_options
+            self.remove_ui_options_key("loading_label")
         else:
             self.update_ui_options_key("loading_label", value)
 
@@ -399,9 +391,7 @@ class ParameterButton(Parameter):
         """Set the loading icon."""
         self._get_button_trait().loading_icon = value
         if value is None:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("loading_icon", None)
-            self.ui_options = ui_options
+            self.remove_ui_options_key("loading_icon")
         else:
             self.update_ui_options_key("loading_icon", value)
 
@@ -415,9 +405,7 @@ class ParameterButton(Parameter):
         """Set the loading icon class."""
         self._get_button_trait().loading_icon_class = value
         if value is None:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("loading_icon_class", None)
-            self.ui_options = ui_options
+            self.remove_ui_options_key("loading_icon_class")
         else:
             self.update_ui_options_key("loading_icon_class", value)
 
