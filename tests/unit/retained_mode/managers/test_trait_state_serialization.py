@@ -6,6 +6,7 @@ can replay onto a fresh node.
 
 import logging
 from collections.abc import Generator
+from unittest.mock import patch
 
 import pytest
 
@@ -198,6 +199,7 @@ class TestSerializeThenReplay:
         assert model_command.traits == [
             {
                 "trait_name": "Options",
+                "trait_module": "griptape_nodes.traits.options",
                 "trait_state": {
                     "choices": ["sdxl", "sd3", "flux"],
                     "show_search": True,
@@ -212,6 +214,7 @@ class TestSerializeThenReplay:
         assert reload_command.traits == [
             {
                 "trait_name": "Button",
+                "trait_module": "griptape_nodes.traits.button",
                 "trait_state": {
                     "label": "Reload",
                     "variant": "secondary",
@@ -268,6 +271,54 @@ class TestSerializeThenReplay:
         )
         assert unsaveable_button.on_click_callback is None
         assert unsaveable_button.label == "Lambda"
+
+
+class TestTraitModuleStabilization:
+    """A trait's module name is only stable within the process that dynamically loaded it."""
+
+    def test_a_dynamic_module_is_rewritten_to_its_stable_namespace(self, engine: Engine) -> None:
+        trait_states = [{"trait_name": "Options", "trait_module": "gtn_dynamic_module_foo_py_123", "trait_state": {}}]
+
+        with (
+            patch.object(engine.library_manager, "is_dynamic_module", return_value=True),
+            patch.object(
+                engine.library_manager,
+                "get_stable_namespace_for_dynamic_module",
+                return_value="griptape_nodes.node_libraries.some_library.traits",
+            ),
+        ):
+            stabilized = engine.node_manager._stabilize_trait_modules(trait_states)
+
+        assert stabilized[0]["trait_module"] == "griptape_nodes.node_libraries.some_library.traits"
+
+    def test_an_in_tree_module_is_left_untouched(self, engine: Engine) -> None:
+        trait_states = [{"trait_name": "Options", "trait_module": "griptape_nodes.traits.options", "trait_state": {}}]
+
+        stabilized = engine.node_manager._stabilize_trait_modules(trait_states)
+
+        assert stabilized[0]["trait_module"] == "griptape_nodes.traits.options"
+
+    def test_serializing_a_library_trait_saves_the_stable_namespace(self, engine: Engine) -> None:
+        node = _add_node(engine, "picker")
+        node.discover()
+
+        with (
+            patch.object(engine.library_manager, "is_dynamic_module", return_value=True),
+            patch.object(
+                engine.library_manager,
+                "get_stable_namespace_for_dynamic_module",
+                return_value="griptape_nodes.node_libraries.some_library.traits",
+            ),
+        ):
+            result = engine.node_manager.on_serialize_node_to_commands(
+                SerializeNodeToCommandsRequest(node_name=node.name)
+            )
+
+        assert isinstance(result, SerializeNodeToCommandsResultSuccess)
+        commands = _added_parameter_commands(result.serialized_node_commands.element_modification_commands)
+        model_traits = commands["model"].traits
+        assert model_traits is not None
+        assert model_traits[0]["trait_module"] == "griptape_nodes.node_libraries.some_library.traits"
 
 
 class _UndeclaredCallbackTrait(Trait):
@@ -335,7 +386,13 @@ class TestMisdeclaredTraitDegradesTheSaveInsteadOfFailingIt:
         assert isinstance(result, SerializeNodeToCommandsResultSuccess)
         commands = _added_parameter_commands(result.serialized_node_commands.element_modification_commands)
         broken_command = commands["broken"]
-        assert broken_command.traits == [{"trait_name": "_UndeclaredCallbackTrait", "trait_state": {}}]
+        assert broken_command.traits == [
+            {
+                "trait_name": "_UndeclaredCallbackTrait",
+                "trait_module": "tests.unit.retained_mode.managers.test_trait_state_serialization",
+                "trait_state": {},
+            }
+        ]
         assert any("on_ping" in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
 
 

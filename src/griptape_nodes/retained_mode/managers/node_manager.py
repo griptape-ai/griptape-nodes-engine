@@ -3728,7 +3728,7 @@ class NodeManager(EngineScoped):
                     # scalar fields, and only options authored on the parameter are saved --
                     # the trait regenerates its own on load.
                     param_dict["ui_options"] = parameter.authored_ui_options()
-                    param_dict["traits"] = parameter.trait_states()
+                    param_dict["traits"] = self._stabilize_trait_modules(parameter.trait_states())
                     param_dict["value_callbacks"] = parameter.value_callback_names(node)
                     NodeManager._report_unsaveable_callbacks(parameter)
                     add_param_request = AddParameterToNodeRequest.create(**param_dict)
@@ -3750,7 +3750,7 @@ class NodeManager(EngineScoped):
                     param_dict = parameter.to_dict()
                     param_dict["initial_setup"] = True
                     param_dict["ui_options"] = parameter.authored_ui_options()
-                    param_dict["traits"] = parameter.trait_states()
+                    param_dict["traits"] = self._stabilize_trait_modules(parameter.trait_states())
                     param_dict["value_callbacks"] = parameter.value_callback_names(node)
                     add_param_request = AddParameterToNodeRequest.create(**param_dict)
                     element_modification_commands.append(add_param_request)
@@ -3765,6 +3765,8 @@ class NodeManager(EngineScoped):
                     if relevant:
                         diff["parameter_name"] = parameter.name
                         diff["initial_setup"] = True
+                        if "traits" in diff:
+                            diff["traits"] = self._stabilize_trait_modules(diff["traits"])
                         alter_param_request = AlterParameterDetailsRequest.create(**diff)
                         element_modification_commands.append(alter_param_request)
 
@@ -4345,6 +4347,27 @@ class NodeManager(EngineScoped):
             result_details=f"Successfully duplicated {len(serialize_result.node_names_serialized)} nodes.",
         )
 
+    def _stabilize_trait_modules(self, trait_states: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Rewrite each saved trait's module to the stable namespace a library reloads under.
+
+        A trait class defined in a library file carries the dynamic, per-process module name
+        it happened to import under; that name is worthless once the process ends. The
+        stable namespace is the same import path across processes and reloads, so
+        ``TraitRegistry.resolve`` can find the same class again on load. A module that isn't
+        dynamic (an in-tree trait) is left untouched.
+        """
+        library_manager = self.engine.library_manager
+        for entry in trait_states:
+            trait_module = entry.get("trait_module")
+            if trait_module is None:
+                continue
+            if not library_manager.is_dynamic_module(trait_module):
+                continue
+            stable_namespace = library_manager.get_stable_namespace_for_dynamic_module(trait_module)
+            if stable_namespace is not None:
+                entry["trait_module"] = stable_namespace
+        return trait_states
+
     @staticmethod
     def _report_unsaveable_callbacks(parameter: Parameter) -> None:
         """Warn about callbacks on this parameter that saving cannot record.
@@ -4390,7 +4413,7 @@ class NodeManager(EngineScoped):
             if existing is not None:
                 existing.apply_state(state)
                 continue
-            trait_class = TraitRegistry.resolve(trait_name)
+            trait_class = TraitRegistry.resolve(trait_name, entry.get("trait_module"))
             if trait_class is None:
                 logger.warning(
                     "Parameter '%s' was saved with the '%s' trait, but no trait by that name is registered. "
