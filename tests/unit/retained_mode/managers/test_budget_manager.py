@@ -243,7 +243,15 @@ class TestProjectChain:
 
         assert _tags(result)["project"] == ["Shot 020"]
 
-    @pytest.mark.parametrize("reserved_name", [SYSTEM_DEFAULTS_KEY, f" {SYSTEM_DEFAULTS_KEY} "])
+    @pytest.mark.parametrize(
+        "reserved_name",
+        [
+            SYSTEM_DEFAULTS_KEY,
+            f" {SYSTEM_DEFAULTS_KEY} ",
+            # Only becomes the reserved value once cut to the 256-char cap.
+            SYSTEM_DEFAULTS_KEY + " " * 239 + "x",
+        ],
+    )
     def test_a_project_actually_named_system_defaults_drops_the_chain(
         self, reserved_name: str, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -251,8 +259,9 @@ class TestProjectChain:
 
         Nothing stops a user typing the reserved string into `name:`. The Cloud discards a
         client copy, which would drop that entry and promote its parent to leaf -- billing a
-        real project for spend it never incurred. Padding does not disguise it: the far end
-        strips before it tests the reserved value, so the comparison here has to strip too.
+        real project for spend it never incurred. Neither padding nor length disguises it: the
+        far end strips, cuts to its value cap, and strips again before it tests the reserved
+        value, so the comparison here runs on that same form.
         """
         project_manager = ProjectManager(Mock(), Mock(), Mock())
         _register_project(project_manager, "grandparent", name="Acme Studios")
@@ -667,6 +676,54 @@ class TestTransmissibility:
 
         assert _tags(result)["project"] == ["Acme Studios"]
         assert result.project_chain == ["Acme Studios"]
+
+    def test_a_padded_workflow_key_travels_unstripped(self) -> None:
+        """A registry key is an identifier, so it goes out as the engine spells it.
+
+        `derive_registry_key` builds the key from a workspace-relative path, and a directory
+        or filename may legally begin or end with a space on macOS and Linux. Trimming it
+        would report a string that no longer names any workflow the engine can look up --
+        the opposite of the project-name case, where normalizing is what makes the value
+        matchable.
+        """
+        mock_engine = _mock_engine()
+        mock_engine.context_manager.has_current_workflow.return_value = True
+        mock_engine.context_manager.get_current_workflow_name.return_value = "shots/sh020 /lighting"
+        manager = BudgetManager(MagicMock(), engine=mock_engine)
+
+        result = _succeed(manager)
+
+        assert _tags(result)["workflow"] == "shots/sh020 /lighting"
+        assert result.workflow_name == "shots/sh020 /lighting"
+
+    def test_a_name_longer_than_the_value_cap_travels_cut_to_it(self) -> None:
+        """The far end keeps 256 characters, so that is what the chain reports."""
+        mock_engine = _mock_engine()
+        mock_engine.project_manager.get_project_chain.return_value = [_entry("leaf", "S" * 300)]
+        manager = BudgetManager(MagicMock(), engine=mock_engine)
+
+        result = _succeed(manager)
+
+        assert _tags(result)["project"] == ["S" * 256]
+        assert result.project_chain == ["S" * 256]
+
+    def test_an_unstorable_byte_past_the_value_cap_does_not_cost_the_chain(self) -> None:
+        """Judge the kept form, or the engine refuses a name the far end would have stored.
+
+        The cut happens before the storability test on the far end, so a control character
+        sitting past the cap is gone by the time anything looks at it. Testing the whole
+        string here would drop a chain over a byte that never arrives.
+        """
+        mock_engine = _mock_engine()
+        mock_engine.project_manager.get_project_chain.return_value = [
+            _entry("leaf", "S" * 300 + "\n"),
+            _entry("root", "Acme Studios"),
+        ]
+        manager = BudgetManager(MagicMock(), engine=mock_engine)
+
+        result = _succeed(manager)
+
+        assert _tags(result)["project"] == ["S" * 256, "Acme Studios"]
 
     def test_an_untransmissible_workflow_key_is_omitted_without_touching_the_chain(self) -> None:
         """One unusable dimension costs its own key and nothing else."""

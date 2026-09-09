@@ -58,6 +58,10 @@ _MAX_DECODED_PAYLOAD_BYTES = 4096
 # something -- see `_is_transmissible`.
 _UNSTORABLE_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
+# Matches the Cloud parser's MAX_VALUE_LENGTH -- the length it cuts a tag value down to before
+# it decides anything about that value. Applied to project names only; see `_as_the_cloud_keeps_it`.
+_MAX_VALUE_CHARS = 256
+
 
 class _AttributionFacts(NamedTuple):
     """The engine facts one outbound call is attributed to.
@@ -90,12 +94,30 @@ class _ReductionStage(NamedTuple):
     reduction_note: str | None
 
 
+def _as_the_cloud_keeps_it(name: str) -> str:
+    """Reduce a project name to the form the Cloud actually stores.
+
+    Strip, cut to the value cap, strip again -- the parser's own order, and the order matters
+    twice. It has to run *before* the reserved-value test, or a name that only becomes
+    `<system-defaults>` after the cut passes here and is refused there, which is the
+    parent-billed-for-its-child failure again. And it has to run before the byte checks, or a
+    control character sitting past the cap drops a whole chain the far end would have stored.
+
+    Project names only. The result is what budget rules are written against, so reporting the
+    kept form is the accurate answer; a workflow registry key is an identifier rather than a
+    match key and travels as the engine spells it.
+    """
+    return name.strip()[:_MAX_VALUE_CHARS].strip()
+
+
 def _is_transmissible(value: str) -> bool:
     """Whether a value survives the trip to the Cloud intact.
 
-    Judged on `value.strip()`, because that is what the Cloud decides on: it strips before
-    testing storability, so a value this passes unstripped and the far end then discards costs
-    an entry, promotes its parent to leaf, and bills a real ancestor for spend it never had.
+    Judged on the stored form, not the given one: the far end normalizes before it decides
+    storability, so a value that passes here raw and is discarded there costs an entry,
+    promotes its parent to leaf, and bills a real ancestor for spend it never had. Stripping
+    covers that for every dimension. Project names are cut to length as well, and arrive
+    already normalized by `_as_the_cloud_keeps_it`.
 
     Three ways a value does not survive. A project name is free text and a workflow registry
     key is derived from a filesystem path, so either can carry a byte the wire cannot hold: a
@@ -117,19 +139,23 @@ def _is_transmissible(value: str) -> bool:
 
 
 def _transmissible_or_none(value: str | None) -> str | None:
-    """Normalize a value the way the Cloud will, or None when it cannot reach it intact.
+    """Pass a value through, or None when it cannot reach the Cloud intact.
 
-    Returns the stripped form rather than the original, because the far end strips what it
-    stores -- sending the stripped value keeps the result's structured fields describing what
-    budgets actually match against. Omitting the key instead says "the engine could not
-    determine this", which is honest: a value the far end would discard is one the engine
-    cannot express.
+    Passed through verbatim, never stripped. Transmissibility is judged on the stripped form
+    because that is what the far end tests, but normalizing is a *project name* rule and this
+    helper runs over every dimension. A workflow registry key is an identifier the engine can
+    be asked to look up again, so trimming it here would hand a consumer a string that no
+    longer names the workflow it came from. `_resolve_project_chain` normalizes its own names,
+    where the reason to is written down.
+
+    Omitting the key says "the engine could not determine this", which is honest: a value the
+    far end would discard is one the engine cannot express.
     """
     if value is None:
         return None
     if not _is_transmissible(value):
         return None
-    return value.strip()
+    return value
 
 
 def _build_attribution_payload(facts: _AttributionFacts) -> dict[str, Any]:
@@ -348,17 +374,19 @@ class BudgetManager(EngineScoped):
                     "attribute its spend."
                 )
                 return []
-            name = _transmissible_or_none(entry.name)
-            if name is None:
+            # Reduced to the kept form before anything is decided about it, so every test
+            # below sees the string the far end will see. A project name is a label rather
+            # than a key, so nothing is lost by reporting it the way it is stored.
+            name = _as_the_cloud_keeps_it(entry.name)
+            if not _is_transmissible(name):
                 logger.warning(
                     "Dropping project attribution for this call: a project name in the chain cannot "
                     "be transmitted intact. Rename the project using ordinary text to attribute its "
                     "spend."
                 )
                 return []
-            # Compared after normalizing, because the Cloud strips before testing the reserved
-            # value: `" <system-defaults> "` is the same claim as the bare string. Separate from
-            # the sentinel *id* skipped above -- this is a real project a user named that.
+            # Separate from the sentinel *id* skipped above -- this is a real project a user
+            # named that, whether outright or by padding one out to the cap.
             if name == SYSTEM_DEFAULTS_KEY:
                 logger.warning(
                     "Dropping project attribution for this call: a project is named '%s', which Griptape "
@@ -376,7 +404,10 @@ class BudgetManager(EngineScoped):
         An unsaved workflow is registered under an `unsaved:<uuid4>` key that is fresh every
         session, so the sentinel goes out instead: one low-cardinality bucket for scratch spend,
         still distinguishable from an absent key. A saved key is workspace-path-derived, so it
-        carries the same transmissibility risk as a project name and gets the same check.
+        carries the same transmissibility risk as a project name and gets the same check --
+        but not the same normalizing. A key is how the engine names the workflow, and a path
+        segment may legally begin or end with a space, so it travels exactly as
+        `get_current_workflow_name` returns it.
         """
         try:
             if not self.engine.context_manager.has_current_workflow():
