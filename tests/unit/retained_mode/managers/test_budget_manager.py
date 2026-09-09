@@ -213,6 +213,28 @@ class TestProjectChain:
         mock_engine.project_manager = project_manager
         return BudgetManager(MagicMock(), engine=mock_engine)
 
+    @pytest.mark.parametrize(
+        "padded",
+        ["  <system-defaults>  ", "\t<system-defaults>", "<system-defaults>\n", " <system-defaults>"],
+    )
+    def test_a_padded_sentinel_copy_never_reaches_the_wire(self, padded: str) -> None:
+        """The far end strips before testing the reserved value, so a padded copy is the same claim.
+
+        Left whole it is dropped there rather than here, and a dropped entry promotes its parent
+        to leaf while `ENTRY_DROPPED` stays out of `mangled` -- so the short chain still matches
+        a budget and bills a real ancestor. The exact string cannot get this far (it is the
+        registry key for the rest state), but a padded one loads fine.
+        """
+        mock_engine = _mock_engine()
+        mock_engine.project_manager.get_project_chain.return_value = [
+            _entry(padded, "leaf"),
+            _entry("acme-studios-0b12d8", "root"),
+        ]
+        result = _succeed(BudgetManager(MagicMock(), engine=mock_engine))
+
+        assert _tags(result)["project"] == ["acme-studios-0b12d8"]
+        assert result.project_chain == ["acme-studios-0b12d8"]
+
     def test_system_defaults_never_reaches_the_wire(self) -> None:
         """The Cloud reserves `<system-defaults>` and counts a client copy as degraded."""
         project_manager = ProjectManager(Mock(), Mock(), Mock())

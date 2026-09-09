@@ -58,9 +58,10 @@ class GetAttributionContextResultSuccess(WorkflowNotAlteredMixin, ResultPayloadS
     project is open and `{"v": 1, "tags": {"project": [...]}}` otherwise. `project` is the only
     key the Cloud matches budgets against, and `tags` the only namespace its parser reads.
 
-    A missing `tags` is a signal rather than an absence: it says no project is open on a client
-    that attributes, which the Cloud distinguishes from a client sending no header at all.
-    `<system-defaults>` never travels -- the Cloud reserves that string and rejects a client copy.
+    A missing `tags` reads at the far end exactly as no header at all -- both satisfy
+    `project_chain_absent` and neither emits a metric -- so the bare envelope is sent for
+    forward-compatibility, not because it currently says anything. `<system-defaults>` never
+    travels, in any padding: the Cloud reserves that string and strips before testing it.
 
     Args:
         header_value: The encoded header value to send
@@ -90,7 +91,8 @@ class GetAttributionContextResultFailure(WorkflowNotAlteredMixin, ResultPayloadF
     at all: an id derived from a filesystem path whose bytes are not valid UTF-8 arrives holding
     lone surrogates that the wire cannot carry.
 
-    Sending nothing is the honest answer -- the Cloud reads a missing header as "this client did
-    not attribute", where `{"v": 1}` would assert no project is open. Either way the spend lands
-    in the default budget.
+    Sending nothing rather than `{"v": 1}` is about the engine not asserting a fact it does not
+    have; the far end reads the two identically today, so it changes nothing there. Either way
+    the spend lands in the default budget, and the loss is visible only in the engine's log --
+    see the `reduced` follow-up on the Cloud side.
     """
