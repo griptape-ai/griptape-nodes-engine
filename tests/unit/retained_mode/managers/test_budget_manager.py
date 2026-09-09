@@ -672,6 +672,23 @@ class TestSizeCap:
         assert result.project_chain == ["Only"]
         assert result.chain_truncated is False
 
+    def test_the_utf8_backstop_returns_none_instead_of_raising(self) -> None:
+        """The one path no dispatch can reach, tested directly because it still has to hold.
+
+        Every dimension is filtered through `_transmissible_or_none` before it gets here, so
+        the encoder should never see an unencodable payload -- but if one ever slips past, the
+        cost of letting `str.encode` raise is an ERROR with a traceback on every metered call,
+        because a handler exception becomes a `GenericResultFailure` that ignores
+        `failure_log_level`. Called on the module function, since the guard is unreachable
+        through the manager by construction.
+        """
+        payload = {"v": 1, "tags": {"project": ["\udce9"]}}
+
+        with pytest.raises(UnicodeEncodeError):
+            json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+        assert budget_manager_module._encode_attribution_payload(payload) is None
+
     def test_unencodable_payload_fails_without_raising(self) -> None:
         """The floor: no usable header value exists, so Success would be a lie."""
         manager = self._manager()
