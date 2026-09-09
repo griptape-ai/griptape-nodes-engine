@@ -1180,14 +1180,16 @@ class AgentManager(EngineScoped):
         )
         instructions = _compose_server_rules(configs)
         # Which servers carry a `rules` string at all, so an empty result can be
-        # told apart from a rule the model simply didn't follow.
+        # told apart from a rule the model simply didn't follow. The rules text
+        # itself is deliberately not logged: it is free-form user input that can
+        # contain anything they pasted into the box, and engine logs get attached
+        # to support reports.
         with_rules = [str(config["name"]) for config in configs if str(config.get("rules") or "").strip()]
         logger.info(
-            "%s rules from %s -> run instructions (%d chars): %r",
+            "%s rules from %s -> run instructions (%d chars)",
             TIMING_LOG_PREFIX,
             ", ".join(with_rules) or "no servers",
             len(instructions),
-            instructions,
         )
         return _MCPAttachment(lease=lease, instructions=instructions)
 
