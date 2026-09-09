@@ -930,14 +930,13 @@ class AgentManager(EngineScoped):
         return runner
 
     def _ensure_skills_directory(self, workspace_root: Path) -> None:
-        """Scaffold `<workspace>/.agents/skills` so the runner always builds a skills capability.
+        """Scaffold `<workspace>/.agents/skills` so the runner always has a library to scan.
 
-        Called before every runner construction: the runner only attaches a
-        `SkillsCapability` when the directory exists at construction time, and
-        runners are cached, so creating the directory here guarantees skills
-        added mid-session are picked up on the next scan. Seeds a README the
-        first time so users discovering the folder know what belongs in it.
-        Failure to scaffold is logged but never blocks building the agent.
+        Called before every runner construction: the runner builds its skills
+        capability from this directory on each run, so creating it here means a
+        skill added mid-session is picked up without an engine restart. Seeds a
+        README the first time so users discovering the folder know what belongs
+        in it. Failure to scaffold is logged but never blocks building the agent.
         """
         skills_dir = workspace_root / DEFAULT_SKILLS_DIRECTORY
         try:
