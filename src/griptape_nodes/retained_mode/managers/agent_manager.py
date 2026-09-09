@@ -1175,7 +1175,18 @@ class AgentManager(EngineScoped):
             ", ".join(f"{server.name}@{server.digest}" for server in lease.resolved) or "no servers",
             (time.monotonic() - started) * 1000,
         )
-        return _MCPAttachment(lease=lease, instructions=_compose_server_rules(configs))
+        instructions = _compose_server_rules(configs)
+        # Which servers carry a `rules` string at all, so an empty result can be
+        # told apart from a rule the model simply didn't follow.
+        with_rules = [str(config["name"]) for config in configs if str(config.get("rules") or "").strip()]
+        logger.info(
+            "%s rules from %s -> run instructions (%d chars): %r",
+            TIMING_LOG_PREFIX,
+            ", ".join(with_rules) or "no servers",
+            len(instructions),
+            instructions,
+        )
+        return _MCPAttachment(lease=lease, instructions=instructions)
 
     def _lookup_enabled_mcp_servers(self) -> Mapping[str, Mapping[str, Any]] | None:
         """Current config of every enabled MCP server, or ``None`` if unreadable.
