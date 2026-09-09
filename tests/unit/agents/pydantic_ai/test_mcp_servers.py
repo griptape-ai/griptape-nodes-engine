@@ -59,6 +59,18 @@ def test_streamable_http_without_url_returns_none() -> None:
     assert mcp_server_from_config("svc", {"transport": "streamable_http"}) is None
 
 
+@pytest.mark.parametrize("transport", ["sse", "streamable_http"])
+@pytest.mark.parametrize("url", ["not-a-url", "localhost:8000/mcp", "ftp://host/mcp"])
+def test_an_unusable_url_returns_none_instead_of_raising(transport: str, url: str) -> None:
+    """A typo'd URL is skipped like any other bad config.
+
+    The transport constructor raises for a URL that isn't http(s), and nothing
+    validates the field on the way in. Letting that escape would abandon a whole
+    set of servers part-way through building it, over one bad entry.
+    """
+    assert mcp_server_from_config("svc", {"transport": transport, "url": url}) is None
+
+
 def test_unsupported_transport_returns_none() -> None:
     """An unknown transport is rejected rather than guessed."""
     assert mcp_server_from_config("svc", {"transport": "carrier-pigeon"}) is None
