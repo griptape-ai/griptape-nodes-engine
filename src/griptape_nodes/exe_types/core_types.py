@@ -3272,6 +3272,20 @@ class ParameterDictionary(ParameterContainer):
 # TODO: https://github.com/griptape-ai/griptape-nodes/issues/858
 
 
+class AuthoredInit(NamedTuple):
+    """The constructor a Trait subclass declared in its own body.
+
+    Captured by ``Trait.__init_subclass__`` at class creation, which runs before
+    ``@dataclass`` can add a generated ``__init__``. So a record existing at all is proof
+    the author wrote one, with no need to tell hand-written code from generated code after
+    the fact.
+    """
+
+    parameter_names: tuple[str, ...]
+    # Whether the constructor takes **kwargs, and so can forward to an ancestor's.
+    forwards_keywords: bool
+
+
 @dataclass(eq=False)
 class Trait(ABC, BaseNodeElement):
     # Maps an ``__init__`` parameter name to the attribute that holds its
@@ -3282,6 +3296,35 @@ class Trait(ABC, BaseNodeElement):
     # ``__init__`` parameters that are behavior, not state, and so are never saved
     # (``Button(on_click=...)``).
     STATE_EXCLUDE: ClassVar[frozenset[str]] = frozenset()
+
+    # Set per class by ``__init_subclass__`` below, and only on a class that declared its
+    # own ``__init__``. Annotated without a value so it stays off ``Trait`` itself, which is
+    # what lets the MRO walk use its presence as the signal.
+    _AUTHORED_INIT: ClassVar[AuthoredInit]
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        """Record the ``__init__`` this subclass declared, before ``@dataclass`` adds one.
+
+        Runs while the class body is being turned into a class, which is strictly earlier
+        than any decorator on it. So an ``__init__`` in ``cls.__dict__`` at this moment is
+        the author's by construction. Stored per class, because ``_state_parameter_names``
+        needs to know which classes in the MRO declared one.
+        """
+        super().__init_subclass__(**kwargs)
+        authored_init = cls.__dict__.get("__init__")
+        if authored_init is None:
+            return
+        parameters = inspect.signature(authored_init).parameters.values()
+        cls._AUTHORED_INIT = AuthoredInit(
+            parameter_names=tuple(
+                parameter.name
+                for parameter in parameters
+                if parameter.name != "self"
+                and parameter.kind is not inspect.Parameter.VAR_POSITIONAL
+                and parameter.kind is not inspect.Parameter.VAR_KEYWORD
+            ),
+            forwards_keywords=any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters),
+        )
 
     def __hash__(self) -> int:
         # Use a unique, immutable attribute for hashing
@@ -3419,39 +3462,32 @@ class Trait(ABC, BaseNodeElement):
 
     @classmethod
     def _state_parameter_names(cls) -> list[str]:
-        """Return the trait's own ``__init__`` parameter names, minus variadics.
+        """Return the constructor parameters this trait's authors declared, nearest first.
 
-        Walks only as far as the nearest ``__init__`` a Trait subclass hand-writes. A trait
-        with no constructor of its own (``Compare``) has no state; without this stop the
-        walk reaches the ``@dataclass``-generated ``__init__``, which takes
-        ``BaseNodeElement``'s inherited fields and would report engine internals such as
-        ``_children`` and ``_parent`` as trait state.
+        Reads the names captured by ``__init_subclass__`` rather than inspecting whatever
+        ``__init__`` the class ended up with, because a trait that declares none still
+        inherits a ``@dataclass``-generated one whose signature is ``BaseNodeElement``'s
+        fields. Reporting those would save engine internals such as ``_children`` as state.
+
+        Merges up the MRO instead of stopping at the nearest declaration, so a trait that
+        inherits part of its constructor keeps the inherited arguments. The walk stops at a
+        constructor that takes no ``**kwargs``: without a passthrough, an ancestor's extra
+        parameters cannot be reached through this one, so saving them would produce state
+        the constructor rejects.
         """
-        initializer = None
+        names: list[str] = []
         for klass in cls.__mro__:
             if klass in (Trait, BaseNodeElement):
                 break
-            candidate = klass.__dict__.get("__init__")
-            if candidate is None:
+            declared = klass.__dict__.get("_AUTHORED_INIT")
+            if declared is None:
                 continue
-            # A @dataclass-generated __init__ is exec'd from a synthetic filename, so it
-            # carries no author intent about what counts as trait state.
-            if candidate.__code__.co_filename == "<string>":
-                continue
-            initializer = candidate
-            break
-        if initializer is None:
-            return []
-
-        parameters = inspect.signature(initializer).parameters
-        return [
-            name
-            for name, parameter in parameters.items()
-            if name != "self"
-            and name not in cls.STATE_EXCLUDE
-            and parameter.kind is not inspect.Parameter.VAR_POSITIONAL
-            and parameter.kind is not inspect.Parameter.VAR_KEYWORD
-        ]
+            for name in declared.parameter_names:
+                if name not in cls.STATE_EXCLUDE and name not in names:
+                    names.append(name)
+            if not declared.forwards_keywords:
+                break
+        return names
 
     @classmethod
     @abstractmethod
