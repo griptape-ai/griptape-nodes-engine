@@ -2141,6 +2141,16 @@ class LibraryManager(EngineScoped):
         if file_path and not library_name:
             lib_info = self._library_file_path_to_info.get(file_path)
 
+            # If a previous load left this path in a terminal failure/disabled state, clear
+            # it so an explicit file-path registration (e.g. after an export writes a new
+            # JSON) can retry from the updated file on disk.
+            if lib_info is not None and lib_info.lifecycle_state in (
+                LibraryManager.LibraryLifecycleState.FAILURE,
+                LibraryManager.LibraryLifecycleState.DISABLED,
+            ):
+                del self._library_file_path_to_info[file_path]
+                lib_info = None
+
             # If we don't have LibraryInfo yet, load metadata to get the name
             if not lib_info or not lib_info.library_name:
                 metadata_result = self.load_library_metadata_from_file_request(

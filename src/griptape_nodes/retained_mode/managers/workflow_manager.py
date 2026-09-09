@@ -12,6 +12,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as importlib_version
 from inspect import getmodule, isclass, iscoroutinefunction
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypeVar, cast
@@ -311,6 +313,14 @@ NodeParameterMap = dict[str, ParameterShapeInfo]  # {param_name: param_info}
 WorkflowShapeNodes = dict[str, NodeParameterMap]  # {node_name: {param_name: param_info}}
 
 logger = logging.getLogger("griptape_nodes")
+
+
+def _get_engine_version() -> str:
+    """Return the installed engine version for library metadata, falling back to a safe default."""
+    try:
+        return importlib_version("griptape-nodes-engine")
+    except PackageNotFoundError:
+        return "0.99.0"
 
 
 class WorkflowRegistrationResult(NamedTuple):
@@ -7602,10 +7612,11 @@ class WorkflowManager(EngineScoped):
                 "author": "User",
                 "description": "Subflows exported from the canvas.",
                 "library_version": "0.1.0",
-                "engine_version": "0.1.0",
+                "engine_version": _get_engine_version(),
                 "tags": ["subflow"],
             },
         )
+        library_data["metadata"]["engine_version"] = _get_engine_version()
         library_data.setdefault(
             "categories",
             [
@@ -7824,7 +7835,7 @@ class WorkflowManager(EngineScoped):
                 "author": "User",
                 "description": "Subflows exported from the canvas.",
                 "library_version": "0.1.0",
-                "engine_version": "0.1.0",
+                "engine_version": _get_engine_version(),
                 "tags": ["subflow"],
             },
             "categories": [
@@ -8260,7 +8271,7 @@ class WorkflowManager(EngineScoped):
                 "author": "User",
                 "description": "Live subflows published from the canvas.",
                 "library_version": "0.1.0",
-                "engine_version": "0.1.0",
+                "engine_version": _get_engine_version(),
                 "tags": ["subflow", "live"],
             },
             "categories": [
