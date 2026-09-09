@@ -84,7 +84,9 @@ class GetAttributionContextResultSuccess(WorkflowNotAlteredMixin, ResultPayloadS
         workflow_name: The current workflow's registry key, or `<unsaved>`
         node_type: The node type the caller passed back, unchanged
         engine_id: The id of the engine that answered
-        orchestrator_engine_id: The parent engine's id when this engine is a worker
+        orchestrator_engine_id: Reserved; not emitted in practice. Worker requests are
+            forwarded to the orchestrator, which has no parent, so this is always absent
+            today -- do not build a consumer-side join on it
         session_id: The active session id
         chain_truncated: Whether ancestors were dropped from `project_chain`
     """

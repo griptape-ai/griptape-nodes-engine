@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import MagicMock, Mock, PropertyMock, patch
@@ -406,7 +407,7 @@ class TestDegradation:
 
 
 class TestSizeCap:
-    """One reduction step and a floor, not a ladder."""
+    """Reduction sheds the cheapest dimensions first, then the chain, then fails."""
 
     def _manager(self) -> BudgetManager:
         mock_engine = _mock_engine()
@@ -436,11 +437,139 @@ class TestSizeCap:
         assert result.chain_truncated is True
         assert any(record.levelno == logging.WARNING for record in caplog.records)
 
+    def test_labels_are_shed_before_the_chain(self, caplog: pytest.LogCaptureFixture) -> None:
+        """An oversized payload gives up the workflow and node type before any ancestor.
+
+        The chain is the only dimension the Cloud matches budgets against, and its paths are
+        root-anchored, so an ancestor dropped to make room for an audit-only label costs every
+        match the Cloud would have made. Sized so the full payload is over the cap but the
+        chain survives without the labels: shedding the chain here would be pure loss.
+        """
+        manager = self._manager()
+
+        with (
+            patch.object(budget_manager_module, "_MAX_DECODED_PAYLOAD_BYTES", 100),
+            caplog.at_level(logging.WARNING, logger="griptape_nodes"),
+        ):
+            result = _succeed(manager, node_type="GriptapeProxyImage")
+
+        tags = _tags(result)
+        assert tags["project"] == ["leaf", "parent"]
+        assert "workflow" not in tags
+        assert "node_type" not in tags
+        assert result.project_chain == ["leaf", "parent"]
+        assert result.chain_truncated is False
+        assert any(record.levelno == logging.WARNING for record in caplog.records)
+
+    def test_reduction_of_a_single_entry_chain_does_not_claim_truncation(self) -> None:
+        """Reducing an oversized payload cuts nothing when the chain is already one deep.
+
+        `chain_truncated` says ancestors were dropped. A caller passing a huge `node_type`
+        can force the reduction step without the chain having anything to lose, and a
+        consumer reading the flag to decide whether project attribution is incomplete
+        would otherwise get a false positive.
+        """
+        mock_engine = _mock_engine()
+        mock_engine.project_manager.get_project_chain.return_value = [Mock(id="only")]
+        mock_engine.context_manager.has_current_workflow.return_value = True
+        mock_engine.context_manager.get_current_workflow_name.return_value = "shots/sh020"
+        manager = BudgetManager(MagicMock(), engine=mock_engine)
+
+        with patch.object(budget_manager_module, "_MAX_DECODED_PAYLOAD_BYTES", 80):
+            result = _succeed(manager, node_type="GriptapeProxyImage")
+
+        assert _tags(result)["project"] == ["only"]
+        assert result.project_chain == ["only"]
+        assert result.chain_truncated is False
+
     def test_unencodable_payload_fails_without_raising(self) -> None:
         """The floor: no usable header value exists, so Success would be a lie."""
         manager = self._manager()
 
         with patch.object(budget_manager_module, "_MAX_DECODED_PAYLOAD_BYTES", 1):
+            result = _dispatch(manager)
+
+        assert isinstance(result, GetAttributionContextResultFailure)
+        assert "attribution" in str(result.result_details).lower()
+
+
+class TestTransmissibility:
+    """A value the Cloud cannot store is dropped here rather than sent and discarded there.
+
+    Both shapes arrive the same way: a legacy project id is a canonical filesystem path
+    (`project_manager.py:795`) and the saved workflow key is derived from one. A path whose
+    bytes are not valid UTF-8 carries lone surrogates from `surrogateescape`; a directory name
+    may legally contain a control character.
+    """
+
+    # A path-shaped legacy project id holding a byte that is not valid UTF-8.
+    SURROGATE_ID = "/Users/alice/renders\udce9/project.yml"
+    # Legal on Linux, encodes fine here, and dropped by the Cloud's storability check.
+    CONTROL_CHAR_ID = "/Users/alice/two\nlines/project.yml"
+
+    @pytest.mark.parametrize("bad_id", [SURROGATE_ID, CONTROL_CHAR_ID])
+    def test_an_untransmissible_id_drops_the_whole_chain(self, bad_id: str, caplog: pytest.LogCaptureFixture) -> None:
+        """The chain goes as a unit: a partial chain bills an ancestor for the leaf's spend.
+
+        Budget paths are root-anchored, so a chain missing a link matches nothing either way.
+        Dropping only the offending entry would promote its parent to leaf and charge a real
+        project for spend it never incurred, which is worse than no attribution at all.
+        """
+        mock_engine = _mock_engine()
+        mock_engine.project_manager.get_project_chain.return_value = [Mock(id="leaf"), Mock(id=bad_id)]
+        manager = BudgetManager(MagicMock(), engine=mock_engine)
+
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            result = _succeed(manager)
+
+        assert "project" not in _tags(result)
+        assert result.project_chain == []
+        assert any(record.levelno == logging.WARNING for record in caplog.records)
+
+    def test_a_transmissible_path_shaped_id_still_travels(self) -> None:
+        """The filter targets unstorable bytes, not paths -- a legacy id is still an id."""
+        mock_engine = _mock_engine()
+        mock_engine.project_manager.get_project_chain.return_value = [Mock(id="/Users/alice/acme/project.yml")]
+        manager = BudgetManager(MagicMock(), engine=mock_engine)
+
+        assert _tags(_succeed(manager))["project"] == ["/Users/alice/acme/project.yml"]
+
+    def test_an_untransmissible_workflow_key_is_omitted_without_touching_the_chain(self) -> None:
+        """One unusable dimension costs its own key and nothing else."""
+        mock_engine = _mock_engine()
+        mock_engine.project_manager.get_project_chain.return_value = [Mock(id="leaf")]
+        mock_engine.context_manager.has_current_workflow.return_value = True
+        mock_engine.context_manager.get_current_workflow_name.return_value = "shots/sh020\udce9/lighting"
+        manager = BudgetManager(MagicMock(), engine=mock_engine)
+
+        result = _succeed(manager)
+
+        tags = _tags(result)
+        assert "workflow" not in tags
+        assert tags["project"] == ["leaf"]
+        assert result.workflow_name is None
+
+    def test_an_untransmissible_node_type_is_omitted(self) -> None:
+        """`node_type` is caller-supplied, so it gets the same check as the engine's own facts."""
+        manager = BudgetManager(MagicMock(), engine=_mock_engine())
+
+        result = _succeed(manager, node_type="Griptape\udce9Image")
+
+        assert "node_type" not in _tags(result)
+        assert result.node_type is None
+
+    def test_an_unencodable_identifier_degrades_instead_of_raising(self) -> None:
+        """The encoder floor: identifiers are not filtered individually, so it must not raise.
+
+        `os.getenv` decodes with `surrogateescape`, so `orchestrator_engine_id` can arrive
+        holding a lone surrogate. Raising out of the handler would return `GenericResultFailure`,
+        which ignores `failure_log_level` and would log an ERROR with a traceback on every
+        metered call rather than degrading quietly.
+        """
+        mock_engine = _mock_engine()
+        manager = BudgetManager(MagicMock(), engine=mock_engine)
+
+        with patch.dict(os.environ, {"GTN_ORCHESTRATOR_ENGINE_ID": "eng-orch\udce9"}):
             result = _dispatch(manager)
 
         assert isinstance(result, GetAttributionContextResultFailure)
