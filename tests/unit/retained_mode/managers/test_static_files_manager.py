@@ -790,6 +790,44 @@ class TestStaticFilesManagerCreateDownloadUrlFromPath:
         assert any("Preview unavailable" in m for m in warning_messages)
 
     @pytest.mark.asyncio
+    async def test_extensionless_file_serves_original_without_preview(
+        self, mock_static_files_manager: StaticFilesManager, tmp_path: Path
+    ) -> None:
+        """A file with no extension has no preview pipeline; the original is served, no reason set."""
+        from griptape_nodes.retained_mode.events.static_file_events import (
+            CreateStaticFileDownloadUrlFromPathRequest,
+            CreateStaticFileDownloadUrlFromPathResultSuccess,
+        )
+
+        source_file = tmp_path / "README"
+        source_file.write_bytes(b"plain text")
+
+        mock_static_files_manager.storage_driver.create_signed_download_url.return_value = "http://signed-url.com"
+        mock_static_files_manager.storage_driver.get_asset_url.return_value = "http://asset-url.com"
+
+        request = CreateStaticFileDownloadUrlFromPathRequest(file_path=str(source_file), preview=True)
+
+        result = await mock_static_files_manager.on_handle_create_static_file_download_url_from_path_request(request)
+
+        assert isinstance(result, CreateStaticFileDownloadUrlFromPathResultSuccess)
+        assert result.preview_failure_reason is None
+        mock_static_files_manager.storage_driver.create_signed_download_url.assert_called_once_with(source_file)
+
+    @pytest.mark.asyncio
+    async def test_unsupported_format_serves_original_without_preview(
+        self, mock_static_files_manager: StaticFilesManager, tmp_path: Path
+    ) -> None:
+        """A format with no registered provider is not a failure; the original is served."""
+        source_file = tmp_path / "notes.txt"
+        registry = mock_static_files_manager.engine.artifact_manager._registry
+        registry.get_provider_classes_by_format.return_value = []
+
+        resolution = await mock_static_files_manager._generate_preview_if_needed(source_file)
+
+        assert resolution.path_to_serve == source_file
+        assert resolution.preview_failure_reason is None
+
+    @pytest.mark.asyncio
     async def test_missing_source_fallback_logs_debug_not_warning(
         self,
         mock_static_files_manager: StaticFilesManager,
