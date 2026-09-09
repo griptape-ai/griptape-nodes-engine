@@ -696,27 +696,52 @@ class TestTransmissibility:
         assert _tags(result)["workflow"] == "shots/sh020 /lighting"
         assert result.workflow_name == "shots/sh020 /lighting"
 
-    def test_a_name_longer_than_the_value_cap_travels_cut_to_it(self) -> None:
-        """The far end keeps 256 characters, so that is what the chain reports."""
+    def test_a_name_longer_than_the_value_cap_travels_uncut(self) -> None:
+        """Cutting is the far end's job, and doing it here would hide that it happened.
+
+        The Cloud truncates an over-long name rather than dropping it, then marks the chain
+        mangled and stops matching it against admin-authored paths. Pre-cutting hands it a
+        prefix that looks intact, so it matches -- and two sibling projects sharing their
+        first 256 characters silently collapse onto one budget with nothing recorded.
+        Stripping stays, because the far end strips too and flags nothing when it does.
+        """
         mock_engine = _mock_engine()
-        mock_engine.project_manager.get_project_chain.return_value = [_entry("leaf", "S" * 300)]
+        mock_engine.project_manager.get_project_chain.return_value = [_entry("leaf", "  " + "S" * 300 + "  ")]
         manager = BudgetManager(MagicMock(), engine=mock_engine)
 
         result = _succeed(manager)
 
-        assert _tags(result)["project"] == ["S" * 256]
-        assert result.project_chain == ["S" * 256]
+        assert _tags(result)["project"] == ["S" * 300]
+        assert result.project_chain == ["S" * 300]
 
     def test_an_unstorable_byte_past_the_value_cap_does_not_cost_the_chain(self) -> None:
         """Judge the kept form, or the engine refuses a name the far end would have stored.
 
         The cut happens before the storability test on the far end, so a control character
         sitting past the cap is gone by the time anything looks at it. Testing the whole
-        string here would drop a chain over a byte that never arrives.
+        string here would drop a chain over a byte that never arrives -- and the name still
+        travels uncut, because the far end is the one that should decide it was too long.
         """
         mock_engine = _mock_engine()
         mock_engine.project_manager.get_project_chain.return_value = [
-            _entry("leaf", "S" * 300 + "\n"),
+            _entry("leaf", "S" * 300 + "\n" + "S" * 20),
+            _entry("root", "Acme Studios"),
+        ]
+        manager = BudgetManager(MagicMock(), engine=mock_engine)
+
+        result = _succeed(manager)
+
+        assert _tags(result)["project"] == ["S" * 300 + "\n" + "S" * 20, "Acme Studios"]
+
+    def test_a_surrogate_past_the_value_cap_falls_back_to_the_cut_form(self) -> None:
+        """One name's truncation signal is worth less than every other dimension on the call.
+
+        A lone surrogate survives the strip and cannot be UTF-8 encoded, so sending the uncut
+        name would cost the entire header. The cut form drops the byte, which is the trade.
+        """
+        mock_engine = _mock_engine()
+        mock_engine.project_manager.get_project_chain.return_value = [
+            _entry("leaf", "S" * 300 + "\udce9"),
             _entry("root", "Acme Studios"),
         ]
         manager = BudgetManager(MagicMock(), engine=mock_engine)

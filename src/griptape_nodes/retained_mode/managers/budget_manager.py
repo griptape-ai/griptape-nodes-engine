@@ -44,10 +44,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("griptape_nodes")
 
-# The four constants below mirror the Cloud parser, and each was read off it rather than agreed
-# in a doc: `control_plane/api/griptapecloud/components/spend/attribution.py` in the
-# griptape-cloud repo (PR #2225). Diverging from any of them costs attribution silently, so
-# check that file before changing one.
+# The four constants below mirror Griptape Cloud's attribution-header parser, and each was read
+# off that parser rather than agreed in a doc. Diverging from any of them costs attribution
+# silently, so re-check them against it before changing one; the PR description says where it
+# lives.
 
 # The parser's MAX_CHAIN_LENGTH. Truncating lower would not be conservative: it flags a
 # truncated chain as mangled because budget paths are root-anchored, so dropping ancestors
@@ -65,8 +65,8 @@ _MAX_DECODED_PAYLOAD_BYTES = 4096
 _UNSTORABLE_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 # The parser's MAX_VALUE_LENGTH, and a cap on *characters*: it compares `len(value)` and slices
-# `value[:MAX_VALUE_LENGTH]` on a `str`, never on encoded bytes. Applied to project names only;
-# see `_as_the_cloud_keeps_it`.
+# `value[:MAX_VALUE_LENGTH]` on a `str`, never on encoded bytes. Used to judge project names,
+# not to cut them -- see `_project_name_for_the_wire`.
 _MAX_VALUE_CHARS = 256
 
 
@@ -110,11 +110,37 @@ def _as_the_cloud_keeps_it(name: str) -> str:
     parent-billed-for-its-child failure again. And it has to run before the byte checks, or a
     control character sitting past the cap drops a whole chain the far end would have stored.
 
-    Project names only. The result is what budget rules are written against, so reporting the
-    kept form is the accurate answer; a workflow registry key is an identifier rather than a
-    match key and travels as the engine spells it.
+    For deciding only. What actually travels is `_project_name_for_the_wire`, which is a
+    different string for an over-long name and for a good reason.
     """
     return name.strip()[:_MAX_VALUE_CHARS].strip()
+
+
+def _project_name_for_the_wire(name: str) -> str:
+    """Which form of a project name to send: the full one whenever it can travel.
+
+    Stripping here is free, because the far end strips too and records nothing when it does.
+    Cutting here is not. The parser marks a chain it had to cut as mangled and stops matching
+    it against admin-authored paths -- which is what keeps two sibling projects sharing a
+    256-character prefix from collapsing onto one budget. Handing it a pre-cut name presents
+    that prefix as an intact one: it reports no degradation, emits no metric, and matches. The
+    substitution then goes unrecorded on both sides, since `chain_truncated` on the result is
+    about the length of the chain, not of a name in it.
+
+    Whether a prefix match beats falling to the default budget is the Cloud's call to make on
+    its own data. Sending the full name leaves it able to make it.
+
+    One exception, and it is a real trade rather than a preference: a lone surrogate past the
+    cap survives the strip and makes the payload unencodable, costing the whole header. The cut
+    form drops that byte, so it goes instead -- one name's truncation signal for every other
+    dimension on the call.
+    """
+    stripped = name.strip()
+    try:
+        stripped.encode("utf-8")
+    except UnicodeEncodeError:
+        return _as_the_cloud_keeps_it(name)
+    return stripped
 
 
 def _is_transmissible(value: str) -> bool:
@@ -383,11 +409,11 @@ class BudgetManager(EngineScoped):
                     "attribute its spend."
                 )
                 return []
-            # Reduced to the kept form before anything is decided about it, so every test
-            # below sees the string the far end will see. A project name is a label rather
-            # than a key, so nothing is lost by reporting it the way it is stored.
-            name = _as_the_cloud_keeps_it(entry.name)
-            if not _is_transmissible(name):
+            # Judged on the form the far end keeps, so both tests below see the string it
+            # will see -- not on the form that travels, which for an over-long name is the
+            # uncut one.
+            kept = _as_the_cloud_keeps_it(entry.name)
+            if not _is_transmissible(kept):
                 logger.warning(
                     "Dropping project attribution for this call: a project name in the chain cannot "
                     "be transmitted intact. Rename the project using ordinary text to attribute its "
@@ -396,14 +422,14 @@ class BudgetManager(EngineScoped):
                 return []
             # Separate from the sentinel *id* skipped above -- this is a real project a user
             # named that, whether outright or by padding one out to the cap.
-            if name == SYSTEM_DEFAULTS_KEY:
+            if kept == SYSTEM_DEFAULTS_KEY:
                 logger.warning(
                     "Dropping project attribution for this call: a project is named '%s', which Griptape "
                     "Cloud reserves for its own use. Rename the project to attribute its spend.",
                     SYSTEM_DEFAULTS_KEY,
                 )
                 return []
-            project_names.append(name)
+            project_names.append(_project_name_for_the_wire(entry.name))
 
         return project_names
 
