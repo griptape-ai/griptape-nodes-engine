@@ -3189,11 +3189,9 @@ class OSManager(EngineScoped):
         if isinstance(content, bytes):
             data = content
         else:
-            # Mirror text-mode newline translation: the pre-atomic OVERWRITE path
-            # wrote str content through open(mode="w"), which turns every "\n"
-            # into os.linesep ("\r\n" on Windows). The atomic path writes raw
-            # bytes, so translate here or every text save silently switches
-            # Windows files to bare LF.
+            # Text mode translates every "\n" to os.linesep ("\r\n" on Windows);
+            # this path writes raw bytes, so translate here or every text save
+            # on Windows lands with bare LF.
             if os.linesep != "\n":
                 content = content.replace("\n", os.linesep)
             try:

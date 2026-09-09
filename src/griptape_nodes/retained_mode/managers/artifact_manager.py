@@ -545,12 +545,16 @@ class ArtifactManager(EngineScoped):
         #
         # Generate-then-verify loop: if the source changed while the preview was
         # rendering, the preview depicts the old content — retry once with a fresh
-        # pre-generation stat. If the source is STILL changing after the retry (e.g.
-        # a render writing frames), stop: the recorded pre-generation stat then
-        # mismatches the file on disk, which is exactly what makes the next request
-        # judge the preview stale and regenerate. "Changed" uses the same size/mtime
-        # comparison as the staleness check, so we only chase changes that check
-        # would notice.
+        # pre-generation stat. If the source is STILL changing after the retry
+        # (e.g. a render writing frames), stop and keep the pre-generation stat.
+        # The verify compares mtime EXACTLY, unlike the staleness check's
+        # mtimes_match tolerance: that tolerance absorbs drift a recorded mtime
+        # picks up from syncs and cross-volume copies, but both stats here come
+        # from the same filesystem seconds apart, where any difference is a real
+        # write. A tolerant compare would make a same-size in-place rewrite (a
+        # re-rendered frame, cp over the file) invisible to this loop — and the
+        # staleness check is blind to that same rewrite for the same reason, so
+        # this is the only place it can be caught.
         max_generation_attempts = 2
         generation_attempt = 1
         while True:
@@ -578,18 +582,16 @@ class ArtifactManager(EngineScoped):
                 # Can't verify (file vanished mid-flight?); keep what we generated.
                 break
 
-            source_unchanged = post_generation_info_result.file_entry.size == source_file_entry.size and (
-                mtimes_match(
-                    post_generation_info_result.file_entry.modified_time,
-                    source_file_entry.modified_time,
-                )
+            source_unchanged = (
+                post_generation_info_result.file_entry.size == source_file_entry.size
+                and post_generation_info_result.file_entry.modified_time == source_file_entry.modified_time
             )
             if source_unchanged:
                 break
 
             if generation_attempt >= max_generation_attempts:
                 logger.info(
-                    "Source file '%s' is still changing; keeping the pre-generation stat so the next request regenerates.",
+                    "Source file '%s' is still changing; its preview may briefly show older content until it settles.",
                     source_path,
                 )
                 break
@@ -801,7 +803,8 @@ class ArtifactManager(EngineScoped):
 
         if file_info_result.file_entry is None:
             return GetPreviewForArtifactResultFailure(
-                result_details=f"Attempted to get preview for '{source_path}'. Failed due to: source file not found"
+                result_details=f"Attempted to get preview for '{source_path}'. Failed due to: source file not found",
+                source_file_missing=True,
             )
 
         # FAILURE CASE: Validate provider

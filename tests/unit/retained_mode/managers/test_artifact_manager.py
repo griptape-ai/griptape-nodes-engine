@@ -1110,6 +1110,47 @@ class TestGeneratePreview:
         assert metadata["source_file_size"] == source_stat.st_size
 
     @pytest.mark.asyncio
+    async def test_same_size_rewrite_mid_generation_retries(
+        self, artifact_manager: ArtifactManager, test_macro_path: MacroPath, test_image_path: Path
+    ) -> None:
+        """A same-size in-place rewrite during generation still triggers the retry.
+
+        The verify compares mtime exactly: a tolerant compare would make this
+        rewrite invisible (size unchanged, mtime within the drift window), and the
+        staleness check is blind to it for the same reason — this loop is the only
+        place it can be caught.
+        """
+        import os
+
+        generation_calls = 0
+        original = ImageArtifactProvider.attempt_generate_preview
+
+        async def generate_then_rewrite_same_size(provider_self: ImageArtifactProvider, **kwargs: object) -> object:
+            nonlocal generation_calls
+            generation_calls += 1
+            result = await original(provider_self, **kwargs)  # type: ignore[arg-type]
+            if generation_calls == 1:
+                # Rewrite in place: same byte count, mtime nudged by less than the
+                # staleness tolerance window — the shape of a re-rendered frame.
+                source_stat = await anyio.Path(test_image_path).stat()
+                content = await anyio.Path(test_image_path).read_bytes()
+                await anyio.Path(test_image_path).write_bytes(content)
+                os.utime(test_image_path, (source_stat.st_atime, source_stat.st_mtime + 0.5))
+            return result
+
+        request = GeneratePreviewRequest(
+            macro_path=test_macro_path,
+            artifact_provider_name="Image",
+            generate_preview_metadata_json=True,
+            preview_generator_parameters={"max_width": 50, "max_height": 50},
+        )
+        with patch.object(ImageArtifactProvider, "attempt_generate_preview", generate_then_rewrite_same_size):
+            result = await artifact_manager.on_handle_generate_preview_request(request)
+
+        assert isinstance(result, GeneratePreviewResultSuccess)
+        assert generation_calls == 2  # noqa: PLR2004
+
+    @pytest.mark.asyncio
     async def test_source_still_changing_stops_after_two_attempts(
         self,
         artifact_manager: ArtifactManager,
@@ -1669,7 +1710,7 @@ class TestGetPreviewForArtifact:
     ) -> None:
         """A synced/copied source whose mtime drifted slightly still serves its preview.
 
-        Before the tolerance existed, exact float equality made this a permanent
+        Exact float equality would brand this permanently stale — a
         DO_NOT_GENERATE failure with a valid preview sitting on disk.
         """
         import asyncio

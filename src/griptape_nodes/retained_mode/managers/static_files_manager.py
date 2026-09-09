@@ -19,6 +19,7 @@ from griptape_nodes.retained_mode.engine import Engine, EngineScoped
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.artifact_events import (
     GetPreviewForArtifactRequest,
+    GetPreviewForArtifactResultFailure,
     GetPreviewForArtifactResultSuccess,
     PreviewGenerationPolicy,
 )
@@ -246,7 +247,14 @@ class StaticFilesManager(EngineScoped):
 
         if not isinstance(result, GetPreviewForArtifactResultSuccess) or not isinstance(result.paths_to_preview, str):
             failure_reason = str(result.result_details)
-            logger.warning(
+            # A vanished source is routine (outputs cleaned up between runs) and
+            # fires once per component displaying the artifact — nobody can act
+            # on it, so it stays at DEBUG. Everything else (provider error,
+            # failed write) is worth an operator's attention.
+            source_file_missing = isinstance(result, GetPreviewForArtifactResultFailure) and result.source_file_missing
+            fallback_log_level = logging.DEBUG if source_file_missing else logging.WARNING
+            logger.log(
+                fallback_log_level,
                 "Preview unavailable for %s; serving the original file instead. Reason: %s",
                 file_path,
                 failure_reason,

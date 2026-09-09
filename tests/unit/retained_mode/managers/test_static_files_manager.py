@@ -750,8 +750,8 @@ class TestStaticFilesManagerCreateDownloadUrlFromPath:
     ) -> None:
         """A failed preview falls back to the original file, names why, and logs at WARNING.
 
-        Before this, the failure logged at DEBUG and the result carried no signal, so
-        the editor rendered an unexplained full-size image or an empty frame.
+        Without the reason and a visible log line, the editor renders an
+        unexplained full-size image or an empty frame and the engine says nothing.
         """
         import logging
 
@@ -788,6 +788,54 @@ class TestStaticFilesManagerCreateDownloadUrlFromPath:
         mock_static_files_manager.storage_driver.create_signed_download_url.assert_called_once_with(source_file)
         warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
         assert any("Preview unavailable" in m for m in warning_messages)
+
+    @pytest.mark.asyncio
+    async def test_missing_source_fallback_logs_debug_not_warning(
+        self,
+        mock_static_files_manager: StaticFilesManager,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A vanished source stays at DEBUG — it's routine and fires once per component.
+
+        The reason still reaches the editor via preview_failure_reason; only the
+        log level distinguishes the unactionable case from real failures.
+        """
+        import logging
+
+        from griptape_nodes.retained_mode.events.artifact_events import GetPreviewForArtifactResultFailure
+        from griptape_nodes.retained_mode.events.static_file_events import (
+            CreateStaticFileDownloadUrlFromPathRequest,
+            CreateStaticFileDownloadUrlFromPathResultSuccess,
+        )
+
+        source_file = tmp_path / "image.png"
+        source_file.write_bytes(b"not a real png")
+
+        provider_class = Mock()
+        provider_class.get_friendly_name.return_value = "Image"
+        registry = mock_static_files_manager.engine.artifact_manager._registry
+        registry.get_provider_classes_by_format.return_value = [provider_class]
+        mock_static_files_manager.engine.ahandle_request = AsyncMock(
+            return_value=GetPreviewForArtifactResultFailure(
+                result_details="source file not found", source_file_missing=True
+            )
+        )
+        mock_static_files_manager.storage_driver.create_signed_download_url.return_value = "http://signed-url.com"
+        mock_static_files_manager.storage_driver.get_asset_url.return_value = "http://asset-url.com"
+
+        request = CreateStaticFileDownloadUrlFromPathRequest(file_path=str(source_file), preview=True)
+
+        with caplog.at_level(logging.DEBUG, logger="griptape_nodes"):
+            result = await mock_static_files_manager.on_handle_create_static_file_download_url_from_path_request(
+                request
+            )
+
+        assert isinstance(result, CreateStaticFileDownloadUrlFromPathResultSuccess)
+        assert result.preview_failure_reason is not None
+        fallback_records = [r for r in caplog.records if "Preview unavailable" in r.message]
+        assert fallback_records
+        assert all(r.levelno == logging.DEBUG for r in fallback_records)
 
     @pytest.mark.asyncio
     async def test_preview_generation_exception_falls_back_with_reason(

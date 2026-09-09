@@ -142,14 +142,14 @@ class TestKeyedMutex:
             waiter_task = asyncio.create_task(waiter())
             await asyncio.sleep(0.05)  # let the waiter reach its polling sleep
             waiter_task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await waiter_task
+            waiter_outcome = await asyncio.gather(waiter_task, return_exceptions=True)
+            assert isinstance(waiter_outcome[0], asyncio.CancelledError)
 
             # Only the holder's reference remains; the waiter checked in on cancel.
             assert mutex._entries["key"].refcount == 1
 
             release_holder.set()
-            await holder_task
+            await asyncio.wait_for(holder_task, timeout=5)
 
         asyncio.run(scenario())
 

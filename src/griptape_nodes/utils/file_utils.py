@@ -6,7 +6,7 @@ import contextlib
 import logging
 import os
 import stat
-import tempfile
+import uuid
 from dataclasses import dataclass
 from fnmatch import fnmatch
 from functools import partial
@@ -29,15 +29,6 @@ DEFAULT_MAX_SEARCH_DEPTH = 5
 # is treated as "same file state"; a real edit moves mtime beyond it. Callers should
 # always compare file SIZE exactly alongside this — sizes don't drift.
 MTIME_MATCH_TOLERANCE_SECONDS = 2.0
-
-
-# Snapshot the process umask at import time, while the process is still
-# single-threaded. os.umask is the only way to READ the umask and it also SETS
-# it, so calling it later — atomic_write_bytes runs on worker threads — would
-# open a window where concurrent file creation on other threads inherits
-# umask 0 and lands world-writable.
-_PROCESS_UMASK = os.umask(0)
-os.umask(_PROCESS_UMASK)
 
 
 def mtimes_match(mtime_a: float, mtime_b: float) -> bool:
@@ -81,8 +72,15 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
     # leave the target stale. A dangling link creates its target, as open() would.
     if path.is_symlink():
         path = path.resolve()
-    tmp_fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
-    tmp_path = Path(tmp_name)
+
+    # Dot-prefixed and self-identifying: the scratch name is hidden from artists
+    # browsing the destination directory, and if a power loss strands one, the
+    # name says what left it there. Created with an explicit 0o666 so the KERNEL
+    # applies the process umask — same default open(mode="w") produces — instead
+    # of reading the umask ourselves, which would require mutating global state.
+    tmp_path = path.parent / f".gtn-write-partial-{uuid.uuid4().hex}{path.suffix}"
+    open_flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+    tmp_fd = os.open(tmp_path, open_flags, mode=0o666)
     try:
         with os.fdopen(tmp_fd, "wb") as tmp_file:
             tmp_file.write(data)
@@ -94,14 +92,14 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
             # rename can promote the temp file into the destination name.
             tmp_file.flush()
             os.fsync(tmp_file.fileno())
-        # mkstemp creates 0600; without this, every overwrite silently tightens
-        # the destination's permissions. Preserve an existing file's mode, and
-        # give new files the same default open(mode="w") would have produced.
+        # Preserve an existing destination's permissions: the temp file's fresh
+        # umask-derived mode would otherwise supplant whatever mode the file had.
         try:
             file_mode = stat.S_IMODE(path.stat().st_mode)
+            tmp_path.chmod(file_mode)
         except FileNotFoundError:
-            file_mode = 0o666 & ~_PROCESS_UMASK
-        tmp_path.chmod(file_mode)
+            # New destination: the kernel-applied umask default already matches.
+            pass
         tmp_path.replace(path)
     except OSError:
         tmp_path.unlink(missing_ok=True)
