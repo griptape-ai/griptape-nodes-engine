@@ -195,7 +195,8 @@ def test_get_thread_metadata_skips_malformed_run_records(storage: LocalThreadSto
                 {"bad_field": "value"},  # missing required fields — must be skipped
                 {"message_index": 1, "provider_name": "ollama", "model": "llama3", "mcp_servers": []},
             ]
-        )
+        ),
+        encoding="utf-8",
     )
 
     thread = storage.get_thread_metadata(thread_id)

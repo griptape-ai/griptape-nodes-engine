@@ -9,14 +9,15 @@ Each conversation is a **thread**. Threads are named automatically with the date
 
 ## Where threads are stored
 
-Threads are saved to your local filesystem and persist across sessions. Each thread is stored as two files:
+Threads are saved to your local filesystem and persist across sessions. Each thread is stored as three files:
 
-| File                    | Contents                                                          |
-| ----------------------- | ----------------------------------------------------------------- |
-| `thread_{id}.json`      | Full message history                                              |
-| `thread_{id}.meta.json` | Title, timestamps, message count, and per-run provider/model info |
+| File                    | Contents                                     |
+| ----------------------- | -------------------------------------------- |
+| `thread_{id}.json`      | Full message history                         |
+| `thread_{id}.meta.json` | Title, timestamps, message count             |
+| `thread_{id}.runs.json` | Per-run provider, model, and MCP server info |
 
-The metadata file tracks which AI provider, model, and MCP servers were used for each response in the thread.
+The runs file tracks which AI provider, model, and MCP servers were used for each response in the thread.
 
 The storage location follows the [XDG Base Directory](https://specifications.freedesktop.org/basedir-spec/latest/) convention.
 
