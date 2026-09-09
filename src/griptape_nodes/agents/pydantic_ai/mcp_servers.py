@@ -89,61 +89,83 @@ class BuiltMCPServer:
     transport: ClientTransport
 
 
-def mcp_server_from_config(name: str, config: Mapping[str, Any]) -> BuiltMCPServer | None:  # noqa: PLR0911
+_HTTP_TRANSPORTS: dict[str, type[SSETransport | StreamableHttpTransport]] = {
+    "sse": SSETransport,
+    "streamable_http": StreamableHttpTransport,
+}
+"""The URL-based transports, which differ only in the class they instantiate."""
+
+
+def mcp_server_from_config(name: str, config: Mapping[str, Any]) -> BuiltMCPServer | None:
     """Build a Pydantic AI MCP toolset from an engine ``MCPServerConfig``.
 
-    Returns ``None`` and logs a warning when the config is missing required
-    fields for its declared transport. The returned toolset is prefixed with
-    ``name`` so tools from different servers can't collide.
+    Returns ``None`` and logs a warning for any config this cannot build from -
+    a missing required field, an unusable URL, an unknown transport. Never
+    raises: one unbuildable server must not stop the agent attaching the others,
+    and a caller part-way through building a set of them would otherwise be left
+    holding a half-built result. The returned toolset is prefixed with ``name``
+    so tools from different servers can't collide.
     """
     transport = config.get("transport", "stdio")
 
     if transport == "stdio":
-        command = config.get("command")
-        if not command:
-            logger.warning("MCP server %r: stdio transport requires `command`; skipping.", name)
-            return None
-        client = StdioTransport(
-            command=command,
-            args=list(config.get("args") or []),
-            env=_stdio_env(config.get("env")),
-            cwd=config.get("cwd"),
-        )
-        return BuiltMCPServer(
-            toolset=_compose(name, MCPToolset(client, max_retries=DEFAULT_TOOL_MAX_RETRIES)),
-            transport=client,
-        )
+        return _stdio_server_from_config(name, config)
 
-    if transport == "sse":
-        url = config.get("url")
-        if not url:
-            logger.warning("MCP server %r: sse transport requires `url`; skipping.", name)
-            return None
-        client = SSETransport(url=url, headers=dict(config.get("headers") or {}))
-        return BuiltMCPServer(
-            toolset=_compose(
-                name,
-                MCPToolset(client, max_retries=DEFAULT_TOOL_MAX_RETRIES, init_timeout=_connect_timeout(config)),
-            ),
-            transport=client,
-        )
-
-    if transport == "streamable_http":
-        url = config.get("url")
-        if not url:
-            logger.warning("MCP server %r: %s transport requires `url`; skipping.", name, transport)
-            return None
-        client = StreamableHttpTransport(url=url, headers=dict(config.get("headers") or {}))
-        return BuiltMCPServer(
-            toolset=_compose(
-                name,
-                MCPToolset(client, max_retries=DEFAULT_TOOL_MAX_RETRIES, init_timeout=_connect_timeout(config)),
-            ),
-            transport=client,
-        )
+    if transport in _HTTP_TRANSPORTS:
+        return _http_server_from_config(name, config, str(transport))
 
     logger.warning("MCP server %r: unsupported transport %r; skipping.", name, transport)
     return None
+
+
+def _stdio_server_from_config(name: str, config: Mapping[str, Any]) -> BuiltMCPServer | None:
+    """Build a subprocess-backed MCP server.
+
+    No ``init_timeout``: unlike the URL transports there is no network handshake
+    to bound, and a slow-starting local server is not a failure.
+    """
+    command = config.get("command")
+    if not command:
+        logger.warning("MCP server %r: stdio transport requires `command`; skipping.", name)
+        return None
+    client = StdioTransport(
+        command=command,
+        args=list(config.get("args") or []),
+        env=_stdio_env(config.get("env")),
+        cwd=config.get("cwd"),
+    )
+    return BuiltMCPServer(
+        toolset=_compose(name, MCPToolset(client, max_retries=DEFAULT_TOOL_MAX_RETRIES)),
+        transport=client,
+    )
+
+
+def _http_server_from_config(name: str, config: Mapping[str, Any], transport: str) -> BuiltMCPServer | None:
+    """Build a URL-backed MCP server (``sse`` or ``streamable_http``)."""
+    url = config.get("url")
+    if not url:
+        logger.warning("MCP server %r: %s transport requires `url`; skipping.", name, transport)
+        return None
+    try:
+        client = _HTTP_TRANSPORTS[transport](url=url, headers=dict(config.get("headers") or {}))
+    # The transport constructor rejects a URL that isn't http:// or https://,
+    # and nothing validates the field on the way in, so a plain typo lands here.
+    except ValueError as e:
+        logger.warning(
+            "Attempted to reach MCP server '%s' at '%s'. That is not a usable web address, so the server "
+            "will be skipped. Check it starts with http:// or https://. Failed due to: %s",
+            name,
+            url,
+            e,
+        )
+        return None
+    return BuiltMCPServer(
+        toolset=_compose(
+            name,
+            MCPToolset(client, max_retries=DEFAULT_TOOL_MAX_RETRIES, init_timeout=_connect_timeout(config)),
+        ),
+        transport=client,
+    )
 
 
 async def disconnect_transport(name: str, transport: ClientTransport) -> None:

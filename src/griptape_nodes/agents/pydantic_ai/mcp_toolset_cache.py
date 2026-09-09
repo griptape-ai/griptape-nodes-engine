@@ -51,8 +51,7 @@ if TYPE_CHECKING:
 
     from fastmcp.client.transports import ClientTransport
     from pydantic_ai import RunContext
-    from pydantic_ai.tools import ToolsetTool
-    from pydantic_ai.toolsets import AbstractToolset
+    from pydantic_ai.toolsets import AbstractToolset, ToolsetTool
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -237,12 +236,17 @@ class MCPToolsetCache:
         started = time.monotonic()
         entries: list[_Entry] = []
         async with self._lock:
+            # Two passes on purpose. Resolving an entry can raise, and there is
+            # no lease yet to release what came before it, so nothing takes a use
+            # count until every entry is in hand. An entry built before the raise
+            # stays cached at `users == 0`, which is reusable and still reapable;
+            # one left at `users > 0` with no lease could never be disconnected.
             for config in configs:
                 entry = await self._entry_for(str(config["name"]), config)
-                if entry is None:
-                    continue
+                if entry is not None:
+                    entries.append(entry)
+            for entry in entries:
                 entry.users += 1
-                entries.append(entry)
         logger.info(
             "%s acquired %d of %d server(s) in %.1f ms",
             TIMING_LOG_PREFIX,
@@ -274,7 +278,14 @@ class MCPToolsetCache:
             )
 
     async def aclose(self) -> None:
-        """Disconnect every cached server. Called when the owning manager shuts down."""
+        """Disconnect every cached server.
+
+        Nothing calls this in the engine today: managers have no shutdown hook,
+        so cached servers are reaped by the process exiting. It exists for tests
+        and for embedders that outlive an engine, and is the hook to wire up if a
+        manager shutdown path is ever added - until then, do not assume a warm
+        subprocess is ever shut down cleanly.
+        """
         async with self._lock:
             for name in list(self._entries):
                 await self._retire(name)

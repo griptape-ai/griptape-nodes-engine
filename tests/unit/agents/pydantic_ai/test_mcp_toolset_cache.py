@@ -331,6 +331,36 @@ class TestUnbuildableServers:
         assert transports == []
 
 
+class TestAcquireFailure:
+    """A raise part-way through acquiring must not strand a server."""
+
+    @pytest.mark.asyncio
+    async def test_a_failed_acquire_leaves_no_use_counts_behind(
+        self, transports: list[_StubTransport], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cache = MCPToolsetCache()
+        boom = RuntimeError("builder blew up")
+
+        def explode_on_beta(name: str, config: dict[str, Any]) -> BuiltMCPServer | None:
+            if name == "beta":
+                raise boom
+            return _stub_builder(transports)(name, config)
+
+        monkeypatch.setattr(
+            "griptape_nodes.agents.pydantic_ai.mcp_toolset_cache.mcp_server_from_config",
+            explode_on_beta,
+        )
+
+        with pytest.raises(RuntimeError):
+            await cache.acquire([_config("alpha"), _config("beta")])
+
+        # Alpha was built before beta raised, and there is no lease to release it.
+        # If it kept a use count it would be permanently unreapable, so the only
+        # safe state is zero - which `aclose` can then tear down.
+        await cache.aclose()
+        assert transports[0].disconnected
+
+
 class TestAclose:
     """Shutdown reaps every server the cache is holding."""
 

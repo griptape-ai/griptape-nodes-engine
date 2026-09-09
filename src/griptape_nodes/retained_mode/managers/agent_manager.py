@@ -533,7 +533,6 @@ class AgentManager(EngineScoped):
             model_name=request.model_name,
         )
         composed = await _compose_prompt(request.input, request.url_artifacts)
-        mcp = await self._acquire_mcp_toolsets(request.additional_mcp_servers)
 
         event_manager = self.engine.event_manager
 
@@ -550,6 +549,10 @@ class AgentManager(EngineScoped):
         cancel_event = asyncio.Event()
         self._active_runs[thread_id] = _ActiveRun(cancel_event=cancel_event, loop=asyncio.get_running_loop())
         try:
+            # Acquired here, with nothing between it and the `async with` that
+            # releases it: the lease holds a use count on every MCP server it
+            # names, and a server left with a stray count can never be shut down.
+            mcp = await self._acquire_mcp_toolsets(request.additional_mcp_servers)
             async with mcp.lease:
                 result = await runner.run(
                     composed.live,
