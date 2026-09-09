@@ -687,8 +687,7 @@ class AgentManager(EngineScoped):
                 logger.error(details)
                 return ArchiveThreadResultFailure(result_details=details)
 
-            thread = self._thread_storage.get_thread_metadata(request.thread_id)
-            if thread.archived:
+            if self._thread_storage.is_archived(request.thread_id):
                 details = f"Thread {request.thread_id} is already archived"
                 logger.error(details)
                 return ArchiveThreadResultFailure(result_details=details)
@@ -711,8 +710,7 @@ class AgentManager(EngineScoped):
                 logger.error(details)
                 return UnarchiveThreadResultFailure(result_details=details)
 
-            thread = self._thread_storage.get_thread_metadata(request.thread_id)
-            if not thread.archived:
+            if not self._thread_storage.is_archived(request.thread_id):
                 details = f"Thread {request.thread_id} is not archived"
                 logger.error(details)
                 return UnarchiveThreadResultFailure(result_details=details)
@@ -1133,8 +1131,7 @@ class AgentManager(EngineScoped):
             new_id, _ = self._thread_storage.create_thread()
             return new_id
 
-        thread = self._thread_storage.get_thread_metadata(thread_id)
-        if thread.archived:
+        if self._thread_storage.is_archived(thread_id):
             details = f"Cannot run agent on archived thread {thread_id}. Unarchive it first."
             raise ValueError(details)
         return thread_id

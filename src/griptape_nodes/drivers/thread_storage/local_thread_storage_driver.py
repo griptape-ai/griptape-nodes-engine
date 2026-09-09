@@ -161,6 +161,9 @@ class LocalThreadStorageDriver(BaseThreadStorageDriver):
     def thread_exists(self, thread_id: str) -> bool:
         return self._meta_path(thread_id).exists()
 
+    def is_archived(self, thread_id: str) -> bool:
+        return bool(self._read_meta(thread_id).get("archived", False))
+
     def load_history(self, thread_id: str) -> list[ModelMessage]:
         path = self._history_path(thread_id)
         if not path.exists():

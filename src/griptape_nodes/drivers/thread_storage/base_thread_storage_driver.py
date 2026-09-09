@@ -88,6 +88,15 @@ class BaseThreadStorageDriver(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def is_archived(self, thread_id: str) -> bool:
+        """Return True iff this thread is archived.
+
+        Prefer this over get_thread_metadata when only the archived flag is needed;
+        implementations may read far less data (e.g. meta.json only, skipping runs.json).
+        """
+        raise NotImplementedError
+
+    @abstractmethod
     def load_history(self, thread_id: str) -> list["ModelMessage"]:
         """Load the persisted Pydantic AI message history for a thread.
 
