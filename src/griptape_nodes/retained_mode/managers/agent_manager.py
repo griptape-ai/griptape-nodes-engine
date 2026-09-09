@@ -23,6 +23,7 @@ import asyncio
 import logging
 import mimetypes
 import os
+import re
 import textwrap
 import threading
 from dataclasses import dataclass, replace
@@ -263,10 +264,11 @@ def _friendly_list_models_error(exc: Exception, base_url: str | None) -> str | N
     return None
 
 
-# Substring of Pydantic AI's UnexpectedModelBehavior text for a tool that spent
-# its retry budget. Matched rather than inferred from the exception's cause,
-# which other UnexpectedModelBehavior sites chain too.
-_TOOL_RETRIES_EXHAUSTED_MARKER = "exceeded max retries count of"
+# Pydantic AI's UnexpectedModelBehavior text for a tool that spent its retry
+# budget (`tool_manager.py`), which also carries the tool's name. Matched rather
+# than inferred from the exception's cause, which other UnexpectedModelBehavior
+# sites chain too.
+_TOOL_RETRIES_EXHAUSTED_PATTERN = re.compile(r"Tool '(?P<tool>[^']+)' exceeded max retries count of")
 
 
 def _explain_tool_retry_exhaustion(exc: Exception) -> str | None:
@@ -274,22 +276,26 @@ def _explain_tool_retry_exhaustion(exc: Exception) -> str | None:
 
     Pydantic AI ends the turn with ``UnexpectedModelBehavior`` once a tool has
     spent its retries, and names an internal limit and links the Pydantic AI
-    docs. Neither means anything to the person chatting. The correction the tool
-    handed the model does (``load_capability`` answers an unknown skill with the
-    real ones), so lead with that.
+    docs. Neither means anything to the person chatting; the tool's name does, so
+    lead with that.
+
+    A tool that raised ``ModelRetry`` also handed the model a correction worth
+    passing on. A tool the model called with bad arguments failed validation
+    instead, and that report is Pydantic jargon, so the name is all the user gets.
 
     Returns ``None`` for anything else so the caller keeps its own message.
     """
     if not isinstance(exc, UnexpectedModelBehavior):
         return None
-    if _TOOL_RETRIES_EXHAUSTED_MARKER not in str(exc):
+    match = _TOOL_RETRIES_EXHAUSTED_PATTERN.search(str(exc))
+    if match is None:
         return None
     detail = ""
     if isinstance(exc.__cause__, ModelRetry):
         detail = f" The tool reported: {exc.__cause__.message}"
     return (
-        "Attempted to answer your message. The assistant kept calling one of its tools incorrectly and ran out of "
-        f"attempts.{detail} Send the message again, or reword it."
+        f"Attempted to answer your message. The assistant kept calling its '{match['tool']}' tool incorrectly and "
+        f"ran out of attempts.{detail} Send the message again, or reword it."
     )
 
 

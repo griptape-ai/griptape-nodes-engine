@@ -28,8 +28,6 @@ from typing import TYPE_CHECKING, Any
 from fastmcp.client.transports import SSETransport, StdioTransport, StreamableHttpTransport
 from pydantic_ai.mcp import MCPToolset
 
-from griptape_nodes.agents.pydantic_ai.tool_retries import DEFAULT_TOOL_MAX_RETRIES
-
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
@@ -58,6 +56,10 @@ def mcp_server_from_config(name: str, config: Mapping[str, Any]) -> AbstractTool
     Returns ``None`` and logs a warning when the config is missing required
     fields for its declared transport. The returned toolset is prefixed with
     ``name`` so tools from different servers can't collide.
+
+    No toolset sets ``max_retries``, so every MCP tool inherits the agent's
+    budget: one knob (``PydanticAgentRunner.retries``) covers every tool the chat
+    agent can call.
     """
     transport = config.get("transport", "stdio")
 
@@ -72,7 +74,7 @@ def mcp_server_from_config(name: str, config: Mapping[str, Any]) -> AbstractTool
             env=_stdio_env(config.get("env")),
             cwd=config.get("cwd"),
         )
-        return _compose(name, MCPToolset(client, max_retries=DEFAULT_TOOL_MAX_RETRIES))
+        return _compose(name, MCPToolset(client))
 
     if transport == "sse":
         url = config.get("url")
@@ -80,10 +82,7 @@ def mcp_server_from_config(name: str, config: Mapping[str, Any]) -> AbstractTool
             logger.warning("MCP server %r: sse transport requires `url`; skipping.", name)
             return None
         client = SSETransport(url=url, headers=dict(config.get("headers") or {}))
-        return _compose(
-            name,
-            MCPToolset(client, max_retries=DEFAULT_TOOL_MAX_RETRIES, init_timeout=_connect_timeout(config)),
-        )
+        return _compose(name, MCPToolset(client, init_timeout=_connect_timeout(config)))
 
     if transport == "streamable_http":
         url = config.get("url")
@@ -91,10 +90,7 @@ def mcp_server_from_config(name: str, config: Mapping[str, Any]) -> AbstractTool
             logger.warning("MCP server %r: %s transport requires `url`; skipping.", name, transport)
             return None
         client = StreamableHttpTransport(url=url, headers=dict(config.get("headers") or {}))
-        return _compose(
-            name,
-            MCPToolset(client, max_retries=DEFAULT_TOOL_MAX_RETRIES, init_timeout=_connect_timeout(config)),
-        )
+        return _compose(name, MCPToolset(client, init_timeout=_connect_timeout(config)))
 
     logger.warning("MCP server %r: unsupported transport %r; skipping.", name, transport)
     return None
@@ -105,7 +101,7 @@ def streamable_http_local(url: str, *, name: str | None = None) -> AbstractTools
     server_name = name or "GriptapeNodes"
     return _compose(
         server_name,
-        MCPToolset(StreamableHttpTransport(url=url), max_retries=DEFAULT_TOOL_MAX_RETRIES),
+        MCPToolset(StreamableHttpTransport(url=url)),
         tool_blocklist=DEFAULT_GTN_TOOL_BLOCKLIST,
     )
 

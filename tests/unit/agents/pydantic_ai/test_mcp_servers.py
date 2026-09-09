@@ -114,6 +114,21 @@ def test_default_transport_is_stdio() -> None:
     assert isinstance(_mcp_toolset(composed).client.transport, StdioTransport)
 
 
+def test_toolsets_leave_the_retry_budget_to_the_agent() -> None:
+    """An unset `max_retries` is what makes MCP tools follow `PydanticAgentRunner.retries`.
+
+    Pydantic AI reads a toolset's own budget when it has one and the agent's only
+    otherwise, so a value here would pin MCP tools to it and split the knob in two.
+    """
+    for config in (
+        {"transport": "stdio", "command": "run"},
+        {"transport": "sse", "url": "http://h/sse"},
+        {"transport": "streamable_http", "url": "http://h/mcp"},
+    ):
+        assert _mcp_toolset(mcp_server_from_config("svc", config)).max_retries is None
+    assert _mcp_toolset(streamable_http_local("http://h/mcp")).max_retries is None
+
+
 def test_compose_applies_name_prefix() -> None:
     """`_compose` exposes tools under the server name prefix."""
     composed = _compose("Svc", MCPToolset(StreamableHttpTransport(url="http://h/mcp/"), max_retries=3))
