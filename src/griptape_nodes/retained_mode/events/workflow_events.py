@@ -1467,6 +1467,75 @@ class ConvertNodesToSubflowResultFailure(ResultPayloadFailure):
 
 
 # ---------------------------------------------------------------------------
+# Subflow Node: Convert Selection to Live Subflow
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+@PayloadRegistry.register
+class ConvertNodesToLiveSubflowRequest(RequestPayload):
+    """Convert a set of nodes into a new LiveSubflowNode and immediately publish it.
+
+    Creates a LiveSubflowNode in the parent flow, moves the selected nodes into its inner flow,
+    wires any boundary connections through auto-created StartFlow and EndFlow nodes,
+    promotes those connections to the LiveSubflowNode's surface, then serializes and
+    writes the inner flow to disk as a versioned live subflow library entry.
+
+    Args:
+        node_names: Names of the nodes to move into the new LiveSubflowNode.
+        version: Version string for the live subflow (e.g. "1.0.0").
+        destination_folder: Folder where the versioned .py and library JSON are written.
+        flow_name: Parent flow name (None to infer from the nodes themselves).
+        position: Canvas position for the new LiveSubflowNode as {"x": ..., "y": ...}.
+            If None, the centroid of the selected nodes is used.
+        node_type_name: Display name used as the node type and file stem (defaults to the node's assigned name).
+
+    Results: ConvertNodesToLiveSubflowResultSuccess | ConvertNodesToLiveSubflowResultFailure
+    """
+
+    node_names: list[str]
+    version: str
+    destination_folder: str
+    flow_name: str | None = None
+    position: dict[str, float] | None = None
+    node_type_name: str | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class ConvertNodesToLiveSubflowResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
+    """Nodes successfully converted into a LiveSubflowNode and published.
+
+    Args:
+        subflow_node_name: Name of the newly created LiveSubflowNode.
+        child_flow_name: Name of the inner flow that now contains the moved nodes.
+        promoted_params: Names of the parameters promoted to the LiveSubflowNode's surface.
+        file_path: Absolute path to the written .py file.
+        library_json_path: Absolute path to the library JSON file.
+        live_version: Version string that was published.
+        live_path: Absolute path to the backing .py file (same as file_path).
+    """
+
+    subflow_node_name: str
+    child_flow_name: str
+    promoted_params: list[str]
+    file_path: str
+    library_json_path: str
+    live_version: str
+    live_path: str
+
+
+@dataclass
+@PayloadRegistry.register
+class ConvertNodesToLiveSubflowResultFailure(ResultPayloadFailure):
+    """Nodes could not be converted to a LiveSubflowNode.
+
+    Common causes: empty node list, nodes not found, nodes in different flows,
+    LiveSubflowNode or inner flow creation failed, or publish failed.
+    """
+
+
+# ---------------------------------------------------------------------------
 # Subflow Node: Export as Locked
 # ---------------------------------------------------------------------------
 

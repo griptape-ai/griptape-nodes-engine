@@ -80,7 +80,13 @@ from griptape_nodes.retained_mode.events.app_events import (
 )
 
 # Runtime imports for ResultDetails since it's used at runtime
-from griptape_nodes.retained_mode.events.base_events import AppEvent, GriptapeNodeEvent, ResultDetail, ResultDetails
+from griptape_nodes.retained_mode.events.base_events import (
+    AppEvent,
+    EventResultSuccess,
+    GriptapeNodeEvent,
+    ResultDetail,
+    ResultDetails,
+)
 from griptape_nodes.retained_mode.events.connection_events import (
     CreateConnectionRequest,
     DeleteConnectionRequest,
@@ -90,6 +96,8 @@ from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowResultSuccess,
     GetTopLevelFlowRequest,
     GetTopLevelFlowResultSuccess,
+    ListNodesInFlowRequest,
+    ListNodesInFlowResultSuccess,
     SerializedConnectionKey,
     SerializedFlowCommands,
     SerializeFlowToCommandsRequest,
@@ -108,6 +116,8 @@ from griptape_nodes.retained_mode.events.library_events import (
 from griptape_nodes.retained_mode.events.node_events import (
     CreateNodeRequest,
     CreateNodeResultSuccess,
+    DeleteNodeRequest,
+    DeleteNodeResultSuccess,
     GetFlowForNodeRequest,
     GetFlowForNodeResultSuccess,
     MoveNodeToNewFlowRequest,
@@ -141,6 +151,9 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     CompareWorkflowsRequest,
     CompareWorkflowsResultFailure,
     CompareWorkflowsResultSuccess,
+    ConvertNodesToLiveSubflowRequest,
+    ConvertNodesToLiveSubflowResultFailure,
+    ConvertNodesToLiveSubflowResultSuccess,
     ConvertNodesToSubflowRequest,
     ConvertNodesToSubflowResultFailure,
     ConvertNodesToSubflowResultSuccess,
@@ -328,6 +341,14 @@ class WorkflowRegistrationResult(NamedTuple):
 
     succeeded: list[str]
     failed: list[str]
+
+
+class _ConvertToSubflowResult(NamedTuple):
+    subflow_node_name: str
+    child_flow_name: str
+    promoted_params: list[str]
+    parent_flow_name: str
+    moved_node_names: list[str]
 
 
 @dataclass
@@ -640,6 +661,10 @@ class WorkflowManager(EngineScoped):
         event_manager.assign_manager_to_request_type(
             ConvertNodesToSubflowRequest,
             self.on_convert_nodes_to_subflow_request,
+        )
+        event_manager.assign_manager_to_request_type(
+            ConvertNodesToLiveSubflowRequest,
+            self.on_convert_nodes_to_live_subflow_request,
         )
         event_manager.assign_manager_to_request_type(
             ExportFlowAsLibraryNodeRequest,
@@ -7178,24 +7203,185 @@ class WorkflowManager(EngineScoped):
             result_details=ResultDetails(message=details, level=logging.INFO),
         )
 
-    def on_convert_nodes_to_subflow_request(self, request: ConvertNodesToSubflowRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
-        """Convert a set of nodes into a new SubflowNode atomically.
+    async def on_convert_nodes_to_subflow_request(self, request: ConvertNodesToSubflowRequest) -> ResultPayload:
+        result = self._do_convert_to_subflow(
+            node_type="SubflowNode",
+            node_names=request.node_names,
+            flow_name=request.flow_name,
+            position=request.position,
+        )
+        if isinstance(result, str):
+            return ConvertNodesToSubflowResultFailure(result_details=result)
 
-        Creates the SubflowNode, opens its inner canvas, creates StartFlow and EndFlow
-        inside, moves the selected nodes in, wires boundary connections through the
-        Start/End nodes, and syncs the SubflowNode's surface parameters.
-        """
-        if not request.node_names:
-            return ConvertNodesToSubflowResultFailure(
-                result_details="Attempted to convert nodes to subflow. Failed because no node names were provided."
+        await self._push_node_events_to_frontend(
+            created_node_name=result.subflow_node_name,
+            created_node_type="SubflowNode",
+            parent_flow_name=result.parent_flow_name,
+            moved_node_names=result.moved_node_names,
+        )
+
+        details = (
+            f"Successfully converted {len(result.moved_node_names)} node(s) into SubflowNode '{result.subflow_node_name}' "
+            f"with inner flow '{result.child_flow_name}'. Promoted {len(result.promoted_params)} boundary parameter(s)."
+        )
+        return ConvertNodesToSubflowResultSuccess(
+            result_details=ResultDetails(message=details, level=logging.INFO),
+            subflow_node_name=result.subflow_node_name,
+            child_flow_name=result.child_flow_name,
+            promoted_params=result.promoted_params,
+        )
+
+    async def on_convert_nodes_to_live_subflow_request(  # noqa: PLR0911
+        self, request: ConvertNodesToLiveSubflowRequest
+    ) -> ResultPayload:
+        result = self._do_convert_to_subflow(
+            node_type="LiveSubflowNode",
+            node_names=request.node_names,
+            flow_name=request.flow_name,
+            position=request.position,
+        )
+        if isinstance(result, str):
+            return ConvertNodesToLiveSubflowResultFailure(result_details=result)
+
+        node = self.engine.object_manager.attempt_get_object_by_name_as_type(result.subflow_node_name, LiveSubflowNode)
+        if node is None:
+            return ConvertNodesToLiveSubflowResultFailure(
+                result_details=f"Attempted to convert nodes to live subflow. Failed because the created LiveSubflowNode '{result.subflow_node_name}' could not be found."
             )
+
+        child_flow_name = result.child_flow_name
+
+        try:
+            shape_dict = self.extract_workflow_shape(workflow_name=result.subflow_node_name, flow_name=child_flow_name)
+        except ValueError as err:
+            return ConvertNodesToLiveSubflowResultFailure(
+                result_details=(
+                    f"Attempted to convert nodes to live subflow '{result.subflow_node_name}'. "
+                    f"Failed because the inner canvas has no Start Flow or End Flow nodes: {err}."
+                )
+            )
+
+        workflow_shape = WorkflowShape(inputs=shape_dict["input"], outputs=shape_dict["output"])
+        serialized_result = await self.engine.ahandle_request(
+            SerializeFlowToCommandsRequest(flow_name=child_flow_name, include_create_flow_command=True)
+        )
+        if not isinstance(serialized_result, SerializeFlowToCommandsResultSuccess):
+            return ConvertNodesToLiveSubflowResultFailure(
+                result_details=f"Attempted to convert nodes to live subflow '{result.subflow_node_name}'. Failed because the inner canvas could not be serialized."
+            )
+
+        serialized_commands = serialized_result.serialized_flow_commands
+        if isinstance(serialized_commands.flow_initialization_command, CreateFlowRequest):
+            serialized_commands.flow_initialization_command = CreateFlowRequest(
+                parent_flow_name=None,
+                flow_name=serialized_commands.flow_initialization_command.flow_name,
+                set_as_new_context=serialized_commands.flow_initialization_command.set_as_new_context,
+                metadata=serialized_commands.flow_initialization_command.metadata,
+            )
+
+        node_type_name = request.node_type_name or result.subflow_node_name
+        safe_version = request.version.replace(".", "_")
+        versioned_name = f"{node_type_name}_v{safe_version}"
+        destination_folder = Path(request.destination_folder)
+        py_file_path = destination_folder / f"{versioned_name}.py"
+        library_json_path = destination_folder / "griptape_nodes_library.json"
+
+        try:
+            workflow_metadata = self._generate_workflow_metadata_from_commands(
+                serialized_flow_commands=serialized_commands,
+                file_name=versioned_name,
+                creation_date=datetime.now(tz=UTC),
+                display_name=versioned_name,
+                workflow_shape=workflow_shape,
+            )
+        except Exception as err:
+            return ConvertNodesToLiveSubflowResultFailure(
+                result_details=f"Attempted to convert nodes to live subflow '{result.subflow_node_name}'. Failed during metadata generation: {err}"
+            )
+
+        workflow_metadata.is_live = True
+        workflow_metadata.is_locked = True
+        workflow_metadata.live_version = request.version
+        workflow_metadata.live_path = str(py_file_path)
+
+        try:
+            final_code_output = self._generate_workflow_file_content(
+                serialized_flow_commands=serialized_commands,
+                workflow_metadata=workflow_metadata,
+            )
+        except Exception as err:
+            return ConvertNodesToLiveSubflowResultFailure(
+                result_details=f"Attempted to convert nodes to live subflow '{result.subflow_node_name}'. Failed during file content generation: {err}"
+            )
+
+        self._write_live_subflow_package(
+            destination_folder=destination_folder,
+            py_file_path=py_file_path,
+            final_code_output=final_code_output,
+            library_json_path=library_json_path,
+            node_type_name=node_type_name,
+            versioned_name=versioned_name,
+            version=request.version,
+        )
+
+        node.metadata[LIVE_VERSION_KEY] = request.version
+        node.metadata[LIVE_PATH_KEY] = str(py_file_path)
+        node.metadata.pop(IS_LOCALLY_OVERRIDDEN_KEY, None)
+
+        await self.engine.ahandle_request(RegisterLibraryFromFileRequest(file_path=str(library_json_path)))
+        self._hot_register_workflow_node(
+            library_name="Live Subflows",
+            node_type_name=versioned_name,
+            py_file_path=py_file_path,
+            category="live_subflows",
+            description=f"{node_type_name} v{request.version}",
+            display_name=f"{node_type_name} v{request.version}",
+        )
+        await self._push_library_info_to_frontend("Live Subflows")
+
+        await self._push_node_events_to_frontend(
+            created_node_name=result.subflow_node_name,
+            created_node_type="LiveSubflowNode",
+            parent_flow_name=result.parent_flow_name,
+            moved_node_names=result.moved_node_names,
+        )
+
+        details = (
+            f"Converted {len(result.moved_node_names)} node(s) into LiveSubflowNode '{result.subflow_node_name}' "
+            f"and published as '{versioned_name}' v{request.version} to '{py_file_path}'."
+        )
+        return ConvertNodesToLiveSubflowResultSuccess(
+            result_details=ResultDetails(message=details, level=logging.INFO),
+            subflow_node_name=result.subflow_node_name,
+            child_flow_name=result.child_flow_name,
+            promoted_params=result.promoted_params,
+            file_path=str(py_file_path),
+            library_json_path=str(library_json_path),
+            live_version=request.version,
+            live_path=str(py_file_path),
+        )
+
+    def _do_convert_to_subflow(  # noqa: C901, PLR0911, PLR0912, PLR0915
+        self,
+        node_type: str,
+        node_names: list[str],
+        flow_name: str | None,
+        position: dict[str, float] | None,
+    ) -> _ConvertToSubflowResult | str:
+        """Core logic for converting a node selection into a subflow node.
+
+        Returns a _ConvertToSubflowResult on success or a failure message string on failure.
+        The node_type parameter controls whether a SubflowNode or LiveSubflowNode is created.
+        """
+        if not node_names:
+            return "Attempted to convert nodes to subflow. Failed because no node names were provided."
 
         obj_mgr = self.engine.object_manager
 
         # 1. Validate all nodes exist.
         errors = []
         nodes: list[BaseNode] = []
-        for node_name in request.node_names:
+        for node_name in node_names:
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 errors.append(f"Node '{node_name}' was not found.")
@@ -7203,33 +7389,24 @@ class WorkflowManager(EngineScoped):
                 nodes.append(node)
 
         if errors:
-            details = f"Attempted to convert nodes to subflow. Failed: {' '.join(errors)}"
-            return ConvertNodesToSubflowResultFailure(result_details=details)
+            return f"Attempted to convert nodes to subflow. Failed: {' '.join(errors)}"
 
         # 2. Verify all nodes are in the same flow.
         parent_flow_name: str | None = None
         for node in nodes:
             flow_result = self.engine.handle_request(GetFlowForNodeRequest(node_name=node.name))
             if not isinstance(flow_result, GetFlowForNodeResultSuccess):
-                return ConvertNodesToSubflowResultFailure(
-                    result_details=f"Attempted to convert nodes to subflow. Failed because the flow for node '{node.name}' could not be found."
-                )
+                return f"Attempted to convert nodes to subflow. Failed because the flow for node '{node.name}' could not be found."
             if parent_flow_name is None:
                 parent_flow_name = flow_result.flow_name
             elif flow_result.flow_name != parent_flow_name:
-                return ConvertNodesToSubflowResultFailure(
-                    result_details=f"Attempted to convert nodes to subflow. Failed because nodes span multiple flows ('{parent_flow_name}' and '{flow_result.flow_name}')."
-                )
+                return f"Attempted to convert nodes to subflow. Failed because nodes span multiple flows ('{parent_flow_name}' and '{flow_result.flow_name}')."
 
         if parent_flow_name is None:
-            return ConvertNodesToSubflowResultFailure(
-                result_details="Attempted to convert nodes to subflow. Failed because no parent flow could be determined."
-            )
+            return "Attempted to convert nodes to subflow. Failed because no parent flow could be determined."
 
-        if request.flow_name is not None and request.flow_name != parent_flow_name:
-            return ConvertNodesToSubflowResultFailure(
-                result_details=f"Attempted to convert nodes to subflow. Failed because the specified flow '{request.flow_name}' does not match the nodes' actual flow '{parent_flow_name}'."
-            )
+        if flow_name is not None and flow_name != parent_flow_name:
+            return f"Attempted to convert nodes to subflow. Failed because the specified flow '{flow_name}' does not match the nodes' actual flow '{parent_flow_name}'."
 
         # 3. Collect boundary connections before moving nodes.
         #    Connections are global so they survive the move; we snapshot them now to know
@@ -7252,10 +7429,33 @@ class WorkflowManager(EngineScoped):
                 if conn.target_node.name not in node_names_set
             )
 
-        # 4. Calculate position for the new SubflowNode.
-        if request.position is not None:
-            pos_x = float(request.position.get("x", 0.0))
-            pos_y = float(request.position.get("y", 0.0))
+        # 3b. Delete all boundary connections while selected nodes are still in the parent flow.
+        #     DeleteConnectionRequest resolves nodes in their current flow; once a node is moved
+        #     to the inner flow it is no longer reachable from the parent scope. Do all deletes
+        #     now so step 8 (move) and step 9 (bridge) operate on a clean slate.
+        for ext_src_node, ext_src_param, tgt_node, tgt_param in incoming_boundary:
+            self.engine.handle_request(
+                DeleteConnectionRequest(
+                    source_node_name=ext_src_node,
+                    source_parameter_name=ext_src_param,
+                    target_node_name=tgt_node,
+                    target_parameter_name=tgt_param,
+                )
+            )
+        for src_node, src_param, ext_tgt_node, ext_tgt_param in outgoing_boundary:
+            self.engine.handle_request(
+                DeleteConnectionRequest(
+                    source_node_name=src_node,
+                    source_parameter_name=src_param,
+                    target_node_name=ext_tgt_node,
+                    target_parameter_name=ext_tgt_param,
+                )
+            )
+
+        # 4. Calculate position for the new node.
+        if position is not None:
+            pos_x = float(position.get("x", 0.0))
+            pos_y = float(position.get("y", 0.0))
         else:
             pos_xs: list[float] = []
             pos_ys: list[float] = []
@@ -7270,59 +7470,75 @@ class WorkflowManager(EngineScoped):
             pos_x = sum(pos_xs) / len(pos_xs) if pos_xs else 0.0
             pos_y = sum(pos_ys) / len(pos_ys) if pos_ys else 0.0
 
-        # 5. Create the SubflowNode in the parent flow.
+        # 5. Create the node in the parent flow.
         create_node_result = self.engine.handle_request(
             CreateNodeRequest(
-                node_type="SubflowNode",
+                node_type=node_type,
                 override_parent_flow_name=parent_flow_name,
                 metadata={"position": {"x": pos_x, "y": pos_y}},
                 create_error_proxy_on_failure=False,
             )
         )
         if not isinstance(create_node_result, CreateNodeResultSuccess):
-            return ConvertNodesToSubflowResultFailure(
-                result_details=f"Attempted to convert nodes to subflow. Failed to create SubflowNode: {create_node_result.result_details}"
-            )
+            return f"Attempted to convert nodes to subflow. Failed to create {node_type}: {create_node_result.result_details}"
         subflow_node_name = create_node_result.node_name
 
-        # 6. Open the inner canvas (creates the child flow and links it to the SubflowNode).
+        # 6. Open the inner canvas (creates the child flow and links it to the node).
         open_result = self.engine.handle_request(OpenNodeInnerCanvasRequest(node_name=subflow_node_name))
         if not isinstance(open_result, OpenNodeInnerCanvasResultSuccess):
-            return ConvertNodesToSubflowResultFailure(
-                result_details=f"Attempted to convert nodes to subflow. Failed to open inner canvas for '{subflow_node_name}': {open_result.result_details}"
-            )
+            return f"Attempted to convert nodes to subflow. Failed to open inner canvas for '{subflow_node_name}': {open_result.result_details}"
         child_flow_name = open_result.child_flow_name
 
         # 7. Create StartFlow and EndFlow inside the child flow.
-        create_start_result = self.engine.handle_request(
-            CreateNodeRequest(
-                node_type="StartFlow",
-                override_parent_flow_name=child_flow_name,
-                create_error_proxy_on_failure=False,
-            )
+        #    If the inner flow was adopted from a previous conversion (e.g. after a failed
+        #    prior attempt), Start/End Flow nodes may already exist — reuse them instead of
+        #    creating duplicates.
+        existing_start_result = self.engine.handle_request(
+            ListNodesInFlowRequest(flow_name=child_flow_name, node_types=["StartFlow"])
         )
-        if not isinstance(create_start_result, CreateNodeResultSuccess):
-            return ConvertNodesToSubflowResultFailure(
-                result_details=f"Attempted to convert nodes to subflow. Failed to create StartFlow: {create_start_result.result_details}"
+        if isinstance(existing_start_result, ListNodesInFlowResultSuccess) and existing_start_result.node_names:
+            start_flow_name = existing_start_result.node_names[0]
+        else:
+            create_start_result = self.engine.handle_request(
+                CreateNodeRequest(
+                    node_type="StartFlow",
+                    override_parent_flow_name=child_flow_name,
+                    create_error_proxy_on_failure=False,
+                )
             )
-        start_flow_name = create_start_result.node_name
+            if not isinstance(create_start_result, CreateNodeResultSuccess):
+                return f"Attempted to convert nodes to subflow. Failed to create StartFlow: {create_start_result.result_details}"
+            start_flow_name = create_start_result.node_name
 
-        create_end_result = self.engine.handle_request(
-            CreateNodeRequest(
-                node_type="EndFlow",
-                override_parent_flow_name=child_flow_name,
-                create_error_proxy_on_failure=False,
-            )
+        existing_end_result = self.engine.handle_request(
+            ListNodesInFlowRequest(flow_name=child_flow_name, node_types=["EndFlow"])
         )
-        if not isinstance(create_end_result, CreateNodeResultSuccess):
-            return ConvertNodesToSubflowResultFailure(
-                result_details=f"Attempted to convert nodes to subflow. Failed to create EndFlow: {create_end_result.result_details}"
+        if isinstance(existing_end_result, ListNodesInFlowResultSuccess) and existing_end_result.node_names:
+            end_flow_name = existing_end_result.node_names[0]
+        else:
+            create_end_result = self.engine.handle_request(
+                CreateNodeRequest(
+                    node_type="EndFlow",
+                    override_parent_flow_name=child_flow_name,
+                    create_error_proxy_on_failure=False,
+                )
             )
-        end_flow_name = create_end_result.node_name
+            if not isinstance(create_end_result, CreateNodeResultSuccess):
+                return f"Attempted to convert nodes to subflow. Failed to create EndFlow: {create_end_result.result_details}"
+            end_flow_name = create_end_result.node_name
 
         # 8. Move each selected node into the child flow.
         #    Connections are global and survive the move unchanged.
+        #    Skip nodes already in child_flow_name — the inner flow may have been adopted from
+        #    a prior conversion attempt that moved some nodes before failing.
+        moved_node_names = [node.name for node in nodes]
+        inner_list_result = self.engine.handle_request(ListNodesInFlowRequest(flow_name=child_flow_name))
+        nodes_already_in_inner = (
+            set(inner_list_result.node_names) if isinstance(inner_list_result, ListNodesInFlowResultSuccess) else set()
+        )
         for node in nodes:
+            if node.name in nodes_already_in_inner:
+                continue
             move_result = self.engine.handle_request(
                 MoveNodeToNewFlowRequest(
                     node_name=node.name,
@@ -7331,9 +7547,7 @@ class WorkflowManager(EngineScoped):
                 )
             )
             if not isinstance(move_result, MoveNodeToNewFlowResultSuccess):
-                return ConvertNodesToSubflowResultFailure(
-                    result_details=f"Attempted to convert nodes to subflow. Failed to move node '{node.name}' into the inner flow: {move_result.result_details}"
-                )
+                return f"Attempted to convert nodes to subflow. Failed to move node '{node.name}' into the inner flow: {move_result.result_details}"
 
         # 9. Wire incoming boundary connections (external → selected) through StartFlow.
         promoted_params: list[str] = []
@@ -7381,7 +7595,6 @@ class WorkflowManager(EngineScoped):
                 )
                 continue
 
-            # Wire StartFlow bridge → internal target parameter.
             self.engine.handle_request(
                 CreateConnectionRequest(
                     source_node_name=start_flow_name,
@@ -7391,21 +7604,10 @@ class WorkflowManager(EngineScoped):
                 )
             )
 
-            # Remove the now-invalid cross-flow connection (external → internal).
-            self.engine.handle_request(
-                DeleteConnectionRequest(
-                    source_node_name=ext_src_node,
-                    source_parameter_name=ext_src_param,
-                    target_node_name=tgt_node,
-                    target_parameter_name=tgt_param,
-                )
-            )
-
             promoted_params.append(bridge_name)
 
         # Wire outgoing boundary connections (selected → external) through EndFlow.
         used_end_names: set[str] = set()
-
         outgoing_bridge_map: list[tuple[str, str, str, str, str]] = []
 
         for src_node, src_param, ext_tgt_node, ext_tgt_param in outgoing_boundary:
@@ -7449,7 +7651,6 @@ class WorkflowManager(EngineScoped):
                 )
                 continue
 
-            # Wire internal source parameter → EndFlow bridge.
             self.engine.handle_request(
                 CreateConnectionRequest(
                     source_node_name=src_node,
@@ -7459,20 +7660,10 @@ class WorkflowManager(EngineScoped):
                 )
             )
 
-            # Remove the now-invalid cross-flow connection (internal → external).
-            self.engine.handle_request(
-                DeleteConnectionRequest(
-                    source_node_name=src_node,
-                    source_parameter_name=src_param,
-                    target_node_name=ext_tgt_node,
-                    target_parameter_name=ext_tgt_param,
-                )
-            )
-
             if bridge_name not in promoted_params:
                 promoted_params.append(bridge_name)
 
-        # 10. Sync the SubflowNode surface from the StartFlow/EndFlow params.
+        # 10. Sync the node surface from the StartFlow/EndFlow params.
         sync_result = self.engine.handle_request(SyncInnerFlowSurfaceRequest(node_name=subflow_node_name))
         if not isinstance(sync_result, SyncInnerFlowSurfaceResultSuccess):
             logger.warning(
@@ -7481,7 +7672,7 @@ class WorkflowManager(EngineScoped):
                 sync_result.result_details,
             )
 
-        # 11. Re-wire external connections to the SubflowNode's new surface parameters.
+        # 11. Re-wire external connections to the new node's surface parameters.
         for ext_src_node, ext_src_param, _tgt_node, _tgt_param, bridge_name in incoming_bridge_map:
             if bridge_name not in promoted_params:
                 continue
@@ -7506,15 +7697,12 @@ class WorkflowManager(EngineScoped):
                 )
             )
 
-        details = (
-            f"Successfully converted {len(nodes)} node(s) into SubflowNode '{subflow_node_name}' "
-            f"with inner flow '{child_flow_name}'. Promoted {len(promoted_params)} boundary parameter(s)."
-        )
-        return ConvertNodesToSubflowResultSuccess(
-            result_details=ResultDetails(message=details, level=logging.INFO),
+        return _ConvertToSubflowResult(
             subflow_node_name=subflow_node_name,
             child_flow_name=child_flow_name,
             promoted_params=promoted_params,
+            parent_flow_name=parent_flow_name,
+            moved_node_names=moved_node_names,
         )
 
     async def on_export_flow_as_library_node_request(self, request: ExportFlowAsLibraryNodeRequest) -> ResultPayload:
@@ -8202,6 +8390,41 @@ class WorkflowManager(EngineScoped):
             display_name=display_name,
         )
         library.register_new_node_type(node_class, metadata=node_metadata)
+
+    async def _push_node_events_to_frontend(
+        self,
+        created_node_name: str,
+        created_node_type: str,
+        parent_flow_name: str,
+        moved_node_names: list[str],
+    ) -> None:
+        """Push delete events for moved nodes and a create event for the new subflow node."""
+        session_id = self.engine.session_manager.active_session_id
+        if session_id is None:
+            return
+        response_topic = f"sessions/{session_id}/response"
+
+        for node_name in moved_node_names:
+            delete_event = EventResultSuccess(
+                request=DeleteNodeRequest(node_name=node_name),
+                request_id=None,
+                result=DeleteNodeResultSuccess(result_details=""),
+                response_topic=response_topic,
+            )
+            await self.engine._event_manager.aput_event(GriptapeNodeEvent(wrapped_event=delete_event))
+
+        create_event = EventResultSuccess(
+            request=CreateNodeRequest(node_type=created_node_type),
+            request_id=None,
+            result=CreateNodeResultSuccess(
+                result_details="",
+                node_name=created_node_name,
+                node_type=created_node_type,
+                parent_flow_name=parent_flow_name,
+            ),
+            response_topic=response_topic,
+        )
+        await self.engine._event_manager.aput_event(GriptapeNodeEvent(wrapped_event=create_event))
 
     async def _push_library_info_to_frontend(self, library_name: str) -> None:
         """Push updated library info to the frontend so the sidebar refreshes immediately."""
