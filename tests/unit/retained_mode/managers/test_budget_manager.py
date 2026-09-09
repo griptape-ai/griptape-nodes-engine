@@ -591,16 +591,47 @@ class TestSizeCap:
             _entry("leaf", "S" * 4200),
             _entry("root", "Acme Studios"),
         ]
+        mock_engine.context_manager.has_current_workflow.return_value = True
+        mock_engine.context_manager.get_current_workflow_name.return_value = "shots/sh020/lighting"
         manager = BudgetManager(MagicMock(), engine=mock_engine)
 
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
-            result = _succeed(manager)
+            result = _succeed(manager, node_type="GriptapeProxyImage")
 
-        assert _tags(result)["project"] == ["S" * 256, "Acme Studios"]
+        tags = _tags(result)
+        assert tags["project"] == ["S" * 256, "Acme Studios"]
         assert result.project_chain == ["S" * 256, "Acme Studios"]
         # Names were cut, not ancestors dropped. The flag says the latter.
         assert result.chain_truncated is False
+        # The rung that cuts keeps the labels. Cutting this name frees thousands of bytes and
+        # the labels are worth tens, so shedding them alongside would cost a dashboard row for
+        # an overage the cut already covered.
+        assert tags["workflow"] == "shots/sh020/lighting"
+        assert tags["node_type"] == "GriptapeProxyImage"
         assert any("cut" in record.getMessage() for record in caplog.records)
+
+    def test_labels_are_shed_alongside_a_cut_only_when_cutting_alone_is_not_enough(self) -> None:
+        """The fourth rung exists, and nothing reaches it that the third could have served.
+
+        A long project name and an oversized workflow key together stay over the cap even with
+        every name cut, so this is the one shape that legitimately loses both.
+        """
+        mock_engine = _mock_engine()
+        mock_engine.project_manager.get_project_chain.return_value = [
+            _entry("leaf", "S" * 4200),
+            _entry("root", "Acme Studios"),
+        ]
+        mock_engine.context_manager.has_current_workflow.return_value = True
+        mock_engine.context_manager.get_current_workflow_name.return_value = "w" * 4000
+        manager = BudgetManager(MagicMock(), engine=mock_engine)
+
+        result = _succeed(manager, node_type="GriptapeProxyImage")
+
+        tags = _tags(result)
+        assert tags["project"] == ["S" * 256, "Acme Studios"]
+        assert "workflow" not in tags
+        assert "node_type" not in tags
+        assert result.chain_truncated is False
 
     def test_a_chain_too_long_even_cut_is_still_shed_whole(self) -> None:
         """The new rung is a rung, not a floor: it does not rescue every oversized chain.

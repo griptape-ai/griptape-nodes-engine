@@ -66,8 +66,9 @@ _UNSTORABLE_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 # The parser's MAX_VALUE_LENGTH, and a cap on *characters*: it compares `len(value)` and slices
 # `value[:MAX_VALUE_LENGTH]` on a `str`, never on encoded bytes. Used to judge project names
-# (`_is_transmissible`), and to cut them only on the last rung before the chain is shed
-# (`_encode_attribution_header`) -- never on the ordinary path, which sends them whole.
+# (`_is_transmissible`), and to cut them only on the rungs between shedding the labels and
+# shedding the chain (`_encode_attribution_header`) -- never on the ordinary path, which sends
+# them whole.
 _MAX_VALUE_CHARS = 256
 
 
@@ -255,20 +256,26 @@ def _encode_attribution_header(facts: _AttributionFacts) -> _AttributionEncoding
     """Encode the attribution header, shedding dimensions in stages until it fits.
 
     The chain is always truncated to `_MAX_PROJECT_CHAIN_ENTRIES` from the leaf -- a standing
-    rule, not a size response. If the result does not fit, dimensions are shed in order of increasing
-    value: the workflow and node type first, and only then the chain's ancestors.
+    rule, not a size response. If the result does not fit, five rungs are tried in order of what
+    each gives up and the first that fits is sent: nothing, the labels, cut project names, both,
+    the chain.
+
+    Ordered by cost, not by being successively smaller -- rung three puts back the labels rung two
+    shed. Each rung is its own set of reductions rather than a further trim of the one above, so
+    none gives up more than its own overage needs. Cutting one long name frees thousands of bytes
+    where the labels are worth tens, and bundling the two would cost a dashboard row for nothing.
 
     The chain goes last because it is the only dimension the Cloud matches budgets against.
     Shedding it first would trade the billable dimension for audit-only labels, even when an
-    oversized `workflow` was what pushed the payload over.
+    oversized `workflow` was what pushed the payload over. The labels go before any cutting
+    because sending a name whole is what buys a truncation signal on the far end, and that signal
+    is what keeps two siblings sharing a 256-character prefix off one budget -- worth more than an
+    audit-only dimension.
 
-    One rung rewrites rather than sheds, and sits just above that: project names cut to the form
-    the Cloud stores. Sending them whole is the rule and `_project_name_for_the_wire` says why,
-    but what that rule buys is a truncation signal on the far end, and a payload over the cap
-    never gets there to carry one. Shedding the chain instead lands the spend in the default
-    bucket with `reasons` empty -- indistinguishable from an engine that never attributed
-    anything. Cutting keeps the match. It gives up the signal only where the signal was already
-    lost.
+    Cutting is worth reaching at all because a payload over the cap never arrives to carry that
+    signal. Shedding the chain instead lands the spend in the default bucket with `reasons` empty:
+    no metric fires, and it reads as an engine that never attributed anything. Cutting keeps the
+    match, and gives up the signal only where the signal was already gone.
 
     When the chain does go, all of it goes. Budget paths are root-anchored, so keeping the leaf buys
     no narrower match; it presents a nested project as a root, which matches nothing at best
@@ -281,9 +288,8 @@ def _encode_attribution_header(facts: _AttributionFacts) -> _AttributionEncoding
     chain_truncated = len(facts.project_chain) > _MAX_PROJECT_CHAIN_ENTRIES
     full_facts = facts._replace(project_chain=list(facts.project_chain[:_MAX_PROJECT_CHAIN_ENTRIES]))
     without_labels = full_facts._replace(workflow_name=None, node_type=None)
-    cut_names = without_labels._replace(
-        project_chain=[_as_the_cloud_keeps_it(name) for name in without_labels.project_chain]
-    )
+    cut_names = full_facts._replace(project_chain=[_as_the_cloud_keeps_it(name) for name in full_facts.project_chain])
+    cut_names_without_labels = cut_names._replace(workflow_name=None, node_type=None)
     no_chain = without_labels._replace(project_chain=[])
 
     stages = (
@@ -295,6 +301,13 @@ def _encode_attribution_header(facts: _AttributionFacts) -> _AttributionEncoding
         _ReductionStage(
             facts=cut_names,
             reduction_note="long project names will be attributed cut to the form the Cloud stores",
+        ),
+        _ReductionStage(
+            facts=cut_names_without_labels,
+            reduction_note=(
+                "long project names will be attributed cut to the form the Cloud stores, and the "
+                "workflow and node type not at all"
+            ),
         ),
         _ReductionStage(
             facts=no_chain,
