@@ -134,12 +134,16 @@ Behavior:
 - **No nesting.** `EventRequestBatch` is intentionally absent from
     `SUPPORTED_REQUEST_EVENTS` and the inner `request_type` enum, so a batch cannot
     contain another batch.
-- **Default timeout scales with size.** `timeout_ms` defaults to
-    `30000 × len(requests)` clamped at `300000` ms (5 min). Pass an explicit
-    override when the last slot is `StartFlowRequest(wait_for_completion=True)` or
-    any other long-running call; otherwise the synchronous run can eat the budget
-    meant for the rest of the batch. `bool` is rejected explicitly so `True`
-    cannot silently become 1ms.
+- **Default timeout scales with size.** `timeout_ms` defaults to the sum of what each
+    inner request gets on its own — `30000` ms for most, `300000` ms for
+    `RunWorkflowFromRegistryRequest`, which replays a whole saved file — clamped at
+    `300000` ms (5 min). Pass an explicit override when the last slot is
+    `StartFlowRequest(wait_for_completion=True)` or any other long-running call;
+    otherwise the synchronous run can eat the budget meant for the rest of the batch.
+    `bool` is rejected explicitly so `True` cannot silently become 1ms.
+- **A timeout does not cancel anything.** The engine runs each request to completion on
+    its own loop, so a timeout only ends your wait. Read the state back rather than
+    resending — a resent batch runs its requests a second time.
 
 Return shape: a JSON array of trimmed slot responses in submission order. Each slot
 looks identical to the response that single-tool dispatch would have returned for
@@ -380,6 +384,12 @@ editor is attached there always is one, because a blank canvas is itself an
     wipes the engine before opening — throwing away unsaved changes in the workflow the
     artist may have open in front of them, with no undo. Save first
     (`SaveWorkflowRequest`), or ask, before opening something on a live engine.
+
+    A big workflow takes a while to open, since it resolves node libraries and replays the
+    whole file, so this tool gets a 5-minute budget instead of the usual 30 seconds. If it
+    does time out, the open keeps going — wait and read the graph back
+    (`ListNodesInFlowRequest`) rather than sending the request again, which would replay the
+    file on top of the first attempt.
 
 - **To close what's open without opening anything**, send
     `ClearAllObjectStateRequest(i_know_what_im_doing=True)`. This wipes EVERYTHING
