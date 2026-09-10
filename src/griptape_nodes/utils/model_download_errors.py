@@ -65,7 +65,7 @@ class DownloadFailure(NamedTuple):
     detail: str | None
 
 
-def classify(exc: Exception) -> DownloadErrorKind:  # noqa: PLR0911
+def classify(exc: Exception) -> DownloadErrorKind:  # noqa: C901, PLR0911
     """Assign a download exception the kind whose advice fits it.
 
     Args:
@@ -95,10 +95,9 @@ def classify(exc: Exception) -> DownloadErrorKind:  # noqa: PLR0911
         return DownloadErrorKind.UNKNOWN
     if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
         return DownloadErrorKind.NO_DISK_SPACE
-    # `snapshot_download` catches the transport error at the metadata step and, with nothing
-    # cached to fall back to, re-raises it as this, so it is the shape an offline download
-    # actually fails with. A live transport error only escapes when the network dies mid-transfer.
-    if isinstance(exc, LocalEntryNotFoundError | httpx.TransportError):
+    if isinstance(exc, LocalEntryNotFoundError):
+        return _classify_hub_fallback(exc)
+    if isinstance(exc, httpx.TransportError):
         return DownloadErrorKind.NETWORK_UNREACHABLE
     return DownloadErrorKind.UNKNOWN
 
@@ -219,6 +218,20 @@ def parse_error_event(stderr: str) -> DownloadFailure | None:
             detail=detail if isinstance(detail, str) else None,
         )
     return None
+
+
+def _classify_hub_fallback(exc: LocalEntryNotFoundError) -> DownloadErrorKind:
+    """Read the verdict off whatever the hub's cache-fallback error is standing in for.
+
+    Everything that stopped `snapshot_download` reaching the Hub with nothing cached to fall back
+    to arrives as this one error, an unreachable host and a 429 and a 500 alike, so the wrapper
+    cannot speak for any of them. It chains what it caught, and only a genuinely offline attempt
+    reaches here with nothing usable chained.
+    """
+    cause = exc.__cause__
+    if isinstance(cause, Exception) and not isinstance(cause, LocalEntryNotFoundError):
+        return classify(cause)
+    return DownloadErrorKind.NETWORK_UNREACHABLE
 
 
 def _to_kind(value: object) -> DownloadErrorKind:

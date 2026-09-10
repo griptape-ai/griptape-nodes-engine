@@ -490,8 +490,6 @@ class ModelManager(EngineScoped):
 
         # Deliberately no token check: public models download without one, and Hugging Face
         # answers a gated model with a 401 the download reports as a missing-token failure.
-        # Refusing up front blocked downloads that would have worked, and returned before a
-        # status file existed, so the editor had no row to show the reason on.
         try:
             download_params = DownloadParams(
                 model_id=parsed_model_id,

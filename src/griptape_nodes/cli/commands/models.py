@@ -6,6 +6,7 @@ import sys
 from typing import TYPE_CHECKING
 
 import typer
+from rich.markup import escape
 from rich.table import Table
 
 from griptape_nodes.cli.shared import console
@@ -147,7 +148,10 @@ async def _download_model(
     except Exception as e:
         failure = DownloadFailure(kind=classify(e), detail=readable_exception_message(e))
         _emit_error_event(failure)
-        console.print(f"[bold red]{describe(failure, model_id=model_id, revision=revision)}[/bold red]")
+        # Escaped because the message can carry an exception's own text, and a stray bracket in
+        # it is markup to rich: it either raises or eats the span, losing the sentence.
+        reason = escape(describe(failure, model_id=model_id, revision=revision))
+        console.print(f"[bold red]{reason}[/bold red]")
         sys.exit(1)
 
     console.print("[bold green]Model downloaded successfully![/bold green]")

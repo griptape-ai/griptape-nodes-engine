@@ -33,6 +33,15 @@ def _hub_error(error_class: type[HfHubHTTPError], status_code: int) -> HfHubHTTP
     return error_class(f"{status_code} Client Error.", response=httpx.Response(status_code, request=request))
 
 
+def _wrapped_by_the_hub(cause: Exception) -> LocalEntryNotFoundError:
+    """Wrap `cause` the way `snapshot_download` does when it cannot reach the Hub."""
+    error = LocalEntryNotFoundError(
+        f"Got: {type(cause).__name__}: {cause}\nAn error happened while trying to locate the files on the Hub."
+    )
+    error.__cause__ = cause
+    return error
+
+
 class TestClassify:
     def test_anonymous_gated_access_reads_as_a_credential_problem(self) -> None:
         """Hugging Face answers an unauthenticated request for a gated repo with 401."""
@@ -56,6 +65,7 @@ class TestClassify:
         assert classify(_hub_error(HfHubHTTPError, 429)) is DownloadErrorKind.RATE_LIMITED
 
     def test_other_http_failures_stay_unclassified(self) -> None:
+        """Also guards the branch order: every HfHubHTTPError is an httpx.HTTPError and an OSError."""
         assert classify(_hub_error(HfHubHTTPError, 500)) is DownloadErrorKind.UNKNOWN
 
     def test_full_disk(self) -> None:
@@ -71,16 +81,25 @@ class TestClassify:
         `LocalEntryNotFoundError`, which is a FileNotFoundError rather than an httpx error, so the
         transport branch alone left the common offline case unclassified.
         """
-        offline = LocalEntryNotFoundError(
-            "Got: ConnectError: [Errno 8] nodename nor servname provided, or not known\n"
-            "An error happened while trying to locate the files on the Hub."
-        )
+        offline = _wrapped_by_the_hub(httpx.ConnectError("[Errno 8] nodename nor servname provided"))
 
         assert classify(offline) is DownloadErrorKind.NETWORK_UNREACHABLE
 
-    def test_an_http_error_is_not_mistaken_for_a_transport_or_disk_error(self) -> None:
-        """Every HfHubHTTPError is also an httpx.HTTPError and an OSError."""
-        assert classify(_hub_error(HfHubHTTPError, 500)) is DownloadErrorKind.UNKNOWN
+    def test_an_http_failure_the_hub_wrapped_keeps_its_own_verdict(self) -> None:
+        """The wrapper is not evidence of a network problem.
+
+        `snapshot_download` re-raises every failure it could not reach the Hub through as
+        `LocalEntryNotFoundError`, a 429 and a 500 included, so reading the wrapper alone told a
+        rate-limited user to check their internet connection and left `RATE_LIMITED` unreachable.
+        """
+        rate_limited = _wrapped_by_the_hub(_hub_error(HfHubHTTPError, 429))
+
+        assert classify(rate_limited) is DownloadErrorKind.RATE_LIMITED
+
+    def test_a_wrapper_chained_to_itself_still_terminates(self) -> None:
+        assert classify(_wrapped_by_the_hub(LocalEntryNotFoundError("nested"))) is (
+            DownloadErrorKind.NETWORK_UNREACHABLE
+        )
 
     def test_anything_else(self) -> None:
         assert classify(RuntimeError("boom")) is DownloadErrorKind.UNKNOWN
