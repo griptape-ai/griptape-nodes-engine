@@ -479,11 +479,18 @@ class WorkspaceDecision(NamedTuple):
     activation must refuse rather than apply it, or a child would adopt a workspace its chain never
     named. Environmental chain breaks (moved/unreadable ancestor files, cycles) do NOT set this;
     those keep the long-standing warn-and-fall-back behavior.
+
+    `pin_supplied_by_config` distinguishes the two kinds of pin, for `set_workspace_override`.
+    Branch 5 reads `workspace_directory` out of the user (or default) config layer and pins that
+    value back, so the config layer is still the owner and a settings write to it decides what the
+    next activation pins. Branches 0, 1 and 4 pin a value no config layer supplies (a project
+    template's field, a `project_workspaces` mapping, an ancestor's workspace).
     """
 
     workspace_dir: Path
     apply_override: bool
     blocked_reason: str | None = None
+    pin_supplied_by_config: bool = False
 
 
 class LibrariesRootDecision(NamedTuple):
@@ -1980,6 +1987,7 @@ class ProjectManager(EngineScoped):
                 workspace_dir=decision.workspace_dir,
                 apply_override=decision.apply_override,
                 blocked_reason=lookup.incomplete_reason,
+                pin_supplied_by_config=decision.pin_supplied_by_config,
             )
         return decision
 
@@ -2643,9 +2651,10 @@ class ProjectManager(EngineScoped):
         none. A non-None value is pinned. Otherwise falls to the global configured workspace_directory
         (user config, then default config), and finally the project's own directory (branch 5b, a
         defensive path reached only when workspace_directory is unset in both layers). All of these
-        pin via apply_override=True. Shared verbatim by decide_workspace and
-        resolve_workspace_dir_for_project_id; only the source of `inherited` (registry vs. disk walk)
-        differs between the two callers.
+        pin via apply_override=True, but only branch 5's pin sets `pin_supplied_by_config`, since it
+        alone re-applies a value a config layer already supplies. Shared verbatim by decide_workspace
+        and resolve_workspace_dir_for_project_id; only the source of `inherited` (registry vs. disk
+        walk) differs between the two callers.
         """
         if inherited is not None:
             return WorkspaceDecision(Path(inherited), apply_override=True)
@@ -2662,7 +2671,8 @@ class ProjectManager(EngineScoped):
                 default=None,
             )
         if configured_root is not None:
-            return WorkspaceDecision(Path(configured_root), apply_override=True)
+            # Branch 5: the pin is the config layer's own value, read back and re-applied.
+            return WorkspaceDecision(Path(configured_root), apply_override=True, pin_supplied_by_config=True)
 
         return WorkspaceDecision(project_file_path.parent, apply_override=True)
 
@@ -3317,7 +3327,9 @@ class ProjectManager(EngineScoped):
             libraries_root = self.decide_libraries_root(project_file_path, template_libraries_dir)
 
         if decision.apply_override:
-            self._config_manager.set_workspace_override(decision.workspace_dir)
+            self._config_manager.set_workspace_override(
+                decision.workspace_dir, supplied_by_config=decision.pin_supplied_by_config
+            )
         self._config_manager.set_libraries_root_override(libraries_root)
         return None
 

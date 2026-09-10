@@ -97,6 +97,9 @@ from griptape_nodes.retained_mode.events.agent_events import (
     GetConversationMemoryRequest,
     GetConversationMemoryResultFailure,
     GetConversationMemoryResultSuccess,
+    GetThreadMetadataRequest,
+    GetThreadMetadataResultFailure,
+    GetThreadMetadataResultSuccess,
     ListAgentModelsRequest,
     ListAgentModelsResultSuccess,
     ListAgentProvidersRequest,
@@ -116,6 +119,7 @@ from griptape_nodes.retained_mode.events.agent_events import (
     RunAgentRequestArtifact,
     RunAgentResultFailure,
     RunAgentResultSuccess,
+    RunRecord,
     UnarchiveThreadRequest,
     UnarchiveThreadResultFailure,
     UnarchiveThreadResultSuccess,
@@ -376,6 +380,9 @@ class AgentManager(EngineScoped):
                 GetConversationMemoryRequest, self.on_handle_get_conversation_memory_request
             )
             event_manager.assign_manager_to_request_type(CreateThreadRequest, self.on_handle_create_thread_request)
+            event_manager.assign_manager_to_request_type(
+                GetThreadMetadataRequest, self.on_handle_get_thread_metadata_request
+            )
             event_manager.assign_manager_to_request_type(ListThreadsRequest, self.on_handle_list_threads_request)
             event_manager.assign_manager_to_request_type(DeleteThreadRequest, self.on_handle_delete_thread_request)
             event_manager.assign_manager_to_request_type(RenameThreadRequest, self.on_handle_rename_thread_request)
@@ -514,6 +521,18 @@ class AgentManager(EngineScoped):
             self._thread_storage.update_thread_metadata(
                 result.thread_id, title=textwrap.shorten(request.input, width=50, placeholder="...")
             )
+        # A cancelled run persists nothing, so there is no response to record.
+        if not result.cancelled:
+            resolved_provider = self._get_provider(request.provider_name)
+            self._thread_storage.append_run_record(
+                result.thread_id,
+                RunRecord(
+                    message_index=result.message_count - 1,
+                    provider_name=resolved_provider.name,
+                    model=request.model_name or resolved_provider.model,
+                    mcp_servers=request.additional_mcp_servers or [],
+                ),
+            )
 
         if result.cancelled:
             logger.info("Agent run for thread %s cancelled by request.", result.thread_id)
@@ -604,6 +623,22 @@ class AgentManager(EngineScoped):
             logger.exception(details)
             return CreateThreadResultFailure(result_details=details)
 
+    def on_handle_get_thread_metadata_request(self, request: GetThreadMetadataRequest) -> ResultPayload:
+        try:
+            if not self._thread_storage.thread_exists(request.thread_id):
+                details = f"Thread {request.thread_id} not found"
+                logger.error(details)
+                return GetThreadMetadataResultFailure(result_details=details)
+
+            thread = self._thread_storage.get_thread_metadata(request.thread_id)
+            return GetThreadMetadataResultSuccess(
+                thread=thread, result_details="Thread metadata retrieved successfully."
+            )
+        except Exception as e:
+            details = f"Error retrieving thread metadata: {e}"
+            logger.exception(details)
+            return GetThreadMetadataResultFailure(result_details=details)
+
     def on_handle_list_threads_request(self, _: ListThreadsRequest) -> ResultPayload:
         try:
             threads = self._thread_storage.list_threads()
@@ -652,8 +687,7 @@ class AgentManager(EngineScoped):
                 logger.error(details)
                 return ArchiveThreadResultFailure(result_details=details)
 
-            meta = self._thread_storage.get_thread_metadata(request.thread_id)
-            if meta.get("archived", False):
+            if self._thread_storage.is_archived(request.thread_id):
                 details = f"Thread {request.thread_id} is already archived"
                 logger.error(details)
                 return ArchiveThreadResultFailure(result_details=details)
@@ -676,8 +710,7 @@ class AgentManager(EngineScoped):
                 logger.error(details)
                 return UnarchiveThreadResultFailure(result_details=details)
 
-            meta = self._thread_storage.get_thread_metadata(request.thread_id)
-            if not meta.get("archived", False):
+            if not self._thread_storage.is_archived(request.thread_id):
                 details = f"Thread {request.thread_id} is not archived"
                 logger.error(details)
                 return UnarchiveThreadResultFailure(result_details=details)
@@ -895,14 +928,13 @@ class AgentManager(EngineScoped):
         return runner
 
     def _ensure_skills_directory(self, workspace_root: Path) -> None:
-        """Scaffold `<workspace>/.agents/skills` so the runner always builds a skills capability.
+        """Scaffold `<workspace>/.agents/skills` so the runner always has a library to scan.
 
-        Called before every runner construction: the runner only attaches a
-        `SkillsCapability` when the directory exists at construction time, and
-        runners are cached, so creating the directory here guarantees skills
-        added mid-session are picked up on the next scan. Seeds a README the
-        first time so users discovering the folder know what belongs in it.
-        Failure to scaffold is logged but never blocks building the agent.
+        Called before every runner construction: the runner builds its skills
+        capability from this directory on each run, so creating it here means a
+        skill added mid-session is picked up without an engine restart. Seeds a
+        README the first time so users discovering the folder know what belongs
+        in it. Failure to scaffold is logged but never blocks building the agent.
         """
         skills_dir = workspace_root / DEFAULT_SKILLS_DIRECTORY
         try:
@@ -1099,8 +1131,7 @@ class AgentManager(EngineScoped):
             new_id, _ = self._thread_storage.create_thread()
             return new_id
 
-        meta = self._thread_storage.get_thread_metadata(thread_id)
-        if meta.get("archived", False):
+        if self._thread_storage.is_archived(thread_id):
             details = f"Cannot run agent on archived thread {thread_id}. Unarchive it first."
             raise ValueError(details)
         return thread_id

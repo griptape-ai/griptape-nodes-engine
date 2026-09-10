@@ -117,7 +117,7 @@ gtn libraries sync
 You can connect with us through several channels:
 
 - [Website](https://www.griptape.ai) - Visit our homepage for general information
-- [Discord](https://discord.gg/gnWRz88eym) - Join our community for questions and discussions
+- [Discord](https://discord.com/invite/rpWWNmgGv9) - Join our community for questions and discussions
 - [GitHub](https://github.com/griptape-ai/griptape-nodes) - Submit issues or contribute to the codebase
 
 These same links are also available as the three icons in the footer (bottom right) of every documentation page.
