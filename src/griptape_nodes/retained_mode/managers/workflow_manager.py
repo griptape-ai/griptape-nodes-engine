@@ -965,7 +965,7 @@ class WorkflowManager(EngineScoped):
             # in-file failures are the only record of what the workflow needs.
             duplicate_library_failures = (
                 EventSuppressionContext(self.engine.event_manager, {RegisterLibraryFromFileResultFailure})
-                if frame.problems
+                if any(isinstance(problem, LibraryNotRegisteredProblem) for problem in frame.problems)
                 else nullcontext()
             )
             with duplicate_library_failures:
@@ -2119,8 +2119,10 @@ class WorkflowManager(EngineScoped):
             # See how our desired version compares against the actual library we (may) have.
             # Check if library is registered (silent check - no error logging)
             if library_name not in registered_libraries:
-                # Library not registered
-                had_critical_error = True
+                # Library not registered. Recoverable, not critical: the workflow opens with
+                # ErrorProxyNode placeholders standing in for that library's nodes, so calling it
+                # UNUSABLE would contradict what the editor is about to show (issue #5505). The
+                # version-mismatch and malformed-metadata problems below stay critical.
                 problems.append(LibraryNotRegisteredProblem(library_name=library_name))
                 dependency_infos.append(
                     WorkflowManager.WorkflowDependencyInfo(
@@ -2138,8 +2140,9 @@ class WorkflowManager(EngineScoped):
             library_metadata_result = self.engine.library_manager.get_library_metadata_request(library_metadata_request)
 
             if not isinstance(library_metadata_result, GetLibraryMetadataResultSuccess):
-                # Should not happen since we verified library is registered, but handle gracefully
-                had_critical_error = True
+                # Should not happen since we verified library is registered, but handle gracefully.
+                # Recoverable for the same reason as the unregistered case above: the library IS
+                # in the registry, so its nodes still construct -- only its version is unknown.
                 problems.append(LibraryNotRegisteredProblem(library_name=library_name))
                 dependency_infos.append(
                     WorkflowManager.WorkflowDependencyInfo(

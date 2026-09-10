@@ -25,7 +25,7 @@ import json
 import logging
 import sys
 from typing import TYPE_CHECKING, Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -77,7 +77,10 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     SaveWorkflowFileFromSerializedFlowResultSuccess,
     WorkflowStatus,
 )
-from griptape_nodes.retained_mode.managers.fitness_problems.workflows import LibraryNotRegisteredProblem
+from griptape_nodes.retained_mode.managers.fitness_problems.workflows import (
+    LibraryNotRegisteredProblem,
+    MissingCreationDateProblem,
+)
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.managers.workflow_manager import WorkflowManager
 from griptape_nodes.utils.version_utils import engine_version
@@ -998,3 +1001,34 @@ class TestWorkflowNodeRefusesAFlawedSubflow:
 
         assert isinstance(result, ImportWorkflowAsReferencedSubFlowResultSuccess), result
         assert result.status is WorkflowStatus.GOOD
+
+
+class TestSuppressionIsKeyedToLibraryProblems:
+    """Only a library-registration problem opens the exec window's suppression.
+
+    Today `_ensure_libraries_for_workflow` produces nothing else, so a bare truthiness check on
+    the problem list behaves identically -- but the frame now also collects problems bubbled up
+    from nested subflow loads, and a future problem type has no business silencing library
+    registration failures the engine did not predict.
+    """
+
+    def test_a_non_library_problem_does_not_silence_registration_failures(self, engine: Engine, tmp_path: Path) -> None:
+        del engine
+        relative_path = _save_two_library_workflow(tmp_path)
+        reopened = _rebuild_engine_without_library(tmp_path, disabled=True)
+
+        # Stand in for a future problem type: present, but not about library registration.
+        other_problem = MissingCreationDateProblem(default_date="1970-01-01")
+        with patch.object(
+            reopened.workflow_manager,
+            "_ensure_libraries_for_workflow",
+            AsyncMock(return_value=[other_problem]),
+        ):
+            result, visible_failures = _visible_register_failures(reopened, relative_path)
+
+        # The load still carries the problem it was handed...
+        assert result.problems == (other_problem,)
+        # ...but the file's own registration failure is NOT suppressed, because nothing reported
+        # that library: the engine never attempted it here.
+        assert len(visible_failures) == 1
+        assert "disabled in libraries_to_register" in visible_failures[0]

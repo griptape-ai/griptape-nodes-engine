@@ -74,6 +74,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 from griptape_nodes.retained_mode.managers.context_manager import ContextManager
 from griptape_nodes.retained_mode.managers.fitness_problems.workflows import (
     InvalidTomlFormatProblem,
+    LibraryNotRegisteredProblem,
     MissingTomlSectionProblem,
 )
 from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
@@ -1606,6 +1607,77 @@ class TestWorkflowManager:
             info = workflow_manager._workflow_file_path_to_info[str(tmp_path / file_name)]
             assert info.status is WorkflowManager.WorkflowStatus.UNUSABLE, file_name
             assert any(isinstance(problem, MissingTomlSectionProblem) for problem in info.problems), file_name
+
+    @pytest.mark.asyncio
+    async def test_unregistered_library_reports_flawed_not_unusable(self, engine: Engine, tmp_path: Path) -> None:
+        """A header naming a library that is not registered leaves the workflow FLAWED.
+
+        It used to be critical, which meant UNUSABLE. That contradicts what the editor now does
+        with such a workflow: it opens, with ErrorProxyNode placeholders standing in for that
+        library's nodes (issue #5505). UNUSABLE would tell the artist not to bother opening the
+        thing they can in fact open and edit.
+        """
+        workflow_manager = engine.workflow_manager
+        engine.config_manager.workspace_path = tmp_path
+        engine.library_manager._libraries_loading_complete.set()
+
+        header = WorkflowManager.WORKFLOW_METADATA_HEADER
+        (tmp_path / "missing_library.py").write_text(
+            "\n".join(
+                [
+                    f"# /// {header}",
+                    "# [tool.griptape-nodes]",
+                    '# name = "missing_library"',
+                    f'# schema_version = "{WorkflowMetadata.LATEST_SCHEMA_VERSION}"',
+                    '# engine_version_created_with = "0.0.0"',
+                    '# node_libraries_referenced = [["Nowhere Library", "1.0.0"]]',
+                    "# ///",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        result = await workflow_manager.on_load_workflow_metadata_request(
+            LoadWorkflowMetadata(file_name="missing_library.py")
+        )
+
+        assert isinstance(result, LoadWorkflowMetadataResultSuccess)
+        info = workflow_manager._workflow_file_path_to_info[str(tmp_path / "missing_library.py")]
+        assert info.status is WorkflowManager.WorkflowStatus.FLAWED
+        assert any(isinstance(problem, LibraryNotRegisteredProblem) for problem in info.problems)
+
+    @pytest.mark.asyncio
+    async def test_a_malformed_dependency_version_is_still_unusable(self, engine: Engine, tmp_path: Path) -> None:
+        """Only the not-registered case was downgraded; a header the engine cannot parse still is not loadable."""
+        workflow_manager = engine.workflow_manager
+        engine.config_manager.workspace_path = tmp_path
+        engine.library_manager._libraries_loading_complete.set()
+
+        header = WorkflowManager.WORKFLOW_METADATA_HEADER
+        (tmp_path / "bad_version.py").write_text(
+            "\n".join(
+                [
+                    f"# /// {header}",
+                    "# [tool.griptape-nodes]",
+                    '# name = "bad_version"',
+                    f'# schema_version = "{WorkflowMetadata.LATEST_SCHEMA_VERSION}"',
+                    '# engine_version_created_with = "0.0.0"',
+                    '# node_libraries_referenced = [["Nowhere Library", "not-a-version"]]',
+                    "# ///",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        result = await workflow_manager.on_load_workflow_metadata_request(
+            LoadWorkflowMetadata(file_name="bad_version.py")
+        )
+
+        assert isinstance(result, LoadWorkflowMetadataResultSuccess)
+        info = workflow_manager._workflow_file_path_to_info[str(tmp_path / "bad_version.py")]
+        assert info.status is WorkflowManager.WorkflowStatus.UNUSABLE
 
     # --- WorkflowInfo payload helpers ---
 
