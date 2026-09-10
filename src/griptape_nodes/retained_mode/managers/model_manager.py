@@ -155,8 +155,7 @@ def _create_progress_tracker(model_id: str) -> type[tqdm]:  # noqa: C901
             )
 
         def display(self, *args, **kwargs) -> bool | None:
-            """Render nothing while the parent is reading events off the pipe.
-            """
+            """Render nothing while the parent is reading events off the pipe."""
             if self._emit_progress:
                 return False
             return super().display(*args, **kwargs)
