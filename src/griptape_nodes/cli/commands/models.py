@@ -30,6 +30,7 @@ from griptape_nodes.retained_mode.events.model_events import (
 )
 from griptape_nodes.retained_mode.managers.model_manager import _PROGRESS_PIPE_ENV_VAR
 from griptape_nodes.retained_mode.retained_mode import GriptapeNodes
+from griptape_nodes.utils.exception_utils import readable_exception_message
 from griptape_nodes.utils.model_download_errors import (
     DownloadFailure,
     classify,
@@ -148,7 +149,7 @@ async def _download_model(
             ignore_patterns=None,
         )
     except Exception as e:
-        failure = DownloadFailure(kind=classify(e), detail=str(e))
+        failure = DownloadFailure(kind=classify(e), detail=readable_exception_message(e))
         _emit_error_event(failure)
         console.print(f"[bold red]{describe(failure, model_id=model_id, revision=revision)}[/bold red]")
         sys.exit(1)

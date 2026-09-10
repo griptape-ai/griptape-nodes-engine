@@ -10,6 +10,7 @@ from huggingface_hub.errors import (
     GatedRepoError,
     HfHubHTTPError,
     HFValidationError,
+    LocalEntryNotFoundError,
     RepositoryNotFoundError,
     RevisionNotFoundError,
 )
@@ -40,12 +41,6 @@ class TestClassify:
     def test_authenticated_gated_access_reads_as_a_pending_access_request(self) -> None:
         assert classify(_hub_error(GatedRepoError, 403)) is DownloadErrorKind.GATED_NO_ACCESS
 
-    def test_a_gated_error_without_a_usable_response_is_not_a_crash(self) -> None:
-        error = _hub_error(GatedRepoError, 401)
-        error.response = None  # type: ignore[assignment]
-
-        assert classify(error) is DownloadErrorKind.GATED_UNAUTHENTICATED
-
     def test_missing_repo(self) -> None:
         assert classify(_hub_error(RepositoryNotFoundError, 401)) is DownloadErrorKind.REPO_NOT_FOUND
 
@@ -66,8 +61,22 @@ class TestClassify:
     def test_full_disk(self) -> None:
         assert classify(OSError(errno.ENOSPC, "No space left on device")) is DownloadErrorKind.NO_DISK_SPACE
 
-    def test_unreachable_host(self) -> None:
+    def test_unreachable_host_mid_transfer(self) -> None:
         assert classify(httpx.ConnectError("nodename nor servname provided")) is (DownloadErrorKind.NETWORK_UNREACHABLE)
+
+    def test_unreachable_host_before_any_transfer(self) -> None:
+        """The shape an offline download actually fails with.
+
+        `snapshot_download` catches the transport error while reading metadata and re-raises it as
+        `LocalEntryNotFoundError`, which is a FileNotFoundError rather than an httpx error, so the
+        transport branch alone left the common offline case unclassified.
+        """
+        offline = LocalEntryNotFoundError(
+            "Got: ConnectError: [Errno 8] nodename nor servname provided, or not known\n"
+            "An error happened while trying to locate the files on the Hub."
+        )
+
+        assert classify(offline) is DownloadErrorKind.NETWORK_UNREACHABLE
 
     def test_an_http_error_is_not_mistaken_for_a_transport_or_disk_error(self) -> None:
         """Every HfHubHTTPError is also an httpx.HTTPError and an OSError."""
@@ -78,11 +87,21 @@ class TestClassify:
 
 
 class TestDescribe:
-    @pytest.mark.parametrize("kind", list(DownloadErrorKind))
-    def test_every_kind_names_the_model(self, kind: DownloadErrorKind) -> None:
-        message = describe(DownloadFailure(kind=kind, detail="raw"), model_id=MODEL_ID)
+    @pytest.mark.parametrize("kind", [kind for kind in DownloadErrorKind if kind is not DownloadErrorKind.UNKNOWN])
+    def test_every_classified_kind_is_worded(self, kind: DownloadErrorKind) -> None:
+        """A kind added to the enum and to `classify` but not to `describe` falls through to UNKNOWN.
+
+        Comparing against the UNKNOWN wording is what makes that visible: asserting only that the
+        message names the model passes on the fallback, which names it too.
+        """
+        detail = "401 Client Error. Cannot access gated repo"
+        unworded = describe(DownloadFailure(kind=DownloadErrorKind.UNKNOWN, detail=detail), model_id=MODEL_ID)
+
+        message = describe(DownloadFailure(kind=kind, detail=detail), model_id=MODEL_ID)
 
         assert MODEL_ID in message
+        assert message != unworded
+        assert detail not in message
 
     def test_unauthenticated_gate_asks_for_a_token_not_for_access_approval(self) -> None:
         message = describe(

@@ -43,10 +43,12 @@ from griptape_nodes.retained_mode.events.model_events import (
 )
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.model_manager import (
+    _PROGRESS_PIPE_ENV_VAR,
     _STATUS_READ_LOCK_ATTEMPTS,
     _STATUS_READ_TORN_ATTEMPTS,
     DownloadParams,
     ModelManager,
+    _create_progress_tracker,
     _load_status_file,
 )
 
@@ -554,6 +556,51 @@ class TestDownloadModelTaskSubprocess:
 
         assert captured_cmd[3] == "download"
         assert "org/model" in captured_cmd
+
+
+# ---------------------------------------------------------------------------
+# _create_progress_tracker — bars stay off the channel a failure is reported on
+# ---------------------------------------------------------------------------
+
+
+class TestProgressTrackerInPipeMode:
+    @pytest.fixture
+    def pipe_mode(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(_PROGRESS_PIPE_ENV_VAR, "1")
+
+    def test_a_tracked_bar_draws_nothing_but_still_counts(self, pipe_mode: None) -> None:  # noqa: ARG002
+        """Bars must stay off stderr.
+
+        Progress reaches the parent as JSON on stdout, so a drawn bar is only noise the parent
+        has to tell apart from a failure report on the same stream.
+        """
+        downloaded_bytes = 40
+        stream = io.StringIO()
+        tracker = _create_progress_tracker("org/model")
+
+        # Typed loosely because the factory hands back `type[tqdm]`: the counters this asserts on
+        # belong to the subclass it builds, which the annotation cannot name.
+        bar: Any = tracker(total=100, unit="B", desc="Downloading bytes", file=stream)
+        bar.update(downloaded_bytes)
+        bar.close()
+
+        assert stream.getvalue().strip() == ""
+        assert bar._cumulative_bytes == downloaded_bytes
+
+    def test_the_file_enumeration_bar_is_still_excluded(self, pipe_mode: None) -> None:  # noqa: ARG002
+        """Fences off tqdm's own `disable=True` as a way to stop the drawing.
+
+        A disabled tqdm returns from `tqdm.__init__` before recording `desc` or `unit`, which is
+        what this bar is recognized by, so switching to it would flip `_should_track` on and report
+        a file count as a byte total. Passes on either implementation today; it exists to fail on
+        that refactor.
+        """
+        tracker = _create_progress_tracker("org/model")
+
+        bar: Any = tracker(total=29, unit="it", desc="Fetching 29 files", file=io.StringIO())
+        bar.close()
+
+        assert bar._should_track is False
 
 
 # ---------------------------------------------------------------------------

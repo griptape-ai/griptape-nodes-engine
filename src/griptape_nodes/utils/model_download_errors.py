@@ -3,9 +3,11 @@
 A download runs in a child process (`griptape_nodes.cli.commands.models download`),
 so the exception is raised in one process and the message is shown by another. The
 child classifies the exception it caught and reports the verdict; the parent turns
-that verdict into the sentence the user reads. Both halves live here so a download
-failure reads the same in the editor as it does in a terminal, and so the wire
-format has its writer and its reader side by side.
+that verdict into the sentence the user reads. Both halves live here so the editor
+and a direct CLI run cannot drift into wording a failure differently, and so the
+wire format has its writer and its reader side by side. The wording is aimed at the
+editor, which is where downloads are started from; a CLI run gets the same sentence,
+naming settings it has to reach through the editor.
 
 The parent must never build a message out of the child's output streams. Those
 streams also carry progress bars and library warnings, so text scavenged from them
@@ -25,6 +27,7 @@ from huggingface_hub.errors import (
     GatedRepoError,
     HfHubHTTPError,
     HFValidationError,
+    LocalEntryNotFoundError,
     RepositoryNotFoundError,
     RevisionNotFoundError,
 )
@@ -74,7 +77,7 @@ def classify(exc: Exception) -> DownloadErrorKind:  # noqa: PLR0911
     # Order is load-bearing: GatedRepoError is a RepositoryNotFoundError, and every
     # HfHubHTTPError is also an httpx.HTTPError and an OSError.
     if isinstance(exc, GatedRepoError):
-        if _status_code(exc) == HTTPStatus.FORBIDDEN:
+        if exc.response.status_code == HTTPStatus.FORBIDDEN:
             return DownloadErrorKind.GATED_NO_ACCESS
         # Hugging Face answers an anonymous or rejected request with 401 and a
         # gated-repo code, so anything that is not an explicit 403 is a credential
@@ -87,12 +90,15 @@ def classify(exc: Exception) -> DownloadErrorKind:  # noqa: PLR0911
     if isinstance(exc, HFValidationError):
         return DownloadErrorKind.INVALID_MODEL_ID
     if isinstance(exc, HfHubHTTPError):
-        if _status_code(exc) == HTTPStatus.TOO_MANY_REQUESTS:
+        if exc.response.status_code == HTTPStatus.TOO_MANY_REQUESTS:
             return DownloadErrorKind.RATE_LIMITED
         return DownloadErrorKind.UNKNOWN
     if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
         return DownloadErrorKind.NO_DISK_SPACE
-    if isinstance(exc, httpx.TransportError):
+    # `snapshot_download` catches the transport error at the metadata step and, with nothing
+    # cached to fall back to, re-raises it as this, so it is the shape an offline download
+    # actually fails with. A live transport error only escapes when the network dies mid-transfer.
+    if isinstance(exc, LocalEntryNotFoundError | httpx.TransportError):
         return DownloadErrorKind.NETWORK_UNREACHABLE
     return DownloadErrorKind.UNKNOWN
 
@@ -127,7 +133,14 @@ def describe(failure: DownloadFailure, *, model_id: str, revision: str | None = 
             f"{model_url}, then start the download again."
         )
     if failure.kind is DownloadErrorKind.REPO_NOT_FOUND:
-        return f"{attempted} Hugging Face has no model with that id. Check the id at {model_url}."
+        # Hugging Face answers a missing repo and a private one the caller cannot see with the
+        # same 401, so this cannot promise the id is wrong. Naming both keeps the owner of a
+        # private model from hunting for a typo that is not there.
+        return (
+            f"{attempted} Hugging Face has no model with that id, or it is private and this machine "
+            f"has no token with access to it. Check the id at {model_url}, and if the model is "
+            f"private, add your Hugging Face token as HF_TOKEN under Settings -> API Keys & Secrets."
+        )
     if failure.kind is DownloadErrorKind.REVISION_NOT_FOUND:
         pinned = f"revision '{revision}'" if revision else "the requested revision"
         return (
@@ -205,17 +218,6 @@ def parse_error_event(stderr: str) -> DownloadFailure | None:
             kind=_to_kind(event[_EVENT_KIND_KEY]),
             detail=detail if isinstance(detail, str) else None,
         )
-    return None
-
-
-def _status_code(exc: HfHubHTTPError) -> int | None:
-    """Read the HTTP status off a hub error, which carries its response."""
-    response = getattr(exc, "response", None)
-    if response is None:
-        return None
-    status_code = getattr(response, "status_code", None)
-    if isinstance(status_code, int):
-        return status_code
     return None
 
 
