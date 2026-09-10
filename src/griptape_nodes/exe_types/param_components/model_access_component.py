@@ -628,7 +628,7 @@ class ModelAccessComponent:
         for choice in self._model_choices:
             row: dict[str, str] = {"name": choice}
             display_name = self._snapshot.display_name_for(choice)
-            if display_name is not None:
+            if display_name is not None and display_name.strip():
                 row["label"] = display_name
                 if _id_adds_detail(display_name, choice):
                     row["subtitle"] = choice
