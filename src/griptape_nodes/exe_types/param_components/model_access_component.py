@@ -133,6 +133,27 @@ if TYPE_CHECKING:
 _REFRESH_ICON = "list-restart"
 
 
+def _comparable(value: str) -> str:
+    """``value`` reduced to its letters and digits, lowercased.
+
+    Collapses the ways a catalog name and a provider id spell the same thing, so
+    "GPT-5.5" and ``gpt-5.5`` compare equal.
+    """
+    return "".join(character for character in value.lower() if character.isalnum())
+
+
+def _id_adds_detail(display_name: str, provider_model_id: str) -> bool:
+    """Whether ``provider_model_id`` carries something its display name drops.
+
+    "Seedream 5.0 Pro" hides the vendor prefix and build date in
+    ``dola-seedream-5-0-pro-260628``, so the id earns a second line on the row.
+    Most of the catalog does not: "GPT-5.5" and ``gpt-5.5`` differ only in
+    punctuation, and ``o3``'s display name IS ``o3``, so repeating the id there
+    only doubles the row height with the text already above it.
+    """
+    return _comparable(display_name) != _comparable(provider_model_id)
+
+
 class ModelAccessComponent:
     """Composition helper for a model-selection dropdown that respects license policy.
 
@@ -597,6 +618,11 @@ class ModelAccessComponent:
         keeps recording the exact provider id rather than a prettified name.
         A choice the catalog does not describe carries no ``label`` and renders
         as its id, which is what a dropdown did before labels existed.
+
+        The id repeats as a ``subtitle`` only where it says something the label
+        does not -- see ``_id_adds_detail``. Most of the catalog names a model
+        the way its id spells it, and a second line reading ``gpt-5.5`` under
+        "GPT-5.5" costs every row twice the height to say nothing.
         """
         data: list[dict[str, str]] = []
         for choice in self._model_choices:
@@ -604,9 +630,8 @@ class ModelAccessComponent:
             display_name = self._snapshot.display_name_for(choice)
             if display_name is not None:
                 row["label"] = display_name
-                # Only worth a second line once the first one is a name: the id is
-                # otherwise already the visible text.
-                row["subtitle"] = choice
+                if _id_adds_detail(display_name, choice):
+                    row["subtitle"] = choice
             if self._cached_denial(choice) is not None:
                 row["icon"] = DENIED_ROW_ICON
                 # Outranks the id: it is the actionable line, and it keeps a denied row
