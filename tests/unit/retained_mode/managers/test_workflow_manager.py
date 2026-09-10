@@ -110,6 +110,17 @@ def _notified_workflow_names(put_event: Mock) -> list[str | None]:
     return names
 
 
+def _attach_event_queue(engine: Engine) -> None:
+    """Give the engine somewhere to put events, as a session with a client attached has.
+
+    Any test that asserts on CurrentWorkflowChanged needs this. Without a queue `put_event` drops
+    what it is handed, and ContextManager leaves a switch it could not send owed rather than
+    recording it as announced -- so on a queue-less engine every notification is a first
+    notification, and the context the test sets up beforehand never counts as announced.
+    """
+    engine.event_manager.initialize_queue(asyncio.Queue())
+
+
 class TestWorkflowManager:
     """Test WorkflowManager functionality including parameter serialization."""
 
@@ -691,6 +702,7 @@ class TestWorkflowManager:
         workflow_manager = engine.workflow_manager
         context_manager = engine.context_manager
         config_manager = engine.config_manager
+        _attach_event_queue(engine)
 
         workspace = tmp_path.resolve()
         (workspace / "my_workflow.py").write_text("# stub")
@@ -751,6 +763,7 @@ class TestWorkflowManager:
 
         workflow_manager = engine.workflow_manager
         context_manager = engine.context_manager
+        _attach_event_queue(engine)
 
         unsaved_key = "unsaved:abc-123"
         saved_key = "my_flow"
@@ -1253,6 +1266,7 @@ class TestWorkflowManager:
         what `workflow_dir` answers with.
         """
         context_manager = engine.context_manager
+        _attach_event_queue(engine)
         context_manager.push_workflow(workflow_name="my_workflow")
 
         try:
@@ -1285,6 +1299,7 @@ class TestWorkflowManager:
         waking every attached editor for a switch that did not happen.
         """
         context_manager = engine.context_manager
+        _attach_event_queue(engine)
         context_manager.push_workflow(workflow_name="my_workflow")
         context_manager.set_current_workflow_file_path("/workspace/my_workflow.py")
 
@@ -1560,6 +1575,7 @@ class TestWorkflowManager:
         workflow_manager._workflows_loading_complete.set()
         context_manager = engine.context_manager
         object_manager = engine.object_manager
+        _attach_event_queue(engine)
 
         workflow_key = "unsaved:delete-active"
 
@@ -1605,6 +1621,7 @@ class TestWorkflowManager:
         workflow_manager = engine.workflow_manager
         workflow_manager._workflows_loading_complete.set()
         context_manager = engine.context_manager
+        _attach_event_queue(engine)
 
         active_key = "unsaved:keep-me"
         other_key = "unsaved:delete-me"
@@ -5167,6 +5184,11 @@ class TestRunWorkflowFromRegistryNotifiesContextChange:
     it left an MCP-driven open invisible to every editor. The push emits CurrentWorkflowChanged
     instead, and the failure path's teardown emits the revert.
     """
+
+    @pytest.fixture(autouse=True)
+    def _engine_with_a_client_attached(self, engine: Engine) -> None:
+        """Every test here asserts on what went out, so the engine needs somewhere to put it."""
+        _attach_event_queue(engine)
 
     @staticmethod
     def _saved_workflow(key: str) -> Mock:

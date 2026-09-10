@@ -1,6 +1,7 @@
 """Tests for ContextManager.push_workflow."""
 
 import ast
+import asyncio
 import logging
 import tempfile
 from datetime import UTC, datetime
@@ -544,6 +545,17 @@ class TestEnsureWorkflowAndFlowRequest:
 class TestCurrentWorkflowChangedNotification:
     """Tests for the CurrentWorkflowChanged app event ContextManager broadcasts."""
 
+    @pytest.fixture(autouse=True)
+    def _engine_with_a_client_attached(self, engine: Engine) -> None:
+        """Give the engine an event queue, as a session with a client attached has.
+
+        `put_event` drops what it is handed until then, and ContextManager leaves a switch it could
+        not send owed rather than recording it as announced -- so on a queue-less engine the context
+        a test arranges beforehand never counts as announced, and every assertion below would be
+        measuring a re-send of it.
+        """
+        engine.event_manager.initialize_queue(asyncio.Queue())
+
     @staticmethod
     def _notified_workflow_names(put_event: Mock) -> list[str | None]:
         """The workflow_name off every CurrentWorkflowChanged put on the queue, in order."""
@@ -606,8 +618,8 @@ class TestCurrentWorkflowChangedNotification:
 
         This is the name-only primitive; every handler that renames a workflow also moves the
         file behind it and so goes through `rekey_workflow` instead (pinned below, and at the
-        handler level in test_workflow_manager.py). Kept notifying because a name change on its
-        own is still a change clients have to hear about.
+        handler level in test_workflow_manager.py). It notifies anyway, because a name change on
+        its own is still a change clients have to hear about.
         """
         context_manager = engine.context_manager
         context_manager.push_workflow(workflow_name="before_rename")
@@ -775,6 +787,29 @@ class TestCurrentWorkflowChangedNotification:
             context_manager.push_workflow(workflow_name="announced_late")
 
         assert self._notified_workflow_names(put_event) == ["announced_late"]
+
+        context_manager.pop_workflow()
+        context_manager.pop_workflow()
+
+    def test_a_switch_made_before_the_queue_exists_is_still_owed(self, engine: Engine) -> None:
+        """An event that had no queue to go on is owed exactly like one the loop refused.
+
+        `put_event` is a no-op until `initialize_queue` runs, which covers engine construction and
+        a workflow file a script or the CLI replays. Treating "the queue took it" as "clients were
+        told" would leave that workflow the one nobody hears about, since every later notification
+        would compare against a name that never left the engine.
+        """
+        context_manager = engine.context_manager
+
+        with patch.object(engine.event_manager, "put_event", Mock(return_value=False)):
+            context_manager.push_workflow(workflow_name="pushed_before_anyone_listened")
+
+        assert context_manager.get_current_workflow_name() == "pushed_before_anyone_listened"
+
+        with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
+            context_manager.push_workflow(workflow_name="pushed_before_anyone_listened")
+
+        assert self._notified_workflow_names(put_event) == ["pushed_before_anyone_listened"]
 
         context_manager.pop_workflow()
         context_manager.pop_workflow()
