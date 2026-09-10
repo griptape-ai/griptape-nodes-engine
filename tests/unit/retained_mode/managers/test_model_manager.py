@@ -684,6 +684,37 @@ class TestFailedDownloadMessages:
         assert "Fetching" not in message
 
     @pytest.mark.asyncio
+    async def test_a_cancelled_download_is_not_reported_as_a_failure(self, model_manager: ModelManager) -> None:
+        """A cancel is carried out by killing the child, so its non-zero exit is expected.
+
+        Reported as a failure, it told the user their deliberate cancel "failed for an
+        unexpected reason" and left a Failed row behind the handler that removes it.
+        """
+        model_manager._download_tasks = {}
+        model_manager._download_processes = {}
+        model_manager._cancelled_downloads = {"black-forest-labs/FLUX.1-dev"}
+
+        process = SimpleNamespace(
+            stdout=None,
+            stderr=_FakeStderr([]),
+            returncode=-15,
+            wait=AsyncMock(return_value=-15),
+        )
+        written: list[dict] = []
+
+        async def fake_create_subprocess_exec(*_cmd: str, **_kwargs: object) -> SimpleNamespace:
+            return process
+
+        with (
+            patch("asyncio.create_subprocess_exec", side_effect=fake_create_subprocess_exec),
+            patch.object(model_manager, "_write_download_status", side_effect=lambda _f, data: written.append(data)),
+        ):
+            await model_manager._download_model_task(DownloadParams(model_id="black-forest-labs/FLUX.1-dev"))
+
+        assert [record["status"] for record in written] == ["downloading"]
+        assert model_manager._cancelled_downloads == set()
+
+    @pytest.mark.asyncio
     async def test_the_pinned_revision_reaches_the_message(self, model_manager: ModelManager) -> None:
         event = b'\n{"error_type": "revision_not_found", "error_message": "404 Client Error."}\n'
 

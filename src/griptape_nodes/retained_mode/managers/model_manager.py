@@ -377,6 +377,10 @@ class ModelManager(EngineScoped):
         super().__init__(engine)
         self._download_tasks = {}
         self._download_processes = {}
+        # Model ids whose subprocess this manager killed on purpose. A killed child exits
+        # non-zero with no verdict, which is indistinguishable from a crash unless the side
+        # that did the killing says so.
+        self._cancelled_downloads: set[str] = set()
 
         if event_manager is not None:
             event_manager.assign_manager_to_request_type(DownloadModelRequest, self.on_handle_download_model_request)
@@ -678,6 +682,12 @@ class ModelManager(EngineScoped):
                     "progress_percent": 100.0,
                 }
                 await asyncio.to_thread(self._write_download_status, status_file, final_data)
+            elif model_id in self._cancelled_downloads:
+                # Killing the child is how a cancel is carried out, so its non-zero exit is the
+                # expected end of one. The cancelling handler removes the status file itself;
+                # writing a terminal status here would either race that or leave a "Failed" row
+                # for a download the user stopped on purpose.
+                logger.info("Download of model '%s' was cancelled", model_id)
             else:
                 # The child's structured event is the only thing here that describes the
                 # failure. Its stderr also carries progress frames and library warnings, so
@@ -706,6 +716,9 @@ class ModelManager(EngineScoped):
         finally:
             if model_id in self._download_processes:
                 del self._download_processes[model_id]
+            # Discarded here rather than where it is read, so a claim left by a kill that lost
+            # the race to a finishing download cannot make the next failure read as a cancel.
+            self._cancelled_downloads.discard(model_id)
 
     async def on_handle_list_models_request(self, request: ListModelsRequest) -> ResultPayload:  # noqa: ARG002
         """Handle model listing requests asynchronously.
@@ -1386,6 +1399,9 @@ class ModelManager(EngineScoped):
             # Cancel active download process if it exists
             if model_id in self._download_processes:
                 process = self._download_processes[model_id]
+                # Claimed before the kill, because the task can reach its own exit handling as
+                # soon as the process dies and has to find the claim already there.
+                self._cancelled_downloads.add(model_id)
                 await cancel_subprocess(process, f"download process for model '{model_id}'")
                 del self._download_processes[model_id]
 
