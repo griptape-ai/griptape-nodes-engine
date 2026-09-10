@@ -52,6 +52,22 @@ class DownloadErrorKind(StrEnum):
     UNKNOWN = "unknown"
 
 
+RETRYABLE_KINDS = frozenset(
+    {
+        DownloadErrorKind.NETWORK_UNREACHABLE,
+        DownloadErrorKind.RATE_LIMITED,
+        DownloadErrorKind.UNKNOWN,
+    }
+)
+"""Kinds a later attempt can get past on its own.
+
+Everything else needs the user to do something first -- add a token, be granted access, fix
+an id, free a disk -- and they start the download again when they have. Retrying those on a
+timer only spends a subprocess to reach the same verdict. `UNKNOWN` is in because it covers
+Hub downtime, which does clear on its own.
+"""
+
+
 class DownloadFailure(NamedTuple):
     """A child's verdict on a failed download.
 

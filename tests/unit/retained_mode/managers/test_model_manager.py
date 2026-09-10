@@ -14,6 +14,7 @@ import importlib.util
 import io
 import json
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -932,3 +933,51 @@ class TestAppInitializationCompleteWorkerGuard:
 
         find_unfinished.assert_called_once()
         assert handle_download.await_args_list[0].args[0].model_id == "org/model"
+
+
+# ---------------------------------------------------------------------------
+# _find_unfinished_downloads — which failures are worth another attempt
+# ---------------------------------------------------------------------------
+
+
+class TestFindUnfinishedDownloads:
+    """A failure the user has to act on first must not be retried once per engine start."""
+
+    @pytest.fixture
+    def status_dir(self, model_manager: ModelManager, tmp_path: Path) -> Iterator[Path]:
+        with patch.object(model_manager, "_get_status_directory", return_value=tmp_path):
+            yield tmp_path
+
+    def _write(self, status_dir: Path, model_id: str, **fields: Any) -> None:
+        record = {"model_id": model_id, "started_at": "s", "updated_at": "u", **fields}
+        (status_dir / f"{model_id.replace('/', '--')}.json").write_text(json.dumps(record), encoding="utf-8")
+
+    def test_an_interrupted_download_is_resumed(self, model_manager: ModelManager, status_dir: Path) -> None:
+        self._write(status_dir, "org/interrupted", status="downloading")
+
+        assert model_manager._find_unfinished_downloads() == ["org/interrupted"]
+
+    def test_a_failure_that_clears_on_its_own_is_retried(self, model_manager: ModelManager, status_dir: Path) -> None:
+        self._write(status_dir, "org/offline", status="failed", error_kind="network_unreachable")
+
+        assert model_manager._find_unfinished_downloads() == ["org/offline"]
+
+    def test_a_failure_needing_the_user_first_is_not_retried(
+        self, model_manager: ModelManager, status_dir: Path
+    ) -> None:
+        """Without a token, this one reached the same 401 on every engine start, forever."""
+        self._write(status_dir, "org/gated", status="failed", error_kind="gated_unauthenticated")
+
+        assert model_manager._find_unfinished_downloads() == []
+
+    def test_a_failure_recorded_before_kinds_existed_is_still_retried(
+        self, model_manager: ModelManager, status_dir: Path
+    ) -> None:
+        self._write(status_dir, "org/legacy", status="failed")
+
+        assert model_manager._find_unfinished_downloads() == ["org/legacy"]
+
+    def test_a_completed_download_is_left_alone(self, model_manager: ModelManager, status_dir: Path) -> None:
+        self._write(status_dir, "org/done", status="completed")
+
+        assert model_manager._find_unfinished_downloads() == []

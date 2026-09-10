@@ -61,6 +61,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
 from griptape_nodes.retained_mode.managers.settings import MODELS_TO_DOWNLOAD_KEY
 from griptape_nodes.utils.async_utils import cancel_subprocess
 from griptape_nodes.utils.model_download_errors import (
+    RETRYABLE_KINDS,
     DownloadErrorKind,
     DownloadFailure,
     describe,
@@ -709,6 +710,9 @@ class ModelManager(EngineScoped):
                     "updated_at": current_time,
                     "failed_at": current_time,
                     "error_message": error_msg,
+                    # Recorded so a resume can tell a failure that will clear on its own from one
+                    # that needs the user first. Not part of ModelDownloadStatus: nothing renders it.
+                    "error_kind": failure.kind.value,
                 }
                 await asyncio.to_thread(self._write_download_status, status_file, final_data)
                 raise ValueError(error_msg)
@@ -1161,10 +1165,16 @@ class ModelManager(EngineScoped):
         return statuses
 
     def _find_unfinished_downloads(self) -> list[str]:
-        """Find model IDs with unfinished downloads from status files.
+        """Find model IDs worth picking up again from status files.
+
+        A download interrupted mid-transfer always is. A failed one only is when its recorded
+        kind is something a later attempt gets past on its own: a gated model with no token, or
+        an id that does not exist, reaches the same verdict every time, and resuming it spends a
+        subprocess per engine start to log the same error until the user deletes the row. A
+        failure written before the kind was recorded is retried, which is what it did before.
 
         Returns:
-            list[str]: List of model IDs with status 'downloading' or 'failed'
+            list[str]: List of model IDs to download again
         """
         status_dir = self._get_status_directory()
 
@@ -1179,11 +1189,23 @@ class ModelManager(EngineScoped):
 
             status = data.get("status", "")
             model_id = data.get("model_id", "")
+            if not model_id:
+                continue
 
-            if model_id and status in ("downloading", "failed"):
+            interrupted = status == "downloading"
+            retryable_failure = status == "failed" and self._failure_is_worth_retrying(data)
+            if interrupted or retryable_failure:
                 unfinished_models.append(model_id)
 
         return unfinished_models
+
+    @staticmethod
+    def _failure_is_worth_retrying(data: dict) -> bool:
+        """Whether a failed download's recorded kind is one a later attempt can get past."""
+        recorded_kind = data.get("error_kind")
+        if recorded_kind is None:
+            return True
+        return recorded_kind in RETRYABLE_KINDS
 
     async def on_handle_list_model_downloads_request(self, request: ListModelDownloadsRequest) -> ResultPayload:
         """Handle model download status requests asynchronously.
