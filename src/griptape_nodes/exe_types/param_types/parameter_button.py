@@ -190,10 +190,6 @@ class ParameterButton(Parameter):
         # Store href for property access
         self._href = href
 
-        # Merge button UI options into parameter UI options
-        button_ui_options = button_trait.ui_options_for_trait()
-        ui_options.update(button_ui_options)
-
         # Add button trait to traits set
         # Button is a Trait, so it can be added to the traits set
         if traits is None:
@@ -278,7 +274,9 @@ class ParameterButton(Parameter):
         """Set the button label (display text only - separate from parameter value)."""
         # Update button trait (primary source of truth for display)
         self._get_button_trait().label = value
-        # Update UI options
+        # Not stored: authored_ui_options subtracts the keys the trait renders. This call is
+        # here for the update event its setter emits, which is what tells the editor the
+        # button restyled. The other button properties below write for the same reason.
         self.update_ui_options_key("button_label", value)
 
     @property

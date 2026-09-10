@@ -1,6 +1,9 @@
-"""Trait-derived UI options must stay owned by the trait, never copied into stored state."""
+"""Trait-derived UI options must stay owned by the trait, never saved as stored state."""
 
 from griptape_nodes.exe_types.core_types import Parameter
+from griptape_nodes.exe_types.param_types.parameter_button import ParameterButton
+from griptape_nodes.exe_types.param_types.parameter_json import ParameterJson
+from griptape_nodes.traits.button import Button
 from griptape_nodes.traits.options import Options
 from griptape_nodes.traits.slider import Slider
 
@@ -124,3 +127,46 @@ class TestClearingAUIOption:
         parameter.display_name = None
 
         assert parameter.authored_ui_options() == {}
+
+
+class TestOwnershipHoldsWhateverOrderThingsHappenIn:
+    """A trait can attach before or after a key is written, and neither order stores a copy."""
+
+    def test_a_constructor_handed_a_trait_owned_key_stores_none_of_it(self) -> None:
+        # ParameterButton renders its Button trait's options and passes them down to
+        # Parameter.__init__, which assigns _ui_options directly rather than through the
+        # setter. Storing them would leave the save carrying a copy of the trait.
+        parameter = ParameterButton(name="go", label="Original", icon="play")
+
+        assert "button_label" not in parameter.authored_ui_options()
+        assert parameter.ui_options["button_label"] == "Original"
+
+    def test_a_trait_change_still_reaches_the_ui_after_construction(self) -> None:
+        parameter = ParameterButton(name="go", label="Original")
+
+        parameter.label = "Changed"
+
+        assert parameter.ui_options["button_label"] == "Changed"
+
+    def test_attaching_a_trait_takes_over_a_key_already_authored(self) -> None:
+        # The reverse order: the key is authored while nothing owns it, then a trait that
+        # renders it attaches. The authored value must stop being reported and stop being
+        # saved, or it shadows the trait that now owns it.
+        parameter = ParameterJson(name="payload", tooltip="JSON")
+        parameter.button_label = "Mine"
+
+        parameter.add_trait(Button(label="Go"))
+
+        assert "button_label" not in parameter.authored_ui_options()
+        assert parameter.ui_options["button_label"] == "Go"
+
+    def test_detaching_a_trait_hands_back_the_authored_value(self) -> None:
+        parameter = ParameterJson(name="payload", tooltip="JSON")
+        parameter.button_label = "Mine"
+        button = Button(label="Go")
+        parameter.add_trait(button)
+
+        parameter.remove_trait(button)
+
+        assert parameter.authored_ui_options()["button_label"] == "Mine"
+        assert parameter.ui_options["button_label"] == "Mine"
