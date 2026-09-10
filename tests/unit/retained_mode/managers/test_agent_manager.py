@@ -8,18 +8,22 @@ the real config system.
 
 import asyncio
 import json
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import httpx
 import pytest
-from pydantic_ai.exceptions import ModelHTTPError, ModelRetry
+from pydantic_ai.exceptions import ModelHTTPError, ModelRetry, UnexpectedModelBehavior
 from pydantic_ai.messages import BinaryContent, ImageUrl, ModelMessage, ModelRequest, UserPromptPart
+from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 
 from griptape_nodes.agents.pydantic_ai.runner import (
     AgentRunResult,
+    PydanticAgentRunner,
     RunEvent,
     TextDelta,
     ThinkingDelta,
@@ -35,6 +39,7 @@ from griptape_nodes.drivers.cloud_models import (
     ProviderCatalogEntry,
     provider_catalog_entries,
 )
+from griptape_nodes.drivers.thread_storage.local_thread_storage_driver import LocalThreadStorageDriver
 from griptape_nodes.retained_mode.events.agent_events import (
     AgentStreamEvent,
     AgentThinkingEvent,
@@ -1185,8 +1190,109 @@ class TestExplainAgentRunError:
 
         assert "not entitled" not in message
 
+    @pytest.mark.asyncio
+    async def test_tool_retry_exhaustion_drops_pydantic_ai_jargon(
+        self, providers_manager: AgentManager, tmp_path: Path
+    ) -> None:
+        """The retry limit and the pydantic-ai docs link mean nothing to the person chatting.
+
+        Driven through a real run so the message this parses is the one pydantic-ai
+        raises. A hand-written `UnexpectedModelBehavior` would keep passing after an
+        upgrade reworded it, which is when the branch stops firing.
+        """
+        exc = await _exhaust_tool_retries(tmp_path, {"id": "no-such-skill"})
+
+        message = providers_manager._explain_agent_run_error(exc, "my-ollama")
+
+        assert "max retries" not in message
+        assert "https://" not in message
+        assert "'load_capability'" in message
+        assert isinstance(exc.__cause__, ModelRetry)
+        assert exc.__cause__.message in message
+
+    @pytest.mark.asyncio
+    async def test_tool_retry_exhaustion_on_bad_args_still_names_the_tool(
+        self, providers_manager: AgentManager, tmp_path: Path
+    ) -> None:
+        """Args the tool's schema rejects raise `ValidationError`, so there is no correction to quote."""
+        exc = await _exhaust_tool_retries(tmp_path, {"bogus_arg": 1})
+
+        message = providers_manager._explain_agent_run_error(exc, "my-ollama")
+
+        assert "max retries" not in message
+        assert "'load_capability'" in message
+        assert not isinstance(exc.__cause__, ModelRetry)
+
+    @pytest.mark.asyncio
+    async def test_tool_retry_exhaustion_names_a_tool_holding_an_apostrophe(
+        self, providers_manager: AgentManager, tmp_path: Path
+    ) -> None:
+        """Pydantic AI quotes the name with `repr()`, which uses double quotes when it holds an apostrophe.
+
+        Reachable through MCP, where a tool is named `<server>_<tool>` and the
+        server name is whatever the user typed. Built by swapping the name into a
+        real message so the rest of the wording stays the library's.
+        """
+        raised = await _exhaust_tool_retries(tmp_path, {"id": "no-such-skill"})
+        tool = "dev's box_always_bad"
+        exc = UnexpectedModelBehavior(str(raised).replace(repr("load_capability"), repr(tool)))
+
+        message = providers_manager._explain_agent_run_error(exc, "my-ollama")
+
+        assert f'"{tool}"' in str(exc)
+        assert "max retries" not in message
+        assert tool in message
+
+    def test_other_unexpected_model_behavior_keeps_original_message(self, providers_manager: AgentManager) -> None:
+        message = providers_manager._explain_agent_run_error(
+            UnexpectedModelBehavior("Received empty model response"), "my-ollama"
+        )
+
+        assert message == "Received empty model response"
+
 
 _CLOUD_HOST = "cloud.griptape.ai"
+
+
+async def _exhaust_tool_retries(tmp_path: Path, tool_args: dict[str, Any]) -> UnexpectedModelBehavior:
+    """Spend `load_capability`'s retry budget on `tool_args`, returning what pydantic-ai raises.
+
+    The model calls the tool the same wrong way every request, so the run ends with
+    the real ``UnexpectedModelBehavior`` rather than a fixture standing in for it.
+    """
+    workspace = tmp_path / "ws"
+    skill_dir = workspace / ".agents/skills/demo-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: demo-skill\ndescription: Demo skill description.\n---\n\nGuidance for the task."
+    )
+    storage = LocalThreadStorageDriver(tmp_path / "threads", config_manager=None, secrets_manager=None)  # type: ignore[arg-type]
+    runner = PydanticAgentRunner(
+        model_name="test",
+        api_key="dummy",
+        workspace_root=workspace,
+        storage=storage,
+    )
+
+    calls = 0
+
+    async def stream(_messages: list[ModelMessage], _info: AgentInfo) -> AsyncIterator[Any]:
+        nonlocal calls
+        calls += 1
+        yield {
+            0: DeltaToolCall(
+                name="load_capability",
+                json_args=json.dumps(tool_args),
+                tool_call_id=f"call-{calls}",
+            )
+        }
+
+    with (
+        runner.agent.override(model=FunctionModel(stream_function=stream)),
+        pytest.raises(UnexpectedModelBehavior) as raised,
+    ):
+        await runner.run("go")
+    return raised.value
 
 
 def _httpx_403(url: str) -> httpx.HTTPStatusError:

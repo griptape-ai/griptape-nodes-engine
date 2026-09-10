@@ -55,6 +55,7 @@ from griptape_nodes.agents.pydantic_ai.image_tools import (
     register_image_tools,
 )
 from griptape_nodes.agents.pydantic_ai.model import build_model
+from griptape_nodes.agents.pydantic_ai.tool_retries import DEFAULT_TOOL_MAX_RETRIES
 from griptape_nodes.drivers.cloud_models import ProviderID
 
 if TYPE_CHECKING:
@@ -174,6 +175,7 @@ class PydanticAgentRunner:
     skills_directory: str = DEFAULT_SKILLS_DIRECTORY
     usage_limits: UsageLimits | None = None
     model_settings: ModelSettings | None = None
+    retries: int = DEFAULT_TOOL_MAX_RETRIES
 
     _agent: Agent[Any, str] = field(init=False)
     _image_toolset: ImageGenerationToolset | None = field(init=False, default=None)
@@ -184,6 +186,7 @@ class PydanticAgentRunner:
         agent_kwargs: dict[str, Any] = {
             "instructions": instructions,
             "toolsets": toolsets or None,
+            "retries": self.retries,
         }
         if self.system_prompt:
             agent_kwargs["system_prompt"] = self.system_prompt
@@ -206,13 +209,14 @@ class PydanticAgentRunner:
         resolved_settings = model.settings or {}
         logger.info(
             "PydanticAgentRunner ready: model=%s workspace=%s mcp_servers=%d image_tool=%s skills_library=%s "
-            "usage_limits=%s max_tokens=%s",
+            "usage_limits=%s retries=%d max_tokens=%s",
             self.model_name,
             self.workspace_root,
             len(self.mcp_servers),
             self._image_toolset is not None,
             self._skills_library(),
             self.usage_limits,
+            self.retries,
             # "provider default" is the honest description of sending no
             # max_tokens: the ceiling exists, we just don't choose it.
             resolved_settings.get("max_tokens", "provider default"),
