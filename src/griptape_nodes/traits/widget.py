@@ -1,9 +1,6 @@
-from dataclasses import dataclass
-
 from griptape_nodes.exe_types.core_types import Trait
 
 
-@dataclass(eq=False, kw_only=True)
 class Widget(Trait):
     """Associates a parameter with a UI widget from a library.
 

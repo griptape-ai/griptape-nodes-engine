@@ -1,22 +1,20 @@
-"""A trait that writes its own __init__ must not declare dataclass fields.
+"""A trait initializes the element it is, whichever way it declares its constructor.
 
-@dataclass does not replace an __init__ found in the class body, so the generated one, and
-every field default feeding it, is discarded. A field declared alongside a hand-written
-constructor is therefore inert at best: ``field(default=x)`` leaves a class attribute that
-masks the deadness, and ``field(default_factory=...)`` leaves nothing at all, so reading the
-attribute raises unless the constructor happens to set it. AddParameterButton.type and
-Slider._allowed_modes both shipped that way.
+``BaseNodeElement`` is not a dataclass, so nothing generates a constructor that quietly
+skips it. A trait either writes an ``__init__`` that calls ``super().__init__()``, or
+inherits one. What must not happen is a constructor that runs without the base attributes
+being set, which is how a trait ends up with no ``element_id`` and fails only later, at the
+point something tries to hash it or send it to the editor.
 """
 
 import dataclasses
 import importlib
-import inspect
 import pkgutil
 
 import pytest
 
 import griptape_nodes.traits
-from griptape_nodes.exe_types.core_types import Trait
+from griptape_nodes.exe_types.core_types import BaseNodeElement, Trait
 
 
 def _in_tree_traits() -> list[type[Trait]]:
@@ -33,20 +31,50 @@ def _in_tree_traits() -> list[type[Trait]]:
     return [found[key] for key in sorted(found)]
 
 
-def _own_field_names(trait_class: type[Trait]) -> list[str]:
-    """Field names this class declares itself, with ClassVars and inherited fields excluded."""
-    declared = set(inspect.get_annotations(trait_class))
-    fields = {field.name for field in dataclasses.fields(trait_class)}
-    return sorted(declared & fields)
+IN_TREE_TRAITS = _in_tree_traits()
 
 
-@pytest.mark.parametrize("trait_class", _in_tree_traits(), ids=lambda cls: cls.__name__)
-def test_a_hand_written_constructor_comes_with_no_field_declarations(trait_class: type[Trait]) -> None:
-    """A field declared beside a hand-written __init__ is inert, so there should be none."""
-    if "__init__" not in trait_class.__dict__:
-        pytest.skip("uses the generated constructor, so its field defaults do run")
+def test_the_element_base_is_not_a_dataclass() -> None:
+    """The premise the rest of this file rests on, and what keeps trait constructors clean.
 
-    assert _own_field_names(trait_class) == [], (
-        f"{trait_class.__name__} declares its own __init__, so these field defaults never run. "
-        f"Set the attributes in __init__ instead, annotating them there if the type matters."
-    )
+    A generated constructor on the base would publish ``_children``, ``_parent``, and the
+    rest of the element wiring as arguments to every trait.
+    """
+    assert not dataclasses.is_dataclass(BaseNodeElement)
+
+
+@pytest.mark.parametrize("trait_class", IN_TREE_TRAITS, ids=lambda cls: cls.__name__)
+def test_a_trait_is_not_a_dataclass(trait_class: type[Trait]) -> None:
+    """A generated constructor would set the trait's fields and never reach the base one.
+
+    The trait would come out with no ``element_id``, failing later at whatever first reads
+    it. Write ``__init__`` and call ``super().__init__()``.
+    """
+    assert not dataclasses.is_dataclass(trait_class)
+
+
+@pytest.mark.parametrize("trait_class", IN_TREE_TRAITS, ids=lambda cls: cls.__name__)
+def test_a_trait_constructs_with_its_element_attributes_set(trait_class: type[Trait]) -> None:
+    """Default-constructible traits must come out as usable elements."""
+    try:
+        trait = trait_class()
+    except TypeError:
+        pytest.skip("requires constructor arguments; covered by the round-trip tests")
+
+    assert trait.element_id
+    assert trait.element_type
+    assert trait.name
+    assert trait.get_badge() is None
+    assert hash(trait) == hash(trait.element_id)
+
+
+@pytest.mark.parametrize("trait_class", IN_TREE_TRAITS, ids=lambda cls: cls.__name__)
+def test_a_trait_does_not_report_element_wiring_as_state(trait_class: type[Trait]) -> None:
+    """State is the trait's own constructor arguments, never the base element's.
+
+    ``name`` is exempt: it is the one base attribute a trait may reasonably declare as a
+    constructor argument of its own, and ``Widget`` does.
+    """
+    element_wiring = {"element_id", "element_type", "parent_group_name", "_children", "_parent"}
+
+    assert element_wiring.isdisjoint(trait_class._state_parameter_names())

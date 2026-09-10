@@ -281,29 +281,50 @@ class ParameterType:
         return ParameterType.KeyValueTypePair(key_type=key_type, value_type=value_type)
 
 
-@dataclass(kw_only=True)
 class BaseNodeElement:
-    element_id: str = field(default_factory=lambda: str(uuid.uuid4().hex))
-    element_type: str = field(default_factory=lambda: BaseNodeElement.__name__)
-    name: str = field(default_factory=lambda: str(f"{BaseNodeElement.__name__}_{uuid.uuid4().hex}"))
-    parent_group_name: str | None = None
-    _changes: dict[str, Any] = field(default_factory=dict)
+    """Base of the node element tree: parameters, groups, messages, and traits.
 
-    _children: list[BaseNodeElement] = field(default_factory=list)
+    Deliberately not a dataclass. Its five private attributes are internal wiring, and a
+    generated ``__init__`` would publish them as constructor arguments to every subclass,
+    which is why each subclass used to hand-write an ``__init__`` purely to hide them again.
+
+    A subclass hand-writes its own ``__init__`` and calls ``super().__init__()``. It is not
+    a dataclass either: a generated constructor would set the subclass's fields and never
+    reach this one, leaving the element without an ``element_id``.
+    """
+
     _stack: ClassVar[list[BaseNodeElement]] = []
-    _parent: BaseNodeElement | None = field(default=None)
-    _node_context: BaseNode | None = field(default=None)
-    _badge: BadgeData | None = field(default=None)
+
+    def __init__(
+        self,
+        *,
+        element_id: str | None = None,
+        element_type: str | None = None,
+        name: str | None = None,
+        parent_group_name: str | None = None,
+    ) -> None:
+        # element_type and name fall back to "BaseNodeElement" rather than the subclass name,
+        # which is what the generated constructor did. to_dict() reports the class name
+        # instead, so the two disagree; the alter-element event reads this attribute.
+        self.element_id: str = element_id if element_id is not None else uuid.uuid4().hex
+        self.element_type: str = element_type if element_type is not None else BaseNodeElement.__name__
+        self.name: str = name if name is not None else f"{BaseNodeElement.__name__}_{uuid.uuid4().hex}"
+        self.parent_group_name: str | None = parent_group_name
+        self._changes: dict[str, Any] = {}
+        self._children: list[BaseNodeElement] = []
+        self._parent: BaseNodeElement | None = None
+        self._node_context: BaseNode | None = None
+        self._badge: BadgeData | None = None
+
+        # Adopt into the element open as a context manager, if there is one. Runs last so a
+        # parent's add_child sees a fully built child.
+        current = BaseNodeElement.get_current()
+        if current is not None:
+            current.add_child(self)
 
     @property
     def children(self) -> list[BaseNodeElement]:
         return self._children
-
-    def __post_init__(self) -> None:
-        # If there's currently an active element, add this new element as a child
-        current = BaseNodeElement.get_current()
-        if current is not None:
-            current.add_child(self)
 
     def __enter__(self) -> Self:
         # Push this element onto the global stack
@@ -3291,10 +3312,8 @@ class ParameterDictionary(ParameterContainer):
 class AuthoredInit(NamedTuple):
     """The constructor a Trait subclass declared in its own body.
 
-    Captured by ``Trait.__init_subclass__`` at class creation, which runs before
-    ``@dataclass`` can add a generated ``__init__``. So a record existing at all is proof
-    the author wrote one, with no need to tell hand-written code from generated code after
-    the fact.
+    Captured by ``Trait.__init_subclass__`` at class creation, which runs before a decorator
+    on the class can add a generated ``__init__``.
     """
 
     parameter_names: tuple[str, ...]
@@ -3302,7 +3321,6 @@ class AuthoredInit(NamedTuple):
     forwards_keywords: bool
 
 
-@dataclass(eq=False)
 class Trait(ABC, BaseNodeElement):
     # Maps an ``__init__`` parameter name to the attribute that holds its
     # value, for traits whose constructor arguments are spelled differently from their
@@ -3319,28 +3337,11 @@ class Trait(ABC, BaseNodeElement):
     _AUTHORED_INIT: ClassVar[AuthoredInit]
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
-        """Record the ``__init__`` this subclass declared, before ``@dataclass`` adds one.
-
-        Runs while the class body is being turned into a class, which is strictly earlier
-        than any decorator on it. So an ``__init__`` in ``cls.__dict__`` at this moment is
-        the author's by construction. Stored per class, because ``_state_parameter_names``
-        needs to know which classes in the MRO declared one.
-        """
+        """Record the ``__init__`` this subclass declared in its own body."""
         super().__init_subclass__(**kwargs)
-        authored_init = cls.__dict__.get("__init__")
-        if authored_init is None:
-            return
-        parameters = inspect.signature(authored_init).parameters.values()
-        cls._AUTHORED_INIT = AuthoredInit(
-            parameter_names=tuple(
-                parameter.name
-                for parameter in parameters
-                if parameter.name != "self"
-                and parameter.kind is not inspect.Parameter.VAR_POSITIONAL
-                and parameter.kind is not inspect.Parameter.VAR_KEYWORD
-            ),
-            forwards_keywords=any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters),
-        )
+        cls_authored_init = cls._authored_init(cls)
+        if cls_authored_init is not None:
+            cls._AUTHORED_INIT = cls_authored_init
 
     def __hash__(self) -> int:
         # Use a unique, immutable attribute for hashing
@@ -3500,10 +3501,8 @@ class Trait(ABC, BaseNodeElement):
     def _state_parameter_names(cls) -> list[str]:
         """Return the constructor parameters this trait's authors declared, nearest first.
 
-        Reads the names captured by ``__init_subclass__`` rather than inspecting whatever
-        ``__init__`` the class ended up with, because a trait that declares none still
-        inherits a ``@dataclass``-generated one whose signature is ``BaseNodeElement``'s
-        fields. Reporting those would save engine internals such as ``_children`` as state.
+        Reads the names captured by ``__init_subclass__``, and stops at ``Trait``, so the
+        base element constructor's parameters are never mistaken for trait state.
 
         Merges up the MRO instead of stopping at the nearest declaration, so a trait that
         inherits part of its constructor keeps the inherited arguments. The walk stops at a
@@ -3524,6 +3523,24 @@ class Trait(ABC, BaseNodeElement):
             if not declared.forwards_keywords:
                 break
         return names
+
+    @staticmethod
+    def _authored_init(klass: type) -> AuthoredInit | None:
+        """Describe the ``__init__`` in ``klass``'s own body, or None when it declares none."""
+        authored_init = klass.__dict__.get("__init__")
+        if authored_init is None:
+            return None
+        parameters = inspect.signature(authored_init).parameters.values()
+        return AuthoredInit(
+            parameter_names=tuple(
+                parameter.name
+                for parameter in parameters
+                if parameter.name != "self"
+                and parameter.kind is not inspect.Parameter.VAR_POSITIONAL
+                and parameter.kind is not inspect.Parameter.VAR_KEYWORD
+            ),
+            forwards_keywords=any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters),
+        )
 
     @classmethod
     @abstractmethod

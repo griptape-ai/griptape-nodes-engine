@@ -1,5 +1,4 @@
 import logging
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Literal, get_args
 
 from griptape_nodes.exe_types.callback_binding import is_derived_from_state, mark_derived_from_state
@@ -81,7 +80,6 @@ class SetButtonStatusMessagePayload(NodeMessagePayload):
     updates: dict[str, str | bool | None]
 
 
-@dataclass(eq=False)
 class Button(Trait):
     # The two callbacks are behavior, not state, so they are never saved as state. They are
     # carried by method name instead, which is why they still need an attribute mapping.
@@ -120,9 +118,8 @@ class Button(Trait):
         get_button_state: GetButtonStateCallback | None = None,
     ) -> None:
         super().__init__(element_id="Button")
-        # Annotated here rather than declared as dataclass fields: this class writes its own
-        # __init__, so a field default would never run, and setattr in on_message_received
-        # tells the type checker nothing about what these hold.
+        # Annotated here because setattr in on_message_received tells the type checker
+        # nothing about what these hold.
         self.label: str = label
         self.variant: ButtonVariant = variant
         self.size: ButtonSize = size
