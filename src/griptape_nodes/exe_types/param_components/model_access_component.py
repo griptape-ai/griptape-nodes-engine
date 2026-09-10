@@ -1,10 +1,15 @@
 """Model-access parameter component for license/policy-gated dropdowns.
 
 Owns the model list and decorates a node's model-selection ``Parameter`` with
-an ``Options`` trait, an inline ``Button`` refresh trait, per-row entitlement
-icons + subtitles, an error badge on denied selections, and runtime denial
-queries. Node identity (parameter name, type, input_types, tooltip) stays with
-the node so saved workflows round-trip byte-identically.
+an ``Options`` trait, an inline ``Button`` refresh trait, per-row readable
+labels, per-row entitlement icons + subtitles, an error badge on denied
+selections, and runtime denial queries. Node identity (parameter name, type,
+input_types, tooltip) stays with the node so saved workflows round-trip
+byte-identically.
+
+Labels are display-only. A row's ``name`` remains the ``provider_model_id``, so
+what the parameter stores, what the proxy receives, and what provenance metadata
+records are all unchanged by how a row reads. See ``_build_ui_options``.
 
 ``model_choices`` are ``provider_model_id``s, which the component resolves to
 the catalog ``model_id`` the permission layer gates on. ``deprecated_values``
@@ -583,13 +588,31 @@ class ModelAccessComponent:
         Built from ``model_choices`` alone, never ``deprecated_values`` -- a
         legacy value is accepted when assigned but never offered as a fresh
         selection.
+
+        ``name`` stays the provider id on every row: it is what the UI pairs
+        against ``Options.choices``, what the parameter stores, and what the
+        node sends. ``label`` is the catalog's readable name and is the ONLY
+        place a display string is written -- it is deliberately not assigned to
+        the parameter, so provenance metadata (which reads the stored value)
+        keeps recording the exact provider id rather than a prettified name.
+        A choice the catalog does not describe carries no ``label`` and renders
+        as its id, which is what a dropdown did before labels existed.
         """
         data: list[dict[str, str]] = []
         for choice in self._model_choices:
+            row: dict[str, str] = {"name": choice}
+            display_name = self._snapshot.display_name_for(choice)
+            if display_name is not None:
+                row["label"] = display_name
+                # Only worth a second line once the first one is a name: the id is
+                # otherwise already the visible text.
+                row["subtitle"] = choice
             if self._cached_denial(choice) is not None:
-                data.append({"name": choice, "icon": DENIED_ROW_ICON, "subtitle": DENIED_ROW_SUBTITLE})
-            else:
-                data.append({"name": choice})
+                row["icon"] = DENIED_ROW_ICON
+                # Outranks the id: it is the actionable line, and it keeps a denied row
+                # identical to HuggingFace's. The badge still quotes the id verbatim.
+                row["subtitle"] = DENIED_ROW_SUBTITLE
+            data.append(row)
         return {
             "data": data,
             "dropdown_row_icons": True,

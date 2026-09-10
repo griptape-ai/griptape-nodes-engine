@@ -254,14 +254,34 @@ class TestInstall:
             ui = param.ui_options
             assert ui["dropdown_row_icons"] is True
             assert ui["dropdown_row_subtitles"] is True
-            # Alpha row carries the denial decoration; beta is bare.
+            # Both rows keep the provider id as `name` and gain the catalog name as `label`.
+            # Alpha carries the denial decoration, whose subtitle outranks the id; beta shows the id.
             data_by_name = {row["name"]: row for row in ui["data"]}
+            assert data_by_name["alpha"]["label"] == "Alpha"
             assert data_by_name["alpha"]["icon"] == "shield-off"
             assert data_by_name["alpha"]["subtitle"] == "Not permitted by your license"
+            assert data_by_name["beta"]["label"] == "Beta"
             assert "icon" not in data_by_name["beta"]
-            assert "subtitle" not in data_by_name["beta"]
+            assert data_by_name["beta"]["subtitle"] == "beta"
         finally:
             engine.event_manager.remove_authorization_hook(deny_alpha)
+
+    def test_choice_the_catalog_does_not_describe_carries_no_label(self) -> None:
+        """An undeclared choice renders as its own id rather than an invented name.
+
+        The component does not synthesize a label, and it omits the id subtitle
+        too: with no label the id is already the row's visible text, so repeating
+        it would print the same string twice.
+        """
+        node, _helper = _install_probe_node_with_helper(
+            model_choices=["alpha", "gamma"],
+            default_model="alpha",
+        )
+
+        param = node.get_parameter_by_name("model")
+        assert param is not None
+        data_by_name = {row["name"]: row for row in param.ui_options["data"]}
+        assert data_by_name["gamma"] == {"name": "gamma"}
 
     def test_install_preserves_parameter_identity(self) -> None:
         """Install must not change parameter name / type / tooltip / stored value."""
