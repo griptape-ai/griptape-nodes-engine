@@ -114,10 +114,6 @@ def _emit_error_event(failure: DownloadFailure) -> None:
     Only emits when GRIPTAPE_NODES_PROGRESS_PIPE is set, i.e. when spawned by
     the ModelManager subprocess. On direct CLI invocations this is a no-op.
     Uses stderr to avoid mixing with stdout JSON progress events.
-
-    Every failed download emits one of these. It is the only channel by which the
-    parent learns why a download failed, because the parent cannot tell the human
-    text below apart from the progress bars and library warnings sharing the pipe.
     """
     if os.environ.get(_PROGRESS_PIPE_ENV_VAR) == "1":
         sys.stderr.write(format_error_event(failure))
