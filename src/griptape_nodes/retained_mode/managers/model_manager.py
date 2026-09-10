@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
-from huggingface_hub import get_token, list_models, scan_cache_dir, snapshot_download
+from huggingface_hub import list_models, scan_cache_dir, snapshot_download
 from huggingface_hub import model_info as hf_model_info
 from huggingface_hub.utils.tqdm import tqdm
 from xdg_base_dirs import xdg_data_home
@@ -823,13 +823,9 @@ class ModelManager(EngineScoped):
         Returns:
             ResultPayload: Success with exact size and metadata, or failure with error details
         """
-        if get_token() is None:
-            error_msg = (
-                "No Hugging Face token found. Fetching info for gated models requires authentication. "
-                "Set your HF_TOKEN environment variable or log in with `huggingface-cli login`."
-            )
-            return GetModelInfoResultFailure(result_details=error_msg)
-
+        # Deliberately no token check: a public model answers anonymously, and a gated one
+        # answers with a 401 the caller can report. Refusing up front meant a token-less user
+        # got no size for any model, gated or not.
         try:
             info = await asyncio.to_thread(hf_model_info, request.model_id)
         except Exception as e:

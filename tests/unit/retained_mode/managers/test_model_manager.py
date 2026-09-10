@@ -66,17 +66,26 @@ def model_manager() -> ModelManager:
 
 class TestOnHandleGetModelInfoRequest:
     @pytest.mark.asyncio
-    async def test_returns_failure_when_no_hf_token(self, model_manager: ModelManager) -> None:
+    async def test_a_public_model_answers_without_a_token(self, model_manager: ModelManager) -> None:
+        """Hugging Face serves a public model's metadata anonymously.
+
+        Refusing the lookup without a token left every model in the picker with no size, not
+        just the gated ones it was meant to speak for.
+        """
+        expected_size = 11_125_567_216
+        fake_info = SimpleNamespace(used_storage=expected_size, safetensors=None)
+
         with patch(
-            "griptape_nodes.retained_mode.managers.model_manager.get_token",
-            return_value=None,
-        ):
+            "griptape_nodes.retained_mode.managers.model_manager.hf_model_info",
+            return_value=fake_info,
+        ) as hf_info:
             result = await model_manager.on_handle_get_model_info_request(
-                GetModelInfoRequest(model_id="microsoft/phi-2")
+                GetModelInfoRequest(model_id="google/t5-v1_1-xxl")
             )
 
-        assert isinstance(result, GetModelInfoResultFailure)
-        assert "No Hugging Face token found" in str(result.result_details)
+        assert isinstance(result, GetModelInfoResultSuccess)
+        assert result.size_bytes == expected_size
+        assert hf_info.called
 
     @pytest.mark.asyncio
     async def test_returns_success_with_size_and_metadata(self, model_manager: ModelManager) -> None:
@@ -94,15 +103,9 @@ class TestOnHandleGetModelInfoRequest:
             likes=expected_likes,
         )
 
-        with (
-            patch(
-                "griptape_nodes.retained_mode.managers.model_manager.get_token",
-                return_value="hf_token",
-            ),
-            patch(
-                "griptape_nodes.retained_mode.managers.model_manager.hf_model_info",
-                return_value=fake_info,
-            ),
+        with patch(
+            "griptape_nodes.retained_mode.managers.model_manager.hf_model_info",
+            return_value=fake_info,
         ):
             result = await model_manager.on_handle_get_model_info_request(
                 GetModelInfoRequest(model_id="microsoft/phi-2")
@@ -120,15 +123,9 @@ class TestOnHandleGetModelInfoRequest:
 
     @pytest.mark.asyncio
     async def test_returns_failure_when_hf_api_raises(self, model_manager: ModelManager) -> None:
-        with (
-            patch(
-                "griptape_nodes.retained_mode.managers.model_manager.get_token",
-                return_value="hf_token",
-            ),
-            patch(
-                "griptape_nodes.retained_mode.managers.model_manager.hf_model_info",
-                side_effect=ValueError("model not found"),
-            ),
+        with patch(
+            "griptape_nodes.retained_mode.managers.model_manager.hf_model_info",
+            side_effect=ValueError("model not found"),
         ):
             result = await model_manager.on_handle_get_model_info_request(GetModelInfoRequest(model_id="bad/model"))
 
@@ -148,15 +145,9 @@ class TestOnHandleGetModelInfoRequest:
             likes=None,
         )
 
-        with (
-            patch(
-                "griptape_nodes.retained_mode.managers.model_manager.get_token",
-                return_value="hf_token",
-            ),
-            patch(
-                "griptape_nodes.retained_mode.managers.model_manager.hf_model_info",
-                return_value=fake_info,
-            ),
+        with patch(
+            "griptape_nodes.retained_mode.managers.model_manager.hf_model_info",
+            return_value=fake_info,
         ):
             result = await model_manager.on_handle_get_model_info_request(GetModelInfoRequest(model_id="some/model"))
 
@@ -708,12 +699,17 @@ class TestFailedDownloadMessages:
 
 class TestDownloadWithoutAToken:
     @pytest.mark.asyncio
-    async def test_a_missing_token_does_not_block_the_attempt(self, model_manager: ModelManager) -> None:
+    async def test_a_missing_token_does_not_block_the_attempt(
+        self, model_manager: ModelManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Public models download anonymously, and a gated one needs the 401 to reach the user.
 
         Refusing here also returned before any status file existed, leaving the editor's
         download list with no row to show a reason on.
         """
+        # No token discoverable from either place `huggingface_hub` looks for one.
+        monkeypatch.delenv("HF_TOKEN", raising=False)
+        monkeypatch.setenv("HF_TOKEN_PATH", "/nonexistent/hf/token")
         model_manager._download_tasks = {}
         model_manager._download_processes = {}
 
@@ -725,7 +721,6 @@ class TestDownloadWithoutAToken:
             return process
 
         with (
-            patch("griptape_nodes.retained_mode.managers.model_manager.get_token", return_value=None),
             patch("asyncio.create_subprocess_exec", side_effect=fake_create_subprocess_exec),
             patch.object(model_manager, "_write_download_status"),
         ):
