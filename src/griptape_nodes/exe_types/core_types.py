@@ -3401,15 +3401,35 @@ class Trait(ABC, BaseNodeElement):
         return state
 
     def apply_state(self, state: dict[str, Any]) -> None:
-        """Overwrite this trait's state in place.
+        """Overwrite this trait's state in place, reading it back out of the real constructor.
 
         Used when restoring a parameter the node's ``__init__`` already built: the trait
-        instance is kept and only its state is replaced, so anything the constructor
-        attached to it (a button's on_click, for one) is preserved. Rebuilding a fresh
-        instance from state would drop that.
+        instance is kept and only its state is replaced, so anything the constructor attached
+        to it (a button's on_click, for one) is preserved, along with its element id and its
+        place in the parameter's children. Rebuilding a fresh instance would drop all of that.
+
+        The values come from a throwaway the constructor built rather than straight off
+        ``state``, so a coercion or a default the constructor applies lands here too.
+        Otherwise the two restore paths disagree: ``MultiOptions`` snaps an unknown
+        ``icon_size`` back to "small" when built fresh, and a raw assignment would keep the
+        bad value. A state key the constructor accepts but stores nowhere is skipped, which
+        is the load-side counterpart of the warning ``to_state`` logs for it.
+
+        Only the keys ``state`` carries are written. A key it omits, because the file predates
+        the trait gaining that argument, keeps whatever the node's ``__init__`` chose rather
+        than being reset to the trait's default: a file that says nothing should not overrule
+        live code.
+
+        Raises:
+            TypeError: if ``state`` cannot satisfy the constructor. The caller reports it; a
+                half-applied trait would be worse than one left as ``__init__`` built it.
         """
-        for name, value in state.items():
-            setattr(self, self.STATE_ALIASES.get(name, name), value)
+        interpreted = type(self).from_state(state)
+        for name in state:
+            attribute_name = self.STATE_ALIASES.get(name, name)
+            if not hasattr(interpreted, attribute_name):
+                continue
+            setattr(self, attribute_name, getattr(interpreted, attribute_name))
         self._recompute_derived_state()
 
     def callback_names(self, owner: BaseNode | None) -> dict[str, str]:
