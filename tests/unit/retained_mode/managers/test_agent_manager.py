@@ -54,6 +54,9 @@ from griptape_nodes.retained_mode.events.agent_events import (
     DeleteAgentProviderResultSuccess,
     GetAgentConfigRequest,
     GetAgentConfigResultSuccess,
+    GetThreadMetadataRequest,
+    GetThreadMetadataResultFailure,
+    GetThreadMetadataResultSuccess,
     ListAgentModelsRequest,
     ListAgentModelsResultSuccess,
     ListAgentProvidersRequest,
@@ -66,6 +69,8 @@ from griptape_nodes.retained_mode.events.agent_events import (
     RunAgentRequest,
     RunAgentRequestArtifact,
     RunAgentResultSuccess,
+    RunRecord,
+    ThreadMetadata,
     UpdateAgentProviderRequest,
     UpdateAgentProviderResultFailure,
     UpdateAgentProviderResultSuccess,
@@ -1263,8 +1268,14 @@ class TestRunAgentResultPayloadContract:
 
         monkeypatch.setattr(manager, "_validate_thread_for_run", lambda _thread_id: "t1")
         monkeypatch.setattr(manager, "_build_runner", lambda *_a, **_k: SimpleNamespace(run=fake_run))
-        # A non-empty history keeps `is_first_run` False, so no thread metadata write.
-        manager._thread_storage = SimpleNamespace(load_history=lambda _t: [object()])  # type: ignore[assignment]
+        manager._active_provider_name = "griptape_cloud"
+        manager._providers = []
+        # A non-empty history keeps `is_first_run` False, so the title update is skipped.
+        manager._thread_storage = SimpleNamespace(  # type: ignore[assignment]
+            load_history=lambda _t: [object()],
+            update_thread_metadata=lambda _t, **_kw: {},
+            append_run_record=lambda thread_id, record: None,  # noqa: ARG005
+        )
         monkeypatch.setattr(
             _AGENT_MANAGER_MODULE + "._compose_prompt",
             _stub_compose_prompt,
@@ -1302,3 +1313,98 @@ class TestRunAgentResultPayloadContract:
         assert set(payload.output) == {"text", "message_count", "cancelled", "truncated", "generated_image_urls"}, (
             f"the {branch} branch's payload keys differ from the other branches'"
         )
+
+    @pytest.mark.asyncio
+    async def test_cancelled_run_does_not_append_run_record(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A cancelled run must not append a RunRecord — no assistant message was persisted."""
+        recorded: list[RunRecord] = []
+        result = AgentRunResult(thread_id="t1", output="partial", message_count=2, cancelled=True)
+        manager = self._manager(monkeypatch, result)
+        manager._thread_storage.append_run_record = lambda thread_id, record: recorded.append(record)  # noqa: ARG005
+
+        await manager._run_agent(_run_request())
+
+        assert recorded == [], "cancelled run must not record a RunRecord"
+
+    @pytest.mark.asyncio
+    async def test_normal_run_stores_provider_name_model_and_mcp_servers(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A successful run stores the resolved provider name, provider default model, and MCP servers."""
+        recorded: list[RunRecord] = []
+        result = AgentRunResult(thread_id="t1", output="done", message_count=2)
+        manager = self._manager(monkeypatch, result)
+        manager._providers = [ProviderConfig(name="my-ollama", type="ollama", model="llama3")]
+        manager._active_provider_name = "my-ollama"
+        manager._thread_storage.append_run_record = lambda thread_id, record: recorded.append(record)  # noqa: ARG005
+
+        req = RunAgentRequest(
+            input="hello",
+            url_artifacts=[],
+            thread_id="t1",
+            provider_name="my-ollama",
+            additional_mcp_servers=["brave"],
+        )
+        await manager._run_agent(req)
+
+        assert len(recorded) == 1
+        r = recorded[0]
+        assert r.message_index == 1  # message_count - 1
+        assert r.provider_name == "my-ollama"
+        assert r.model == "llama3", "model must come from the provider default, not be None"
+        assert r.mcp_servers == ["brave"]
+
+    @pytest.mark.asyncio
+    async def test_normal_run_explicit_model_name_takes_precedence(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When request.model_name is set it overrides the provider's default model."""
+        recorded: list[RunRecord] = []
+        result = AgentRunResult(thread_id="t1", output="done", message_count=2)
+        manager = self._manager(monkeypatch, result)
+        manager._providers = [ProviderConfig(name="my-ollama", type="ollama", model="llama3")]
+        manager._active_provider_name = "my-ollama"
+        manager._thread_storage.append_run_record = lambda thread_id, record: recorded.append(record)  # noqa: ARG005
+
+        req = RunAgentRequest(
+            input="hello",
+            url_artifacts=[],
+            thread_id="t1",
+            provider_name="my-ollama",
+            model_name="gpt-4o",
+        )
+        await manager._run_agent(req)
+
+        assert len(recorded) == 1
+        assert recorded[0].model == "gpt-4o", "explicit model_name must take precedence over provider default"
+
+
+class TestGetThreadMetadataHandler:
+    """`on_handle_get_thread_metadata_request` routing and guard behaviour."""
+
+    @staticmethod
+    def _manager(thread_exists: bool, metadata: object = None) -> AgentManager:  # noqa: FBT001
+        manager = AgentManager.__new__(AgentManager)
+        manager._thread_storage = SimpleNamespace(  # type: ignore[assignment]
+            thread_exists=lambda _tid: thread_exists,
+            get_thread_metadata=lambda _tid: metadata,
+        )
+        return manager
+
+    def test_missing_thread_returns_failure(self) -> None:
+        """A thread_id that doesn't exist must return GetThreadMetadataResultFailure."""
+        manager = self._manager(thread_exists=False)
+        result = manager.on_handle_get_thread_metadata_request(GetThreadMetadataRequest(thread_id="does-not-exist"))
+        assert isinstance(result, GetThreadMetadataResultFailure)
+
+    def test_existing_thread_returns_success_with_metadata(self) -> None:
+        """A valid thread_id must return GetThreadMetadataResultSuccess carrying the metadata."""
+        thread = ThreadMetadata(
+            thread_id="t1",
+            title="hello",
+            created_at="2024-01-01T00:00:00+00:00",
+            updated_at="2024-01-01T00:00:00+00:00",
+            message_count=2,
+            archived=False,
+            runs=[RunRecord(message_index=1, provider_name="griptape_cloud", model="gpt-4o")],
+        )
+        manager = self._manager(thread_exists=True, metadata=thread)
+        result = manager.on_handle_get_thread_metadata_request(GetThreadMetadataRequest(thread_id="t1"))
+        assert isinstance(result, GetThreadMetadataResultSuccess)
+        assert result.thread is thread
