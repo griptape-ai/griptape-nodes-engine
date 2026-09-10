@@ -156,11 +156,6 @@ def _create_progress_tracker(model_id: str) -> type[tqdm]:  # noqa: C901
 
         def display(self, *args, **kwargs) -> bool | None:
             """Render nothing while the parent is reading events off the pipe.
-
-            tqdm draws to stderr, which is also where a failure is reported. Suppressing
-            the drawing rather than passing tqdm `disable=True` keeps the bar's own
-            bookkeeping intact -- a disabled tqdm never records `desc` or `unit`, which is
-            how this class tells a byte-level bar from the file enumeration bar.
             """
             if self._emit_progress:
                 return False
