@@ -1223,6 +1223,26 @@ class TestExplainAgentRunError:
         assert "'load_capability'" in message
         assert not isinstance(exc.__cause__, ModelRetry)
 
+    @pytest.mark.asyncio
+    async def test_tool_retry_exhaustion_names_a_tool_holding_an_apostrophe(
+        self, providers_manager: AgentManager, tmp_path: Path
+    ) -> None:
+        """Pydantic AI quotes the name with `repr()`, which uses double quotes when it holds an apostrophe.
+
+        Reachable through MCP, where a tool is named `<server>_<tool>` and the
+        server name is whatever the user typed. Built by swapping the name into a
+        real message so the rest of the wording stays the library's.
+        """
+        raised = await _exhaust_tool_retries(tmp_path, {"id": "no-such-skill"})
+        tool = "dev's box_always_bad"
+        exc = UnexpectedModelBehavior(str(raised).replace(repr("load_capability"), repr(tool)))
+
+        message = providers_manager._explain_agent_run_error(exc, "my-ollama")
+
+        assert f'"{tool}"' in str(exc)
+        assert "max retries" not in message
+        assert tool in message
+
     def test_other_unexpected_model_behavior_keeps_original_message(self, providers_manager: AgentManager) -> None:
         message = providers_manager._explain_agent_run_error(
             UnexpectedModelBehavior("Received empty model response"), "my-ollama"

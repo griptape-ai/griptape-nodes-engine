@@ -267,8 +267,9 @@ def _friendly_list_models_error(exc: Exception, base_url: str | None) -> str | N
 # Pydantic AI's UnexpectedModelBehavior text for a tool that spent its retry
 # budget (`tool_manager.py`), which also carries the tool's name. Matched rather
 # than inferred from the exception's cause, which other UnexpectedModelBehavior
-# sites chain too.
-_TOOL_RETRIES_EXHAUSTED_PATTERN = re.compile(r"Tool '(?P<tool>[^']+)' exceeded max retries count of")
+# sites chain too. The name arrives from `repr()`, which switches to double
+# quotes for a name holding an apostrophe, so accept either quote.
+_TOOL_RETRIES_EXHAUSTED_PATTERN = re.compile(r"Tool (?P<q>['\"])(?P<tool>.+?)(?P=q) exceeded max retries count of")
 
 
 def _explain_tool_retry_exhaustion(exc: Exception) -> str | None:
