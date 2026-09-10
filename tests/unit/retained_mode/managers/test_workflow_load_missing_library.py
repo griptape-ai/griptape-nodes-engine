@@ -79,6 +79,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 )
 from griptape_nodes.retained_mode.managers.fitness_problems.workflows import LibraryNotRegisteredProblem
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
+from griptape_nodes.retained_mode.managers.workflow_manager import WorkflowManager
 from griptape_nodes.utils.version_utils import engine_version
 
 if TYPE_CHECKING:
@@ -86,6 +87,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from griptape_nodes.retained_mode.engine import Engine
+    from griptape_nodes.retained_mode.managers.fitness_problems.workflows import WorkflowProblem
 
 _FLOW_NAME = "ControlFlow_1"
 _AVAILABLE_LIBRARY = "Missing Library Fixture (Available)"
@@ -271,6 +273,43 @@ def _save_two_library_workflow(tmp_path: Path, file_stem: str = "two_library_wor
     return f"{file_stem}.py"
 
 
+def _save_flow_as_workflow(engine: Engine, tmp_path: Path, flow_name: str, file_stem: str) -> str:
+    """Serialize `flow_name` and write it to `tmp_path` the way SaveWorkflowRequest does."""
+    serialized = engine.handle_request(SerializeFlowToCommandsRequest(flow_name=flow_name))
+    assert isinstance(serialized, SerializeFlowToCommandsResultSuccess), serialized
+    saved = engine.workflow_manager._save_workflow_file_inline(
+        destination=ProjectFileDestination(str(tmp_path / f"{file_stem}.py")),
+        serialized_flow_commands=serialized.serialized_flow_commands,
+        file_name=file_stem,
+        creation_date=None,
+        display_name=None,
+        image_path=None,
+        description=None,
+        is_template=None,
+        branched_from=None,
+        workflow_shape=None,
+        pickle_control_flow_result=False,
+    )
+    assert isinstance(saved, SaveWorkflowFileFromSerializedFlowResultSuccess), saved
+    return f"{file_stem}.py"
+
+
+def _save_host_importing_subflow(
+    tmp_path: Path, engine: Engine, inner_name: str, file_stem: str = "host_workflow"
+) -> str:
+    """Build and save a workflow whose only content is an import of `inner_name` as a subflow."""
+    engine.context_manager.push_workflow(workflow_name=file_stem)
+    host_flow = engine.handle_request(
+        CreateFlowRequest(parent_flow_name=None, flow_name=f"{file_stem}_HostFlow", set_as_new_context=False)
+    )
+    assert isinstance(host_flow, CreateFlowResultSuccess), host_flow
+    imported = engine.handle_request(
+        ImportWorkflowAsReferencedSubFlowRequest(workflow_name=inner_name, flow_name=host_flow.flow_name)
+    )
+    assert isinstance(imported, ImportWorkflowAsReferencedSubFlowResultSuccess), imported
+    return _save_flow_as_workflow(engine, tmp_path, host_flow.flow_name, file_stem)
+
+
 def _restart_engine(tmp_path: Path) -> Engine:
     """Hand back an engine in the state a just-restarted editor is in: no libraries at all.
 
@@ -444,11 +483,20 @@ class TestEveryLibraryUnavailable:
         # One problem per library, not one per node...
         assert {problem.library_name for problem in result.problems} == {_AVAILABLE_LIBRARY, _UNAVAILABLE_LIBRARY}
         # ...and both collate into a single warning, because they are the same problem type.
-        assert len(reopened.workflow_manager.collate_problems_for_display(result.problems)) == 1
+        assert len(reopened.workflow_manager.collate_problems_by_type(result.problems)) == 1
         assert isinstance(_node(reopened, "Kept"), ErrorProxyNode)
         assert isinstance(_node(reopened, "Vanishing"), ErrorProxyNode)
         # The flow itself is engine-owned, so it is there to hold them.
         assert reopened.flow_manager.get_flow_by_name(_FLOW_NAME) is not None
+
+        # A connection with a placeholder on BOTH ends survives: each side has to invent the
+        # parameter it is asked for, since neither class is loaded to declare it.
+        connections = reopened.handle_request(ListConnectionsForNodeRequest(node_name="Kept"))
+        assert isinstance(connections, ListConnectionsForNodeResultSuccess), connections
+        assert [
+            (outgoing.source_parameter_name, outgoing.target_node_name, outgoing.target_parameter_name)
+            for outgoing in connections.outgoing_connections
+        ] == [("value", "Vanishing", "value")]
 
 
 class TestPlaceholdersRoundTripBackToRealNodes:
@@ -481,23 +529,8 @@ class TestPlaceholdersRoundTripBackToRealNodes:
 
 
 def _resave_current_flow(engine: Engine, tmp_path: Path, file_stem: str) -> str:
-    serialize_result = engine.handle_request(SerializeFlowToCommandsRequest(flow_name=_FLOW_NAME))
-    assert isinstance(serialize_result, SerializeFlowToCommandsResultSuccess), serialize_result
-    save_result = engine.workflow_manager._save_workflow_file_inline(
-        destination=ProjectFileDestination(str(tmp_path / f"{file_stem}.py")),
-        serialized_flow_commands=serialize_result.serialized_flow_commands,
-        file_name=file_stem,
-        creation_date=None,
-        display_name=None,
-        image_path=None,
-        description=None,
-        is_template=None,
-        branched_from=None,
-        workflow_shape=None,
-        pickle_control_flow_result=False,
-    )
-    assert isinstance(save_result, SaveWorkflowFileFromSerializedFlowResultSuccess), save_result
-    return f"{file_stem}.py"
+    """Save the live top-level flow back to disk, placeholders and all."""
+    return _save_flow_as_workflow(engine, tmp_path, _FLOW_NAME, file_stem)
 
 
 def _visible_register_failures(engine: Engine, relative_file_path: str) -> tuple[Any, list[str]]:
@@ -580,8 +613,9 @@ class TestDuplicateLibraryFailureIsNotBroadcast:
 class TestImportAsReferencedSubFlow:
     """Importing a workflow as a subflow reports its unresolved libraries too.
 
-    This is the only result that can: a referenced subflow's libraries are not in the importing
-    workflow's own metadata header, so the outer load has nothing to report about them.
+    A referenced subflow's libraries are not in the importing workflow's own metadata header, so
+    pre-registration never sees them. Imported on its own, the import result is the only thing
+    that can name them; imported from inside a load, they bubble to that load's own result.
     """
 
     def test_import_succeeds_and_names_the_library(self, engine: Engine, tmp_path: Path) -> None:
@@ -706,3 +740,261 @@ class TestHeadlessLoadRefusesPlaceholders:
         asyncio.run(LocalWorkflowExecutor()._load_workflow_from_path(relative_path))
 
         assert not isinstance(_node(restored, "Vanishing"), ErrorProxyNode)
+
+
+class TestNestedSubflowProblemsReachTheOuterLoad:
+    """A referenced subflow's missing library must show up on the load that pulled it in.
+
+    The importing workflow's header doesn't list the subflow's libraries, so pre-registration
+    never sees them -- the inner load discovers them while the outer file is mid-exec. If they
+    stop there, the outer load reports GOOD with placeholders on the canvas, and the headless
+    gate that exists to refuse an incomplete graph waves it through.
+    """
+
+    def _open_host_without_the_library(self, tmp_path: Path) -> tuple[Engine, Any]:
+        inner_path = _save_two_library_workflow(tmp_path, "inner_workflow")
+        building = _rebuild_engine_without_library(tmp_path, disabled=True)
+        inner_name = _register_workflow(building, tmp_path, inner_path)
+        host_path = _save_host_importing_subflow(tmp_path, building, inner_name)
+
+        # Reopen the host on a fresh engine, library still disabled.
+        reopened = _rebuild_engine_without_library(tmp_path, disabled=True)
+        return reopened, _run(reopened, host_path)
+
+    def test_the_outer_load_is_flawed_and_names_the_library(self, engine: Engine, tmp_path: Path) -> None:
+        del engine
+        reopened, result = self._open_host_without_the_library(tmp_path)
+
+        # The graph really is incomplete...
+        assert any(
+            isinstance(node, ErrorProxyNode)
+            for node in reopened.object_manager.get_filtered_subset(type=ErrorProxyNode).values()
+        )
+        # ...so the load that produced it must not claim to be GOOD.
+        assert result.status is WorkflowStatus.FLAWED
+        assert [problem.library_name for problem in result.problems] == [_UNAVAILABLE_LIBRARY]
+
+    def test_the_executor_refuses_a_host_whose_subflow_lost_its_library(self, engine: Engine, tmp_path: Path) -> None:
+        """The gate is only as good as the status it reads."""
+        del engine
+        from griptape_nodes.bootstrap.workflow_executors.local_workflow_executor import (
+            LocalExecutorError,
+            LocalWorkflowExecutor,
+        )
+
+        inner_path = _save_two_library_workflow(tmp_path, "inner_workflow")
+        building = _rebuild_engine_without_library(tmp_path, disabled=True)
+        inner_name = _register_workflow(building, tmp_path, inner_path)
+        host_path = _save_host_importing_subflow(tmp_path, building, inner_name)
+
+        reopened = _rebuild_engine_without_library(tmp_path, disabled=True)
+        del reopened
+
+        with pytest.raises(LocalExecutorError, match="FLAWED"):
+            asyncio.run(LocalWorkflowExecutor()._load_workflow_from_path(host_path))
+
+    def test_the_nested_import_result_does_not_repeat_the_warning(self, engine: Engine, tmp_path: Path) -> None:
+        """The enclosing load reports the problems, so the inner import's own result must not.
+
+        This inspects the ImportWorkflowAsReferencedSubFlow result the outer load emits while it
+        runs -- the payload the GUI would toast -- not the outer result. Suppressing on the wrong
+        side, or not at all, shows the artist the same missing library twice.
+        """
+        del engine
+        inner_path = _save_two_library_workflow(tmp_path, "inner_workflow")
+        building = _rebuild_engine_without_library(tmp_path, disabled=True)
+        inner_name = _register_workflow(building, tmp_path, inner_path)
+        host_path = _save_host_importing_subflow(tmp_path, building, inner_name)
+
+        reopened = _rebuild_engine_without_library(tmp_path, disabled=True)
+
+        queued: list[Any] = []
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            original = reopened.event_manager.aput_event
+
+            async def record(event: Any) -> None:
+                queued.append(event)
+                await original(event)
+
+            monkeypatch.setattr(reopened.event_manager, "aput_event", record)
+            result = _run(reopened, host_path)
+
+        # The outer load is the one that reports it...
+        assert [problem.library_name for problem in result.problems] == [_UNAVAILABLE_LIBRARY]
+
+        # ...so the nested import's own broadcast payload carries no warning about it.
+        import_payloads = [
+            payload
+            for event in queued
+            if isinstance(
+                payload := getattr(getattr(event, "wrapped_event", None), "result", None),
+                ImportWorkflowAsReferencedSubFlowResultSuccess,
+            )
+        ]
+        assert len(import_payloads) == 1, "expected exactly one nested import to be broadcast"
+        assert [message for level, message in _details(import_payloads[0]) if level >= logging.WARNING] == []
+
+    def test_a_library_reached_twice_is_reported_once(self, engine: Engine, tmp_path: Path) -> None:
+        """A host that both uses a library directly and imports a subflow using it counts it once.
+
+        Bubbling without dedup told the artist two libraries were missing, naming the same one
+        twice with identical reasons.
+        """
+        del engine
+        inner_path = _save_two_library_workflow(tmp_path, "inner_workflow")
+        building = _rebuild_engine_without_library(tmp_path, disabled=True)
+        inner_name = _register_workflow(building, tmp_path, inner_path)
+
+        # The host holds its own node from the unavailable library AND imports the subflow, so the
+        # same library arrives from the header and from the nested load.
+        building.context_manager.push_workflow(workflow_name="host_workflow")
+        host_flow = building.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="HostFlow", set_as_new_context=False)
+        )
+        assert isinstance(host_flow, CreateFlowResultSuccess), host_flow
+        _create_node(building, "UnavailableNode", _UNAVAILABLE_LIBRARY, "HostOwn", host_flow.flow_name)
+        imported = building.handle_request(
+            ImportWorkflowAsReferencedSubFlowRequest(workflow_name=inner_name, flow_name=host_flow.flow_name)
+        )
+        assert isinstance(imported, ImportWorkflowAsReferencedSubFlowResultSuccess), imported
+        host_path = _save_flow_as_workflow(building, tmp_path, host_flow.flow_name, "host_workflow")
+
+        reopened = _rebuild_engine_without_library(tmp_path, disabled=True)
+        result = _run(reopened, host_path)
+
+        assert [problem.library_name for problem in result.problems] == [_UNAVAILABLE_LIBRARY]
+        collated = reopened.workflow_manager.collate_problems_by_type(result.problems)
+        assert len(collated) == 1
+        assert "2 libraries" not in collated[0]
+
+
+class TestConcurrentLoadsDoNotCrossContaminate:
+    """A nested subflow load must bubble into its own parent, not a sibling load's frame.
+
+    In PARALLEL execution mode a WorkflowNode loads its subflow from inside a node body, and
+    those bodies run as separate asyncio tasks. A load suspends while reading its file, so two
+    gathered loads really do have frames open at the same time -- and on a stack shared across
+    tasks a nested load then bubbles into whichever frame happens to sit beneath it, which is
+    the sibling's rather than its own parent's.
+
+    Two tests, because they pin different things. The first drives real loads, so the interleave
+    is production's and the assertion is the user-visible consequence -- a host reporting GOOD
+    over placeholder nodes, which the headless gate waves through. It pins the bubbling, but not
+    the task isolation: whether the sibling's frame is still open at the moment the nested frame
+    closes depends on the schedule, and the sibling usually finishes first. The second forces
+    that exact overlap by hand, which is the only way to hold the isolation in place.
+    """
+
+    def test_a_host_load_keeps_its_subflow_problem_beside_a_concurrent_load(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
+        del engine
+        inner_path = _save_two_library_workflow(tmp_path, "inner_workflow")
+        building = _rebuild_engine_without_library(tmp_path, disabled=True)
+        inner_name = _register_workflow(building, tmp_path, inner_path)
+        host_path = _save_host_importing_subflow(tmp_path, building, inner_name)
+
+        reopened = _rebuild_engine_without_library(tmp_path, disabled=True)
+
+        async def load_both() -> tuple[Any, Any]:
+            return await asyncio.gather(  # type: ignore[return-value]
+                reopened.workflow_manager.run_workflow(relative_file_path=host_path),
+                reopened.workflow_manager.run_workflow(relative_file_path=inner_path),
+            )
+
+        host_result, sibling_result = asyncio.run(load_both())
+
+        # The host's own problem came from its subflow, and it has to survive the sibling load
+        # running alongside it -- otherwise the host reports GOOD over placeholder nodes.
+        assert host_result.status is WorkflowStatus.FLAWED
+        assert [problem.library_name for problem in host_result.problems] == [_UNAVAILABLE_LIBRARY]
+        # The sibling reports its own, once.
+        assert [problem.library_name for problem in sibling_result.problems] == [_UNAVAILABLE_LIBRARY]
+
+    def test_a_nested_frame_bubbles_to_its_own_parent_not_a_sibling(self) -> None:
+        """Force the overlap the schedule usually hides: sibling frame open, nested frame closing.
+
+        On a stack shared across tasks the nested frame bubbles into whatever sits beneath it,
+        which here is the sibling task's frame instead of its own parent's.
+        """
+
+        def _library_names(problems: list[WorkflowProblem]) -> list[str]:
+            return [p.library_name for p in problems if isinstance(p, LibraryNotRegisteredProblem)]
+
+        async def load_with_subflow() -> list[str]:
+            with WorkflowManager.LoadProblemFrame() as outer:
+                outer.problems.append(LibraryNotRegisteredProblem(library_name="Outer Library"))
+                await asyncio.sleep(0)  # let the sibling open its frame beneath this one
+                with WorkflowManager.LoadProblemFrame() as inner:
+                    inner.problems.append(LibraryNotRegisteredProblem(library_name="Subflow Library"))
+                    await asyncio.sleep(0)
+                return _library_names(outer.problems)
+
+        async def sibling_load() -> list[str]:
+            with WorkflowManager.LoadProblemFrame() as frame:
+                frame.problems.append(LibraryNotRegisteredProblem(library_name="Sibling Library"))
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+                return _library_names(frame.problems)
+
+        async def load_both() -> tuple[list[str], list[str]]:
+            return await asyncio.gather(load_with_subflow(), sibling_load())  # type: ignore[return-value]
+
+        with_subflow, sibling = asyncio.run(load_both())
+
+        assert with_subflow == ["Outer Library", "Subflow Library"]
+        assert sibling == ["Sibling Library"]
+
+
+class TestWorkflowNodeRefusesAFlawedSubflow:
+    """A WorkflowNode imports in order to RUN, so it refuses a subflow full of placeholders.
+
+    Nothing downstream would catch it: ErrorProxyNode refuses only at validate_before_node_run,
+    which never fires for a placeholder off the resolution path, so the subflow would report
+    output computed without those nodes. Same reason the headless executor refuses.
+    """
+
+    def test_the_import_payload_carries_the_subflow_status(self, engine: Engine, tmp_path: Path) -> None:
+        del engine
+        inner_path = _save_two_library_workflow(tmp_path, "inner_workflow")
+        reopened = _rebuild_engine_without_library(tmp_path, disabled=True)
+        inner_name = _register_workflow(reopened, tmp_path, inner_path)
+
+        reopened.context_manager.push_workflow(workflow_name="host_workflow")
+        host_flow = reopened.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="HostFlow", set_as_new_context=False)
+        )
+        assert isinstance(host_flow, CreateFlowResultSuccess), host_flow
+
+        result = reopened.handle_request(
+            ImportWorkflowAsReferencedSubFlowRequest(workflow_name=inner_name, flow_name=host_flow.flow_name)
+        )
+
+        # The import still succeeds -- importing is editing, and the graph is there to look at...
+        assert isinstance(result, ImportWorkflowAsReferencedSubFlowResultSuccess), result
+        # ...but it says plainly that what arrived is not whole.
+        assert result.status is WorkflowStatus.FLAWED
+
+    def test_a_clean_subflow_import_reports_good(self, engine: Engine, tmp_path: Path) -> None:
+        """The gate has to distinguish, so a healthy subflow must not be refused."""
+        del engine
+        inner_path = _save_two_library_workflow(tmp_path, "inner_workflow")
+
+        restored = _restart_engine(tmp_path)
+        _register(restored, tmp_path / "libraries" / "AvailableNode" / "griptape_nodes_library.json")
+        _register(restored, tmp_path / "libraries" / "UnavailableNode" / "griptape_nodes_library.json")
+        inner_name = _register_workflow(restored, tmp_path, inner_path)
+
+        restored.context_manager.push_workflow(workflow_name="host_workflow")
+        host_flow = restored.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="HostFlow", set_as_new_context=False)
+        )
+        assert isinstance(host_flow, CreateFlowResultSuccess), host_flow
+
+        result = restored.handle_request(
+            ImportWorkflowAsReferencedSubFlowRequest(workflow_name=inner_name, flow_name=host_flow.flow_name)
+        )
+
+        assert isinstance(result, ImportWorkflowAsReferencedSubFlowResultSuccess), result
+        assert result.status is WorkflowStatus.GOOD

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import ClassVar
 
 from griptape_nodes.retained_mode.managers.fitness_problems.workflows.workflow_problem import WorkflowProblem
 
@@ -21,6 +22,8 @@ class LibraryNotRegisteredProblem(WorkflowProblem):
     library_name: str
     reason: str | None = None
 
+    _GENERIC_REASON: ClassVar[str] = "May have other problems preventing load."
+
     @classmethod
     def collate_problems_for_display(cls, instances: list[LibraryNotRegisteredProblem]) -> str:
         """Display library not registered problems.
@@ -29,20 +32,21 @@ class LibraryNotRegisteredProblem(WorkflowProblem):
         """
         if len(instances) == 1:
             problem = instances[0]
-            return f"'{problem.library_name}' not registered. {problem._reason_or_default()}"
+            return f"'{problem.library_name}' not registered. {problem.reason or cls._GENERIC_REASON}"
 
         # Sort by library_name
         sorted_instances = sorted(instances, key=lambda p: p.library_name)
 
-        output_lines = []
-        output_lines.append(f"{len(instances)} libraries not registered:")
-        for i, problem in enumerate(sorted_instances, 1):
-            output_lines.append(f"  {i}. {problem.library_name}: {problem._reason_or_default()}")
+        # Only a recorded reason earns a per-library line. With none, the generic sentence
+        # belongs in the header: repeating it against every name says nothing N times.
+        if any(problem.reason for problem in sorted_instances):
+            header = f"{len(instances)} libraries not registered:"
+            rows = [
+                f"  {i}. {problem.library_name}: {problem.reason or cls._GENERIC_REASON}"
+                for i, problem in enumerate(sorted_instances, 1)
+            ]
+        else:
+            header = f"{len(instances)} libraries not registered (may have other problems preventing load):"
+            rows = [f"  {i}. {problem.library_name}" for i, problem in enumerate(sorted_instances, 1)]
 
-        return "\n".join(output_lines)
-
-    def _reason_or_default(self) -> str:
-        """The recorded reason, or the generic stand-in when none was captured."""
-        if self.reason is None:
-            return "May have other problems preventing load."
-        return self.reason
+        return "\n".join([header, *rows])

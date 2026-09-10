@@ -416,9 +416,13 @@ class ImportWorkflowAsReferencedSubFlowResultSuccess(WorkflowAlteredMixin, Resul
 
     Args:
         created_flow_name: Name of the created sub-flow
+        status: Fitness of the imported subflow's own load. FLAWED means placeholders stand in
+            for nodes whose library could not be registered -- editable, but not runnable.
+            Callers that import in order to RUN the subflow should refuse anything but GOOD.
     """
 
     created_flow_name: str
+    status: WorkflowStatus = WorkflowStatus.GOOD
 
 
 @dataclass

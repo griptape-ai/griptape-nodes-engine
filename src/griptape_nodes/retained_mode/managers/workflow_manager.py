@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextvars
 import logging
 import pickle
 import re
@@ -247,6 +248,12 @@ WorkflowShapeNodes = dict[str, NodeParameterMap]  # {node_name: {param_name: par
 
 logger = logging.getLogger("griptape_nodes")
 
+# WorkflowManager.LoadProblemFrame writes this; is_loading_workflow reads it. Scoped to the
+# current context so concurrent loads cannot pop or read each other's frames.
+_load_problem_frames: contextvars.ContextVar[tuple[list[WorkflowProblem], ...]] = contextvars.ContextVar(
+    "workflow_load_problem_frames", default=()
+)
+
 
 class WorkflowRegistrationResult(NamedTuple):
     """Result of processing workflows for registration."""
@@ -374,6 +381,58 @@ class WorkflowManager(EngineScoped):
             self.manager._referenced_workflow_stack.pop()
 
     _referenced_workflow_stack: list[str] = field(default_factory=list)
+
+    class LoadProblemFrame:
+        """Collects one workflow load's problems, bubbling them into the enclosing load on exit.
+
+        A workflow file can import another workflow as a referenced subflow, and that import
+        runs as a nested request dispatched from inside the outer file's exec() -- so the inner
+        load's problems have no return path to the outer one. Without bubbling, an outer load
+        reports GOOD while the canvas holds the inner load's placeholders, and a caller that
+        gates on status (the headless executor) runs an incomplete graph.
+
+        The stack lives in a ContextVar rather than on the manager because loads genuinely run
+        concurrently: in PARALLEL execution mode a WorkflowNode loads its subflow from inside a
+        node body, and those bodies run as separate tasks. A shared list would let one task pop
+        another's frame, so a load would report a library a *different* workflow was missing --
+        or see a sibling's open frame and suppress the only report of its own. A task inherits a
+        copy of the context, so a nested load still reaches the enclosing frame (same task) while
+        siblings stay isolated. `EventSuppressionContext` is contextvar-scoped for the same reason.
+        """
+
+        def __init__(self) -> None:
+            self.problems: list[WorkflowProblem] = []
+            self._tokens: list[contextvars.Token[tuple[list[WorkflowProblem], ...]]] = []
+
+        def __enter__(self) -> WorkflowManager.LoadProblemFrame:
+            self._tokens.append(_load_problem_frames.set((*_load_problem_frames.get(), self.problems)))
+            return self
+
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc_value: BaseException | None,
+            exc_traceback: TracebackType | None,
+        ) -> None:
+            frames = _load_problem_frames.get()
+            if len(frames) > 1:
+                enclosing = frames[-2]
+                # A library the outer file declares for itself AND reaches through a subflow
+                # would otherwise be counted twice, and the collated display would name it
+                # twice while claiming two libraries are missing.
+                enclosing.extend(problem for problem in self.problems if problem not in enclosing)
+            if self._tokens:
+                _load_problem_frames.reset(self._tokens.pop())
+
+    def is_loading_workflow(self) -> bool:
+        """Whether a workflow load is in progress, so its result will report the problems found.
+
+        Read after a nested load has closed, so a frame still on the stack is an ENCLOSING load.
+        That makes this the complement of the bubble in LoadProblemFrame.__exit__: exactly one of
+        the two names any given problem. A frame that stopped bubbling would have to stop
+        answering True here as well, or nothing would report it.
+        """
+        return len(_load_problem_frames.get()) > 0
 
     class WorkflowExecutionResult(NamedTuple):
         """Result of a workflow execution.
@@ -792,7 +851,7 @@ class WorkflowManager(EngineScoped):
             if not wf_info.problems:
                 problems = "No problems detected."
             else:
-                collated_strings = self.collate_problems_for_display(wf_info.problems)
+                collated_strings = self.collate_problems_by_type(wf_info.problems)
 
                 # Format for display
                 if len(collated_strings) == 1:
@@ -878,7 +937,17 @@ class WorkflowManager(EngineScoped):
         # Resolve path using utility function
         workspace_path = self.engine.config_manager.workspace_path
         complete_file_path = resolve_workspace_path(Path(relative_file_path), workspace_path)
-        problems: list[WorkflowProblem] = []
+        # Problems found anywhere under this load land in the frame, including those of a
+        # referenced subflow imported from inside exec() -- see LoadProblemFrame.
+        with WorkflowManager.LoadProblemFrame() as frame:
+            return await self._run_workflow_in_frame(
+                relative_file_path=relative_file_path, complete_file_path=complete_file_path, frame=frame
+            )
+
+    async def _run_workflow_in_frame(
+        self, *, relative_file_path: str, complete_file_path: Path, frame: LoadProblemFrame
+    ) -> WorkflowExecutionResult:
+        """Read, resolve libraries for, and exec one workflow file, recording problems in `frame`."""
         try:
             async with await anyio.open_file(Path(complete_file_path), encoding="utf-8") as file:
                 workflow_content = await file.read()
@@ -887,7 +956,7 @@ class WorkflowManager(EngineScoped):
             # The metadata header lists every library the workflow uses; each must
             # be registered (discovery is triggered if needed) so node construction
             # inside the script can succeed.
-            problems = await self._ensure_libraries_for_workflow(relative_file_path=relative_file_path)
+            frame.problems.extend(await self._ensure_libraries_for_workflow(relative_file_path=relative_file_path))
 
             # _generate_workflow_run_prerequisite_code emits one registration per header entry,
             # so each library we just failed to register is about to fail again on a request the
@@ -896,7 +965,7 @@ class WorkflowManager(EngineScoped):
             # in-file failures are the only record of what the workflow needs.
             duplicate_library_failures = (
                 EventSuppressionContext(self.engine.event_manager, {RegisterLibraryFromFileResultFailure})
-                if problems
+                if frame.problems
                 else nullcontext()
             )
             with duplicate_library_failures:
@@ -926,15 +995,15 @@ class WorkflowManager(EngineScoped):
                 execution_successful=False,
                 execution_details=f"Failed to run workflow on path '{complete_file_path}'. Exception: {e}",
                 status=WorkflowStatus.UNUSABLE,
-                problems=tuple(problems),
+                problems=tuple(frame.problems),
             )
         return WorkflowManager.WorkflowExecutionResult(
             execution_successful=True,
             execution_details=f"Succeeded in running workflow on path '{complete_file_path}'.",
             # A problem that did not stop the load leaves it recoverable: the graph is on the
             # canvas, with placeholders where the missing library's nodes belong.
-            status=WorkflowStatus.FLAWED if problems else WorkflowStatus.GOOD,
-            problems=tuple(problems),
+            status=WorkflowStatus.FLAWED if frame.problems else WorkflowStatus.GOOD,
+            problems=tuple(frame.problems),
         )
 
     async def _ensure_libraries_for_workflow(self, *, relative_file_path: str) -> list[WorkflowProblem]:
@@ -1005,7 +1074,7 @@ class WorkflowManager(EngineScoped):
         return problems
 
     @staticmethod
-    def collate_problems_for_display(problems: Iterable[WorkflowProblem]) -> list[str]:
+    def collate_problems_by_type(problems: Iterable[WorkflowProblem]) -> list[str]:
         """Group problems by type and let each type render its own instances, one string per group.
 
         Every problem class owns its wording and its singular/plural form, so grouping is what
@@ -1032,7 +1101,7 @@ class WorkflowManager(EngineScoped):
         """
         details = [
             ResultDetail(message=problem, level=logging.WARNING)
-            for problem in cls.collate_problems_for_display(execution_result.problems)
+            for problem in cls.collate_problems_by_type(execution_result.problems)
         ]
         # Only a load that survived has placeholders to point at; a failed one cleared the
         # canvas. Said once for the whole load rather than per problem, which is what keeps
@@ -1526,7 +1595,7 @@ class WorkflowManager(EngineScoped):
 
     def _build_workflow_info_payload(self, wf_info: WorkflowInfo) -> WorkflowInfoSummary:
         """Build a WorkflowInfoSummary from a WorkflowInfo, collating problems for display."""
-        collated_problems = self.collate_problems_for_display(wf_info.problems)
+        collated_problems = self.collate_problems_by_type(wf_info.problems)
         return WorkflowInfoSummary(
             status=wf_info.status,
             workflow_name=wf_info.workflow_name,
@@ -6120,9 +6189,7 @@ class WorkflowManager(EngineScoped):
         if not workflow_result.execution_successful:
             details = f"Attempted to import workflow '{request.workflow_name}' as referenced sub flow. Failed because workflow execution failed: {workflow_result.execution_details}"
             return ImportWorkflowAsReferencedSubFlowResultFailure(
-                result_details=ResultDetails(
-                    *self._execution_result_details(workflow_result, level=logging.ERROR, message=details)
-                )
+                result_details=self._import_result_details(workflow_result, details, level=logging.ERROR)
             )
 
         # Get flows after importing to find the new referenced sub flow
@@ -6155,14 +6222,25 @@ class WorkflowManager(EngineScoped):
         details = (
             f"Successfully imported workflow '{request.workflow_name}' as referenced sub flow '{created_flow_name}'"
         )
-        # A referenced subflow's libraries are not in the importing workflow's own header, so this
-        # is the only result that can name them -- the outer load has nothing to report.
         return ImportWorkflowAsReferencedSubFlowResultSuccess(
             created_flow_name=created_flow_name,
-            result_details=ResultDetails(
-                *self._execution_result_details(workflow_result, level=logging.DEBUG, message=details)
-            ),
+            status=workflow_result.status,
+            result_details=self._import_result_details(workflow_result, details, level=logging.DEBUG),
         )
+
+    def _import_result_details(
+        self, workflow_result: WorkflowExecutionResult, message: str, *, level: int
+    ) -> ResultDetails:
+        """Render an import result, naming the subflow's problems only if nobody else will.
+
+        Nested inside a load, the subflow's problems have already bubbled into the enclosing
+        frame and will be reported on that load's result; naming them here too would warn twice
+        for one condition. Imported on its own -- the editor dropping a workflow into a flow --
+        there is no such load, so this is the only result that can name them.
+        """
+        if self.is_loading_workflow():
+            return ResultDetails(message=message, level=level)
+        return ResultDetails(*self._execution_result_details(workflow_result, level=level, message=message))
 
     @staticmethod
     def _select_top_level_imported_flow(

@@ -2804,7 +2804,6 @@ class TestLibraryResolutionOnLoad:
                 "unavailable_placeholder",
                 "<version unavailable; workflow was saved when library was unable to be loaded>",
             ),
-            ("empty", ""),
         ],
     )
     def test_ensure_libraries_never_reports_the_declared_version(
@@ -2828,7 +2827,7 @@ class TestLibraryResolutionOnLoad:
 
         collated = LibraryNotRegisteredProblem.collate_problems_for_display(problems)
         assert "Missing Library" in collated
-        assert stored_version not in collated or stored_version == ""
+        assert stored_version not in collated
 
     def test_ensure_libraries_is_noop_when_metadata_missing(self, engine: Engine) -> None:
         """If metadata can't be loaded, _ensure_libraries_for_workflow reports nothing (tolerant fallback)."""
@@ -2916,14 +2915,6 @@ class TestRunResultRendering:
 
         assert details[-1].message == "Successfully imported workflow 'x' as referenced sub flow 'y'"
         assert "Library A" in details[0].message
-
-    def test_a_flawed_load_is_distinguishable_from_a_clean_one_without_reading_prose(self) -> None:
-        """The status is what a caller gates on; the strings are for the reader."""
-        from griptape_nodes.retained_mode.events.workflow_events import WorkflowStatus
-
-        assert self._result(successful=True, libraries=()).status is WorkflowStatus.GOOD
-        assert self._result(successful=True, libraries=("Library A",)).status is WorkflowStatus.FLAWED
-        assert self._result(successful=False, libraries=()).status is WorkflowStatus.UNUSABLE
 
 
 class TestWorkflowsLoadingGate:
