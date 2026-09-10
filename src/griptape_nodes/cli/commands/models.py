@@ -1,13 +1,11 @@
 """Models command for managing AI models."""
 
 import asyncio
-import json
 import os
 import sys
 from typing import TYPE_CHECKING
 
 import typer
-from huggingface_hub.errors import GatedRepoError, RepositoryNotFoundError
 from rich.table import Table
 
 from griptape_nodes.cli.shared import console
@@ -32,6 +30,12 @@ from griptape_nodes.retained_mode.events.model_events import (
 )
 from griptape_nodes.retained_mode.managers.model_manager import _PROGRESS_PIPE_ENV_VAR
 from griptape_nodes.retained_mode.retained_mode import GriptapeNodes
+from griptape_nodes.utils.model_download_errors import (
+    DownloadFailure,
+    classify,
+    describe,
+    format_error_event,
+)
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.model_events import ModelDownloadStatus
@@ -103,15 +107,19 @@ def search_command(
     asyncio.run(_search_models(query, task, limit, sort, direction))
 
 
-def _emit_error_event(error_type: str, error_message: str) -> None:
+def _emit_error_event(failure: DownloadFailure) -> None:
     """Write a structured JSON error event to stderr when running in pipe mode.
 
     Only emits when GRIPTAPE_NODES_PROGRESS_PIPE is set, i.e. when spawned by
     the ModelManager subprocess. On direct CLI invocations this is a no-op.
     Uses stderr to avoid mixing with stdout JSON progress events.
+
+    Every failed download emits one of these. It is the only channel by which the
+    parent learns why a download failed, because the parent cannot tell the human
+    text below apart from the progress bars and library warnings sharing the pipe.
     """
     if os.environ.get(_PROGRESS_PIPE_ENV_VAR) == "1":
-        sys.stderr.write(json.dumps({"error_type": error_type, "error_message": error_message}) + "\n")
+        sys.stderr.write(format_error_event(failure))
         sys.stderr.flush()
 
 
@@ -139,25 +147,14 @@ async def _download_model(
             allow_patterns=None,
             ignore_patterns=None,
         )
-
-        # Success case
-        console.print("[bold green]Model downloaded successfully![/bold green]")
-        console.print(f"[green]Downloaded to: {local_path}[/green]")
-
-    except GatedRepoError as e:
-        _emit_error_event("gated_repo", str(e))
-        console.print(f"[bold red]Model download failed:[/bold red] {e}")
-        sys.exit(1)
-
-    except RepositoryNotFoundError as e:
-        _emit_error_event("repo_not_found", str(e))
-        console.print(f"[bold red]Model download failed:[/bold red] {e}")
-        sys.exit(1)
-
     except Exception as e:
-        console.print("[bold red]Model download failed:[/bold red]")
-        console.print(f"[red]{e}[/red]")
+        failure = DownloadFailure(kind=classify(e), detail=str(e))
+        _emit_error_event(failure)
+        console.print(f"[bold red]{describe(failure, model_id=model_id, revision=revision)}[/bold red]")
         sys.exit(1)
+
+    console.print("[bold green]Model downloaded successfully![/bold green]")
+    console.print(f"[green]Downloaded to: {local_path}[/green]")
 
 
 async def _list_models() -> None:

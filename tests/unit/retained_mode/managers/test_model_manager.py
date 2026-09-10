@@ -4,7 +4,9 @@ Covers:
 - `on_handle_get_model_info_request` — token guard and HF API delegation
 - `on_handle_search_models_request` — search result handling
 - `on_handle_declare_model_invocation_request` — clears a declared invocation past the pre-dispatch chain
-- `_download_model_task` — the spawned subprocess targets a runnable module
+- `_download_model_task` — the spawned subprocess targets a runnable module, and a failed
+  download reports a written message rather than whatever landed in the subprocess pipe
+- `on_handle_download_model_request` — a missing Hugging Face token does not block the attempt
 - `_load_status_file` — status file reads survive a concurrent status file write
 """
 
@@ -28,6 +30,8 @@ from griptape_nodes.retained_mode.events.model_events import (
     DeclareModelInvocationRequest,
     DeclareModelInvocationResultFailure,
     DeclareModelInvocationResultSuccess,
+    DownloadModelRequest,
+    DownloadModelResultSuccess,
     GetModelInfoRequest,
     GetModelInfoResultFailure,
     GetModelInfoResultSuccess,
@@ -550,6 +554,146 @@ class TestDownloadModelTaskSubprocess:
 
         assert captured_cmd[3] == "download"
         assert "org/model" in captured_cmd
+
+
+# ---------------------------------------------------------------------------
+# _download_model_task — what a failed download tells the user
+# ---------------------------------------------------------------------------
+
+
+class _FakeStderr:
+    """Subprocess stderr that hands back preloaded chunks, then EOF."""
+
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = list(chunks)
+
+    async def readline(self) -> bytes:
+        if not self._chunks:
+            return b""
+        return self._chunks.pop(0)
+
+
+_TQDM_FRAMES = (
+    b"\rFetching 29 files:   0%|          | 0/29 [00:00<?, ?it/s]"
+    b"\rFetching 29 files:   7%| | 2/29 [00:00<00:02, 12.14it/s]\n"
+)
+
+
+class TestFailedDownloadMessages:
+    """A download failure must report a sentence someone wrote.
+
+    The subprocess pipe also carries tqdm frames and library warnings, so text taken
+    from the stream surfaces a progress animation where an explanation belongs (#3126).
+    """
+
+    async def _run_failed_download(
+        self,
+        model_manager: ModelManager,
+        stderr_chunks: list[bytes],
+        revision: str | None = None,
+    ) -> str:
+        """Run a download whose subprocess exits non-zero; return the reported message."""
+        model_manager._download_tasks = {}
+        model_manager._download_processes = {}
+
+        process = SimpleNamespace(
+            stdout=None,
+            stderr=_FakeStderr(stderr_chunks),
+            returncode=1,
+            wait=AsyncMock(return_value=1),
+        )
+        written: list[dict] = []
+
+        async def fake_create_subprocess_exec(*_cmd: str, **_kwargs: object) -> SimpleNamespace:
+            return process
+
+        with (
+            patch("asyncio.create_subprocess_exec", side_effect=fake_create_subprocess_exec),
+            patch.object(model_manager, "_write_download_status", side_effect=lambda _f, data: written.append(data)),
+            pytest.raises(ValueError, match="Attempted to download"),
+        ):
+            await model_manager._download_model_task(
+                DownloadParams(model_id="black-forest-labs/FLUX.1-dev", revision=revision)
+            )
+
+        assert written[-1]["status"] == "failed"
+        return written[-1]["error_message"]
+
+    @pytest.mark.asyncio
+    async def test_progress_frames_never_become_the_error_message(self, model_manager: ModelManager) -> None:
+        event = b'\n{"error_type": "gated_unauthenticated", "error_message": "401 Client Error."}\n'
+
+        message = await self._run_failed_download(model_manager, [_TQDM_FRAMES, event])
+
+        assert "Fetching" not in message
+        assert "HF_TOKEN" in message
+
+    @pytest.mark.asyncio
+    async def test_a_child_that_reported_nothing_still_yields_a_message(self, model_manager: ModelManager) -> None:
+        """A killed or crashed child leaves no verdict; the row must still read as English."""
+        message = await self._run_failed_download(model_manager, [])
+
+        assert "black-forest-labs/FLUX.1-dev" in message
+        assert "engine log" in message
+
+    @pytest.mark.asyncio
+    async def test_unreported_failures_do_not_leak_the_stream(self, model_manager: ModelManager) -> None:
+        noise = b"Ignored error while writing tree cache file: [Errno 1] Operation not permitted\n"
+
+        message = await self._run_failed_download(model_manager, [noise, _TQDM_FRAMES])
+
+        assert "Errno 1" not in message
+        assert "Fetching" not in message
+
+    @pytest.mark.asyncio
+    async def test_the_pinned_revision_reaches_the_message(self, model_manager: ModelManager) -> None:
+        event = b'\n{"error_type": "revision_not_found", "error_message": "404 Client Error."}\n'
+
+        message = await self._run_failed_download(model_manager, [event], revision="refs/pr/1")
+
+        assert "refs/pr/1" in message
+
+
+# ---------------------------------------------------------------------------
+# on_handle_download_model_request — the token is not a precondition
+# ---------------------------------------------------------------------------
+
+
+class TestDownloadWithoutAToken:
+    @pytest.mark.asyncio
+    async def test_a_missing_token_does_not_block_the_attempt(self, model_manager: ModelManager) -> None:
+        """Public models download anonymously, and a gated one needs the 401 to reach the user.
+
+        Refusing here also returned before any status file existed, leaving the editor's
+        download list with no row to show a reason on.
+        """
+        model_manager._download_tasks = {}
+        model_manager._download_processes = {}
+
+        process = SimpleNamespace(stdout=None, stderr=None, returncode=0, wait=AsyncMock(return_value=0))
+        spawned: list[str] = []
+
+        async def fake_create_subprocess_exec(*cmd: str, **_kwargs: object) -> SimpleNamespace:
+            spawned.extend(cmd)
+            return process
+
+        with (
+            patch("griptape_nodes.retained_mode.managers.model_manager.get_token", return_value=None),
+            patch("asyncio.create_subprocess_exec", side_effect=fake_create_subprocess_exec),
+            patch.object(model_manager, "_write_download_status"),
+        ):
+            result = await model_manager.on_handle_download_model_request(
+                DownloadModelRequest(
+                    model_id="google/t5-v1_1-xxl",
+                    local_dir=None,
+                    revision="main",
+                    allow_patterns=None,
+                    ignore_patterns=None,
+                )
+            )
+
+        assert isinstance(result, DownloadModelResultSuccess)
+        assert "google/t5-v1_1-xxl" in spawned
 
 
 # ---------------------------------------------------------------------------

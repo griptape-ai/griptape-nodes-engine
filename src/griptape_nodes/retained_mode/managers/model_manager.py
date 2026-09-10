@@ -60,6 +60,12 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
 )
 from griptape_nodes.retained_mode.managers.settings import MODELS_TO_DOWNLOAD_KEY
 from griptape_nodes.utils.async_utils import cancel_subprocess
+from griptape_nodes.utils.model_download_errors import (
+    DownloadErrorKind,
+    DownloadFailure,
+    describe,
+    parse_error_event,
+)
 
 if TYPE_CHECKING:
     from griptape_nodes.node_library.library_declarations import ResolvedModel
@@ -70,9 +76,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("griptape_nodes")
 
-
-HTTP_UNAUTHORIZED = 401
-HTTP_FORBIDDEN = 403
 
 MIN_CACHE_DIR_PARTS = 3
 
@@ -119,12 +122,13 @@ def _create_progress_tracker(model_id: str) -> type[tqdm]:  # noqa: C901
         """Tqdm subclass that emits JSON progress events to stdout for the parent process to handle."""
 
         def __init__(self, *args, **kwargs) -> None:
+            # Only emit JSON progress events when spawned by the main process, not on direct CLI invocation.
+            # Assigned before tqdm's constructor because that constructor renders, and rendering reads it.
+            self._emit_progress = os.environ.get(_PROGRESS_PIPE_ENV_VAR) == "1"
             super().__init__(*args, **kwargs)
             self.model_id = model_id
             self._cumulative_bytes = 0
             self._last_emit_time = 0.0
-            # Only emit JSON progress events when spawned by the main process, not on direct CLI invocation
-            self._emit_progress = os.environ.get(_PROGRESS_PIPE_ENV_VAR) == "1"
 
             # Check if this is a byte-level progress bar or file enumeration bar
             unit = getattr(self, "unit", "")
@@ -149,6 +153,18 @@ def _create_progress_tracker(model_id: str) -> type[tqdm]:  # noqa: C901
                 unit,
                 desc,
             )
+
+        def display(self, *args, **kwargs) -> bool | None:
+            """Render nothing while the parent is reading events off the pipe.
+
+            tqdm draws to stderr, which is also where a failure is reported. Suppressing
+            the drawing rather than passing tqdm `disable=True` keeps the bar's own
+            bookkeeping intact -- a disabled tqdm never records `desc` or `unit`, which is
+            how this class tells a byte-level bar from the file enumeration bar.
+            """
+            if self._emit_progress:
+                return False
+            return super().display(*args, **kwargs)
 
         def update(self, n: int = 1) -> None:
             """Override update to emit rate-limited JSON progress to stdout."""
@@ -478,13 +494,10 @@ class ModelManager(EngineScoped):
         if parsed_model_id != request.model_id:
             logger.debug("Parsed model ID '%s' from URL '%s'", parsed_model_id, request.model_id)
 
-        if get_token() is None:
-            error_msg = (
-                "No Hugging Face token found. Set your HF_TOKEN environment variable "
-                "or log in with `huggingface-cli login` before downloading models."
-            )
-            return DownloadModelResultFailure(result_details=error_msg)
-
+        # Deliberately no token check: public models download without one, and Hugging Face
+        # answers a gated model with a 401 the download reports as a missing-token failure.
+        # Refusing up front blocked downloads that would have worked, and returned before a
+        # status file existed, so the editor had no row to show the reason on.
         try:
             download_params = DownloadParams(
                 model_id=parsed_model_id,
@@ -597,7 +610,7 @@ class ModelManager(EngineScoped):
             lines.append(line.decode())
         return lines
 
-    async def _download_model_task(self, download_params: DownloadParams) -> None:  # noqa: C901
+    async def _download_model_task(self, download_params: DownloadParams) -> None:
         """Background task for downloading a model using CLI command.
 
         Owns the full status file lifecycle: writes initial status before launching the
@@ -674,26 +687,20 @@ class ModelManager(EngineScoped):
                 }
                 await asyncio.to_thread(self._write_download_status, status_file, final_data)
             else:
-                # Scan stderr for a structured error event emitted by the subprocess CLI
-                error_type = None
-                error_msg = None
-                for line in stderr_lines:
-                    try:
-                        event = json.loads(line.strip())
-                        if isinstance(event, dict) and "error_type" in event:
-                            error_type = event.get("error_type")
-                            error_msg = event.get("error_message")
-                            break
-                    except json.JSONDecodeError:
-                        pass
-                model_url = f"https://huggingface.co/{model_id}"
-                if error_type == "gated_repo":
-                    error_msg = f"Model '{model_id}' is gated and requires access approval. Visit {model_url} to request access."
-                elif error_type == "repo_not_found":
-                    error_msg = f"Model '{model_id}' was not found. Check that the model ID is correct at {model_url}."
-                elif not error_msg:
-                    error_msg = "".join(stderr_lines).strip()
-                logger.error("Failed to download model '%s': %s", model_id, error_msg)
+                # The child's structured event is the only thing here that describes the
+                # failure. Its stderr also carries progress frames and library warnings, so
+                # text taken from the stream itself would put those in front of the user.
+                stderr_output = "".join(stderr_lines)
+                failure = parse_error_event(stderr_output) or DownloadFailure(
+                    kind=DownloadErrorKind.UNKNOWN, detail=None
+                )
+                error_msg = describe(failure, model_id=model_id, revision=download_params.revision)
+                logger.error(
+                    "Failed to download model '%s' (%s). Subprocess stderr:\n%s",
+                    model_id,
+                    failure.kind.value,
+                    stderr_output.strip(),
+                )
                 final_data = {
                     **last_known,
                     "status": "failed",
