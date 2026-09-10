@@ -1,5 +1,5 @@
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from griptape_nodes.exe_types.core_types import Parameter, Trait
@@ -7,8 +7,6 @@ from griptape_nodes.exe_types.core_types import Parameter, Trait
 
 @dataclass(eq=False)
 class CompareImagesTrait(Trait):
-    element_id: str = field(default_factory=lambda: "CompareImagesTrait")
-
     def __init__(self) -> None:
         super().__init__()
 
