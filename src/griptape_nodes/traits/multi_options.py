@@ -1,11 +1,9 @@
 from collections.abc import Callable
-from dataclasses import dataclass
 from typing import Any, ClassVar
 
 from griptape_nodes.exe_types.core_types import Parameter, Trait
 
 
-@dataclass(eq=False)
 class MultiOptions(Trait):
     DEFAULT_CHOICES: ClassVar[list[str]] = ["choice 1", "choice 2", "choice 3"]
 
@@ -21,8 +19,6 @@ class MultiOptions(Trait):
         allow_user_created_options: bool = False,
     ) -> None:
         super().__init__()
-        # Assigned unconditionally: this class declares its own __init__, so the dataclass
-        # field default above never runs.
         if choices is None:
             self.choices = list(self.DEFAULT_CHOICES)
         else:

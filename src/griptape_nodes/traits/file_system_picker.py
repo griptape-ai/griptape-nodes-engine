@@ -1,11 +1,9 @@
 from collections.abc import Callable
-from dataclasses import dataclass
 from typing import Any
 
 from griptape_nodes.exe_types.core_types import Parameter, Trait
 
 
-@dataclass(eq=False)
 class FileSystemPicker(Trait):
     def __init__(  # noqa: PLR0913
         self,

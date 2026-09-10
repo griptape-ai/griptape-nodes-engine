@@ -1,11 +1,9 @@
 from collections.abc import Callable
-from dataclasses import dataclass
 from typing import Any, ClassVar
 
 from griptape_nodes.exe_types.core_types import Parameter, Trait
 
 
-@dataclass(eq=False)
 class MinMax(Trait):
     STATE_ALIASES: ClassVar[dict[str, str]] = {"min_val": "min", "max_val": "max"}
 

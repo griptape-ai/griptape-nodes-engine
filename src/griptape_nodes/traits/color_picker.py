@@ -1,11 +1,9 @@
 from collections.abc import Callable
-from dataclasses import dataclass
 from typing import Any, Literal
 
 from griptape_nodes.exe_types.core_types import Parameter, Trait
 
 
-@dataclass(eq=False)
 class ColorPicker(Trait):
     def __init__(self, format: Literal["hex", "hexa", "rgb", "rgba", "hsl", "hsla", "hsv", "hsva"] = "hex") -> None:  # noqa: A002
         super().__init__()

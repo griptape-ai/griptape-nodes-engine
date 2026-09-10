@@ -1,11 +1,9 @@
 from collections.abc import Callable
-from dataclasses import dataclass
 from typing import Any, ClassVar
 
 from griptape_nodes.exe_types.core_types import Parameter, Trait
 
 
-@dataclass(eq=False)
 class Options(Trait):
     """Offers a parameter's value as a list of choices.
 
@@ -33,8 +31,6 @@ class Options(Trait):
         allow_custom: bool = False,
     ) -> None:
         super().__init__()
-        # Assigned unconditionally: this class declares its own __init__, so the dataclass
-        # field default above never runs.
         if choices is None:
             self.choices = list(self.DEFAULT_CHOICES)
         else:
