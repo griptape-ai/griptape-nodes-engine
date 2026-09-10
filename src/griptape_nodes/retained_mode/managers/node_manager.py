@@ -4403,15 +4403,17 @@ class NodeManager(EngineScoped):
         Callbacks are handled separately by ``_apply_trait_callbacks``, which has to run
         after the parameter is attached to its node.
         """
-        existing_by_class = {type(trait).__name__: trait for trait in parameter.find_elements_by_type(Trait)}
-        for entry in trait_states:
+        paired = NodeManager._pair_saved_traits(parameter, trait_states)
+        for entry, existing in zip(trait_states, paired, strict=True):
             trait_name = entry.get("trait_name")
             if trait_name is None:
                 continue
             state = entry.get("trait_state", {})
-            existing = existing_by_class.get(trait_name)
             if existing is not None:
-                existing.apply_state(state)
+                try:
+                    existing.apply_state(state)
+                except TypeError:
+                    NodeManager._warn_unsatisfiable_trait_state(parameter, trait_name)
                 continue
             trait_class = TraitRegistry.resolve(trait_name, entry.get("trait_module"))
             if trait_class is None:
@@ -4425,15 +4427,44 @@ class NodeManager(EngineScoped):
             try:
                 trait = trait_class.from_state(state)
             except TypeError:
-                logger.warning(
-                    "Parameter '%s' was saved with the '%s' trait, but its saved state is missing "
-                    "something the trait requires. The parameter will load without it. Check that the "
-                    "library providing it is up to date.",
-                    parameter.name,
-                    trait_name,
-                )
+                NodeManager._warn_unsatisfiable_trait_state(parameter, trait_name)
                 continue
             parameter.add_trait(trait)
+
+    @staticmethod
+    def _pair_saved_traits(parameter: Parameter, trait_states: list[dict[str, Any]]) -> list[Trait | None]:
+        """Match each saved entry to the attached trait it describes, in entry order.
+
+        Matches on the resolved class rather than the saved name, so two traits sharing a
+        name across libraries stay distinct, and consumes each match, so a parameter carrying
+        two traits of the same class has both updated instead of both entries landing on
+        whichever one came first. A slot is None when nothing attached corresponds to that
+        entry, which tells the caller to build it.
+        """
+        unmatched = parameter.find_elements_by_type(Trait)
+        paired: list[Trait | None] = []
+        for entry in trait_states:
+            trait_class = TraitRegistry.resolve(entry.get("trait_name", ""), entry.get("trait_module"))
+            match = None
+            for candidate in unmatched:
+                if type(candidate) is trait_class:
+                    match = candidate
+                    break
+            if match is not None:
+                unmatched.remove(match)
+            paired.append(match)
+        return paired
+
+    @staticmethod
+    def _warn_unsatisfiable_trait_state(parameter: Parameter, trait_name: str) -> None:
+        """Report saved state the trait's own constructor will not accept."""
+        logger.warning(
+            "Parameter '%s' was saved with the '%s' trait, but its saved state is missing "
+            "something the trait requires. The parameter will load without it. Check that the "
+            "library providing it is up to date.",
+            parameter.name,
+            trait_name,
+        )
 
     @staticmethod
     def _apply_trait_callbacks(parameter: Parameter, trait_states: list[dict[str, Any]]) -> None:
@@ -4447,13 +4478,10 @@ class NodeManager(EngineScoped):
         ``apply_callback_names``: live code beats a saved name.
         """
         owner = parameter.get_node()
-        traits_by_class = {type(trait).__name__: trait for trait in parameter.find_elements_by_type(Trait)}
-        for entry in trait_states:
+        paired = NodeManager._pair_saved_traits(parameter, trait_states)
+        for entry, trait in zip(trait_states, paired, strict=True):
             callback_names = entry.get("trait_callbacks")
-            if not callback_names:
-                continue
-            trait = traits_by_class.get(entry.get("trait_name", ""))
-            if trait is None:
+            if not callback_names or trait is None:
                 continue
             trait.apply_callback_names(callback_names, owner)
 
