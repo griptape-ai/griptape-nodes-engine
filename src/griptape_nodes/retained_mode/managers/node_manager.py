@@ -16,7 +16,6 @@ from griptape_nodes.common.strict_mode import (
     StrictModeScopeKind,
     StrictModeSeverity,
 )
-from griptape_nodes.common.strict_mode_checks import RULES
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -4378,7 +4377,6 @@ class NodeManager(EngineScoped):
         its callbacks on load.
         """
         owner = parameter.get_node()
-        rule = RULES["callback-cannot-be-saved"]
         locations: list[str] = []
         for trait in parameter.find_elements_by_type(Trait):
             unnameable = trait.unnameable_callbacks(owner)
@@ -4388,7 +4386,13 @@ class NodeManager(EngineScoped):
             locations.append(f"{count} {kind[:-1] if count == 1 else kind}")
         if not locations:
             return
-        logger.warning(rule.render(parameter_name=parameter.name, location="; ".join(locations)))
+        logger.warning(
+            "Parameter '%s' attaches %s that cannot be saved. Pass a method of the node "
+            "(self.my_handler) rather than a lambda or a local function, so the saved workflow "
+            "can find it again on load.",
+            parameter.name,
+            "; ".join(locations),
+        )
 
     @staticmethod
     def _apply_trait_states(parameter: Parameter, trait_states: list[dict[str, Any]]) -> None:

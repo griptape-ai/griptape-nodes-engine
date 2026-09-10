@@ -96,27 +96,6 @@ RULES: dict[str, StrictModeRule] = {
         # for an ergonomics warning.
         worker_escalation=False,
     ),
-    # Rendered and logged directly at save time (NodeManager._report_unsaveable_callbacks),
-    # not reported through a strict-mode scope: serialization opens no scope, so
-    # default_severity and worker_escalation below are inert for this entry.
-    "callback-cannot-be-saved": StrictModeRule(
-        rule_id="callback-cannot-be-saved",
-        default_severity=StrictModeSeverity.WARNING,
-        correctness=False,
-        description=(
-            "A run-time parameter was given a callback that cannot be "
-            "written to a saved workflow. Saving records a method name on the "
-            "owning node, and a lambda or closure has no name to resolve, so "
-            "the parameter loads without that behavior."
-        ),
-        remediation_template=(
-            "Parameter '{parameter_name}' attaches {location} that cannot be "
-            "saved. Pass a method of the node (self.my_handler) rather than a "
-            "lambda or a local function, so the saved workflow can find it "
-            "again on load."
-        ),
-        worker_escalation=False,
-    ),
     "parameter-mutation-during-aprocess": StrictModeRule(
         rule_id="parameter-mutation-during-aprocess",
         default_severity=StrictModeSeverity.WARNING,
