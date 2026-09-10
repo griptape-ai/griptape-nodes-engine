@@ -183,7 +183,9 @@ class CurrentWorkflowChanged(AppPayload):
     workflow's contents have finished loading: RunWorkflowFromRegistry switches the context
     before it replays the saved file, so this arrives first and the workflow's nodes follow
     behind it as ordinary creation events. A client that repopulates a canvas on this event
-    should expect to fill it from those, not from a graph that is already complete.
+    should expect to fill it from those, not from a graph that is already complete. Nor is
+    GetWorkflowContextRequest a readiness check: it reports the new workflow from the moment the
+    switch happens, so it answers the same way whether the replay has finished or not.
 
     Where one operation moves the context more than once, every move is reported and the last
     one is the truth. An ordinary open of a workflow while another one is open is two: None
@@ -191,6 +193,13 @@ class CurrentWorkflowChanged(AppPayload):
     switch is not the artist closing their work. Opening on an engine with nothing open is a
     single event, since there was no workflow to wipe -- how many arrive depends on where the
     engine started, so a client should react to each one rather than count them.
+
+    A failure is reported the same way. An open that fails after the switch adds a trailing None,
+    because it reverts to an empty engine, so no client is left showing a workflow that is not
+    there. An open rejected before the switch -- an unknown registry key, or a workflow that was
+    never saved and so has no file to replay -- leaves the Current Context alone and reports
+    nothing at all. The exception is a clean slate that itself fails partway: the engine is left
+    partially cleared, and what is reported is whatever the clearing left behind.
 
     Unlike SetWorkflowContextSuccess it is not the result of a request, so a client observes
     it even when it was not the one that asked -- a second editor attached to the same
