@@ -3310,11 +3310,7 @@ class ParameterDictionary(ParameterContainer):
 
 
 class AuthoredInit(NamedTuple):
-    """The constructor a Trait subclass declared in its own body.
-
-    Captured by ``Trait.__init_subclass__`` at class creation, which runs before a decorator
-    on the class can add a generated ``__init__``.
-    """
+    """The constructor a Trait subclass declared in its own body."""
 
     parameter_names: tuple[str, ...]
     # Whether the constructor takes **kwargs, and so can forward to an ancestor's.
@@ -3330,18 +3326,6 @@ class Trait(ABC, BaseNodeElement):
     # ``__init__`` parameters that are behavior, not state, and so are never saved
     # (``Button(on_click=...)``).
     STATE_EXCLUDE: ClassVar[frozenset[str]] = frozenset()
-
-    # Set per class by ``__init_subclass__`` below, and only on a class that declared its
-    # own ``__init__``. Annotated without a value so it stays off ``Trait`` itself, which is
-    # what lets the MRO walk use its presence as the signal.
-    _AUTHORED_INIT: ClassVar[AuthoredInit]
-
-    def __init_subclass__(cls, **kwargs: Any) -> None:
-        """Record the ``__init__`` this subclass declared in its own body."""
-        super().__init_subclass__(**kwargs)
-        cls_authored_init = cls._authored_init(cls)
-        if cls_authored_init is not None:
-            cls._AUTHORED_INIT = cls_authored_init
 
     def __hash__(self) -> int:
         # Use a unique, immutable attribute for hashing
@@ -3501,8 +3485,8 @@ class Trait(ABC, BaseNodeElement):
     def _state_parameter_names(cls) -> list[str]:
         """Return the constructor parameters this trait's authors declared, nearest first.
 
-        Reads the names captured by ``__init_subclass__``, and stops at ``Trait``, so the
-        base element constructor's parameters are never mistaken for trait state.
+        Reads each class's own ``__init__``, and stops at ``Trait``, so the base element
+        constructor's parameters are never mistaken for trait state.
 
         Merges up the MRO instead of stopping at the nearest declaration, so a trait that
         inherits part of its constructor keeps the inherited arguments. The walk stops at a
@@ -3514,7 +3498,7 @@ class Trait(ABC, BaseNodeElement):
         for klass in cls.__mro__:
             if klass in (Trait, BaseNodeElement):
                 break
-            declared = klass.__dict__.get("_AUTHORED_INIT")
+            declared = cls._authored_init(klass)
             if declared is None:
                 continue
             for name in declared.parameter_names:
@@ -3526,7 +3510,17 @@ class Trait(ABC, BaseNodeElement):
 
     @staticmethod
     def _authored_init(klass: type) -> AuthoredInit | None:
-        """Describe the ``__init__`` in ``klass``'s own body, or None when it declares none."""
+        """Describe the ``__init__`` in ``klass``'s own body, or None when it declares none.
+
+        Nothing in the element hierarchy is a dataclass, so there is no generated constructor
+        to mistake for a hand-written one, and the question can be asked where the answer is
+        used rather than captured at class creation.
+
+        A trait subclass free to be a dataclass would report the right names here, since its
+        generated constructor takes the fields it declared and nothing inherited. It would
+        still have to reach ``BaseNodeElement.__init__`` some other way, because a generated
+        constructor does not call ``super().__init__()``.
+        """
         authored_init = klass.__dict__.get("__init__")
         if authored_init is None:
             return None
