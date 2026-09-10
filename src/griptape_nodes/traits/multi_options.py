@@ -1,5 +1,5 @@
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, ClassVar
 
 from griptape_nodes.exe_types.core_types import Parameter, Trait
@@ -8,15 +8,6 @@ from griptape_nodes.exe_types.core_types import Parameter, Trait
 @dataclass(eq=False)
 class MultiOptions(Trait):
     DEFAULT_CHOICES: ClassVar[list[str]] = ["choice 1", "choice 2", "choice 3"]
-
-    _choices: list = field(default_factory=lambda: ["choice 1", "choice 2", "choice 3"])
-    element_id: str = field(default_factory=lambda: "MultiOptions")
-    placeholder: str = field(default="Select options...")
-    max_selected_display: int = field(default=3)
-    show_search: bool = field(default=True)
-    search_filter: str = field(default="")
-    icon_size: str = field(default="small")
-    allow_user_created_options: bool = field(default=False)
 
     def __init__(  # noqa: PLR0913
         self,

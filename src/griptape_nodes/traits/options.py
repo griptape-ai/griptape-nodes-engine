@@ -1,5 +1,5 @@
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, ClassVar
 
 from griptape_nodes.exe_types.core_types import Parameter, Trait
@@ -21,12 +21,6 @@ class Options(Trait):
     fine-tune. The flag drops the converter and the validator, so updating ``choices`` at
     run time cannot invalidate a value the node already holds.
     """
-
-    _choices: list = field(default_factory=lambda: ["choice 1", "choice 2", "choice 3"])
-    element_id: str = field(default_factory=lambda: "Options")
-    show_search: bool = field(default=True)
-    search_filter: str = field(default="")
-    allow_custom: bool = field(default=False)
 
     DEFAULT_CHOICES: ClassVar[list[str]] = ["choice 1", "choice 2", "choice 3"]
 

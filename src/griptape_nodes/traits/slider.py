@@ -1,19 +1,13 @@
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, ClassVar
 
-from griptape_nodes.exe_types.core_types import Parameter, ParameterMode, Trait
+from griptape_nodes.exe_types.core_types import Parameter, Trait
 
 
 @dataclass(eq=False)
 class Slider(Trait):
     STATE_ALIASES: ClassVar[dict[str, str]] = {"min_val": "min", "max_val": "max"}
-
-    min: Any = 0
-    max: Any = 100
-    element_id: str = field(default_factory=lambda: "Slider")
-
-    _allowed_modes: set = field(default_factory=lambda: {ParameterMode.PROPERTY})
 
     def __init__(self, min_val: float, max_val: float) -> None:
         super().__init__()

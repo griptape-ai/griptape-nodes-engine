@@ -1,5 +1,5 @@
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Literal, get_args
 
 from griptape_nodes.exe_types.callback_binding import is_derived_from_state, mark_derived_from_state
@@ -100,25 +100,6 @@ class Button(Trait):
     GET_BUTTON_STATUS_MESSAGE_TYPE = "get_button_status"
     SET_BUTTON_STATUS_MESSAGE_TYPE = "set_button_status"
 
-    # Button styling and behavior properties
-    label: str = "Button"
-    variant: ButtonVariant = "default"
-    size: ButtonSize = "default"
-    state: ButtonState = "normal"
-    icon: str | None = None
-    icon_class: str | None = None
-    icon_position: IconPosition | None = None
-    full_width: bool = False
-    loading_label: str | None = None
-    loading_icon: str | None = None
-    loading_icon_class: str | None = None
-    tooltip: str | None = None
-    button_link: str | None = None
-
-    element_id: str = field(default_factory=lambda: "Button")
-    on_click_callback: OnClickCallback | None = field(default=None, init=False)
-    get_button_state_callback: GetButtonStateCallback | None = field(default=None, init=False)
-
     def __init__(  # noqa: PLR0913
         self,
         *,
@@ -139,19 +120,22 @@ class Button(Trait):
         get_button_state: GetButtonStateCallback | None = None,
     ) -> None:
         super().__init__(element_id="Button")
-        self.label = label
-        self.variant = variant
-        self.size = size
-        self.state = state
-        self.icon = icon
-        self.icon_class = icon_class
-        self.icon_position = icon_position
-        self.full_width = full_width
-        self.loading_label = loading_label
-        self.loading_icon = loading_icon
-        self.loading_icon_class = loading_icon_class
-        self.tooltip = tooltip
-        self.button_link = button_link
+        # Annotated here rather than declared as dataclass fields: this class writes its own
+        # __init__, so a field default would never run, and setattr in on_message_received
+        # tells the type checker nothing about what these hold.
+        self.label: str = label
+        self.variant: ButtonVariant = variant
+        self.size: ButtonSize = size
+        self.state: ButtonState = state
+        self.icon: str | None = icon
+        self.icon_class: str | None = icon_class
+        self.icon_position: IconPosition | None = icon_position
+        self.full_width: bool = full_width
+        self.loading_label: str | None = loading_label
+        self.loading_icon: str | None = loading_icon
+        self.loading_icon_class: str | None = loading_icon_class
+        self.tooltip: str | None = tooltip
+        self.button_link: str | None = button_link
 
         # Validate that both button_link and on_click are not provided simultaneously
         if button_link is not None and on_click is not None:

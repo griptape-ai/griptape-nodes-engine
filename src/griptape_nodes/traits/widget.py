@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from griptape_nodes.exe_types.core_types import Trait
 
@@ -10,9 +10,6 @@ class Widget(Trait):
     Widgets are JavaScript modules that render parameter UI.
     The widget must be registered in the library's widgets list.
     """
-
-    library: str  # Library that provides the widget (e.g., "example_nodes_template")
-    element_id: str = field(default_factory=lambda: "Widget")
 
     def __init__(self, name: str, library: str) -> None:
         super().__init__()
