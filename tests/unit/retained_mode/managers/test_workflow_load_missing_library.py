@@ -1032,3 +1032,59 @@ class TestSuppressionIsKeyedToLibraryProblems:
         # that library: the engine never attempted it here.
         assert len(visible_failures) == 1
         assert "disabled in libraries_to_register" in visible_failures[0]
+
+
+class TestRefusedSubflowIsNotOrphaned:
+    """Refusing a FLAWED subflow must delete the flow the import already built.
+
+    The refusal happens after ImportWorkflowAsReferencedSubFlow succeeded, so a flow full of
+    nodes exists by then. Raising without deleting strands it in ObjectManager for the rest of
+    the session and consumes the node names, so a later import of the same workflow gets
+    suffixed names and the artist accumulates flows the editor has no path to remove.
+    """
+
+    @staticmethod
+    def _node_class_for(workflow_path: Path) -> type:
+        """A WorkflowNode subclass with an empty surface, the way the library builds one per workflow."""
+        from griptape_nodes.exe_types.workflow_node import WorkflowNode, WorkflowNodeSurface
+
+        return type(
+            "ProbeWorkflowNode",
+            (WorkflowNode,),
+            {
+                "workflow_file_path": workflow_path,
+                "workflow_metadata": read_workflow_metadata(workflow_path),
+                "workflow_surface": WorkflowNodeSurface(parameters={}, start_node_names=[], end_node_names=[]),
+            },
+        )
+
+    def test_repeated_refusals_do_not_accumulate_flows(self, engine: Engine, tmp_path: Path) -> None:
+        del engine
+        from griptape_nodes.exe_types.flow import ControlFlow
+
+        relative_path = _save_two_library_workflow(tmp_path, "inner_workflow")
+        reopened = _rebuild_engine_without_library(tmp_path, disabled=True)
+        _register_workflow(reopened, tmp_path, relative_path)
+
+        reopened.context_manager.push_workflow(workflow_name="host_workflow")
+        host_flow = reopened.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="HostFlow", set_as_new_context=False)
+        )
+        assert isinstance(host_flow, CreateFlowResultSuccess), host_flow
+
+        # Register the node the way CreateNodeRequest would; its class is not in a library, so the
+        # request path is unavailable and _load_subflow needs the parent-flow mapping to resolve.
+        node = self._node_class_for(tmp_path / relative_path)(name="Wrapper")
+        reopened.flow_manager.get_flow_by_name(host_flow.flow_name).add_node(node)
+        reopened.object_manager.add_object_by_name(node.name, node)
+        reopened.node_manager._name_to_parent_flow_name[node.name] = host_flow.flow_name
+
+        flows_before = set(reopened.object_manager.get_filtered_subset(type=ControlFlow))
+        for _ in range(3):
+            with pytest.raises(RuntimeError, match="FLAWED"):
+                asyncio.run(node._load_subflow())
+
+        # Each refusal cleaned up after itself, so three of them leave nothing behind...
+        assert set(reopened.object_manager.get_filtered_subset(type=ControlFlow)) == flows_before
+        # ...and nothing is left tracked for a later run to trip over.
+        assert node.metadata.get("subflow_name") is None

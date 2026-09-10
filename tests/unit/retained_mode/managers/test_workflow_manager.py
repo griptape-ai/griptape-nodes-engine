@@ -1612,10 +1612,9 @@ class TestWorkflowManager:
     async def test_unregistered_library_reports_flawed_not_unusable(self, engine: Engine, tmp_path: Path) -> None:
         """A header naming a library that is not registered leaves the workflow FLAWED.
 
-        It used to be critical, which meant UNUSABLE. That contradicts what the editor now does
-        with such a workflow: it opens, with ErrorProxyNode placeholders standing in for that
-        library's nodes (issue #5505). UNUSABLE would tell the artist not to bother opening the
-        thing they can in fact open and edit.
+        Such a workflow opens, with ErrorProxyNode placeholders standing in for that library's
+        nodes (issue #5505). UNUSABLE would tell the artist not to bother opening the thing they
+        can in fact open and edit.
         """
         workflow_manager = engine.workflow_manager
         engine.config_manager.workspace_path = tmp_path

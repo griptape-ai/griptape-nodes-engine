@@ -387,6 +387,13 @@ class WorkflowNode(ControlNode):
         # placeholder off the resolution path would let the subflow report output computed without
         # it. Refuse here, the way the headless executor does for the same reason.
         if import_result.status is not WorkflowStatus.GOOD:
+            # The import already built a flow full of nodes. Hand it to the usual cleanup before
+            # refusing: left behind it would sit in ObjectManager for the rest of the session and
+            # keep its node names, so a later import of the same workflow gets suffixed ones.
+            # Tracking it only to discard it is deliberate -- the key must not outlive this call,
+            # or the next one would find a live subflow tracked and reuse it without re-checking.
+            self.metadata[SUBFLOW_NAME_KEY] = import_result.created_flow_name
+            self._discard_subflow()
             msg = (
                 f"Attempted to load the workflow at '{self.workflow_file_path}' for node '{self.name}'. "
                 f"Failed because it loaded with status {import_result.status}, which cannot be executed: "
