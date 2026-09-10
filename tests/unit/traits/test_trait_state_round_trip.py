@@ -11,6 +11,7 @@ from griptape_nodes.exe_types.core_types import Trait
 from griptape_nodes.traits.clamp import Clamp
 from griptape_nodes.traits.compare import Compare
 from griptape_nodes.traits.minmax import MinMax
+from griptape_nodes.traits.multi_options import MultiOptions
 from griptape_nodes.traits.slider import Slider
 
 
@@ -199,3 +200,54 @@ class TestGeneratedConstructorsAreNotState:
 
     def test_compare_declares_no_constructor_and_stays_empty(self) -> None:
         assert Compare().to_state() == {}
+
+
+class TestApplyStateGoesThroughTheConstructor:
+    """Restoring in place must interpret state the same way building fresh does."""
+
+    def test_a_constructor_coercion_applies_in_place(self) -> None:
+        # MultiOptions snaps an unrecognized icon_size back to "small". A raw assignment
+        # would keep "huge", so the same saved file produced two different traits depending
+        # on whether the node's __init__ had already built one.
+        trait = MultiOptions(choices=["a"])
+
+        trait.apply_state({"choices": ["a"], "icon_size": "huge"})
+
+        assert trait.icon_size == "small"
+        assert trait.icon_size == MultiOptions.from_state({"choices": ["a"], "icon_size": "huge"}).icon_size
+
+    def test_a_key_the_saved_state_omits_keeps_what_init_built(self) -> None:
+        # A file saved before the trait gained an argument says nothing about it. Live code
+        # should win there, so the node's own constructor value stands rather than being
+        # reset to the trait's default.
+        trait = MultiOptions(choices=["a"], placeholder="Pick one")
+
+        trait.apply_state({"choices": ["b"]})
+
+        assert trait.choices == ["b"]
+        assert trait.placeholder == "Pick one"
+        assert MultiOptions.from_state({"choices": ["b"]}).placeholder == "Select options..."
+
+    def test_an_aliased_argument_still_lands_on_its_attribute(self) -> None:
+        trait = Slider(min_val=0, max_val=1)
+
+        trait.apply_state({"min_val": 2, "max_val": 8})
+
+        assert (trait.min, trait.max) == (2, 8)
+
+    def test_state_the_constructor_cannot_satisfy_raises(self) -> None:
+        # The caller reports this. Applying what fits and leaving the rest would produce a
+        # trait that is neither what was saved nor what __init__ built.
+        trait = Slider(min_val=0, max_val=1)
+
+        with pytest.raises(TypeError):
+            trait.apply_state({"min_val": 2})
+
+    def test_a_failed_apply_leaves_the_trait_as_it_was(self) -> None:
+        trait = Slider(min_val=0, max_val=1)
+
+        with pytest.raises(TypeError):
+            trait.apply_state({"min_val": 2})
+
+        assert trait.min == 0
+        assert trait.max == 1
