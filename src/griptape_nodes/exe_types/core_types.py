@@ -739,10 +739,12 @@ class UIOptionsMixin:
     def authored_ui_options(self) -> dict[str, Any]:
         """Return only the UI options authored on this element, with nothing derived.
 
-        This is the save view, and the base every read-modify-write below starts from. A
-        subclass whose ``ui_options`` getter merges in options derived from live state (a
-        trait's rendered options, a container's layout) must leave those out of here, and
-        must add back any authored option it holds outside ``_ui_options``.
+        This is the save view, and the base every read-modify-write below starts from. It is
+        also the single place the authored/derived split is enforced, so ``_ui_options`` is
+        free to hold whatever it was handed. A subclass whose ``ui_options`` getter merges in
+        options derived from live state (a trait's rendered options, a container's layout)
+        must subtract those here, and must add back any authored option it holds outside
+        ``_ui_options``.
         """
         return dict(self._ui_options)  # type: ignore[attr-defined]
 
@@ -753,11 +755,9 @@ class UIOptionsMixin:
     def update_ui_options(self, updates: dict[str, Any]) -> None:
         """Update multiple UI options at once.
 
-        Reads the authored view rather than the ``ui_options`` getter. On ``Parameter`` that
-        getter is a merge of trait-derived options with authored ones, so writing it back
-        would copy every trait's rendered options into stored state, permanently detaching
-        them from the trait that owns them. Assignment still goes through the setter so the
-        update event is emitted.
+        Reads the authored view rather than the ``ui_options`` getter, so an unrelated write
+        does not copy every derived option into stored state on its way past. Assignment
+        still goes through the setter so the update event is emitted.
         """
         authored = self.authored_ui_options()
         authored.update(updates)
@@ -766,9 +766,9 @@ class UIOptionsMixin:
     def remove_ui_options_key(self, key: str) -> None:
         """Drop a single UI option key, so whatever its absence means applies again.
 
-        The counterpart to ``update_ui_options_key``, and it exists for the same reason:
-        popping the key out of the merged ``ui_options`` getter and writing that back would
-        store every derived option alongside it.
+        The counterpart to ``update_ui_options_key``, and it reads the same authored view for
+        the same reason: popping the key out of the merged ``ui_options`` getter and writing
+        that back would store every derived option alongside it.
         """
         authored = self.authored_ui_options()
         authored.pop(key, None)
@@ -1998,15 +1998,29 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
     @ui_options.setter
     @BaseNodeElement.emits_update_on_write
     def ui_options(self, value: dict) -> None:
-        self._ui_options = self._without_trait_owned_keys(value)
+        self._ui_options = value
+
+    def authored_ui_options(self) -> dict[str, Any]:
+        """Subtract the keys the attached traits render, leaving what this parameter authored.
+
+        Filtering here rather than in the setter is what makes the split hold whatever order
+        things happen in. Ownership changes when a trait attaches, which can be before a key
+        is written (the constructor, or ``ui_options=``) or after it (``add_trait``), so no
+        write site can decide the question on its own. This runs at the moment the answer is
+        needed instead: saving and diffing both read it.
+
+        Leaving ``_ui_options`` unfiltered also means detaching a trait hands back the value
+        the parameter had authored under that key, rather than having lost it on attach.
+        """
+        return self._without_trait_owned_keys(super().authored_ui_options())
 
     def _without_trait_owned_keys(self, value: dict) -> dict:
-        """Drop the keys an attached trait renders, so stored options stay authored-only.
+        """Drop the keys an attached trait renders.
 
-        The editor is handed the merged ``ui_options``, so an inbound write echoing it back
-        would otherwise store every trait's rendered options as though the parameter had
-        authored them, where the copy then shadows the trait that owns it. Filtering in the
-        setter makes that unrepresentable, rather than something every caller must avoid.
+        A trait derives its options from its current state, so a copy of them stored on the
+        parameter is at best redundant and at worst a stale shadow of the trait it came from.
+        The editor is handed the merged ``ui_options`` and echoes it back, which is the
+        ordinary way such a copy arrives.
         """
         trait_owned: set[str] = set()
         for trait in self.find_elements_by_type(Trait):
@@ -2725,12 +2739,14 @@ class ParameterList(ParameterContainer):
         }
 
     def authored_ui_options(self) -> dict[str, Any]:
-        """Include the layout options this class holds outside ``_ui_options``.
+        """Add back the layout options this class holds outside ``_ui_options``.
 
         ``collapsed``, ``child_prefix``, and the grid keys are authored, not derived: they
         come from constructor arguments and the properties above. Leaving them out would
         drop a list's layout from the save, and would make any other UI option write erase
         it, since the setter below reads grid mode back out of the dict it is handed.
+
+        Trait-owned keys are still subtracted, by ``Parameter``'s override above.
         """
         return {
             **super().authored_ui_options(),
@@ -2776,7 +2792,7 @@ class ParameterList(ParameterContainer):
         base_ui_options = {
             k: v for k, v in value.items() if k not in ["display", "columns", "collapsed", "child_prefix"]
         }
-        self._ui_options = self._without_trait_owned_keys(base_ui_options)
+        self._ui_options = base_ui_options
 
     def to_dict(self) -> dict[str, Any]:
         """Override to_dict to use the merged ui_options."""
