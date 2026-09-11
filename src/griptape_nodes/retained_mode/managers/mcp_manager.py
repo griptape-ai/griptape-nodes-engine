@@ -65,7 +65,25 @@ class MCPManager:
             )
 
     def _get_mcp_servers(self, filter_by: dict[str, Any] | None = None) -> list[MCPServerConfig]:
-        """Get the current MCP servers configuration from the config manager.
+        """Get the current MCP servers configuration, treating an unreadable config as empty.
+
+        Args:
+            filter_by: Optional dict of field=value pairs to filter by.
+                      Keys should match server config field names, values are the expected values.
+        """
+        try:
+            return self._read_mcp_servers(filter_by=filter_by)
+        except Exception as e:
+            logger.error("Failed to parse MCP servers configuration: %s", e)
+            return []
+
+    def _read_mcp_servers(self, filter_by: dict[str, Any] | None = None) -> list[MCPServerConfig]:
+        """Read and validate the MCP servers configuration, raising if it cannot be parsed.
+
+        Prefer this over :meth:`_get_mcp_servers` wherever an empty list would be
+        acted on as "the user has no servers". A caller that cannot tell those
+        apart will happily shut running servers down because a single malformed
+        entry made the whole list unreadable.
 
         Args:
             filter_by: Optional dict of field=value pairs to filter by.
@@ -78,23 +96,20 @@ class MCPManager:
         if not mcp_config_data:
             return []
 
-        try:
-            servers = [MCPServerConfig.model_validate(server) for server in mcp_config_data]
-            if filter_by:
-                filtered_servers = []
-                for server in servers:
-                    match = True
-                    for field, value in filter_by.items():
-                        if getattr(server, field, None) != value:
-                            match = False
-                            break
-                    if match:
-                        filtered_servers.append(server)
-                return filtered_servers
-            return servers  # noqa: TRY300
-        except Exception as e:
-            logger.error("Failed to parse MCP servers configuration: %s", e)
-            return []
+        servers = [MCPServerConfig.model_validate(server) for server in mcp_config_data]
+        if not filter_by:
+            return servers
+
+        filtered_servers = []
+        for server in servers:
+            match = True
+            for field, value in filter_by.items():
+                if getattr(server, field, None) != value:
+                    match = False
+                    break
+            if match:
+                filtered_servers.append(server)
+        return filtered_servers
 
     def _save_mcp_servers(self, servers: list[MCPServerConfig]) -> None:
         """Save the MCP servers configuration to the config manager."""
@@ -357,9 +372,16 @@ class MCPManager:
         self,
         request: GetEnabledMCPServersRequest,  # noqa: ARG002
     ) -> GetEnabledMCPServersResultSuccess | GetEnabledMCPServersResultFailure:
-        """Handle get enabled MCP servers request."""
+        """Handle get enabled MCP servers request.
+
+        Reads through `_read_mcp_servers` rather than `_get_mcp_servers` so an
+        unreadable config fails the request instead of answering "no servers are
+        enabled". Callers use this to decide which servers to attach *and* which
+        to shut down, so the difference is the difference between a warning and
+        tearing down every running server over one bad config entry.
+        """
         try:
-            enabled_servers = self._get_mcp_servers(filter_by={"enabled": True})
+            enabled_servers = self._read_mcp_servers(filter_by={"enabled": True})
             servers_dict = {server.name: server.model_dump() for server in enabled_servers}
 
         except Exception as e:
