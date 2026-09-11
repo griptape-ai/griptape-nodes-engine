@@ -388,28 +388,27 @@ class BaseNodeElement:
             self._badge.hide = hide
         if hide_clear_button is not None:
             self._badge.hide_clear_button = hide_clear_button
-        self._changes["badge"] = self._badge.to_dict()
-        # Batch UI updates: add to node's tracked list so emit_parameter_changes() sends our _changes later.
-        # Only when attached to a node and not already in the list (avoids duplicate events).
-        if self._node_context is not None and self not in self._node_context._tracked_parameters:
-            self._node_context._tracked_parameters.append(self)
+        self.track_change("badge", self._badge.to_dict())
 
     def clear_badge(self) -> None:
         """Set badge to None (cleared)."""
         self._badge = None
-        self._changes["badge"] = None
-        # Batch UI updates: add to node's tracked list so emit_parameter_changes() sends our _changes later.
-        # Only when attached to a node and not already in the list (avoids duplicate events).
-        if self._node_context is not None and self not in self._node_context._tracked_parameters:
-            self._node_context._tracked_parameters.append(self)
+        self.track_change("badge", None)
 
     def dismiss_badge(self) -> None:
         """Hide the badge indicator (hide=True). Frontend can send clear_badge_display to trigger this."""
         if self._badge is None:
             return
         self._badge.hide = True
-        self._changes["badge"] = self._badge.to_dict()
-        # Batch UI updates: add to node's tracked list so emit_parameter_changes() sends our _changes later.
+        self.track_change("badge", self._badge.to_dict())
+
+    def track_change(self, key: str, value: Any) -> None:
+        """Record a changed field and queue this element for the next batched UI update.
+
+        A queue rather than a send: ``emit_parameter_changes()`` picks the element up later
+        and reports every change recorded since the last flush.
+        """
+        self._changes[key] = value
         # Only when attached to a node and not already in the list (avoids duplicate events).
         if self._node_context is not None and self not in self._node_context._tracked_parameters:
             self._node_context._tracked_parameters.append(self)
@@ -426,11 +425,7 @@ class BaseNodeElement:
                 new_value = getattr(self, f"{func.__name__}", None) if hasattr(self, f"{func.__name__}") else None
                 # Track change if different
                 if old_value != new_value:
-                    self._changes[func.__name__] = new_value
-                    # Batch UI updates: add to node's tracked list so emit_parameter_changes() sends our _changes later.
-                    # Only when attached to a node and not already in the list (avoids duplicate events).
-                    if self._node_context is not None and self not in self._node_context._tracked_parameters:
-                        self._node_context._tracked_parameters.append(self)
+                    self.track_change(func.__name__, new_value)
                 return result
             return func(self, *args, **kwargs)
 
@@ -607,7 +602,7 @@ class BaseNodeElement:
         }
         return event_data
 
-    def _apply_badge_from_message_data(self, data: dict) -> None:  # noqa: C901
+    def _apply_badge_from_message_data(self, data: dict) -> None:
         """Apply badge fields from a message data dict and track change."""
         if self._badge is None:
             self._badge = BadgeData()
@@ -632,11 +627,7 @@ class BaseNodeElement:
             self._badge.hide = data["hide"]
         if "hide_clear_button" in data:
             self._badge.hide_clear_button = data["hide_clear_button"]
-        self._changes["badge"] = self._badge.to_dict()
-        # Batch UI updates: add to node's tracked list so emit_parameter_changes() sends our _changes later.
-        # Only when attached to a node and not already in the list (avoids duplicate events).
-        if self._node_context is not None and self not in self._node_context._tracked_parameters:
-            self._node_context._tracked_parameters.append(self)
+        self.track_change("badge", self._badge.to_dict())
 
     def _on_badge_message_received(
         self, message_type: str, message: NodeMessagePayload | None
