@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any, cast
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from griptape_nodes.node_library.library_registry import Dependencies, LibraryMetadata
 from griptape_nodes.retained_mode.events.app_events import LibraryLoadedNotification
+from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
+    IncompatibleRequirementsProblem,
+)
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 
 
@@ -120,14 +123,35 @@ class TestGetWorkerForLibrary:
 
 class TestOnLibraryLoadedNotification:
     def _make_lib_info(self, library_name: str) -> LibraryManager.LibraryInfo:
+        """A legacy worker-mode library awaiting its worker's verdict.
+
+        `requires_worker` is what puts a library in WORKER_PENDING in the first place (see
+        `_start_workers`), so a fixture in that state without the flag describes something the
+        engine never produces.
+        """
         return LibraryManager.LibraryInfo(
             lifecycle_state=LibraryManager.LibraryLifecycleState.WORKER_PENDING,
             fitness=LibraryManager.LibraryFitness.NOT_EVALUATED,
             library_path="/some/path.json",
             is_sandbox=False,
             library_name=library_name,
+            requires_worker=True,
+            executes_in_worker=True,
         )
 
+    def _make_exec_deps_lib_info(self, library_name: str) -> LibraryManager.LibraryInfo:
+        """An execution-dependency library that already loaded its real nodes locally."""
+        return LibraryManager.LibraryInfo(
+            lifecycle_state=LibraryManager.LibraryLifecycleState.LOADED,
+            fitness=LibraryManager.LibraryFitness.FLAWED,
+            library_path="/some/exec-deps.json",
+            is_sandbox=False,
+            library_name=library_name,
+            requires_worker=False,
+            executes_in_worker=True,
+        )
+
+    @pytest.mark.asyncio
     @pytest.mark.asyncio
     async def test_updates_fitness_and_lifecycle_to_loaded(self) -> None:
         mgr = _make_library_manager()
@@ -139,6 +163,28 @@ class TestOnLibraryLoadedNotification:
         assert lib_info.lifecycle_state == LibraryManager.LibraryLifecycleState.LOADED
         assert lib_info.fitness == LibraryManager.LibraryFitness.GOOD
 
+    @pytest.mark.asyncio
+    @pytest.mark.asyncio
+    async def test_a_worker_does_not_overwrite_a_locally_derived_fitness(self) -> None:
+        """An exec-deps library's fitness is the orchestrator's own finding, not the worker's.
+
+        It loaded real node classes here, so its FLAWED verdict came from doing that -- an
+        edit-time dependency that failed, a node module that would not import. The worker only
+        knows whether ITS copy came up. Taking the worker's answer would paint over a broken node
+        that is sitting on the canvas, and the reason would not travel with it.
+        """
+        mgr = _make_library_manager()
+        lib_info = self._make_exec_deps_lib_info("exec_deps_lib")
+        mgr._library_file_path_to_info["/some/exec-deps.json"] = lib_info
+
+        await mgr._on_library_loaded_notification(
+            LibraryLoadedNotification(library_name="exec_deps_lib", fitness="GOOD")
+        )
+
+        assert lib_info.fitness == LibraryManager.LibraryFitness.FLAWED
+        assert lib_info.lifecycle_state == LibraryManager.LibraryLifecycleState.LOADED
+
+    @pytest.mark.asyncio
     @pytest.mark.asyncio
     async def test_accepts_flawed_fitness(self) -> None:
         mgr = _make_library_manager()
@@ -152,6 +198,7 @@ class TestOnLibraryLoadedNotification:
         assert lib_info.lifecycle_state == LibraryManager.LibraryLifecycleState.LOADED
         assert lib_info.fitness == LibraryManager.LibraryFitness.FLAWED
 
+    @pytest.mark.asyncio
     @pytest.mark.asyncio
     async def test_does_nothing_for_unknown_library(self) -> None:
         mgr = _make_library_manager()
@@ -311,3 +358,131 @@ class TestExecuteWaitsForTheWorkerLibraryLoad:
         assert info.lifecycle_state is LibraryManager.LibraryLifecycleState.LOADED, (
             "an exec-deps library must stay editable through an eviction"
         )
+
+
+class TestOnWorkerEvicted:
+    """What an evicted worker leaves behind, per library kind.
+
+    An exec-dependencies library loaded real node classes on the orchestrator before its worker
+    ever spawned, so losing the worker must cost EXECUTION and nothing else: still LOADED, still
+    editable, with a reason the next run can report. A legacy worker-mode library has only stubs
+    until its worker confirms, so losing the worker is a load failure. Neither was covered, and
+    the difference is the whole point of the split.
+    """
+
+    def _info(self, *, requires_worker: bool, lifecycle: LibraryManager.LibraryLifecycleState) -> Any:
+        return LibraryManager.LibraryInfo(
+            lifecycle_state=lifecycle,
+            fitness=LibraryManager.LibraryFitness.GOOD,
+            library_path="/some/path.json",
+            is_sandbox=False,
+            library_name="Lib",
+            requires_worker=requires_worker,
+            executes_in_worker=True,
+        )
+
+    def test_exec_deps_library_stays_loaded_and_records_why(self) -> None:
+        manager = _make_library_manager()
+        info = self._info(requires_worker=False, lifecycle=LibraryManager.LibraryLifecycleState.LOADED)
+        manager._library_file_path_to_info["/some/path.json"] = info
+
+        manager.on_worker_evicted("worker-1", "Lib")
+
+        assert info.lifecycle_state is LibraryManager.LibraryLifecycleState.LOADED
+        assert info.fitness is LibraryManager.LibraryFitness.GOOD
+        assert info.execution_unavailable_reason is not None
+        assert "stopped responding" in info.execution_unavailable_reason
+
+    def test_legacy_worker_pending_library_becomes_failure(self) -> None:
+        manager = _make_library_manager()
+        info = self._info(requires_worker=True, lifecycle=LibraryManager.LibraryLifecycleState.WORKER_PENDING)
+        manager._library_file_path_to_info["/some/path.json"] = info
+
+        manager.on_worker_evicted("worker-1", "Lib")
+
+        assert info.lifecycle_state is LibraryManager.LibraryLifecycleState.FAILURE
+        assert info.fitness is LibraryManager.LibraryFitness.UNUSABLE
+
+    def test_unknown_library_name_is_a_no_op(self) -> None:
+        manager = _make_library_manager()
+        manager.on_worker_evicted("worker-1", "Never Registered")
+        manager.on_worker_evicted("worker-1", None)
+
+
+class TestSpawnSkipForUnmetRequirements:
+    """A pointless spawn is skipped -- but only where the nodes already exist locally.
+
+    An exec-dependencies library loaded real node classes on the orchestrator, so a worker it can
+    never use costs a whole execution environment -- torch, gigabytes -- for nothing. A legacy
+    worker-mode library is the opposite: the orchestrator skips its node modules entirely and its
+    classes arrive as stubs from the worker, so skipping the spawn would leave it with no node
+    types at all.
+    """
+
+    def _manager(self, *, requires_worker: bool, unmet: bool) -> LibraryManager:
+        manager = _make_library_manager()
+        manager._engine = MagicMock()  # type: ignore[assignment]
+        manager._engine.ahandle_request = AsyncMock()  # type: ignore[union-attr]
+        info = LibraryManager.LibraryInfo(
+            lifecycle_state=LibraryManager.LibraryLifecycleState.LOADED,
+            fitness=LibraryManager.LibraryFitness.GOOD,
+            library_path="/some/path.json",
+            is_sandbox=False,
+            library_name="Lib",
+            requires_worker=requires_worker,
+            executes_in_worker=True,
+        )
+        if unmet:
+            info.problems = [
+                IncompatibleRequirementsProblem(
+                    requirements={"compute": (["cuda"], "has_any")},
+                    system_capabilities={"compute": ["cpu"]},
+                )
+            ]
+            info.execution_unavailable_reason = "it needs compute cuda, and this machine has cpu."
+        manager._library_file_path_to_info["/some/path.json"] = info
+        return manager
+
+    @pytest.mark.asyncio
+    async def test_exec_deps_library_with_unmet_requirements_is_not_spawned(self) -> None:
+        manager = self._manager(requires_worker=False, unmet=True)
+
+        await manager._start_workers()
+
+        cast("MagicMock", manager._engine).ahandle_request.assert_not_awaited()
+        info = manager._library_file_path_to_info["/some/path.json"]
+        assert info.execution_unavailable_reason is not None, "the local refusal must survive"
+
+    @pytest.mark.asyncio
+    async def test_legacy_worker_library_still_spawns_even_when_unmet(self) -> None:
+        """Its nodes come from the worker, so no spawn means no node types at all."""
+        manager = self._manager(requires_worker=True, unmet=True)
+
+        await manager._start_workers()
+
+        cast("MagicMock", manager._engine).ahandle_request.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_the_spawn_a_legacy_library_still_gets_does_not_clear_its_refusal(self) -> None:
+        """execution_unavailable_reason is the only gate get_worker_for_library has.
+
+        This library's spawn is deliberately not skipped, so clearing the reason on a fresh attempt
+        would let execution dispatch to a worker that cannot load it. An unmet requirement is a
+        standing fact about the machine, not an account of a previous attempt.
+        """
+        manager = self._manager(requires_worker=True, unmet=True)
+
+        await manager._start_workers()
+
+        info = manager._library_file_path_to_info["/some/path.json"]
+        assert info.execution_unavailable_reason is not None
+
+    @pytest.mark.asyncio
+    async def test_a_library_with_met_requirements_spawns(self) -> None:
+        manager = self._manager(requires_worker=False, unmet=False)
+
+        await manager._start_workers()
+
+        cast("MagicMock", manager._engine).ahandle_request.assert_awaited_once()
+        # Nothing standing in the way, so a stale account of a previous attempt is cleared.
+        assert manager._library_file_path_to_info["/some/path.json"].execution_unavailable_reason is None

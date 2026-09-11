@@ -227,28 +227,80 @@ bus:
 
 Issue the request via `GriptapeNodes.handle_request(...)` from
 inside `process`. The handler-side path propagates the change back
-to the orchestrator. Worker subprocesses pick up the new parameter
-list on the next execute. The
+to the orchestrator. The
 [`parameter-mutation-during-aprocess`](strict_mode.md) rule fires
 on direct in-execute mutations and tells you which one to use.
 
-**`before_value_set` / `after_value_set` do not fire on editor
-changes for isolated libraries.** These hooks run inside the worker
-subprocess, on the temporary copy of your node built for each
-execute. The orchestrator holds only a stub copy of your node class
-— parameters, no code — so it never calls your overrides when a
-user edits a value in the editor. Transforming an incoming value
-still works: the hooks run as inputs are applied, just before
-`process`. But a parameter-list change made inside them is
-discarded with the temporary node. It skips the
-[`parameter-mutation-during-aprocess`](strict_mode.md) rule, and it
-does not propagate either.
+**The change lands on the orchestrator's node, not the one that is
+running.** That is the same rule as everywhere else here — the
+orchestrator holds the authoritative node — but it has a
+consequence worth stating outright: you cannot read the parameter
+back during the execution that added it.
+`self.get_parameter_by_name("new_param")` returns `None` in the
+worker even though the request succeeded and the editor is already
+showing the parameter.
 
-The practical consequence: hooks that adjust the parameter list in
-response to user input (for example, showing or hiding fields when
-a dropdown changes) only work in Shared mode. For an isolated
-library, define the full parameter list statically in `__init__`.
-Overriding a value hook fires the
+It does not reappear on the next execute either. Each execution
+builds a fresh worker-side copy from the node class, so parameter
+*structure* never carries forward — only values do.
+
+This is the contract, stated once: **a node's parameter structure
+must be a deterministic function of its parameter values.** Create
+parameters in `__init__`, or create and remove them from a value
+hook based on the values being set — the pattern the diffusers VAE
+decoder uses, rebuilding its output parameters from the pipeline
+value whenever it is set. Structure written that way needs no
+syncing at all: the same derivation runs on the orchestrator's
+node at edit time and again on the fresh worker copy as its values
+hydrate, so every copy converges on the same shape. Structure that
+exists only because something added it once — by request, from
+`process`, in a previous session — is history, not derivation, and
+history does not carry.
+
+Hydration honors the contract from its side. Values are applied in
+passes until the structure settles, so a value for a derived
+parameter works even when it arrives before the value that derives
+it — including chains, where one derived parameter's hook creates
+the next. A value for a parameter
+that nothing on the copy derives — most commonly one a user added
+in the editor — is left unapplied for that run, with a warning
+naming the parameter; it does not fail the execution, and the
+authoritative value on the orchestrator is untouched.
+
+### Value hooks: it depends on which kind of library
+
+**Execution-dependency libraries** (the ones that declare
+`pip_dependencies_exec`) keep real node classes on the
+orchestrator, so `before_value_set` / `after_value_set` fire there
+when a user edits a value, exactly as they do for a Shared
+library. Hooks that adjust the parameter list in response to user
+input — showing or hiding fields when a dropdown changes, growing
+a list — work normally at edit time.
+
+Two things to know about those hooks at *execution* time:
+
+- They also run in the worker, as inputs are applied. The
+    orchestrator skips hooks for a value that has not changed, but
+    the worker's node is freshly built, so every value looks new and
+    every hook runs. Keep them cheap and idempotent.
+- Anything they do to the node object there is discarded with the
+    temporary node. A parameter-list change made from a hook during
+    execution follows the rule above: route it through the request
+    bus if it needs to persist, and do not expect to read it back in
+    that same execution.
+
+**Legacy worker-mode libraries** (Isolated mode, chosen by
+`worker_mode_override` or `suggested_worker_mode`) behave
+differently, because the orchestrator holds only a stub copy of
+your node class — parameters, no code — so it never calls your
+overrides when a user edits a value. Transforming an incoming
+value still works, since the hooks run as inputs are applied just
+before `process`, but a parameter-list change made inside them is
+discarded with the temporary node: it skips the
+[`parameter-mutation-during-aprocess`](strict_mode.md) rule and
+does not propagate either. For those libraries, define the full
+parameter list statically in `__init__`. Overriding a value hook
+fires the
 [`value-hooks-execute-only-on-worker`](strict_mode.md) warning at
 library load.
 
