@@ -6,6 +6,7 @@ import uuid
 import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum, StrEnum, auto
@@ -47,7 +48,7 @@ class NodeMessageResult(BaseModel):
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
     from types import TracebackType
 
     from griptape_nodes.exe_types.node_types import BaseNode
@@ -331,6 +332,24 @@ class BaseNodeElement:
         # Push this element onto the global stack
         BaseNodeElement._stack.append(self)
         return self
+
+    @staticmethod
+    @contextmanager
+    def detached() -> Iterator[None]:
+        """Build elements without adopting them into the element context that is open.
+
+        For an element built to be read and discarded, which would otherwise be attached to
+        whatever element is open as a context manager and show up as a child of it.
+
+        Mutates the one list rather than rebinding it, so an ``__exit__`` reached from inside
+        this block still pops the element its ``__enter__`` pushed.
+        """
+        open_elements = BaseNodeElement._stack[:]
+        BaseNodeElement._stack.clear()
+        try:
+            yield
+        finally:
+            BaseNodeElement._stack[:] = open_elements
 
     def __exit__(
         self,
@@ -3445,6 +3464,8 @@ class Trait(ABC, BaseNodeElement):
             TypeError: if ``state`` cannot satisfy the constructor. The caller reports it; a
                 half-applied trait would be worse than one left as ``__init__`` built it.
         """
+        if not state:
+            return
         interpreted = type(self).from_state(state)
         for name in state:
             attribute_name = self.STATE_ALIASES.get(name, name)
@@ -3529,8 +3550,14 @@ class Trait(ABC, BaseNodeElement):
 
     @classmethod
     def from_state(cls, state: dict[str, Any]) -> Self:
-        """Rebuild a trait from ``to_state`` output by calling the real constructor."""
-        return cls(**state)
+        """Rebuild a trait from ``to_state`` output by calling the real constructor.
+
+        Detached, because every caller decides for itself where the trait belongs: one
+        attaches it to a parameter, another reads its values and throws it away. Adopting it
+        into whatever element happens to be open as a context manager would do neither.
+        """
+        with BaseNodeElement.detached():
+            return cls(**state)
 
     @classmethod
     def _state_parameter_names(cls) -> list[str]:
