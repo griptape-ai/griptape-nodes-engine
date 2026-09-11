@@ -134,7 +134,13 @@ class TestUnresolvableTraitName:
                 parameter_name="model",
                 tooltip="t",
                 type="str",
-                traits=[{"trait_name": "NoSuchTrait", "trait_state": {}}],
+                traits=[
+                    {
+                        "trait_name": "NoSuchTrait",
+                        "trait_module": "griptape_nodes.node_libraries.a_library_that_is_gone.traits",
+                        "trait_state": {},
+                    }
+                ],
             )
         )
 
@@ -153,7 +159,13 @@ class TestUnresolvableTraitName:
                 parameter_name="model",
                 tooltip="t",
                 type="str",
-                traits=[{"trait_name": "NoSuchTrait", "trait_state": {}}],
+                traits=[
+                    {
+                        "trait_name": "NoSuchTrait",
+                        "trait_module": "griptape_nodes.node_libraries.a_library_that_is_gone.traits",
+                        "trait_state": {},
+                    }
+                ],
             )
         )
 
@@ -429,7 +441,13 @@ class TestTraitStateMissingARequiredArgument:
                 parameter_name="model",
                 tooltip="t",
                 type="str",
-                traits=[{"trait_name": "_RequiredCallbackTrait", "trait_state": {"label": "x"}}],
+                traits=[
+                    {
+                        "trait_name": "_RequiredCallbackTrait",
+                        "trait_module": _RequiredCallbackTrait.__module__,
+                        "trait_state": {"label": "x"},
+                    }
+                ],
             )
         )
 
@@ -448,7 +466,13 @@ class TestTraitStateMissingARequiredArgument:
                 parameter_name="model",
                 tooltip="t",
                 type="str",
-                traits=[{"trait_name": "_RequiredCallbackTrait", "trait_state": {"label": "x"}}],
+                traits=[
+                    {
+                        "trait_name": "_RequiredCallbackTrait",
+                        "trait_module": _RequiredCallbackTrait.__module__,
+                        "trait_state": {"label": "x"},
+                    }
+                ],
             )
         )
 
