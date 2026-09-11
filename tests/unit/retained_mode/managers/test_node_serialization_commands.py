@@ -74,6 +74,30 @@ class _TextNode(DataNode):
         pass
 
 
+class _MetadataDrivenNode(DataNode):
+    """A node that rebuilds its dynamic parameters in ``__init__`` from its own metadata.
+
+    A node following this pattern already carries those parameters by the time the create command
+    replays, so serialization must not also emit an add for them.
+    """
+
+    def __init__(self, name: str, metadata: dict | None = None) -> None:
+        super().__init__(name, metadata=metadata)
+        for dynamic_name in self.metadata.get("dynamic_parameters") or []:
+            self.add_parameter(
+                Parameter(
+                    name=dynamic_name,
+                    tooltip="Dynamic value",
+                    type="str",
+                    default_value="",
+                    allowed_modes={ParameterMode.PROPERTY},
+                )
+            )
+
+    def process(self) -> None:
+        pass
+
+
 class _ComputedValueNode(DataNode):
     """A node whose parameter value is computed rather than stored in parameter_values.
 
@@ -164,6 +188,9 @@ def library_name(engine: Engine) -> Generator[str, None, None]:
     library.register_new_node_type(_TextNode, NodeMetadata(category="test", description="d", display_name="Text"))
     library.register_new_node_type(
         _ComputedValueNode, NodeMetadata(category="test", description="d", display_name="Computed")
+    )
+    library.register_new_node_type(
+        _MetadataDrivenNode, NodeMetadata(category="test", description="d", display_name="Metadata Driven")
     )
     library.register_new_node_type(_GroupNode, NodeMetadata(category="test", description="d", display_name="Group"))
     engine.handle_request(
@@ -278,51 +305,73 @@ class TestElementModificationCommands:
         assert alter_commands[0].tooltip == "Changed tooltip"
         assert alter_commands[0].default_value == "changed default"
 
-    def test_parameter_added_after_construction_is_created_not_altered(self, engine: Engine, library_name: str) -> None:
-        """A parameter the node class does not declare has to be added, since nothing exists to alter.
+    def test_parameter_the_class_does_not_declare_is_left_out(self, engine: Engine, library_name: str) -> None:
+        """A parameter absent from the class produces no command, and the node still round trips.
 
-        Nodes that grow parameters as they run reach this: the reference instance the serializer
-        diffs against is built from the class, so it has no such parameter.
+        Nodes add such parameters transiently while they run — a scratch parameter feeding a media
+        upload, removed once the run ends. An alter command would target a parameter that the
+        recreated node never has, failing the deserialize.
         """
         node_name = _create_text_node(engine, library_name, "N1")
         node = engine.object_manager.get_object_by_name(node_name)
         assert isinstance(node, BaseNode)
         node.add_parameter(
-            Parameter(name="grown", tooltip="grown at runtime", type="str", allowed_modes={ParameterMode.PROPERTY})
+            Parameter(
+                name="_scratch_upload",
+                tooltip="Transient",
+                type="str",
+                allowed_modes={ParameterMode.PROPERTY},
+            )
         )
 
         result = engine.node_manager.on_serialize_node_to_commands(SerializeNodeToCommandsRequest(node_name=node_name))
 
         assert isinstance(result, SerializeNodeToCommandsResultSuccess)
-        commands_for_grown = [
+        assert not [
             command
             for command in result.serialized_node_commands.element_modification_commands
-            if getattr(command, "parameter_name", None) == "grown"
+            if getattr(command, "parameter_name", None) == "_scratch_upload"
         ]
-        assert len(commands_for_grown) == 1
-        assert isinstance(commands_for_grown[0], AddParameterToNodeRequest)
-
-    def test_node_with_parameter_added_after_construction_round_trips(self, engine: Engine, library_name: str) -> None:
-        """Deserializing such a node succeeds and the recreated node carries the parameter."""
-        node_name = _create_text_node(engine, library_name, "N1")
-        node = engine.object_manager.get_object_by_name(node_name)
-        assert isinstance(node, BaseNode)
-        node.add_parameter(
-            Parameter(name="grown", tooltip="grown at runtime", type="str", allowed_modes={ParameterMode.PROPERTY})
-        )
-
-        serialize_result = engine.node_manager.on_serialize_node_to_commands(
-            SerializeNodeToCommandsRequest(node_name=node_name)
-        )
-        assert isinstance(serialize_result, SerializeNodeToCommandsResultSuccess)
         deserialize_result = engine.handle_request(
-            DeserializeNodeFromCommandsRequest(serialized_node_commands=serialize_result.serialized_node_commands)
+            DeserializeNodeFromCommandsRequest(serialized_node_commands=result.serialized_node_commands)
+        )
+        assert isinstance(deserialize_result, DeserializeNodeFromCommandsResultSuccess), deserialize_result
+        new_node = engine.object_manager.get_object_by_name(deserialize_result.node_name)
+        assert isinstance(new_node, BaseNode)
+        assert new_node.get_parameter_by_name("_scratch_upload") is None
+
+    def test_metadata_driven_parameters_are_not_added_twice(self, engine: Engine, library_name: str) -> None:
+        """A node rebuilding its dynamic parameters in ``__init__`` keeps the same parameter names.
+
+        The reference instance carries these too, so they take the alter path. Adding them instead
+        would collide with the ones ``__init__`` already created and rename them to ``<name>_1``.
+        """
+        create_result = engine.handle_request(
+            CreateNodeRequest(
+                node_type="_MetadataDrivenNode",
+                specific_library_name=library_name,
+                node_name="MD1",
+                metadata={"dynamic_parameters": ["prompt_1"]},
+            )
+        )
+        assert isinstance(create_result, CreateNodeResultSuccess), create_result
+        node = engine.object_manager.get_object_by_name(create_result.node_name)
+        assert isinstance(node, BaseNode)
+        names_before = [parameter.name for parameter in node.parameters]
+        assert "prompt_1" in names_before
+
+        result = engine.node_manager.on_serialize_node_to_commands(
+            SerializeNodeToCommandsRequest(node_name=create_result.node_name)
+        )
+        assert isinstance(result, SerializeNodeToCommandsResultSuccess)
+        deserialize_result = engine.handle_request(
+            DeserializeNodeFromCommandsRequest(serialized_node_commands=result.serialized_node_commands)
         )
 
         assert isinstance(deserialize_result, DeserializeNodeFromCommandsResultSuccess), deserialize_result
         new_node = engine.object_manager.get_object_by_name(deserialize_result.node_name)
         assert isinstance(new_node, BaseNode)
-        assert new_node.get_parameter_by_name("grown") is not None
+        assert [parameter.name for parameter in new_node.parameters] == names_before
 
 
 class TestLockState:
