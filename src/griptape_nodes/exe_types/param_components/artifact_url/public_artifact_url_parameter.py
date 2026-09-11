@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 import mimetypes
 import os
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -14,11 +16,13 @@ from griptape.artifacts.video_url_artifact import VideoUrlArtifact
 from griptape_nodes.common.parameter_hydration import hydrate_value
 from griptape_nodes.drivers.cloud_credentials import MISSING_CREDENTIAL_MESSAGE, resolve_cloud_credential
 from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
-from griptape_nodes.exe_types.core_types import Parameter
-from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.retained_mode.events.config_events import GetConfigValueRequest, GetConfigValueResultSuccess
 from griptape_nodes.retained_mode.events.secrets_events import GetSecretValueRequest, GetSecretValueResultSuccess
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+if TYPE_CHECKING:
+    from griptape_nodes.exe_types.core_types import Parameter
+    from griptape_nodes.exe_types.node_types import BaseNode
+    from griptape_nodes.retained_mode.engine import Engine
 
 
 class PublicArtifactUrlParameter:
@@ -53,7 +57,7 @@ class PublicArtifactUrlParameter:
             )
             raise ValueError(msg)
 
-        api_key = resolve_cloud_credential(GriptapeNodes.SecretsManager(), secret_name=self.API_KEY_NAME)
+        api_key = resolve_cloud_credential(node.engine.secrets_manager, secret_name=self.API_KEY_NAME)
         if not api_key:
             msg = (
                 f"Attempted to make '{artifact_url_parameter.name}' publicly accessible. "
@@ -63,16 +67,16 @@ class PublicArtifactUrlParameter:
 
         base = os.getenv("GT_CLOUD_BASE_URL", "https://cloud.griptape.ai")
         self._storage_driver = GriptapeCloudStorageDriver(
-            GriptapeNodes.ConfigManager(),
-            bucket_id=self._get_bucket_id(base, api_key, timeout=self._request_timeout),
+            node.engine.config_manager,
+            bucket_id=self._get_bucket_id(node.engine, base, api_key, timeout=self._request_timeout),
             api_key=api_key,
             base_url=base,
             request_timeout=self._request_timeout,
         )
 
     @classmethod
-    def _get_bucket_id(cls, base_url: str, api_key: str, timeout: float | None = None) -> str:
-        bucket_id: str | None = cls._get_secret_value(cls.BUCKET_ID_NAME, should_error_on_not_found=False)
+    def _get_bucket_id(cls, engine: Engine, base_url: str, api_key: str, timeout: float | None = None) -> str:
+        bucket_id: str | None = cls._get_secret_value(engine, cls.BUCKET_ID_NAME, should_error_on_not_found=False)
 
         # A blank/whitespace-only secret is treated the same as an unset one: it can't
         # point at a real bucket and, left alone, produces confusing downstream 404s from
@@ -116,9 +120,9 @@ class PublicArtifactUrlParameter:
         return default_bucket_id
 
     @classmethod
-    def _get_config_value(cls, key: str, default: Any | None = None) -> Any | None:
+    def _get_config_value(cls, engine: Engine, key: str, default: Any | None = None) -> Any | None:
         request = GetConfigValueRequest(category_and_key=key)
-        result_event = GriptapeNodes.handle_request(request)
+        result_event = engine.handle_request(request)
 
         if isinstance(result_event, GetConfigValueResultSuccess):
             return result_event.value
@@ -127,10 +131,10 @@ class PublicArtifactUrlParameter:
 
     @classmethod
     def _get_secret_value(
-        cls, key: str, default: Any | None = None, *, should_error_on_not_found: bool = False
+        cls, engine: Engine, key: str, default: Any | None = None, *, should_error_on_not_found: bool = False
     ) -> Any | None:
         request = GetSecretValueRequest(key=key, should_error_on_not_found=should_error_on_not_found)
-        result_event = GriptapeNodes.handle_request(request)
+        result_event = engine.handle_request(request)
 
         if isinstance(result_event, GetSecretValueResultSuccess):
             return result_event.value

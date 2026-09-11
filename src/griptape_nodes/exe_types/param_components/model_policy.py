@@ -24,12 +24,12 @@ from griptape_nodes.retained_mode.events.access_events import (
     QueryModelAccessForNodeRequest,
     QueryModelAccessForNodeResultSuccess,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
 from griptape_nodes.retained_mode.managers.event_manager import reentrant_bus_in_init_would_report
 
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.core_types import Parameter
+    from griptape_nodes.retained_mode.engine import Engine
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -177,7 +177,7 @@ class ModelPolicySnapshot:
 DEFERRED_SNAPSHOT = ModelPolicySnapshot(deferred=True)
 
 
-def query_model_policy(node_type: str, *, fail_closed: bool = True) -> ModelPolicySnapshot:
+def query_model_policy(engine: Engine, node_type: str, *, fail_closed: bool = True) -> ModelPolicySnapshot:
     """Ask the engine which of ``node_type``'s declared models are permitted.
 
     Returns ``DEFERRED_SNAPSHOT`` without querying when the request would trip
@@ -192,6 +192,7 @@ def query_model_policy(node_type: str, *, fail_closed: bool = True) -> ModelPoli
     only after it runs.
 
     Args:
+        engine: Engine to ask about model access.
         node_type: The node class name the manifest declares ``model_usage`` against.
         fail_closed: What an unanswerable query means. When True, the returned snapshot carries a
             ``failure_detail`` so every subsequent lookup denies -- a broken library registration
@@ -205,7 +206,7 @@ def query_model_policy(node_type: str, *, fail_closed: bool = True) -> ModelPoli
             node_type,
         )
         return DEFERRED_SNAPSHOT
-    result = GriptapeNodes.handle_request(QueryModelAccessForNodeRequest(node_type=node_type))
+    result = engine.handle_request(QueryModelAccessForNodeRequest(node_type=node_type))
     if not isinstance(result, QueryModelAccessForNodeResultSuccess):
         details = getattr(result, "result_details", None) or type(result).__name__
         if not fail_closed:
