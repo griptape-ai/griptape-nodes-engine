@@ -161,7 +161,7 @@ class TestLocalStorageDriverCreateSignedDownloadUrl:
     ) -> None:
         """Internal files should produce a workspace-relative URL."""
         with patch("griptape_nodes.drivers.storage.local_storage_driver.time") as mock_time:
-            mock_time.time.return_value = 1000
+            mock_time.time_ns.return_value = 1_000_000_000
             url = local_storage_driver.create_signed_download_url(Path("/workspace/images/photo.png"))
 
         assert url == "http://localhost:8124/workspace/images/photo.png?t=1000"
@@ -175,7 +175,7 @@ class TestLocalStorageDriverCreateSignedDownloadUrl:
             patch("griptape_nodes.drivers.storage.local_storage_driver.time") as mock_time,
             patch("griptape_nodes.drivers.storage.local_storage_driver.resolve_workspace_path") as mock_resolve,
         ):
-            mock_time.time.return_value = 1000
+            mock_time.time_ns.return_value = 1_000_000_000
             external_path = Path("/external/video.mp4")
             mock_resolve.return_value = external_path
             url = local_storage_driver.create_signed_download_url(external_path)
@@ -188,7 +188,7 @@ class TestLocalStorageDriverCreateSignedDownloadUrl:
     ) -> None:
         """External Windows-style files should produce a URL with forward slashes, not backslashes."""
         with patch("griptape_nodes.drivers.storage.local_storage_driver.time") as mock_time:
-            mock_time.time.return_value = 1000
+            mock_time.time_ns.return_value = 1_000_000_000
 
             # Simulate a Windows absolute path by patching resolve_workspace_path
             # to return a PurePosixPath that mimics what a Windows Path would look like after as_posix()
@@ -223,7 +223,7 @@ class TestLocalStorageDriverCreateSignedDownloadUrl:
             patch("griptape_nodes.drivers.storage.local_storage_driver.time") as mock_time,
             patch("griptape_nodes.drivers.storage.local_storage_driver.resolve_workspace_path") as mock_resolve,
         ):
-            mock_time.time.return_value = 1000
+            mock_time.time_ns.return_value = 1_000_000_000
             mock_resolve.return_value = Path("//?/C:/Users/foo/image.png")
             url = local_storage_driver.create_signed_download_url(Path("C:/Users/foo/image.png"))
 
@@ -245,7 +245,7 @@ class TestLocalStorageDriverCreateSignedDownloadUrl:
             patch("griptape_nodes.drivers.storage.local_storage_driver.time") as mock_time,
             patch("griptape_nodes.drivers.storage.local_storage_driver.resolve_workspace_path") as mock_resolve,
         ):
-            mock_time.time.return_value = 1000
+            mock_time.time_ns.return_value = 1_000_000_000
             mock_resolve.return_value = Path(r"\\?\C:\ws\images\photo.png")
             url = driver.create_signed_download_url(Path(r"C:\ws\images\photo.png"))
 
@@ -270,7 +270,7 @@ class TestSignedDownloadUrlRoundTrip:
         original = Path("/workspace/staticfiles/clip.mp4")
 
         with patch("griptape_nodes.drivers.storage.local_storage_driver.time") as mock_time:
-            mock_time.time.return_value = 1000
+            mock_time.time_ns.return_value = 1_000_000_000
             url = driver.create_signed_download_url(original)
 
         assert parse_static_server_url(url, Path("/workspace")) == original
@@ -281,7 +281,7 @@ class TestSignedDownloadUrlRoundTrip:
         original = Path("/workspace/outputs/shots/010/clip.mp4")
 
         with patch("griptape_nodes.drivers.storage.local_storage_driver.time") as mock_time:
-            mock_time.time.return_value = 1000
+            mock_time.time_ns.return_value = 1_000_000_000
             url = driver.create_signed_download_url(original)
 
         assert parse_static_server_url(url, Path("/workspace")) == original
@@ -294,7 +294,7 @@ class TestSignedDownloadUrlRoundTrip:
         driver = LocalStorageDriver(Mock(workspace_path=Path("/workspace")), Mock())
 
         with patch("griptape_nodes.drivers.storage.local_storage_driver.time") as mock_time:
-            mock_time.time.return_value = 1000
+            mock_time.time_ns.return_value = 1_000_000_000
             url = driver.create_signed_download_url(Path("/workspace/staticfiles/clip.mp4"))
 
         assert "?t=1000" in url

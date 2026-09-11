@@ -2,6 +2,7 @@ import asyncio
 import base64
 import contextlib
 import ctypes
+import errno
 import logging
 import mimetypes
 import os
@@ -152,6 +153,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
 
 # File is not in static directory (or not a local file), create small preview
+from griptape_nodes.utils.file_utils import atomic_write_bytes
 from griptape_nodes.utils.image_preview import create_image_preview_from_bytes
 
 console = Console()
@@ -2535,16 +2537,37 @@ class OSManager(EngineScoped):
                 else:
                     mode = "a" if request.append else "w"  # Append or overwrite
 
-                # Perform the write operation using helper
-                result = self._attempt_file_write(
-                    normalized_path=Path(normalized_path),
-                    content=content,
-                    encoding=request.encoding,
-                    mode=mode,
-                    file_path_display=file_path,
-                    fail_if_file_exists=True,  # FAIL policy always fails on file exists
-                    fail_if_file_locked=True,
-                )
+                if mode == "w":
+                    # Whole-file overwrites go through a sibling temp file + rename
+                    # instead of truncating in place, so a concurrent reader (e.g. the
+                    # static server streaming a preview to a browser) never observes a
+                    # zero-length or partially-written destination. The rename replaces
+                    # portalocker as the concurrency mechanism here: concurrent
+                    # overwrites are last-rename-wins, and writer interleaving is
+                    # impossible because each writer fills a private sibling.
+                    result = self._attempt_atomic_file_write(
+                        normalized_path=Path(normalized_path),
+                        content=content,
+                        encoding=request.encoding,
+                        file_path_display=file_path,
+                    )
+                else:
+                    # The other modes cannot use rename semantics and keep the
+                    # portalocker-locked in-place write: append ("a") mutates the
+                    # existing file, so writer mutual exclusion is the only thing
+                    # keeping two appenders from interleaving; exclusive create ("x",
+                    # the FAIL policy) gets its atomicity from O_EXCL, and its
+                    # FileExistsError signal plus the debris cleanup around it are
+                    # load-bearing for the CREATE_NEW candidate walk.
+                    result = self._attempt_file_write(
+                        normalized_path=Path(normalized_path),
+                        content=content,
+                        encoding=request.encoding,
+                        mode=mode,
+                        file_path_display=file_path,
+                        fail_if_file_exists=True,  # FAIL policy always fails on file exists
+                        fail_if_file_locked=True,
+                    )
                 if result.failure_reason is not None:
                     # error_message is guaranteed to be set when failure_reason is set
                     return WriteFileResultFailure(
@@ -3137,6 +3160,108 @@ class OSManager(EngineScoped):
             return FileIOFailureReason.POLICY_NO_CREATE_PARENT_DIRS
 
         return None
+
+    def _attempt_atomic_file_write(  # noqa: PLR0911
+        self,
+        normalized_path: Path,
+        content: str | bytes,
+        encoding: str,
+        file_path_display: str | Path,
+    ) -> FileWriteAttemptResult:
+        """Overwrite a file atomically via ``atomic_write_bytes``, mapping errors.
+
+        The destination holds either its prior content or the full new content —
+        readers never see a truncated file, and a failed write (including disk
+        full) leaves the previous file intact instead of destroying it first the
+        way an in-place truncate does.
+
+        Args:
+            normalized_path: The normalized destination path
+            content: Content to write (str or bytes)
+            encoding: Encoding for text content
+            file_path_display: Path to use in error messages
+
+        Returns:
+            FileWriteAttemptResult with either bytes_written set (success) or
+            failure_reason and error_message set (failure). Never returns the
+            continue signal — overwrites have no fallback candidates.
+        """
+        if isinstance(content, bytes):
+            data = content
+        else:
+            # Text mode translates every "\n" to os.linesep ("\r\n" on Windows);
+            # this path writes raw bytes, so translate here or every text save
+            # on Windows lands with bare LF.
+            if os.linesep != "\n":
+                content = content.replace("\n", os.linesep)
+            try:
+                data = content.encode(encoding)
+            except UnicodeEncodeError as e:
+                msg = f"Attempted to write to file '{file_path_display}'. Failed because the text could not be encoded as {encoding}: {e}"
+                return FileWriteAttemptResult(
+                    bytes_written=None,
+                    failure_reason=FileIOFailureReason.ENCODING_ERROR,
+                    error_message=msg,
+                )
+
+        try:
+            atomic_write_bytes(normalized_path, data)
+        except IsADirectoryError as e:
+            msg = f"Attempted to write to file '{file_path_display}'. Failed due to path is a directory: {e}"
+            return FileWriteAttemptResult(
+                bytes_written=None,
+                failure_reason=FileIOFailureReason.IS_DIRECTORY,
+                error_message=msg,
+            )
+        except PermissionError as e:
+            # On Windows, renaming onto a destination that another process holds
+            # open (without FILE_SHARE_DELETE) raises PermissionError. That is
+            # contention, not a permissions problem — retrying after the reader
+            # closes succeeds — so report it as a lock. Classify off the error's
+            # own winerror (sharing/lock violation) rather than probing the
+            # filesystem afterward, which could observe a different state than
+            # the one that caused the failure. winerror is None off-Windows.
+            windows_contention_codes = (32, 33)  # ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
+            if getattr(e, "winerror", None) in windows_contention_codes:
+                msg = f"Attempted to write to file '{file_path_display}'. Failed because the file is in use by another process: {e}"
+                return FileWriteAttemptResult(
+                    bytes_written=None,
+                    failure_reason=FileIOFailureReason.FILE_LOCKED,
+                    error_message=msg,
+                )
+            msg = f"Attempted to write to file '{file_path_display}'. Failed due to permission denied: {e}"
+            return FileWriteAttemptResult(
+                bytes_written=None,
+                failure_reason=FileIOFailureReason.PERMISSION_DENIED,
+                error_message=msg,
+            )
+        except OSError as e:
+            if e.errno == errno.ENOSPC:
+                # The swap needs the old and new file to coexist briefly, so a
+                # nearly-full volume fails here — cleanly, with the previous
+                # file untouched. Say so in terms an artist can act on.
+                msg = (
+                    f"Attempted to write to file '{file_path_display}'. "
+                    f"Failed because the disk holding it is full. The previous version of the file was left unchanged. "
+                    f"Free up space on that drive and try again."
+                )
+                return FileWriteAttemptResult(
+                    bytes_written=None,
+                    failure_reason=FileIOFailureReason.DISK_FULL,
+                    error_message=msg,
+                )
+            msg = f"Attempted to write to file '{file_path_display}'. Failed due to I/O error: {e}"
+            return FileWriteAttemptResult(
+                bytes_written=None,
+                failure_reason=FileIOFailureReason.IO_ERROR,
+                error_message=msg,
+            )
+
+        return FileWriteAttemptResult(
+            bytes_written=len(data),
+            failure_reason=None,
+            error_message=None,
+        )
 
     def _attempt_file_write(  # noqa: PLR0911, PLR0913
         self,
@@ -4052,8 +4177,12 @@ class OSManager(EngineScoped):
         # Get file information
         try:
             is_dir = resolved_path.is_dir()
-            size = 0 if is_dir else resolved_path.stat().st_size
-            modified_time = resolved_path.stat().st_mtime
+            # One stat() call for both fields: two calls can straddle a concurrent
+            # replace and pair one file's size with another's mtime, poisoning the
+            # preview staleness check that compares both against recorded values.
+            stat_result = resolved_path.stat()
+            size = 0 if is_dir else stat_result.st_size
+            modified_time = stat_result.st_mtime
 
             # Get MIME type for files only
             mime_type = None

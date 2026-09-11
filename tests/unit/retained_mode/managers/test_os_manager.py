@@ -204,7 +204,10 @@ class TestWriteFileRequest:
         file_path = temp_dir / "test.txt"
         request = WriteFileRequest(file_path=str(file_path), content="Content")
 
-        with patch("builtins.open", side_effect=PermissionError("Permission denied")):
+        with patch(
+            "griptape_nodes.retained_mode.managers.os_manager.atomic_write_bytes",
+            side_effect=PermissionError("Permission denied"),
+        ):
             result = os_manager.on_write_file_request(request)
 
         assert isinstance(result, WriteFileResultFailure)

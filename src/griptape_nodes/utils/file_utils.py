@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
-import tempfile
+import stat
+import uuid
 from dataclasses import dataclass
 from fnmatch import fnmatch
 from functools import partial
@@ -20,28 +22,124 @@ logger = logging.getLogger(__name__)
 # pathologically deep trees and symlink loops without a visited-set.
 DEFAULT_MAX_SEARCH_DEPTH = 5
 
+# Filesystems and transfer tools do not preserve mtime exactly: FAT stores 2-second
+# resolution, and rsync/cloud-sync/cross-volume copies round-trip timestamps through
+# varying precisions. Exact float equality therefore brands two observations of the
+# same unchanged file as different after any sync or copy. Drift within this window
+# is treated as "same file state"; a real edit moves mtime beyond it. Callers should
+# always compare file SIZE exactly alongside this — sizes don't drift.
+MTIME_MATCH_TOLERANCE_SECONDS = 2.0
+
+
+def mtimes_match(mtime_a: float, mtime_b: float) -> bool:
+    """Whether two file modification times plausibly describe the same file state.
+
+    Use for staleness decisions that compare a recorded mtime against a fresh
+    ``stat()`` — never exact float equality, which breaks across filesystems and
+    sync tools (see MTIME_MATCH_TOLERANCE_SECONDS).
+
+    Args:
+        mtime_a: One modification time (Unix seconds, e.g. ``st_mtime``).
+        mtime_b: The other modification time.
+
+    Returns:
+        True when the two times are within the tolerance window.
+    """
+    return abs(mtime_a - mtime_b) <= MTIME_MATCH_TOLERANCE_SECONDS
+
 
 def atomic_write_bytes(path: Path, data: bytes) -> None:
     """Write ``data`` to ``path`` atomically.
 
     Writes to a temp file in the same directory and renames it into place via
-    ``Path.replace`` (an atomic rename on the same filesystem), so a crash
-    mid-write leaves the previous file intact rather than a truncated one. The
-    temp file is removed if the write or rename fails.
+    ``Path.replace`` (an atomic rename on the same filesystem), so neither a
+    crash mid-write nor a concurrent reader ever observes a truncated file —
+    the destination holds either its prior content or the full new content.
+    The temp file is removed if the write or rename fails.
+
+    The temp file MUST live in the destination's directory: rename is only
+    atomic within one filesystem, and workstations with small local disks rely
+    on large assets (and therefore their in-flight bytes) staying on the
+    volume that already holds the destination — never ``$TMPDIR``.
 
     Args:
         path: Destination file path. Its parent directory must already exist.
         data: Bytes to write.
     """
-    tmp_fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
-    tmp_path = Path(tmp_name)
+    # Write THROUGH a symlinked destination, matching in-place open(mode="w")
+    # semantics: the link survives and its target gets the new content. Without
+    # this, the rename would replace the link itself with a regular file and
+    # leave the target stale. A dangling link creates its target, as open() would.
+    if path.is_symlink():
+        path = path.resolve()
+
+    # Dot-prefixed and self-identifying: hidden from artists browsing the
+    # directory, and if a power loss strands one, the name says what left it
+    # there. The fixed ".partial" terminator matters as much as the dot:
+    # pathlib.glob matches dotfiles, and pollers glob extension patterns over
+    # directories this function writes into — a scratch name ending in the
+    # destination's own suffix would read as a second record mid-write.
+    tmp_path = path.parent / f".gtn-write-partial-{uuid.uuid4().hex}{path.suffix}.partial"
+
+    # The scratch must never expose content at a looser mode than the
+    # destination it replaces, even for the duration of the write — think a
+    # 0600 .env of API keys. So: create at a 0600 floor, align to the
+    # destination's exact mode while the scratch is still EMPTY, and only then
+    # write bytes. A brand-new destination instead gets 0o666 with the kernel
+    # applying the process umask — the same default open(mode="w") produces.
+    try:
+        destination_mode = stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        destination_mode = None
+    creation_mode = 0o600 if destination_mode is not None else 0o666
+    open_flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+    tmp_fd = os.open(tmp_path, open_flags, mode=creation_mode)
     try:
         with os.fdopen(tmp_fd, "wb") as tmp_file:
+            if destination_mode is not None:
+                # chmod is not umask-masked the way os.open's mode is, so this
+                # is what preserves a destination mode looser than the 0600
+                # creation floor. No content has been written yet.
+                tmp_path.chmod(destination_mode)
             tmp_file.write(data)
+            # flush() drains Python's userspace BufferedWriter into the kernel;
+            # fsync() then pushes the kernel's buffers to disk. fsync alone is
+            # not enough — it only syncs what the kernel has, and write() may
+            # have left bytes sitting in Python's buffer that fsync never sees.
+            # Both together guarantee the full payload is durable before the
+            # rename can promote the temp file into the destination name.
+            tmp_file.flush()
+            os.fsync(tmp_file.fileno())
         tmp_path.replace(path)
     except OSError:
         tmp_path.unlink(missing_ok=True)
         raise
+    _fsync_directory_best_effort(path.parent)
+
+
+def _fsync_directory_best_effort(directory: Path) -> None:
+    """Sync a directory's entries to disk, never raising.
+
+    The rename in ``atomic_write_bytes`` lives in the directory entry, which the
+    file's own fsync does not cover, so a crash right after ``replace()`` can
+    forget the rename on some filesystems. Readers are unaffected either way
+    (the rename is atomic regardless); this only firms up crash durability.
+    Best-effort because directories cannot be opened for sync on some
+    platforms/filesystems (Windows among them), and a failed sync must not fail
+    a write that already completed.
+    """
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY)
+    except OSError as e:
+        logger.debug("Could not open directory %s for fsync: %s", directory, e)
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError as e:
+        logger.debug("Could not fsync directory %s: %s", directory, e)
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(dir_fd)
 
 
 def find_file_in_directory(directory: Path, pattern: str) -> Path | None:
