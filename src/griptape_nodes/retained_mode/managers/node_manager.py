@@ -3722,16 +3722,7 @@ class NodeManager(EngineScoped):
                 # Create the parameter, or alter it on the existing node
                 if parameter.user_defined:
                     # Always serialize user-defined parameters regardless of node type
-                    param_dict = parameter.to_dict()
-                    param_dict["initial_setup"] = True
-                    # Trait identity and state travel separately from the
-                    # scalar fields, and only options authored on the parameter are saved --
-                    # the trait regenerates its own on load.
-                    param_dict["ui_options"] = parameter.authored_ui_options()
-                    param_dict["traits"] = self._stabilize_trait_modules(parameter.trait_states())
-                    param_dict["value_callbacks"] = parameter.value_callback_names(node)
-                    NodeManager._report_unsaveable_callbacks(parameter)
-                    add_param_request = AddParameterToNodeRequest.create(**param_dict)
+                    add_param_request = AddParameterToNodeRequest.create(**self._parameter_save_dict(parameter, node))
                     element_modification_commands.append(add_param_request)
                 elif isinstance(node, ErrorProxyNode):
                     # For ErrorProxyNode, replay all recorded initialization requests for this parameter
@@ -3747,12 +3738,7 @@ class NodeManager(EngineScoped):
                     element_modification_commands.extend(matching_requests)
                 elif reference_node is None:
                     # Normal node with no reference - treat all parameters as needing serialization
-                    param_dict = parameter.to_dict()
-                    param_dict["initial_setup"] = True
-                    param_dict["ui_options"] = parameter.authored_ui_options()
-                    param_dict["traits"] = self._stabilize_trait_modules(parameter.trait_states())
-                    param_dict["value_callbacks"] = parameter.value_callback_names(node)
-                    add_param_request = AddParameterToNodeRequest.create(**param_dict)
+                    add_param_request = AddParameterToNodeRequest.create(**self._parameter_save_dict(parameter, node))
                     element_modification_commands.append(add_param_request)
                 else:
                     # Normal node - compare against reference node
@@ -4346,6 +4332,22 @@ class NodeManager(EngineScoped):
             result.node_names,
             result_details=f"Successfully duplicated {len(serialize_result.node_names_serialized)} nodes.",
         )
+
+    def _parameter_save_dict(self, parameter: Parameter, node: BaseNode) -> dict[str, Any]:
+        """Build the request fields that recreate ``parameter`` from scratch on load.
+
+        Trait identity and state travel separately from the scalar fields, and only the
+        options authored on the parameter are saved: the trait regenerates its own on load.
+        Reporting what cannot be saved belongs here too, so every from-scratch save path
+        warns about the same losses.
+        """
+        param_dict = parameter.to_dict()
+        param_dict["initial_setup"] = True
+        param_dict["ui_options"] = parameter.authored_ui_options()
+        param_dict["traits"] = self._stabilize_trait_modules(parameter.trait_states())
+        param_dict["value_callbacks"] = parameter.value_callback_names(node)
+        NodeManager._report_unsaveable_callbacks(parameter)
+        return param_dict
 
     def _stabilize_trait_modules(self, trait_states: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Rewrite each saved trait's module to the stable namespace a library reloads under.
