@@ -85,7 +85,10 @@ def _register(  # noqa: PLR0913 (a test-library builder; each knob is one manife
         dependencies["pip_install_flags"] = offline_install_flags(wheel_dir)
     schema["metadata"]["dependencies"] = dependencies
     if required_resources is not None:
-        schema["metadata"]["resources"] = {"required": required_resources}
+        resources: dict[str, object] = {}
+        if required_resources is not None:
+            resources["required"] = required_resources
+        schema["metadata"]["resources"] = resources
     library_json = library_dir / "griptape_nodes_library.json"
     library_json.write_text(json.dumps(schema, indent=2))
     shutil.copy(fixture_dir / node_file, library_dir / node_file)
@@ -432,6 +435,29 @@ class TestUnmetResourcesCostExecutionNotLoading:
         info = _library_info(library_json)
         assert info.execution_unavailable_reason is None
         assert info.fitness is LibraryManager.LibraryFitness.GOOD
+
+
+class TestUnmetRequirementCostsExecutionNotEditing:
+    """A resource this machine lacks must not stop the library loading.
+
+    SAM3 declares cuda-only, and refusing to register it took editing away from every machine that
+    was only ever going to edit -- placeholder nodes reading "Library not found" on a laptop. The
+    requirement now gates the run instead, so the refusal arrives when someone presses run.
+    """
+
+    IMPOSSIBLE_COMPUTE: ClassVar[dict[str, object]] = {"compute": [["definitely-not-a-real-backend"], "has_any"]}
+
+    def test_execution_refuses_for_an_unmet_requirement(self, tmp_path: Path) -> None:
+        _register(
+            tmp_path,
+            fixture_dir=BEHAVIOR_FIXTURE,
+            node_file="behavior_preservation_node.py",
+            name="Requires The Impossible",
+            required_resources=self.IMPOSSIBLE_COMPUTE,
+        )
+
+        with pytest.raises(RuntimeError, match="definitely-not-a-real-backend"):
+            current_engine().library_manager.get_worker_for_library("Requires The Impossible")
 
 
 class TestUnshippableOutputGuardrail:

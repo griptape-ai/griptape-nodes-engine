@@ -42,6 +42,7 @@ def _make_library_info() -> LibraryManager.LibraryInfo:
 
 def _make_library(advanced_library: AdvancedNodeLibrary | None = None) -> Library:
     schema = MagicMock(spec=LibrarySchema)
+    schema.execution_modules = None
     schema.is_default_library = False
     schema.name = "TestLib"
     schema.nodes = []

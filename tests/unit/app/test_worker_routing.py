@@ -43,6 +43,7 @@ from griptape_nodes.retained_mode.events.project_events import (
     GetPathForMacroRequest,
     GetSituationRequest,
 )
+from griptape_nodes.retained_mode.events.resource_events import GetExecutionDeviceRequest
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 
 if TYPE_CHECKING:
@@ -208,6 +209,15 @@ class TestInstallRemoteHandlersSwap:
             assert request_type in LOCAL_ONLY_REQUEST_TYPES, (
                 f"{request_type.__name__} must be answered by the worker, not forwarded"
             )
+
+    def test_the_device_read_is_answered_by_the_worker(self) -> None:
+        """`execution_device` must describe the machine that will run the model.
+
+        Forwarding asked the orchestrator about its own hardware. Today both processes share a
+        machine so the answers coincide, which is exactly why this needs pinning: the moment a
+        venue runs somewhere else, a forwarded answer is silently the wrong machine's.
+        """
+        assert GetExecutionDeviceRequest in LOCAL_ONLY_REQUEST_TYPES
 
     def test_unregistered_types_are_skipped_without_error(self) -> None:
         """Nothing to swap is not a bootstrap failure: only registered types are touched.

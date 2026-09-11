@@ -13,6 +13,9 @@ from griptape_nodes.retained_mode.events.resource_events import (
     FreeResourceInstanceRequest,
     FreeResourceInstanceResultFailure,
     FreeResourceInstanceResultSuccess,
+    GetExecutionDeviceRequest,
+    GetExecutionDeviceResultFailure,
+    GetExecutionDeviceResultSuccess,
     GetResourceInstanceStatusRequest,
     GetResourceInstanceStatusResultFailure,
     GetResourceInstanceStatusResultSuccess,
@@ -32,6 +35,7 @@ from griptape_nodes.retained_mode.events.resource_events import (
 )
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.resource_components.resource_type import ResourceType
+from griptape_nodes.retained_mode.managers.resource_types.compute_resource import ComputeBackend, ComputeInstance
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.resource_components.resource_instance import ResourceInstance
@@ -49,6 +53,10 @@ class ResourceStatus:
     def is_locked(self) -> bool:
         """Check if this resource is currently locked."""
         return self.owner_of_lock is not None
+
+
+# Most capable first. A node that wants something else passes it as `preferred`.
+DEVICE_PREFERENCE = (ComputeBackend.CUDA, ComputeBackend.MPS, ComputeBackend.CPU)
 
 
 class ResourceManager:
@@ -77,6 +85,9 @@ class ResourceManager:
         )
         event_manager.assign_manager_to_request_type(
             request_type=ReleaseResourceInstanceLockRequest, callback=self.on_release_resource_instance_lock_request
+        )
+        event_manager.assign_manager_to_request_type(
+            request_type=GetExecutionDeviceRequest, callback=self.on_get_execution_device_request
         )
         event_manager.assign_manager_to_request_type(
             request_type=ListCompatibleResourceInstancesRequest,
@@ -226,6 +237,49 @@ class ResourceManager:
         return ReleaseResourceInstanceLockResultSuccess(
             result_details=f"Successfully released lock on resource instance {request.instance_id} from {request.owner_id}"
         )
+
+    def on_get_execution_device_request(self, request: GetExecutionDeviceRequest) -> ResultPayload:
+        """Answer which compute device to run on, without importing a framework to find out.
+
+        `preferred` wins when this machine has it -- that is the user or config pin. Otherwise the
+        answer is the most capable backend present, cuda before mps before cpu.
+
+        A `preferred` value this machine lacks is deliberately NOT an error. A workflow authored on
+        a CUDA box should still open and run on a laptop; what changes is the device, not the file.
+        """
+        available = self._detected_compute_backends()
+        if not available:
+            return GetExecutionDeviceResultFailure(
+                result_details=(
+                    "Attempted to determine the execution device. Failed because no compute "
+                    "resource instance is registered, so the machine's backends are unknown."
+                )
+            )
+
+        if request.preferred and request.preferred in available:
+            return GetExecutionDeviceResultSuccess(
+                device=request.preferred,
+                available=available,
+                honored_preference=True,
+                result_details=f"Using the preferred device '{request.preferred}'.",
+            )
+
+        device = next((backend.value for backend in DEVICE_PREFERENCE if backend.value in available), available[0])
+        detail = f"Chose '{device}' from {available}."
+        if request.preferred:
+            detail += f" The preferred '{request.preferred}' is not available on this machine."
+        return GetExecutionDeviceResultSuccess(
+            device=device, available=available, honored_preference=False, result_details=detail
+        )
+
+    def _detected_compute_backends(self) -> list[str]:
+        """The machine's compute backends, read off the registered compute resource."""
+        for instance in self._instances.values():
+            if not isinstance(instance, ComputeInstance):
+                continue
+            backends = instance.get_capability_value("compute") or []
+            return [str(getattr(backend, "value", backend)) for backend in backends]
+        return []
 
     def on_list_compatible_resource_instances_request(
         self, request: ListCompatibleResourceInstancesRequest

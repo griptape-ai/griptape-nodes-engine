@@ -58,6 +58,7 @@ from griptape_nodes.retained_mode.events.project_events import (
     SetCurrentProjectRequest,
 )
 from griptape_nodes.retained_mode.events.resource_events import (
+    GetExecutionDeviceRequest,
     RegisterResourceTypeRequest,
 )
 from griptape_nodes.retained_mode.events.static_file_events import (
@@ -378,6 +379,10 @@ LOCAL_ONLY_REQUEST_TYPES: frozenset[type[RequestPayload]] = frozenset(
         GetPathForMacroRequest,
         # The write-side counterpart: maps a written path back to a portable macro reference.
         AttemptMapAbsolutePathToProjectRequest,
+        # Which device to run on describes the machine that will run the model, and that is this one.
+        # Forwarding asked the orchestrator about its own hardware -- indistinguishable while both
+        # share a machine, and wrong the moment a venue runs anywhere else.
+        GetExecutionDeviceRequest,
         #
         # --- 3. The wire cannot carry it today --------------------------------------------------
         #

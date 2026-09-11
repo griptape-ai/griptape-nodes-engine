@@ -35,6 +35,7 @@ class _BetaNode(_LazyMockNode):
 
 def _make_library(name: str = "TestLib") -> Library:
     schema = MagicMock(spec=LibrarySchema)
+    schema.execution_modules = None
     schema.is_default_library = False
     schema.name = name
     return Library(library_data=schema)
