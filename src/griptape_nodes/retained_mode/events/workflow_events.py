@@ -23,6 +23,15 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.flow_events import SerializedFlowCommands
 
 
+class WorkflowStatus(StrEnum):
+    """The status of a workflow that was attempted to be loaded."""
+
+    GOOD = "GOOD"
+    FLAWED = "FLAWED"
+    UNUSABLE = "UNUSABLE"
+    MISSING = "MISSING"
+
+
 @dataclass
 @PayloadRegistry.register
 class RunWorkflowFromScratchRequest(RequestPayload):
@@ -43,7 +52,16 @@ class RunWorkflowFromScratchRequest(RequestPayload):
 @dataclass
 @PayloadRegistry.register
 class RunWorkflowFromScratchResultSuccess(ResultPayloadSuccess):
-    """Workflow loaded and started successfully from file."""
+    """Workflow loaded and started successfully from file.
+
+    Args:
+        status: Fitness of the load. FLAWED means the graph is on the canvas with placeholders
+            standing in for nodes whose library could not be registered -- editable, but not
+            runnable until that library is available. Callers that need a whole graph (the
+            headless executor, publishing) should refuse anything but GOOD.
+    """
+
+    status: WorkflowStatus = WorkflowStatus.GOOD
 
 
 @dataclass
@@ -72,7 +90,16 @@ class RunWorkflowWithCurrentStateRequest(RequestPayload):
 @dataclass
 @PayloadRegistry.register
 class RunWorkflowWithCurrentStateResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
-    """Workflow loaded successfully while preserving current state."""
+    """Workflow loaded successfully while preserving current state.
+
+    Args:
+        status: Fitness of the load. FLAWED means the graph is on the canvas with placeholders
+            standing in for nodes whose library could not be registered -- editable, but not
+            runnable until that library is available. Callers that need a whole graph (the
+            headless executor, publishing) should refuse anything but GOOD.
+    """
+
+    status: WorkflowStatus = WorkflowStatus.GOOD
 
 
 @dataclass
@@ -103,7 +130,16 @@ class RunWorkflowFromRegistryRequest(RequestPayload):
 @dataclass
 @PayloadRegistry.register
 class RunWorkflowFromRegistryResultSuccess(ResultPayloadSuccess):
-    """Workflow from registry started successfully."""
+    """Workflow from registry started successfully.
+
+    Args:
+        status: Fitness of the load. FLAWED means the graph is on the canvas with placeholders
+            standing in for nodes whose library could not be registered -- editable, but not
+            runnable until that library is available. Callers that need a whole graph (the
+            headless executor, publishing) should refuse anything but GOOD.
+    """
+
+    status: WorkflowStatus = WorkflowStatus.GOOD
 
 
 @dataclass
@@ -380,9 +416,13 @@ class ImportWorkflowAsReferencedSubFlowResultSuccess(WorkflowAlteredMixin, Resul
 
     Args:
         created_flow_name: Name of the created sub-flow
+        status: Fitness of the imported subflow's own load. FLAWED means placeholders stand in
+            for nodes whose library could not be registered -- editable, but not runnable.
+            Callers that import in order to RUN the subflow should refuse anything but GOOD.
     """
 
     created_flow_name: str
+    status: WorkflowStatus = WorkflowStatus.GOOD
 
 
 @dataclass
@@ -909,15 +949,6 @@ class GetWorkflowMetadataResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuc
 @PayloadRegistry.register
 class GetWorkflowMetadataResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Workflow metadata retrieval failed. Common causes: workflow not found, registry error, file load error."""
-
-
-class WorkflowStatus(StrEnum):
-    """The status of a workflow that was attempted to be loaded."""
-
-    GOOD = "GOOD"
-    FLAWED = "FLAWED"
-    UNUSABLE = "UNUSABLE"
-    MISSING = "MISSING"
 
 
 class WorkflowDependencyStatus(StrEnum):
