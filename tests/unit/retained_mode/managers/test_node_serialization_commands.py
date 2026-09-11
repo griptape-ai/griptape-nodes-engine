@@ -19,7 +19,7 @@ import pytest
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
 from griptape_nodes.exe_types.node_groups.subflow_node_group import SubflowNodeGroup
-from griptape_nodes.exe_types.node_types import LOCAL_EXECUTION, DataNode, NodeDependencies
+from griptape_nodes.exe_types.node_types import LOCAL_EXECUTION, BaseNode, DataNode, NodeDependencies
 from griptape_nodes.node_library.library_registry import (
     LibraryMetadata,
     LibraryRegistry,
@@ -277,6 +277,52 @@ class TestElementModificationCommands:
         assert len(alter_commands) == 1
         assert alter_commands[0].tooltip == "Changed tooltip"
         assert alter_commands[0].default_value == "changed default"
+
+    def test_parameter_added_after_construction_is_created_not_altered(self, engine: Engine, library_name: str) -> None:
+        """A parameter the node class does not declare has to be added, since nothing exists to alter.
+
+        Nodes that grow parameters as they run reach this: the reference instance the serializer
+        diffs against is built from the class, so it has no such parameter.
+        """
+        node_name = _create_text_node(engine, library_name, "N1")
+        node = engine.object_manager.get_object_by_name(node_name)
+        assert isinstance(node, BaseNode)
+        node.add_parameter(
+            Parameter(name="grown", tooltip="grown at runtime", type="str", allowed_modes={ParameterMode.PROPERTY})
+        )
+
+        result = engine.node_manager.on_serialize_node_to_commands(SerializeNodeToCommandsRequest(node_name=node_name))
+
+        assert isinstance(result, SerializeNodeToCommandsResultSuccess)
+        commands_for_grown = [
+            command
+            for command in result.serialized_node_commands.element_modification_commands
+            if getattr(command, "parameter_name", None) == "grown"
+        ]
+        assert len(commands_for_grown) == 1
+        assert isinstance(commands_for_grown[0], AddParameterToNodeRequest)
+
+    def test_node_with_parameter_added_after_construction_round_trips(self, engine: Engine, library_name: str) -> None:
+        """Deserializing such a node succeeds and the recreated node carries the parameter."""
+        node_name = _create_text_node(engine, library_name, "N1")
+        node = engine.object_manager.get_object_by_name(node_name)
+        assert isinstance(node, BaseNode)
+        node.add_parameter(
+            Parameter(name="grown", tooltip="grown at runtime", type="str", allowed_modes={ParameterMode.PROPERTY})
+        )
+
+        serialize_result = engine.node_manager.on_serialize_node_to_commands(
+            SerializeNodeToCommandsRequest(node_name=node_name)
+        )
+        assert isinstance(serialize_result, SerializeNodeToCommandsResultSuccess)
+        deserialize_result = engine.handle_request(
+            DeserializeNodeFromCommandsRequest(serialized_node_commands=serialize_result.serialized_node_commands)
+        )
+
+        assert isinstance(deserialize_result, DeserializeNodeFromCommandsResultSuccess), deserialize_result
+        new_node = engine.object_manager.get_object_by_name(deserialize_result.node_name)
+        assert isinstance(new_node, BaseNode)
+        assert new_node.get_parameter_by_name("grown") is not None
 
 
 class TestLockState:

@@ -3717,8 +3717,11 @@ class NodeManager(EngineScoped):
                         )
                     ]
                     element_modification_commands.extend(matching_requests)
-                elif reference_node is None:
-                    # Normal node with no reference - treat all parameters as needing serialization
+                elif reference_node is None or reference_node.get_parameter_by_name(parameter.name) is None:
+                    # Either there is no reference to diff against, or the reference does not declare
+                    # this parameter because the live node gained it after construction -- a node that
+                    # grows parameters as it runs, or a handler that added one. Nothing exists to alter
+                    # on the recreated node, so the parameter has to be created outright.
                     param_dict = parameter.to_dict()
                     param_dict["initial_setup"] = True
                     add_param_request = AddParameterToNodeRequest.create(**param_dict)
