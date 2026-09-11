@@ -131,6 +131,7 @@ class TestRebindingCallbacks:
                 traits=[
                     {
                         "trait_name": "Button",
+                        "trait_module": "griptape_nodes.traits.button",
                         "trait_state": {"label": "Refresh"},
                         "trait_callbacks": {"on_click": "method_that_went_away"},
                     }
@@ -153,7 +154,13 @@ class TestRebindingCallbacks:
 
         NodeManager._apply_trait_callbacks(
             parameter,
-            [{"trait_name": "Button", "trait_callbacks": {"on_click": "process"}}],
+            [
+                {
+                    "trait_name": "Button",
+                    "trait_module": "griptape_nodes.traits.button",
+                    "trait_callbacks": {"on_click": "process"},
+                }
+            ],
             [_button_of(parameter)],
         )
 

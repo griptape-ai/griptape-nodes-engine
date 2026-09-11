@@ -1,4 +1,4 @@
-"""TraitRegistry.resolve prefers a saved trait's module over guessing by name alone."""
+"""TraitRegistry.resolve finds a saved trait through the module it was saved with."""
 
 from __future__ import annotations
 
@@ -77,40 +77,14 @@ class TestResolveByModule:
         assert resolved is Slider
 
     def test_the_module_disambiguates_two_classes_sharing_a_name(self) -> None:
-        resolved = TraitRegistry.resolve("SharedTraitName", _CollisionTraitB.__module__)
-
-        assert resolved is _CollisionTraitB
-
-    def test_a_module_that_no_longer_imports_falls_back_to_the_name_walk(self) -> None:
-        resolved = TraitRegistry.resolve("Slider", "griptape_nodes.traits.a_module_that_was_removed")
-
-        assert resolved is Slider
-
-
-class TestResolveByNameWalkAmbiguity:
-    """No module to disambiguate with, so name alone must pick from the collision."""
-
-    def test_a_collision_is_resolved_but_logged(self, caplog: pytest.LogCaptureFixture) -> None:
-        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
-            resolved = TraitRegistry.resolve("SharedTraitName")
-
-        # Deterministic: sorted by module, so module_a wins over module_b every time.
-        assert resolved is _CollisionTraitA
-        assert _CollisionTraitA.__module__ in caplog.text
-        assert _CollisionTraitB.__module__ in caplog.text
-
-    def test_a_class_with_no_collision_logs_nothing(self, caplog: pytest.LogCaptureFixture) -> None:
-        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
-            resolved = TraitRegistry.resolve("Slider")
-
-        assert resolved is Slider
-        assert caplog.text == ""
+        assert TraitRegistry.resolve("SharedTraitName", _CollisionTraitA.__module__) is _CollisionTraitA
+        assert TraitRegistry.resolve("SharedTraitName", _CollisionTraitB.__module__) is _CollisionTraitB
 
 
 class TestABrokenTraitModuleDoesNotFailTheLoad:
     """Resolving executes a library's module code, which must not take the workflow down."""
 
-    def test_a_module_that_raises_on_import_falls_back_and_warns(
+    def test_a_module_that_raises_on_import_warns_instead_of_propagating(
         self, caplog: pytest.LogCaptureFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         (tmp_path / "exploding_trait_module.py").write_text('raise RuntimeError("library blew up on import")')
@@ -119,25 +93,25 @@ class TestABrokenTraitModuleDoesNotFailTheLoad:
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
             resolved = TraitRegistry.resolve("Slider", "exploding_trait_module")
 
-        # Fell back to the name walk rather than propagating the library's RuntimeError.
-        assert resolved is Slider
+        assert resolved is None
         assert "library blew up on import" in caplog.text
 
-    def test_a_missing_module_falls_back_quietly(self, caplog: pytest.LogCaptureFixture) -> None:
+    def test_a_missing_module_resolves_to_nothing_quietly(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The caller reports the trait it could not restore, so this stays quiet."""
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
             resolved = TraitRegistry.resolve("Slider", "griptape_nodes.traits.never_existed")
 
-        assert resolved is Slider
+        assert resolved is None
         assert caplog.text == ""
 
 
 class TestUnresolvableTraitDegradesInsteadOfRaising:
-    def test_an_unknown_trait_name_returns_none(self) -> None:
-        resolved = TraitRegistry.resolve("NoSuchTraitAnywhere")
+    def test_a_name_the_module_does_not_hold_returns_none(self) -> None:
+        resolved = TraitRegistry.resolve("NoSuchTraitAnywhere", "griptape_nodes.traits.slider")
 
         assert resolved is None
 
-    def test_an_unknown_trait_name_with_an_unimportable_module_also_returns_none(self) -> None:
-        resolved = TraitRegistry.resolve("NoSuchTraitAnywhere", "griptape_nodes.traits.does_not_exist")
+    def test_a_name_that_holds_something_other_than_a_trait_returns_none(self) -> None:
+        resolved = TraitRegistry.resolve("Parameter", "griptape_nodes.exe_types.core_types")
 
         assert resolved is None

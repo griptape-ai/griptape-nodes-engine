@@ -4423,13 +4423,14 @@ class NodeManager(EngineScoped):
                 except TypeError:
                     NodeManager._warn_unsatisfiable_trait_state(parameter, trait_name)
                 continue
-            trait_class = TraitRegistry.resolve(trait_name, entry.get("trait_module"))
+            trait_class = NodeManager._resolve_saved_trait(entry)
             if trait_class is None:
                 logger.warning(
-                    "Parameter '%s' was saved with the '%s' trait, but no trait by that name is registered. "
+                    "Parameter '%s' was saved with the '%s' trait from '%s', but that trait could not be loaded. "
                     "The parameter will load without it. Check that the library providing it is installed.",
                     parameter.name,
                     trait_name,
+                    entry.get("trait_module"),
                 )
                 continue
             try:
@@ -4454,7 +4455,7 @@ class NodeManager(EngineScoped):
         unmatched = parameter.find_elements_by_type(Trait)
         paired: list[Trait | None] = []
         for entry in trait_states:
-            trait_class = TraitRegistry.resolve(entry.get("trait_name", ""), entry.get("trait_module"))
+            trait_class = NodeManager._resolve_saved_trait(entry)
             match = None
             for candidate in unmatched:
                 if type(candidate) is trait_class:
@@ -4464,6 +4465,19 @@ class NodeManager(EngineScoped):
                 unmatched.remove(match)
             paired.append(match)
         return paired
+
+    @staticmethod
+    def _resolve_saved_trait(entry: dict[str, Any]) -> type[Trait] | None:
+        """Resolve one saved entry to its trait class, or None when it names nothing loadable.
+
+        Both the name and the module are required. The module is what tells two libraries'
+        same-named traits apart, so an entry without one names no particular class.
+        """
+        trait_name = entry.get("trait_name")
+        trait_module = entry.get("trait_module")
+        if trait_name is None or trait_module is None:
+            return None
+        return TraitRegistry.resolve(trait_name, trait_module)
 
     @staticmethod
     def _warn_unsatisfiable_trait_state(parameter: Parameter, trait_name: str) -> None:
