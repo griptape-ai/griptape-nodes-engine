@@ -30,6 +30,7 @@ if TYPE_CHECKING:
         ArbitraryCodeExecManager,
     )
     from griptape_nodes.retained_mode.managers.artifact_manager import ArtifactManager
+    from griptape_nodes.retained_mode.managers.budget_manager import BudgetManager
     from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
     from griptape_nodes.retained_mode.managers.context_manager import ContextManager
     from griptape_nodes.retained_mode.managers.engine_identity_manager import EngineIdentityManager
@@ -222,6 +223,10 @@ class GriptapeNodes(metaclass=_EngineRootMeta):
     @classmethod
     def ManifestManager(cls) -> ManifestManager:
         return current_engine().manifest_manager
+
+    @classmethod
+    def BudgetManager(cls) -> BudgetManager:
+        return current_engine().budget_manager
 
     @classmethod
     def WorkerManager(cls) -> WorkerManager:

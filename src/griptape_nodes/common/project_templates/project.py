@@ -43,7 +43,7 @@ def build_project_yaml() -> YAML:
 
 
 class ProjectTemplate(BaseModel):
-    """Complete project template loaded from project.yml."""
+    """Complete project template loaded from a `griptape-nodes-project.yml` file."""
 
     LATEST_SCHEMA_VERSION: ClassVar[str] = "1.0.0"
 
@@ -52,11 +52,16 @@ class ProjectTemplate(BaseModel):
     id: str | None = Field(
         default=None,
         description=(
-            "Opaque identifier for the template, unique per engine. The UI sets a GUID by default, but a "
-            "user may set any unique string. It is the identifier used by project events and referenced by "
-            "external consumers such as policies; consumers must not parse or construct it. Absent on legacy "
-            "projects that predate this field, in which case the engine derives the id from the canonicalized "
-            "project file path. Set once at creation and immutable thereafter."
+            "Opaque identifier for the template, unique per engine. The editor's New Project flow "
+            "proposes a slug of the project name plus a short random suffix (e.g. `season-02-a3f9c1`), "
+            "and the user may override it with any unique string. It is the identifier used by project "
+            "events and referenced by external consumers such as policies; consumers must not parse or "
+            "construct it -- the slug is a convenience for the person picking it, not a parseable "
+            "structure. Absent whenever nothing supplied one: a hand-written project file, a project "
+            "created before this field existed, or one created by an editor talking to an engine older "
+            "than 0.87.0, which dropped the field during validation. In those cases the engine derives "
+            "the id from the canonicalized project file path. Set once at creation and immutable "
+            "thereafter."
         ),
     )
     description: str | None = Field(default=None, description="Description of the project")
