@@ -42,6 +42,8 @@ For the full list of traits, the widgets they render, and the `ui_options` keys 
 
 **Saving callbacks**: a `Button`'s `on_click`/`get_button_state`, and a parameter's `converters`/`validators`, must be bound methods of the node (`self.my_handler`) to survive a save. Saving records the method's name and resolves it back against the node on load; a lambda or a local function has no name to resolve, so it loads without that behavior and a warning is logged.
 
+**Saving trait state**: a trait's saved state is its `__init__` arguments, so those can hold text, numbers, true/false, and lists or dictionaries of those. A set or tuple is saved as a list and handed back to the constructor as one. Anything else is dropped with a warning.
+
 ## Parameter helper constructs (`ParameterString`, `ParameterInt`, ...)
 
 Griptape Nodes includes a set of convenience Parameter subclasses under `griptape_nodes.exe_types.param_types.*`.

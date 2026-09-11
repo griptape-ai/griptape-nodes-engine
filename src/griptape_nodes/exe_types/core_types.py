@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, NamedTuple, Self, Type
 from pydantic import BaseModel
 
 from griptape_nodes.exe_types.callback_binding import is_derived_from_state, name_callback, resolve_callback
+from griptape_nodes.exe_types.trait_state import TraitStateEntry, as_saved_state_value
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -1816,15 +1817,13 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         owner = self.get_node()
         states: list[dict[str, Any]] = []
         for trait in self.find_elements_by_type(Trait):
-            state: dict[str, Any] = {
-                "trait_name": type(trait).__name__,
-                "trait_module": type(trait).__module__,
-                "trait_state": trait.to_state(),
-            }
-            callback_names = trait.callback_names(owner)
-            if callback_names:
-                state["trait_callbacks"] = callback_names
-            states.append(state)
+            entry = TraitStateEntry(
+                trait_name=type(trait).__name__,
+                trait_module=type(trait).__module__,
+                trait_state=trait.to_state(),
+                trait_callbacks=trait.callback_names(owner),
+            )
+            states.append(entry.to_dict())
         return states
 
     def to_event(self, node: BaseNode) -> dict:
@@ -3345,10 +3344,11 @@ class Trait(ABC, BaseNodeElement):
         it enforces. A parameter declared in ``STATE_EXCLUDE`` may hold a callable; that
         callback is carried separately, by name, through ``callback_names``.
 
-        A parameter this trait cannot account for, whether missing its attribute or
-        holding an undeclared callback, is logged and omitted rather than raised. This
-        runs on every save; failing the whole save over one misdeclared trait would cost
-        the artist their work for a library-authoring mistake they cannot fix.
+        A parameter this trait cannot account for is logged and omitted rather than raised:
+        one missing its attribute, one holding an undeclared callback, and one holding a value
+        no saved artifact can express. This runs on every save; failing the whole save over
+        one misdeclared trait would cost the artist their work for a library-authoring mistake
+        they cannot fix.
         """
         state: dict[str, Any] = {}
         for name in self._state_parameter_names():
@@ -3376,7 +3376,19 @@ class Trait(ABC, BaseNodeElement):
                     name,
                 )
                 continue
-            state[name] = value
+            saved = as_saved_state_value(value)
+            if saved.unsupported_type is not None:
+                logger.warning(
+                    "Trait '%s' takes '%s', but its value holds a %s, which cannot be written to a saved "
+                    "workflow. Trait state can hold text, numbers, true/false, and lists or dictionaries "
+                    "of those. The parameter will load without this trait's '%s'.",
+                    type(self).__name__,
+                    name,
+                    saved.unsupported_type,
+                    name,
+                )
+                continue
+            state[name] = saved.value
         return state
 
     def apply_state(self, state: dict[str, Any]) -> None:

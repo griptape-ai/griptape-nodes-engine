@@ -3,6 +3,7 @@
 import json
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -106,6 +107,65 @@ class TestMisdeclaredTraitStateDegradesInsteadOfFailingTheSave:
         assert state == {}
         assert "threshold" in caplog.text
         assert "STATE_ALIASES" in caplog.text
+
+    def test_a_value_no_saved_file_can_hold_is_omitted_and_warned_about(self, caplog: pytest.LogCaptureFixture) -> None:
+        trait = _UnsaveableValueTrait(label="x", root=Path("/tmp/somewhere"))  # noqa: S108
+
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            state = trait.to_state()
+
+        assert state == {"label": "x"}
+        assert "root" in caplog.text
+        assert "PosixPath" in caplog.text
+
+
+class _UnsaveableValueTrait(Trait):
+    """Stands in for a trait whose constructor takes something no data format holds."""
+
+    def __init__(self, *, label: str = "hi", root: Path | None = None) -> None:
+        super().__init__(element_id="_UnsaveableValueTrait")
+        self.label = label
+        self.root = root
+
+    def ui_options_for_trait(self) -> dict:
+        return {}
+
+    @classmethod
+    def get_trait_keys(cls) -> list[str]:
+        return ["unsaveable_value"]
+
+
+class _ExtensionsTrait(Trait):
+    """Stands in for a trait whose constructor takes a set, as a file picker's extensions are."""
+
+    def __init__(self, *, extensions: set[str] | list[str] | None = None) -> None:
+        super().__init__(element_id="_ExtensionsTrait")
+        self.extensions = extensions
+
+    def ui_options_for_trait(self) -> dict:
+        return {}
+
+    @classmethod
+    def get_trait_keys(cls) -> list[str]:
+        return ["extensions"]
+
+
+class TestStateIsWhatADataFormatCanHold:
+    """State goes into a saved artifact, so a container with no data form becomes one that has."""
+
+    def test_a_set_is_saved_as_a_list(self) -> None:
+        trait = _ExtensionsTrait(extensions={".mp4", ".avi"})
+
+        assert trait.to_state() == {"extensions": [".avi", ".mp4"]}
+
+    def test_the_constructor_is_handed_that_list_on_load(self) -> None:
+        """A trait wanting a set builds one in its constructor, which is where coercion belongs."""
+        source = _ExtensionsTrait(extensions={".mp4", ".avi"})
+
+        rebuilt = _ExtensionsTrait.from_state(json.loads(json.dumps(source.to_state())))
+
+        assert rebuilt.extensions == [".avi", ".mp4"]
+        assert rebuilt.to_state() == source.to_state()
 
 
 @dataclass(eq=False)

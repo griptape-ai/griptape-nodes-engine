@@ -4,6 +4,7 @@ import pytest
 
 from griptape_nodes.exe_types.core_types import NodeMessageResult, Parameter, Trait
 from griptape_nodes.exe_types.node_types import BaseNode, sanctioned_parameter_mutation
+from griptape_nodes.exe_types.trait_state import TraitStateEntry
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.parameter_events import (
     AddParameterToNodeRequest,
@@ -146,7 +147,7 @@ class TestRebindingCallbacks:
 
     def test_a_constructor_supplied_callback_wins_over_a_saved_name(self) -> None:
         """A node that rewires a button in a new version keeps the new wiring."""
-        from griptape_nodes.retained_mode.managers.node_manager import NodeManager
+        from griptape_nodes.retained_mode.managers.node_manager import NodeManager, RestoredTrait
 
         target = ButtonNode(name="target")
         parameter = target.add_button("models", Button(label="Refresh", on_click=target.refresh))
@@ -155,13 +156,15 @@ class TestRebindingCallbacks:
         NodeManager._apply_trait_callbacks(
             parameter,
             [
-                {
-                    "trait_name": "Button",
-                    "trait_module": "griptape_nodes.traits.button",
-                    "trait_callbacks": {"on_click": "process"},
-                }
+                RestoredTrait(
+                    entry=TraitStateEntry(
+                        trait_name="Button",
+                        trait_module="griptape_nodes.traits.button",
+                        trait_callbacks={"on_click": "process"},
+                    ),
+                    trait=_button_of(parameter),
+                )
             ],
-            [_button_of(parameter)],
         )
 
         assert _button_of(parameter).on_click_callback is live_callback

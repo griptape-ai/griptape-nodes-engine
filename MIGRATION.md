@@ -32,6 +32,20 @@ read off the attributes of the same name. Two things to declare when they do not
     Those are saved by method name instead, so pass a method of the node (`self.my_handler`);
     a lambda has no name to resolve on load.
 
+State is written into a saved workflow as data, so it can hold text, numbers, true/false, and
+lists or dictionaries of those. A set or a tuple is saved as a list, which is what the
+constructor is handed on load, so coerce there if the trait wants a set:
+
+```python
+class Extensions(Trait):
+    def __init__(self, extensions: set[str] | list[str]) -> None:
+        super().__init__()
+        self.extensions = set(extensions)
+```
+
+Anything else, a `Path` or any other object, is dropped from the state with a warning, and the
+parameter loads without that one value.
+
 A leftover `field(...)` on a class that is no longer a dataclass is a `Field` object, not the
 default it looks like, and gets saved as the trait's state. Delete those along with the decorator.
 
