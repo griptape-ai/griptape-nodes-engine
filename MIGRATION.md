@@ -1,5 +1,65 @@
 # Unreleased
 
+## A `Trait` subclass writes its own `__init__`
+
+`Trait` and `BaseNodeElement` are no longer dataclasses, so a trait that relied on a generated
+constructor never reaches `BaseNodeElement.__init__` and loads without an `element_id`:
+
+```python
+@dataclass(eq=False)  # generated __init__ sets threshold and stops there
+class Threshold(Trait):
+    threshold: int = field(default=5)
+
+
+Threshold().element_id  # AttributeError
+```
+
+Drop the decorator and write the constructor:
+
+```python
+class Threshold(Trait):
+    def __init__(self, threshold: int = 5) -> None:
+        super().__init__()
+        self.threshold = threshold
+```
+
+The constructor is now also what saving reads: a trait's state is its `__init__` parameters,
+read off the attributes of the same name. Two things to declare when they do not line up:
+
+- `STATE_ALIASES` when an argument is stored under another name, as `Slider(min_val=...)`
+    stores `self.min`.
+- `STATE_EXCLUDE` for an argument that is behavior rather than state, as `Button(on_click=...)`.
+    Those are saved by method name instead, so pass a method of the node (`self.my_handler`);
+    a lambda has no name to resolve on load.
+
+A leftover `field(...)` on a class that is no longer a dataclass is a `Field` object, not the
+default it looks like, and gets saved as the trait's state. Delete those along with the decorator.
+
+## A trait owns the `ui_options` keys it renders
+
+A trait's options used to be merged into `Parameter.ui_options` and saved as part of it, where
+any stored copy won. The copy could predate the trait's current state, so narrowing a `Slider`
+moved its validator but not the slider an artist sees. Trait state is now saved in its own right,
+and the trait wins:
+
+|                                | before                | after                  |
+| ------------------------------ | --------------------- | ---------------------- |
+| reported to the editor         | stored copy           | what the trait renders |
+| saved                          | merged, copy included | authored options only  |
+| runtime `trait.choices` update | lost unless mirrored  | saved as trait state   |
+
+Setting a trait-rendered key on the parameter no longer has any effect: set it on the trait.
+
+```python
+parameter.ui_options = {"simple_dropdown": choices}  # dropped at save, shadowed at read
+trait.choices = choices  # saved, and reported to the editor
+```
+
+**Workflows already on disk.** A file that predates trait state carries its dropdown choices in
+`ui_options`, and a parameter with no trait still loads and renders them. A parameter whose node
+declares the trait takes the trait's choices instead, so a dropdown its node populated at run time
+reloads with whatever that node's `__init__` builds until the workflow is saved again.
+
 ## Branched workflows show a title instead of a file path
 
 Branching a workflow used to set the new workflow's `metadata.name` — the human-readable display
