@@ -769,6 +769,12 @@ class TestLibraryManagerRegisterLibraryFromFile:
             assert "Install failed" in str(result.result_details)
 
 
+# A real Path rather than a MagicMock: retiring an execution environment tests `.exists()` on
+# whatever this returns, and a Mock answers truthily, so the removal would run against a path that
+# was never there.
+_ABSENT_VENV_PATH = Path("nonexistent-library-venv")
+
+
 class TestLibraryManagerInstallLibraryDependencies:
     """Tests for install_library_dependencies_request."""
 
@@ -792,10 +798,11 @@ class TestLibraryManagerInstallLibraryDependencies:
         schema.metadata.library_version = "1.0.0"
         schema.metadata.dependencies.pip_dependencies = []
         schema.metadata.dependencies.pip_install_flags = []
+        schema.metadata.dependencies.pip_dependencies_exec = None
 
         with (
             patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
-            patch.object(mgr, "_get_library_venv_path", return_value=MagicMock()),
+            patch.object(mgr, "_get_library_venv_path", return_value=_ABSENT_VENV_PATH),
             patch.object(
                 mgr,
                 "_init_library_venv",
@@ -828,7 +835,7 @@ class TestLibraryManagerInstallLibraryDependencies:
 
         with (
             patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
-            patch.object(mgr, "_get_library_venv_path", return_value=MagicMock()),
+            patch.object(mgr, "_get_library_venv_path", return_value=_ABSENT_VENV_PATH),
             patch.object(
                 mgr,
                 "_init_library_venv",
@@ -859,10 +866,11 @@ class TestLibraryManagerInstallLibraryDependencies:
         schema.metadata.library_version = "1.0.0"
         schema.metadata.dependencies.pip_dependencies = []
         schema.metadata.dependencies.pip_install_flags = []
+        schema.metadata.dependencies.pip_dependencies_exec = None
 
         with (
             patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
-            patch.object(mgr, "_get_library_venv_path", return_value=MagicMock()),
+            patch.object(mgr, "_get_library_venv_path", return_value=_ABSENT_VENV_PATH),
             patch.object(mgr, "_init_library_venv", new_callable=AsyncMock, side_effect=RuntimeError("disk full")),
         ):
             result = await mgr.install_library_dependencies_request(
@@ -881,10 +889,11 @@ class TestLibraryManagerInstallLibraryDependencies:
         schema.metadata.library_version = "1.0.0"
         schema.metadata.dependencies.pip_dependencies = []
         schema.metadata.dependencies.pip_install_flags = []
+        schema.metadata.dependencies.pip_dependencies_exec = None
 
         with (
             patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
-            patch.object(mgr, "_get_library_venv_path", return_value=MagicMock()),
+            patch.object(mgr, "_get_library_venv_path", return_value=_ABSENT_VENV_PATH),
             patch.object(
                 mgr,
                 "_init_library_venv",
@@ -908,10 +917,11 @@ class TestLibraryManagerInstallLibraryDependencies:
         schema.metadata.library_version = "1.0.0"
         schema.metadata.dependencies.pip_dependencies = []
         schema.metadata.dependencies.pip_install_flags = []
+        schema.metadata.dependencies.pip_dependencies_exec = None
 
         with (
             patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
-            patch.object(mgr, "_get_library_venv_path", return_value=MagicMock()),
+            patch.object(mgr, "_get_library_venv_path", return_value=_ABSENT_VENV_PATH),
             patch.object(
                 mgr,
                 "_init_library_venv",
@@ -944,10 +954,11 @@ class TestLibraryManagerInstallLibraryDependencies:
         schema.metadata.library_version = "1.0.0"
         schema.metadata.dependencies.pip_dependencies = ["a==1"]
         schema.metadata.dependencies.pip_install_flags = []
+        schema.metadata.dependencies.pip_dependencies_exec = None
 
         with (
             patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
-            patch.object(mgr, "_get_library_venv_path", return_value=MagicMock()),
+            patch.object(mgr, "_get_library_venv_path", return_value=_ABSENT_VENV_PATH),
             patch.object(
                 mgr,
                 "_init_library_venv",
@@ -984,11 +995,12 @@ class TestLibraryManagerInstallLibraryDependencies:
         schema.metadata.library_version = "1.0.0"
         schema.metadata.dependencies.pip_dependencies = ["a==1"]
         schema.metadata.dependencies.pip_install_flags = []
+        schema.metadata.dependencies.pip_dependencies_exec = None
         expected_attempts = 2
 
         with (
             patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
-            patch.object(mgr, "_get_library_venv_path", return_value=MagicMock()),
+            patch.object(mgr, "_get_library_venv_path", return_value=_ABSENT_VENV_PATH),
             patch.object(
                 mgr,
                 "_init_library_venv",
@@ -1031,10 +1043,11 @@ class TestLibraryManagerInstallLibraryDependencies:
         schema.metadata.library_version = "1.0.0"
         schema.metadata.dependencies.pip_dependencies = ["a==1"]
         schema.metadata.dependencies.pip_install_flags = []
+        schema.metadata.dependencies.pip_dependencies_exec = None
 
         with (
             patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
-            patch.object(mgr, "_get_library_venv_path", return_value=MagicMock()),
+            patch.object(mgr, "_get_library_venv_path", return_value=_ABSENT_VENV_PATH),
             patch.object(
                 mgr,
                 "_init_library_venv",
@@ -1071,11 +1084,12 @@ class TestLibraryManagerInstallLibraryDependencies:
         schema.metadata.library_version = "1.0.0"
         schema.metadata.dependencies.pip_dependencies = ["a==1"]
         schema.metadata.dependencies.pip_install_flags = []
+        schema.metadata.dependencies.pip_dependencies_exec = None
         expected_attempts = 2
 
         with (
             patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
-            patch.object(mgr, "_get_library_venv_path", return_value=MagicMock()),
+            patch.object(mgr, "_get_library_venv_path", return_value=_ABSENT_VENV_PATH),
             patch.object(
                 mgr,
                 "_init_library_venv",

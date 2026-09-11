@@ -79,6 +79,30 @@ class _EngineRootMeta(type):
         return current_engine()
 
 
+def _forbid_manager_during_worker_execution(manager_name: str, request_hint: str) -> None:
+    """Raise when node code reaches for a manager while executing in a worker process.
+
+    A worker holds no authoritative state: config, secrets, and the filesystem all belong to
+    the orchestrator, and reads that look local would be answered by a process that is not
+    the source of truth. Node code gets there with ``GriptapeNodes.handle_request(...)``,
+    which forwards to the orchestrator, so the value is always the real one.
+
+    Scoped to node execution deliberately: engine boot and library load run in the worker
+    too, and they legitimately need their own managers.
+    """
+    engine = current_engine()
+    if not engine.library_manager.is_worker:
+        return
+    if not engine.event_manager.in_node_execution():
+        return
+    msg = (
+        f"Attempted to use {manager_name} while running in an isolated library process, where "
+        f"it holds no authoritative state. Use GriptapeNodes.handle_request({request_hint}) "
+        f"instead, which asks the main engine and returns the real value."
+    )
+    raise RuntimeError(msg)
+
+
 class GriptapeNodes(metaclass=_EngineRootMeta):
     """Static accessors for the current engine's managers and request handlers."""
 
@@ -157,14 +181,17 @@ class GriptapeNodes(metaclass=_EngineRootMeta):
 
     @classmethod
     def ConfigManager(cls) -> ConfigManager:
+        _forbid_manager_during_worker_execution("ConfigManager", "GetConfigValueRequest(...)")
         return current_engine().config_manager
 
     @classmethod
     def OSManager(cls) -> OSManager:
+        _forbid_manager_during_worker_execution("OSManager", "ReadFileRequest(...) / WriteFileRequest(...)")
         return current_engine().os_manager
 
     @classmethod
     def SecretsManager(cls) -> SecretsManager:
+        _forbid_manager_during_worker_execution("SecretsManager", "GetSecretValueRequest(...)")
         return current_engine().secrets_manager
 
     @classmethod
