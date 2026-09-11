@@ -786,6 +786,16 @@ class UIOptionsMixin:
         authored.pop(key, None)
         self.ui_options = authored  # type: ignore[attr-defined]
 
+    def report_ui_options_change(self) -> None:
+        """Tell the editor the UI options changed, without storing a copy of what changed.
+
+        For an option rendered by an attached trait: the value lives on the trait, and the
+        ``ui_options`` getter already merges it in, so writing it through the setter would
+        store a key ``authored_ui_options`` throws away again at save time. Setting the trait
+        and calling this reports the same change and stores nothing.
+        """
+        self.track_change("ui_options", self.ui_options)  # type: ignore[attr-defined]
+
 
 class ParameterMessage(BaseNodeElement, UIOptionsMixin):
     """Represents a UI message element, such as a warning or informational text."""

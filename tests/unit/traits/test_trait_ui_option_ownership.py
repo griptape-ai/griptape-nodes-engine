@@ -6,6 +6,7 @@ from griptape_nodes.exe_types.param_types.parameter_json import ParameterJson
 from griptape_nodes.traits.button import Button
 from griptape_nodes.traits.options import Options
 from griptape_nodes.traits.slider import Slider
+from tests.unit.exe_types.mocks import MockNode
 
 
 def _slider_parameter() -> Parameter:
@@ -170,3 +171,40 @@ class TestOwnershipHoldsWhateverOrderThingsHappenIn:
 
         assert parameter.authored_ui_options()["button_label"] == "Mine"
         assert parameter.ui_options["button_label"] == "Mine"
+
+
+class TestReportingATraitOwnedChange:
+    """A styling write lands on the trait, and is reported without storing a copy."""
+
+    def test_a_styling_write_stores_nothing(self) -> None:
+        parameter = ParameterButton(name="go", label="Original")
+
+        parameter.label = "Changed"
+
+        assert "button_label" not in parameter.authored_ui_options()
+
+    def test_a_styling_write_is_reported_to_the_editor(self) -> None:
+        parameter = ParameterButton(name="go", label="Original")
+
+        parameter.label = "Changed"
+
+        assert parameter._changes["ui_options"]["button_label"] == "Changed"
+
+    def test_a_styling_write_queues_the_parameter_for_the_next_update(self) -> None:
+        node = MockNode()
+        parameter = ParameterButton(name="go", label="Original")
+        parameter._node_context = node
+
+        parameter.label = "Changed"
+
+        assert parameter in node._tracked_parameters
+
+    def test_clearing_a_styling_option_stops_reporting_it(self) -> None:
+        # The trait publishes an icon's options only while it has an icon, so clearing the
+        # icon has to drop them from the reported view rather than leave a stored copy behind.
+        parameter = ParameterButton(name="go", label="Go", icon="play")
+
+        parameter.icon = None
+
+        assert "button_icon" not in parameter.ui_options
+        assert "button_icon" not in parameter.authored_ui_options()
