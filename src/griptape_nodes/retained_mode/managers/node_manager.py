@@ -7,6 +7,7 @@ import logging
 import pickle
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 from uuid import uuid4
 
@@ -42,6 +43,13 @@ from griptape_nodes.exe_types.core_types import (
     ParameterTypeBuiltin,
 )
 from griptape_nodes.exe_types.flow import ControlFlow
+from griptape_nodes.exe_types.live_subflow_node import (
+    IS_LIVE_KEY,
+    IS_LOCALLY_OVERRIDDEN_KEY,
+    IS_LOCKED_KEY,
+    LIVE_PATH_KEY,
+    LIVE_VERSION_KEY,
+)
 from griptape_nodes.exe_types.node_groups import NodeGroupMembershipError, SubflowNodeGroup
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
 from griptape_nodes.exe_types.node_types import (
@@ -55,6 +63,7 @@ from griptape_nodes.exe_types.node_types import (
     aprocess_scope,
     sanctioned_parameter_mutation,
 )
+from griptape_nodes.exe_types.workflow_node import WorkflowNode
 from griptape_nodes.node_library.library_declarations import (
     ArbitraryPythonExecutionNodeProperty,
     LifecycleStageLibraryProperty,
@@ -122,6 +131,9 @@ from griptape_nodes.retained_mode.events.node_events import (
     CanResetNodeToDefaultsRequest,
     CanResetNodeToDefaultsResultFailure,
     CanResetNodeToDefaultsResultSuccess,
+    ChangeSubflowFilePathRequest,
+    ChangeSubflowFilePathResultFailure,
+    ChangeSubflowFilePathResultSuccess,
     CreateNodeRequest,
     CreateNodeResultFailure,
     CreateNodeResultSuccess,
@@ -134,6 +146,9 @@ from griptape_nodes.retained_mode.events.node_events import (
     DeserializeSelectedNodesFromCommandsRequest,
     DeserializeSelectedNodesFromCommandsResultFailure,
     DeserializeSelectedNodesFromCommandsResultSuccess,
+    DetachFromLiveReferenceRequest,
+    DetachFromLiveReferenceResultFailure,
+    DetachFromLiveReferenceResultSuccess,
     DuplicateSelectedNodesRequest,
     DuplicateSelectedNodesResultFailure,
     DuplicateSelectedNodesResultSuccess,
@@ -413,6 +428,12 @@ class NodeManager(EngineScoped):
         )
         event_manager.assign_manager_to_request_type(ExecuteNodeRequest, self.on_execute_node_request)
         event_manager.assign_manager_to_request_type(CancelExecuteNodeRequest, self.on_cancel_execute_node_request)
+        event_manager.assign_manager_to_request_type(
+            ChangeSubflowFilePathRequest, self.on_change_subflow_file_path_request
+        )
+        event_manager.assign_manager_to_request_type(
+            DetachFromLiveReferenceRequest, self.on_detach_from_live_reference_request
+        )
 
     def handle_node_rename(self, old_name: str, new_name: str) -> None:
         # Get the node itself
@@ -854,6 +875,39 @@ class NodeManager(EngineScoped):
                 "Node '%s' was created in a RESOLVING state. This is not allowed. Setting to UNRESOLVED.", node.name
             )
         node.state = NodeResolutionState(state)
+
+        # Handle subflow import modes for exported workflow nodes (copy vs live reference).
+        if request.create_as_live is not None and isinstance(node, WorkflowNode):
+            node_workflow_metadata = type(node).workflow_metadata
+            node_workflow_file_path = type(node).workflow_file_path
+
+            if node_workflow_metadata.is_locked:
+                node.lock = True
+
+            if request.create_as_live:
+                node.metadata[IS_LIVE_KEY] = True
+                node.metadata[LIVE_PATH_KEY] = str(node_workflow_file_path)
+                node.metadata[IS_LOCKED_KEY] = node_workflow_metadata.is_locked
+            else:
+                base_name = requested_node_name
+                n = 1
+                while True:
+                    candidate = f"{base_name} Copy{n}"
+                    if (
+                        obj_mgr.generate_name_for_object(type_name=request.node_type, requested_name=candidate)
+                        == candidate
+                    ):
+                        break
+                    n += 1
+                rename_result = self.engine.handle_request(
+                    RenameObjectRequest(
+                        object_name=node.name,
+                        requested_name=candidate,
+                        allow_next_closest_name_available=False,
+                    )
+                )
+                if isinstance(rename_result, RenameObjectResultSuccess):
+                    final_node_name = rename_result.final_name
 
         # See if we want to push this into the context of the current flow.
         if request.set_as_new_context:
@@ -5595,3 +5649,86 @@ class NodeManager(EngineScoped):
         node.make_node_unresolved(current_states_to_trigger_change_event={NodeResolutionState.RESOLVED})
         self.engine.flow_manager.get_connections().unresolve_future_nodes(node)
         return UnresolveNodeResultSuccess(result_details=f"Node '{request.node_name}' marked as unresolved.")
+
+    def on_change_subflow_file_path_request(self, request: ChangeSubflowFilePathRequest) -> ResultPayload:
+        try:
+            node = self.get_node_by_name(request.node_name)
+        except ValueError as err:
+            return ChangeSubflowFilePathResultFailure(
+                result_details=f"Attempted to change file path on '{request.node_name}'. Node not found: {err}"
+            )
+
+        if not node.metadata.get(IS_LIVE_KEY):
+            return ChangeSubflowFilePathResultFailure(
+                result_details=f"Attempted to change file path on '{request.node_name}'. Node is not a live reference."
+            )
+
+        node.metadata[LIVE_PATH_KEY] = request.new_file_path
+
+        new_base_name = Path(request.new_file_path).stem
+        rename_result = self.engine.handle_request(
+            RenameObjectRequest(
+                object_name=request.node_name,
+                requested_name=new_base_name,
+                allow_next_closest_name_available=True,
+            )
+        )
+        if isinstance(rename_result, RenameObjectResultSuccess):
+            new_node_name = rename_result.final_name
+        else:
+            new_node_name = request.node_name
+
+        return ChangeSubflowFilePathResultSuccess(
+            node_name=request.node_name,
+            new_node_name=new_node_name,
+            new_file_path=request.new_file_path,
+            result_details=f"Changed live reference file path on '{request.node_name}' to '{request.new_file_path}'.",
+        )
+
+    def on_detach_from_live_reference_request(self, request: DetachFromLiveReferenceRequest) -> ResultPayload:
+        try:
+            node = self.get_node_by_name(request.node_name)
+        except ValueError as err:
+            return DetachFromLiveReferenceResultFailure(
+                result_details=f"Attempted to detach live reference on '{request.node_name}'. Node not found: {err}"
+            )
+
+        if not node.metadata.get(IS_LIVE_KEY):
+            return DetachFromLiveReferenceResultFailure(
+                result_details=f"Attempted to detach live reference on '{request.node_name}'. Node is not a live reference."
+            )
+
+        node.metadata.pop(IS_LIVE_KEY, None)
+        node.metadata.pop(LIVE_PATH_KEY, None)
+        node.metadata.pop(LIVE_VERSION_KEY, None)
+        node.metadata.pop(IS_LOCALLY_OVERRIDDEN_KEY, None)
+
+        obj_mgr = self.engine.object_manager
+        base_name = request.node_name
+        n = 1
+        while True:
+            candidate = f"{base_name} Copy{n}"
+            if (
+                obj_mgr.generate_name_for_object(type_name=node.__class__.__name__, requested_name=candidate)
+                == candidate
+            ):
+                break
+            n += 1
+
+        rename_result = self.engine.handle_request(
+            RenameObjectRequest(
+                object_name=request.node_name,
+                requested_name=candidate,
+                allow_next_closest_name_available=False,
+            )
+        )
+        if isinstance(rename_result, RenameObjectResultSuccess):
+            new_node_name = rename_result.final_name
+        else:
+            new_node_name = request.node_name
+
+        return DetachFromLiveReferenceResultSuccess(
+            node_name=request.node_name,
+            new_node_name=new_node_name,
+            result_details=f"Detached live reference on '{request.node_name}', renamed to '{new_node_name}'.",
+        )

@@ -44,6 +44,7 @@ from griptape_nodes.exe_types.subflow_node import SubflowNode
 from griptape_nodes.exe_types.subflow_node import _get_flow_or_none as _get_subflow_or_none
 from griptape_nodes.exe_types.workflow_node import (
     SUBFLOW_NAME_KEY,
+    WorkflowNode,
     WorkflowNodeDefinitionError,
     build_workflow_node_class,
 )
@@ -7081,12 +7082,12 @@ class WorkflowManager(EngineScoped):
             return registry_key
         return None
 
-    def on_open_node_inner_canvas_request(self, request: OpenNodeInnerCanvasRequest) -> ResultPayload:
+    async def on_open_node_inner_canvas_request(self, request: OpenNodeInnerCanvasRequest) -> ResultPayload:  # noqa: PLR0911
         node = self.engine.object_manager.attempt_get_object_by_name_as_type(request.node_name, BaseNode)
         if node is None:
             details = f"Attempted to open inner canvas of '{request.node_name}'. Failed because the node was not found."
             return OpenNodeInnerCanvasResultFailure(result_details=details)
-        if not isinstance(node, SubflowNode):
+        if not isinstance(node, SubflowNode) and not isinstance(node, WorkflowNode):
             details = (
                 f"Attempted to open inner canvas of '{request.node_name}'. "
                 "Failed because the node does not support an inner canvas."
@@ -7116,6 +7117,15 @@ class WorkflowManager(EngineScoped):
             )
         else:
             flow_to_return = None
+            if existing_name is None:
+                logger.warning(
+                    "OpenNodeInnerCanvas: node='%s' has no SUBFLOW_NAME_KEY. "
+                    "Canonical flow '%s' also absent. Will create a new inner flow. "
+                    "Full metadata keys: %s",
+                    request.node_name,
+                    canonical_child_name,
+                    list(node.metadata.keys()),
+                )
 
         if flow_to_return is not None:
             return OpenNodeInnerCanvasResultSuccess(
@@ -7133,6 +7143,11 @@ class WorkflowManager(EngineScoped):
             return OpenNodeInnerCanvasResultFailure(result_details=details)
 
         parent_flow_name = flow_result.flow_name
+
+        # WorkflowNode: provision inner canvas by importing from the registered workflow file.
+        if isinstance(node, WorkflowNode):
+            return await self._open_workflow_node_inner_canvas(node, request.node_name, parent_flow_name)
+
         child_flow_name = canonical_child_name
 
         create_result = self.engine.handle_request(
@@ -7160,6 +7175,69 @@ class WorkflowManager(EngineScoped):
             child_flow_name=create_result.flow_name,
             created=True,
             result_details=f"Inner canvas for '{request.node_name}' created as '{create_result.flow_name}'.",
+        )
+
+    async def _open_workflow_node_inner_canvas(
+        self,
+        node: WorkflowNode,
+        node_name: str,
+        parent_flow_name: str,
+    ) -> ResultPayload:
+        """Provision an inner canvas for a WorkflowNode by importing its workflow file."""
+        workflow_file_path = type(node).workflow_file_path
+        workflow_file_str = str(workflow_file_path)
+        workflow_name = derive_registry_key(workflow_file_str)
+
+        registered_here = False
+        if not WorkflowRegistry.has_workflow_with_name(workflow_name):
+            try:
+                workflow_metadata = self._load_workflow_metadata_from_file(workflow_file_str)
+            except Exception as err:
+                details = (
+                    f"Attempted to open inner canvas of '{node_name}'. "
+                    f"Failed because the workflow file could not be read: {err}"
+                )
+                return OpenNodeInnerCanvasResultFailure(result_details=details)
+
+            register_result = self.engine.handle_request(
+                RegisterWorkflowRequest(metadata=workflow_metadata, file_name=workflow_file_str)
+            )
+            if not isinstance(register_result, RegisterWorkflowResultSuccess):
+                details = (
+                    f"Attempted to open inner canvas of '{node_name}'. "
+                    "Failed because the workflow could not be registered for import."
+                )
+                return OpenNodeInnerCanvasResultFailure(result_details=details)
+            registered_here = True
+
+        import_result = await self.engine.ahandle_request(
+            ImportWorkflowAsReferencedSubFlowRequest(
+                workflow_name=workflow_name,
+                flow_name=parent_flow_name,
+                track_as_referenced=False,
+            )
+        )
+        if registered_here:
+            WorkflowRegistry.delete_workflow_by_name(workflow_name)
+
+        if not isinstance(import_result, ImportWorkflowAsReferencedSubFlowResultSuccess):
+            details = (
+                f"Attempted to open inner canvas of '{node_name}'. "
+                f"Failed because the workflow could not be imported: {import_result.result_details}"
+            )
+            return OpenNodeInnerCanvasResultFailure(result_details=details)
+
+        child_flow_name = import_result.created_flow_name
+        node.metadata[SUBFLOW_NAME_KEY] = child_flow_name
+        logger.info(
+            "OpenNodeInnerCanvas (WorkflowNode): created inner flow '%s' for '%s'",
+            child_flow_name,
+            node_name,
+        )
+        return OpenNodeInnerCanvasResultSuccess(
+            child_flow_name=child_flow_name,
+            created=True,
+            result_details=f"Inner canvas for '{node_name}' created as '{child_flow_name}'.",
         )
 
     def on_sync_inner_flow_surface_request(self, request: SyncInnerFlowSurfaceRequest) -> ResultPayload:
@@ -7214,10 +7292,8 @@ class WorkflowManager(EngineScoped):
             return ConvertNodesToSubflowResultFailure(result_details=result)
 
         await self._push_node_events_to_frontend(
-            created_node_name=result.subflow_node_name,
-            created_node_type="SubflowNode",
-            parent_flow_name=result.parent_flow_name,
             moved_node_names=result.moved_node_names,
+            child_flow_name=result.child_flow_name,
         )
 
         details = (
@@ -7340,10 +7416,8 @@ class WorkflowManager(EngineScoped):
         await self._push_library_info_to_frontend("Live Subflows")
 
         await self._push_node_events_to_frontend(
-            created_node_name=result.subflow_node_name,
-            created_node_type="LiveSubflowNode",
-            parent_flow_name=result.parent_flow_name,
             moved_node_names=result.moved_node_names,
+            child_flow_name=result.child_flow_name,
         )
 
         details = (
@@ -7433,24 +7507,51 @@ class WorkflowManager(EngineScoped):
         #     DeleteConnectionRequest resolves nodes in their current flow; once a node is moved
         #     to the inner flow it is no longer reachable from the parent scope. Do all deletes
         #     now so step 8 (move) and step 9 (bridge) operate on a clean slate.
+        #     broadcast_result=False: these are internal clean-up deletes; surfacing them as
+        #     error toasts when they fail is noise to the user.
+        logger.info(
+            "ConvertNodesToSubflow: step 3b — deleting %d incoming + %d outgoing boundary connections",
+            len(incoming_boundary),
+            len(outgoing_boundary),
+        )
         for ext_src_node, ext_src_param, tgt_node, tgt_param in incoming_boundary:
-            self.engine.handle_request(
+            del_result = self.engine.handle_request(
                 DeleteConnectionRequest(
                     source_node_name=ext_src_node,
                     source_parameter_name=ext_src_param,
                     target_node_name=tgt_node,
                     target_parameter_name=tgt_param,
+                    broadcast_result=False,
                 )
             )
+            if del_result.failed():
+                logger.warning(
+                    "ConvertNodesToSubflow: could not delete incoming boundary connection %s.%s → %s.%s: %s",
+                    ext_src_node,
+                    ext_src_param,
+                    tgt_node,
+                    tgt_param,
+                    del_result.result_details,
+                )
         for src_node, src_param, ext_tgt_node, ext_tgt_param in outgoing_boundary:
-            self.engine.handle_request(
+            del_result = self.engine.handle_request(
                 DeleteConnectionRequest(
                     source_node_name=src_node,
                     source_parameter_name=src_param,
                     target_node_name=ext_tgt_node,
                     target_parameter_name=ext_tgt_param,
+                    broadcast_result=False,
                 )
             )
+            if del_result.failed():
+                logger.warning(
+                    "ConvertNodesToSubflow: could not delete outgoing boundary connection %s.%s → %s.%s: %s",
+                    src_node,
+                    src_param,
+                    ext_tgt_node,
+                    ext_tgt_param,
+                    del_result.result_details,
+                )
 
         # 4. Calculate position for the new node.
         if position is not None:
@@ -7536,18 +7637,38 @@ class WorkflowManager(EngineScoped):
         nodes_already_in_inner = (
             set(inner_list_result.node_names) if isinstance(inner_list_result, ListNodesInFlowResultSuccess) else set()
         )
+        logger.info(
+            "ConvertNodesToSubflow: step 8 — moving %d nodes into '%s' (already inside: %s)",
+            len(nodes),
+            child_flow_name,
+            nodes_already_in_inner,
+        )
         for node in nodes:
             if node.name in nodes_already_in_inner:
+                logger.info("ConvertNodesToSubflow: skipping '%s' (already in inner flow)", node.name)
                 continue
+            logger.info(
+                "ConvertNodesToSubflow: moving '%s' from '%s' to '%s'",
+                node.name,
+                parent_flow_name,
+                child_flow_name,
+            )
             move_result = self.engine.handle_request(
                 MoveNodeToNewFlowRequest(
                     node_name=node.name,
                     target_flow_name=child_flow_name,
                     source_flow_name=parent_flow_name,
+                    broadcast_result=False,
                 )
             )
             if not isinstance(move_result, MoveNodeToNewFlowResultSuccess):
+                logger.error(
+                    "ConvertNodesToSubflow: FAILED to move '%s': %s",
+                    node.name,
+                    move_result.result_details,
+                )
                 return f"Attempted to convert nodes to subflow. Failed to move node '{node.name}' into the inner flow: {move_result.result_details}"
+            logger.info("ConvertNodesToSubflow: moved '%s' successfully", node.name)
 
         # 9. Wire incoming boundary connections (external → selected) through StartFlow.
         promoted_params: list[str] = []
@@ -8393,17 +8514,26 @@ class WorkflowManager(EngineScoped):
 
     async def _push_node_events_to_frontend(
         self,
-        created_node_name: str,
-        created_node_type: str,
-        parent_flow_name: str,
         moved_node_names: list[str],
+        child_flow_name: str | None = None,
     ) -> None:
-        """Push delete events for moved nodes and a create event for the new subflow node."""
+        """Push delete/re-create events for moved nodes to update the frontend canvas.
+
+        Sends synthetic DeleteNode events for each moved node (removing them from the
+        outer canvas in the frontend) followed by synthetic CreateNode events placing
+        them in the inner canvas.  The subflow node itself is NOT re-announced here;
+        ConvertNodesToSubflowResultSuccess already carries subflow_node_name and the
+        frontend uses that to render the collapsed node.  Sending a duplicate CreateNode
+        for the subflow node caused the frontend to delete-then-recreate it, which
+        triggered SubflowNode._discard_child_flow() and destroyed the inner flow.
+        """
         session_id = self.engine.session_manager.active_session_id
         if session_id is None:
             return
         response_topic = f"sessions/{session_id}/response"
+        obj_mgr = self.engine.object_manager
 
+        # Remove moved nodes from the outer canvas.
         for node_name in moved_node_names:
             delete_event = EventResultSuccess(
                 request=DeleteNodeRequest(node_name=node_name),
@@ -8413,18 +8543,24 @@ class WorkflowManager(EngineScoped):
             )
             await self.engine._event_manager.aput_event(GriptapeNodeEvent(wrapped_event=delete_event))
 
-        create_event = EventResultSuccess(
-            request=CreateNodeRequest(node_type=created_node_type),
-            request_id=None,
-            result=CreateNodeResultSuccess(
-                result_details="",
-                node_name=created_node_name,
-                node_type=created_node_type,
-                parent_flow_name=parent_flow_name,
-            ),
-            response_topic=response_topic,
-        )
-        await self.engine._event_manager.aput_event(GriptapeNodeEvent(wrapped_event=create_event))
+        # Tell the frontend each moved node now lives in the inner canvas so it
+        # renders them there instead of treating the delete as permanent.
+        if child_flow_name is not None:
+            for node_name in moved_node_names:
+                node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
+                node_type = type(node).__name__ if node is not None else "BaseNode"
+                inner_create_event = EventResultSuccess(
+                    request=CreateNodeRequest(node_type=node_type),
+                    request_id=None,
+                    result=CreateNodeResultSuccess(
+                        result_details="",
+                        node_name=node_name,
+                        node_type=node_type,
+                        parent_flow_name=child_flow_name,
+                    ),
+                    response_topic=response_topic,
+                )
+                await self.engine._event_manager.aput_event(GriptapeNodeEvent(wrapped_event=inner_create_event))
 
     async def _push_library_info_to_frontend(self, library_name: str) -> None:
         """Push updated library info to the frontend so the sidebar refreshes immediately."""
@@ -8622,9 +8758,9 @@ class WorkflowManager(EngineScoped):
         if node is None:
             details = f"Attempted to make '{request.node_name}' editable. Failed because the node was not found."
             return MakeLiveSubflowEditableResultFailure(result_details=details)
-        if not isinstance(node, LiveSubflowNode):
+        if not isinstance(node, LiveSubflowNode) and not node.metadata.get(IS_LIVE_KEY):
             details = (
-                f"Attempted to make '{request.node_name}' editable. Failed because the node is not a LiveSubflowNode."
+                f"Attempted to make '{request.node_name}' editable. Failed because the node is not a live subflow node."
             )
             return MakeLiveSubflowEditableResultFailure(result_details=details)
 

@@ -1283,10 +1283,15 @@ class FlowManager(EngineScoped):
         if source_node is None:
             try:
                 source_node = self.engine.node_manager.get_node_by_name(source_node_name)
-            except ValueError as err:
-                details = f'Connection not deleted "{source_node_name}.{request.source_parameter_name}" to "{target_node_name}.{request.target_parameter_name}". Error: {err}'
-
-                return DeleteConnectionResultFailure(result_details=details)
+            except ValueError:
+                # Source node no longer exists — connection cannot exist either, treat as already deleted.
+                logger.debug(
+                    "DeleteConnection: source node '%s' not found; treating connection as already removed.",
+                    source_node_name,
+                )
+                return DeleteConnectionResultSuccess(
+                    result_details="Connection already removed (source node not found)."
+                )
 
         target_node_name = request.target_node_name
         if target_node_name is None:
@@ -1301,10 +1306,15 @@ class FlowManager(EngineScoped):
         if target_node is None:
             try:
                 target_node = self.engine.node_manager.get_node_by_name(target_node_name)
-            except ValueError as err:
-                details = f'Connection not deleted "{source_node_name}.{request.source_parameter_name}" to "{target_node_name}.{request.target_parameter_name}". Error: {err}'
-
-                return DeleteConnectionResultFailure(result_details=details)
+            except ValueError:
+                # Target node no longer exists — connection cannot exist either, treat as already deleted.
+                logger.debug(
+                    "DeleteConnection: target node '%s' not found; treating connection as already removed.",
+                    target_node_name,
+                )
+                return DeleteConnectionResultSuccess(
+                    result_details="Connection already removed (target node not found)."
+                )
 
         # The two nodes exist.
         # Get the parent flows.

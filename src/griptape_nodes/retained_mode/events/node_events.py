@@ -93,6 +93,8 @@ class CreateNodeRequest(RequestPayload):
     subflow_name: str | None = None
     # Name of the group node to add this node to after creation
     parent_group_name: str | None = None
+    # When True, import as live reference; False, import as copy with CopyN suffix; None, normal creation
+    create_as_live: bool | None = None
 
 
 @dataclass
@@ -467,6 +469,92 @@ class BatchSetNodeLockStateResultSuccess(WorkflowNotAlteredMixin, ResultPayloadS
 @PayloadRegistry.register
 class BatchSetNodeLockStateResultFailure(ResultPayloadFailure):
     """Batch node lock state update failed. Common causes: all nodes not found."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ChangeSubflowFilePathRequest(RequestPayload):
+    """Change the referenced file path on a live reference subflow node.
+
+    Use when: A consumer wants to point a live reference node at a different subflow file.
+    On confirmation, updates the node's live_path metadata and renames the node to match
+    the new file's stem.
+
+    Args:
+        node_name: Name of the live reference node to update
+        new_file_path: Absolute path to the replacement subflow .py file
+
+    Results: ChangeSubflowFilePathResultSuccess | ChangeSubflowFilePathResultFailure
+    """
+
+    node_name: str
+    new_file_path: str
+
+
+@dataclass
+@PayloadRegistry.register
+class ChangeSubflowFilePathResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
+    """Live reference file path updated successfully.
+
+    Args:
+        node_name: Original node name (before any rename)
+        new_node_name: Node name after rename (derived from new file's stem)
+        new_file_path: The new live_path now stored on the node
+    """
+
+    node_name: str
+    new_node_name: str
+    new_file_path: str
+
+
+@dataclass
+@PayloadRegistry.register
+class ChangeSubflowFilePathResultFailure(ResultPayloadFailure):
+    """Live reference file path update failed.
+
+    Common causes: node not found, node is not a live reference.
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class DetachFromLiveReferenceRequest(RequestPayload):
+    """Detach a live reference subflow node, converting it to an editable copy.
+
+    Use when: A consumer wants to break the live link and edit the subflow independently.
+    Clears all live-reference metadata (is_live, live_path, live_version) while preserving
+    the node's child flow and lock state. Renames the node with a CopyN suffix.
+
+    Args:
+        node_name: Name of the live reference node to detach
+
+    Results: DetachFromLiveReferenceResultSuccess | DetachFromLiveReferenceResultFailure
+    """
+
+    node_name: str
+
+
+@dataclass
+@PayloadRegistry.register
+class DetachFromLiveReferenceResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
+    """Live reference detached successfully. Node is now a standalone copy.
+
+    Args:
+        node_name: Original node name (before rename)
+        new_node_name: Node name after rename (original name + CopyN suffix)
+    """
+
+    node_name: str
+    new_node_name: str
+
+
+@dataclass
+@PayloadRegistry.register
+class DetachFromLiveReferenceResultFailure(ResultPayloadFailure):
+    """Live reference detach failed.
+
+    Common causes: node not found, node is not a live reference.
+    """
 
 
 # A Node's state can be serialized to a sequence of commands that the engine runs.
