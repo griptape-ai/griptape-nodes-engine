@@ -55,6 +55,7 @@ from griptape_nodes.exe_types.node_types import (
     aprocess_scope,
     sanctioned_parameter_mutation,
 )
+from griptape_nodes.machines.dag_builder import NodeState
 from griptape_nodes.node_library.library_declarations import (
     ArbitraryPythonExecutionNodeProperty,
     LifecycleStageLibraryProperty,
@@ -246,6 +247,28 @@ logger = logging.getLogger("griptape_nodes")
 # Sentinel for "key not present in node.parameter_values". Distinct from None
 # so a legitimately-stored None does not collide with "missing".
 _PARAM_MISSING = object()
+
+# A node in one of these states owes the running flow nothing further, so deleting it takes
+# nothing away from the run.
+_SETTLED_NODE_STATES = frozenset({NodeState.DONE, NodeState.CANCELED, NodeState.ERRORED})
+
+# A node in one of these states has not been dispatched yet. Dispatch is when a node collects
+# values from its upstream nodes (see ExecuteDagState.collect_values_from_upstream_nodes), so a
+# node still in one of these states has NOT received its inputs and would fall back to its
+# parameter defaults if an upstream disappeared first.
+_UNCOLLECTED_NODE_STATES = frozenset({NodeState.WAITING, NodeState.QUEUED})
+
+
+@dataclass
+class _FlowCancelOutcome:
+    """What deleting a node did to the workflow that was running, if any.
+
+    Both halves are worth reporting: a delete that could not stop the run has to fail, and a delete
+    that did stop it has to say so, or the run appears to stop for no stated reason.
+    """
+
+    failure: ResultPayload | None = None
+    cancelled_for_node_name: str | None = None
 
 
 class SerializedParameterValues(NamedTuple):
@@ -1219,14 +1242,20 @@ class NodeManager(EngineScoped):
             node_group_name=request.node_group_name,
         )
 
-    def cancel_conditionally(
+    async def cancel_conditionally(
         self, parent_flow: ControlFlow, parent_flow_name: str, node: BaseNode
-    ) -> ResultPayload | None:
-        """Conditionally cancels a parent flow if it's currently executing nodes are connected to the specified node.
+    ) -> _FlowCancelOutcome:
+        """Cancel the running flow if deleting this node would take unfinished work away from it.
 
-        This method checks if the parent flow is running, and if so, determines whether the currently
-        executing or resolving node is connected to the specified node. If a connection exists, the parent
-        flow is cancelled to prevent operations on the deleted node.
+        Only genuine entanglement cancels. Sharing a connected component with something live is not
+        enough: a node the run has already finished with, or one the run was never going to reach,
+        can be deleted while the run carries on.
+
+        The cancel is awaited rather than dispatched synchronously. `on_cancel_flow_request` is an async
+        handler that gathers the running node tasks, and those tasks belong to the engine's event loop.
+        Dispatching it from sync code bridges it onto a side loop instead, where the gather cannot bind to
+        the tasks it is waiting on -- so the cancel raised "attached to a different loop" and every delete
+        during a run was refused.
 
         Args:
             parent_flow: The control flow object that may need to be cancelled.
@@ -1234,43 +1263,70 @@ class NodeManager(EngineScoped):
             node: The base node that is trying to be deleted.
 
         Returns:
-            ResultPayload: A DeleteNodeResultFailure if cancellation was attempted but failed.
-            None: If no cancellation was needed or cancellation succeeded.
+            An outcome carrying a DeleteNodeResultFailure if cancellation was attempted but failed,
+            and the name of the live node the cancellation was for if one happened. Both are empty
+            when the delete took nothing away from the run.
 
         Note:
             This method also clears the flow queue regardless of whether cancellation occurred,
             to ensure the specified node is not processed in the future.
         """
-        if self.engine.flow_manager.check_for_existing_running_flow():
-            # get the current node executing / resolving
-            # if it's in connected nodes, cancel flow.
-            # otherwise, leave it.
-            control_node_names, resolving_node_names, _ = self.engine.flow_manager.flow_state(parent_flow)
-            connected_nodes = parent_flow.get_all_connected_nodes(node)
-            cancelled = False
-            if control_node_names is not None:
-                for control_node_name in control_node_names:
-                    control_node = self.engine.object_manager.get_object_by_name(control_node_name)
-                    if control_node in connected_nodes:
-                        result = self.engine.handle_request(CancelFlowRequest(flow_name=parent_flow_name))
-                        cancelled = True
-                        if result.failed():
-                            details = f"Attempted to delete a Node '{node.name}'. Failed because running flow could not cancel."
-                            return DeleteNodeResultFailure(result_details=details)
-            if resolving_node_names is not None and not cancelled:
-                for resolving_node_name in resolving_node_names:
-                    resolving_node = self.engine.object_manager.get_object_by_name(resolving_node_name)
-                    if resolving_node in connected_nodes:
-                        result = self.engine.handle_request(CancelFlowRequest(flow_name=parent_flow_name))
-                        if result.failed():
-                            details = f"Attempted to delete a Node '{node.name}'. Failed because running flow could not cancel."
-                            return DeleteNodeResultFailure(result_details=details)
-                        break  # Only need to cancel once
-            # Clear the execution queue, because we don't want to hit this node eventually.
-            parent_flow.clear_execution_queue()
+        if not self.engine.flow_manager.check_for_existing_running_flow():
+            return _FlowCancelOutcome()
+
+        entangled_node_name = self._find_entangled_live_node(node)
+        if entangled_node_name is not None:
+            result = await self.engine.ahandle_request(CancelFlowRequest(flow_name=parent_flow_name))
+            if result.failed():
+                details = f"Attempted to delete a Node '{node.name}'. Failed because running flow could not cancel."
+                return _FlowCancelOutcome(failure=DeleteNodeResultFailure(result_details=details))
+
+        # Clear the execution queue, because we don't want to hit this node eventually.
+        parent_flow.clear_execution_queue()
+        return _FlowCancelOutcome(cancelled_for_node_name=entangled_node_name)
+
+    def _find_entangled_live_node(self, node: BaseNode) -> str | None:
+        """Name the live node that deleting `node` would damage, or None if nothing would be.
+
+        Three ways a delete can damage a run, and only these three:
+
+        1. The node is part of the live run and has not settled, so the run is still counting on it
+           to produce something.
+        2. A node in the live run has not been dispatched yet and is fed by this node. Dispatch is
+           when a node collects its inputs from upstream, so a consumer that has not been dispatched
+           has not received this node's outputs and would fall back to its parameter defaults --
+           finishing the run with the wrong answer and no indication anything went wrong.
+        3. The run is gated on this node: a data node is registered as reachable only once this node
+           finishes, and would otherwise wait forever for something that is never coming.
+
+        A consumer that is already processing or done has its values, so it is not damaged. Control
+        connections count the same as data connections here: deleting a settled node whose control
+        output feeds a node that has not started truncates the chain and can strand it.
+
+        The live run is the DAG, not the flow. Nodes the run was never going to reach are absent
+        from it, which is what makes deleting a bystander or an unreached consumer free.
+        """
+        dag_builder = self.engine.flow_manager.global_dag_builder
+        dag_nodes = dag_builder.node_to_reference
+
+        own_dag_node = dag_nodes.get(node.name)
+        if own_dag_node is not None and own_dag_node.node_state not in _SETTLED_NODE_STATES:
+            return node.name
+
+        connections = self.engine.flow_manager.get_connections()
+        for connection in connections.get_all_outgoing_connections(node):
+            target_dag_node = dag_nodes.get(connection.target_node.name)
+            if target_dag_node is not None and target_dag_node.node_state in _UNCOLLECTED_NODE_STATES:
+                return connection.target_node.name
+
+        for gated_node_name, boundary_nodes_by_graph in dag_builder.start_node_candidates.items():
+            for boundary_node_names in boundary_nodes_by_graph.values():
+                if node.name in boundary_node_names:
+                    return gated_node_name
+
         return None
 
-    def on_delete_node_request(self, request: DeleteNodeRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915 (Complex logic, lots of edge cases)
+    async def on_delete_node_request(self, request: DeleteNodeRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915 (Complex logic, lots of edge cases)
         node_name = request.node_name
         node = None
         if node_name is None:
@@ -1297,9 +1353,14 @@ class NodeManager(EngineScoped):
                 details = f"Attempted to delete a Node '{node_name}'. Error: {err}"
                 return DeleteNodeResultFailure(result_details=details)
 
-            cancel_result = self.cancel_conditionally(parent_flow, parent_flow_name, node)
-            if cancel_result is not None:
-                return cancel_result
+            cancel_outcome = await self.cancel_conditionally(parent_flow, parent_flow_name, node)
+            if cancel_outcome.failure is not None:
+                return cancel_outcome.failure
+
+            # The node is leaving, so the live DAG has to stop naming it: it is published to the
+            # editor as an involved node, iterated on cancel, and checked before a node is allowed
+            # to start. Harmless when the run was cancelled above, since teardown clears it anyway.
+            self.engine.flow_manager.global_dag_builder.remove_node(node_name)
 
             # Call after_node_deleted hook for cleanup of a node, implemented by node author.
             try:
@@ -1373,6 +1434,15 @@ class NodeManager(EngineScoped):
             self.engine.context_manager.pop_node()
 
         details = f"Successfully deleted Node '{node_name}'."
+        # Stopping a run the artist started is not something to do silently. Say it happened, and say
+        # which node still needed the deleted one, so the reason is not left to guesswork.
+        if cancel_outcome.cancelled_for_node_name == node_name:
+            details += " Cancelled the running workflow, because this Node was still running."
+        elif cancel_outcome.cancelled_for_node_name is not None:
+            details += (
+                f" Cancelled the running workflow, because Node '{cancel_outcome.cancelled_for_node_name}' "
+                f"was still waiting on it."
+            )
         return DeleteNodeResultSuccess(result_details=details)
 
     def on_move_node_to_new_flow_request(self, request: MoveNodeToNewFlowRequest) -> ResultPayload:  # noqa: PLR0911
@@ -5353,7 +5423,7 @@ class NodeManager(EngineScoped):
             result_details=details,
         )
 
-    def on_reset_node_to_defaults_request(self, request: ResetNodeToDefaultsRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
+    async def on_reset_node_to_defaults_request(self, request: ResetNodeToDefaultsRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
         """Reset a node to its default state while preserving connections where possible."""
         node_name = request.node_name
         node = None
@@ -5462,7 +5532,7 @@ class NodeManager(EngineScoped):
 
         # FAILURE CHECK: Delete source node
         delete_request = DeleteNodeRequest(node_name=node_name)
-        delete_result = self.on_delete_node_request(delete_request)
+        delete_result = await self.on_delete_node_request(delete_request)
         if not isinstance(delete_result, DeleteNodeResultSuccess):
             details = f"Attempted to reset Node '{node_name}'. Failed to delete original node."
             return ResetNodeToDefaultsResultFailure(result_details=details)
