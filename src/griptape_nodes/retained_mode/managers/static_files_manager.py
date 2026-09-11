@@ -1,6 +1,7 @@
 import base64
 import binascii
 import logging
+import os
 import threading
 from pathlib import Path
 from typing import NamedTuple
@@ -52,7 +53,13 @@ from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
 from griptape_nodes.servers import bind_free_socket
-from griptape_nodes.servers.static import STATIC_SERVER_HOST, STATIC_SERVER_PORT, STATIC_SERVER_URL, start_static_server
+from griptape_nodes.servers.static import (
+    ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV,
+    STATIC_SERVER_HOST,
+    STATIC_SERVER_PORT,
+    STATIC_SERVER_URL,
+    start_static_server,
+)
 from griptape_nodes.utils.url_utils import uri_to_path
 
 logger = logging.getLogger("griptape_nodes")
@@ -103,6 +110,11 @@ class StaticFilesManager(EngineScoped):
         # until then is also what tells that handler it has not settled this yet, so a second
         # initialization pass in the same process doesn't start a second server.
         self._static_server_base_url: str | None = None
+        # Set once on_app_initialization_complete has decided the URL -- including deciding there
+        # is none (cloud storage). App-event listeners fan out as unordered concurrent tasks, so a
+        # consumer that needs the answer waits on this instead of sampling mid-race. A
+        # threading.Event because waiters and the resolver can sit on different event loops.
+        self._base_url_settled = threading.Event()
 
         # Seed the driver with any configured override so URLs built before initialization
         # completes still point at the tunnel or proxy fronting the server. The handler re-reads
@@ -177,6 +189,36 @@ class StaticFilesManager(EngineScoped):
         if self._static_server_base_url is None:
             msg = "static_server_base_url accessed before on_app_initialization_complete resolved it."
             raise RuntimeError(msg)
+        return self._static_server_base_url
+
+    @property
+    def static_server_base_url_settled(self) -> bool:
+        """Whether initialization has decided the URL yet, including deciding there is none.
+
+        Lets a caller skip the wait when the answer is already in, and tell "decided: no server"
+        apart from "never decided" afterwards -- two states that want different diagnostics.
+
+        Pair it with ``wait_for_static_server_base_url(0)``, NOT with ``static_server_base_url``:
+        that property raises when the decision was "no server", which is the very case this
+        distinguishes.
+        """
+        return self._base_url_settled.is_set()
+
+    def wait_for_static_server_base_url(self, timeout_s: float) -> str | None:
+        """Block until initialization has decided the URL, then return it (None means "no server").
+
+        The deciding listener and a consumer needing its answer run as unordered sibling tasks in
+        the AppInitializationComplete fan-out, so sampling the property from another listener's
+        call chain is a race. Waiting on the decision makes the ordering structural. Blocking by
+        design: call it off-loop (``asyncio.to_thread``) from async code.
+
+        Returns None when initialization decided no server will exist here -- cloud storage serves
+        assets itself, or resolution raised -- and also when nothing decided within the bound. Both
+        mean "spawn without a URL", but they are different failures: read
+        ``static_server_base_url_settled`` to tell them apart, as the spawn path does to pick which
+        of two warnings to emit.
+        """
+        self._base_url_settled.wait(timeout_s)
         return self._static_server_base_url
 
     async def _generate_preview_if_needed(self, file_path: Path) -> tuple[Path, dict | None]:
@@ -459,10 +501,30 @@ class StaticFilesManager(EngineScoped):
         )
 
     def on_app_initialization_complete(self, payload: AppInitializationComplete) -> None:
+        # try/finally rather than settling per branch: whatever resolution reached before raising
+        # is what there is going to be, so waking waiters immediately beats making them sit out a
+        # full timeout on an initialization that already failed. Usually that means no URL, though a
+        # raise from starting the server thread leaves one already assigned.
+        try:
+            self._resolve_static_server(payload)
+        finally:
+            self._base_url_settled.set()
+
+    def _resolve_static_server(self, payload: AppInitializationComplete) -> None:
         if not isinstance(self.storage_driver, LocalStorageDriver):
             return
 
-        if payload.static_server_base_url is not None:
+        # The env var outranks the payload: a parent that set it serves the shared workspace on a
+        # port outliving this process, a stronger signal than "some process serves it". Gated on
+        # being a worker, because anywhere else the variable is a leaked shell export and adopting
+        # it would point every asset URL at an address nothing here controls. Read from the payload
+        # rather than the engine-level worker flag, which LibraryManager sets from a concurrent
+        # listener for this same event.
+        if payload.is_worker and os.getenv(ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV):
+            adopted = os.environ[ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV].rstrip("/")
+            self._static_server_base_url = adopted
+            logger.debug("Adopted the orchestrator's static server at %s", adopted)
+        elif payload.static_server_base_url is not None:
             # The host process serves this workspace and told us where. Pointing at its server
             # keeps asset URLs valid for as long as the host runs, rather than only as long as
             # this engine does.

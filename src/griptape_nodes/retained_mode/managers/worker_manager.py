@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from griptape_nodes.bootstrap.utils.subprocess_websocket_base import WebSocketMessage
+from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events import worker_events
 from griptape_nodes.retained_mode.events.app_events import ConfigChanged, CurrentProjectChanged, SecretChanged
@@ -21,6 +22,7 @@ from griptape_nodes.retained_mode.managers.settings import (
     WORKER_HEARTBEAT_STARTUP_GRACE_KEY,
     WORKER_HEARTBEAT_TIMEOUT_KEY,
 )
+from griptape_nodes.servers.static import ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV
 from griptape_nodes.utils.version_utils import engine_version
 
 if TYPE_CHECKING:
@@ -32,6 +34,12 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
 
 logger = logging.getLogger("griptape_nodes_app")
+
+# How long a spawn waits for initialization to decide the static server URL. Resolution is a socket
+# bind, so seconds -- not the startup grace, whose 10 minutes is sized for dependency installs. On a
+# restart into an existing session it resolves in the same event fan-out that triggers the spawn; on
+# a fresh boot the spawn comes later, off AppSessionStartedEvent, by which point it is long settled.
+_STATIC_URL_SETTLE_TIMEOUT_S = 30.0
 
 
 @dataclass
@@ -340,6 +348,16 @@ class WorkerManager(EngineScoped):
         # desktop app); unbuffered output keeps worker log lines from stalling in Python's
         # block buffer and from being lost on a crash.
         worker_environ["PYTHONUNBUFFERED"] = "1"
+
+        # Hand the worker the URL of the static server the orchestrator is ALREADY serving
+        # this workspace on. Without it the worker starts its own server, wins an arbitrary
+        # OS-assigned port, and hands back asset URLs on that port -- which die when the
+        # worker is evicted and are already dead by the time a saved workflow is reopened.
+        # Both processes share the workspace on disk, so the orchestrator's long-lived
+        # server is the right place to serve anything a worker writes.
+        static_base_url = await self._orchestrator_static_server_base_url()
+        if static_base_url is not None:
+            worker_environ[ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV] = static_base_url
         # Hand the orchestrator's own stdout/stderr to the worker explicitly so worker log
         # lines land in the same stream as orchestrator logs. Implicit inheritance is
         # POSIX-only: on Windows, redirected std handles (e.g. the desktop app's pipes) are
@@ -424,6 +442,55 @@ class WorkerManager(EngineScoped):
         # RequestClient.cancel_requests_by_tag, so a dead worker still surfaces
         # to the caller without a per-request ceiling.
         return await future
+
+    async def _orchestrator_static_server_base_url(self) -> str | None:
+        """The base URL this engine serves the workspace on, awaited until initialization decides it.
+
+        On a restart into an existing session, spawning and URL resolution are both reactions to
+        AppInitializationComplete, whose listeners fan out as unordered concurrent tasks -- so this
+        waits for the decision rather than sampling mid-fan-out. Returns None when this engine serves
+        nothing itself (cloud storage), in which case the worker's URLs come from the same bucket as
+        the orchestrator's and outlive it regardless.
+        """
+        static_files_manager = self.engine.static_files_manager
+        # Normally the decision is already in, so read it without an executor hop. The hop below is
+        # the one with a cost: a blocking wait handed to a thread cannot be cancelled, so if nothing
+        # ever settles it parks a default-executor thread that shutdown_default_executor() joins at
+        # teardown. Unreachable in any ordering found so far -- the resolving listener is synchronous
+        # and finishes at the library listener's first await -- so this path is what runs.
+        if static_files_manager.static_server_base_url_settled:
+            base_url = static_files_manager.wait_for_static_server_base_url(0)
+        else:
+            base_url = await asyncio.to_thread(
+                static_files_manager.wait_for_static_server_base_url, _STATIC_URL_SETTLE_TIMEOUT_S
+            )
+        if base_url is not None:
+            return base_url
+
+        # Only for local storage: there, no URL means the worker serves assets on its own ephemeral
+        # port and every URL it produces dies with it -- the dead-links bug this handover exists to
+        # prevent. Loud, because it is invisible otherwise. On a cloud backend a worker's URLs come
+        # from the same bucket as the orchestrator's and outlive it, so there is nothing to say.
+        if isinstance(static_files_manager.storage_driver, LocalStorageDriver):
+            # Two different failures, and pointing an operator at the wrong one costs real time:
+            # initialization can DECIDE there is no server, which settles in microseconds and has
+            # nothing to do with the timeout. That means a resolution that raised -- binding even the
+            # fallback port 0 failed, or the server thread would not start -- since every branch that
+            # returns normally under local storage sets a URL.
+            if static_files_manager.static_server_base_url_settled:
+                logger.warning(
+                    "Initialization resolved no static server, so a spawned worker will serve assets "
+                    "on its own port. URLs it produces will stop working when it exits. Check for an "
+                    "earlier failure resolving the static server."
+                )
+            else:
+                logger.warning(
+                    "Worker startup waited %.0fs for the static server URL and it was never decided, "
+                    "so the worker is being spawned without one and will serve assets on its own "
+                    "port. URLs it produces will stop working when it exits.",
+                    _STATIC_URL_SETTLE_TIMEOUT_S,
+                )
+        return None
 
     async def evict_worker(self, worker_engine_id: str) -> None:
         """Remove a worker from the registry and unsubscribe from its response topic."""
@@ -621,11 +688,12 @@ class WorkerManager(EngineScoped):
         ]
         await self.spawn_worker(args, library_name)
 
-    @staticmethod
-    def _log_spawn_error(task: asyncio.Task, library_name: str) -> None:
+    def _log_spawn_error(self, task: asyncio.Task, library_name: str) -> None:
+        """Log a spawn that never produced a worker."""
         exc = task.exception()
-        if exc is not None:
-            logger.error("Failed to spawn worker for library '%s': %s", library_name, exc)
+        if exc is None:
+            return
+        logger.error("Failed to spawn worker for library '%s': %s", library_name, exc)
 
     def get_topics_to_subscribe(self, *, is_worker: bool) -> list[str]:
         """Build the list of topics to subscribe to at connection start.

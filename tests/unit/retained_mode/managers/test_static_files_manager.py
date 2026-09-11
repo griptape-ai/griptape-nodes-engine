@@ -1,4 +1,6 @@
 import tempfile
+import threading
+import time
 from collections.abc import Generator
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
@@ -8,6 +10,7 @@ import pytest
 from griptape_nodes.drivers.storage import StorageBackend
 from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
 from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
+from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.os_events import ExistingFilePolicy
 from griptape_nodes.retained_mode.managers.static_files_manager import ResolvedStaticFilePath, StaticFilesManager
 
@@ -1161,8 +1164,9 @@ class TestStaticFilesManagerOnAppInitializationComplete:
     def test_access_before_initialization_raises_even_with_an_override(self, mock_secrets_manager: Mock) -> None:
         """A configured override does not count as resolved: no server is known to exist yet.
 
-        This is also what lets the resolved URL stand in for "already settled" once
-        initialization completes, with no extra state to track.
+        The URL alone cannot answer "has initialization decided", because deciding there is no
+        server at all leaves it None -- which is why settledness is tracked separately. See
+        TestStaticServerUrlSettlement.
         """
         manager = self._build_manager(mock_secrets_manager, "https://my-tunnel.ngrok.io")
 
@@ -1333,3 +1337,69 @@ class TestStaticFilesManagerCloudCredential:
         manager = self._build(gtc_config_manager, {"GT_CLOUD_BUCKET_ID": self._BUCKET_ID})
 
         assert manager._create_cloud_storage_driver(self._BUCKET_ID) is None
+
+
+class TestStaticServerUrlSettlement:
+    """The URL decision is awaited, not sampled.
+
+    Resolution and its consumers (worker spawn) are both listeners on AppInitializationComplete,
+    which fan out as unordered concurrent tasks -- so a consumer sampling the property races the
+    resolver. `wait_for_static_server_base_url` is the ordering guarantee: it returns the decision,
+    including the decision that no server will exist here.
+    """
+
+    @pytest.fixture
+    def manager(self) -> StaticFilesManager:
+        mock_config = Mock()
+        mock_config.get_config_value.return_value = "local"
+        mock_config.workspace_path = Path("/mock/workspace")
+        with patch("griptape_nodes.retained_mode.managers.static_files_manager.LocalStorageDriver"):
+            return StaticFilesManager(config_manager=mock_config, secrets_manager=Mock(), event_manager=None)
+
+    def test_a_waiter_gets_the_url_decided_after_it_started_waiting(self, manager: StaticFilesManager) -> None:
+        """The spawn-side shape: ask first, resolve second, still get the URL."""
+        manager.storage_driver = Mock(spec=LocalStorageDriver)
+
+        def resolve() -> None:
+            # Deliberately not is_worker: that branch adopts GTN_ORCHESTRATOR_STATIC_SERVER_BASE_URL
+            # from the ambient environment, which nothing here scrubs, so anyone with it exported
+            # would fail on their own value. The host-provided branch is what this test wants.
+            manager.on_app_initialization_complete(AppInitializationComplete(static_server_base_url="http://host:4242"))
+
+        timer = threading.Timer(0.05, resolve)
+        timer.start()
+        try:
+            assert manager.wait_for_static_server_base_url(5.0) == "http://host:4242"
+        finally:
+            timer.cancel()
+
+    def test_no_server_is_a_decision_too(self, manager: StaticFilesManager) -> None:
+        """Cloud storage resolves to no URL, and a waiter learns that immediately, not by timeout."""
+        manager.storage_driver = Mock(spec=GriptapeCloudStorageDriver)
+
+        manager.on_app_initialization_complete(AppInitializationComplete())
+
+        started = time.monotonic()
+        assert manager.wait_for_static_server_base_url(5.0) is None
+        assert time.monotonic() - started < 1.0
+
+    def test_a_failed_resolution_settles_as_no_url(self, manager: StaticFilesManager) -> None:
+        """A raising resolution counts as a decision, so waiters do not hold their full timeout.
+
+        It also has to read as "decided: no server" rather than "still deciding" -- the spawn path
+        words its warning off that, and pointing an operator at slow initialization when a socket
+        bind failed costs them the actual lead.
+        """
+        manager.storage_driver = Mock(spec=LocalStorageDriver)
+        assert manager.static_server_base_url_settled is False
+
+        with (
+            patch.object(manager, "_resolve_static_server", side_effect=OSError("bind failed")),
+            pytest.raises(OSError, match="bind failed"),
+        ):
+            manager.on_app_initialization_complete(AppInitializationComplete())
+
+        assert manager.static_server_base_url_settled is True
+        started = time.monotonic()
+        assert manager.wait_for_static_server_base_url(5.0) is None
+        assert time.monotonic() - started < 1.0
