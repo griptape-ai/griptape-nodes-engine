@@ -42,7 +42,17 @@ class _EngineRoleFilter(logging.Filter):
 
 
 class _EngineRoleHandler(RichHandler):
-    """RichHandler that inserts a worker engine designator as its own column between log level and message."""
+    """RichHandler that inserts a worker engine designator as its own column between log level and message.
+
+    Construct this with ``markup=False``. Log messages carry user- and model-authored text
+    (prompts, tool arguments, tool results, exception strings), and Rich reads a bracketed
+    sequence such as ``[/SECTION]`` as a closing style tag. With no matching open tag that
+    raises MarkupError from ``RichHandler.emit``, which guards only the console write and not
+    the markup parse -- so the error escapes the ``logger.info(...)`` call and takes down the
+    caller. Colour, the time column, the designator column and rich tracebacks are all
+    unaffected by ``markup=False``; a line that genuinely wants markup opts in per-record
+    with ``logger.info(..., extra={"markup": True})``.
+    """
 
     _COLUMN_WIDTH = 15  # display width for "Worker-XXXXXXXX"
 
@@ -89,8 +99,3 @@ class _EngineRoleHandler(RichHandler):
 
         output.add_row(formatted_time, level, designator, msg_cell)
         return output
-
-
-_engine_role_filter = _EngineRoleFilter()
-_rich_handler = _EngineRoleHandler(show_time=True, show_path=False, markup=True, rich_tracebacks=True)
-_rich_handler.addFilter(_engine_role_filter)
