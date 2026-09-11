@@ -770,31 +770,40 @@ def _get_image_data(self, image_artifact: ImageArtifact | ImageUrlArtifact) -> s
 Create reusable utility functions for common operations:
 
 ```python
-# Connection checking utilities
-def _outgoing_connection_exists(source_node: str, source_param: str) -> bool:
-    """Check if a source node/parameter has any outgoing connections."""
+# Connection checking utilities.
+#
+# These ask through a request rather than reaching for GriptapeNodes.FlowManager(). The manager
+# accessor is refused while a node executes in a worker, where connections belong to the
+# orchestrator; the request is answered by whichever process owns them.
+def _connections_for(node_name: str) -> ListConnectionsForNodeResultSuccess | None:
+    from griptape_nodes.retained_mode.events.connection_events import (
+        ListConnectionsForNodeRequest,
+        ListConnectionsForNodeResultSuccess,
+    )
     from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
-    connections = GriptapeNodes.FlowManager().get_connections()
-    source_connections = connections.outgoing_index.get(source_node)
-    if source_connections is None:
+    result = GriptapeNodes.handle_request(ListConnectionsForNodeRequest(node_name=node_name))
+    if isinstance(result, ListConnectionsForNodeResultSuccess):
+        return result
+    return None
+
+
+def _outgoing_connection_exists(source_node: str, source_param: str) -> bool:
+    """Check if a source node/parameter has any outgoing connections."""
+    connections = _connections_for(source_node)
+    if connections is None:
         return False
 
-    param_connections = source_connections.get(source_param)
-    return bool(param_connections) if param_connections else False
+    return any(c.source_parameter_name == source_param for c in connections.outgoing_connections)
 
 
 def _incoming_connection_exists(target_node: str, target_param: str) -> bool:
     """Check if a target node/parameter has any incoming connections."""
-    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-    connections = GriptapeNodes.FlowManager().get_connections()
-    target_connections = connections.incoming_index.get(target_node)
-    if target_connections is None:
+    connections = _connections_for(target_node)
+    if connections is None:
         return False
 
-    param_connections = target_connections.get(target_param)
-    return bool(param_connections) if param_connections else False
+    return any(c.target_parameter_name == target_param for c in connections.incoming_connections)
 ```
 
 **Best Practice**: Create utility functions for common operations like connection checking, validation, and data processing.
