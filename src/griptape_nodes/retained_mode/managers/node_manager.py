@@ -56,6 +56,7 @@ from griptape_nodes.exe_types.node_types import (
     aprocess_scope,
     sanctioned_parameter_mutation,
 )
+from griptape_nodes.exe_types.trait_state import TraitStateEntry
 from griptape_nodes.node_library.library_declarations import (
     ArbitraryPythonExecutionNodeProperty,
     LifecycleStageLibraryProperty,
@@ -248,6 +249,18 @@ logger = logging.getLogger("griptape_nodes")
 # Sentinel for "key not present in node.parameter_values". Distinct from None
 # so a legitimately-stored None does not collide with "missing".
 _PARAM_MISSING = object()
+
+
+class RestoredTrait(NamedTuple):
+    """One saved trait entry paired with the trait it landed on, or None when it landed nowhere.
+
+    Restoring runs in two passes, because a saved callback names a method on the owning node
+    and the parameter only reaches that node after it is attached. This is what the first pass
+    hands the second, so nothing has to re-resolve or re-align the entries.
+    """
+
+    entry: TraitStateEntry
+    trait: Trait | None
 
 
 class SerializedParameterValues(NamedTuple):
@@ -1904,9 +1917,9 @@ class NodeManager(EngineScoped):
         )
         # Rebuild traits from saved state so their converters, validators,
         # and ui_options come back with the class.
-        paired_traits: list[Trait | None] = []
+        restored_traits: list[RestoredTrait] = []
         if request.traits:
-            paired_traits = NodeManager._apply_trait_states(new_param, request.traits)
+            restored_traits = NodeManager._apply_trait_states(new_param, request.traits)
         try:
             with sanctioned_parameter_mutation():
                 if request.parent_container_name and request.initial_setup:
@@ -1924,7 +1937,7 @@ class NodeManager(EngineScoped):
         # Re-bind trait callbacks now that the parameter is attached: a saved callback names
         # a method on the owning node, which the parameter can only reach once it has one.
         if request.traits:
-            NodeManager._apply_trait_callbacks(new_param, request.traits, paired_traits)
+            NodeManager._apply_trait_callbacks(new_param, restored_traits)
         if request.value_callbacks:
             new_param.apply_value_callback_names(request.value_callbacks, node)
 
@@ -2284,8 +2297,8 @@ class NodeManager(EngineScoped):
             if request.traits is not None:
                 # An altered parameter is already attached to its node, so state and
                 # callbacks can both be restored here.
-                paired = NodeManager._apply_trait_states(parameter, request.traits)
-                NodeManager._apply_trait_callbacks(parameter, request.traits, paired)
+                restored = NodeManager._apply_trait_states(parameter, request.traits)
+                NodeManager._apply_trait_callbacks(parameter, restored)
             if request.value_callbacks is not None:
                 parameter.apply_value_callback_names(request.value_callbacks, parameter.get_node())
         if request.ui_options is not None and hasattr(parameter, "ui_options"):
@@ -4398,8 +4411,8 @@ class NodeManager(EngineScoped):
         )
 
     @staticmethod
-    def _apply_trait_states(parameter: Parameter, trait_states: list[dict[str, Any]]) -> list[Trait | None]:
-        """Restore saved trait state onto a parameter, and return the trait each entry landed on.
+    def _apply_trait_states(parameter: Parameter, trait_states: list[dict[str, Any]]) -> list[RestoredTrait]:
+        """Restore saved trait state onto a parameter, and report where each entry landed.
 
         A trait the node's ``__init__`` already built is updated in place rather than
         replaced, so whatever the constructor attached to that instance survives. A trait
@@ -4411,39 +4424,60 @@ class NodeManager(EngineScoped):
         after the parameter is attached to its node. The returned pairing is what it consumes,
         so resolving a saved name to a class happens once per load rather than once per pass.
         """
-        paired = NodeManager._pair_saved_traits(parameter, trait_states)
-        for index, (entry, existing) in enumerate(zip(trait_states, paired, strict=True)):
-            trait_name = entry.get("trait_name")
-            if trait_name is None:
-                continue
-            state = entry.get("trait_state", {})
-            if existing is not None:
+        entries = NodeManager._parse_trait_entries(parameter, trait_states)
+        paired = NodeManager._pair_saved_traits(parameter, entries)
+        restored: list[RestoredTrait] = []
+        for entry, existing in zip(entries, paired, strict=True):
+            trait = existing
+            if existing is None:
+                trait = NodeManager._build_saved_trait(parameter, entry)
+            else:
                 try:
-                    existing.apply_state(state)
+                    existing.apply_state(entry.trait_state)
                 except TypeError:
-                    NodeManager._warn_unsatisfiable_trait_state(parameter, trait_name)
-                continue
-            trait_class = NodeManager._resolve_saved_trait(entry)
-            if trait_class is None:
-                logger.warning(
-                    "Parameter '%s' was saved with the '%s' trait from '%s', but that trait could not be loaded. "
-                    "The parameter will load without it. Check that the library providing it is installed.",
-                    parameter.name,
-                    trait_name,
-                    entry.get("trait_module"),
-                )
-                continue
-            try:
-                trait = trait_class.from_state(state)
-            except TypeError:
-                NodeManager._warn_unsatisfiable_trait_state(parameter, trait_name)
-                continue
-            parameter.add_trait(trait)
-            paired[index] = trait
-        return paired
+                    NodeManager._warn_unsatisfiable_trait_state(parameter, entry.trait_name)
+            restored.append(RestoredTrait(entry=entry, trait=trait))
+        return restored
 
     @staticmethod
-    def _pair_saved_traits(parameter: Parameter, trait_states: list[dict[str, Any]]) -> list[Trait | None]:
+    def _parse_trait_entries(parameter: Parameter, trait_states: list[dict[str, Any]]) -> list[TraitStateEntry]:
+        """Read the saved entries, dropping any that names no trait."""
+        entries: list[TraitStateEntry] = []
+        for state in trait_states:
+            entry = TraitStateEntry.from_dict(state)
+            if entry is None:
+                logger.warning(
+                    "Parameter '%s' was saved with a trait entry that names no trait, so it is skipped. "
+                    "The parameter will load without whatever control that entry described.",
+                    parameter.name,
+                )
+                continue
+            entries.append(entry)
+        return entries
+
+    @staticmethod
+    def _build_saved_trait(parameter: Parameter, entry: TraitStateEntry) -> Trait | None:
+        """Build and attach the trait an entry describes, or None when it cannot be built."""
+        trait_class = NodeManager._resolve_saved_trait(entry)
+        if trait_class is None:
+            logger.warning(
+                "Parameter '%s' was saved with the '%s' trait from '%s', but that trait could not be loaded. "
+                "The parameter will load without it. Check that the library providing it is installed.",
+                parameter.name,
+                entry.trait_name,
+                entry.trait_module,
+            )
+            return None
+        try:
+            trait = trait_class.from_state(entry.trait_state)
+        except TypeError:
+            NodeManager._warn_unsatisfiable_trait_state(parameter, entry.trait_name)
+            return None
+        parameter.add_trait(trait)
+        return trait
+
+    @staticmethod
+    def _pair_saved_traits(parameter: Parameter, entries: list[TraitStateEntry]) -> list[Trait | None]:
         """Match each saved entry to the attached trait it describes, in entry order.
 
         Matches on the resolved class rather than the saved name, so two traits sharing a
@@ -4454,7 +4488,7 @@ class NodeManager(EngineScoped):
         """
         unmatched = parameter.find_elements_by_type(Trait)
         paired: list[Trait | None] = []
-        for entry in trait_states:
+        for entry in entries:
             trait_class = NodeManager._resolve_saved_trait(entry)
             match = None
             for candidate in unmatched:
@@ -4467,17 +4501,11 @@ class NodeManager(EngineScoped):
         return paired
 
     @staticmethod
-    def _resolve_saved_trait(entry: dict[str, Any]) -> type[Trait] | None:
-        """Resolve one saved entry to its trait class, or None when it names nothing loadable.
-
-        Both the name and the module are required. The module is what tells two libraries'
-        same-named traits apart, so an entry without one names no particular class.
-        """
-        trait_name = entry.get("trait_name")
-        trait_module = entry.get("trait_module")
-        if trait_name is None or trait_module is None:
+    def _resolve_saved_trait(entry: TraitStateEntry) -> type[Trait] | None:
+        """Resolve one saved entry to its trait class, or None when it names nothing loadable."""
+        if entry.trait_module is None:
             return None
-        return TraitRegistry.resolve(trait_name, trait_module)
+        return TraitRegistry.resolve(entry.trait_name, entry.trait_module)
 
     @staticmethod
     def _warn_unsatisfiable_trait_state(parameter: Parameter, trait_name: str) -> None:
@@ -4491,25 +4519,22 @@ class NodeManager(EngineScoped):
         )
 
     @staticmethod
-    def _apply_trait_callbacks(
-        parameter: Parameter, trait_states: list[dict[str, Any]], paired: list[Trait | None]
-    ) -> None:
+    def _apply_trait_callbacks(parameter: Parameter, restored: list[RestoredTrait]) -> None:
         """Re-bind saved trait callbacks to methods on the parameter's node.
 
         Separate from ``_apply_trait_states`` because a saved callback is the name of a
         method on the owning node, so the parameter has to be attached before the name can
-        be resolved. ``paired`` is that call's return value, matching ``trait_states`` entry
-        for entry.
+        be resolved. ``restored`` is that call's return value, which pairs each saved entry
+        with the trait it landed on.
 
         A callback the node's ``__init__`` already supplied is left alone by
         ``apply_callback_names``: live code beats a saved name.
         """
         owner = parameter.get_node()
-        for entry, trait in zip(trait_states, paired, strict=True):
-            callback_names = entry.get("trait_callbacks")
-            if not callback_names or trait is None:
+        for entry, trait in restored:
+            if not entry.trait_callbacks or trait is None:
                 continue
-            trait.apply_callback_names(callback_names, owner)
+            trait.apply_callback_names(entry.trait_callbacks, owner)
 
     @staticmethod
     def _manage_alter_details(parameter: Parameter, base_node_obj: BaseNode) -> dict:
