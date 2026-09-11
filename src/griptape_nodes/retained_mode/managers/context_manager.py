@@ -482,6 +482,39 @@ class ContextManager(EngineScoped):
                 raise ValueError(msg) from e
         return self.ElementContext(self, element)
 
+    def mirror_workflow_context(self, name: str | None, file_path: str | None, working_directory: str | None) -> None:
+        """Adopt another engine's workflow context as this engine's own.
+
+        A real stack entry rather than an override of the getters, because `has_current_workflow()`
+        answers two questions at once -- "is identity resolvable" and "is there an entry to index"
+        -- and satisfying only the first raises IndexError in `has_current_flow`, `push_flow`,
+        `pop_flow`, and the context setters.
+
+        Idempotent and never popped: this MIRRORS a peer's context rather than nesting under it, so
+        one entry is replaced in place. There is no push/pop pair whose ordering could interleave
+        while a worker runs nodes concurrently.
+        """
+        if name is None:
+            # The peer has no workflow, so this engine must have none either. A mirror left from an
+            # earlier execution would resolve paths against that workflow's folder while the peer
+            # resolves them workspace-relative -- the divergence this mirror exists to prevent,
+            # reached from the other direction. Only a mirror is ever on a worker's stack.
+            self._workflow_stack.clear()
+            return
+
+        state = self.WorkflowContextState(name=name, file_path=file_path, working_directory=working_directory)
+        if not self._workflow_stack:
+            self._workflow_stack.append(state)
+            return
+
+        current = self._workflow_stack[-1]
+        if current._name == name and current._file_path == file_path:
+            return
+
+        # Replace rather than append: a mirror tracks one peer context, and stacking would leave
+        # the previous workflow's entry to be read by whatever runs next.
+        self._workflow_stack[-1] = state
+
     def has_current_workflow(self) -> bool:
         """Check if there is an active Workflow context."""
         return len(self._workflow_stack) > 0

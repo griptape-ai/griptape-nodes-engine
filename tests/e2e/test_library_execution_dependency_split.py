@@ -124,12 +124,11 @@ def _import_fresh(module_name: str) -> object:
 
 class TestOrchestratorHoldsEditTimeDepsOnly:
     def test_the_orchestrator_does_not_install_execution_dependencies_at_all(self, tmp_path: Path) -> None:
-        """The orchestrator builds the edit-time environment and stops there.
+        """The orchestrator installs the edit-time environment and never imports the execution set.
 
-        It never imports the execution set -- only a worker splices .venv-exec onto sys.path --
-        so installing it here bought nothing and cost everything the split exists to save: the
-        whole weight of every heavy library, downloaded and stored by the process that merely
-        draws the nodes. Half a gigabyte for a single torch pin, measured.
+        It owns both directories -- the worker receives .venv-exec as PYTHONPATH and so cannot be
+        the process that creates it -- but nothing on the orchestrator's sys.path comes from there,
+        so a heavy pin cannot shadow anything it has loaded.
 
         The library still loads, with real node classes and GOOD fitness, because defining and
         editing a node needs the edit-time set alone. That is the same reason a broken
@@ -151,7 +150,9 @@ class TestOrchestratorHoldsEditTimeDepsOnly:
         edit_venv = library_dir / ".venv"
         exec_venv = library_dir / ".venv-exec"
         assert edit_venv.exists()
-        # The worker that runs the nodes builds this one, in its own process.
+        # Absent because the exec build is scheduled rather than awaited, and a synchronous caller
+        # runs the handler under asyncio.run -- the loop closes before the task can finish. This
+        # pins the edit-time install being the only thing registration blocks on, not ownership.
         assert not exec_venv.exists()
 
         # And the heavy dependency is unreachable from here either way.
@@ -160,34 +161,6 @@ class TestOrchestratorHoldsEditTimeDepsOnly:
         assert _import_fresh(EDIT_DEP).__version__ == EDIT_DEP_VERSION  # type: ignore[attr-defined]
         with pytest.raises(ImportError):
             _import_fresh(EXEC_DEP)
-
-    def test_the_execution_environment_also_holds_the_edit_time_set(self, tmp_path: Path) -> None:
-        """One resolution over both sets, so a shared package cannot end up at two versions.
-
-        The two venvs are isolated, and .venv-exec is spliced AHEAD of .venv in a worker. Resolved
-        separately, anything present in both (numpy as an edit dep, numpy pulled in by torch) could
-        differ, and the execution copy would win -- so a node module would bind one version when
-        the orchestrator built the node and another when the worker ran it.
-
-        Asserted on disk rather than by import: .venv is on sys.path too, so an import proves
-        nothing about which environment satisfied it.
-        """
-        wheel_dir = tmp_path / "wheels"
-        _build_both_wheels(wheel_dir)
-        library_dir = tmp_path / "library"
-        library_json = _materialize_library(
-            library_dir, wheel_dir=wheel_dir, name="Exec Dep Union", exec_dependencies=[EXEC_DEP]
-        )
-        current_engine().library_manager._is_worker = True
-
-        _register(library_json)
-
-        exec_site_packages = Path(_site_packages(library_dir / ".venv-exec"))
-        assert (exec_site_packages / EXEC_DEP).exists(), "execution dependency missing from .venv-exec"
-        assert (exec_site_packages / EDIT_DEP).exists(), (
-            "edit-time dependency missing from .venv-exec: the two environments were resolved "
-            "separately, so a shared package can differ between them"
-        )
 
     def test_an_unresolvable_execution_dependency_still_leaves_the_library_editable(self, tmp_path: Path) -> None:
         """A broken execution dependency must cost execution and nothing else.
@@ -240,113 +213,32 @@ class TestOrchestratorHoldsEditTimeDepsOnly:
             _import_fresh(EXEC_DEP)
 
 
-class TestWorkerHoldsBothEnvironments:
-    def test_a_worker_can_import_both_dependency_sets(self, tmp_path: Path) -> None:
-        """What a worker needs is both sets importable -- not two directories on sys.path.
+class TestWorkerBuildsNeitherEnvironment:
+    def test_a_worker_builds_neither_venv(self, tmp_path: Path) -> None:
+        """One writer per directory, and it is never the worker.
 
-        Asserted as a capability because the ownership changed: `<library>/.venv` belongs to the
-        ORCHESTRATOR, which loads exec-dependency libraries itself and keeps that venv on its own
-        sys.path for the session. A worker building it too gave one directory two writers, and the
-        corrupt-install recovery path rmtrees it -- so an execution-side retry could delete the
-        environment the orchestrator was importing from.
+        A worker used to build `.venv-exec` and splice it onto its own sys.path. That cannot give a
+        library its own versions -- sys.modules never reconsiders an imported module -- so the
+        orchestrator builds both and the spawn hands `.venv-exec` over as PYTHONPATH.
 
-        The worker instead gets everything from `.venv-exec`, which is resolved over both sets.
+        Registration fails here, because the node module needs the edit-time dependency and this
+        process has no inherited PYTHONPATH to satisfy it from. That is the point: a worker cannot
+        produce either environment for itself. The handover is covered in
+        tests/unit/app/test_app_worker.py::TestWorkerExecutionPath, which is the only level that
+        can observe a spawn's environment.
         """
         wheel_dir = tmp_path / "wheels"
         _build_both_wheels(wheel_dir)
         library_dir = tmp_path / "library"
         library_json = _materialize_library(
-            library_dir, wheel_dir=wheel_dir, name="Exec Dep Worker", exec_dependencies=[EXEC_DEP]
+            library_dir, wheel_dir=wheel_dir, name="Exec Dep Worker Builds Nothing", exec_dependencies=[EXEC_DEP]
         )
         current_engine().library_manager._is_worker = True
 
-        _register(library_json)
-
-        assert _site_packages(library_dir / ".venv-exec") in sys.path
-        assert _import_fresh(EDIT_DEP).__version__ == EDIT_DEP_VERSION  # type: ignore[attr-defined]
-        assert _import_fresh(EXEC_DEP).__version__ == EXEC_DEP_VERSION  # type: ignore[attr-defined]
-
-    def test_a_worker_does_not_build_the_orchestrators_edit_venv(self, tmp_path: Path) -> None:
-        """One writer per directory. With two, an execution-side retry deletes an edit-time env."""
-        wheel_dir = tmp_path / "wheels"
-        _build_both_wheels(wheel_dir)
-        library_dir = tmp_path / "library"
-        library_json = _materialize_library(
-            library_dir, wheel_dir=wheel_dir, name="Exec Dep Single Writer", exec_dependencies=[EXEC_DEP]
-        )
-        current_engine().library_manager._is_worker = True
-
-        _register(library_json)
+        current_engine().handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
 
         assert not (library_dir / ".venv").exists()
-
-    def test_a_worker_serves_its_own_library_when_scoped_to_it(self, tmp_path: Path) -> None:
-        """The gate on target libraries must not lock a worker out of the library it exists for.
-
-        The other tests here leave `_target_library_names` unset, which short-circuits that gate
-        to True -- so they traverse it without exercising it, and a regression that skipped the
-        worker's OWN execution environment would pass them all and surface as an ImportError at
-        node execution. This one sets the scope a real spawn sets.
-        """
-        wheel_dir = tmp_path / "wheels"
-        _build_both_wheels(wheel_dir)
-        library_dir = tmp_path / "library"
-        library_json = _materialize_library(
-            library_dir, wheel_dir=wheel_dir, name="Exec Dep Scoped", exec_dependencies=[EXEC_DEP]
-        )
-        library_manager = current_engine().library_manager
-        library_manager._is_worker = True
-        library_manager._target_library_names = ["Exec Dep Scoped"]
-
-        _register(library_json)
-
-        assert (library_dir / ".venv-exec").exists()
-        assert _site_packages(library_dir / ".venv-exec") in sys.path
-        assert _import_fresh(EXEC_DEP).__version__ == EXEC_DEP_VERSION  # type: ignore[attr-defined]
-
-    def test_a_worker_builds_no_execution_environment_for_a_library_it_does_not_serve(self, tmp_path: Path) -> None:
-        """A nested registration must not put another library's heavy pins on this sys.path.
-
-        One library declaring another as a dependency registers it inside whichever process is
-        loading -- so without this gate a worker built and spliced a second library's `.venv-exec`
-        at position 0 of its own sys.path, which is the shadowing the edit/execution split exists
-        to end. The edit-time venv IS still built here, because nobody else will: the orchestrator
-        never loaded this library.
-        """
-        wheel_dir = tmp_path / "wheels"
-        _build_both_wheels(wheel_dir)
-        library_dir = tmp_path / "library"
-        library_json = _materialize_library(
-            library_dir, wheel_dir=wheel_dir, name="Exec Dep Foreign", exec_dependencies=[EXEC_DEP]
-        )
-        library_manager = current_engine().library_manager
-        library_manager._is_worker = True
-        library_manager._target_library_names = ["Some Other Library"]
-
-        _register(library_json)
-
         assert not (library_dir / ".venv-exec").exists()
-        assert _site_packages(library_dir / ".venv-exec") not in sys.path
-        assert (library_dir / ".venv").exists(), "the edit-time venv has no other owner here"
-
-    def test_process_runs_in_a_worker(self, tmp_path: Path) -> None:
-        """The payoff: the same node whose process is unrunnable on the orchestrator runs here."""
-        wheel_dir = tmp_path / "wheels"
-        _build_both_wheels(wheel_dir)
-        library_dir = tmp_path / "library"
-        library_json = _materialize_library(
-            library_dir, wheel_dir=wheel_dir, name="Exec Dep Worker Process", exec_dependencies=[EXEC_DEP]
-        )
-        current_engine().library_manager._is_worker = True
-        _register(library_json)
-        node = LibraryRegistry.create_node(
-            node_type="ExecDepNode", name="exec_dep_node", specific_library_name="Exec Dep Worker Process"
-        )
-
-        node.process()
-
-        assert node.parameter_output_values["edit_dep_version"] == EDIT_DEP_VERSION
-        assert node.parameter_output_values["exec_dep_version"] == EXEC_DEP_VERSION
 
 
 class TestLibrariesWithoutExecutionDependencies:

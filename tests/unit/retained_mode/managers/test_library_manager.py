@@ -858,6 +858,49 @@ class TestLibraryManagerInstallLibraryDependencies:
         assert result.dependencies_installed == 0
 
     @pytest.mark.asyncio
+    async def test_an_unremovable_execution_environment_still_loads_the_library(self, engine: Engine) -> None:
+        """A directory that will not delete costs execution, never editing.
+
+        This runs on the registration path, so raising here takes the library's node types with
+        it -- every workflow using it opens with "Library not found" over a leftover directory.
+        """
+        mgr = engine.library_manager
+        schema = MagicMock()
+        schema.name = "test_lib"
+        schema.metadata.library_version = "1.0.0"
+        schema.metadata.dependencies.pip_dependencies = []
+        schema.metadata.dependencies.pip_install_flags = []
+        schema.metadata.dependencies.pip_dependencies_exec = None
+
+        with (
+            patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
+            # Reports as present so the removal is attempted, unlike _ABSENT_VENV_PATH.
+            patch.object(mgr, "_get_library_venv_path", return_value=MagicMock(exists=MagicMock(return_value=True))),
+            patch.object(
+                mgr,
+                "_init_library_venv",
+                new_callable=AsyncMock,
+                return_value=LibraryVenvInitResult(python_path=MagicMock(), reused=False),
+            ),
+            patch.object(mgr, "_can_write_to_venv_location", return_value=True),
+            patch(
+                "griptape_nodes.retained_mode.managers.library_manager.OSManager.check_available_disk_space",
+                return_value=True,
+            ),
+            patch.object(engine.config_manager, "get_config_value", return_value=5.0),
+            patch(
+                "griptape_nodes.retained_mode.managers.library_manager.shutil.rmtree",
+                side_effect=OSError("in use by another process"),
+            ) as mock_rmtree,
+        ):
+            result = await mgr.install_library_dependencies_request(
+                InstallLibraryDependenciesRequest(library_file_path="/mock.json")
+            )
+
+        mock_rmtree.assert_called_once()
+        assert isinstance(result, InstallLibraryDependenciesResultSuccess)
+
+    @pytest.mark.asyncio
     async def test_returns_failure_when_venv_creation_fails_with_no_deps(self, engine: Engine) -> None:
         """Test that venv creation failure returns failure even when pip_dependencies is empty."""
         mgr = engine.library_manager

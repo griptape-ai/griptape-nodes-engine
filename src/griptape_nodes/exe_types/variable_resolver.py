@@ -128,9 +128,10 @@ class VariableResolver:
     def is_substitution_enabled(engine: Engine) -> bool:
         """Return True if variable substitution is enabled for the active workflow.
 
-        KNOWN LIMITATION in a worker: this reads a local manager, and
-        `is_variable_substitution_enabled` answers True whenever there is no current workflow,
-        which is always the case in a worker process.
+        KNOWN LIMITATION in a worker: this reads a local manager whose map is never populated.
+        SetVariableSubstitutionEnabledRequest writes it, and a generated workflow file emits that as
+        it loads -- on the orchestrator. Adopting the orchestrator's workflow context makes the
+        lookup index by name rather than short-circuit, but the answer is still the default True.
 
         The orchestrator encodes "disabled" as an EMPTY variable dict when it pre-seeds one for a
         dispatch, and substituting with an empty dict is not the same as not substituting:
