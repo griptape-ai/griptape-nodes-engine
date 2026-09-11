@@ -1,20 +1,10 @@
 from collections.abc import Callable
-from dataclasses import dataclass, field
 from typing import Any
 
-from griptape_nodes.exe_types.core_types import Parameter, ParameterMode, Trait
+from griptape_nodes.exe_types.core_types import Parameter, Trait
 
 
-@dataclass(eq=False)
 class NumbersSelector(Trait):
-    defaults: dict[str, float] = field(kw_only=True)
-    step: float = 1.0
-    overall_min: float | None = None
-    overall_max: float | None = None
-    element_id: str = field(default_factory=lambda: "NumbersSelector")
-
-    _allowed_modes: set = field(default_factory=lambda: {ParameterMode.PROPERTY})
-
     def __init__(
         self,
         defaults: dict[str, float],

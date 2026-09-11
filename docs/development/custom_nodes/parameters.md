@@ -40,6 +40,12 @@ Add functionality via `add_trait()`:
 
 For the full list of traits, the widgets they render, and the `ui_options` keys they manage, see the [Parameter UI Reference](parameter_ui_reference.md).
 
+**Saving callbacks**: a `Button`'s `on_click`/`get_button_state`, and a parameter's `converters`/`validators`, must be bound methods of the node (`self.my_handler`) to survive a save. Saving records the method's name and resolves it back against the node on load; a lambda or a local function has no name to resolve, so it loads without that behavior and a warning is logged.
+
+**Saving trait state**: a trait's saved state is its `__init__` arguments, so those can hold text, numbers, true/false, and lists or dictionaries of those. A set or tuple is saved as a list and handed back to the constructor as one. Anything else is dropped with a warning.
+
+**Accepting a UI option write**: the editor and any workflow saved before trait state was carried separately write a trait's keys straight into the parameter's `ui_options`. Implement `state_from_ui_options`, the inverse of `ui_options_for_trait`, to have those routed to the trait instead of stored where they would be shadowed. A trait that does not implement it ignores such a write, which is right for a key with no state behind it.
+
 ## Parameter helper constructs (`ParameterString`, `ParameterInt`, ...)
 
 Griptape Nodes includes a set of convenience Parameter subclasses under `griptape_nodes.exe_types.param_types.*`.
@@ -591,7 +597,7 @@ def after_value_set(self, parameter: Parameter, value: Any) -> None:
 
 ### Dynamic Options Updates
 
-Update parameter choices at runtime:
+Update parameter choices at runtime. The new choices are saved as trait state, so they survive a reload:
 
 ```python
 from griptape_nodes.traits.options import Options

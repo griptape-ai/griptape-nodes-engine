@@ -141,8 +141,6 @@ class ParameterPython(Parameter):
     @placeholder_text.setter
     def placeholder_text(self, value: str | None) -> None:
         if value is None:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("placeholder_text", None)
-            self.ui_options = ui_options
+            self.remove_ui_options_key("placeholder_text")
         else:
             self.update_ui_options_key("placeholder_text", value)

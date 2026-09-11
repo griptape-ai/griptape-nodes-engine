@@ -1,5 +1,98 @@
 # Unreleased
 
+## A `Trait` subclass writes its own `__init__`
+
+`Trait` and `BaseNodeElement` are no longer dataclasses, so a trait that relied on a generated
+constructor never reaches `BaseNodeElement.__init__` and loads without an `element_id`:
+
+```python
+@dataclass(eq=False)  # generated __init__ sets threshold and stops there
+class Threshold(Trait):
+    threshold: int = field(default=5)
+
+
+Threshold().element_id  # AttributeError
+```
+
+Drop the decorator and write the constructor:
+
+```python
+class Threshold(Trait):
+    def __init__(self, threshold: int = 5) -> None:
+        super().__init__()
+        self.threshold = threshold
+```
+
+The constructor is now also what saving reads: a trait's state is its `__init__` parameters,
+read off the attributes of the same name. Two things to declare when they do not line up:
+
+- `STATE_ALIASES` when an argument is stored under another name, as `Slider(min_val=...)`
+    stores `self.min`.
+- `STATE_EXCLUDE` for an argument that is behavior rather than state, as `Button(on_click=...)`.
+    Those are saved by method name instead, so pass a method of the node (`self.my_handler`);
+    a lambda has no name to resolve on load.
+
+State is written into a saved workflow as data, so it can hold text, numbers, true/false, and
+lists or dictionaries of those. A set or a tuple is saved as a list, which is what the
+constructor is handed on load, so coerce there if the trait wants a set:
+
+```python
+class Extensions(Trait):
+    def __init__(self, extensions: set[str] | list[str]) -> None:
+        super().__init__()
+        self.extensions = set(extensions)
+```
+
+Anything else, a `Path` or any other object, is dropped from the state with a warning, and the
+parameter loads without that one value.
+
+A leftover `field(...)` on a class that is no longer a dataclass is a `Field` object, not the
+default it looks like, and gets saved as the trait's state. Delete those along with the decorator.
+
+## A trait owns the `ui_options` keys it renders
+
+A trait's options used to be merged into `Parameter.ui_options` and saved as part of it, where
+any stored copy won. The copy could predate the trait's current state, so narrowing a `Slider`
+moved its validator but not the slider an artist sees. Trait state is now saved in its own right,
+and the trait wins:
+
+|                                | before                | after                  |
+| ------------------------------ | --------------------- | ---------------------- |
+| reported to the editor         | stored copy           | what the trait renders |
+| saved                          | merged, copy included | authored options only  |
+| runtime `trait.choices` update | lost unless mirrored  | saved as trait state   |
+
+Setting a trait-rendered key on the parameter in node code no longer has any effect: set it on
+the trait.
+
+```python
+parameter.ui_options = {"simple_dropdown": choices}  # dropped at save, shadowed at read
+trait.choices = choices  # saved, and reported to the editor
+```
+
+**A write arriving from the editor or a saved file is routed to the trait**, so the flat shape
+keeps working for the writers that do not know about traits. A trait declares what it will adopt
+by implementing `state_from_ui_options`, the inverse of `ui_options_for_trait`:
+
+```python
+class Threshold(Trait):
+    def ui_options_for_trait(self) -> dict:
+        return {"threshold": self.threshold}
+
+    def state_from_ui_options(self, ui_options: dict) -> dict:
+        if "threshold" not in ui_options:
+            return {}
+        return {"threshold": ui_options["threshold"]}
+```
+
+Without it a trait ignores such a write, which is the right answer for a key with no state behind
+it, such as a widget-type marker. `Options`, `MultiOptions`, and `Slider` adopt theirs.
+
+**Workflows already on disk.** A file that predates trait state carries a dropdown's choices in
+`ui_options`, since that was the only field a save wrote. The load adopts them onto the trait, so a
+dropdown its node filled in at run time keeps its choices and its saved selection, and the next
+save records them as trait state. A parameter with no trait keeps rendering them as before.
+
 ## Branched workflows show a title instead of a file path
 
 Branching a workflow used to set the new workflow's `metadata.name` — the human-readable display

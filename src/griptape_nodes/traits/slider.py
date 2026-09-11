@@ -1,17 +1,11 @@
 from collections.abc import Callable
-from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 
-from griptape_nodes.exe_types.core_types import Parameter, ParameterMode, Trait
+from griptape_nodes.exe_types.core_types import Parameter, Trait
 
 
-@dataclass(eq=False)
 class Slider(Trait):
-    min: Any = 0
-    max: Any = 100
-    element_id: str = field(default_factory=lambda: "Slider")
-
-    _allowed_modes: set = field(default_factory=lambda: {ParameterMode.PROPERTY})
+    STATE_ALIASES: ClassVar[dict[str, str]] = {"min_val": "min", "max_val": "max"}
 
     def __init__(self, min_val: float, max_val: float) -> None:
         super().__init__()
@@ -24,6 +18,17 @@ class Slider(Trait):
 
     def ui_options_for_trait(self) -> dict:
         return {"slider": {"min_val": self.min, "max_val": self.max}}
+
+    def state_from_ui_options(self, ui_options: dict) -> dict[str, Any]:
+        """Adopt slider bounds written straight into the parameter's ``ui_options``.
+
+        The editor's parameter properties panel writes ``slider`` as the same pair
+        ``ui_options_for_trait`` renders, so moving a bound there moves the validator with it.
+        """
+        written = ui_options.get("slider")
+        if not isinstance(written, dict):
+            return {}
+        return {key: written[key] for key in ("min_val", "max_val") if key in written}
 
     def validators_for_trait(self) -> list[Callable[..., Any]]:
         def validate(param: Parameter, value: Any) -> None:  # noqa: ARG001

@@ -94,3 +94,19 @@ class TestPublishedUiOptions:
         param = _parameter_with(Options(choices=CHOICES, allow_custom=True))
 
         assert param.ui_options["simple_dropdown"] == CHOICES
+
+
+class TestChoicesDefault:
+    def test_choices_default_applies(self) -> None:
+        # Options declares its own __init__, so the dataclass field default never runs.
+        assert Options().choices == Options.DEFAULT_CHOICES
+
+    def test_choices_are_held_by_the_trait(self) -> None:
+        """Choices live on the trait, not smuggled through the parameter's stored ui_options."""
+        options = Options(choices=CHOICES)
+        param = _parameter_with(options)
+
+        options.choices = ["new"]
+
+        assert param.ui_options["simple_dropdown"] == ["new"]
+        assert "simple_dropdown" not in param.authored_ui_options()

@@ -1,28 +1,10 @@
 from collections.abc import Callable
-from dataclasses import dataclass, field
 from typing import Any
 
 from griptape_nodes.exe_types.core_types import Parameter, Trait
 
 
-@dataclass(eq=False)
 class FileSystemPicker(Trait):
-    allow_files: bool = False
-    allow_directories: bool = True
-    allow_sequences: bool = False
-    multiple: bool = False
-    file_types: list[str] = field(default_factory=list)
-    file_extensions: list[str] = field(default_factory=list)
-    exclude_patterns: list[str] = field(default_factory=list)
-    include_patterns: list[str] = field(default_factory=list)
-    max_file_size: int | None = None
-    min_file_size: int | None = None
-    workspace_only: bool = False
-    initial_path: str | None = None
-    allow_create: bool = False
-    allow_rename: bool = False
-    element_id: str = field(default_factory=lambda: "FileSystemPicker")
-
     def __init__(  # noqa: PLR0913
         self,
         *,

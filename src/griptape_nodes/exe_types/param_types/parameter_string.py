@@ -220,9 +220,7 @@ class ParameterString(Parameter):
         if value:
             self.update_ui_options_key("markdown", value)
         else:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("markdown", None)
-            self.ui_options = ui_options
+            self.remove_ui_options_key("markdown")
 
     @property
     def multiline(self) -> bool:
@@ -243,9 +241,7 @@ class ParameterString(Parameter):
         if value:
             self.update_ui_options_key("multiline", value)
         else:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("multiline", None)
-            self.ui_options = ui_options
+            self.remove_ui_options_key("multiline")
 
     @property
     def placeholder_text(self) -> str | None:
@@ -264,9 +260,7 @@ class ParameterString(Parameter):
             value: The placeholder text to use, or None to remove it
         """
         if value is None:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("placeholder_text", None)
-            self.ui_options = ui_options
+            self.remove_ui_options_key("placeholder_text")
         else:
             self.update_ui_options_key("placeholder_text", value)
 
@@ -289,6 +283,4 @@ class ParameterString(Parameter):
         if value:
             self.update_ui_options_key("is_full_width", value)
         else:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("is_full_width", None)
-            self.ui_options = ui_options
+            self.remove_ui_options_key("is_full_width")

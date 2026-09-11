@@ -196,9 +196,7 @@ class ParameterAudio(Parameter):
         if value:
             self.update_ui_options_key("pulse_on_run", value)
         else:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("pulse_on_run", None)
-            self.ui_options = ui_options
+            self.remove_ui_options_key("pulse_on_run")
 
     @property
     def clickable_file_browser(self) -> bool:
@@ -219,9 +217,7 @@ class ParameterAudio(Parameter):
         if value:
             self.update_ui_options_key("clickable_file_browser", value)
         else:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("clickable_file_browser", None)
-            self.ui_options = ui_options
+            self.remove_ui_options_key("clickable_file_browser")
 
     @property
     def microphone_capture_audio(self) -> bool:
@@ -242,9 +238,7 @@ class ParameterAudio(Parameter):
         if value:
             self.update_ui_options_key("microphone_capture_audio", value)
         else:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("microphone_capture_audio", None)
-            self.ui_options = ui_options
+            self.remove_ui_options_key("microphone_capture_audio")
 
     @property
     def edit_audio(self) -> bool:
@@ -265,6 +259,4 @@ class ParameterAudio(Parameter):
         if value:
             self.update_ui_options_key("edit_audio", value)
         else:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("edit_audio", None)
-            self.ui_options = ui_options
+            self.remove_ui_options_key("edit_audio")

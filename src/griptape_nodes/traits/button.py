@@ -1,7 +1,7 @@
 import logging
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal, get_args
+from typing import TYPE_CHECKING, ClassVar, Literal, get_args
 
+from griptape_nodes.exe_types.callback_binding import is_derived_from_state, mark_derived_from_state
 from griptape_nodes.exe_types.core_types import NodeMessagePayload, NodeMessageResult, Trait
 
 if TYPE_CHECKING:
@@ -80,8 +80,15 @@ class SetButtonStatusMessagePayload(NodeMessagePayload):
     updates: dict[str, str | bool | None]
 
 
-@dataclass(eq=False)
 class Button(Trait):
+    # The two callbacks are behavior, not state, so they are never saved as state. They are
+    # carried by method name instead, which is why they still need an attribute mapping.
+    STATE_EXCLUDE: ClassVar[frozenset[str]] = frozenset({"on_click", "get_button_state"})
+    STATE_ALIASES: ClassVar[dict[str, str]] = {
+        "on_click": "on_click_callback",
+        "get_button_state": "get_button_state_callback",
+    }
+
     # Specific callback types for better type safety and clarity
     type OnClickCallback = Callable[[Button, ButtonDetailsMessagePayload], NodeMessageResult | None]
     type GetButtonStateCallback = Callable[[Button, ButtonDetailsMessagePayload], NodeMessageResult | None]
@@ -90,25 +97,6 @@ class Button(Trait):
     ON_CLICK_MESSAGE_TYPE = "on_click"
     GET_BUTTON_STATUS_MESSAGE_TYPE = "get_button_status"
     SET_BUTTON_STATUS_MESSAGE_TYPE = "set_button_status"
-
-    # Button styling and behavior properties
-    label: str = "Button"
-    variant: ButtonVariant = "default"
-    size: ButtonSize = "default"
-    state: ButtonState = "normal"
-    icon: str | None = None
-    icon_class: str | None = None
-    icon_position: IconPosition | None = None
-    full_width: bool = False
-    loading_label: str | None = None
-    loading_icon: str | None = None
-    loading_icon_class: str | None = None
-    tooltip: str | None = None
-    button_link: str | None = None
-
-    element_id: str = field(default_factory=lambda: "Button")
-    on_click_callback: OnClickCallback | None = field(default=None, init=False)
-    get_button_state_callback: GetButtonStateCallback | None = field(default=None, init=False)
 
     def __init__(  # noqa: PLR0913
         self,
@@ -130,19 +118,21 @@ class Button(Trait):
         get_button_state: GetButtonStateCallback | None = None,
     ) -> None:
         super().__init__(element_id="Button")
-        self.label = label
-        self.variant = variant
-        self.size = size
-        self.state = state
-        self.icon = icon
-        self.icon_class = icon_class
-        self.icon_position = icon_position
-        self.full_width = full_width
-        self.loading_label = loading_label
-        self.loading_icon = loading_icon
-        self.loading_icon_class = loading_icon_class
-        self.tooltip = tooltip
-        self.button_link = button_link
+        # Annotated here because setattr in on_message_received tells the type checker
+        # nothing about what these hold.
+        self.label: str = label
+        self.variant: ButtonVariant = variant
+        self.size: ButtonSize = size
+        self.state: ButtonState = state
+        self.icon: str | None = icon
+        self.icon_class: str | None = icon_class
+        self.icon_position: IconPosition | None = icon_position
+        self.full_width: bool = full_width
+        self.loading_label: str | None = loading_label
+        self.loading_icon: str | None = loading_icon
+        self.loading_icon_class: str | None = loading_icon_class
+        self.tooltip: str | None = tooltip
+        self.button_link: str | None = button_link
 
         # Validate that both button_link and on_click are not provided simultaneously
         if button_link is not None and on_click is not None:
@@ -176,7 +166,29 @@ class Button(Trait):
                 altered_workflow_state=False,
             )
 
-        return handler
+        # Rebuilt from button_link, which is saved as state, so this handler needs no name.
+        return mark_derived_from_state(handler)
+
+    def _recompute_derived_state(self) -> None:
+        """Rebuild ``on_click_callback`` from a changed ``button_link``.
+
+        Only touches the callback when it is itself derived from state, or absent, so a
+        node-supplied ``on_click`` set by the constructor survives ``apply_state`` untouched.
+        A plain ``None`` cannot represent that intent (there is nothing to preserve), so it is
+        treated the same as derived: otherwise a button built with no ``button_link`` and no
+        ``on_click`` would gain a saved link with no handler to fire it.
+        """
+        if self.on_click_callback is not None and not is_derived_from_state(self.on_click_callback):
+            # The node's own handler won, so a saved link is dead: it belongs to a version of
+            # this node that wired the button differently. Dropping it keeps the one-or-the-
+            # other invariant the constructor enforces, and stops the next save recording a
+            # link that a later build-from-scratch would revive as the handler instead.
+            self.button_link = None
+            return
+        if self.button_link is None:
+            self.on_click_callback = None
+            return
+        self.on_click_callback = self._create_button_link_handler(self.button_link)
 
     @classmethod
     def get_trait_keys(cls) -> list[str]:
