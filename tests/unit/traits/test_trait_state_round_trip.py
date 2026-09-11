@@ -2,13 +2,17 @@
 
 import json
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
-from griptape_nodes.exe_types.core_types import Trait
+from griptape_nodes.exe_types.core_types import BaseNodeElement, ParameterGroup, Trait
+from griptape_nodes.traits.add_param_button import AddParameterButton
 from griptape_nodes.traits.clamp import Clamp
 from griptape_nodes.traits.compare import Compare
 from griptape_nodes.traits.minmax import MinMax
@@ -311,3 +315,43 @@ class TestApplyStateGoesThroughTheConstructor:
 
         assert trait.min == 0
         assert trait.max == 1
+
+
+@contextmanager
+def _recording_elements(built: list[str]) -> Iterator[None]:
+    """Record the class name of every node element constructed inside the block."""
+    original_init = BaseNodeElement.__init__
+
+    def recording_init(self: BaseNodeElement, **kwargs: Any) -> None:
+        built.append(type(self).__name__)
+        original_init(self, **kwargs)
+
+    with patch.object(BaseNodeElement, "__init__", recording_init):
+        yield
+
+
+class TestTheThrowawayIsNeverObservable:
+    """apply_state reads its values off an instance the constructor built, then discards it."""
+
+    def test_it_is_not_adopted_by_an_open_element_context(self) -> None:
+        # An element built inside a `with` block is attached to it, which is what lets node
+        # code declare a parameter's children by nesting. Wrong for an instance built only to
+        # be read: the group would grow a phantom trait.
+        trait = Slider(min_val=0, max_val=1)
+
+        with ParameterGroup(name="g") as group:
+            trait.apply_state({"min_val": 2, "max_val": 8})
+
+        assert group.children == []
+
+    def test_state_with_nothing_in_it_builds_nothing(self) -> None:
+        # A trait declaring no constructor arguments has no state for a throwaway to
+        # interpret. Building one anyway runs its constructor, and AddParameterButton's
+        # attaches a Button child.
+        built: list[str] = []
+        trait = AddParameterButton()
+
+        with _recording_elements(built):
+            trait.apply_state({})
+
+        assert built == []
