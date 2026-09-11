@@ -836,18 +836,17 @@ class ParameterMessage(BaseNodeElement, UIOptionsMixin):
     type ButtonAlignType = Literal["full-width", "left", "center", "right"]
     type ButtonVariantType = Literal["default", "destructive", "outline", "secondary", "ghost", "link"]
 
-    element_type: str = field(default_factory=lambda: ParameterMessage.__name__)
-    _variant: VariantType = field(init=False)
-    _title: str | None = field(default=None, init=False)
-    _value: str = field(init=False)
-    _message_icon: str | None = field(default="__DEFAULT__", init=False)
-    _button_link: str | None = field(default=None, init=False)
-    _button_text: str | None = field(default=None, init=False)
-    _button_icon: str | None = field(default=None, init=False)
-    _button_variant: ButtonVariantType = field(default="outline", init=False)
-    _button_align: ButtonAlignType = field(default="full-width", init=False)
-    _full_width: bool = field(default=False, init=False)
-    _ui_options: dict = field(default_factory=dict, init=False)
+    _variant: VariantType
+    _title: str | None
+    _value: str
+    _message_icon: str | None
+    _button_link: str | None
+    _button_text: str | None
+    _button_icon: str | None
+    _button_variant: ButtonVariantType
+    _button_align: ButtonAlignType
+    _full_width: bool
+    _ui_options: dict
 
     def __init__(  # noqa: PLR0913
         self,
@@ -1529,13 +1528,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
     private: bool = False
     exclude_from_metadata: bool = False
     allow_variable_substitution: bool = True
-    _allowed_modes: set = field(
-        default_factory=lambda: {
-            ParameterMode.OUTPUT,
-            ParameterMode.INPUT,
-            ParameterMode.PROPERTY,
-        }
-    )
+    _allowed_modes: set
     _converters: list[Callable[[Any], Any]]
     _validators: list[Callable[[Parameter, Any], None]]
     _on_incoming_connection_removed: list[Callable[[Parameter, str, str], None]]
