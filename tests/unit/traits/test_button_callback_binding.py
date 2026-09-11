@@ -190,9 +190,41 @@ class TestApplyStateRecomputesDerivedCallbacks:
         button = Button(label="Refresh", on_click=node.refresh)
         before = button.on_click_callback
 
-        button.apply_state({})
+        button.apply_state({"label": "Reload"})
 
         assert button.on_click_callback is before
+
+    def test_a_saved_link_yields_to_a_constructor_supplied_on_click_and_is_dropped(self) -> None:
+        """A node that rewired its button from a link to one of its methods in a new version.
+
+        The live wiring wins, so the saved link describes a version of the node that no longer
+        exists. Keeping it would re-save a link that the next build-from-scratch turns back
+        into the handler, quietly replacing the node's method with a URL.
+        """
+        node = ButtonNode(name="rewired")
+        button = Button(label="Refresh", on_click=node.refresh)
+
+        button.apply_state({"label": "Refresh", "button_link": "https://example.test/old"})
+
+        assert button.on_click_callback == node.refresh
+        assert button.button_link is None
+        assert button.to_state()["button_link"] is None
+
+    def test_the_node_method_still_wins_after_a_full_save_cycle(self) -> None:
+        """The saved state and the saved callback name have to agree on which one fires.
+
+        A stale link surviving the first restore is handed to the constructor on a load that
+        builds the trait fresh, and the handler it builds then blocks the saved ``on_click``
+        name from binding, because a callback already present is left alone.
+        """
+        node = ButtonNode(name="cycle")
+        live = Button(label="Refresh", on_click=node.refresh)
+        live.apply_state({"label": "Refresh", "button_link": "https://example.test/old"})
+
+        rebuilt = Button.from_state(live.to_state())
+        rebuilt.apply_callback_names(live.callback_names(node), node)
+
+        assert rebuilt.on_click_callback == node.refresh
 
     def test_a_saved_link_on_a_bare_button_builds_a_handler(self) -> None:
         """A button built with neither button_link nor on_click has no callback to preserve."""

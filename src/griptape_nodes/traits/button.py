@@ -179,6 +179,11 @@ class Button(Trait):
         ``on_click`` would gain a saved link with no handler to fire it.
         """
         if self.on_click_callback is not None and not is_derived_from_state(self.on_click_callback):
+            # The node's own handler won, so a saved link is dead: it belongs to a version of
+            # this node that wired the button differently. Dropping it keeps the one-or-the-
+            # other invariant the constructor enforces, and stops the next save recording a
+            # link that a later build-from-scratch would revive as the handler instead.
+            self.button_link = None
             return
         if self.button_link is None:
             self.on_click_callback = None
