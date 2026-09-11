@@ -44,6 +44,18 @@ class MultiOptions(Trait):
     def choices(self, value: list) -> None:
         self._choices = value
 
+    def state_from_ui_options(self, ui_options: dict) -> dict[str, Any]:
+        """Adopt a multi-select written straight into the parameter's ``ui_options``.
+
+        A workflow saved before trait state was carried in its own right mirrored a run-time
+        ``choices`` update into ``multi_options`` so that it would survive the save. The
+        nested keys are this trait's constructor arguments, which is what makes them state.
+        """
+        written = ui_options.get("multi_options")
+        if not isinstance(written, dict):
+            return {}
+        return {key: written[key] for key in self._state_parameter_names() if key in written}
+
     @classmethod
     def get_trait_keys(cls) -> list[str]:
         return ["multi_options"]
