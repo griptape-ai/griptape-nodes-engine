@@ -2014,6 +2014,36 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
     def ui_options(self, value: dict) -> None:
         self._ui_options = value
 
+    def adopt_ui_options(self, value: dict) -> None:
+        """Assign an inbound ``ui_options`` write, handing each trait the keys it owns.
+
+        Use this for a write arriving from outside the engine, rather than assigning
+        ``ui_options`` directly. Such a writer works from the merged view and does not know
+        which keys belong to a trait, so a trait-owned key has to be routed to its owner:
+        stored, it would be shadowed by the trait at read time and dropped at save time, and
+        the write would appear to succeed while changing nothing.
+
+        The whole dict is still stored afterwards. Leaving the trait-owned keys in it is
+        deliberate and harmless, for the reasons ``authored_ui_options`` gives: they are
+        inert, and keeping them means detaching a trait hands back what was written.
+        """
+        for trait in self.find_elements_by_type(Trait):
+            adopted = trait.state_from_ui_options(value)
+            if not adopted:
+                continue
+            # Merged over the trait's current state so the constructor that interprets it
+            # sees a complete set of arguments, whatever subset the write mentioned.
+            try:
+                trait.apply_state({**trait.to_state(), **adopted})
+            except TypeError:
+                logger.warning(
+                    "Attempted to update the %s control on parameter '%s' from a UI option change, "
+                    "but it would not accept those values, so the control is unchanged.",
+                    type(trait).__name__,
+                    self.name,
+                )
+        self.ui_options = value
+
     def authored_ui_options(self) -> dict[str, Any]:
         """Subtract the keys the attached traits render, leaving what this parameter authored.
 
@@ -3422,6 +3452,21 @@ class Trait(ABC, BaseNodeElement):
                 continue
             setattr(self, attribute_name, getattr(interpreted, attribute_name))
         self._recompute_derived_state()
+
+    def state_from_ui_options(self, ui_options: dict[str, Any]) -> dict[str, Any]:  # noqa: ARG002
+        """Return the state an inbound ``ui_options`` write is asking this trait to take on.
+
+        The inverse of ``ui_options_for_trait``, for the writers that do not know about
+        traits. The editor is handed the merged ``ui_options`` and writes back the same flat
+        shape, and a workflow saved before trait state was carried in its own right holds a
+        trait's options there too. Either way a key this trait renders is this trait's state,
+        so a write to it is a request to change the trait.
+
+        Return only what the incoming dict actually mentions. Empty by default, which means a
+        trait that does not implement this ignores such a write; ``{}`` is also the right
+        answer for a key with no state behind it, such as a widget-type marker.
+        """
+        return {}
 
     def callback_names(self, owner: BaseNode | None) -> dict[str, str]:
         """Return each attached callback as the name of a method on ``owner``.

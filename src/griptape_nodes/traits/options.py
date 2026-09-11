@@ -47,6 +47,23 @@ class Options(Trait):
     def choices(self, value: list) -> None:
         self._choices = value
 
+    def state_from_ui_options(self, ui_options: dict[str, Any]) -> dict[str, Any]:
+        """Adopt a dropdown written straight into the parameter's ``ui_options``.
+
+        Two writers do this. The editor's fixed-options panel sends these keys back flat, and
+        a workflow saved before trait state was carried in its own right mirrored a run-time
+        ``choices`` update into ``simple_dropdown`` so that it would survive the save. Without
+        adopting it, such a file loads with whatever choices the node's ``__init__`` builds,
+        and the converter below then rewrites the saved value to the first of those.
+        """
+        state: dict[str, Any] = {}
+        if "simple_dropdown" in ui_options:
+            state["choices"] = ui_options["simple_dropdown"]
+        for key in ("show_search", "search_filter", "allow_custom"):
+            if key in ui_options:
+                state[key] = ui_options[key]
+        return state
+
     @classmethod
     def get_trait_keys(cls) -> list[str]:
         return ["options", "models"]
