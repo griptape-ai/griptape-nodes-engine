@@ -65,7 +65,11 @@ from griptape_nodes.node_library.library_validation import (
     detect_retired_node_declarations,
     validate_library_declarations,
 )
-from griptape_nodes.node_library.workflow_registry import WorkflowMetadataError, read_workflow_metadata
+from griptape_nodes.node_library.workflow_registry import (
+    WorkflowMetadataError,
+    WorkflowRegistry,
+    read_workflow_metadata,
+)
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import (
     AppInitializationComplete,
@@ -78,6 +82,7 @@ from griptape_nodes.retained_mode.events.app_events import (
     InitializationStatus,
     LibraryLoadedNotification,
     LibraryLoadStatus,
+    LibraryWorkflowsChanged,
     WorkerNodeSchema,
     WorkerParameterSchema,
 )
@@ -2090,22 +2095,21 @@ class LibraryManager(EngineScoped):
 
         # Phase 3: Return appropriate result based on fitness
         # At this point, library_name must be set (it's set during METADATA_LOADED phase)
-        if library_info.library_name is None:
+        library_name = library_info.library_name
+        if library_name is None:
             details = "Library loaded but library_name was not set during metadata loading"
             return RegisterLibraryFromFileResultFailure(result_details=details)
 
         match library_info.fitness:
             case LibraryManager.LibraryFitness.GOOD:
-                details = f"Successfully loaded Library '{library_info.library_name}' from JSON file at {file_path}"
-                return RegisterLibraryFromFileResultSuccess(
-                    library_name=library_info.library_name,
-                    result_details=ResultDetails(message=details, level=logging.INFO),
+                details = f"Successfully loaded Library '{library_name}' from JSON file at {file_path}"
+                return await self._finish_successful_library_registration(
+                    library_info, library_name, ResultDetails(message=details, level=logging.INFO)
                 )
             case LibraryManager.LibraryFitness.FLAWED:
                 details = f"Successfully loaded Library JSON file from '{file_path}', but one or more nodes failed to load. Check the log for more details."
-                return RegisterLibraryFromFileResultSuccess(
-                    library_name=library_info.library_name,
-                    result_details=ResultDetails(message=details, level=logging.WARNING),
+                return await self._finish_successful_library_registration(
+                    library_info, library_name, ResultDetails(message=details, level=logging.WARNING)
                 )
             case LibraryManager.LibraryFitness.UNUSABLE:
                 details = f"Attempted to load Library JSON file from '{file_path}'. Failed because no nodes were loaded. Check the log for more details."
@@ -2117,14 +2121,38 @@ class LibraryManager(EngineScoped):
                 # AppStartSessionRequest or by _maybe_start_workers_for_existing_session)
                 # so we must NOT block here -- doing so would prevent the orchestrator from
                 # sending heartbeats to the worker process, causing it to self-terminate.
-                details = f"Successfully registered Library '{library_info.library_name}' from '{file_path}'. Node loading is delegated to a worker process."
-                return RegisterLibraryFromFileResultSuccess(
-                    library_name=library_info.library_name,
-                    result_details=ResultDetails(message=details, level=logging.INFO),
+                details = f"Successfully registered Library '{library_name}' from '{file_path}'. Node loading is delegated to a worker process."
+                return await self._finish_successful_library_registration(
+                    library_info, library_name, ResultDetails(message=details, level=logging.INFO)
                 )
             case _:
                 details = f"Attempted to load Library JSON file from '{file_path}'. Failed because an unknown/unexpected fitness '{library_info.fitness}' was returned."
                 return RegisterLibraryFromFileResultFailure(result_details=details)
+
+    async def _finish_successful_library_registration(
+        self, library_info: LibraryManager.LibraryInfo, library_name: str, result_details: ResultDetails
+    ) -> RegisterLibraryFromFileResultSuccess:
+        """Register the workflows the library declares, then build the success result.
+
+        Reached only from the fitness arms that succeed, so the `match` above stays the single
+        place that decides what each fitness value means. `library_name` is passed in already
+        narrowed by the caller rather than re-derived here.
+
+        Every path that brings a library into the engine funnels through
+        `register_library_from_file_request` -- engine start, installing from a file,
+        installing from a requirement specifier, and reloading after a git update -- so this
+        is the one place that has to know a library can ship workflows.
+
+        Except while libraries are still loading. Registering a workflow reaches
+        `WorkflowManager.on_load_workflow_metadata_request`, which waits on
+        `_libraries_loading_complete`; doing that from inside the load that owns the event
+        would deadlock the engine. `load_all_libraries_from_config` is the only thing that
+        closes the gate, and it registers the whole set's workflows as soon as it opens it
+        again, so a library loading in that window gets its workflows from there instead.
+        """
+        if self._libraries_loading_complete.is_set():
+            await self.register_workflows_for_library(library_info)
+        return RegisterLibraryFromFileResultSuccess(library_name=library_name, result_details=result_details)
 
     async def _establish_register_library_prerequisites(  # noqa: C901, PLR0911, PLR0912 (prerequisite validation needs branches)
         self, request: RegisterLibraryFromFileRequest
@@ -3049,6 +3077,10 @@ class LibraryManager(EngineScoped):
             self._libraries_reloaded_after_import.add(request.library_name)
         self._unregister_all_stable_module_aliases_for_library(request.library_name)
 
+        # Take the library's workflows back out of the WorkflowRegistry so an unloaded library
+        # stops offering them.
+        self._unregister_workflows_for_library(request.library_name)
+
         # Remove the library from our library info list. This prevents it from still showing
         # up in the table of attempted library loads. Remove ALL entries for this name, not
         # just the first: a duplicately-registered library (e.g. two on-disk copies, or a
@@ -3759,10 +3791,17 @@ class LibraryManager(EngineScoped):
             # Remove any missing libraries AFTER we've loaded them for the user.
             user_libraries_section = LIBRARIES_TO_REGISTER_KEY
             self._remove_missing_libraries_from_config(config_category=user_libraries_section)
-
-            return reconcile_failures
         finally:
             self._libraries_loading_complete.set()
+
+        # Each library above skipped registering its own workflows, because registering one
+        # reaches WorkflowManager.on_load_workflow_metadata_request, which waits on the event
+        # the finally above has only just set -- doing it inside the loop would hang the engine
+        # on an event only this function can set. So this is where they get registered, paired
+        # with the .set() that unblocks them rather than left to a caller to remember. A
+        # library loaded on its own, mid-session, registers its workflows as it loads.
+        await self.register_workflows_for_all_libraries()
+        return reconcile_failures
 
     async def on_preview_project_provisioning_request(
         self, request: PreviewProjectProvisioningRequest
@@ -4317,13 +4356,10 @@ class LibraryManager(EngineScoped):
         # Register all secrets now that libraries are loaded and settings are merged
         self.engine.secrets_manager.register_all_secrets()
 
-        # We have to load all libraries before we attempt to load workflows.
-
-        # This will (attempts to) load all workflows specified by LIBRARIES. User workflows are loaded later.
-        library_workflow_files_to_register = await self._collect_library_workflow_files()
-        await self.engine.workflow_manager.register_list_of_workflows(library_workflow_files_to_register)
-
-        # Go tell the Workflow Manager that it's turn is now.
+        # We have to load all libraries before we attempt to load workflows. The workflows the
+        # libraries themselves ship are already registered -- load_all_libraries_from_config
+        # does that once its loading gate opens -- so this scan is for the user's workspace,
+        # and it leaves library-contributed entries alone.
         await self.engine.workflow_manager.refresh_workflow_registry()
 
         # Signal readiness so the application layer can render its library status
@@ -4342,35 +4378,139 @@ class LibraryManager(EngineScoped):
                 )
             )
 
-    async def _collect_library_workflow_files(self) -> list[str]:
-        """Collect workflow file paths declared by all registered libraries.
+    async def register_workflows_for_all_libraries(self) -> None:
+        """Register the workflows declared by every library this engine has loaded.
 
-        Returns absolute paths to workflow files, adding each library's base directory
-        to sys.path so relative imports work when the workflow is loaded.
+        Idempotent: a workflow whose key is already in the registry is skipped, so running
+        this again leaves the same entries rather than a second copy of each. Called once a
+        full library load has opened its loading gate; a library that loads on its own,
+        mid-session, registers its workflows from the registration handler instead.
         """
-        workflow_files: list[str] = []
-        library_result = await self.engine.ahandle_request(ListRegisteredLibrariesRequest(broadcast_result=False))
-        if not isinstance(library_result, ListRegisteredLibrariesResultSuccess):
-            return workflow_files
-        for library_name in library_result.libraries:
-            try:
-                library = LibraryRegistry.get_library(name=library_name)
-            except KeyError:
-                logger.error("Could not find library '%s'", library_name)
+        for library_name in LibraryRegistry.list_libraries():
+            # Resolved through the shared resolver rather than by scanning the info dict, so a
+            # duplicately-registered library contributes its workflows once, from whichever
+            # on-disk copy actually loaded.
+            library_info = self.get_library_info_by_library_name(library_name)
+            if library_info is None:
+                # Expected, not a fault: LibraryRegistry is process-global, so in a process
+                # running more than one Engine this lists libraries another engine registered
+                # and this one has never seen. Their workflows are that engine's business.
+                logger.debug("Library '%s' is not known to this engine; skipping its workflows.", library_name)
                 continue
-            library_data = library.get_library_data()
-            if not library_data.workflows:
+            await self.register_workflows_for_library(library_info)
+
+    async def rekey_workflows_for_all_libraries(self) -> None:
+        """Re-derive every library-owned registry key against the current workspace.
+
+        A registry key is workspace-relative while the file sits inside the workspace and
+        absolute otherwise, and libraries live under the workspace by default. So when the
+        workspace moves, a library's entries keep their old spelling and resolve against the
+        new workspace, pointing at nothing. A library reload rebuilds them as a side effect of
+        unloading and loading each library, but a workspace-only project switch does not reload
+        libraries, which is the case this covers.
+
+        Removal first, then registration: registering alone skips a key already in the registry
+        and adds the newly-derived one beside it, leaving the workflow registered twice with the
+        stale copy resolving nowhere.
+        """
+        for library_name in LibraryRegistry.list_libraries():
+            library_info = self.get_library_info_by_library_name(library_name)
+            if library_info is None:
+                # Another engine's library in this process -- see register_workflows_for_all_libraries.
+                logger.debug("Library '%s' is not known to this engine; skipping its workflows.", library_name)
                 continue
-            # Workflows are stored relative to the library JSON; find the library's path.
-            for library_info in self._library_file_path_to_info.values():
-                if library_info.library_name == library_name:
-                    library_path = Path(library_info.library_path)
-                    base_dir = library_path.parent.absolute()
-                    # Add the directory to the Python path to allow for relative imports.
-                    sys.path.insert(0, str(base_dir))
-                    workflow_files.extend(str(base_dir / workflow) for workflow in library_data.workflows)
-                    break
-        return workflow_files
+            self._unregister_workflows_for_library(library_name)
+            await self.register_workflows_for_library(library_info)
+
+    async def register_workflows_for_library(self, library_info: LibraryManager.LibraryInfo) -> None:
+        """Register the workflows one library declares, owned by that library.
+
+        The registry records the owner, so unloading the library later removes exactly these
+        entries, and a workspace rescan -- which clears everything it found itself -- leaves
+        them alone.
+
+        Workers are skipped: they exist to import node classes on the orchestrator's behalf
+        and never serve workflow lists, so registering workflows there is pure overhead.
+        """
+        library_name = library_info.library_name
+        if library_name is None or self._is_worker:
+            return
+
+        workflow_files = self._collect_workflow_files_for_library(library_info)
+        if not workflow_files:
+            return
+
+        registration = await self.engine.workflow_manager.register_list_of_workflows(
+            workflow_files, library_name=library_name
+        )
+        if not registration.succeeded:
+            return
+
+        self.engine.event_manager.put_event(
+            AppEvent(
+                payload=LibraryWorkflowsChanged(
+                    library_name=library_name,
+                    workflow_names=registration.succeeded,
+                    registered=True,
+                )
+            )
+        )
+
+    def _collect_workflow_files_for_library(self, library_info: LibraryManager.LibraryInfo) -> list[str]:
+        """Collect the absolute paths of the workflow files a single library declares.
+
+        The `workflows` entries in `griptape_nodes_library.json` are relative to that JSON
+        file, so they resolve against the library's own directory. That directory is already
+        on `sys.path` from when the library loaded, so a workflow's relative imports resolve.
+        """
+        if library_info.library_name is None:
+            return []
+
+        try:
+            library = LibraryRegistry.get_library(name=library_info.library_name)
+        except KeyError:
+            logger.error("Could not find library '%s'", library_info.library_name)
+            return []
+
+        library_data = library.get_library_data()
+        if not library_data.workflows:
+            return []
+
+        base_dir = Path(library_info.library_path).parent.absolute()
+        return [str(base_dir / workflow) for workflow in library_data.workflows]
+
+    def _unregister_workflows_for_library(self, library_name: str) -> None:
+        """Take a library's workflows out of the WorkflowRegistry, and announce their removal.
+
+        Nothing else does this: the workspace rescan deliberately spares library-owned
+        entries, so without this an install -> uninstall -> reinstall cycle accumulates stale
+        entries and an unloaded library keeps offering workflows for the life of the process.
+
+        Guarded on this engine knowing the library, the same condition
+        `register_workflows_for_all_libraries` registers under. `WorkflowRegistry` is
+        process-global and entries are keyed by contributing library name only, so in a process
+        running more than one Engine an unguarded delete would take the other engine's entries
+        for a library this one never registered -- the exact case the register side defends
+        against. Called before the unload path drops the library's info, so the lookup still
+        resolves for a library this engine is unloading.
+        """
+        if self.get_library_info_by_library_name(library_name) is None:
+            logger.debug("Library '%s' is not known to this engine; leaving its workflows alone.", library_name)
+            return
+
+        removed_keys = WorkflowRegistry.remove_workflows_from_library(library_name)
+        if not removed_keys:
+            return
+
+        self.engine.event_manager.put_event(
+            AppEvent(
+                payload=LibraryWorkflowsChanged(
+                    library_name=library_name,
+                    workflow_names=removed_keys,
+                    registered=False,
+                )
+            )
+        )
 
     async def _on_session_started(self, _event: AppSessionStartedEvent) -> None:
         """Spawn workers for all libraries that require one now that a session is active.
@@ -5594,6 +5734,11 @@ class LibraryManager(EngineScoped):
         # opens the current workflow immediately on receiving the result, so all node types
         # must be registered before we respond.
         await self._await_pending_workers()
+
+        # The libraries' workflows are back too: the unload loop above removed them, and
+        # load_all_libraries_from_config re-registered them. The early returns above, where a
+        # library fails to unload, deliberately never get that far -- they leave the workflows
+        # removed, which is the honest state, since the libraries offering them are unloaded.
 
         # Signal readiness again so the app re-renders the library status table with real
         # fitness now that workers have reported back. is_initial_start=False so the app
@@ -7188,7 +7333,9 @@ class LibraryManager(EngineScoped):
                 result=update_result,
             )
 
-        # Gather all update results concurrently
+        # Gather all update results concurrently. Each update unloads its library and registers
+        # it again, and registering is what puts that library's workflows back, so the workflows
+        # follow the libraries here without this path arranging anything.
         async with asyncio.TaskGroup() as tg:
             update_tasks = [
                 tg.create_task(update_library(info.library_name, info.old_version, info.new_version))

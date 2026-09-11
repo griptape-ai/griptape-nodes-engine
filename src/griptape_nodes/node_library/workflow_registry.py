@@ -298,6 +298,7 @@ class WorkflowRegistry(metaclass=SingletonMeta):
         registry_key: str,
         metadata: WorkflowMetadata,
         file_path: str | None = None,
+        library_name: str | None = None,
     ) -> Workflow:
         """Register a workflow under `registry_key` with the given metadata.
 
@@ -309,6 +310,12 @@ class WorkflowRegistry(metaclass=SingletonMeta):
         `file_path` is optional: provide it for saved workflows (backed by a file on
         disk; existence is verified at construction time); omit it for unsaved in-memory
         entries. Unsaved keys must start with `UNSAVED_KEY_PREFIX`.
+
+        `library_name` names the library that contributed this workflow, for entries
+        registered from a library's `workflows` list. Leave it None for everything the
+        workspace scan finds and everything the user creates. See `Workflow.library_name`
+        for why the registry records this rather than inferring it from the metadata
+        header.
         """
         instance = cls()
         if registry_key in instance._workflows:
@@ -322,9 +329,19 @@ class WorkflowRegistry(metaclass=SingletonMeta):
             msg = f"Saved registry key '{registry_key}' requires a file_path."
             raise ValueError(msg)
         if file_path is None:
-            workflow = Workflow(registry_key=instance._registry_key, metadata=metadata, file_path=None)
+            workflow = Workflow(
+                registry_key=instance._registry_key,
+                metadata=metadata,
+                file_path=None,
+                library_name=library_name,
+            )
         else:
-            workflow = Workflow.from_disk(registry_key=instance._registry_key, file_path=file_path, metadata=metadata)
+            workflow = Workflow.from_disk(
+                registry_key=instance._registry_key,
+                file_path=file_path,
+                metadata=metadata,
+                library_name=library_name,
+            )
         instance._workflows[registry_key] = workflow
         return workflow
 
@@ -401,18 +418,26 @@ class WorkflowRegistry(metaclass=SingletonMeta):
         return instance._workflows.pop(name)
 
     @classmethod
-    def clear_user_workflows(cls) -> None:
-        """Remove all non-library workflows from the registry.
+    def clear_scanned_workflows(cls) -> None:
+        """Remove every workflow that no library contributed.
 
-        Library-provided workflows (is_griptape_provided=True) are preserved.
-        Called before re-registering workflows so that a workspace change takes effect cleanly.
+        Called before re-scanning the workspace so that a workspace change takes effect
+        cleanly. Library-contributed entries are left alone: they belong to their library
+        and go away when it unloads, not when the workspace moves.
         """
         instance = cls()
-        keys_to_remove = [
-            key for key, workflow in instance._workflows.items() if not workflow.metadata.is_griptape_provided
-        ]
+        keys_to_remove = [key for key, workflow in instance._workflows.items() if workflow.library_name is None]
         for key in keys_to_remove:
             del instance._workflows[key]
+
+    @classmethod
+    def remove_workflows_from_library(cls, library_name: str) -> list[str]:
+        """Remove every workflow `library_name` contributed and return the keys removed."""
+        instance = cls()
+        keys_to_remove = [key for key, workflow in instance._workflows.items() if workflow.library_name == library_name]
+        for key in keys_to_remove:
+            del instance._workflows[key]
+        return keys_to_remove
 
     @classmethod
     def rekey_workflow(cls, old_key: str, new_key: str) -> None:
@@ -444,16 +469,25 @@ class Workflow:
     - **Unsaved**: in-memory only. `file_path is None`. Created via
       `WorkflowRegistry.generate_new_workflow` with `file_path=None`. Transitions to
       saved when `SaveWorkflowRequest` is handled for this workflow's registry key.
+
+    `library_name` records who put the workflow in the registry, because the two
+    populations have different lifetimes: entries the workspace scan found are dropped
+    when the workspace changes, and entries a library contributed are dropped when that
+    library unloads. It is the registering library's name for the latter and None for
+    everything else. The metadata header cannot answer this: an author sets those flags
+    and they survive being copied out of the library into the workspace.
     """
 
     metadata: WorkflowMetadata
     file_path: str | None
+    library_name: str | None
 
     def __init__(
         self,
         registry_key: WorkflowRegistry._RegistryKey,
         metadata: WorkflowMetadata,
         file_path: str | None,
+        library_name: str | None = None,
     ) -> None:
         if not isinstance(registry_key, WorkflowRegistry._RegistryKey):
             msg = "Workflows can only be created through WorkflowRegistry"
@@ -461,6 +495,7 @@ class Workflow:
 
         self.metadata = metadata
         self.file_path = file_path
+        self.library_name = library_name
 
     @classmethod
     def from_disk(
@@ -468,6 +503,7 @@ class Workflow:
         registry_key: WorkflowRegistry._RegistryKey,
         metadata: WorkflowMetadata,
         file_path: str,
+        library_name: str | None = None,
     ) -> Workflow:
         """Construct a Workflow backed by an existing file on disk.
 
@@ -479,7 +515,7 @@ class Workflow:
         if not Path(complete_path).is_file():
             msg = f"File path '{complete_path}' does not exist."
             raise ValueError(msg)
-        return cls(registry_key=registry_key, metadata=metadata, file_path=file_path)
+        return cls(registry_key=registry_key, metadata=metadata, file_path=file_path, library_name=library_name)
 
     @property
     def is_saved(self) -> bool:
