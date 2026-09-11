@@ -8,17 +8,20 @@ import pytest
 from mcp.types import CallToolRequestParams
 
 from griptape_nodes.retained_mode.events.base_events import RequestPayload
+from griptape_nodes.retained_mode.events.workflow_events import RunWorkflowFromRegistryRequest
 from griptape_nodes.servers import mcp as mcp_module
 from griptape_nodes.servers.mcp import (
     _BATCH_MAX_AUTO_TIMEOUT_MS,
-    _BATCH_PER_REQUEST_TIMEOUT_MS,
+    _SINGLE_REQUEST_TIMEOUT_MS,
     EVENT_REQUEST_BATCH_TOOL_NAME,
     SUPPORTED_REQUEST_EVENTS,
     _build_batch_pairs,
+    _dispatch_batch_to_engine,
     _dispatch_to_engine,
     _event_request_batch_input_schema,
     _resolve_batch_timeout_ms,
     _summarize_result_details,
+    _timeout_ms_for_request,
     _trim_batch_results,
     _trim_response,
     call_tool,
@@ -175,19 +178,41 @@ class TestBuildBatchPairs:
             _build_batch_pairs([{"request_type": "CreateNodeRequest", "request": {"node_type": "X", "bogus_field": 1}}])
 
 
+class TestTimeoutMsForRequest:
+    """Opening a workflow is the one tool that routinely outlasts the default budget."""
+
+    def test_defaults_to_the_single_request_timeout(self) -> None:
+        assert _timeout_ms_for_request("CreateNodeRequest") == _SINGLE_REQUEST_TIMEOUT_MS
+
+    def test_opening_a_workflow_gets_longer_than_the_default(self) -> None:
+        """A replay of a large saved file resolves libraries and rebuilds every node.
+
+        Timing that out would not stop the open -- `_dispatch_to_engine` shields the engine-side
+        coroutine -- it would only leave the agent guessing, and a retry lands a second clean slate
+        partway through the first replay.
+        """
+        assert _timeout_ms_for_request("RunWorkflowFromRegistryRequest") > _SINGLE_REQUEST_TIMEOUT_MS
+
+
 class TestResolveBatchTimeoutMs:
-    _BATCH_OF_FOUR = 4
-    _LARGE_BATCH = 100
+    _BATCH_OF_FOUR = ["CreateNodeRequest"] * 4
+    _LARGE_BATCH = ["CreateNodeRequest"] * 100
     _EXPLICIT_OVERRIDE_MS = 15000
 
     def test_scales_default_with_batch_size(self) -> None:
-        assert (
-            _resolve_batch_timeout_ms(None, self._BATCH_OF_FOUR) == _BATCH_PER_REQUEST_TIMEOUT_MS * self._BATCH_OF_FOUR
+        assert _resolve_batch_timeout_ms(None, self._BATCH_OF_FOUR) == _SINGLE_REQUEST_TIMEOUT_MS * len(
+            self._BATCH_OF_FOUR
         )
 
     def test_caps_default_at_ceiling(self) -> None:
         # A 100-call batch would scale past the cap; the helper clamps it.
         assert _resolve_batch_timeout_ms(None, self._LARGE_BATCH) == _BATCH_MAX_AUTO_TIMEOUT_MS
+
+    def test_default_covers_a_slow_inner_request(self) -> None:
+        """A tool that needs longer alone needs just as long inside a batch of one."""
+        assert _resolve_batch_timeout_ms(None, ["RunWorkflowFromRegistryRequest"]) == _timeout_ms_for_request(
+            "RunWorkflowFromRegistryRequest"
+        )
 
     def test_passes_through_explicit_override(self) -> None:
         assert _resolve_batch_timeout_ms(self._EXPLICIT_OVERRIDE_MS, self._BATCH_OF_FOUR) == self._EXPLICIT_OVERRIDE_MS
@@ -339,6 +364,24 @@ class TestCallTool:
         assert result.is_error is True
 
     @pytest.mark.asyncio
+    async def test_gives_a_slow_tool_its_own_timeout(self) -> None:
+        """The budget follows the tool, so opening a workflow is not held to the 30s default."""
+        seen: dict[str, object] = {}
+
+        async def fake_dispatch(_payload: object, timeout_ms: int | None = None) -> dict[str, Any]:
+            seen["timeout_ms"] = timeout_ms
+            return {"result_type": "RunWorkflowFromRegistryResultSuccess", "result": {}}
+
+        with patch.object(mcp_module, "_dispatch_to_engine", fake_dispatch):
+            result = await call_tool(
+                _NO_CONTEXT,
+                CallToolRequestParams(name="RunWorkflowFromRegistryRequest", arguments={"workflow_name": "my_flow"}),
+            )
+
+        assert result.is_error is False
+        assert seen["timeout_ms"] == _timeout_ms_for_request("RunWorkflowFromRegistryRequest")
+
+    @pytest.mark.asyncio
     async def test_dispatches_the_batch_envelope(self) -> None:
         async def fake_batch_dispatch(pairs: list[tuple[str, dict[str, Any]]], timeout_ms: int) -> list[Any]:  # noqa: ARG001
             return [{"result_type": "CreateNodeResultSuccess", "result": {"node_name": "A_1"}} for _ in pairs]
@@ -428,6 +471,38 @@ class TestDispatchToEngineShield:
             self._stop_engine_loop(engine_loop, thread)
 
     @pytest.mark.asyncio
+    async def test_timeout_says_what_timed_out_and_not_to_resend(self) -> None:
+        """A bare TimeoutError stringifies to nothing, and `call_tool` reports what it catches.
+
+        An agent handed an error with an empty message learns neither that it waited too long nor
+        that the engine is still working -- and the obvious response, sending the request again, is
+        the one that does damage.
+        """
+        engine_loop, thread = self._run_engine_loop_in_thread()
+
+        async def slow_engine_handler(_payload: object) -> dict[str, bool]:
+            await asyncio.sleep(0.5)
+            return {"ok": True}
+
+        event_manager = MagicMock()
+        event_manager.event_loop = engine_loop
+        try:
+            with (
+                patch.object(mcp_module.GriptapeNodes, "EventManager", return_value=event_manager),
+                patch.object(mcp_module, "_handle_request_on_engine_loop", slow_engine_handler),
+            ):
+                with pytest.raises(TimeoutError) as timed_out:
+                    await _dispatch_to_engine(self._a_request_payload(), timeout_ms=50)
+
+                await asyncio.sleep(0.75)
+
+            message = str(timed_out.value)
+            assert "ListRegisteredLibrariesRequest" in message
+            assert "still working" in message
+        finally:
+            self._stop_engine_loop(engine_loop, thread)
+
+    @pytest.mark.asyncio
     async def test_returns_result_when_engine_finishes_before_timeout(self) -> None:
         engine_loop, thread = self._run_engine_loop_in_thread()
 
@@ -446,3 +521,42 @@ class TestDispatchToEngineShield:
             assert result == {"ok": True}
         finally:
             self._stop_engine_loop(engine_loop, thread)
+
+
+class TestDispatchBatchToEngineTimeout:
+    @pytest.mark.asyncio
+    async def test_timeout_says_what_timed_out_and_not_to_resend(self) -> None:
+        """The batch-wide timeout needs a message for the same reason a single one does."""
+
+        async def slow_dispatch(_payload: object, timeout_ms: int | None = None) -> dict[str, Any]:  # noqa: ARG001
+            await asyncio.sleep(0.5)
+            return {"result_type": "CreateNodeResultSuccess", "result": {}}
+
+        pairs = [("CreateNodeRequest", {"node_type": "X"}), ("CreateNodeRequest", {"node_type": "Y"})]
+        with (
+            patch.object(mcp_module, "_dispatch_to_engine", slow_dispatch),
+            pytest.raises(TimeoutError) as timed_out,
+        ):
+            await _dispatch_batch_to_engine(pairs, timeout_ms=50)
+
+        message = str(timed_out.value)
+        assert "batch of 2 requests" in message
+        assert "still working" in message
+
+
+class TestSupportedRequestEventsExposesOpeningAWorkflow:
+    """An MCP client has to be able to open a workflow.
+
+    SetWorkflowContextRequest only records a name -- and refuses outright while the editor has
+    a workflow open, which is always -- so without RunWorkflowFromRegistryRequest exposed here
+    an agent driving the engine had no way to open anything at all.
+    """
+
+    def test_run_workflow_from_registry_is_exposed(self) -> None:
+        """Membership is the whole contract: `list_tools` advertises exactly this mapping.
+
+        `TestListTools.test_advertises_every_request_event_plus_the_batch_envelope` asserts the
+        tool names equal `SUPPORTED_REQUEST_EVENTS` plus the batch envelope, so being in here is
+        being offered to the agent.
+        """
+        assert SUPPORTED_REQUEST_EVENTS["RunWorkflowFromRegistryRequest"] is RunWorkflowFromRegistryRequest
