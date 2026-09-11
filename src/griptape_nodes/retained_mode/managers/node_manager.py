@@ -1904,8 +1904,9 @@ class NodeManager(EngineScoped):
         )
         # Rebuild traits from saved state so their converters, validators,
         # and ui_options come back with the class.
+        paired_traits: list[Trait | None] = []
         if request.traits:
-            NodeManager._apply_trait_states(new_param, request.traits)
+            paired_traits = NodeManager._apply_trait_states(new_param, request.traits)
         try:
             with sanctioned_parameter_mutation():
                 if request.parent_container_name and request.initial_setup:
@@ -1923,7 +1924,7 @@ class NodeManager(EngineScoped):
         # Re-bind trait callbacks now that the parameter is attached: a saved callback names
         # a method on the owning node, which the parameter can only reach once it has one.
         if request.traits:
-            NodeManager._apply_trait_callbacks(new_param, request.traits)
+            NodeManager._apply_trait_callbacks(new_param, request.traits, paired_traits)
         if request.value_callbacks:
             new_param.apply_value_callback_names(request.value_callbacks, node)
 
@@ -2283,8 +2284,8 @@ class NodeManager(EngineScoped):
             if request.traits is not None:
                 # An altered parameter is already attached to its node, so state and
                 # callbacks can both be restored here.
-                NodeManager._apply_trait_states(parameter, request.traits)
-                NodeManager._apply_trait_callbacks(parameter, request.traits)
+                paired = NodeManager._apply_trait_states(parameter, request.traits)
+                NodeManager._apply_trait_callbacks(parameter, request.traits, paired)
             if request.value_callbacks is not None:
                 parameter.apply_value_callback_names(request.value_callbacks, parameter.get_node())
         if request.ui_options is not None and hasattr(parameter, "ui_options"):
@@ -4395,8 +4396,8 @@ class NodeManager(EngineScoped):
         )
 
     @staticmethod
-    def _apply_trait_states(parameter: Parameter, trait_states: list[dict[str, Any]]) -> None:
-        """Restore saved trait state onto a parameter.
+    def _apply_trait_states(parameter: Parameter, trait_states: list[dict[str, Any]]) -> list[Trait | None]:
+        """Restore saved trait state onto a parameter, and return the trait each entry landed on.
 
         A trait the node's ``__init__`` already built is updated in place rather than
         replaced, so whatever the constructor attached to that instance survives. A trait
@@ -4405,10 +4406,11 @@ class NodeManager(EngineScoped):
         saying out loud rather than failing the whole load.
 
         Callbacks are handled separately by ``_apply_trait_callbacks``, which has to run
-        after the parameter is attached to its node.
+        after the parameter is attached to its node. The returned pairing is what it consumes,
+        so resolving a saved name to a class happens once per load rather than once per pass.
         """
         paired = NodeManager._pair_saved_traits(parameter, trait_states)
-        for entry, existing in zip(trait_states, paired, strict=True):
+        for index, (entry, existing) in enumerate(zip(trait_states, paired, strict=True)):
             trait_name = entry.get("trait_name")
             if trait_name is None:
                 continue
@@ -4434,6 +4436,8 @@ class NodeManager(EngineScoped):
                 NodeManager._warn_unsatisfiable_trait_state(parameter, trait_name)
                 continue
             parameter.add_trait(trait)
+            paired[index] = trait
+        return paired
 
     @staticmethod
     def _pair_saved_traits(parameter: Parameter, trait_states: list[dict[str, Any]]) -> list[Trait | None]:
@@ -4471,18 +4475,20 @@ class NodeManager(EngineScoped):
         )
 
     @staticmethod
-    def _apply_trait_callbacks(parameter: Parameter, trait_states: list[dict[str, Any]]) -> None:
+    def _apply_trait_callbacks(
+        parameter: Parameter, trait_states: list[dict[str, Any]], paired: list[Trait | None]
+    ) -> None:
         """Re-bind saved trait callbacks to methods on the parameter's node.
 
         Separate from ``_apply_trait_states`` because a saved callback is the name of a
         method on the owning node, so the parameter has to be attached before the name can
-        be resolved.
+        be resolved. ``paired`` is that call's return value, matching ``trait_states`` entry
+        for entry.
 
         A callback the node's ``__init__`` already supplied is left alone by
         ``apply_callback_names``: live code beats a saved name.
         """
         owner = parameter.get_node()
-        paired = NodeManager._pair_saved_traits(parameter, trait_states)
         for entry, trait in zip(trait_states, paired, strict=True):
             callback_names = entry.get("trait_callbacks")
             if not callback_names or trait is None:

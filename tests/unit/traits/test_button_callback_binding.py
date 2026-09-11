@@ -154,6 +154,7 @@ class TestRebindingCallbacks:
         NodeManager._apply_trait_callbacks(
             parameter,
             [{"trait_name": "Button", "trait_callbacks": {"on_click": "process"}}],
+            [_button_of(parameter)],
         )
 
         assert _button_of(parameter).on_click_callback is live_callback
