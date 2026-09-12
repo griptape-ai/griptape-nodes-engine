@@ -40,11 +40,20 @@ class ModelAccessVerdict:
     `denial` is ``None`` when the model is allowed; a ``CheckpointDenial``
     otherwise, carrying the same failure tuple any other denied checkpoint
     surfaces (so the UI renders identical reason text).
+
+    `display_name` is the catalog's human-readable name for the model (e.g.
+    ``Claude Opus 4.7``), for callers rendering a choice to a person. It is
+    ``None`` on the same terms as `provider_model_id`: the candidate did not
+    resolve to a catalog entry. It is never an identity: two entries may share a
+    `provider_model_id`, names are re-cased and reused between generations, and a
+    stored value or a wire payload must always carry `provider_model_id` instead.
     """
 
     model_id: str
     provider_model_id: str | None
     denial: CheckpointDenial | None
+    # Trails `denial` because callers construct this positionally.
+    display_name: str | None = None
 
 
 @dataclass
