@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 from unittest.mock import create_autospec
 
+from griptape_nodes.exe_types.core_types import ControlParameterInput, ControlParameterOutput, ParameterMode
 from griptape_nodes.exe_types.node_groups.subflow_node_group import SubflowNodeGroup
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
 
@@ -85,6 +86,28 @@ class TestGetAllNodes:
         group.nodes = {"only": _MiniSubflowGroup(name="only")}
 
         assert set(group.get_all_nodes()) == {"only"}
+
+
+class TestSubflowNodeGroupProxyParameters:
+    """Boundary proxies must remain control ports after request-handler reconstruction."""
+
+    def test_control_proxy_preserves_port_shape_and_bridge_modes(self, engine: Engine) -> None:
+        group = _MiniSubflowGroup(name="group")
+        engine.object_manager.add_object_by_name(group.name, group)
+
+        incoming_proxy = group._create_proxy_parameter_for_connection(
+            ControlParameterInput(name="upstream_exec"), is_incoming=True
+        )
+        outgoing_proxy = group._create_proxy_parameter_for_connection(
+            ControlParameterOutput(name="downstream_exec"), is_incoming=False
+        )
+
+        assert isinstance(incoming_proxy, ControlParameterInput)
+        assert isinstance(outgoing_proxy, ControlParameterOutput)
+        assert incoming_proxy.allowed_modes == {ParameterMode.INPUT, ParameterMode.OUTPUT}
+        assert outgoing_proxy.allowed_modes == {ParameterMode.INPUT, ParameterMode.OUTPUT}
+        assert ParameterMode.PROPERTY not in incoming_proxy.allowed_modes
+        assert ParameterMode.PROPERTY not in outgoing_proxy.allowed_modes
 
 
 class _MiniSubflowGroup(SubflowNodeGroup):
