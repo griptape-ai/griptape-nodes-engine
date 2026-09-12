@@ -8,6 +8,7 @@ the route_to_worker / pending-future mechanism.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import sys
 import threading
@@ -44,11 +45,10 @@ class _FakeRequestClient:
 
     async def track_request(
         self, request_id: str, tag: str = "", *, resolve_failures_as_payload: bool = False
-    ) -> asyncio.Future:
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future = loop.create_future()
+    ) -> concurrent.futures.Future:
+        future: concurrent.futures.Future = concurrent.futures.Future()
         self._pending_requests[request_id] = _PendingRequest(
-            future, tag, loop, resolve_failures_as_payload=resolve_failures_as_payload
+            future, tag, resolve_failures_as_payload=resolve_failures_as_payload
         )
         return future
 

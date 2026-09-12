@@ -860,12 +860,11 @@ class EventManager(EngineScoped):
         Called once at worker startup after the RequestClient is constructed and topics
         are subscribed. Inert on the orchestrator (never called there).
 
-        websocket_event_loop is the loop that owns the Client/RequestClient (the daemon
-        thread's loop). All RequestClient primitives -- its asyncio.Lock, the pending-
-        request Future, and the _try_match filter that claims responses -- are bound to
-        that loop. Forwarding calls must be dispatched there via run_coroutine_threadsafe;
-        awaiting RequestClient methods directly from the main loop or a ThreadRunner loop
-        causes cross-loop contention that stalls for seconds per request.
+        websocket_event_loop is the loop that owns the Client (the daemon thread's loop).
+        Forwarding is dispatched there via run_coroutine_threadsafe so the sync
+        handle_request path can block its own thread on the result, which is only safe when
+        the coroutine runs on another thread's loop. RequestClient's own state is
+        loop-agnostic, so the hop is about the blocking caller rather than about reaching it.
         """
         self._worker_request_client = request_client
         self._orchestrator_request_topic = orchestrator_request_topic
@@ -959,11 +958,11 @@ class EventManager(EngineScoped):
         payload, and reconstructs it as an EventResultSuccess/EventResultFailure whose
         shape matches the locally-dispatched path.
 
-        The RequestClient send/track/await happens on the websocket event loop
-        (configured via configure_worker_forwarding) so that its asyncio.Lock and
-        the pending-request Future live on the same loop as the _try_match filter
-        that resolves them. Awaiting those primitives from any other loop causes
-        cross-loop contention that stalls for seconds.
+        The send/track/await is dispatched onto the websocket event loop (configured via
+        configure_worker_forwarding), the loop that owns the transport. Reaching
+        RequestClient state does not require that -- the state is loop-agnostic -- but the
+        sync handle_request path does, since it blocks its own thread on the result and can
+        only do so when the coroutine runs on another thread's loop.
         """
         if (
             self._worker_request_client is None
