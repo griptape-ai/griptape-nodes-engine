@@ -154,6 +154,69 @@ Usually one of two things:
 1. Check the **Libraries** panel with the filter set to **Errors** for libraries that failed to install or load. See ["I installed the library but I don't see its nodes"](guides/libraries.md#i-installed-the-library-but-i-dont-see-its-nodes).
 1. Make sure your libraries are up to date. Open **Manage → Library Management**, expand the library, and click **Check for Updates**, then **Update** when one is offered. See [Updating a library](guides/editor/managing_models_and_libraries.md#updating-a-library). To update the engine itself, see the [FAQ](faq.md#how-do-i-update-griptape-nodes).
 
+## Two libraries installed together, and one of them shows placeholder nodes
+
+**Symptoms**
+
+You install a second library, and nodes from a library that used to work are now placeholders reading:
+
+```
+This placeholder stands in for the '<node type>' node from the '<library>' library, which could not be loaded.
+```
+
+The engine startup table marks the library `FLAWED` with a count of failures, and the logs carry an import error naming a third-party package rather than the library:
+
+```
+! - <library name> vX.Y.Z (FLAWED)
+    Encountered 11 node module import failures:
+```
+
+The specific error depends on which package the two libraries disagree about. Ones we've seen:
+
+```
+Failed to import diffusers.pipelines.pipeline_utils
+  → Failed to import diffusers.models.autoencoders.autoencoder_kl
+    → Could not import module 'PreTrainedModel'
+```
+
+```
+tokenizers>=0.22.0,<=0.23.0 is required for a normal functioning of this module,
+but found tokenizers==0.23.1
+```
+
+```
+ImportError: DLL load failed while importing _C
+cannot import name '_HAS_OPS' from 'torchvision.extension'
+```
+
+This is most common with media generation libraries, because they share large dependencies — `diffusers`, `transformers`, `tokenizers`, `torch`, `torchvision`.
+
+**Cause**
+
+Two libraries want different versions of the same Python package, and both are running **Shared**.
+
+Every library gets its own virtual environment, so the two versions install side by side without a pip conflict. But libraries running Shared all load in the main engine process, and they share one import path. Whichever library loads first wins for any package they have in common — the second library then imports the *first* library's version, and its node modules fail if that version doesn't satisfy its pins.
+
+The error text names the package, not the other library, which is why this usually looks like a broken install of the library that's actually fine. Per-library virtual environments prevent install-time conflicts; they don't isolate imports for Shared libraries. See [Python dependency isolation](guides/libraries.md#python-dependency-isolation).
+
+**Fix**
+
+Any one of these resolves it. The first is the durable fix.
+
+1. **Run the heavier library Isolated.** In the **Configuration Editor → Libraries** view, find the library under **Libraries To Register** and set its dropdown to **Isolated**. It then loads its dependencies in its own process, where nothing else can shadow them. Changes take effect on the next library refresh. This needs engine 0.86.0 or later, and the library's author has to permit isolation — if the dropdown is locked to **Shared**, use one of the options below. See [Shared vs. Isolated](guides/libraries.md#shared-vs-isolated).
+
+1. **Update both libraries.** Conflicts often come from one library being behind — pins that disagree today may already agree on the latest versions. Open **Manage → Library Management**, expand each library, and click **Check for Updates**, then **Update**.
+
+1. **Turn the other library off.** Flip the toggle next to its **Libraries To Register** entry. The library stays on disk and stops loading at startup, which is enough to confirm the diagnosis even if you want both libraries eventually.
+
+1. **Remove the other library, including its virtual environment.** Removing the entry with the trash icon leaves the clone on disk. Delete the library's directory — the `.venv` inside it is what was shadowing the imports — then reinstall whichever library you want to keep. See [Where libraries are stored on disk](guides/libraries.md#where-libraries-are-stored-on-disk).
+
+!!! tip "Confirming which library is winning"
+
+    The terminal the engine is running in logs libraries as they load, in order. The library that loads *first* is the one supplying the shared package; the one that fails is loading second. That tells you which of the two to move to Isolated.
+
+Once the library loads cleanly, reopening the workflow substitutes the real nodes back in — the placeholders don't damage the saved workflow.
+
 ## "failed to locate pyvenv.cfg" / the engine won't start
 
 **Symptoms**
