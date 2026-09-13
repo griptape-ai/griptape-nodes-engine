@@ -4,6 +4,8 @@ from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from griptape_nodes.common.project_templates.situation import SituationTemplate
 from griptape_nodes.files.project_file import ProjectFileDestination
 from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import SidecarContent
@@ -512,6 +514,195 @@ class TestProjectFileDestinationInit:
         # No sidecar metadata: the situation macro+variables don't re-resolve to
         # the absolute path we honored verbatim, so recording them would be a lie.
         assert dest._file._file_metadata is None
+
+    def test_from_situation_file_uri_resolves_to_local_path(self) -> None:
+        """A file:// URI is honored as the local path it names, not split into a `file:` sub-directory."""
+        from griptape_nodes.common.project_templates.situation import (
+            SituationFilePolicy,
+            SituationPolicy,
+            SituationTemplate,
+        )
+        from griptape_nodes.retained_mode.events.project_events import GetSituationResultSuccess
+
+        situation = SituationTemplate(
+            name="save_node_output",
+            macro="{outputs}/{sub_dirs?:/}{file_name_base}.{file_extension}",
+            policy=SituationPolicy(on_collision=SituationFilePolicy.OVERWRITE, create_dirs=True),
+        )
+
+        with patch(
+            HANDLE_REQUEST_PATH, return_value=GetSituationResultSuccess(situation=situation, result_details="ok")
+        ):
+            dest = ProjectFileDestination.from_situation("file:///something.png", "save_node_output")
+
+        # Before the fix this came out as the macro `{outputs}/{sub_dirs?:/}...` with
+        # sub_dirs="file:", resolving to `{outputs}/file:/something.png`.
+        assert dest._file.location == "/something.png"
+        assert dest._file._file_metadata is None
+
+    def test_from_situation_file_uri_with_directories_keeps_full_path(self) -> None:
+        """A file:// URI naming a nested path keeps every directory component."""
+        from griptape_nodes.common.project_templates.situation import (
+            SituationFilePolicy,
+            SituationPolicy,
+            SituationTemplate,
+        )
+        from griptape_nodes.retained_mode.events.project_events import GetSituationResultSuccess
+
+        situation = SituationTemplate(
+            name="save_node_output",
+            macro="{outputs}/{sub_dirs?:/}{file_name_base}.{file_extension}",
+            policy=SituationPolicy(on_collision=SituationFilePolicy.OVERWRITE, create_dirs=True),
+        )
+
+        with patch(
+            HANDLE_REQUEST_PATH, return_value=GetSituationResultSuccess(situation=situation, result_details="ok")
+        ):
+            dest = ProjectFileDestination.from_situation("file:///renders/act_1/out.png", "save_node_output")
+
+        assert dest._file.location == "/renders/act_1/out.png"
+
+    def test_from_situation_file_uri_percent_decodes(self) -> None:
+        """Percent-encoding in a file:// URI is decoded, matching parse_file_uri on the read side."""
+        from griptape_nodes.common.project_templates.situation import (
+            SituationFilePolicy,
+            SituationPolicy,
+            SituationTemplate,
+        )
+        from griptape_nodes.retained_mode.events.project_events import GetSituationResultSuccess
+
+        situation = SituationTemplate(
+            name="save_node_output",
+            macro="{outputs}/{sub_dirs?:/}{file_name_base}.{file_extension}",
+            policy=SituationPolicy(on_collision=SituationFilePolicy.OVERWRITE, create_dirs=True),
+        )
+
+        with patch(
+            HANDLE_REQUEST_PATH, return_value=GetSituationResultSuccess(situation=situation, result_details="ok")
+        ):
+            dest = ProjectFileDestination.from_situation("file:///renders/my%20render.png", "save_node_output")
+
+        assert dest._file.location == "/renders/my render.png"
+
+    def test_from_situation_windows_file_uri_bypasses_macro(self) -> None:
+        """A Windows file:// URI is honored verbatim even on a POSIX host, where it isn't `is_absolute()`."""
+        from griptape_nodes.common.project_templates.situation import (
+            SituationFilePolicy,
+            SituationPolicy,
+            SituationTemplate,
+        )
+        from griptape_nodes.retained_mode.events.project_events import GetSituationResultSuccess
+
+        situation = SituationTemplate(
+            name="save_node_output",
+            macro="{outputs}/{sub_dirs?:/}{file_name_base}.{file_extension}",
+            policy=SituationPolicy(on_collision=SituationFilePolicy.OVERWRITE, create_dirs=True),
+        )
+
+        with patch(
+            HANDLE_REQUEST_PATH, return_value=GetSituationResultSuccess(situation=situation, result_details="ok")
+        ):
+            dest = ProjectFileDestination.from_situation("file:///C:/renders/out.png", "save_node_output")
+
+        # `Path("C:/renders").is_absolute()` is False on POSIX, so the absolute-path
+        # branch alone would not catch this and the drive letter would land in sub_dirs.
+        assert dest._file.location == "C:/renders/out.png"
+        assert dest._file._file_metadata is None
+
+    def test_from_situation_localhost_file_uri_resolves_to_local_path(self) -> None:
+        """The file://localhost/ form names a local file too, so it is honored the same way."""
+        from griptape_nodes.common.project_templates.situation import (
+            SituationFilePolicy,
+            SituationPolicy,
+            SituationTemplate,
+        )
+        from griptape_nodes.retained_mode.events.project_events import GetSituationResultSuccess
+
+        situation = SituationTemplate(
+            name="save_node_output",
+            macro="{outputs}/{sub_dirs?:/}{file_name_base}.{file_extension}",
+            policy=SituationPolicy(on_collision=SituationFilePolicy.OVERWRITE, create_dirs=True),
+        )
+
+        with patch(
+            HANDLE_REQUEST_PATH, return_value=GetSituationResultSuccess(situation=situation, result_details="ok")
+        ):
+            dest = ProjectFileDestination.from_situation("file://localhost/renders/out.png", "save_node_output")
+
+        assert dest._file.location == "/renders/out.png"
+
+    def test_from_situation_rejects_remote_url(self) -> None:
+        """An http(s) URL names no writable local file, so it is refused rather than mangled."""
+        from griptape_nodes.common.project_templates.situation import (
+            SituationFilePolicy,
+            SituationPolicy,
+            SituationTemplate,
+        )
+        from griptape_nodes.retained_mode.events.project_events import GetSituationResultSuccess
+
+        situation = SituationTemplate(
+            name="save_node_output",
+            macro="{outputs}/{sub_dirs?:/}{file_name_base}.{file_extension}",
+            policy=SituationPolicy(on_collision=SituationFilePolicy.OVERWRITE, create_dirs=True),
+        )
+
+        with (
+            patch(
+                HANDLE_REQUEST_PATH, return_value=GetSituationResultSuccess(situation=situation, result_details="ok")
+            ),
+            pytest.raises(ValueError, match="web address"),
+        ):
+            ProjectFileDestination.from_situation("https://example.com/out.png", "save_node_output")
+
+    def test_from_situation_rejects_non_localhost_file_uri(self) -> None:
+        """A file:// URI pointing at another host has no local path, so it is refused."""
+        from griptape_nodes.common.project_templates.situation import (
+            SituationFilePolicy,
+            SituationPolicy,
+            SituationTemplate,
+        )
+        from griptape_nodes.retained_mode.events.project_events import GetSituationResultSuccess
+
+        situation = SituationTemplate(
+            name="save_node_output",
+            macro="{outputs}/{sub_dirs?:/}{file_name_base}.{file_extension}",
+            policy=SituationPolicy(on_collision=SituationFilePolicy.OVERWRITE, create_dirs=True),
+        )
+
+        with (
+            patch(
+                HANDLE_REQUEST_PATH, return_value=GetSituationResultSuccess(situation=situation, result_details="ok")
+            ),
+            pytest.raises(ValueError, match="web address"),
+        ):
+            ProjectFileDestination.from_situation("file://remote-server/renders/out.png", "save_node_output")
+
+    def test_from_situation_windows_drive_path_is_not_a_url(self) -> None:
+        """A drive-letter path spelled `C://...` stays a path -- a drive letter is not a URL scheme."""
+        from griptape_nodes.common.project_templates.situation import (
+            SituationFilePolicy,
+            SituationPolicy,
+            SituationTemplate,
+        )
+        from griptape_nodes.retained_mode.events.project_events import GetSituationResultSuccess
+
+        situation = SituationTemplate(
+            name="save_node_output",
+            macro="{outputs}/{sub_dirs?:/}{file_name_base}.{file_extension}",
+            policy=SituationPolicy(on_collision=SituationFilePolicy.OVERWRITE, create_dirs=True),
+        )
+
+        with patch(
+            HANDLE_REQUEST_PATH, return_value=GetSituationResultSuccess(situation=situation, result_details="ok")
+        ):
+            dest = ProjectFileDestination.from_situation("C://renders/out.png", "save_node_output")
+
+        # Not raised as a URL. On POSIX this is a relative path, so it routes through the
+        # macro with sub_dirs; the point of the test is that it is not refused.
+        assert dest._file._file_metadata is not None
+        assert dest._file._file_metadata.situation is not None
+        assert dest._file._file_metadata.situation.variables is not None
+        assert dest._file._file_metadata.situation.variables["file_name_base"] == "out"
 
     def test_file_metadata_policy_matches_situation(self) -> None:
         """SidecarContent.situation.policy mirrors the situation's policy."""
