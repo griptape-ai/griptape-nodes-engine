@@ -4,7 +4,9 @@ Covers:
 - `on_handle_get_model_info_request` — token guard and HF API delegation
 - `on_handle_search_models_request` — search result handling
 - `on_handle_declare_model_invocation_request` — clears a declared invocation past the pre-dispatch chain
-- `_download_model_task` — the spawned subprocess targets a runnable module
+- `_download_model_task` — the spawned subprocess targets a runnable module, and a failed
+  download reports a written message rather than whatever landed in the subprocess pipe
+- `on_handle_download_model_request` — a missing Hugging Face token does not block the attempt
 - `_load_status_file` — status file reads survive a concurrent status file write
 """
 
@@ -12,6 +14,7 @@ import importlib.util
 import io
 import json
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -28,6 +31,8 @@ from griptape_nodes.retained_mode.events.model_events import (
     DeclareModelInvocationRequest,
     DeclareModelInvocationResultFailure,
     DeclareModelInvocationResultSuccess,
+    DownloadModelRequest,
+    DownloadModelResultSuccess,
     GetModelInfoRequest,
     GetModelInfoResultFailure,
     GetModelInfoResultSuccess,
@@ -39,10 +44,12 @@ from griptape_nodes.retained_mode.events.model_events import (
 )
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.model_manager import (
+    _PROGRESS_PIPE_ENV_VAR,
     _STATUS_READ_LOCK_ATTEMPTS,
     _STATUS_READ_TORN_ATTEMPTS,
     DownloadParams,
     ModelManager,
+    _create_progress_tracker,
     _load_status_file,
 )
 
@@ -60,17 +67,26 @@ def model_manager() -> ModelManager:
 
 class TestOnHandleGetModelInfoRequest:
     @pytest.mark.asyncio
-    async def test_returns_failure_when_no_hf_token(self, model_manager: ModelManager) -> None:
+    async def test_a_public_model_answers_without_a_token(self, model_manager: ModelManager) -> None:
+        """Hugging Face serves a public model's metadata anonymously.
+
+        Refusing the lookup without a token left every model in the picker with no size, not
+        just the gated ones it was meant to speak for.
+        """
+        expected_size = 11_125_567_216
+        fake_info = SimpleNamespace(used_storage=expected_size, safetensors=None)
+
         with patch(
-            "griptape_nodes.retained_mode.managers.model_manager.get_token",
-            return_value=None,
-        ):
+            "griptape_nodes.retained_mode.managers.model_manager.hf_model_info",
+            return_value=fake_info,
+        ) as hf_info:
             result = await model_manager.on_handle_get_model_info_request(
-                GetModelInfoRequest(model_id="microsoft/phi-2")
+                GetModelInfoRequest(model_id="google/t5-v1_1-xxl")
             )
 
-        assert isinstance(result, GetModelInfoResultFailure)
-        assert "No Hugging Face token found" in str(result.result_details)
+        assert isinstance(result, GetModelInfoResultSuccess)
+        assert result.size_bytes == expected_size
+        assert hf_info.called
 
     @pytest.mark.asyncio
     async def test_returns_success_with_size_and_metadata(self, model_manager: ModelManager) -> None:
@@ -88,15 +104,9 @@ class TestOnHandleGetModelInfoRequest:
             likes=expected_likes,
         )
 
-        with (
-            patch(
-                "griptape_nodes.retained_mode.managers.model_manager.get_token",
-                return_value="hf_token",
-            ),
-            patch(
-                "griptape_nodes.retained_mode.managers.model_manager.hf_model_info",
-                return_value=fake_info,
-            ),
+        with patch(
+            "griptape_nodes.retained_mode.managers.model_manager.hf_model_info",
+            return_value=fake_info,
         ):
             result = await model_manager.on_handle_get_model_info_request(
                 GetModelInfoRequest(model_id="microsoft/phi-2")
@@ -114,15 +124,9 @@ class TestOnHandleGetModelInfoRequest:
 
     @pytest.mark.asyncio
     async def test_returns_failure_when_hf_api_raises(self, model_manager: ModelManager) -> None:
-        with (
-            patch(
-                "griptape_nodes.retained_mode.managers.model_manager.get_token",
-                return_value="hf_token",
-            ),
-            patch(
-                "griptape_nodes.retained_mode.managers.model_manager.hf_model_info",
-                side_effect=ValueError("model not found"),
-            ),
+        with patch(
+            "griptape_nodes.retained_mode.managers.model_manager.hf_model_info",
+            side_effect=ValueError("model not found"),
         ):
             result = await model_manager.on_handle_get_model_info_request(GetModelInfoRequest(model_id="bad/model"))
 
@@ -142,15 +146,9 @@ class TestOnHandleGetModelInfoRequest:
             likes=None,
         )
 
-        with (
-            patch(
-                "griptape_nodes.retained_mode.managers.model_manager.get_token",
-                return_value="hf_token",
-            ),
-            patch(
-                "griptape_nodes.retained_mode.managers.model_manager.hf_model_info",
-                return_value=fake_info,
-            ),
+        with patch(
+            "griptape_nodes.retained_mode.managers.model_manager.hf_model_info",
+            return_value=fake_info,
         ):
             result = await model_manager.on_handle_get_model_info_request(GetModelInfoRequest(model_id="some/model"))
 
@@ -553,6 +551,226 @@ class TestDownloadModelTaskSubprocess:
 
 
 # ---------------------------------------------------------------------------
+# _create_progress_tracker — bars stay off the channel a failure is reported on
+# ---------------------------------------------------------------------------
+
+
+class TestProgressTrackerInPipeMode:
+    @pytest.fixture
+    def pipe_mode(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(_PROGRESS_PIPE_ENV_VAR, "1")
+
+    def test_a_tracked_bar_draws_nothing_but_still_counts(self, pipe_mode: None) -> None:  # noqa: ARG002
+        """Bars must stay off stderr.
+
+        Progress reaches the parent as JSON on stdout, so a drawn bar is only noise the parent
+        has to tell apart from a failure report on the same stream.
+        """
+        downloaded_bytes = 40
+        stream = io.StringIO()
+        tracker = _create_progress_tracker("org/model")
+
+        # Typed loosely because the factory hands back `type[tqdm]`: the counters this asserts on
+        # belong to the subclass it builds, which the annotation cannot name.
+        bar: Any = tracker(total=100, unit="B", desc="Downloading bytes", file=stream)
+        bar.update(downloaded_bytes)
+        bar.close()
+
+        assert stream.getvalue().strip() == ""
+        assert bar._cumulative_bytes == downloaded_bytes
+
+    def test_the_file_enumeration_bar_is_still_excluded(self, pipe_mode: None) -> None:  # noqa: ARG002
+        """Fences off tqdm's own `disable=True` as a way to stop the drawing.
+
+        A disabled tqdm returns from `tqdm.__init__` before recording `desc` or `unit`, which is
+        what this bar is recognized by, so switching to it would flip `_should_track` on and report
+        a file count as a byte total. Passes on either implementation today; it exists to fail on
+        that refactor.
+        """
+        tracker = _create_progress_tracker("org/model")
+
+        bar: Any = tracker(total=29, unit="it", desc="Fetching 29 files", file=io.StringIO())
+        bar.close()
+
+        assert bar._should_track is False
+
+
+# ---------------------------------------------------------------------------
+# _download_model_task — what a failed download tells the user
+# ---------------------------------------------------------------------------
+
+
+class _FakeStderr:
+    """Subprocess stderr that hands back preloaded chunks, then EOF."""
+
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = list(chunks)
+
+    async def readline(self) -> bytes:
+        if not self._chunks:
+            return b""
+        return self._chunks.pop(0)
+
+
+_TQDM_FRAMES = (
+    b"\rFetching 29 files:   0%|          | 0/29 [00:00<?, ?it/s]"
+    b"\rFetching 29 files:   7%| | 2/29 [00:00<00:02, 12.14it/s]\n"
+)
+
+
+class TestFailedDownloadMessages:
+    """A download failure must report a sentence someone wrote.
+
+    The subprocess pipe also carries tqdm frames and library warnings, so text taken
+    from the stream surfaces a progress animation where an explanation belongs (#3126).
+    """
+
+    async def _run_failed_download(
+        self,
+        model_manager: ModelManager,
+        stderr_chunks: list[bytes],
+        revision: str | None = None,
+    ) -> str:
+        """Run a download whose subprocess exits non-zero; return the reported message."""
+        model_manager._download_tasks = {}
+        model_manager._download_processes = {}
+
+        process = SimpleNamespace(
+            stdout=None,
+            stderr=_FakeStderr(stderr_chunks),
+            returncode=1,
+            wait=AsyncMock(return_value=1),
+        )
+        written: list[dict] = []
+
+        async def fake_create_subprocess_exec(*_cmd: str, **_kwargs: object) -> SimpleNamespace:
+            return process
+
+        with (
+            patch("asyncio.create_subprocess_exec", side_effect=fake_create_subprocess_exec),
+            patch.object(model_manager, "_write_download_status", side_effect=lambda _f, data: written.append(data)),
+            pytest.raises(ValueError, match="Attempted to download"),
+        ):
+            await model_manager._download_model_task(
+                DownloadParams(model_id="black-forest-labs/FLUX.1-dev", revision=revision)
+            )
+
+        assert written[-1]["status"] == "failed"
+        return written[-1]["error_message"]
+
+    @pytest.mark.asyncio
+    async def test_progress_frames_never_become_the_error_message(self, model_manager: ModelManager) -> None:
+        event = b'\n{"error_type": "gated_unauthenticated", "error_message": "401 Client Error."}\n'
+
+        message = await self._run_failed_download(model_manager, [_TQDM_FRAMES, event])
+
+        assert "Fetching" not in message
+        assert "HF_TOKEN" in message
+
+    @pytest.mark.asyncio
+    async def test_a_child_that_reported_nothing_still_yields_a_message(self, model_manager: ModelManager) -> None:
+        """A killed or crashed child leaves no verdict; the row must still read as English."""
+        message = await self._run_failed_download(model_manager, [])
+
+        assert "black-forest-labs/FLUX.1-dev" in message
+        assert "engine log" in message
+
+    @pytest.mark.asyncio
+    async def test_unreported_failures_do_not_leak_the_stream(self, model_manager: ModelManager) -> None:
+        noise = b"Ignored error while writing tree cache file: [Errno 1] Operation not permitted\n"
+
+        message = await self._run_failed_download(model_manager, [noise, _TQDM_FRAMES])
+
+        assert "Errno 1" not in message
+        assert "Fetching" not in message
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_download_is_not_reported_as_a_failure(self, model_manager: ModelManager) -> None:
+        """A cancel is carried out by killing the child, so its non-zero exit is expected.
+
+        Reported as a failure, it told the user their deliberate cancel "failed for an
+        unexpected reason" and left a Failed row behind the handler that removes it.
+        """
+        model_manager._download_tasks = {}
+        model_manager._download_processes = {}
+        model_manager._cancelled_downloads = {"black-forest-labs/FLUX.1-dev"}
+
+        process = SimpleNamespace(
+            stdout=None,
+            stderr=_FakeStderr([]),
+            returncode=-15,
+            wait=AsyncMock(return_value=-15),
+        )
+        written: list[dict] = []
+
+        async def fake_create_subprocess_exec(*_cmd: str, **_kwargs: object) -> SimpleNamespace:
+            return process
+
+        with (
+            patch("asyncio.create_subprocess_exec", side_effect=fake_create_subprocess_exec),
+            patch.object(model_manager, "_write_download_status", side_effect=lambda _f, data: written.append(data)),
+        ):
+            await model_manager._download_model_task(DownloadParams(model_id="black-forest-labs/FLUX.1-dev"))
+
+        assert [record["status"] for record in written] == ["downloading"]
+        assert model_manager._cancelled_downloads == set()
+
+    @pytest.mark.asyncio
+    async def test_the_pinned_revision_reaches_the_message(self, model_manager: ModelManager) -> None:
+        event = b'\n{"error_type": "revision_not_found", "error_message": "404 Client Error."}\n'
+
+        message = await self._run_failed_download(model_manager, [event], revision="refs/pr/1")
+
+        assert "refs/pr/1" in message
+
+
+# ---------------------------------------------------------------------------
+# on_handle_download_model_request — the token is not a precondition
+# ---------------------------------------------------------------------------
+
+
+class TestDownloadWithoutAToken:
+    @pytest.mark.asyncio
+    async def test_a_missing_token_does_not_block_the_attempt(
+        self, model_manager: ModelManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Public models download anonymously, and a gated one needs the 401 to reach the user.
+
+        Refusing here also returned before any status file existed, leaving the editor's
+        download list with no row to show a reason on.
+        """
+        # No token discoverable from either place `huggingface_hub` looks for one.
+        monkeypatch.delenv("HF_TOKEN", raising=False)
+        monkeypatch.setenv("HF_TOKEN_PATH", "/nonexistent/hf/token")
+        model_manager._download_tasks = {}
+        model_manager._download_processes = {}
+
+        process = SimpleNamespace(stdout=None, stderr=None, returncode=0, wait=AsyncMock(return_value=0))
+        spawned: list[str] = []
+
+        async def fake_create_subprocess_exec(*cmd: str, **_kwargs: object) -> SimpleNamespace:
+            spawned.extend(cmd)
+            return process
+
+        with (
+            patch("asyncio.create_subprocess_exec", side_effect=fake_create_subprocess_exec),
+            patch.object(model_manager, "_write_download_status"),
+        ):
+            result = await model_manager.on_handle_download_model_request(
+                DownloadModelRequest(
+                    model_id="google/t5-v1_1-xxl",
+                    local_dir=None,
+                    revision="main",
+                    allow_patterns=None,
+                    ignore_patterns=None,
+                )
+            )
+
+        assert isinstance(result, DownloadModelResultSuccess)
+        assert "google/t5-v1_1-xxl" in spawned
+
+
+# ---------------------------------------------------------------------------
 # _load_status_file — reads that land on a status file being written
 # ---------------------------------------------------------------------------
 
@@ -715,3 +933,51 @@ class TestAppInitializationCompleteWorkerGuard:
 
         find_unfinished.assert_called_once()
         assert handle_download.await_args_list[0].args[0].model_id == "org/model"
+
+
+# ---------------------------------------------------------------------------
+# _find_unfinished_downloads — which failures are worth another attempt
+# ---------------------------------------------------------------------------
+
+
+class TestFindUnfinishedDownloads:
+    """A failure the user has to act on first must not be retried once per engine start."""
+
+    @pytest.fixture
+    def status_dir(self, model_manager: ModelManager, tmp_path: Path) -> Iterator[Path]:
+        with patch.object(model_manager, "_get_status_directory", return_value=tmp_path):
+            yield tmp_path
+
+    def _write(self, status_dir: Path, model_id: str, **fields: Any) -> None:
+        record = {"model_id": model_id, "started_at": "s", "updated_at": "u", **fields}
+        (status_dir / f"{model_id.replace('/', '--')}.json").write_text(json.dumps(record), encoding="utf-8")
+
+    def test_an_interrupted_download_is_resumed(self, model_manager: ModelManager, status_dir: Path) -> None:
+        self._write(status_dir, "org/interrupted", status="downloading")
+
+        assert model_manager._find_unfinished_downloads() == ["org/interrupted"]
+
+    def test_a_failure_that_clears_on_its_own_is_retried(self, model_manager: ModelManager, status_dir: Path) -> None:
+        self._write(status_dir, "org/offline", status="failed", error_kind="network_unreachable")
+
+        assert model_manager._find_unfinished_downloads() == ["org/offline"]
+
+    def test_a_failure_needing_the_user_first_is_not_retried(
+        self, model_manager: ModelManager, status_dir: Path
+    ) -> None:
+        """Without a token, this one reached the same 401 on every engine start, forever."""
+        self._write(status_dir, "org/gated", status="failed", error_kind="gated_unauthenticated")
+
+        assert model_manager._find_unfinished_downloads() == []
+
+    def test_a_failure_recorded_before_kinds_existed_is_still_retried(
+        self, model_manager: ModelManager, status_dir: Path
+    ) -> None:
+        self._write(status_dir, "org/legacy", status="failed")
+
+        assert model_manager._find_unfinished_downloads() == ["org/legacy"]
+
+    def test_a_completed_download_is_left_alone(self, model_manager: ModelManager, status_dir: Path) -> None:
+        self._write(status_dir, "org/done", status="completed")
+
+        assert model_manager._find_unfinished_downloads() == []
