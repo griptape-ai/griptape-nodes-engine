@@ -502,6 +502,81 @@ async def test_deleting_a_supplier_of_a_later_chain_member_cancels_the_run(
 @requires_fixture_library
 @pytest.mark.usefixtures("registered_library", "parallel_mode")
 @pytest.mark.asyncio
+async def test_deleting_a_supplier_a_data_hop_away_from_the_chain_cancels_the_run(
+    tmp_path: Path,
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    create_node: Callable[..., str],
+    connect: Callable[..., None],
+) -> None:
+    """One data node in between must not make the consumer invisible.
+
+    The test above wires ``Shared`` straight into a chain member, so asking "will the run walk into
+    this node" is a question about the control graph and gets an answer. Put ``Resizer`` in between and
+    that question stops working: a node reached only by data connections is not on the control graph
+    at all, so no forward walk over control edges can ever find it.
+
+    The run still arrives, though -- as a *dependency*, the moment it reaches whatever consumes it. So
+    reachability for a data node has to be asked of its consumers rather than of the node, and until it
+    is, this delete is waved through and ``Resizer`` runs later on its parameter default.
+    """
+    flow_name = _new_flow(engine, "delete_supplier_a_data_hop_away_wf")
+    first_gate = tmp_path / "gates" / "first.gate"
+
+    create_node("GatedStreamStartNode", "Start", flow_name, library_name=LIBRARY_NAME)
+    create_node(NODE_TYPE, "First", flow_name, library_name=LIBRARY_NAME)
+    create_node(NODE_TYPE, "Second", flow_name, library_name=LIBRARY_NAME)
+    create_node("GatedStreamEndNode", "End", flow_name, library_name=LIBRARY_NAME)
+    create_node(NODE_TYPE, "Loader", flow_name, library_name=LIBRARY_NAME)
+    create_node(NODE_TYPE, "Resizer", flow_name, library_name=LIBRARY_NAME)
+
+    connect("Start", "exec_out", "First", "exec_in")
+    connect("First", "exec_out", "Second", "exec_in")
+    connect("Second", "exec_out", "End", "exec_in")
+    connect("Second", "result", "End", "result")
+    # Loader and Resizer are off the control chain entirely: only data reaches them.
+    connect("Loader", "result", "Resizer", "linked_text")
+    connect("Resizer", "result", "Second", "linked_text")
+
+    _set_parameter(engine, "Start", "text", "chain start")
+    _configure(engine, "Loader", text="from loader")
+    _configure(engine, "Resizer")
+    _configure(engine, "First", gate_file=first_gate)
+    _configure(engine, "Second")
+
+    cancellations = _record_published(engine, monkeypatch, ControlFlowCancelledEvent, lambda _payload: True)
+
+    run = asyncio.create_task(engine.ahandle_request(StartFlowRequest(flow_name=flow_name, wait_for_completion=True)))
+
+    await _wait_until_resolving(engine, "First")
+
+    dag_nodes = engine.flow_manager.global_dag_builder.node_to_reference
+    for absent_member in ("Second", "Resizer"):
+        assert absent_member not in dag_nodes, (
+            f"Test setup is wrong: {absent_member} was already in the live DAG, so this is not the "
+            f"absent-consumer case."
+        )
+
+    delete_result = await _delete_node(engine, flow_name, "Loader")
+
+    _open_gate(first_gate)
+    await _drain_cancelled_run(run)
+
+    assert cancellations, (
+        "Nothing on the control graph leads to Resizer, but the run was always going to pull it in as "
+        "a dependency of Second. Waving this delete through leaves Resizer running on its default."
+    )
+    # Resizer rather than Second: it is the node that actually loses its input, and naming the direct
+    # consumer is more use to an artist than naming the chain member two hops away.
+    assert "Resizer" in str(delete_result.result_details), (
+        f"The cancellation never named the node that lost its input: {delete_result.result_details}"
+    )
+    assert engine.flow_manager.check_for_existing_running_flow() is False
+
+
+@requires_fixture_library
+@pytest.mark.usefixtures("registered_library", "parallel_mode")
+@pytest.mark.asyncio
 async def test_deleting_a_supplier_two_hops_down_the_chain_cancels_the_run(
     tmp_path: Path,
     engine: Engine,
@@ -671,7 +746,6 @@ async def test_deleting_a_resolved_upstream_leaves_its_running_successor_alone(
     # node it is about to run as unresolved, and that happened long before the delete.
     unresolved_before_delete = len(unresolved)
     await _delete_node(engine, flow_name, "Upstream")
-    unresolved_after_delete = unresolved[unresolved_before_delete:]
 
     # Still parked in its gate, so it must still be holding the value it is running on.
     downstream = engine.node_manager.get_node_by_name("Downstream")
@@ -679,15 +753,23 @@ async def test_deleting_a_resolved_upstream_leaves_its_running_successor_alone(
         "The connection teardown reset a running node's input out from under it."
     )
 
+    # The window that matters closes here: once the node is allowed to finish, going unresolved is
+    # correct rather than a contradiction, so the "not while executing" assertion below has to stop
+    # counting at this line.
+    unresolved_at_gate_open = len(unresolved)
+    unresolved_while_executing = unresolved[unresolved_before_delete:unresolved_at_gate_open]
+
     _open_gate(downstream_gate)
     await asyncio.wait_for(run, timeout=_RUN_TIMEOUT_SECONDS)
 
-    assert downstream.state is NodeResolutionState.RESOLVED
+    # Unresolved, not resolved: it finished on a value from a connection that no longer exists, so
+    # leaving it resolved would make every later run skip rebuilding it and keep serving that value.
+    assert downstream.state is NodeResolutionState.UNRESOLVED
     assert downstream.parameter_output_values.get("result") == "from upstream", (
         "Downstream was executing on the upstream value and finished on the parameter default "
         "instead. The run reported success with the wrong answer."
     )
-    assert "Downstream" not in unresolved_after_delete, (
+    assert "Downstream" not in unresolved_while_executing, (
         "Downstream was announced unresolved while it was still executing, which the finishing run then contradicts."
     )
     assert engine.flow_manager.check_for_existing_running_flow() is False
@@ -697,6 +779,67 @@ async def test_deleting_a_resolved_upstream_leaves_its_running_successor_alone(
     # editor, so a value left behind would keep being produced on every later run.
     assert downstream.parameter_values.get("linked_text") == "", (
         "The deferred reset never applied, so the node keeps a value from a connection that no longer exists."
+    )
+
+
+@requires_fixture_library
+@pytest.mark.usefixtures("registered_library", "parallel_mode")
+@pytest.mark.asyncio
+async def test_a_later_run_does_not_keep_serving_the_deleted_connection(
+    tmp_path: Path,
+    engine: Engine,
+    create_node: Callable[..., str],
+    connect: Callable[..., None],
+) -> None:
+    """Deferring the reset must not become a permanent lie about the node being up to date.
+
+    Protecting a node that is mid-execution means letting it finish on the value it was actually
+    running on, which is right. But if that is all that happens, the node also *ends* the run looking
+    resolved -- and a resolved upstream is skipped when a later run builds its graph. So the node is
+    never rebuilt, and every subsequent run hands its consumer an output computed from a connection the
+    artist deleted. Not corrupt in flight, which is what the previous test covers, but corrupt forever.
+
+    Two runs are what makes it visible: the first is the one being protected, the second is the one
+    that has to see the deletion.
+    """
+    flow_name = _new_flow(engine, "later_run_after_deferred_reset_wf")
+    middle_gate = tmp_path / "gates" / "middle.gate"
+    consumer_gate = tmp_path / "gates" / "consumer.gate"
+
+    create_node(NODE_TYPE, "Supplier", flow_name, library_name=LIBRARY_NAME)
+    create_node(NODE_TYPE, "Middle", flow_name, library_name=LIBRARY_NAME)
+    create_node(NODE_TYPE, "Consumer", flow_name, library_name=LIBRARY_NAME)
+    connect("Supplier", "result", "Middle", "linked_text")
+    connect("Middle", "result", "Consumer", "linked_text")
+    _configure(engine, "Supplier", text="from the supplier")
+    # `linked_text` wins over `text` while the connection exists, so this only surfaces once the
+    # connection is gone -- which makes it the signal that the node really was rebuilt.
+    _configure(engine, "Middle", text="middle on its own", gate_file=middle_gate)
+    _configure(engine, "Consumer", gate_file=consumer_gate)
+
+    first_run = asyncio.create_task(engine.ahandle_request(ResolveNodeRequest(node_name="Consumer")))
+
+    await _wait_until_resolving(engine, "Middle")
+    await _delete_node(engine, flow_name, "Supplier")
+
+    _open_gate(middle_gate)
+    _open_gate(consumer_gate)
+    await asyncio.wait_for(first_run, timeout=_RUN_TIMEOUT_SECONDS)
+
+    consumer = engine.node_manager.get_node_by_name("Consumer")
+    assert consumer.parameter_values.get("linked_text") == "from the supplier", (
+        "The first run was supposed to be protected: Middle was mid-execution on the supplier value "
+        "and had to finish on it."
+    )
+
+    # Consumer is already unresolved -- tearing down the connection into Middle unresolved everything
+    # downstream of it -- so this run rebuilds, and whether it rebuilds Middle too is the whole point.
+    second_run = asyncio.create_task(engine.ahandle_request(ResolveNodeRequest(node_name="Consumer")))
+    await asyncio.wait_for(second_run, timeout=_RUN_TIMEOUT_SECONDS)
+
+    assert consumer.parameter_values.get("linked_text") == "middle on its own", (
+        "Middle was skipped as an up-to-date upstream, so Consumer was handed a value derived from a "
+        "connection that no longer exists. Every later run would do the same."
     )
 
 

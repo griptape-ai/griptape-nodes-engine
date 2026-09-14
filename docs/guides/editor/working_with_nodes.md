@@ -108,15 +108,16 @@ depends on whether the run still needs it:
 
 - **The run doesn't need it** — because it already finished with that node,
     or was never going to reach it — and the run carries straight on. A node
-    off to one side of the canvas, or one on a branch this run won't take,
-    falls in this group.
+    off to one side of the canvas, with nothing wiring it into the running
+    chain, falls in this group.
 - **The run still needs it** and the run is cancelled. The engine reports
     which node was still waiting on the one you deleted, so you can see why
     the run stopped. The run buttons come back as soon as it has wound down.
 
 A node further down the chain counts as still needed even though it hasn't
 started yet: the run is going to arrive at it, and it would arrive to find
-its input missing.
+its input missing. The same goes for a node that only feeds one of those
+indirectly, through other nodes in between.
 
 The second case is deliberate. Letting the run continue without a node it
 depends on would finish it using that parameter's default value instead of

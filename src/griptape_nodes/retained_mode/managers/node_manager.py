@@ -1292,10 +1292,11 @@ class NodeManager(EngineScoped):
 
         1. The node is part of the live run and has not settled, so the run is still counting on it
            to produce something.
-        2. A node in the live run has not been dispatched yet and is fed by this node. Dispatch is
-           when a node collects its inputs from upstream, so a consumer that has not been dispatched
-           has not received this node's outputs and would fall back to its parameter defaults --
-           finishing the run with the wrong answer and no indication anything went wrong.
+        2. A node in the live run has not been dispatched yet and is fed by this node -- directly, or
+           through data nodes in between that will be pulled in along with it. Dispatch is when a node
+           collects its inputs from upstream, so a consumer that has not been dispatched has not
+           received this node's outputs and would fall back to its parameter defaults -- finishing the
+           run with the wrong answer and no indication anything went wrong.
         3. The run is gated on this node: a data node is registered as reachable only once this node
            finishes, and would otherwise wait forever for something that is never coming.
 
@@ -1303,11 +1304,12 @@ class NodeManager(EngineScoped):
         connections count the same as data connections here: deleting a settled node whose control
         output feeds a node that has not started truncates the chain and can strand it.
 
-        Absence from the DAG does not mean the run will never reach the node. The DAG grows along the
-        control chain as it executes: only control *entry* nodes are seeded up front, and a chain
-        member is added when its predecessor completes. So a consumer one step further down the chain
-        is legitimately absent while its predecessor runs, and is still coming -- case 2 asks about
-        forward control reachability for those rather than reading absence as safety.
+        Absence from the DAG does not mean the run will never reach the node, for two separate
+        reasons. The DAG grows along the control chain as it executes: only control *entry* nodes are
+        seeded up front, and a chain member is added when its predecessor completes, so a consumer one
+        step further down the chain is legitimately absent while its predecessor runs. And a pure data
+        node is absent until the run reaches whatever consumes it, at which point it is pulled in as a
+        dependency. Case 2 asks `_run_will_reach` about both rather than reading absence as safety.
 
         Scope: this reads the *global* DAG. A node executing inside an isolated subflow (a group body,
         a ForEach iteration) runs on that subflow's own `DagBuilder` and never appears here, so
@@ -1337,14 +1339,31 @@ class NodeManager(EngineScoped):
 
         return None
 
-    def _run_will_reach(self, node: BaseNode) -> bool:
+    def _run_will_reach(self, node: BaseNode, visited: set[str] | None = None) -> bool:
         """Whether the live run is still going to arrive at a node that is not in the DAG yet.
 
-        Answered by walking control connections forward from the nodes the run has live right now.
-        Anchoring on live nodes rather than on the graphs' start nodes matters in both directions: a
-        node further down the chain is correctly reported as coming, while one the run has already
-        gone past is not, because nothing live leads back to it.
+        A run arrives at a node in one of two ways, and both have to be asked about.
+
+        It walks into it along the control chain. That is answered by walking control connections
+        forward from the nodes the run has live right now. Anchoring on live nodes rather than on the
+        graphs' start nodes matters in both directions: a node further down the chain is correctly
+        reported as coming, while one the run has already gone past is not, because nothing live
+        leads back to it.
+
+        Or it pulls the node in as a *data dependency* of whatever consumes it, when it arrives at
+        that consumer. A node reached only by data connections has no control connections of its own,
+        so the walk above can never find it -- it is not on the control graph at all. For those, the
+        run arriving is a fact about their consumers rather than about the node, which is why this
+        recurses. Control connections are excluded from that recursion on purpose: control
+        reachability was already answered exhaustively above, over every branch including untaken
+        ones, so following a control edge again could only add a false positive.
         """
+        if visited is None:
+            visited = set()
+        if node.name in visited:
+            return False
+        visited.add(node.name)
+
         dag_builder = self.engine.flow_manager.global_dag_builder
         connections = self.engine.flow_manager.get_connections()
 
@@ -1352,6 +1371,12 @@ class NodeManager(EngineScoped):
             if dag_node.node_state in _SETTLED_NODE_STATES:
                 continue
             if connections.is_node_in_forward_control_path(dag_node.node_reference, node):
+                return True
+
+        for connection in connections.get_all_outgoing_connections(node):
+            if connection.source_parameter.output_type == ParameterTypeBuiltin.CONTROL_TYPE.value:
+                continue
+            if self._run_will_reach(connection.target_node, visited):
                 return True
 
         return False
