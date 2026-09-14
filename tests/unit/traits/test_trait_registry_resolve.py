@@ -27,10 +27,6 @@ class _CollisionTraitA(Trait):
     def ui_options_for_trait(self) -> dict:
         return {}
 
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["collision_a"]
-
 
 class _CollisionTraitB(Trait):
     """The other of the two, standing in for a second library's trait of the same name."""
@@ -40,10 +36,6 @@ class _CollisionTraitB(Trait):
 
     def ui_options_for_trait(self) -> dict:
         return {}
-
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["collision_b"]
 
 
 # Renamed to collide: both now report the class name "SharedTraitName", from different

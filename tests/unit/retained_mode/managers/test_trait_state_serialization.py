@@ -343,10 +343,6 @@ class _UndeclaredCallbackTrait(Trait):
     def ui_options_for_trait(self) -> dict:
         return {}
 
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["undeclared_callback"]
-
 
 class _MisdeclaredTraitNode(BaseNode):
     """A node that grows a parameter with a trait a third-party library forgot to declare correctly."""
@@ -423,10 +419,6 @@ class _RequiredCallbackTrait(Trait):
 
     def ui_options_for_trait(self) -> dict:
         return {}
-
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["required_callback"]
 
 
 class TestTraitStateMissingARequiredArgument:

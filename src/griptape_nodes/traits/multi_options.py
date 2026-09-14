@@ -57,10 +57,6 @@ class MultiOptions(Trait):
             return {}
         return {key: written[key] for key in cls._state_parameter_names() if key in written}
 
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["multi_options"]
-
     def converters_for_trait(self) -> list[Callable]:
         def converter(value: Any) -> Any:
             # Handle case where value is not a list (convert single values to list)

@@ -12,10 +12,6 @@ class Slider(Trait):
         self.min = min_val
         self.max = max_val
 
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["slider"]
-
     def ui_options_for_trait(self) -> dict:
         return {"slider": {"min_val": self.min, "max_val": self.max}}
 

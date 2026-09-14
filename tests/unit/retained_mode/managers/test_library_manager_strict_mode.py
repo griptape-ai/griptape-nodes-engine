@@ -160,10 +160,6 @@ class TestHuggingFaceRepoParameterSurvivesTheProbe:
 class _DummyTrait(Trait):
     """Minimal concrete Trait used to exercise the trait-detection path."""
 
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["dummy"]
-
 
 class _ProbeWithConverterParam:
     """Node class whose probe exposes a Parameter with a user-attached converter."""

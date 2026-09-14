@@ -3613,11 +3613,6 @@ class Trait(ABC, BaseNodeElement):
             forwards_keywords=any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters),
         )
 
-    @classmethod
-    @abstractmethod
-    def get_trait_keys(cls) -> list[str]:
-        """This will return keys that trigger this trait."""
-
     def ui_options_for_trait(self) -> dict:
         """Returns a list of UI options for the parameter as a list of strings or dictionaries."""
         return {}

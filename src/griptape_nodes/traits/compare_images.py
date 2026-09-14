@@ -8,10 +8,6 @@ class CompareImagesTrait(Trait):
     def __init__(self) -> None:
         super().__init__()
 
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["compare_images"]
-
     def validators_for_trait(self) -> list[Callable[[Parameter, Any], Any]]:
         def validate_image_comparison(parameter: Parameter, value: Any) -> Any:
             if not isinstance(value, dict):
