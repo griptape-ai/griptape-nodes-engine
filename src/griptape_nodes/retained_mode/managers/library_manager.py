@@ -674,13 +674,10 @@ class LibraryManager(EngineScoped):
         self._is_worker: bool = False
         # The libraries this process is restricted to loading (set on workers).
         self._target_library_names: list[str] | None = None
-        # In-flight `.venv-exec` builds, keyed by the venv directory they write. Manager-level
-        # rather than on LibraryInfo because the single-writer guarantee is per DIRECTORY: a full
-        # reload deletes and recreates the LibraryInfo while a multi-minute build keeps
-        # installing, and a handle stored on the old info would be unreachable exactly when the
-        # replacement registration needs to cancel it. Entries are left behind when a build
-        # finishes (done tasks are skipped); this also keeps a strong reference so the event
-        # loop cannot garbage-collect an install mid-download.
+        # In-flight `.venv-exec` builds, keyed by the directory they write, because that is the unit
+        # the single-writer guarantee covers. Not on LibraryInfo: a reload replaces that record
+        # while a multi-minute build keeps installing, so the handle needed to cancel it would be
+        # unreachable. Also the strong reference that keeps the loop from collecting a live build.
         self._execution_env_builds: dict[str, asyncio.Task] = {}
 
         event_manager.assign_manager_to_request_type(
@@ -1071,12 +1068,10 @@ class LibraryManager(EngineScoped):
                 "the worker process that runs it stopped responding and was shut down."
             )
 
-        # Release any waiter regardless of lifecycle state. Eviction is terminal -- nothing
-        # respawns the worker -- so a waiter that keeps waiting waits forever. This has to sit
-        # OUTSIDE the WORKER_PENDING branch below: an exec-dependencies library is LOADED, because
-        # its real node classes were imported on the orchestrator before any worker existed, so
-        # the branch never fires for exactly the libraries whose execution just died. The reason
-        # recorded above is what the next run reports instead.
+        # Outside the WORKER_PENDING branch below on purpose: an exec-dependencies library is
+        # LOADED, so that branch never fires for exactly the libraries whose execution just died.
+        # Eviction is terminal -- nothing respawns the worker -- so an unreleased waiter waits
+        # forever.
         if library_info.worker_ready is not None:
             library_info.worker_ready.set()
 
@@ -3470,12 +3465,10 @@ class LibraryManager(EngineScoped):
 
         await self._add_library_edit_venv_to_sys_path(library_name, library_file_path)
 
-        # The EXECUTION environment is deliberately not spliced here. Adding it to a running
-        # interpreter cannot give the library its own versions: a module already in sys.modules is
-        # never reconsidered, and a package that probed for an optional dependency at import time
-        # has already cached the answer. A worker receives that directory as PYTHONPATH at spawn
-        # instead (WorkerManager.spawn_worker), which puts it on sys.path before the process
-        # imports anything.
+        # The EXECUTION environment is deliberately not spliced here: a module already in
+        # sys.modules is never reconsidered, and a package that probed for an optional dependency
+        # at import time has cached the answer, so adding the directory to a running interpreter
+        # cannot give the library its own versions. A worker receives it as PYTHONPATH at spawn.
 
     async def _add_library_edit_venv_to_sys_path(self, library_name: str, library_file_path: str) -> None:
         """Add a library's EDIT-time venv site-packages to sys.path, if it exists.
