@@ -682,12 +682,10 @@ class ProjectManager(EngineScoped):
         # is selected. Any code path that previously cleared this to None now routes
         # back to system defaults via SetCurrentProjectRequest's default value.
         self._current_project_id: ProjectID = SYSTEM_DEFAULTS_KEY
-        # The last activation that fully SUCCEEDED, with a generation that increments on each.
-        # `_current_project_id` is assigned before activation's fallible steps, so reading it
-        # mid-switch can observe a project about to be rolled back; a worker registering in that
-        # window would adopt an abandoned project and never hear otherwise. The committed pair is
-        # what registration replies and fan-outs carry, and the generation is how a worker orders
-        # a registration reply against a concurrently-delivered switch fan-out.
+        # The last activation that fully SUCCEEDED. `_current_project_id` is assigned before
+        # activation's fallible steps, so reading it mid-switch can observe a project about to be
+        # rolled back, and a worker registering in that window would adopt an abandoned one.
+        # Registration replies and switch fan-outs carry this pair instead.
         self._committed_project_id: ProjectID = SYSTEM_DEFAULTS_KEY
         self._project_generation: int = 0
         # Worker-side: the highest generation this engine has adopted, so a stale activation
@@ -3384,12 +3382,10 @@ class ProjectManager(EngineScoped):
         await self._load_registered_projects()
         if project_id in self._successfully_loaded_project_templates:
             return True
-        # Registered-project discovery only covers projects_to_register. A project the
+        # Registered-project discovery only covers projects_to_register, so a project the
         # orchestrator holds via the persisted `project_file` -- which is how every install names
-        # its project after any prior activation -- is invisible to it, and that miss is exactly
-        # how a worker ended up running against a different workspace than its orchestrator. The
-        # id IS the canonical template path, so when a file exists there, load it directly with
-        # the same loader the orchestrator used; the resulting id matches by construction.
+        # its project after any prior activation -- is invisible to it. The id IS the canonical
+        # template path, so when a file exists there, load it with the orchestrator's own loader.
         candidate = Path(project_id)
         # Absolute only: the branch's premise is that the id IS the canonical template path. The
         # id space also holds custom non-path ids, and probing those against this process's CWD
