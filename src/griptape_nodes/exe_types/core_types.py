@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, NamedTuple, Self, Type
 
 from pydantic import BaseModel
 
-from griptape_nodes.exe_types.callback_binding import is_derived_from_state, name_callback, resolve_callback
+from griptape_nodes.exe_types.callback_binding import name_callback, resolve_callback
 from griptape_nodes.exe_types.trait_state import TraitStateEntry, as_saved_state_value
 
 logger = logging.getLogger("griptape_nodes")
@@ -3460,6 +3460,9 @@ class Trait(ABC, BaseNodeElement):
         than being reset to the trait's default: a file that says nothing should not overrule
         live code.
 
+        A trait whose attributes depend on one another reconciles them in the setter for the
+        one being written, so a partial write cannot leave a pair out of step.
+
         Raises:
             TypeError: if ``state`` cannot satisfy the constructor. The caller reports it; a
                 half-applied trait would be worse than one left as ``__init__`` built it.
@@ -3472,7 +3475,6 @@ class Trait(ABC, BaseNodeElement):
             if not hasattr(interpreted, attribute_name):
                 continue
             setattr(self, attribute_name, getattr(interpreted, attribute_name))
-        self._recompute_derived_state()
 
     def state_from_ui_options(self, ui_options: dict[str, Any]) -> dict[str, Any]:  # noqa: ARG002
         """Return the state an inbound ``ui_options`` write is asking this trait to take on.
@@ -3509,14 +3511,15 @@ class Trait(ABC, BaseNodeElement):
 
         A lambda, a closure, or a function belonging to something other than the owning
         node has no name to resolve on load, so it would be silently lost.
+
+        A trait that derives a callback from its own state reports None for it here, since
+        the state is what gets saved, so there is nothing to warn about.
         """
         unnameable: list[str] = []
         for parameter_name in sorted(self.STATE_EXCLUDE):
             attribute_name = self.STATE_ALIASES.get(parameter_name, parameter_name)
             callback = getattr(self, attribute_name, None)
             if callback is None:
-                continue
-            if is_derived_from_state(callback):
                 continue
             if name_callback(callback, owner) is None:
                 unnameable.append(parameter_name)
@@ -3538,15 +3541,6 @@ class Trait(ABC, BaseNodeElement):
             callback = resolve_callback(method_name, owner, described_as=described_as)
             if callback is not None:
                 setattr(self, attribute_name, callback)
-
-    def _recompute_derived_state(self) -> None:
-        """Rebuild an attribute ``apply_state``'s raw ``setattr`` cannot restore on its own.
-
-        Some traits derive one attribute from another, such as ``Button`` deriving
-        ``on_click_callback`` from ``button_link``. ``apply_state`` only overwrites what was
-        saved, so a changed ``button_link`` would otherwise leave the old handler in place.
-        No-op by default; a trait overrides this where such a derived attribute exists.
-        """
 
     @classmethod
     def from_state(cls, state: dict[str, Any]) -> Self:

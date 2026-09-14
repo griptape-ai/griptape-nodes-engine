@@ -1,5 +1,7 @@
 """Callbacks on a run-time parameter survive a save by naming a method on the owning node."""
 
+from collections.abc import Callable
+
 import pytest
 
 from griptape_nodes.exe_types.core_types import NodeMessageResult, Parameter, Trait
@@ -170,8 +172,25 @@ class TestRebindingCallbacks:
         assert _button_of(parameter).on_click_callback is live_callback
 
 
-class TestApplyStateRecomputesDerivedCallbacks:
-    """apply_state overwrites button_link directly; on_click_callback must follow it."""
+def _apply_a_saved_link(button: Button, node: ButtonNode) -> None:  # noqa: ARG001
+    button.apply_state({"button_link": "https://example.test"})
+
+
+def _apply_a_saved_handler_name(button: Button, node: ButtonNode) -> None:
+    button.apply_callback_names({"on_click": "refresh"}, node)
+
+
+def _reassign_the_handler(button: Button, node: ButtonNode) -> None:
+    button.on_click_callback = node.refresh
+
+
+class TestALinkAndAHandlerCannotDrift:
+    """A button holds one click action, so a partial restore cannot leave a pair out of step.
+
+    A link is saved as state and a handler is saved as a method name, so the two arrive on
+    separate passes. Holding them as one value is what stops either pass from producing a
+    button that reports both, or a link whose handler still opens the previous URL.
+    """
 
     def test_a_changed_button_link_rebuilds_the_handler(self) -> None:
         button = Button(label="Docs", button_link="https://example.test/old")
@@ -245,3 +264,39 @@ class TestApplyStateRecomputesDerivedCallbacks:
         button.apply_state({"button_link": None})
 
         assert button.on_click_callback is None
+
+    def test_a_link_reports_one_handler_rather_than_a_fresh_one_per_read(self) -> None:
+        """Callers compare the callback by identity, so reading it must not rebuild it."""
+        button = Button(label="Docs", button_link="https://example.test")
+
+        assert button.on_click_callback is button.on_click_callback
+
+    def test_assigning_a_handler_replaces_the_link_it_had(self) -> None:
+        """How ``ParameterButton.href`` swaps a link button over to its own callback."""
+        node = ButtonNode(name="swapped")
+        button = Button(label="Docs", button_link="https://example.test")
+
+        button.on_click_callback = node.refresh
+
+        assert button.on_click_callback == node.refresh
+        assert button.button_link is None
+
+    @pytest.mark.parametrize(
+        "arrive_at_a_handler",
+        [
+            pytest.param(_apply_a_saved_link, id="saved_link_applied_over_a_handler"),
+            pytest.param(_apply_a_saved_handler_name, id="saved_name_applied_over_a_handler"),
+            pytest.param(_reassign_the_handler, id="reassigned_directly"),
+        ],
+    )
+    def test_a_button_never_reports_both_a_link_and_a_handler(
+        self, arrive_at_a_handler: Callable[[Button, ButtonNode], None]
+    ) -> None:
+        node = ButtonNode(name="both")
+        button = Button(label="Refresh", on_click=node.refresh)
+
+        arrive_at_a_handler(button, node)
+
+        assert button.on_click_handler is not None
+        assert button.button_link is None
+        assert button.to_state()["button_link"] is None
