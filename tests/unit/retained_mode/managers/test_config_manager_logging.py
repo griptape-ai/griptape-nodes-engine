@@ -23,6 +23,7 @@ import pytest
 
 from griptape_nodes.common import log_capture
 from griptape_nodes.common.log_capture import default_log_directory
+from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.config_events import (
     SetConfigCategoryRequest,
     SetConfigCategoryResultSuccess,
@@ -211,6 +212,72 @@ class TestApplyLoggingSettings:
         manager.set_config_value("log_level", "DEBUG")
 
         assert logging.getLogger("griptape_nodes").level == logging.DEBUG
+
+
+@_skip_on_windows
+@pytest.mark.usefixtures("isolate_user_config")
+class TestAWrittenSettingIsReadAsTheKindOfThingItIs:
+    """A config file holds whatever was typed into it, which is not always the right type.
+
+    Loading validates the merged config against `Settings`, but keeps the values as written
+    rather than as pydantic parsed them. So a setting declared `int` really can arrive as a
+    string of digits, and one declared `bool` as the word "false" -- and both of those are
+    truthy, non-comparable strings by the time the sinks are configured from them.
+    """
+
+    @pytest.mark.parametrize(
+        ("setting", "argument"),
+        [("session_log_buffer_lines", "buffer_lines"), ("log_retention_days", "retention_days")],
+    )
+    def test_a_count_written_as_a_string_of_digits_arrives_as_a_number(
+        self, isolate_user_config: Path, setting: str, argument: str
+    ) -> None:
+        """Both counts are compared against zero to decide whether the feature is on at all.
+
+        `"25" <= 0` is a `TypeError`, raised from the end of a config load -- and the first
+        config load happens inside `ConfigManager.__init__`, so it would be an engine that
+        refuses to start rather than a logging setting that misbehaves.
+        """
+        isolate_user_config.write_text(json.dumps({"logging": {setting: "25"}}), encoding="utf-8")
+
+        with patch(_CONFIGURE) as configure:
+            ConfigManager()
+
+        assert configure.call_args.kwargs[argument] == 25  # noqa: PLR2004
+
+    def test_file_logging_turned_off_as_a_string_is_really_off(self, isolate_user_config: Path) -> None:
+        """A non-empty string is truthy, so the user's "false" would have turned it on."""
+        isolate_user_config.write_text(json.dumps({"logging": {"log_to_file": "false"}}), encoding="utf-8")
+
+        with patch(_CONFIGURE) as configure:
+            ConfigManager()
+
+        assert configure.call_args.kwargs["log_to_file"] is False
+
+    def test_a_log_directory_written_as_a_secret_reference_still_builds_a_manager(
+        self, isolate_user_config: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`log_directory` is the one of these four whose declared type accepts a `$` value.
+
+        Reading one with expansion left on resolves it through
+        `self.engine.secrets_manager`, and `Engine.__init__` builds the `ConfigManager`
+        before the `SecretsManager` exists -- so the `AttributeError` would come out of a
+        constructor, with no log file behind it to say why. The other three are declared
+        `int`, `int`, and `bool`, so `Settings` validation rejects a `$` value in one of them
+        and the whole merged config falls back to defaults before any of this runs.
+        """
+
+        def no_peers_yet(_manager: object) -> None:
+            msg = "This manager reached for a peer while the engine was still being built."
+            raise RuntimeError(msg)
+
+        isolate_user_config.write_text(json.dumps({"logging": {"log_directory": "$SOME_VARIABLE"}}), encoding="utf-8")
+        monkeypatch.setattr(EngineScoped, "engine", property(no_peers_yet))
+
+        manager = ConfigManager()
+
+        # Not absolute, so it is ignored the way any other relative value would be.
+        assert manager.log_directory == default_log_directory()
 
 
 @_skip_on_windows

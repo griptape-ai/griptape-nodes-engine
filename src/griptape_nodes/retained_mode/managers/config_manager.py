@@ -2257,13 +2257,41 @@ class ConfigManager(EngineScoped):
             self._applied_logging_settings = settings
 
     def _resolve_logging_settings(self) -> _LoggingSettings:
-        """Read the settings the logger and its sinks are built from."""
-        buffer_lines = self.get_config_value(SESSION_LOG_BUFFER_LINES_KEY, default=DEFAULT_BUFFER_LINES, cast_type=int)
-        retention_days = self.get_config_value(LOG_RETENTION_DAYS_KEY, default=DEFAULT_RETENTION_DAYS, cast_type=int)
+        """Read the settings the logger and its sinks are built from.
+
+        Every one is read with secret expansion off, for the reason the ``log_directory``
+        property gives: expansion looks a ``$``-prefixed value up through
+        ``self.engine.secrets_manager``, and this runs at the end of every config load --
+        including the one inside ``ConfigManager.__init__``, which ``Engine.__init__``
+        performs before it has a ``SecretsManager`` to look anything up in. The
+        ``AttributeError`` would come out of a constructor: not a broken log file, an engine
+        that refuses to start, reported with no log behind it to say why. Nothing is lost by
+        reading these literally, because none of them is a credential -- a line count, a day
+        count, a flag, and a directory.
+
+        Each is also coerced to the type this returns it as. ``load_configs`` validates the
+        merged config against ``Settings``, but keeps the values as written rather than as
+        pydantic parsed them, so a config file saying ``"log_to_file": "false"`` passes
+        validation and leaves a *string* in the config -- one that is perfectly truthy, so
+        file logging would stay on for a user who turned it off. The counts arrive the same
+        way, and reach a comparison against zero that a string cannot be part of.
+        """
         return _LoggingSettings(
             log_level=str(self.merged_config.get("log_level", LogLevel.INFO.value)),
-            buffer_lines=buffer_lines,
-            log_to_file=self.get_config_value(LOG_TO_FILE_KEY, default=True, cast_type=bool),
+            buffer_lines=self.get_config_value(
+                SESSION_LOG_BUFFER_LINES_KEY,
+                default=DEFAULT_BUFFER_LINES,
+                cast_type=int,
+                should_load_env_var_if_detected=False,
+            ),
+            log_to_file=self.get_config_value(
+                LOG_TO_FILE_KEY, default=True, cast_type=bool, should_load_env_var_if_detected=False
+            ),
             log_directory=self.log_directory,
-            retention_days=retention_days,
+            retention_days=self.get_config_value(
+                LOG_RETENTION_DAYS_KEY,
+                default=DEFAULT_RETENTION_DAYS,
+                cast_type=int,
+                should_load_env_var_if_detected=False,
+            ),
         )
