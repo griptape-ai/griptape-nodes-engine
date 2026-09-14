@@ -1096,11 +1096,12 @@ class LibraryManager(EngineScoped):
         of what it needs to run, so they load here too.
         """
         roots = list(dict.fromkeys(target_library_names))
-        dependencies = [dep.library_name for dep in self._walk_declared_library_dependencies(roots)]
+        root_libraries = [library for library in (self._discovered_library(name) for name in roots) if library]
+        dependencies = [dep.library_name for dep in self._walk_declared_library_dependencies(root_libraries)]
         return list(dict.fromkeys([*roots, *dependencies]))
 
-    def _execution_dependencies_of_declared_libraries(self, library_name: str) -> list[str]:
-        """The execution dependencies declared by the libraries `library_name` depends on.
+    def _execution_dependencies_of_declared_libraries(self, library_data: LibrarySchema) -> list[str]:
+        """The execution dependencies declared by the libraries `library_data` depends on.
 
         These resolve into the depending library's OWN execution environment rather than each
         dependency's, for the same reason the combined install below already gives: two
@@ -1108,17 +1109,18 @@ class LibraryManager(EngineScoped):
         worker with both on sys.path binds whichever landed first. One resolution cannot disagree
         with itself. It also keeps a worker from writing a venv that another library owns.
         """
+        root = DiscoveredLibraryDependency(library_name=library_data.name, schema=library_data)
         dependencies: list[str] = []
-        for dep in self._walk_declared_library_dependencies([library_name]):
+        for dep in self._walk_declared_library_dependencies([root]):
             declared = dep.schema.metadata.dependencies
             if declared is not None:
                 dependencies.extend(declared.pip_dependencies_exec or [])
         return list(dict.fromkeys(dependencies))
 
     def _walk_declared_library_dependencies(
-        self, root_library_names: list[str]
+        self, roots: list[DiscoveredLibraryDependency]
     ) -> Iterator[DiscoveredLibraryDependency]:
-        """Yield every library reachable from `root_library_names` through dependency declarations.
+        """Yield every library reachable from `roots` through dependency declarations.
 
         Reads declarations from the discovered manifests rather than from LibraryRegistry, so this
         is usable before anything has loaded. Roots are not yielded, only what they depend on. A
@@ -1127,14 +1129,14 @@ class LibraryManager(EngineScoped):
         an optional companion library was absent would be a worse failure than the feature that
         companion powers being unavailable.
 
-        Each manifest is read once and travels with the name, so callers needing both do not read
-        it again.
+        Roots arrive with their manifest already read, so a caller holding one does not pay for it
+        twice, and no manifest in the graph is read more than once.
         """
-        seen = set(root_library_names)
-        queue = [schema for schema in (self._library_schema_for_name(name) for name in root_library_names) if schema]
+        seen = {root.library_name for root in roots}
+        queue = list(roots)
         while queue:
-            schema = queue.pop(0)
-            for dep in schema.metadata.declarations or []:
+            library = queue.pop(0)
+            for dep in library.schema.metadata.declarations or []:
                 if not isinstance(dep, LibraryDependencyDeclaration):
                     continue
                 repo_name = self._parse_dependency_url(dep.url).repo_name
@@ -1143,18 +1145,25 @@ class LibraryManager(EngineScoped):
                     logger.info(
                         "Library '%s' declares a dependency on '%s', which is not installed here; "
                         "features that need it will be unavailable in this process.",
-                        schema.name,
+                        library.library_name,
                         repo_name,
                     )
                     continue
                 if dep_info.library_name in seen:
                     continue
                 seen.add(dep_info.library_name)
-                dep_schema = self._library_schema_for_name(dep_info.library_name)
-                if dep_schema is None:
+                discovered = self._discovered_library(dep_info.library_name)
+                if discovered is None:
                     continue
-                queue.append(dep_schema)
-                yield DiscoveredLibraryDependency(library_name=dep_info.library_name, schema=dep_schema)
+                queue.append(discovered)
+                yield discovered
+
+    def _discovered_library(self, library_name: str) -> DiscoveredLibraryDependency | None:
+        """`library_name` paired with its discovered manifest, or None when it cannot be read."""
+        schema = self._library_schema_for_name(library_name)
+        if schema is None:
+            return None
+        return DiscoveredLibraryDependency(library_name=library_name, schema=schema)
 
     def _library_schema_for_name(self, library_name: str) -> LibrarySchema | None:
         """The discovered manifest for `library_name`, or None when it cannot be read.
@@ -7308,7 +7317,7 @@ class LibraryManager(EngineScoped):
         # below reads the combined set. A library that declares no execution dependencies of its
         # own still needs one built when something it depends on does.
         execution_dependencies = list(
-            dict.fromkeys([*pip_dependencies_exec, *self._execution_dependencies_of_declared_libraries(library_name)])
+            dict.fromkeys([*pip_dependencies_exec, *self._execution_dependencies_of_declared_libraries(library_data)])
         )
 
         # Ahead of either install and outside every gate below: a manifest that stopped declaring
