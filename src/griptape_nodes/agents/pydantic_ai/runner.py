@@ -339,6 +339,8 @@ class PydanticAgentRunner:
         cancel_event: asyncio.Event | None = None,
         persist_prompt: str | Sequence[UserContent] | None = None,
         history_rehydrator: Callable[[list[ModelMessage]], Awaitable[list[ModelMessage]]] | None = None,
+        extra_toolsets: Sequence[AbstractToolset[Any]] | None = None,
+        extra_instructions: str | None = None,
     ) -> AgentRunResult:
         """Run the agent against ``prompt``, streaming events and saving history.
 
@@ -367,6 +369,15 @@ class PydanticAgentRunner:
                 input: the pristine history is persisted again after this turn,
                 so any in-place edit would leak back onto disk. ``None`` sends
                 the loaded history to the model unchanged.
+            extra_toolsets: Toolsets to attach to this run only, on top of the
+                ones baked into the agent. Pydantic AI treats run-level toolsets
+                as additive, so these do not replace ``mcp_servers``. Use this
+                for toolsets whose configuration can change between runs - an
+                MCP server the user just edited - so the run picks up the
+                current config without rebuilding the agent.
+            extra_instructions: Instructions to append for this run only, in the
+                same additive spirit. Guidance that belongs to a toolset passed
+                via ``extra_toolsets`` travels here, so the two stay in sync.
 
         Returns:
             An :class:`AgentRunResult` describing the new state of the thread.
@@ -388,11 +399,12 @@ class PydanticAgentRunner:
         capabilities = self._build_skills_capabilities()
 
         logger.info(
-            "[run %s] start: model=%s history_len=%d skills=%s prompt=%r",
+            "[run %s] start: model=%s history_len=%d skills=%s run_toolsets=%d prompt=%r",
             run_id,
             self.model_name,
             len(history),
             [name for capability in capabilities for name in capability.skill_names],
+            len(extra_toolsets or []),
             _prompt_preview(prompt),
         )
         started = time.monotonic()
@@ -412,6 +424,8 @@ class PydanticAgentRunner:
                 usage_limits=self.usage_limits,
                 event_stream_handler=event_handler,
                 capabilities=capabilities or None,
+                toolsets=list(extra_toolsets) if extra_toolsets else None,
+                instructions=extra_instructions or None,
             )
         )
         try:
