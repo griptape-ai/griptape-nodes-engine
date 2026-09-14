@@ -85,11 +85,17 @@ class _Run:
         return [type(request).__name__ for request in self.requests]
 
 
-def _run(result: object) -> _Run:
+def _run(result: object, *, library_load: object = None) -> _Run:
     """Invoke the command with a stubbed engine and capture what it did.
 
     Printed into a string buffer rather than a Mock console, so a test can assert the
     command got as far as printing its verdict instead of only that it did not raise.
+
+    Args:
+        result: What the health-check request returns, or an exception for it to raise.
+            Raising stands for an engine that could not be built at all, since dispatching
+            the request is what builds one.
+        library_load: The same, for the library load that runs before it.
     """
     console = Console(
         file=io.StringIO(), record=True, width=_WIDE_ENOUGH_NOT_TO_WRAP, no_color=True, legacy_windows=False
@@ -100,8 +106,12 @@ def _run(result: object) -> _Run:
         # silently hands the library load's answer to the health checks the day the command
         # dispatches one more request.
         if isinstance(request, RunHealthChecksRequest):
+            if isinstance(result, Exception):
+                raise result
             return result
-        return None
+        if isinstance(library_load, Exception):
+            raise library_load
+        return library_load
 
     exit_code: int | None = None
     with (
@@ -153,6 +163,48 @@ class TestDoctorCommand:
         run = _run(_success(HealthStatus.PASS))
 
         assert run.request_type_names() == ["LoadLibrariesRequest", "RunHealthChecksRequest"]
+
+
+class TestAnEngineThatWillNotStart:
+    """The most likely reason somebody is running this command is that something is broken.
+
+    Both of the requests it makes are what build the engine in the first place, so a config
+    file the engine cannot get past, or a node library that raises on import, surfaces as an
+    exception out of a dispatch. Unguarded, the tool that exists to explain that answered
+    with a traceback -- the same thing the user had already seen, and the reason they came
+    here.
+    """
+
+    def test_an_engine_that_cannot_be_built_is_explained_rather_than_traced(self) -> None:
+        run = _run(RuntimeError("the config file could not be parsed"))
+
+        assert run.exit_code == 1
+        assert "The engine itself could not be started" in run.printed
+        assert "the config file could not be parsed" in run.printed
+
+    def test_libraries_that_will_not_load_do_not_stop_the_checks(self) -> None:
+        """Which libraries are broken is one of the checks, so this is a finding, not a stop.
+
+        The library check reports what failed to arrive, which is more use than the import
+        error on its own -- and every other check still has something to say about a machine
+        whose libraries are broken.
+        """
+        run = _run(_success(HealthStatus.PASS), library_load=RuntimeError("a node library raised on import"))
+
+        assert run.exit_code is None
+        assert "a node library raised on import" in run.printed
+        assert _ALL_CLEAR in run.printed
+
+    def test_the_text_of_a_failure_holding_markup_is_shown_as_written(self) -> None:
+        """These messages quote an exception raised while reading the user's own files.
+
+        A config path or a library name can hold square brackets, which Rich reads as a style
+        tag: unescaped, the part of the message that names what broke is dropped silently, or
+        an unknown tag raises a second error on top of the first.
+        """
+        run = _run(RuntimeError("could not read [beta] settings"))
+
+        assert "could not read [beta] settings" in run.printed
 
 
 class TestPrintedVerdict:

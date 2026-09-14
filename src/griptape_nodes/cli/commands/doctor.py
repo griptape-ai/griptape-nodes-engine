@@ -36,11 +36,28 @@ async def _doctor_async() -> None:
     """Run the engine's health checks and print what they found."""
     # Libraries are loaded first because "which libraries are broken" is one of the
     # checks, and an engine that has not loaded any would report none at all.
-    with console.status("Loading libraries..."):
-        await GriptapeNodes.ahandle_request(LoadLibrariesRequest())
+    #
+    # Both of these calls are guarded, and guarded broadly, because both of them start the
+    # engine -- and a broken engine is the single most likely reason somebody is running
+    # this command. A library whose import raises, a config file the engine cannot get
+    # past: left unguarded, the tool that exists to explain those answers with a traceback,
+    # which is the same thing the user already saw. A message naming what was being
+    # attempted is the least this command owes somebody who came here for help.
+    try:
+        with console.status("Loading libraries..."):
+            await GriptapeNodes.ahandle_request(LoadLibrariesRequest())
+    except Exception as err:
+        # Not fatal. The library check reports what failed to arrive, which is the finding.
+        console.print(f"[yellow]Attempted to load the libraries. Failed: {escape(str(err))}[/yellow]")
+        console.print("[yellow]The checks below run anyway, without them.[/yellow]")
 
-    with console.status("Running health checks..."):
-        result = await GriptapeNodes.ahandle_request(RunHealthChecksRequest(broadcast_result=False))
+    try:
+        with console.status("Running health checks..."):
+            result = await GriptapeNodes.ahandle_request(RunHealthChecksRequest(broadcast_result=False))
+    except Exception as err:
+        console.print("[red]Attempted to run health checks. The engine itself could not be started.[/red]")
+        console.print(f"[red]{escape(str(err))}[/red]")
+        raise typer.Exit(code=1) from err
 
     if not isinstance(result, RunHealthChecksResultSuccess):
         console.print("[red]Attempted to run health checks. Failed before any check could run.[/red]")
