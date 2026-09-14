@@ -14,6 +14,7 @@ future's done flag: the flag was always set promptly, which is exactly why the b
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 import time
 from typing import Any
@@ -59,7 +60,7 @@ def _await_tracked(client: RequestClient, request_id: str) -> Any:
     async def run() -> tuple[Any, float]:
         future = await client.track_request(request_id)
         started = time.monotonic()
-        result = await asyncio.wait_for(future, timeout=WAITER_TIMEOUT_S)
+        result = await asyncio.wait_for(asyncio.wrap_future(future), timeout=WAITER_TIMEOUT_S)
         return result, time.monotonic() - started
 
     return run()
@@ -102,7 +103,7 @@ class TestCrossLoopSettlement:
                 future = await client.track_request("req-3", tag="worker-a")
                 started = time.monotonic()
                 try:
-                    await asyncio.wait_for(future, timeout=WAITER_TIMEOUT_S)
+                    await asyncio.wait_for(asyncio.wrap_future(future), timeout=WAITER_TIMEOUT_S)
                 except asyncio.CancelledError:
                     return time.monotonic() - started
                 msg = "expected cancellation"
@@ -113,7 +114,7 @@ class TestCrossLoopSettlement:
 
             # cancel_requests_by_tag is async only for its lock; drive its body from here.
             entry = client._pending_requests.pop("req-3")
-            RequestClient._settle(entry, entry.future.cancel)
+            RequestClient._settle(entry.future.cancel)
             elapsed = pending.result(timeout=WAITER_TIMEOUT_S + 5)
 
         assert elapsed < PROMPT_S, f"waiter learned of the cancel after {elapsed:.1f}s"
@@ -144,3 +145,84 @@ class TestLockCrossesLoops:
 
             assert "req-a" not in client._pending_requests
             assert "req-b" in client._pending_requests
+
+
+class TestTheFutureHasNoOwningLoop:
+    """A tracked future outlives, and is independent of, the loop that created it."""
+
+    def test_a_future_is_awaited_from_a_loop_that_did_not_create_it(self) -> None:
+        client = _client()
+        # asyncio.run closes its loop on the way out, so by the time anything waits on this
+        # future the loop that created it no longer exists.
+        future = asyncio.run(client.track_request("portable-1"))
+
+        async def wait_for_it() -> Any:
+            return await asyncio.wait_for(asyncio.wrap_future(future), timeout=WAITER_TIMEOUT_S)
+
+        with _LoopInThread() as third_loop:
+            pending = asyncio.run_coroutine_threadsafe(wait_for_it(), third_loop)
+            time.sleep(0.2)
+            client._resolve_request_unlocked("portable-1", {"ok": True})
+
+            assert pending.result(timeout=PROMPT_S) == {"ok": True}
+
+    def test_a_result_survives_its_creating_loop_being_closed(self) -> None:
+        """The loop-bound design had to drop this settle; there is no longer anything to drop.
+
+        Its owning loop was gone, so `call_soon_threadsafe` raised and the result was discarded
+        with a debug line. Nothing was waiting by then, but the settle had to be defended against.
+        """
+        client = _client()
+        future = asyncio.run(client.track_request("orphan-1"))
+
+        client._resolve_request_unlocked("orphan-1", {"ok": True})
+
+        assert future.result(timeout=0) == {"ok": True}
+
+
+class TestSettlingAnAlreadyFinishedRequest:
+    """A waiter that gives up settles the future itself, without holding the client's lock.
+
+    `wrap_future` propagates the waiter's cancellation into the tracked future, so a response
+    landing at that moment meets a future that is already done. The loop-bound design could not
+    reach this state: every settle was funnelled through one loop's callback queue, which
+    serialized them for free.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_response_arriving_after_the_waiter_timed_out_is_dropped(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        client = _client()
+        future = await client.track_request("late-1")
+
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.wrap_future(future), timeout=0.01)
+        assert future.cancelled(), "the waiter's timeout should have cancelled the tracked future"
+
+        # The transport has no idea the waiter left. Delivering to it must not raise.
+        with caplog.at_level(logging.DEBUG, logger="griptape_nodes.api_client.request_client"):
+            await client._resolve_request("late-1", {"ok": True})
+
+        # Asserted so the guard cannot quietly become unreachable: without it this settle raises.
+        assert "already-finished" in caplog.text
+        assert client.pending_count == 0
+
+    @pytest.mark.asyncio
+    async def test_a_rejection_arriving_after_a_cancel_by_tag_is_dropped(self) -> None:
+        client = _client()
+        await client.track_request("late-2", tag="worker-a")
+
+        await client.cancel_requests_by_tag("worker-a")
+        # cancel_requests_by_tag already popped the entry, so this is the unknown-request path.
+        await client._reject_request("late-2", RuntimeError("worker died"))
+
+        assert client.pending_count == 0
+
+    @pytest.mark.asyncio
+    async def test_a_duplicate_request_id_still_raises(self) -> None:
+        client = _client()
+        await client.track_request("dup-1")
+
+        with pytest.raises(ValueError, match="Request ID already exists"):
+            await client.track_request("dup-1")
