@@ -232,19 +232,12 @@ class WorkerManager(EngineScoped):
 
         response_topic = f"sessions/{session_id}/workers/{wid}/response"
         await self._tx.subscribe_to_topic(response_topic)
-        # Answer with the project this orchestrator has active. Registration is the only moment
-        # both sides are guaranteed to exist, so it is the one place the two can be put on the same
-        # workspace without a race: the worker adopts this before it loads any library, and
-        # libraries resolve against the workspace a project decides. Pushing it afterwards would
-        # leave the worker's library load and the push ordered by chance.
-        # None on the wire for system defaults, so the worker needs no sentinel knowledge: a
-        # fresh worker IS on system defaults, and both processes derive that workspace from the
-        # same config files, the same CWD, and the same inherited environment.
-        # The COMMITTED pair, not the live id: `_current_project_id` is assigned before
-        # activation's fallible steps, so a registration handled mid-switch could otherwise name
-        # a project about to be rolled back. The generation lets the worker order this reply
-        # against a switch fan-out delivered concurrently -- newest committed activation wins,
-        # regardless of which message arrives first.
+        # The worker adopts this before loading any library, and libraries resolve against the
+        # workspace a project decides, so pushing it afterwards would order the two by chance.
+        # The COMMITTED pair rather than the live id: `_current_project_id` is assigned before
+        # activation's fallible steps, so a registration handled mid-switch could name a project
+        # about to be rolled back. System defaults go over the wire as None, which a fresh worker
+        # already is.
         current_project_id, project_generation = self.engine.project_manager.committed_project()
         if current_project_id == SYSTEM_DEFAULTS_KEY:
             current_project_id = None
@@ -952,10 +945,7 @@ class WorkerManager(EngineScoped):
                 return f"{worker_engine_id}: no reply within {self.heartbeat_startup_grace_s:g} seconds"
             except Exception as e:
                 return f"{worker_engine_id}: {type(e).__name__}: {e}"
-            # endswith rather than a substring test: every result payload ends in ResultSuccess or
-            # ResultFailure, and a substring match would read any type merely CONTAINING "Success"
-            # as one. The result may also be absent or not a dict, in which case the raw reply is
-            # the most informative thing to report.
+            # endswith, not a substring test: that would read any type merely CONTAINING "Success".
             if not str(raw.get("result_type", "")).endswith("ResultSuccess"):
                 result = raw.get("result")
                 details = result.get("result_details", raw) if isinstance(result, dict) else raw

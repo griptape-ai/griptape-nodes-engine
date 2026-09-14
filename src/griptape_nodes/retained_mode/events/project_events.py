@@ -27,11 +27,10 @@ if TYPE_CHECKING:
     # Circular import: project_events -> project_manager -> file.py -> os_events -> project_events
     from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
 
-# The opaque id a project is keyed by. Defined HERE, on the events side, because payloads
-# annotate with it and pydantic must resolve the name at runtime -- a TYPE_CHECKING import
-# leaves TypeAdapter(SetCurrentProjectRequest) unresolvable, which broke every consumer that
-# validates payloads generically (the MCP server). ProjectManager imports it from here, which
-# is the dependency direction that cannot cycle: events are the leaf.
+# The opaque id a project is keyed by. Lives here rather than in ProjectManager because payloads
+# annotate with it and pydantic resolves those annotations at runtime, so a TYPE_CHECKING-only
+# import leaves them unresolvable. Events are the leaf of the import graph, so ProjectManager
+# importing it from here cannot cycle.
 ProjectID = str
 
 
