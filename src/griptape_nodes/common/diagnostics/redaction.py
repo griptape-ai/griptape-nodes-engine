@@ -143,9 +143,16 @@ _SIGNED_URL_PATTERN = TextPattern(
 # not itself a credential. The single-component form (`scheme://token@host`) is deliberately
 # left alone, because its overwhelmingly common spelling is `ssh://git@github.com` and
 # redacting that would replace an identifier nobody needs hidden in every URL in a bundle.
+#
+# The password class allows `@`, and the greedy `+` therefore runs to the *last* `@` in the
+# authority. With `@` excluded it stopped at the first one, so `postgres://u:p@ssw0rd@host`
+# redacted only `p` and wrote `ssw0rd` -- most of a live password -- into the bundle. What
+# the class does exclude is everything that ends an authority: whitespace and `/?#`. Without
+# those, an `@` later in the same URL (`https://u:pw@host/?to=a@b.com`) is the one the greedy
+# match backtracks to, and the host would be redacted along with the password.
 _URL_CREDENTIALS_PATTERN = TextPattern(
     RedactionReason.URL_CREDENTIALS,
-    re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^/\s:@]+):[^/\s@]+@"),
+    re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^/\s:@]+):[^/?#\s]+@"),
     rf"\1:{REDACTED}@",
 )
 

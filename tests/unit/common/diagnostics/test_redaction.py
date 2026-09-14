@@ -353,6 +353,72 @@ class TestCredentialPatterns:
         assert redactor.total_redactions() == 0
 
 
+class TestPasswordsInUrls:
+    """`scheme://user:password@host` is how a private git remote or MCP server is addressed.
+
+    Neither `git_url` nor `url` is a key name that looks sensitive, so this rule is the only
+    thing between the password in one and the config section of a bundle.
+    """
+
+    def test_removes_the_password_and_keeps_the_user(self) -> None:
+        """Which auth scheme was in use is what support needs; the token is not."""
+        redactor = Redactor(normalize_identity=False)
+
+        redacted = redactor.redact_text("https://oauth2:glpat-abcdefghij@gitlab.com/acme/nodes.git")
+
+        assert "glpat-abcdefghij" not in redacted
+        assert redacted == "https://oauth2:<redacted>@gitlab.com/acme/nodes.git"
+        assert redactor.counts() == {RedactionReason.URL_CREDENTIALS: 1}
+
+    @pytest.mark.parametrize(
+        ("url", "expected"),
+        [
+            ("postgres://sam:p@ssw0rd@db.internal/app", "postgres://sam:<redacted>@db.internal/app"),
+            ("postgres://sam:@@@@@db.internal/app", "postgres://sam:<redacted>@db.internal/app"),
+            ("https://sam:tr@ilingat@@example.com/x", "https://sam:<redacted>@example.com/x"),
+        ],
+    )
+    def test_removes_all_of_a_password_containing_an_at_sign(self, url: str, expected: str) -> None:
+        """The whole password goes, not the part of it before its first `@`.
+
+        A password class that stopped at the first `@` matched only `p` of `p@ssw0rd` and
+        wrote the rest into the bundle verbatim -- and an `@` is exactly the kind of
+        character a password policy asks for, so this is the likely spelling, not the exotic
+        one.
+        """
+        redactor = Redactor(normalize_identity=False)
+
+        assert redactor.redact_text(url) == expected
+
+    def test_keeps_the_host_when_something_later_in_the_url_holds_an_at_sign(self) -> None:
+        """Matching to the last `@` in the line rather than in the authority ate the host."""
+        redactor = Redactor(normalize_identity=False)
+
+        redacted = redactor.redact_text("https://sam:secret@mail.example.com/send?to=someone@example.com")
+
+        assert "secret" not in redacted
+        assert redacted.startswith("https://sam:<redacted>@mail.example.com/send")
+
+    def test_keeps_an_email_address_later_on_the_same_line(self) -> None:
+        redactor = Redactor(normalize_identity=False)
+
+        redacted = redactor.redact_text("cloning postgres://sam:secret@db.internal for sam@example.com")
+
+        assert "secret" not in redacted
+        assert redacted == "cloning postgres://sam:<redacted>@db.internal for sam@example.com"
+
+    def test_leaves_the_single_component_form_alone(self) -> None:
+        """`ssh://git@github.com` is the overwhelmingly common spelling of `scheme://x@host`.
+
+        `git` identifies nobody, and hiding it would replace an identifier in every remote
+        URL in a bundle for nothing.
+        """
+        redactor = Redactor(normalize_identity=False)
+
+        assert redactor.redact_text("ssh://git@github.com/acme/nodes.git") == "ssh://git@github.com/acme/nodes.git"
+        assert redactor.total_redactions() == 0
+
+
 class TestIdentityNormalization:
     def test_replaces_the_home_directory_with_a_tilde(self) -> None:
         redactor = Redactor()
