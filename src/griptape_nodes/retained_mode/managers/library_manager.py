@@ -373,6 +373,14 @@ class LibraryGitOperationContext(NamedTuple):
     library_dir: Path
 
 
+class ParsedDependencyUrl(NamedTuple):
+    """A library-dependency declaration's URL, interpreted once for every caller."""
+
+    repo_name: str
+    normalized_url: str
+    ref: str | None
+
+
 class LibraryUpdateInfo(NamedTuple):
     """Information about a library pending update."""
 
@@ -1051,7 +1059,7 @@ class LibraryManager(EngineScoped):
                 continue
 
             for dep in lib_deps:
-                repo_name = self._repo_name_from_dependency_url(dep.url)
+                repo_name = self._parse_dependency_url(dep.url).repo_name
                 dep_info = self._library_info_for_repo_name(repo_name)
                 if dep_info is None:
                     logger.warning(
@@ -1108,7 +1116,7 @@ class LibraryManager(EngineScoped):
             for dep in declarations:
                 if not isinstance(dep, LibraryDependencyDeclaration):
                     continue
-                repo_name = self._repo_name_from_dependency_url(dep.url)
+                repo_name = self._parse_dependency_url(dep.url).repo_name
                 dep_info = self._library_info_for_repo_name(repo_name)
                 if dep_info is None or dep_info.library_name is None:
                     logger.info(
@@ -1124,15 +1132,21 @@ class LibraryManager(EngineScoped):
         return expanded
 
     @staticmethod
-    def _repo_name_from_dependency_url(url: str) -> str:
-        """The repo name a dependency declaration resolves to, normalized once for every caller.
+    def _parse_dependency_url(url: str) -> ParsedDependencyUrl:
+        """Interpret a dependency declaration's URL, once, for every caller.
 
         A declaration URL may carry an `@ref` suffix and a `.git` extension, and both change the
-        final path segment this yields. Two call sites normalizing differently meant one resolved a
-        declaration the other missed, and a miss only logs -- so a worker's target list quietly
-        disagreed with the transitive resolver about the same manifest.
+        final path segment the repo name comes from. Call sites normalizing differently meant one
+        resolved a declaration the other missed, and a miss only logs -- so a worker's target list
+        quietly disagreed with the transitive resolver about the same manifest.
         """
-        return extract_repo_name_from_url(normalize_github_url(parse_git_url_with_ref(url).url))
+        parsed = parse_git_url_with_ref(url)
+        normalized_url = normalize_github_url(parsed.url)
+        return ParsedDependencyUrl(
+            repo_name=extract_repo_name_from_url(normalized_url),
+            normalized_url=normalized_url,
+            ref=parsed.ref,
+        )
 
     def _library_info_for_repo_name(self, repo_name: str) -> LibraryInfo | None:
         """Resolve a library-dependency URL's repo name to a discovered library.
@@ -2636,9 +2650,8 @@ class LibraryManager(EngineScoped):
                                 cast_type=str,
                             )
                             for dep in griptape_library_deps:
-                                parsed = parse_git_url_with_ref(dep.url)
-                                normalized_url = normalize_github_url(parsed.url)
-                                repo_name = extract_repo_name_from_url(normalized_url)
+                                parsed_dep = self._parse_dependency_url(dep.url)
+                                repo_name = parsed_dep.repo_name
                                 already_registered = any(
                                     (info.library_name == repo_name or repo_name in Path(info.library_path).parts)
                                     and info.lifecycle_state != LibraryManager.LibraryLifecycleState.FAILURE
@@ -2671,8 +2684,8 @@ class LibraryManager(EngineScoped):
                                     continue
                                 dep_result = await self.download_library_request(
                                     DownloadLibraryRequest(
-                                        git_url=normalized_url,
-                                        branch_tag_commit=parsed.ref,
+                                        git_url=parsed_dep.normalized_url,
+                                        branch_tag_commit=parsed_dep.ref,
                                         fail_on_exists=False,
                                         auto_register=True,
                                     )

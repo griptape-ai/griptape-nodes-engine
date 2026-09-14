@@ -545,13 +545,32 @@ class TestLibraryDependencyResolution:
         ],
     )
     def test_every_spelling_of_a_declaration_url_yields_one_repo_name(self, url: str) -> None:
-        """Both callers of the resolver read the same field, so they must normalize it the same way.
+        """Every caller reads this field, so it must be derived one way.
 
         A `@ref` suffix and a `.git` extension both change the final path segment. One call site
         normalized and the other did not, so a pinned declaration resolved for the transitive
         resolver and missed for the worker's target expansion -- and a miss only logs.
         """
-        assert LibraryManager._repo_name_from_dependency_url(url) == "griptape-nodes-library-openexr"
+        assert LibraryManager._parse_dependency_url(url).repo_name == "griptape-nodes-library-openexr"
+
+    @pytest.mark.parametrize(
+        ("url", "expected_ref"),
+        [
+            ("griptape-ai/griptape-nodes-library-openexr", None),
+            ("griptape-ai/griptape-nodes-library-openexr@v1.2.0", "v1.2.0"),
+            ("https://github.com/griptape-ai/griptape-nodes-library-openexr.git@v1.2.0", "v1.2.0"),
+        ],
+    )
+    def test_the_parsed_url_carries_what_the_download_needs(self, url: str, expected_ref: str | None) -> None:
+        """Registration downloads a missing dependency from these two fields, not from the repo name.
+
+        The ref is what pins a declaration to a version, so losing it installs the default branch
+        instead of the declared one -- and the install still reports success.
+        """
+        parsed = LibraryManager._parse_dependency_url(url)
+
+        assert parsed.ref == expected_ref
+        assert parsed.normalized_url == "https://github.com/griptape-ai/griptape-nodes-library-openexr.git"
 
     def test_a_failed_duplicate_does_not_mask_the_copy_that_loaded(self) -> None:
         """One path can hold a FAILURE record beside the copy that loaded.
