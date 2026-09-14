@@ -33,12 +33,8 @@ STATIC_SERVER_URL = os.getenv("STATIC_SERVER_URL", "/workspace")
 STATIC_SERVER_LOG_LEVEL = os.getenv("STATIC_SERVER_LOG_LEVEL", "ERROR").lower()
 
 logger = logging.getLogger("griptape_nodes_api")
-# markup=False so a log message is never parsed as Rich markup. Request paths and error
-# text can contain square brackets, and a stray `[/...]` sequence raises MarkupError from
-# inside RichHandler.emit -- which does not guard the markup parse, so the error escapes
-# the logging call and takes down whatever was being logged. Colour, the time column and
-# rich tracebacks all still work; a line that genuinely wants markup can opt in per-record
-# with logger.info(..., extra={"markup": True}).
+# markup=False: a log message body is data, never Rich markup. Request paths and error text
+# can contain brackets, and Rich raises MarkupError on an unmatched `[/...]`. See #5512.
 logging.getLogger("uvicorn").addHandler(
     RichHandler(show_time=True, show_path=False, markup=False, rich_tracebacks=True)
 )

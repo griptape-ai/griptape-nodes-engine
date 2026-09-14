@@ -5,7 +5,7 @@ import functools
 import hashlib
 import logging
 from datetime import UTC
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from rich.logging import RichHandler
 from rich.table import Table
@@ -44,17 +44,19 @@ class _EngineRoleFilter(logging.Filter):
 class _EngineRoleHandler(RichHandler):
     """RichHandler that inserts a worker engine designator as its own column between log level and message.
 
-    Construct this with ``markup=False``. Log messages carry user- and model-authored text
-    (prompts, tool arguments, tool results, exception strings), and Rich reads a bracketed
-    sequence such as ``[/SECTION]`` as a closing style tag. With no matching open tag that
-    raises MarkupError from ``RichHandler.emit``, which guards only the console write and not
-    the markup parse -- so the error escapes the ``logger.info(...)`` call and takes down the
-    caller. Colour, the time column, the designator column and rich tracebacks are all
-    unaffected by ``markup=False``; a line that genuinely wants markup opts in per-record
-    with ``logger.info(..., extra={"markup": True})``.
+    Never markup-parses a message body. Log messages carry user- and model-authored text, and
+    Rich reads a bracketed sequence such as ``[/SECTION]`` as a closing style tag -- raising
+    MarkupError out of the logging call, or silently eating the text. A line that genuinely
+    wants markup opts in per-record with ``logger.info(..., extra={"markup": True})``.
     """
 
     _COLUMN_WIDTH = 15  # display width for "Worker-XXXXXXXX"
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        # Forced rather than defaulted: the crash this prevents came from callers who passed
+        # markup=True explicitly. RichHandler already defaults it off.
+        kwargs["markup"] = False
+        super().__init__(*args, **kwargs)
 
     def render(  # type: ignore[override]
         self,

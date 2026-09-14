@@ -86,7 +86,7 @@ class TestEngineRoleFilter:
 class TestEngineRoleHandlerRender:
     @pytest.fixture
     def handler(self) -> _EngineRoleHandler:
-        return _EngineRoleHandler(show_time=True, show_path=False, markup=False, rich_tracebacks=True)
+        return _EngineRoleHandler(show_time=True, show_path=False, rich_tracebacks=True)
 
     def test_render_without_prefix_returns_a_value(self, handler: _EngineRoleHandler) -> None:
         record = _make_record(prefix="")
@@ -122,10 +122,8 @@ class TestEngineRoleHandlerRender:
 class TestBracketedTextInLogMessages:
     """Bracketed text in a log message must render literally, never as Rich markup.
 
-    Prompts, tool arguments, tool results and exception strings all reach the console
-    handler. Rich reads `[/SECTION]` as a closing style tag, and an unmatched one raises
-    MarkupError from a spot inside RichHandler.emit that is not guarded, so the error
-    escapes the logging call and takes down the caller rather than dropping a log line.
+    Log messages carry user- and model-authored text, so the handler must not treat a
+    message body as markup. See issue #5512.
     """
 
     @pytest.fixture
@@ -138,7 +136,6 @@ class TestBracketedTextInLogMessages:
             show_time=False,
             show_path=False,
             show_level=False,
-            markup=False,
             rich_tracebacks=True,
             console=Console(file=output, width=200, no_color=True),
         )
@@ -156,22 +153,19 @@ class TestBracketedTextInLogMessages:
         assert "[/INSTRUCTIONS]" in output.getvalue()
 
     def test_lowercase_markers_are_not_swallowed(self, logger: logging.Logger, output: io.StringIO) -> None:
-        # A lowercase pair parses as a real style tag, so with markup on it would render
-        # as styled text with the markers -- and the body's meaning -- stripped out.
+        # A lowercase pair is a valid style tag, so markup would strip it and the body's meaning.
         logger.info("prompt=%s", "[section]body[/section]")
 
         assert "[section]body[/section]" in output.getvalue()
 
     def test_bracketed_prefix_survives_in_the_message(self, logger: logging.Logger, output: io.StringIO) -> None:
-        # `[run abc12345]` starts with a lowercase letter, so markup would read it as an
-        # opening style tag and consume the run id that makes these lines traceable.
+        # Markup would eat the run id that makes these lines traceable.
         logger.info("[run %s] tool call #%d", "abc12345", 1)
 
         assert "[run abc12345] tool call #1" in output.getvalue()
 
     def test_error_message_echoing_a_marker_does_not_raise(self, logger: logging.Logger, output: io.StringIO) -> None:
-        # A MarkupError's own message quotes the offending tag, so with markup on, logging
-        # the failure crashes the handler a second time and poisons error reporting itself.
+        # A MarkupError quotes the offending tag, so reporting one must not raise another.
         error_message = "closing tag '[/INSTRUCTIONS]' at position 33 doesn't match any open tag"
 
         logger.error("Node '%s' failed: %s", "Agent_1", error_message)
@@ -184,3 +178,10 @@ class TestBracketedTextInLogMessages:
         rendered = output.getvalue()
         assert "OK all good" in rendered
         assert "[green]" not in rendered
+
+    def test_markup_cannot_be_enabled_on_the_handler(self) -> None:
+        # The invariant is held by the class, not by each construction site, so that the copy
+        # of this module vendored into griptape-nodes-app carries the guarantee too.
+        handler = _EngineRoleHandler(show_time=False, show_path=False, markup=True)
+
+        assert handler.markup is False
