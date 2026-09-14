@@ -77,7 +77,7 @@ def bundle(tmp_path: Path) -> _Bundle:
     workflow_file.write_text(f'API_KEY = "{_WORKFLOW_SECRET}"\n', encoding="utf-8")
 
     engine = Mock()
-    engine.config_manager.config_file_layers = []
+    engine.config_manager.config_layers.return_value = []
     # A credential-named setting, and the same value again under a name that says nothing.
     # The first is removed for its key, the second only because the redactor knows the value.
     engine.config_manager.merged_config = {

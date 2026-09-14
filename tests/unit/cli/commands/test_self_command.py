@@ -345,9 +345,9 @@ class TestPaths:
         assert "~/[2026] projects" in printed
 
 
-class TestConfiguration:
-    def test_the_files_are_listed_in_the_order_they_override_each_other(self) -> None:
-        """A setting that appears not to apply is usually overridden by a later file."""
+class TestConfigLayers:
+    def test_the_layers_are_listed_in_the_order_they_override_each_other(self) -> None:
+        """A setting that appears not to apply is usually overridden by a later layer."""
         files = [
             ConfigFileDiagnostics(
                 path="~/.config/griptape_nodes/griptape_nodes_config.json", layer="user", exists=True
@@ -357,9 +357,55 @@ class TestConfiguration:
 
         printed = _printed(_report(config=ConfigDiagnostics(files=files)))
 
-        user_line = printed.index("user: ~/.config/griptape_nodes/griptape_nodes_config.json (found)")
-        workspace_line = printed.index("workspace: ~/GriptapeNodes/griptape_nodes_config.json (not present)")
+        user_line = printed.index("user")
+        workspace_line = printed.index("workspace")
         assert user_line < workspace_line
+        assert "~/.config/griptape_nodes/griptape_nodes_config.json" in printed
+        assert "(applied)" in printed
+        assert "(not present)" in printed
+
+    def test_a_layer_that_failed_to_parse_says_why(self) -> None:
+        """A broken file is skipped silently, so the merged settings alone never reveal it."""
+        files = [
+            ConfigFileDiagnostics(
+                path="~/GriptapeNodes/griptape_nodes_config.json",
+                layer="workspace",
+                exists=True,
+                parse_error="Expecting ',' delimiter: line 4 column 3 (char 61)",
+            )
+        ]
+
+        printed = _printed(_report(config=ConfigDiagnostics(files=files)))
+
+        assert "parse error: Expecting ',' delimiter: line 4 column 3 (char 61)" in printed
+
+    def test_a_file_the_project_layer_already_read_is_not_claimed_twice(self) -> None:
+        """The workspace dir can be the project dir: one file, read once, as `project`."""
+        files = [
+            ConfigFileDiagnostics(path="~/proj/griptape_nodes_config.json", layer="project", exists=True),
+            ConfigFileDiagnostics(
+                path="~/proj/griptape_nodes_config.json", layer="workspace", exists=True, contributes=False
+            ),
+        ]
+
+        printed = _printed(_report(config=ConfigDiagnostics(files=files)))
+
+        assert "superseded by the project layer" in printed
+
+    def test_a_workspace_pinned_by_the_active_project_is_shown_as_its_own_layer(self) -> None:
+        """No file holds the pin, so a settings write cannot reach it. Saying so is the point."""
+        config = ConfigDiagnostics(runtime_workspace_pin="~/projects/demo/workspace")
+
+        printed = _printed(_report(config=config))
+
+        assert "runtime" in printed
+        assert "workspace_directory = ~/projects/demo/workspace" in printed
+        assert "pinned by the active project" in printed
+
+    def test_nothing_is_said_about_a_pin_when_no_project_pinned_one(self) -> None:
+        printed = _printed(_report())
+
+        assert "pinned by the active project" not in printed
 
     def test_the_environment_variables_that_beat_every_file_are_named(self) -> None:
         """Names only. The values are whatever the user's shell holds, which may be a secret."""
@@ -367,14 +413,15 @@ class TestConfiguration:
 
         printed = _printed(_report(config=config))
 
-        assert "Environment Overrides" in printed
         assert "GTN_CONFIG_LOG_LEVEL" in printed
 
     def test_nothing_is_said_about_environment_overrides_when_there_are_none(self) -> None:
         printed = _printed(_report())
 
-        assert "Environment Overrides" not in printed
+        assert "GTN_CONFIG_" not in printed
 
+
+class TestConfiguration:
     def test_the_settings_are_printed_as_the_report_holds_them(self) -> None:
         """A credential-shaped setting arrives already replaced, and must stay replaced."""
         config = ConfigDiagnostics(merged={"nodes": {"Griptape": {"env": "<redacted>"}}})
