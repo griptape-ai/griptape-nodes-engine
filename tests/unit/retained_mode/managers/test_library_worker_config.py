@@ -688,6 +688,130 @@ class TestExpandTargetsWithLibraryDependencies:
 
         assert manager._expand_targets_with_library_dependencies(["Consumer Library"]) == ["Consumer Library"]
 
+
+class TestExecutionDependenciesOfDeclaredLibraries:
+    """A dependency's execution set is installed into the DEPENDING library's environment.
+
+    A worker loads its library's declared dependencies, so their execution pins have to be on its
+    sys.path too. Building each dependency its own `.venv-exec` and splicing them all back would
+    reproduce between libraries the disagreement the combined edit/exec resolution already avoids
+    within one: two environments resolved apart can choose different versions of anything they
+    share, and whichever landed first would win. It would also have one worker writing a venv
+    another library owns.
+    """
+
+    def _manager_with(self, monkeypatch: pytest.MonkeyPatch, libraries: dict[str, Any]) -> LibraryManager:
+        """A manager whose discovery found `libraries`: {name: (path, declarations, exec_deps)}."""
+        manager = _make_library_manager()
+        by_path: dict[str, Any] = {}
+        for name, (path, declarations, exec_deps) in libraries.items():
+            manager._library_file_path_to_info[path] = LibraryManager.LibraryInfo(
+                lifecycle_state=LibraryManager.LibraryLifecycleState.DISCOVERED,
+                fitness=LibraryManager.LibraryFitness.NOT_EVALUATED,
+                library_path=path,
+                is_sandbox=False,
+                library_name=name,
+            )
+            by_path[path] = (declarations, exec_deps)
+
+        def fake_load(request: Any) -> Any:
+            declarations, exec_deps = by_path[request.file_path]
+            schema = MagicMock()
+            schema.metadata = _make_metadata(
+                declarations=declarations,
+                dependencies=Dependencies(pip_dependencies_exec=exec_deps),
+            )
+            result = MagicMock()
+            result.library_schema = schema
+            return result
+
+        monkeypatch.setattr(manager, "load_library_metadata_from_file_request", fake_load)
+        return manager
+
+    def test_a_dependency_execution_set_is_collected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        manager = self._manager_with(
+            monkeypatch,
+            {
+                "Consumer Library": (
+                    "/libs/consumer/griptape-nodes-library.json",
+                    [LibraryDependencyDeclaration(url="https://github.com/o/griptape-nodes-library-openexr.git")],
+                    ["consumer-only==1.0"],
+                ),
+                "OpenEXR Library": (
+                    "/libs/griptape-nodes-library-openexr/griptape-nodes-library.json",
+                    [],
+                    ["openexr==3.2"],
+                ),
+            },
+        )
+
+        collected = manager._execution_dependencies_of_declared_libraries("Consumer Library")
+
+        # Its own set is added by the caller, so only the dependency's appears here.
+        assert collected == ["openexr==3.2"]
+
+    def test_execution_sets_are_collected_transitively(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        manager = self._manager_with(
+            monkeypatch,
+            {
+                "A": (
+                    "/libs/a/griptape-nodes-library.json",
+                    [LibraryDependencyDeclaration(url="https://github.com/o/griptape-nodes-library-b.git")],
+                    [],
+                ),
+                "B Library": (
+                    "/libs/griptape-nodes-library-b/griptape-nodes-library.json",
+                    [LibraryDependencyDeclaration(url="https://github.com/o/griptape-nodes-library-c.git")],
+                    ["b-pin==1.0"],
+                ),
+                "C Library": (
+                    "/libs/griptape-nodes-library-c/griptape-nodes-library.json",
+                    [],
+                    ["c-pin==2.0"],
+                ),
+            },
+        )
+
+        assert manager._execution_dependencies_of_declared_libraries("A") == ["b-pin==1.0", "c-pin==2.0"]
+
+    def test_a_library_with_no_declarations_collects_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        manager = self._manager_with(
+            monkeypatch,
+            {
+                "Solo Library": ("/libs/solo/griptape-nodes-library.json", [], ["solo==1.0"]),
+            },
+        )
+
+        assert manager._execution_dependencies_of_declared_libraries("Solo Library") == []
+
+    def test_a_pin_declared_by_two_dependencies_appears_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """It becomes one resolution, so a repeat is noise the install does not need."""
+        manager = self._manager_with(
+            monkeypatch,
+            {
+                "Consumer Library": (
+                    "/libs/consumer/griptape-nodes-library.json",
+                    [
+                        LibraryDependencyDeclaration(url="https://github.com/o/griptape-nodes-library-b.git"),
+                        LibraryDependencyDeclaration(url="https://github.com/o/griptape-nodes-library-c.git"),
+                    ],
+                    [],
+                ),
+                "B Library": (
+                    "/libs/griptape-nodes-library-b/griptape-nodes-library.json",
+                    [],
+                    ["shared==1.0"],
+                ),
+                "C Library": (
+                    "/libs/griptape-nodes-library-c/griptape-nodes-library.json",
+                    [],
+                    ["shared==1.0"],
+                ),
+            },
+        )
+
+        assert manager._execution_dependencies_of_declared_libraries("Consumer Library") == ["shared==1.0"]
+
     @pytest.mark.asyncio
     async def test_the_worker_load_path_applies_the_expansion(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Guards the call site, not just the method.
