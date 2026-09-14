@@ -37,6 +37,7 @@ from griptape_nodes.common.diagnostics.report import (
     DIAGNOSTICS_REPORT_SCHEMA_VERSION,
     RedactionSummary,
 )
+from griptape_nodes.files.path_utils import canonicalize_for_io
 
 if TYPE_CHECKING:
     from griptape_nodes.common.diagnostics.health import HealthReport
@@ -245,7 +246,7 @@ class DiagnosticsBundle:
         saved, which is stated in ``warnings`` so nobody debugs against the wrong graph.
         """
         try:
-            text = workflow_path.read_text(encoding="utf-8", errors="replace")
+            text = canonicalize_for_io(workflow_path).read_text(encoding="utf-8", errors="replace")
         except OSError as err:
             warnings.append(
                 f"The open workflow '{workflow_path.name}' could not be read and is not in this bundle: {err}"
@@ -387,7 +388,7 @@ class DiagnosticsBundle:
         is being built, so a size read beforehand can already be out of date.
         """
         try:
-            with path.open("rb") as handle:
+            with canonicalize_for_io(path).open("rb") as handle:
                 size = handle.seek(0, 2)
                 start = max(0, size - max_bytes)
                 handle.seek(start)

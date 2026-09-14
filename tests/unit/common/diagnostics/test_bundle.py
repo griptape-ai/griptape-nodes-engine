@@ -12,7 +12,7 @@ import io
 import json
 import re
 import zipfile
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import pytest
 
@@ -35,9 +35,6 @@ from griptape_nodes.common.diagnostics.report import (
     EngineDiagnostics,
     HostDiagnostics,
 )
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 _GENERATED_AT = "2026-01-01T00:00:00+00:00"
 # A stand-in for a value the engine holds, not a real credential.
@@ -236,6 +233,27 @@ class TestLogFiles:
         assert contents == "x" * 200
         assert warnings == []
 
+    def test_a_home_relative_path_is_read_rather_than_reported_unreadable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The same reason `add_workflow` canonicalizes: a `~` is not a directory name.
+
+        Log paths usually arrive absolute from the directory scan, but the setting behind that
+        directory is a path the user typed, and this is the read that would fail rather than
+        report anything.
+        """
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        _write_source_log(tmp_path / "engine.log", "a line from this session\n")
+        warnings: list[str] = []
+
+        with DiagnosticsBundle(_redactor()) as bundle:
+            bundle.add_log_files([Path("~/engine.log")], warnings)
+
+            assert _read(bundle, f"{LOGS_DIRECTORY_NAME}/engine.log") == "a line from this session\n"
+
+        assert warnings == []
+
     def test_a_second_log_with_the_same_name_is_reported_rather_than_overwriting_the_first(
         self, tmp_path: Path
     ) -> None:
@@ -345,6 +363,27 @@ class TestWorkflow:
 
         assert staged == [f"{WORKFLOW_DIRECTORY_NAME}/user-final.py"]
         assert f"{WORKFLOW_DIRECTORY_NAME}/user-final.py" in names
+
+    def test_a_home_relative_path_is_read_rather_than_reported_unreadable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A workflow path arrives spelled the way it was configured, `~` and all.
+
+        `Path("~/flow.py").read_text()` looks for a directory literally named `~`, so read as
+        given, a workflow registered from a home-relative path was reported as one that could
+        not be read -- in the bundle collected to explain what that workflow did.
+        """
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        (tmp_path / "my_flow.py").write_text("# a workflow\n", encoding="utf-8")
+        warnings: list[str] = []
+
+        with DiagnosticsBundle(_redactor()) as bundle:
+            bundle.add_workflow(Path("~/my_flow.py"), warnings)
+
+            assert _read(bundle, f"{WORKFLOW_DIRECTORY_NAME}/my_flow.py") == "# a workflow\n"
+
+        assert warnings == []
 
     def test_the_replacement_stays_a_legal_file_name_on_windows(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
