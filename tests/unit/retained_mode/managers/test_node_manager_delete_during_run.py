@@ -1,19 +1,64 @@
-"""Two edges of the mid-run delete policy that a full run cannot easily reach.
+"""Edges of the mid-run delete policy that a full run cannot easily reach.
 
-The e2e suite covers what an artist can actually do to a workflow. Two branches sit outside that
+The e2e suite covers what an artist can actually do to a workflow. Several branches sit outside that
 reach: the gated-candidate rule, which needs the scheduler parked in a state a test cannot hold open
-on demand, and the delete that is refused because cancelling the run itself failed -- there is no
-input that makes a healthy engine fail to cancel.
+on demand; the delete that is refused because cancelling the run itself failed, since there is no
+input that makes a healthy engine fail to cancel; and the exact shape of the forward walk over the
+control graph, which a run reaches only through whichever topology it happens to be executing.
 """
 
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from griptape_nodes.exe_types.connections import Connections
+from griptape_nodes.exe_types.core_types import ControlParameterOutput, Parameter, ParameterMode
+from griptape_nodes.exe_types.node_types import BaseNode, ControlNode
 from griptape_nodes.machines.dag_builder import DagBuilder, DagNode, NodeState
 from griptape_nodes.retained_mode.events.node_events import DeleteNodeResultFailure
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.node_manager import NodeManager
+
+LOOP_BACK_PARAMETER = "loop_back"
+DATA_PARAMETER = "value"
+
+
+class _ChainNode(ControlNode):
+    """A real control node, for the cases that need a real control graph to walk.
+
+    `ControlNode.__init__` builds `exec_in`/`exec_out` on its own, so a bare subclass is already a
+    valid link in a chain. The extra output exists so a node can branch two ways -- which is what
+    lets a test build a control *cycle* without a parameter carrying two connections.
+    """
+
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.add_parameter(ControlParameterOutput(name=LOOP_BACK_PARAMETER, display_name="Loop Back"))
+        self.add_parameter(
+            Parameter(
+                name=DATA_PARAMETER,
+                type="str",
+                default_value="",
+                tooltip="",
+                allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY, ParameterMode.OUTPUT},
+            )
+        )
+
+    def process(self) -> None: ...
+
+
+def _parameter(node: BaseNode, name: str) -> Parameter:
+    parameter = node.get_parameter_by_name(name)
+    assert parameter is not None, f"{node.name} is missing parameter {name!r}"
+    return parameter
+
+
+def _connect_control(connections: Connections, source: BaseNode, source_parameter: str, target: BaseNode) -> None:
+    connections.add_connection(source, _parameter(source, source_parameter), target, _parameter(target, "exec_in"))
+
+
+def _connect_data(connections: Connections, source: BaseNode, target: BaseNode) -> None:
+    connections.add_connection(source, _parameter(source, DATA_PARAMETER), target, _parameter(target, DATA_PARAMETER))
 
 
 def _node(name: str) -> MagicMock:
@@ -21,6 +66,16 @@ def _node(name: str) -> MagicMock:
     node = MagicMock()
     node.name = name
     return node
+
+
+def _outgoing_to(*target_nodes: object) -> list[MagicMock]:
+    """Outgoing connections from the node being deleted, one per target."""
+    connections = []
+    for target_node in target_nodes:
+        connection = MagicMock()
+        connection.target_node = target_node
+        connections.append(connection)
+    return connections
 
 
 def _engine(dag_builder: DagBuilder, *, outgoing: list | None = None) -> MagicMock:
@@ -59,6 +114,100 @@ def test_deleting_a_node_nothing_is_gated_on_is_free() -> None:
     node_manager = _node_manager(_engine(dag_builder))
 
     assert node_manager._find_entangled_live_node(_node("Unrelated")) is None
+
+
+def test_a_consumer_the_run_has_already_gone_past_does_not_hold_the_node() -> None:
+    """Nothing live leads to it, so the forward walk must not even be attempted.
+
+    A consumer absent from the DAG is only "still coming" if some node the run has live right now
+    leads to it. When every DAG entry has settled there is nothing to walk from, and asking anyway
+    would be reading the topology instead of the run -- which would make every node with a consumer
+    anywhere downstream permanently undeletable.
+    """
+    dag_builder = DagBuilder(MagicMock())
+    dag_builder.node_to_reference["Finished"] = DagNode(node_reference=_node("Finished"), node_state=NodeState.DONE)
+
+    engine = _engine(dag_builder, outgoing=_outgoing_to(_node("AbsentConsumer")))
+    node_manager = _node_manager(engine)
+
+    assert node_manager._find_entangled_live_node(_node("Deleted")) is None
+    engine.flow_manager.get_connections.return_value.is_node_in_forward_control_path.assert_not_called()
+
+
+def test_an_errored_node_whose_consumer_never_collected_is_still_entangled() -> None:
+    """The deleted node being finished with is not the question -- its consumers are.
+
+    An errored node has settled, so the rule about the node's own state lets it through. But a
+    consumer still sitting in the DAG unstarted has not collected anything from it, because
+    collection happens at the consumer's own dispatch. Deleting the supplier now would let that
+    consumer run on its parameter default.
+    """
+    dag_builder = DagBuilder(MagicMock())
+    deleted = _node("Errored")
+    consumer = _node("Consumer")
+    dag_builder.node_to_reference["Errored"] = DagNode(node_reference=deleted, node_state=NodeState.ERRORED)
+    dag_builder.node_to_reference["Consumer"] = DagNode(node_reference=consumer, node_state=NodeState.WAITING)
+
+    node_manager = _node_manager(_engine(dag_builder, outgoing=_outgoing_to(consumer)))
+
+    assert node_manager._find_entangled_live_node(deleted) == "Consumer"
+
+
+def test_a_consumer_beyond_a_control_loop_is_found_without_the_walk_hanging() -> None:
+    """Loops are ordinary here, so the forward walk has to survive one.
+
+    ``Head -> Body -> Tail`` with ``Body`` looping back to ``Head``. ``Consumer`` hangs off ``Tail``,
+    past the loop, and the run has ``Head`` live. An unbounded walk would circle the loop forever and
+    hang the artist's delete instead of answering it.
+    """
+    head = _ChainNode("Head")
+    body = _ChainNode("Body")
+    tail = _ChainNode("Tail")
+    consumer = _ChainNode("Consumer")
+    deleted = _ChainNode("Deleted")
+
+    connections = Connections()
+    _connect_control(connections, head, "exec_out", body)
+    _connect_control(connections, body, "exec_out", tail)
+    _connect_control(connections, body, LOOP_BACK_PARAMETER, head)
+    _connect_control(connections, tail, "exec_out", consumer)
+    _connect_data(connections, deleted, consumer)
+
+    dag_builder = DagBuilder(MagicMock())
+    dag_builder.node_to_reference["Head"] = DagNode(node_reference=head, node_state=NodeState.PROCESSING)
+
+    engine = _engine(dag_builder)
+    engine.flow_manager.get_connections.return_value = connections
+    node_manager = _node_manager(engine)
+
+    assert node_manager._find_entangled_live_node(deleted) == "Consumer"
+
+
+def test_a_consumer_the_control_graph_never_reaches_is_free() -> None:
+    """The same loop, and a consumer that hangs off nothing the run walks into.
+
+    Paired with the test above so the walk is shown to discriminate rather than to say yes: if it
+    answered True for anything absent, both tests would still pass individually and the policy would
+    have quietly become "never allow a delete".
+    """
+    head = _ChainNode("Head")
+    body = _ChainNode("Body")
+    stranded = _ChainNode("Stranded")
+    deleted = _ChainNode("Deleted")
+
+    connections = Connections()
+    _connect_control(connections, head, "exec_out", body)
+    _connect_control(connections, body, LOOP_BACK_PARAMETER, head)
+    _connect_data(connections, deleted, stranded)
+
+    dag_builder = DagBuilder(MagicMock())
+    dag_builder.node_to_reference["Head"] = DagNode(node_reference=head, node_state=NodeState.PROCESSING)
+
+    engine = _engine(dag_builder)
+    engine.flow_manager.get_connections.return_value = connections
+    node_manager = _node_manager(engine)
+
+    assert node_manager._find_entangled_live_node(deleted) is None
 
 
 @pytest.mark.asyncio

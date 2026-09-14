@@ -499,6 +499,80 @@ async def test_deleting_a_supplier_of_a_later_chain_member_cancels_the_run(
     assert engine.flow_manager.check_for_existing_running_flow() is False
 
 
+@requires_fixture_library
+@pytest.mark.usefixtures("registered_library", "parallel_mode")
+@pytest.mark.asyncio
+async def test_deleting_a_supplier_two_hops_down_the_chain_cancels_the_run(
+    tmp_path: Path,
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    create_node: Callable[..., str],
+    connect: Callable[..., None],
+) -> None:
+    """Being two links away rather than one is not a difference the artist can be asked to care about.
+
+    ``Shared`` feeds only ``Third``, which sits two control hops past the node that is running. Nothing
+    in this workflow has run ``Shared`` either, so both ends of the question are absent from the live
+    DAG -- the only thing that can answer it is walking the control graph forward from the running node
+    until it arrives, and that walk has to keep going past the first hop.
+
+    The one-hop version of this test is the ``later_chain_member`` case above. This one is what
+    distinguishes a real traversal from a peek at the immediate successor.
+    """
+    flow_name = _new_flow(engine, "delete_supplier_two_hops_down_wf")
+    first_gate = tmp_path / "gates" / "first.gate"
+
+    create_node("GatedStreamStartNode", "Start", flow_name, library_name=LIBRARY_NAME)
+    create_node(NODE_TYPE, "First", flow_name, library_name=LIBRARY_NAME)
+    create_node(NODE_TYPE, "Second", flow_name, library_name=LIBRARY_NAME)
+    create_node(NODE_TYPE, "Third", flow_name, library_name=LIBRARY_NAME)
+    create_node("GatedStreamEndNode", "End", flow_name, library_name=LIBRARY_NAME)
+    create_node(NODE_TYPE, "Shared", flow_name, library_name=LIBRARY_NAME)
+
+    connect("Start", "exec_out", "First", "exec_in")
+    connect("First", "exec_out", "Second", "exec_in")
+    connect("Second", "exec_out", "Third", "exec_in")
+    connect("Third", "exec_out", "End", "exec_in")
+    connect("Third", "result", "End", "result")
+    connect("Shared", "result", "Third", "linked_text")
+
+    _set_parameter(engine, "Start", "text", "chain start")
+    _configure(engine, "Shared", text="from shared")
+    _configure(engine, "First", gate_file=first_gate)
+    _configure(engine, "Second")
+    _configure(engine, "Third")
+
+    cancellations = _record_published(engine, monkeypatch, ControlFlowCancelledEvent, lambda _payload: True)
+
+    run = asyncio.create_task(engine.ahandle_request(StartFlowRequest(flow_name=flow_name, wait_for_completion=True)))
+    await _wait_until_resolving(engine, "First")
+
+    dag_nodes = engine.flow_manager.global_dag_builder.node_to_reference
+    for later_member in ("Second", "Third"):
+        assert later_member not in dag_nodes, (
+            f"Test setup is wrong: '{later_member}' was already in the live DAG, so this is not the "
+            f"multi-hop absent-consumer case."
+        )
+    assert "Shared" not in dag_nodes, (
+        "Test setup is wrong: Shared was pulled into the run, so it is not the never-ran supplier this test is about."
+    )
+
+    delete_result = await _delete_node(engine, flow_name, "Shared")
+
+    _open_gate(first_gate)
+    await _drain_cancelled_run(run)
+
+    assert cancellations, (
+        "Third is two hops down the chain the run is already walking, so deleting the node that feeds "
+        "it had to cancel rather than let the run arrive at Third with no input."
+    )
+    assert "Third" in str(delete_result.result_details), (
+        f"The cancellation named something other than the node that actually still needed the deleted "
+        f"one: {delete_result.result_details}"
+    )
+    assert engine.flow_manager.check_for_existing_running_flow() is False
+
+
 # ---------------------------------------------------------------------------------------------
 # Nothing unresolved is lost -> the delete must succeed and the run must carry on untouched.
 # ---------------------------------------------------------------------------------------------
@@ -664,6 +738,136 @@ async def test_deleting_a_downstream_node_that_has_not_started_leaves_the_run_al
     assert not cancellations, "Deleting a not-yet-started downstream node cancelled a healthy run."
     assert producer.state is NodeResolutionState.RESOLVED
     assert producer.parameter_output_values.get("result") == "produced"
+    assert engine.flow_manager.check_for_existing_running_flow() is False
+
+
+@requires_fixture_library
+@pytest.mark.usefixtures("registered_library", "parallel_mode")
+@pytest.mark.asyncio
+async def test_deleting_a_supplier_for_a_chain_nobody_started_leaves_the_run_alone(
+    tmp_path: Path,
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    create_node: Callable[..., str],
+    connect: Callable[..., None],
+) -> None:
+    """A chain sitting idle on the canvas is not part of the run, however deep it is.
+
+    This is the other half of the multi-hop case, and the one that keeps the policy honest. The canvas
+    holds a whole control chain that nobody pressed run on, and a supplier feeding into the middle of
+    it. If "not in the DAG yet" were read as "still coming", every one of those nodes would count as
+    live work and the artist could not delete anything while any run was in flight.
+
+    Streaming across the delete is the observable: the running node has to keep announcing chunks, not
+    merely still be alive at the end.
+    """
+    flow_name = _new_flow(engine, "delete_supplier_for_idle_chain_wf")
+    runner_gate = tmp_path / "gates" / "runner.gate"
+
+    create_node(NODE_TYPE, "Runner", flow_name, library_name=LIBRARY_NAME)
+    create_node("GatedStreamStartNode", "IdleStart", flow_name, library_name=LIBRARY_NAME)
+    create_node(NODE_TYPE, "IdleMiddle", flow_name, library_name=LIBRARY_NAME)
+    create_node("GatedStreamEndNode", "IdleEnd", flow_name, library_name=LIBRARY_NAME)
+    create_node(NODE_TYPE, "Shared", flow_name, library_name=LIBRARY_NAME)
+
+    connect("IdleStart", "exec_out", "IdleMiddle", "exec_in")
+    connect("IdleMiddle", "exec_out", "IdleEnd", "exec_in")
+    connect("IdleMiddle", "result", "IdleEnd", "result")
+    connect("Shared", "result", "IdleMiddle", "linked_text")
+
+    _configure(engine, "Runner", text="runner finished", gate_file=runner_gate, chunk="tick")
+    _set_parameter(engine, "IdleStart", "text", "never started")
+    _configure(engine, "IdleMiddle")
+    _configure(engine, "Shared", text="from shared")
+
+    cancellations = _record_published(engine, monkeypatch, ControlFlowCancelledEvent, lambda _payload: True)
+    streamed = _record_published(engine, monkeypatch, ProgressEvent, lambda payload: payload.node_name)
+
+    run = asyncio.create_task(engine.ahandle_request(ResolveNodeRequest(node_name="Runner")))
+    await _wait_until_resolving(engine, "Runner")
+    await _wait_for_progress(streamed, "Runner", at_least=3)
+
+    delete_result = await _delete_node(engine, flow_name, "Shared")
+    chunks_at_delete = sum(1 for name in streamed if name == "Runner")
+
+    assert "cancel" not in str(delete_result.result_details).lower(), (
+        f"The delete claimed to cancel a run that never touched the deleted node's chain: "
+        f"{delete_result.result_details}"
+    )
+
+    await _wait_for_progress(streamed, "Runner", at_least=chunks_at_delete + 3)
+
+    _open_gate(runner_gate)
+    await asyncio.wait_for(run, timeout=_RUN_TIMEOUT_SECONDS)
+
+    runner = engine.node_manager.get_node_by_name("Runner")
+    assert not cancellations, "Deleting a supplier for an idle chain cancelled an unrelated run."
+    assert runner.state is NodeResolutionState.RESOLVED
+    assert runner.parameter_output_values.get("result") == "runner finished"
+    assert engine.flow_manager.check_for_existing_running_flow() is False
+
+
+@requires_fixture_library
+@pytest.mark.usefixtures("registered_library", "parallel_mode")
+@pytest.mark.asyncio
+async def test_deleting_bystanders_then_the_running_node_answers_each_delete_on_its_own_terms(
+    tmp_path: Path,
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    create_node: Callable[..., str],
+    connect: Callable[..., None],
+) -> None:
+    """Selecting several nodes and pressing delete is one gesture but several deletions.
+
+    Each one is answered against the run as it stands *at that moment*, and every earlier delete has
+    already mutated the DAG and the connection index the answer is read from. So the interesting part
+    is not any single verdict but that they stay correct in sequence: two bystanders wave through, and
+    the running node -- reached last, after all that mutation -- still cancels.
+
+    The two bystanders differ on purpose. One is unconnected; the other is downstream of the running
+    node, so deleting it tears down a live node's outgoing connection while that node is executing.
+    """
+    flow_name = _new_flow(engine, "delete_several_nodes_wf")
+    runner_gate = tmp_path / "gates" / "runner.gate"
+
+    create_node(NODE_TYPE, "Runner", flow_name, library_name=LIBRARY_NAME)
+    create_node(NODE_TYPE, "LooseBystander", flow_name, library_name=LIBRARY_NAME)
+    create_node(NODE_TYPE, "DownstreamBystander", flow_name, library_name=LIBRARY_NAME)
+    connect("Runner", "result", "DownstreamBystander", "linked_text")
+
+    _configure(engine, "Runner", text="still going", gate_file=runner_gate, chunk="tick")
+    _configure(engine, "LooseBystander", text="unrelated")
+    _configure(engine, "DownstreamBystander")
+
+    cancellations = _record_published(engine, monkeypatch, ControlFlowCancelledEvent, lambda _payload: True)
+    streamed = _record_published(engine, monkeypatch, ProgressEvent, lambda payload: payload.node_name)
+
+    run = asyncio.create_task(engine.ahandle_request(ResolveNodeRequest(node_name="Runner")))
+    await _wait_until_resolving(engine, "Runner")
+    await _wait_for_progress(streamed, "Runner", at_least=3)
+
+    for bystander in ("LooseBystander", "DownstreamBystander"):
+        bystander_result = await _delete_node(engine, flow_name, bystander)
+        assert "cancel" not in str(bystander_result.result_details).lower(), (
+            f"Deleting '{bystander}' claimed to cancel a run it had no unresolved work in: "
+            f"{bystander_result.result_details}"
+        )
+        assert not cancellations, f"Deleting '{bystander}' took down a healthy run."
+
+    # The run has to still be observably alive after both, not merely un-cancelled.
+    chunks_after_bystanders = sum(1 for name in streamed if name == "Runner")
+    await _wait_for_progress(streamed, "Runner", at_least=chunks_after_bystanders + 3)
+
+    runner_result = await _delete_node(engine, flow_name, "Runner")
+
+    _open_gate(runner_gate)
+    await _drain_cancelled_run(run)
+
+    assert "cancel" in str(runner_result.result_details).lower(), (
+        f"The running node was deleted after two other deletions had already reshaped the DAG, and the "
+        f"policy stopped recognising it as running: {runner_result.result_details}"
+    )
+    assert cancellations, "Deleting the running node cancelled the run but never told the editor."
     assert engine.flow_manager.check_for_existing_running_flow() is False
 
 
