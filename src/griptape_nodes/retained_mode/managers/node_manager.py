@@ -1303,8 +1303,16 @@ class NodeManager(EngineScoped):
         connections count the same as data connections here: deleting a settled node whose control
         output feeds a node that has not started truncates the chain and can strand it.
 
-        The live run is the DAG, not the flow. Nodes the run was never going to reach are absent
-        from it, which is what makes deleting a bystander or an unreached consumer free.
+        Absence from the DAG does not mean the run will never reach the node. The DAG grows along the
+        control chain as it executes: only control *entry* nodes are seeded up front, and a chain
+        member is added when its predecessor completes. So a consumer one step further down the chain
+        is legitimately absent while its predecessor runs, and is still coming -- case 2 asks about
+        forward control reachability for those rather than reading absence as safety.
+
+        Scope: this reads the *global* DAG. A node executing inside an isolated subflow (a group body,
+        a ForEach iteration) runs on that subflow's own `DagBuilder` and never appears here, so
+        deleting one of those does not cancel. See `FlowManager._is_node_executing`, which has the
+        same blind spot.
         """
         dag_builder = self.engine.flow_manager.global_dag_builder
         dag_nodes = dag_builder.node_to_reference
@@ -1315,9 +1323,12 @@ class NodeManager(EngineScoped):
 
         connections = self.engine.flow_manager.get_connections()
         for connection in connections.get_all_outgoing_connections(node):
-            target_dag_node = dag_nodes.get(connection.target_node.name)
+            target_node = connection.target_node
+            target_dag_node = dag_nodes.get(target_node.name)
             if target_dag_node is not None and target_dag_node.node_state in _UNCOLLECTED_NODE_STATES:
-                return connection.target_node.name
+                return target_node.name
+            if target_dag_node is None and self._run_will_reach(target_node):
+                return target_node.name
 
         for gated_node_name, boundary_nodes_by_graph in dag_builder.start_node_candidates.items():
             for boundary_node_names in boundary_nodes_by_graph.values():
@@ -1325,6 +1336,25 @@ class NodeManager(EngineScoped):
                     return gated_node_name
 
         return None
+
+    def _run_will_reach(self, node: BaseNode) -> bool:
+        """Whether the live run is still going to arrive at a node that is not in the DAG yet.
+
+        Answered by walking control connections forward from the nodes the run has live right now.
+        Anchoring on live nodes rather than on the graphs' start nodes matters in both directions: a
+        node further down the chain is correctly reported as coming, while one the run has already
+        gone past is not, because nothing live leads back to it.
+        """
+        dag_builder = self.engine.flow_manager.global_dag_builder
+        connections = self.engine.flow_manager.get_connections()
+
+        for dag_node in dag_builder.node_to_reference.values():
+            if dag_node.node_state in _SETTLED_NODE_STATES:
+                continue
+            if connections.is_node_in_forward_control_path(dag_node.node_reference, node):
+                return True
+
+        return False
 
     async def on_delete_node_request(self, request: DeleteNodeRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915 (Complex logic, lots of edge cases)
         node_name = request.node_name

@@ -150,7 +150,8 @@ async def _wait_until_resolving(engine: Engine, node_name: str) -> None:
         if node.state is NodeResolutionState.RESOLVING:
             return
         await asyncio.sleep(_POLL_SECONDS)
-    pytest.fail(f"Node '{node_name}' never started executing, so the deletion could not land mid-run.")
+    msg = f"Node '{node_name}' never started executing, so the deletion could not land mid-run."
+    raise AssertionError(msg)
 
 
 async def _wait_until_one_is_resolving(engine: Engine, *node_names: str) -> str:
@@ -168,7 +169,8 @@ async def _wait_until_one_is_resolving(engine: Engine, *node_names: str) -> str:
         if len(resolving) == 1:
             return resolving[0]
         await asyncio.sleep(_POLL_SECONDS)
-    pytest.fail(f"None of {node_names} started executing on its own, so the deletion could not land mid-run.")
+    msg = f"None of {node_names} started executing on its own, so the deletion could not land mid-run."
+    raise AssertionError(msg)
 
 
 async def _wait_until_resolved(engine: Engine, node_name: str) -> None:
@@ -426,6 +428,75 @@ async def test_deleting_an_unresolved_node_from_a_control_chain_ends_the_run(
     assert engine.flow_manager.check_for_existing_running_flow() is False, (
         "The control chain was truncated by the deletion and the run never terminated."
     )
+
+
+@requires_fixture_library
+@pytest.mark.usefixtures("registered_library", "parallel_mode")
+@pytest.mark.asyncio
+async def test_deleting_a_supplier_of_a_later_chain_member_cancels_the_run(
+    tmp_path: Path,
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    create_node: Callable[..., str],
+    connect: Callable[..., None],
+) -> None:
+    """A consumer the run has not built into its DAG yet is still a consumer.
+
+    The DAG is grown along the control chain as the run walks it: only entry nodes are seeded, and a
+    chain member is added when its predecessor finishes. So while ``First`` runs, ``Second`` is simply
+    absent -- and reading that absence as "the run was never going to reach it" is how a delete gets
+    waved through that will leave ``Second`` running on its parameter default when the run does arrive.
+
+    ``Shared`` feeds both chain members and is long finished, which is what makes the case sharp: it
+    owes ``First`` nothing at all, and everything to a node that has not been created yet.
+    """
+    flow_name = _new_flow(engine, "delete_supplier_of_later_chain_member_wf")
+    first_gate = tmp_path / "gates" / "first.gate"
+
+    create_node("GatedStreamStartNode", "Start", flow_name, library_name=LIBRARY_NAME)
+    create_node(NODE_TYPE, "First", flow_name, library_name=LIBRARY_NAME)
+    create_node(NODE_TYPE, "Second", flow_name, library_name=LIBRARY_NAME)
+    create_node("GatedStreamEndNode", "End", flow_name, library_name=LIBRARY_NAME)
+    create_node(NODE_TYPE, "Shared", flow_name, library_name=LIBRARY_NAME)
+
+    connect("Start", "exec_out", "First", "exec_in")
+    connect("First", "exec_out", "Second", "exec_in")
+    connect("Second", "exec_out", "End", "exec_in")
+    connect("Second", "result", "End", "result")
+    connect("Shared", "result", "First", "linked_text")
+    connect("Shared", "result", "Second", "linked_text")
+
+    _set_parameter(engine, "Start", "text", "chain start")
+    _configure(engine, "Shared", text="from shared")
+    _configure(engine, "First", gate_file=first_gate)
+    _configure(engine, "Second")
+
+    cancellations = _record_published(engine, monkeypatch, ControlFlowCancelledEvent, lambda _payload: True)
+
+    run = asyncio.create_task(engine.ahandle_request(StartFlowRequest(flow_name=flow_name, wait_for_completion=True)))
+
+    await _wait_until_resolved(engine, "Shared")
+    await _wait_until_resolving(engine, "First")
+
+    dag_nodes = engine.flow_manager.global_dag_builder.node_to_reference
+    assert "Second" not in dag_nodes, (
+        "Test setup is wrong: Second was already in the live DAG, so this is not the absent-consumer case."
+    )
+
+    delete_result = await _delete_node(engine, flow_name, "Shared")
+
+    _open_gate(first_gate)
+    await _drain_cancelled_run(run)
+
+    assert cancellations, (
+        "Second had not been reached yet, so deleting the node that feeds it had to cancel rather "
+        "than let the run arrive at Second with no input."
+    )
+    assert "Second" in str(delete_result.result_details), (
+        f"The cancellation never named the node further down the chain that still needed the deleted "
+        f"one: {delete_result.result_details}"
+    )
+    assert engine.flow_manager.check_for_existing_running_flow() is False
 
 
 # ---------------------------------------------------------------------------------------------
