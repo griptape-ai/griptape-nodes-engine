@@ -321,22 +321,16 @@ class CurrentProjectChanged(AppPayload):
 
     Emitted on every successful activation that changed the project, including
     during boot: boot activations precede worker spawn, so those emissions fan
-    out to zero workers, and a worker that races registration into the boot
-    window is ordered by the carried generation like any other adoption.
+    out to zero workers, and a worker registering into that window is sent its
+    first activation by the registration handler.
 
     Args:
         project_id: The opaque id of the new current project (SYSTEM_DEFAULTS_KEY
             for system defaults). A worker boots like the orchestrator, so the
             same registry id resolves in both processes.
-        generation: The activation generation the id was committed at, captured in
-            the same synchronous block as the commit. The pair travels together
-            because reading the generation later (in the fan-out handler) can pair
-            an older id with a newer switch's generation, and the older project
-            then wins the workers' newest-generation-wins ordering.
     """
 
     project_id: str
-    generation: int = 0
 
 
 @dataclass

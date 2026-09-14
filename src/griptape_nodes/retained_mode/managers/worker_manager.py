@@ -18,7 +18,6 @@ from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events import worker_events
 from griptape_nodes.retained_mode.events.app_events import ConfigChanged, CurrentProjectChanged, SecretChanged
 from griptape_nodes.retained_mode.events.base_events import EventRequest
-from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
 from griptape_nodes.retained_mode.managers.settings import (
     WORKER_HEARTBEAT_INTERVAL_KEY,
     WORKER_HEARTBEAT_STARTUP_GRACE_KEY,
@@ -232,20 +231,36 @@ class WorkerManager(EngineScoped):
 
         response_topic = f"sessions/{session_id}/workers/{wid}/response"
         await self._tx.subscribe_to_topic(response_topic)
-        # The worker adopts this before loading any library, and libraries resolve against the
-        # workspace a project decides, so pushing it afterwards would order the two by chance.
-        # The COMMITTED pair rather than the live id: `_current_project_id` is assigned before
-        # activation's fallible steps, so a registration handled mid-switch could name a project
-        # about to be rolled back. System defaults go over the wire as None, which a fresh worker
-        # already is.
-        current_project_id, project_generation = self.engine.project_manager.committed_project()
-        if current_project_id == SYSTEM_DEFAULTS_KEY:
-            current_project_id = None
+        # Put the worker on this orchestrator's project rather than answering with it. One sender
+        # and one adoption path, so a switch landing mid-registration is a second message on the
+        # same channel instead of a reply racing a fan-out.
+        await self._activate_project_on_worker(wid, request_topic)
         return worker_events.RegisterWorkerResultSuccess(
             worker_engine_id=wid,
-            current_project_id=current_project_id,
-            project_generation=project_generation,
             result_details="Worker registered successfully.",
+        )
+
+    async def _activate_project_on_worker(self, worker_engine_id: str, worker_request_topic: str) -> None:
+        """Tell one worker which project to be on, as of the last activation that committed.
+
+        Sent without awaiting a reply: registration must not depend on a round trip back into the
+        worker, which would make answering it hostage to a worker that is merely slow. The worker
+        blocks on having applied an activation before it loads a library instead, which is a wait it
+        can bound locally.
+
+        The COMMITTED pair rather than the live id: `_current_project_id` is assigned before
+        activation's fallible steps, so reading it mid-switch could name a project about to be
+        rolled back. Both halves come from one read, so the generation always describes the id it
+        was committed with. Sent for system defaults too -- a worker has to be told what it is on
+        even when that is the rest state, or nothing distinguishes "told" from "not yet told".
+        """
+        from griptape_nodes.app.worker_routing import ActivateProjectRequest
+
+        project_id, generation = self.engine.project_manager.committed_project()
+        await self.forward_event_to_worker(
+            EventRequest(request=ActivateProjectRequest(project_id=project_id, generation=generation)),
+            worker_engine_id=worker_engine_id,
+            worker_request_topic=worker_request_topic,
         )
 
     def handle_worker_heartbeat_request(
@@ -885,11 +900,12 @@ class WorkerManager(EngineScoped):
             return
         await self.broadcast_to_workers(EventRequest(request=RefreshSecretsRequest()))
 
-    async def _on_current_project_changed(self, event: CurrentProjectChanged) -> None:
+    async def _on_current_project_changed(self, _event: CurrentProjectChanged) -> None:
         """Fan out an ActivateProjectRequest after the orchestrator switched projects.
 
-        The generation must ride along: a worker orders this fan-out against its registration
-        reply, which arrives on a different loop, and adopts only strictly newer generations.
+        Reads the committed pair rather than taking the id off the event, so the id and the
+        generation describing it come from one read. Two switches in quick succession therefore
+        both fan out the newest committed state, and a worker cannot be told to go backwards.
         Awaited inline for the same side-loop reason documented on ``_on_config_changed``; lazy
         import for the same circular-dependency reason.
         """
@@ -897,8 +913,9 @@ class WorkerManager(EngineScoped):
 
         if self._transport is None or not self._workers:
             return
+        project_id, generation = self.engine.project_manager.committed_project()
         failures = await self.broadcast_to_workers_awaiting_replies(
-            EventRequest(request=ActivateProjectRequest(project_id=event.project_id, generation=event.generation))
+            EventRequest(request=ActivateProjectRequest(project_id=project_id, generation=generation))
         )
         # A worker left on the old project resolves workspace-relative paths against the old
         # workspace, so it writes where this engine does not read. Loud here beats silent there.
@@ -906,7 +923,7 @@ class WorkerManager(EngineScoped):
             logger.error(
                 "Worker did not adopt project '%s' after the switch; its file paths will not match "
                 "this engine's. Details: %s",
-                event.project_id,
+                project_id,
                 failure,
             )
 
