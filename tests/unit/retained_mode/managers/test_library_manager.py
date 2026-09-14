@@ -1122,6 +1122,67 @@ class TestLibraryManagerInstallLibraryDependencies:
         mock_reset.assert_called_once()
         assert mock_subprocess.await_count == expected_attempts
 
+    def _worker_schema_without_its_own_execution_set(self, mgr: _LibraryManager) -> MagicMock:
+        """A worker serving `test_lib`, whose manifest declares no execution dependencies."""
+        schema = MagicMock()
+        schema.name = "test_lib"
+        schema.metadata.library_version = "1.0.0"
+        schema.metadata.dependencies.pip_dependencies = []
+        schema.metadata.dependencies.pip_install_flags = []
+        schema.metadata.dependencies.pip_dependencies_exec = None
+        mgr._is_worker = True
+        mgr._target_library_names = ["test_lib"]
+        return schema
+
+    @pytest.mark.asyncio
+    async def test_a_dependency_execution_set_builds_this_library_environment(self, engine: Engine) -> None:
+        """A library declaring no execution set of its own still needs one when a dependency does.
+
+        Retirement runs ahead of every gate, so reading only this library's own set removed the
+        environment the dependency's pins were about to be installed into.
+        """
+        mgr = engine.library_manager
+        schema = self._worker_schema_without_its_own_execution_set(mgr)
+
+        with (
+            patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
+            patch.object(mgr, "_execution_dependencies_of_declared_libraries", return_value=["openexr==3.2"]),
+            patch.object(mgr, "_retire_execution_env", new_callable=AsyncMock) as mock_retire,
+            patch.object(mgr, "_install_dependency_set", new_callable=AsyncMock) as mock_install,
+            patch.object(mgr, "_this_process_owns_the_edit_venv", return_value=False),
+        ):
+            result = await mgr.install_library_dependencies_request(
+                InstallLibraryDependenciesRequest(library_file_path="/mock.json")
+            )
+
+        mock_retire.assert_not_called()
+        assert isinstance(result, InstallLibraryDependenciesResultSuccess)
+        # One resolution, so the dependency's pins go in beside this library's own edit-time set.
+        assert mock_install.await_args is not None
+        assert mock_install.await_args.kwargs["execution"] is True
+        assert "openexr==3.2" in mock_install.await_args.kwargs["pip_dependencies"]
+
+    @pytest.mark.asyncio
+    async def test_no_execution_set_anywhere_still_retires(self, engine: Engine) -> None:
+        """The combined set must not keep an environment alive for a library that needs none."""
+        mgr = engine.library_manager
+        schema = self._worker_schema_without_its_own_execution_set(mgr)
+
+        with (
+            patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
+            patch.object(mgr, "_execution_dependencies_of_declared_libraries", return_value=[]),
+            patch.object(mgr, "_retire_execution_env", new_callable=AsyncMock) as mock_retire,
+            patch.object(mgr, "_install_dependency_set", new_callable=AsyncMock) as mock_install,
+            patch.object(mgr, "_this_process_owns_the_edit_venv", return_value=False),
+        ):
+            result = await mgr.install_library_dependencies_request(
+                InstallLibraryDependenciesRequest(library_file_path="/mock.json")
+            )
+
+        mock_retire.assert_called_once()
+        mock_install.assert_not_awaited()
+        assert isinstance(result, InstallLibraryDependenciesResultSuccess)
+
 
 def _fake_config_value(key: str, **_: object) -> object:
     """Return realistic values for config keys touched by venv initialization."""
