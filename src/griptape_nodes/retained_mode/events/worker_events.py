@@ -53,19 +53,15 @@ class RegisterWorkerRequest(RequestPayload):
 class RegisterWorkerResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Worker registration succeeded.
 
+    Carries no project: the orchestrator sends the worker's first activation down the same path a
+    mid-session switch uses, so there is one sender and one adoption path rather than two that have
+    to be ordered against each other.
+
     Args:
         worker_engine_id: The engine_id of the worker that was registered.
-        current_project_id: The project the orchestrator has active, or None when it is on system
-            defaults. The worker adopts this BEFORE loading libraries, which is what keeps the two
-            processes on one workspace: a project decides the workspace, libraries resolve against
-            the workspace, and a worker that loaded first would resolve them against a different
-            one. Answered here rather than pushed afterwards so the ordering is a consequence of
-            the reply the worker already waits for, not of two messages racing.
     """
 
     worker_engine_id: str
-    current_project_id: str | None = None
-    project_generation: int = 0
 
 
 @dataclass

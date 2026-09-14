@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import cast
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
@@ -27,6 +28,7 @@ from griptape_nodes.retained_mode.events.execution_events import (
     ExecuteNodeRequest,
     ExecuteNodeResultSuccess,
 )
+from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
 from griptape_nodes.retained_mode.managers.worker_manager import WorkerManager, WorkerRegistration
 from griptape_nodes.utils.version_utils import engine_version
 
@@ -141,14 +143,13 @@ class TestHandleRegisterWorkerRequest:
         assert result.worker_engine_id == _ENGINE
 
 
-class TestRegistrationCarriesTheProject:
+class TestRegistrationActivatesTheProject:
     @pytest.mark.asyncio
-    async def test_success_reply_names_the_orchestrators_current_project(self, worker_manager: WorkerManager) -> None:
-        """Registration is the one moment both processes are guaranteed to exist.
+    async def test_registering_sends_the_worker_its_first_activation(self, worker_manager: WorkerManager) -> None:
+        """One sender and one adoption path, rather than a reply that has to be ordered against a fan-out.
 
-        The worker adopts this project BEFORE loading libraries, and the workspace follows the
-        project -- so carrying it in the reply the worker already waits for is what makes the two
-        workspaces match deterministically rather than by message-ordering luck.
+        The reply carries no project, so a switch landing mid-registration is a second message on
+        the same channel instead of a second source the worker has to reconcile.
         """
         committed_generation = 7
         worker_manager.engine.project_manager.committed_project.return_value = ("proj-42", committed_generation)  # type: ignore[union-attr]
@@ -157,8 +158,26 @@ class TestRegistrationCarriesTheProject:
         result = await worker_manager.handle_register_worker_request(request)
 
         assert isinstance(result, worker_events.RegisterWorkerResultSuccess)
-        assert result.current_project_id == "proj-42"
-        assert result.project_generation == committed_generation
+        sent = cast("MagicMock", worker_manager._tx.send_message).await_args_list
+        activations = [call for call in sent if "ActivateProjectRequest" in str(call)]
+        assert len(activations) == 1, "registration must send exactly one activation"
+        assert "proj-42" in str(activations[0])
+        assert f'"generation": {committed_generation}' in str(activations[0])
+
+    @pytest.mark.asyncio
+    async def test_the_activation_is_sent_for_system_defaults_too(self, worker_manager: WorkerManager) -> None:
+        """A worker has to be told what it is on even when that is the rest state.
+
+        Skipping it there would leave nothing distinguishing "told" from "not yet told", and the
+        worker's wait before library load would never lift.
+        """
+        worker_manager.engine.project_manager.committed_project.return_value = (SYSTEM_DEFAULTS_KEY, 0)  # type: ignore[union-attr]
+        request = worker_events.RegisterWorkerRequest(worker_engine_id=_ENGINE, engine_version=engine_version)
+
+        await worker_manager.handle_register_worker_request(request)
+
+        sent = cast("MagicMock", worker_manager._tx.send_message).await_args_list
+        assert any("ActivateProjectRequest" in str(call) for call in sent)
 
 
 class TestProjectSwitchWaitsForWorkers:
@@ -299,25 +318,28 @@ class TestProjectSwitchWaitsForWorkers:
         assert "nope" in failures[0]
 
     @pytest.mark.asyncio
-    async def test_fan_out_carries_the_committed_generation(self, worker_manager: WorkerManager) -> None:
-        """A worker adopts only strictly newer generations, so a fan-out that omits one is skipped.
+    async def test_fan_out_reads_the_committed_pair_rather_than_the_event(self, worker_manager: WorkerManager) -> None:
+        """The id and the generation describing it must come from one read.
 
-        The worker records the generation it adopted, so a fan-out stamped with the default 0
+        A worker adopts only strictly newer generations, so a fan-out stamped with the default 0
         makes every switch after the first look stale -- and the worker answers Success, which
-        costs the caller the failure log too.
+        costs the caller the failure log too. Taking the id from the event and the generation from
+        state separately can pair an older id with a newer switch's generation.
         """
         worker_manager._workers = {"worker-a": WorkerRegistration(request_topic="t/a", worker_key=None)}
-        sent: list[int] = []
+        worker_manager.engine.project_manager.committed_project.return_value = ("proj-9", 4)  # type: ignore[union-attr]
+        sent: list[tuple[str, int]] = []
 
         async def carrying_route(event: EventRequest, _worker_engine_id: str, _topic: str) -> dict:
-            sent.append(event.request.generation)  # type: ignore[attr-defined]
+            sent.append((event.request.project_id, event.request.generation))  # type: ignore[attr-defined]
             return {"result_type": "ActivateProjectResultSuccess", "result": {}}
 
         worker_manager.route_to_worker = carrying_route  # type: ignore[method-assign]
 
-        await worker_manager._on_current_project_changed(CurrentProjectChanged(project_id="proj-9", generation=4))
+        # The event's id is deliberately stale here: the fan-out must ignore it.
+        await worker_manager._on_current_project_changed(CurrentProjectChanged(project_id="proj-stale"))
 
-        assert sent == [4]
+        assert sent == [("proj-9", 4)]
 
 
 class TestHandleRegisterWorkerRequestEngineVersion:
