@@ -44,7 +44,8 @@ class MultiOptions(Trait):
     def choices(self, value: list) -> None:
         self._choices = value
 
-    def state_from_ui_options(self, ui_options: dict) -> dict[str, Any]:
+    @classmethod
+    def state_from_ui_options(cls, ui_options: dict) -> dict[str, Any]:
         """Adopt a multi-select written straight into the parameter's ``ui_options``.
 
         A workflow saved before trait state was carried in its own right mirrored a run-time
@@ -54,7 +55,7 @@ class MultiOptions(Trait):
         written = ui_options.get("multi_options")
         if not isinstance(written, dict):
             return {}
-        return {key: written[key] for key in self._state_parameter_names() if key in written}
+        return {key: written[key] for key in cls._state_parameter_names() if key in written}
 
     @classmethod
     def get_trait_keys(cls) -> list[str]:

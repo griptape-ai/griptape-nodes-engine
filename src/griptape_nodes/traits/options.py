@@ -47,7 +47,8 @@ class Options(Trait):
     def choices(self, value: list) -> None:
         self._choices = value
 
-    def state_from_ui_options(self, ui_options: dict[str, Any]) -> dict[str, Any]:
+    @classmethod
+    def state_from_ui_options(cls, ui_options: dict[str, Any]) -> dict[str, Any]:
         """Adopt a dropdown written straight into the parameter's ``ui_options``.
 
         Two writers do this. The editor's fixed-options panel sends these keys back flat, and
@@ -55,10 +56,15 @@ class Options(Trait):
         ``choices`` update into ``simple_dropdown`` so that it would survive the save. Without
         adopting it, such a file loads with whatever choices the node's ``__init__`` builds,
         and the converter below then rewrites the saved value to the first of those.
+
+        ``enum_choices`` is what a dropdown was called before this trait existed. The editor
+        still falls back to reading it, so a file old enough to hold it is still openable.
         """
         state: dict[str, Any] = {}
         if "simple_dropdown" in ui_options:
             state["choices"] = ui_options["simple_dropdown"]
+        elif "enum_choices" in ui_options:
+            state["choices"] = ui_options["enum_choices"]
         for key in ("show_search", "search_filter", "allow_custom"):
             if key in ui_options:
                 state[key] = ui_options[key]
