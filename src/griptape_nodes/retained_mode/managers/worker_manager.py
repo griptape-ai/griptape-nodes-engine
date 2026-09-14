@@ -451,7 +451,9 @@ class WorkerManager(EngineScoped):
         # RequestClient.cancel_requests_by_tag, so a dead worker still surfaces
         # to the caller without a per-request ceiling.
         try:
-            return await future
+            # The future is settled by whichever loop the transport runs on, which is not this one.
+            # wrap_future adapts it for this loop and installs the threadsafe wakeup.
+            return await asyncio.wrap_future(future)
         except asyncio.CancelledError:
             # Eviction cancels this future from underneath the awaiting task. A bare
             # CancelledError is indistinguishable from the artist pressing stop, and the

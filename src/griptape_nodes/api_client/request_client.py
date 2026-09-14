@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import threading
@@ -22,15 +23,12 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class _PendingRequest:
-    future: asyncio.Future
+    # concurrent.futures.Future, not asyncio.Future: the settling side (the transport loop) and
+    # the awaiting side (whichever loop issued the request) differ. An asyncio future belongs to
+    # one loop and set_result wakes its waiter through a non-threadsafe call_soon, so a foreign
+    # settle marks it done without waking the sleeping loop. This one has no loop to get wrong.
+    future: concurrent.futures.Future
     tag: str
-    # The loop the future belongs to, which is NOT always the loop that resolves it. Websocket
-    # messages are handled on the transport loop while a request may have been issued from the
-    # loop running a flow, and asyncio futures are single-loop objects: set_result schedules the
-    # waiting task through `future._loop.call_soon`, which does not wake a loop it is not called
-    # from. Without this the result sits in the target loop's ready queue until something
-    # unrelated wakes it.
-    loop: asyncio.AbstractEventLoop
     # When True, EventResultFailure responses resolve the future with
     # the full payload dict instead of rejecting it with
     # ``Exception(error_msg)``. The default (False) preserves the
@@ -163,9 +161,9 @@ class RequestClient:
             # Wait for response with optional timeout
             if timeout_ms:
                 timeout_sec = timeout_ms / 1000
-                result = await asyncio.wait_for(response_future, timeout=timeout_sec)
+                result = await asyncio.wait_for(asyncio.wrap_future(response_future), timeout=timeout_sec)
             else:
-                result = await response_future
+                result = await asyncio.wrap_future(response_future)
 
         except TimeoutError:
             logger.error("Request %s timed out", request_id)
@@ -226,9 +224,9 @@ class RequestClient:
 
             if timeout_ms:
                 timeout_sec = timeout_ms / 1000
-                result = await asyncio.wait_for(response_future, timeout=timeout_sec)
+                result = await asyncio.wait_for(asyncio.wrap_future(response_future), timeout=timeout_sec)
             else:
-                result = await response_future
+                result = await asyncio.wrap_future(response_future)
 
         except TimeoutError:
             logger.error("Forwarded request %s timed out", request_id)
@@ -291,7 +289,7 @@ class RequestClient:
         # Pre-register futures for every inner request so _try_match can resolve
         # them as responses arrive in arbitrary order.
         inner_events: list[dict[str, Any]] = []
-        futures: list[asyncio.Future] = []
+        futures: list[concurrent.futures.Future] = []
         request_ids: list[str] = []
         for request_type, raw_payload in requests:
             request_id = str(uuid.uuid4())
@@ -313,7 +311,9 @@ class RequestClient:
 
         try:
             await self.client.publish("EventRequestBatch", batch_payload, request_topic)
-            gather = asyncio.gather(*futures, return_exceptions=return_exceptions)
+            gather = asyncio.gather(
+                *(asyncio.wrap_future(future) for future in futures), return_exceptions=return_exceptions
+            )
             if timeout_ms:
                 results = await asyncio.wait_for(gather, timeout=timeout_ms / 1000)
             else:
@@ -333,7 +333,7 @@ class RequestClient:
         tag: str = "",
         *,
         resolve_failures_as_payload: bool = False,
-    ) -> asyncio.Future:
+    ) -> concurrent.futures.Future:
         """Register a future for an outgoing request and return it.
 
         Use this when the send path is handled externally (e.g. WorkerManager
@@ -351,7 +351,8 @@ class RequestClient:
                 ``ResultPayloadFailure`` (preserving exception fidelity).
 
         Returns:
-            Future that will be resolved when the matching response arrives
+            A loop-agnostic future, settled when the matching response arrives. Adapt it with
+            ``asyncio.wrap_future`` to await it; the awaiting loop need not be this one.
         """
         return await self._track_request(request_id, tag=tag, resolve_failures_as_payload=resolve_failures_as_payload)
 
@@ -365,7 +366,7 @@ class RequestClient:
             to_cancel = [rid for rid, entry in self._pending_requests.items() if entry.tag == tag]
             for rid in to_cancel:
                 entry = self._pending_requests.pop(rid)
-                RequestClient._settle(entry, entry.future.cancel)
+                RequestClient._settle(entry.future.cancel)
                 logger.debug("Cancelled request %s (tag=%s)", rid, tag)
 
     async def _track_request(
@@ -374,7 +375,7 @@ class RequestClient:
         tag: str = "",
         *,
         resolve_failures_as_payload: bool = False,
-    ) -> asyncio.Future:
+    ) -> concurrent.futures.Future:
         """Start tracking a request and return a future that will be resolved on response.
 
         Args:
@@ -393,38 +394,26 @@ class RequestClient:
                 msg = f"Request ID already exists: {request_id}"
                 raise ValueError(msg)
 
-            loop = asyncio.get_running_loop()
-            future: asyncio.Future = loop.create_future()
+            future: concurrent.futures.Future = concurrent.futures.Future()
             self._pending_requests[request_id] = _PendingRequest(
-                future, tag, loop, resolve_failures_as_payload=resolve_failures_as_payload
+                future, tag, resolve_failures_as_payload=resolve_failures_as_payload
             )
             logger.debug("Tracking request: %s (tag=%s)", request_id, tag)
             return future
 
     @staticmethod
-    def _settle(entry: _PendingRequest, settle: Callable[[], object]) -> None:
-        """Apply a terminal state to a pending request's future, on the loop that owns it.
+    def _settle(settle: Callable[[], object]) -> None:
+        """Apply a terminal state to a pending request's future.
 
-        A future is bound to one loop. Calling set_result/set_exception/cancel from a different
-        loop marks it done but schedules the waiting task's wakeup with a non-threadsafe
-        `call_soon`, so a sleeping owner loop never learns about it. call_soon_threadsafe is the
-        same operation plus the wakeup, and is safe to use even from the owning loop, so there is
-        one path rather than a same-loop special case to keep in sync.
-
-        The done-check is re-run inside the callback because it runs later, on the other loop,
-        where a cancellation may have landed first.
+        Valid from any thread and needs no loop bookkeeping: the future locks its own state, and
+        each awaiter is woken by the threadsafe callback `asyncio.wrap_future` installs.
         """
-
-        def apply() -> None:
-            if not entry.future.done():
-                settle()
-
         try:
-            entry.loop.call_soon_threadsafe(apply)
-        except RuntimeError:
-            # The owning loop is closed, so nothing is waiting on this future any more. Shutdown
-            # races here rather than an error worth surfacing.
-            logger.debug("Dropping a settled request: its loop is closed")
+            settle()
+        except concurrent.futures.InvalidStateError:
+            # A waiter that times out cancels the future through wrap_future without holding
+            # self._lock, so a response arriving at that moment finds it already cancelled.
+            logger.debug("Dropping a settle for an already-finished request")
 
     def _resolve_request_unlocked(self, request_id: str, result: Any) -> None:
         """Resolve a request's future. Caller must hold self._lock.
@@ -439,7 +428,7 @@ class RequestClient:
             logger.warning("Received response for unknown request: %s", request_id)
             return
 
-        RequestClient._settle(entry, lambda: entry.future.set_result(result))
+        RequestClient._settle(lambda: entry.future.set_result(result))
         logger.debug("Resolved request: %s", request_id)
 
     def _reject_request_unlocked(self, request_id: str, error: Exception) -> None:
@@ -455,7 +444,7 @@ class RequestClient:
             logger.warning("Received error for unknown request: %s", request_id)
             return
 
-        RequestClient._settle(entry, lambda: entry.future.set_exception(error))
+        RequestClient._settle(lambda: entry.future.set_exception(error))
         logger.debug("Rejected request: %s with error: %s", request_id, error)
 
     async def _resolve_request(self, request_id: str, result: Any) -> None:
@@ -491,7 +480,7 @@ class RequestClient:
                 logger.debug("Request already completed or unknown: %s", request_id)
                 return
 
-            RequestClient._settle(entry, entry.future.cancel)
+            RequestClient._settle(entry.future.cancel)
             logger.debug("Cancelled request: %s", request_id)
 
     @property
