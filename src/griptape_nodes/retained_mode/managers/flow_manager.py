@@ -1438,6 +1438,15 @@ class FlowManager(EngineScoped):
         Read from the live DAG rather than from `node.state`. The two are set in the same breath, but
         only the DAG entry is guaranteed to be dropped when a run tears down, so a run that ends
         badly cannot leave a node looking permanently busy and quietly change ordinary editing.
+
+        Scope: the *global* DAG only. A node running inside an isolated subflow -- a group body, a
+        ForEach iteration -- executes on that subflow's own `DagBuilder` (`control_flow.py`, the
+        `is_isolated` branch), which is never registered anywhere: the machine that owns it is a local
+        variable in `on_start_local_subflow_request`. So this reports False for a node that is in fact
+        mid-process, and the caller then treats tearing its input connection down as ordinary editing
+        and resets the value to the parameter default underneath it. Closing that needs a way to find
+        the `DagBuilder` a node is running on; `NodeManager._find_entangled_live_node` is blind the
+        same way, and cannot cancel a subflow run for the same reason.
         """
         dag_node = self._global_dag_builder.node_to_reference.get(node.name)
         return dag_node is not None and dag_node.node_state is NodeState.PROCESSING
