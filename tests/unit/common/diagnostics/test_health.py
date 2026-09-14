@@ -483,6 +483,51 @@ class TestCloudConnectionCheck:
 
         assert CloudConnectionCheck()._websocket_url() == "wss://custom.example.com/ws/engines/events?version=v2"
 
+    @pytest.mark.parametrize(
+        ("base_url", "expected"),
+        [
+            ("https://myhttpserver.example.com", "wss://myhttpserver.example.com/ws/engines/events?version=v2"),
+            ("https://api.http-proxy.example.com", "wss://api.http-proxy.example.com/ws/engines/events?version=v2"),
+            ("https://example.com/http", "wss://example.com/ws/engines/events?version=v2"),
+        ],
+    )
+    def test_only_the_scheme_becomes_a_websocket_scheme(
+        self, monkeypatch: pytest.MonkeyPatch, base_url: str, expected: str
+    ) -> None:
+        """Rewriting the scheme by string replacement rewrote every "http" in the URL.
+
+        `myhttpserver.example.com` became `mywsserver.example.com`, which resolves to nothing
+        -- so a check that exists to report on the connection reported a hostname failure for
+        a host that was never contacted, and said the deployment was unreachable when it was
+        the check that could not address it.
+        """
+        monkeypatch.setenv("GRIPTAPE_NODES_API_BASE_URL", base_url)
+
+        assert CloudConnectionCheck()._websocket_url() == expected
+
+    @pytest.mark.parametrize(
+        ("base_url", "expected_scheme"),
+        [
+            ("http://localhost:8000", "ws://"),
+            ("https://api.nodes.griptape.ai", "wss://"),
+            ("ws://localhost:8000", "ws://"),
+            ("wss://api.nodes.griptape.ai", "wss://"),
+            ("HTTPS://api.nodes.griptape.ai", "wss://"),
+            ("gopher://api.nodes.griptape.ai", "wss://"),
+        ],
+    )
+    def test_an_unencrypted_api_keeps_an_unencrypted_websocket(
+        self, monkeypatch: pytest.MonkeyPatch, base_url: str, expected_scheme: str
+    ) -> None:
+        """The only reason to point at a plain `http` API is a local one, which has no `wss`.
+
+        Anything unrecognized is assumed to be encrypted, because guessing wrong the other
+        way would have the check volunteer to send an API key over a plain connection.
+        """
+        monkeypatch.setenv("GRIPTAPE_NODES_API_BASE_URL", base_url)
+
+        assert CloudConnectionCheck()._websocket_url().startswith(expected_scheme)
+
 
 class _ExplodingCheck(HealthCheck):
     name = "Exploding Check"
@@ -537,10 +582,50 @@ class TestRunHealthChecks:
         assert report.status is HealthStatus.FAIL
 
     @pytest.mark.asyncio
-    async def test_results_keep_the_order_the_checks_ran_in(self) -> None:
+    async def test_results_keep_the_order_the_checks_were_listed_in(self) -> None:
+        """Not the order they finished in, which concurrency makes a race.
+
+        A report that reorders itself between runs cannot be diffed against the one attached
+        to the last bug report.
+        """
         report = await run_health_checks(_check_context(), checks=(_PassingCheck, _ExplodingCheck))
 
         assert [result.name for result in report.results] == ["Passing Check", "Exploding Check"]
+
+    @pytest.mark.asyncio
+    async def test_the_checks_run_alongside_each_other(self) -> None:
+        """`CloudConnectionCheck` waits on a live round trip, with a ten-second timeout.
+
+        Every other check only reads a report already in memory, so run one after another the
+        whole run costs whatever that one connection costs -- while somebody watches `gtn
+        doctor` and wonders whether it has hung. Each of the two below finishes only once the
+        other has started, so they can both pass only if they really did overlap.
+        """
+        first_started = asyncio.Event()
+        second_started = asyncio.Event()
+        # Long enough not to be a flake on a loaded machine, short enough that a regression
+        # to sequential is a failed assertion rather than a suite that never finishes.
+        wait_for_peer = 5
+
+        class _FirstOfAPair(HealthCheck):
+            name = "First Of A Pair"
+
+            async def run(self, _context: HealthCheckContext) -> HealthCheckResult:
+                first_started.set()
+                await asyncio.wait_for(second_started.wait(), timeout=wait_for_peer)
+                return HealthCheckResult(name=self.name, status=HealthStatus.PASS, summary="saw the other one start")
+
+        class _SecondOfAPair(HealthCheck):
+            name = "Second Of A Pair"
+
+            async def run(self, _context: HealthCheckContext) -> HealthCheckResult:
+                second_started.set()
+                await asyncio.wait_for(first_started.wait(), timeout=wait_for_peer)
+                return HealthCheckResult(name=self.name, status=HealthStatus.PASS, summary="saw the other one start")
+
+        report = await run_health_checks(_check_context(), checks=(_FirstOfAPair, _SecondOfAPair))
+
+        assert [result.status for result in report.results] == [HealthStatus.PASS, HealthStatus.PASS]
 
 
 class TestWorstStatus:

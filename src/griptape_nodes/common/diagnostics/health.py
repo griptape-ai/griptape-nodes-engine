@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, ClassVar
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from pydantic import BaseModel, Field
 from websockets.asyncio.client import connect
@@ -140,6 +140,9 @@ class CloudConnectionCheck(HealthCheck):
     _CONNECTION_TIMEOUT = 10.0
     _DEFAULT_API_BASE_URL = "https://api.nodes.griptape.ai"
     _WEBSOCKET_PATH = "/ws/engines/events?version=v2"
+    # What each API scheme becomes for the websocket endpoint. Plain `http` keeps its
+    # unencrypted counterpart, because the only reason to point at one is a local API.
+    _WEBSOCKET_SCHEMES: ClassVar[dict[str, str]] = {"http": "ws", "https": "wss", "ws": "ws", "wss": "wss"}
 
     async def run(self, context: HealthCheckContext) -> HealthCheckResult:
         if not context.cloud_api_key:
@@ -190,9 +193,17 @@ class CloudConnectionCheck(HealthCheck):
         Honors the same ``GRIPTAPE_NODES_API_BASE_URL`` override the engine's own client
         reads, so a check run against a staging API reports on staging rather than always
         reporting on production.
+
+        Only the scheme is rewritten. A ``base_url.replace("http", "ws")`` rewrites every
+        occurrence of that substring, so a staging host named ``myhttpserver.example.com``
+        became ``mywsserver.example.com`` -- and the check then reported on whether a host
+        nobody runs could be reached. An override already spelled ``ws``/``wss`` is left as
+        the user wrote it; anything else is assumed to be TLS, which is what the API is.
         """
         base_url = os.getenv("GRIPTAPE_NODES_API_BASE_URL", self._DEFAULT_API_BASE_URL)
-        return urljoin(base_url.replace("http", "ws"), self._WEBSOCKET_PATH)
+        parts = urlsplit(base_url)
+        scheme = self._WEBSOCKET_SCHEMES.get(parts.scheme.lower(), "wss")
+        return urljoin(urlunsplit(parts._replace(scheme=scheme)), self._WEBSOCKET_PATH)
 
     async def _connect_and_disconnect(self, url: str, headers: dict[str, str]) -> None:
         async with connect(url, additional_headers=headers):
@@ -497,6 +508,12 @@ async def run_health_checks(
     down with it: the other verdicts are still worth having, and a check that cannot
     answer is itself something to look at.
 
+    Run concurrently, because ``CloudConnectionCheck`` waits on a live round trip with a
+    ten-second timeout while every other check only reads a report already in memory. Run
+    one after another, a user with no network paid that timeout before seeing any of the
+    five verdicts that were ready immediately. The results keep the order of ``checks``
+    rather than the order they finished, so a report reads the same every time.
+
     Args:
         context: What the checks are allowed to look at.
         checks: The checks to run. Defaults to all of them.
@@ -504,28 +521,28 @@ async def run_health_checks(
     Returns:
         A report whose status is the worst status any check returned.
     """
-    results: list[HealthCheckResult] = []
-    for check_class in checks:
-        try:
-            # Construction is inside the guard as well as the call. A check is free to do
-            # its setup in __init__, and one that fails there would otherwise take down
-            # every check after it.
-            results.append(await check_class().run(context))
-        except Exception as err:
-            results.append(
-                HealthCheckResult(
-                    name=check_class.name,
-                    status=HealthStatus.FAIL,
-                    summary=f"This check could not be completed: {err}",
-                    remedy="Include this bundle in your bug report; the check itself is at fault.",
-                )
-            )
+    results = await asyncio.gather(*[_run_one_check(check_class, context) for check_class in checks])
 
     return HealthReport(
         generated_at=datetime.now(UTC).isoformat(),
         status=worst_status(results),
         results=results,
     )
+
+
+async def _run_one_check(check_class: type[HealthCheck], context: HealthCheckContext) -> HealthCheckResult:
+    """Run one check, turning anything it raises into that check's own failure."""
+    try:
+        # Construction is inside the guard as well as the call. A check is free to do its
+        # setup in __init__, and one that fails there is still that check's failure.
+        return await check_class().run(context)
+    except Exception as err:
+        return HealthCheckResult(
+            name=check_class.name,
+            status=HealthStatus.FAIL,
+            summary=f"This check could not be completed: {err}",
+            remedy="Include this bundle in your bug report; the check itself is at fault.",
+        )
 
 
 def worst_status(results: list[HealthCheckResult]) -> HealthStatus:
