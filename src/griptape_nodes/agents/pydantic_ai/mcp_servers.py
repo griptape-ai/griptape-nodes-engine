@@ -19,17 +19,12 @@ Connection handling is left to Pydantic AI: if a server is unreachable the
 run fails. Graceful per-server degradation can be layered on later.
 
 **Transport lifetime.** Pydantic AI enters and exits a toolset once per
-``Agent.run``, but that is not the lifetime of the server. ``StdioTransport``
-defaults to ``keep_alive=True``, so exiting a session leaves the subprocess
-running and the next run reuses it. A toolset therefore pins one subprocess,
-launched from the config the transport was *built* with, for as long as the
-toolset is held. Whoever caches a toolset owns calling
-:func:`disconnect_transport` when the *connection* behind it changes; otherwise
-the edit cannot take effect and the old subprocess is never reaped. Which
-config keys those are is recorded as
-:data:`~griptape_nodes.agents.pydantic_ai.mcp_toolset_cache.CONNECTION_KEYS`,
-so a new transport field read here has to be added there too. See
-:class:`~griptape_nodes.agents.pydantic_ai.mcp_toolset_cache.MCPToolsetCache`.
+``Agent.run``, but ``StdioTransport`` defaults to ``keep_alive=True``, so the
+subprocess outlives the session and the next run reuses it. A toolset pins one
+subprocess, launched from the config it was *built* with, until something calls
+:func:`disconnect_transport`. See
+:class:`~griptape_nodes.agents.pydantic_ai.mcp_toolset_cache.MCPToolsetCache`,
+which owns that decision.
 """
 
 from __future__ import annotations
@@ -99,12 +94,9 @@ _HTTP_TRANSPORTS: dict[str, type[SSETransport | StreamableHttpTransport]] = {
 def mcp_server_from_config(name: str, config: Mapping[str, Any]) -> BuiltMCPServer | None:
     """Build a Pydantic AI MCP toolset from an engine ``MCPServerConfig``.
 
-    Returns ``None`` and logs a warning for any config this cannot build from -
-    a missing required field, an unusable URL, an unknown transport. Never
-    raises: one unbuildable server must not stop the agent attaching the others,
-    and a caller part-way through building a set of them would otherwise be left
-    holding a half-built result. The returned toolset is prefixed with ``name``
-    so tools from different servers can't collide.
+    Never raises: returns ``None`` and logs a warning for any config it cannot
+    build from, so one bad server doesn't stop the others being attached. The
+    returned toolset is prefixed with ``name``.
     """
     transport = config.get("transport", "stdio")
 
@@ -121,8 +113,7 @@ def mcp_server_from_config(name: str, config: Mapping[str, Any]) -> BuiltMCPServ
 def _stdio_server_from_config(name: str, config: Mapping[str, Any]) -> BuiltMCPServer | None:
     """Build a subprocess-backed MCP server.
 
-    No ``init_timeout``: unlike the URL transports there is no network handshake
-    to bound, and a slow-starting local server is not a failure.
+    Deliberately no ``init_timeout`` - there is no network handshake to bound.
     """
     command = config.get("command")
     if not command:
@@ -171,11 +162,9 @@ def _http_server_from_config(name: str, config: Mapping[str, Any], transport: st
 async def disconnect_transport(name: str, transport: ClientTransport) -> None:
     """Tear down ``transport``, if its kind holds anything to tear down.
 
-    Only :class:`StdioTransport` owns a long-lived resource: it defaults to
-    ``keep_alive=True``, so its subprocess outlives each session and survives
-    until something disconnects it explicitly. The HTTP transports expose no
-    ``disconnect`` at all and hold no process, so for them this is a no-op
-    rather than a missing case.
+    Only :class:`StdioTransport` does - it keeps a subprocess alive between
+    sessions. A deliberate no-op for the HTTP transports, which hold no process
+    and expose no ``disconnect``.
     """
     if not isinstance(transport, StdioTransport):
         return

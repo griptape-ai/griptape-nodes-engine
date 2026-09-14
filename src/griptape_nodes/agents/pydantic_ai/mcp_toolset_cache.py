@@ -7,31 +7,26 @@ is only correct while the configuration behind it is unchanged - the command,
 args, env, cwd, url and headers are baked into the transport when it is built,
 so a cached toolset speaks to a server launched from the *old* config forever.
 
-This cache makes the trade explicitly: entries are keyed by server name and
-carry a fingerprint of the config, so an unchanged server keeps its warm
-subprocess and an edited one is torn down and rebuilt. Comparing a fingerprint
-per run rather than subscribing to a config-change event means the cache stays
-correct however the config came to be different, including a change that
-arrives with no event attached - though note that a config *file* edited behind
-the engine's back is not picked up at all, because nothing re-reads the file
-until something calls ``load_configs``.
+Entries are keyed by server name and carry a fingerprint of the config, so an
+unchanged server keeps its warm subprocess and an edited one is rebuilt.
+Comparing per run rather than listening for a config-change event keeps the
+cache correct however the config came to be different. Note the limit: a config
+*file* edited behind the engine's back is not picked up at all, because nothing
+re-reads it until something calls ``load_configs``.
 
-Not every edit needs a restart, though, and restarting on the ones that don't
-is expensive: respawning a subprocess costs hundreds of milliseconds where
-reuse costs none. So two different questions are asked of each config, and the
-difference between them matters:
+Two questions are asked of each config, because respawning a subprocess is
+expensive and most edits don't need one:
 
-* *Do we have to reconnect?* - answered by :func:`connection_fingerprint`, over
-  only the keys baked into the transport at build time. A ``rules`` edit is
-  prompt-side and leaves this untouched, so the server keeps its subprocess.
-* *Which configuration did this run use?* - answered by :func:`digest_config`
-  over the whole config, because ``rules`` genuinely change the answer the
-  model gives even though they don't change the connection.
+* *Do we have to reconnect?* - :func:`connection_fingerprint`, over only the
+  keys baked into the transport at build time. A ``rules`` edit is prompt-side
+  and leaves it untouched.
+* *Which configuration did this run use?* - :func:`digest_config`, over the
+  whole config, since ``rules`` change the answer without changing the
+  connection.
 
-Both are derived from :func:`fingerprint_config` output, which contains ``env``
-and ``headers`` and so holds secrets: a fingerprint lives in memory as a
-comparison key and must never be logged or persisted. Only the short digest is
-opaque enough to write to disk or send to a client.
+:func:`fingerprint_config` output contains ``env`` and ``headers``, so it is a
+comparison key that must never be logged or persisted. Only the short digest is
+opaque enough for a log line, disk, or a client.
 """
 
 from __future__ import annotations
