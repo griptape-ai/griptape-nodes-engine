@@ -124,7 +124,12 @@ class ResolvedMCPServer:
 
 @dataclass
 class _Entry:
-    """A live toolset, the transport under it, and the config it was built from."""
+    """A live toolset, the transport under it, and the config it was built from.
+
+    Holds only what the running server owns. Anything that varies per run -
+    notably which whole config a given run supplied - belongs on the lease, not
+    here, because one entry is shared by every run using that server.
+    """
 
     name: str
     toolset: AbstractToolset[Any]
@@ -132,11 +137,6 @@ class _Entry:
     # What the running server was launched from: if this changes, the server has
     # to be replaced, because there is no way to tell a live subprocess about it.
     connection_fingerprint: str
-    # The whole config this entry was last acquired with, as a persistable
-    # digest. Unlike the fingerprint above it is updated in place when a
-    # prompt-side field changes, so a run record names the config that actually
-    # produced the answer rather than the one the server was started with.
-    digest: str
     # Runs currently inside `async with toolset`. A transport cannot be
     # disconnected out from under a live session, so eviction waits for zero.
     users: int = 0
@@ -145,6 +145,20 @@ class _Entry:
     # dict, so it is reachable only through the leases still holding it - which
     # is why a lease holds entries rather than names.
     retired: bool = False
+
+
+@dataclass
+class _LeasedServer:
+    """One entry as one run borrowed it, with the config *that* run supplied.
+
+    The digest lives here rather than on the entry because two overlapping runs
+    share the entry while each having its own config: a prompt-side edit between
+    them changes the digest without changing the server, so an entry-level field
+    would make both runs report whichever acquired last.
+    """
+
+    entry: _Entry
+    digest: str
 
 
 @dataclass
@@ -170,7 +184,7 @@ class MCPToolsetCache:
         The returned lease holds a use count on every toolset it names, so it
         must be released - use it as an async context manager.
         """
-        entries: list[_Entry] = []
+        servers: list[_LeasedServer] = []
         async with self._lock:
             # Two passes on purpose. Resolving an entry can raise, and there is
             # no lease yet to release what came before it, so nothing takes a use
@@ -180,10 +194,10 @@ class MCPToolsetCache:
             for config in configs:
                 entry = await self._entry_for(str(config["name"]), config)
                 if entry is not None:
-                    entries.append(entry)
-            for entry in entries:
-                entry.users += 1
-        return MCPToolsetLease(cache=self, entries=entries)
+                    servers.append(_LeasedServer(entry=entry, digest=digest_config(config)))
+            for server in servers:
+                server.entry.users += 1
+        return MCPToolsetLease(cache=self, servers=servers)
 
     async def retain_only(self, names: Iterable[str]) -> None:
         """Drop cached servers that are no longer configured or enabled.
@@ -216,12 +230,11 @@ class MCPToolsetCache:
     async def _entry_for(self, name: str, config: Mapping[str, Any]) -> _Entry | None:
         """Return a usable entry for ``name``, rebuilding it only if its connection changed."""
         connection = connection_fingerprint(config)
-        digest = digest_config(config)
         cached = self._entries.get(name)
         if cached is not None and cached.connection_fingerprint == connection:
-            # The connection is still valid, so the subprocess is kept - but the
-            # rest of the config may have moved, and the digest has to follow it.
-            cached.digest = digest
+            # The connection is still valid, so the subprocess is kept, whatever
+            # else in the config moved. Which config this run supplied is the
+            # lease's business, not the entry's.
             return cached
         if cached is not None:
             logger.info("MCP server '%s' connection settings changed; restarting it for this run.", name)
@@ -234,7 +247,6 @@ class MCPToolsetCache:
             toolset=built.toolset,
             transport=built.transport,
             connection_fingerprint=connection,
-            digest=digest,
         )
         self._entries[name] = entry
         return entry
@@ -269,21 +281,23 @@ class MCPToolsetLease:
 
     Holds the cache entries themselves rather than server names: an entry
     retired mid-run is removed from the cache immediately, and the lease is
-    what keeps it reachable long enough to be disconnected on release.
+    what keeps it reachable long enough to be disconnected on release. Each is
+    paired with the config digest *this* run supplied, which the shared entry
+    cannot answer for.
     """
 
     cache: MCPToolsetCache
-    entries: list[_Entry]
+    servers: list[_LeasedServer]
 
     @property
     def toolsets(self) -> list[AbstractToolset[Any]]:
         """The toolsets to attach to this run."""
-        return [entry.toolset for entry in self.entries]
+        return [server.entry.toolset for server in self.servers]
 
     @property
     def resolved(self) -> list[ResolvedMCPServer]:
         """Which servers, at which configuration, this run actually got."""
-        return [ResolvedMCPServer(name=entry.name, digest=entry.digest) for entry in self.entries]
+        return [ResolvedMCPServer(name=server.entry.name, digest=server.digest) for server in self.servers]
 
     async def __aenter__(self) -> Self:
         return self
@@ -291,4 +305,4 @@ class MCPToolsetLease:
     async def __aexit__(self, *_: object) -> None:
         # The lease is the cache's own handle type, so reaching into `_release`
         # is one object talking to its other half rather than a leak.
-        await self.cache._release(self.entries)
+        await self.cache._release([server.entry for server in self.servers])

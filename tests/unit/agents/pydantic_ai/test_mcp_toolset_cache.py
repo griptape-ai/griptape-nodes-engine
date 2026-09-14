@@ -189,6 +189,24 @@ class TestPromptSideEditsKeepTheConnection:
         assert resolved[0].digest == digest_config(edited)
 
     @pytest.mark.asyncio
+    async def test_overlapping_runs_each_report_their_own_config(self, transports: list[_StubTransport]) -> None:
+        """Two runs sharing one server must not report each other's config.
+
+        A prompt-side edit between two overlapping runs leaves them sharing the
+        subprocess while their configs differ, so the digest cannot live on the
+        shared entry: whichever acquired last would speak for both, and the log
+        line that answers "did my edit take effect?" would name the wrong config.
+        """
+        first_config = _config("alpha", rules="be terse")
+        second_config = _config("alpha", rules="reply in spanish")
+
+        cache = MCPToolsetCache()
+        async with await cache.acquire([first_config]) as first, await cache.acquire([second_config]) as second:
+            assert len(transports) == 1
+            assert first.resolved[0].digest == digest_config(first_config)
+            assert second.resolved[0].digest == digest_config(second_config)
+
+    @pytest.mark.asyncio
     async def test_an_unknown_new_field_does_not_restart_the_server(self, transports: list[_StubTransport]) -> None:
         # A field this cache has never heard of is assumed prompt-side. Anything
         # that truly reaches the transport has to be added to `CONNECTION_KEYS`.
