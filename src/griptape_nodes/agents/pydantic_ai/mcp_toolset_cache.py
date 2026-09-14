@@ -136,7 +136,10 @@ class _Entry:
     transport: ClientTransport
     # What the running server was launched from: if this changes, the server has
     # to be replaced, because there is no way to tell a live subprocess about it.
-    connection_fingerprint: str
+    # Kept out of `repr` because it embeds `env` and `headers`: a dataclass repr
+    # would otherwise put credentials into pytest output and any log line that
+    # formats an entry or the cache holding it.
+    connection_fingerprint: str = field(repr=False)
     # Runs currently inside `async with toolset`. A transport cannot be
     # disconnected out from under a live session, so eviction waits for zero.
     users: int = 0

@@ -94,6 +94,32 @@ class TestFingerprintAndDigest:
         assert digest_config({"a": 1}) == digest_config({"a": 1})
 
 
+class TestSecretsStayOutOfRepr:
+    """A fingerprint embeds `env` and `headers`, so nothing may render it.
+
+    The fingerprint is a comparison key held in memory; only the digest is
+    opaque enough to be shown. A dataclass `repr` is the easy way to break that
+    rule by accident - pytest failure output and any log line formatting the
+    cache would print credentials in cleartext.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_cache_does_not_render_a_servers_secrets(self, transports: list[_StubTransport]) -> None:
+        credential = "hunter2"
+        config = {
+            **_config("alpha"),
+            "env": {"TOKEN": credential},
+            "headers": {"Authorization": f"Bearer {credential}"},
+        }
+
+        cache = MCPToolsetCache()
+        async with await cache.acquire([config]) as lease:
+            assert credential not in repr(cache)
+            assert credential not in repr(lease)
+
+        assert len(transports) == 1
+
+
 class TestWarmReuse:
     """An unchanged server keeps the connection it already has."""
 
