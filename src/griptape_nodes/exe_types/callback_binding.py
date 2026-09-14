@@ -8,6 +8,9 @@ a node hands one of its own methods to a trait, and it deliberately excludes a l
 closure: those have no name to resolve, and inventing one would restore a callback the node
 never declared. Resolution is a ``getattr`` on the node, so a saved file can only ever name
 something that node already provides.
+
+A callback a trait derives from its own state is not this module's concern. The trait saves
+the state and rebuilds the callback from it, so it never offers one here to be named.
 """
 
 from __future__ import annotations
@@ -21,22 +24,6 @@ if TYPE_CHECKING:
     from griptape_nodes.exe_types.node_types import BaseNode
 
 logger = logging.getLogger("griptape_nodes")
-
-# Set on a callback a trait synthesized from its own state (a Button built from
-# ``button_link``, for one). Such a callback needs no name: the constructor rebuilds it from
-# state on load, so it is neither saved nor reported as lost.
-_DERIVED_FROM_STATE = "_griptape_derived_from_trait_state"
-
-
-def mark_derived_from_state[T](callback: T) -> T:
-    """Mark a callback as one the trait rebuilds from its own state, and return it."""
-    setattr(callback, _DERIVED_FROM_STATE, True)
-    return callback
-
-
-def is_derived_from_state(callback: Any) -> bool:
-    """Whether the trait will rebuild this callback from state, so it needs no name."""
-    return getattr(callback, _DERIVED_FROM_STATE, False) is True
 
 
 def name_callback(callback: Any, owner: BaseNode | None) -> str | None:

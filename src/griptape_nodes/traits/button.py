@@ -1,11 +1,8 @@
 import logging
-from typing import TYPE_CHECKING, ClassVar, Literal, get_args
+from collections.abc import Callable
+from typing import ClassVar, Literal, get_args
 
-from griptape_nodes.exe_types.callback_binding import is_derived_from_state, mark_derived_from_state
 from griptape_nodes.exe_types.core_types import NodeMessagePayload, NodeMessageResult, Trait
-
-if TYPE_CHECKING:
-    from collections.abc import Callable
 
 # Don't export callback types - let users import explicitly
 
@@ -80,12 +77,63 @@ class SetButtonStatusMessagePayload(NodeMessagePayload):
     updates: dict[str, str | bool | None]
 
 
+def _build_link_handler(url: str) -> Callable:
+    """Build the click handler that opens ``url``.
+
+    Derived from the link rather than supplied by a node, so it is never saved by name: the
+    URL travels as trait state and this is rebuilt from it on load.
+    """
+
+    def handler(
+        button: Button,  # noqa: ARG001
+        button_details: ButtonDetailsMessagePayload,
+    ) -> NodeMessageResult:
+        return NodeMessageResult(
+            success=True,
+            details="Opening URL",
+            response=OnClickMessageResultPayload(
+                button_details=button_details,
+                href=url,
+            ),
+            altered_workflow_state=False,
+        )
+
+    return handler
+
+
+class _ClickAction:
+    """What a button does when clicked: open a link, or run the node's own handler.
+
+    One field rather than two, because the two are saved through different channels. A link
+    is data and a handler is a method name, so holding both meant restoring either one had
+    to reason about what the other already held, and keep them from drifting apart. A single
+    field cannot drift, so the one-or-the-other rule is a property of the representation
+    instead of an invariant re-checked after every write.
+    """
+
+
+class _Link(_ClickAction):
+    """Opens a URL. The URL is saved; the handler is rebuilt from it."""
+
+    def __init__(self, url: str) -> None:
+        self.url = url
+        self.handler = _build_link_handler(url)
+
+
+class _NodeHandler(_ClickAction):
+    """Runs a callback the owning node supplied. Saved as a method name, never as a callable."""
+
+    def __init__(self, callback: Callable) -> None:
+        self.callback = callback
+
+
 class Button(Trait):
-    # The two callbacks are behavior, not state, so they are never saved as state. They are
-    # carried by method name instead, which is why they still need an attribute mapping.
+    # Both are behavior rather than state, so they are carried by method name.
     STATE_EXCLUDE: ClassVar[frozenset[str]] = frozenset({"on_click", "get_button_state"})
+    # on_click reads the node-supplied handler alone. A link's handler is derived from
+    # button_link, which is saved as state, so it needs no name of its own.
     STATE_ALIASES: ClassVar[dict[str, str]] = {
-        "on_click": "on_click_callback",
+        "on_click": "on_click_handler",
         "get_button_state": "get_button_state_callback",
     }
 
@@ -132,7 +180,6 @@ class Button(Trait):
         self.loading_icon: str | None = loading_icon
         self.loading_icon_class: str | None = loading_icon_class
         self.tooltip: str | None = tooltip
-        self.button_link: str | None = button_link
 
         # Validate that both button_link and on_click are not provided simultaneously
         if button_link is not None and on_click is not None:
@@ -142,53 +189,64 @@ class Button(Trait):
             )
             raise ValueError(error_msg)
 
-        # If button_link is provided and no custom on_click handler, create a default handler
+        self._action: _ClickAction | None = None
         if button_link is not None:
-            self.on_click_callback = self._create_button_link_handler(button_link)
-        else:
-            self.on_click_callback = on_click
+            self._action = _Link(button_link)
+        elif on_click is not None:
+            self._action = _NodeHandler(on_click)
         self.get_button_state_callback = get_button_state
 
-    def _create_button_link_handler(self, url: str) -> OnClickCallback:
-        """Create a default handler for button_link URLs."""
+    @property
+    def button_link(self) -> str | None:
+        """The URL a click opens, or None when a click runs the node's handler instead."""
+        if isinstance(self._action, _Link):
+            return self._action.url
+        return None
 
-        def handler(
-            button: Button,  # noqa: ARG001
-            button_details: ButtonDetailsMessagePayload,
-        ) -> NodeMessageResult:
-            return NodeMessageResult(
-                success=True,
-                details="Opening URL",
-                response=OnClickMessageResultPayload(
-                    button_details=button_details,
-                    href=url,
-                ),
-                altered_workflow_state=False,
-            )
+    @button_link.setter
+    def button_link(self, url: str | None) -> None:
+        """Point the button at a URL, unless the node already wired its own handler.
 
-        # Rebuilt from button_link, which is saved as state, so this handler needs no name.
-        return mark_derived_from_state(handler)
-
-    def _recompute_derived_state(self) -> None:
-        """Rebuild ``on_click_callback`` from a changed ``button_link``.
-
-        Only touches the callback when it is itself derived from state, or absent, so a
-        node-supplied ``on_click`` set by the constructor survives ``apply_state`` untouched.
-        A plain ``None`` cannot represent that intent (there is nothing to preserve), so it is
-        treated the same as derived: otherwise a button built with no ``button_link`` and no
-        ``on_click`` would gain a saved link with no handler to fire it.
+        A node's handler outranks a saved link, which belongs to a version of the node that
+        wired this button differently. Nothing has to clear the link afterwards: a button
+        running a handler reports no link, so the next save records none.
         """
-        if self.on_click_callback is not None and not is_derived_from_state(self.on_click_callback):
-            # The node's own handler won, so a saved link is dead: it belongs to a version of
-            # this node that wired the button differently. Dropping it keeps the one-or-the-
-            # other invariant the constructor enforces, and stops the next save recording a
-            # link that a later build-from-scratch would revive as the handler instead.
-            self.button_link = None
+        if isinstance(self._action, _NodeHandler):
             return
-        if self.button_link is None:
-            self.on_click_callback = None
+        if url is None:
+            self._action = None
             return
-        self.on_click_callback = self._create_button_link_handler(self.button_link)
+        self._action = _Link(url)
+
+    @property
+    def on_click_handler(self) -> OnClickCallback | None:
+        """The handler the owning node supplied, or None when this button opens a link.
+
+        What a save reads for ``on_click``. A link's handler is deliberately not reported
+        here: it is rebuilt from ``button_link`` on load, so naming a method for it would
+        either fail to resolve or shadow the link it came from.
+        """
+        if isinstance(self._action, _NodeHandler):
+            return self._action.callback
+        return None
+
+    @on_click_handler.setter
+    def on_click_handler(self, callback: OnClickCallback | None) -> None:
+        if callback is None:
+            self._action = None
+            return
+        self._action = _NodeHandler(callback)
+
+    @property
+    def on_click_callback(self) -> OnClickCallback | None:
+        """The callback a click fires, whether the node supplied it or a link derived it."""
+        if isinstance(self._action, _Link):
+            return self._action.handler
+        return self.on_click_handler
+
+    @on_click_callback.setter
+    def on_click_callback(self, callback: OnClickCallback | None) -> None:
+        self.on_click_handler = callback
 
     @classmethod
     def get_trait_keys(cls) -> list[str]:
