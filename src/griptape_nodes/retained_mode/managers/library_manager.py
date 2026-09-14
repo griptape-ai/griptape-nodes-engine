@@ -287,7 +287,7 @@ from griptape_nodes.utils.version_utils import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Sequence
+    from collections.abc import Awaitable, Callable, Iterator, Sequence
     from types import ModuleType
 
     from griptape_nodes.node_library.advanced_node_library import AdvancedNodeLibrary
@@ -379,6 +379,13 @@ class ParsedDependencyUrl(NamedTuple):
     repo_name: str
     normalized_url: str
     ref: str | None
+
+
+class DiscoveredLibraryDependency(NamedTuple):
+    """A library reached through another library's dependency declarations."""
+
+    library_name: str
+    schema: LibrarySchema
 
 
 class LibraryUpdateInfo(NamedTuple):
@@ -1085,35 +1092,49 @@ class LibraryManager(EngineScoped):
     def _expand_targets_with_library_dependencies(self, target_library_names: list[str]) -> list[str]:
         """Add each target library's declared library dependencies, transitively.
 
-        Reads declarations from the discovered manifests rather than from LibraryRegistry, so this
-        is usable before anything has loaded. A dependency that cannot be resolved to a discovered
-        library is left out and logged: declarations are `required: false` in practice, and a
-        worker that refused to start because an optional companion library was absent would be a
-        worse failure than the feature that companion powers being unavailable.
+        A worker is told which library it serves, but that library's declared dependencies are part
+        of what it needs to run, so they load here too.
         """
-        expanded = list(dict.fromkeys(target_library_names))
-        queue = list(expanded)
+        roots = list(dict.fromkeys(target_library_names))
+        dependencies = [dep.library_name for dep in self._walk_declared_library_dependencies(roots)]
+        return list(dict.fromkeys([*roots, *dependencies]))
+
+    def _execution_dependencies_of_declared_libraries(self, library_name: str) -> list[str]:
+        """The execution dependencies declared by the libraries `library_name` depends on.
+
+        These resolve into the depending library's OWN execution environment rather than each
+        dependency's, for the same reason the combined install below already gives: two
+        environments resolved apart can choose different versions of anything they share, and a
+        worker with both on sys.path binds whichever landed first. One resolution cannot disagree
+        with itself. It also keeps a worker from writing a venv that another library owns.
+        """
+        dependencies: list[str] = []
+        for dep in self._walk_declared_library_dependencies([library_name]):
+            declared = dep.schema.metadata.dependencies
+            if declared is not None:
+                dependencies.extend(declared.pip_dependencies_exec or [])
+        return list(dict.fromkeys(dependencies))
+
+    def _walk_declared_library_dependencies(
+        self, root_library_names: list[str]
+    ) -> Iterator[DiscoveredLibraryDependency]:
+        """Yield every library reachable from `root_library_names` through dependency declarations.
+
+        Reads declarations from the discovered manifests rather than from LibraryRegistry, so this
+        is usable before anything has loaded. Roots are not yielded, only what they depend on. A
+        dependency that cannot be resolved to a discovered library is skipped and logged:
+        declarations are `required: false` in practice, and a worker that refused to start because
+        an optional companion library was absent would be a worse failure than the feature that
+        companion powers being unavailable.
+
+        Each manifest is read once and travels with the name, so callers needing both do not read
+        it again.
+        """
+        seen = set(root_library_names)
+        queue = [schema for schema in (self._library_schema_for_name(name) for name in root_library_names) if schema]
         while queue:
-            library_name = queue.pop(0)
-            info = self.get_library_info_by_library_name(library_name)
-            if info is None:
-                continue
-            metadata_result = self.load_library_metadata_from_file_request(
-                LoadLibraryMetadataFromFileRequest(file_path=info.library_path)
-            )
-            if isinstance(metadata_result, LoadLibraryMetadataFromFileResultFailure):
-                # Every dependency this manifest declares is dropped, so say so: silently it looks
-                # identical to a library that declares none.
-                logger.warning(
-                    "Could not read library '%s' manifest at %s, so its declared library "
-                    "dependencies are not being added to this worker's targets: %s",
-                    library_name,
-                    info.library_path,
-                    metadata_result.result_details,
-                )
-                continue
-            declarations = metadata_result.library_schema.metadata.declarations or []
-            for dep in declarations:
+            schema = queue.pop(0)
+            for dep in schema.metadata.declarations or []:
                 if not isinstance(dep, LibraryDependencyDeclaration):
                     continue
                 repo_name = self._parse_dependency_url(dep.url).repo_name
@@ -1122,14 +1143,41 @@ class LibraryManager(EngineScoped):
                     logger.info(
                         "Library '%s' declares a dependency on '%s', which is not installed here; "
                         "features that need it will be unavailable in this process.",
-                        library_name,
+                        schema.name,
                         repo_name,
                     )
                     continue
-                if dep_info.library_name not in expanded:
-                    expanded.append(dep_info.library_name)
-                    queue.append(dep_info.library_name)
-        return expanded
+                if dep_info.library_name in seen:
+                    continue
+                seen.add(dep_info.library_name)
+                dep_schema = self._library_schema_for_name(dep_info.library_name)
+                if dep_schema is None:
+                    continue
+                queue.append(dep_schema)
+                yield DiscoveredLibraryDependency(library_name=dep_info.library_name, schema=dep_schema)
+
+    def _library_schema_for_name(self, library_name: str) -> LibrarySchema | None:
+        """The discovered manifest for `library_name`, or None when it cannot be read.
+
+        A manifest that will not parse contributes no declarations, which looks identical to a
+        library that declares none -- so the difference is logged rather than left silent.
+        """
+        info = self.get_library_info_by_library_name(library_name)
+        if info is None:
+            return None
+        metadata_result = self.load_library_metadata_from_file_request(
+            LoadLibraryMetadataFromFileRequest(file_path=info.library_path)
+        )
+        if isinstance(metadata_result, LoadLibraryMetadataFromFileResultFailure):
+            logger.warning(
+                "Could not read library '%s' manifest at %s, so its declared library dependencies "
+                "are not visible in this process: %s",
+                library_name,
+                info.library_path,
+                metadata_result.result_details,
+            )
+            return None
+        return metadata_result.library_schema
 
     @staticmethod
     def _parse_dependency_url(url: str) -> ParsedDependencyUrl:
@@ -7256,11 +7304,18 @@ class LibraryManager(EngineScoped):
             pip_dependencies_exec = library_metadata.dependencies.pip_dependencies_exec or []
             pip_install_flags = library_metadata.dependencies.pip_install_flags or []
 
+        # A declared dependency's execution set belongs to THIS environment, so every decision
+        # below reads the combined set. A library that declares no execution dependencies of its
+        # own still needs one built when something it depends on does.
+        execution_dependencies = list(
+            dict.fromkeys([*pip_dependencies_exec, *self._execution_dependencies_of_declared_libraries(library_name)])
+        )
+
         # Ahead of either install and outside every gate below: a manifest that stopped declaring
         # execution dependencies must leave no execution environment behind. Which process installs
         # that set, and when, changes further up this stack -- so keying the removal to one of those
         # gates made it unreachable in precisely the case it exists for.
-        if not pip_dependencies_exec:
+        if not execution_dependencies:
             await self._retire_execution_env(library_name, library_file_path)
 
         owns_edit_venv = self._this_process_owns_the_edit_venv(library_file_path)
@@ -7290,7 +7345,7 @@ class LibraryManager(EngineScoped):
         installed_exec_count = 0
         # Gated on the heavy set, not the combined one: a library with no execution
         # dependencies must still produce no .venv-exec at all.
-        if self._is_worker and pip_dependencies_exec and self._is_one_of_my_target_libraries(library_name):
+        if self._is_worker and execution_dependencies and self._is_one_of_my_target_libraries(library_name):
             # The edit-time set is resolved INTO the execution environment alongside the heavy
             # one, not just listed beside it. The two venvs are fully isolated, so resolving them
             # separately let uv pick a different version of anything they share -- numpy as an
@@ -7299,17 +7354,22 @@ class LibraryManager(EngineScoped):
             # `import numpy` would bind one version when the orchestrator built the node and
             # another when the worker ran it, with no diagnostic anywhere. One resolution over
             # both sets makes that impossible rather than merely unlikely.
+            #
+            # A declared dependency's execution set joins the same resolution, for that reason one
+            # scope wider: the alternative is building each dependency's own execution venv and
+            # splicing them all, which reintroduces exactly the disagreement above between
+            # libraries instead of within one.
             try:
                 await self._install_dependency_set(
                     library_name=library_name,
                     library_file_path=library_file_path,
-                    pip_dependencies=[*pip_dependencies, *pip_dependencies_exec],
+                    pip_dependencies=[*pip_dependencies, *execution_dependencies],
                     pip_install_flags=pip_install_flags,
                     execution=True,
                 )
             except DependencyInstallError as e:
                 return InstallLibraryDependenciesResultFailure(result_details=str(e))
-            installed_exec_count = len(pip_dependencies_exec)
+            installed_exec_count = len(execution_dependencies)
 
         # Only count the edit-time set if this process actually installed it: a worker for an
         # exec-deps library skips it (the orchestrator owns that venv), so counting it here
@@ -7319,7 +7379,7 @@ class LibraryManager(EngineScoped):
         details = self._describe_dependency_install(
             library_name=library_name,
             declared_edit=len(pip_dependencies),
-            declared_exec=len(pip_dependencies_exec),
+            declared_exec=len(execution_dependencies),
             installed_edit=installed_edit_count,
             installed_exec=installed_exec_count,
         )
