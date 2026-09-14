@@ -39,14 +39,19 @@ class TestValuesASavedArtifactCanHold:
 
 class TestValuesItCannot:
     def test_an_arbitrary_object_is_reported_by_type(self) -> None:
-        saved = as_saved_state_value(Path("/tmp/somewhere"))  # noqa: S108
+        # Path is PosixPath or WindowsPath depending on the platform, so name it from the value.
+        path = Path("/tmp/somewhere")  # noqa: S108
 
-        assert saved.unsupported_type == "PosixPath"
+        saved = as_saved_state_value(path)
+
+        assert saved.unsupported_type == type(path).__name__
 
     def test_an_unsupported_value_inside_a_container_is_reported(self) -> None:
-        saved = as_saved_state_value({"paths": [Path("/tmp/somewhere")]})  # noqa: S108
+        path = Path("/tmp/somewhere")  # noqa: S108
 
-        assert saved.unsupported_type == "PosixPath"
+        saved = as_saved_state_value({"paths": [path]})
+
+        assert saved.unsupported_type == type(path).__name__
 
     def test_a_dictionary_keyed_by_anything_but_text_is_reported(self) -> None:
         """A saved mapping has text keys, so an int-keyed dict would come back changed."""

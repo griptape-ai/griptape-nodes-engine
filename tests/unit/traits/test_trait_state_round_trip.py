@@ -113,14 +113,16 @@ class TestMisdeclaredTraitStateDegradesInsteadOfFailingTheSave:
         assert "STATE_ALIASES" in caplog.text
 
     def test_a_value_no_saved_file_can_hold_is_omitted_and_warned_about(self, caplog: pytest.LogCaptureFixture) -> None:
-        trait = _UnsaveableValueTrait(label="x", root=Path("/tmp/somewhere"))  # noqa: S108
+        # Path is PosixPath or WindowsPath depending on the platform, so name it from the value.
+        root = Path("/tmp/somewhere")  # noqa: S108
+        trait = _UnsaveableValueTrait(label="x", root=root)
 
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
             state = trait.to_state()
 
         assert state == {"label": "x"}
         assert "root" in caplog.text
-        assert "PosixPath" in caplog.text
+        assert type(root).__name__ in caplog.text
 
 
 class _UnsaveableValueTrait(Trait):
