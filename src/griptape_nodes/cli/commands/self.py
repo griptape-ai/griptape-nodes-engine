@@ -13,7 +13,7 @@ from griptape_nodes.cli.shared import (
     DATA_DIR,
     console,
 )
-from griptape_nodes.common.diagnostics.report import DiagnosticsReport
+from griptape_nodes.common.diagnostics.report import ConfigFileDiagnostics, DiagnosticsReport
 from griptape_nodes.retained_mode.events.diagnostics_events import (
     GetDiagnosticsReportRequest,
     GetDiagnosticsReportResultSuccess,
@@ -239,29 +239,13 @@ def _print_config_layers(report: DiagnosticsReport) -> None:
 
     console.print("[bold]Config Layers[/bold] (lowest to highest priority):")
     for entry in config.files:
-        status = "applied"
-        status_style = "green"
-        if not entry.exists:
-            status = "not present"
-            status_style = "dim"
-        elif not entry.contributes:
-            # The workspace directory is the project directory: one file, loaded once, as
-            # `project`. Saying "applied" twice would read as two layers in the merge.
-            status = "superseded by the project layer"
-            status_style = "dim"
-        console.print(
-            f"  [cyan]{escape(entry.layer):<10}[/cyan] {escape(entry.path)}  "
-            f"[{status_style}]({status})[/{status_style}]"
-        )
+        console.print(f"  [cyan]{escape(entry.layer):<10}[/cyan] {escape(entry.path)}  {_layer_status(entry)}")
         if entry.parse_error:
             console.print(f"    [red]parse error: {escape(entry.parse_error)}[/red]")
 
     if config.runtime_workspace_pin is not None:
-        console.print(
-            f"  [cyan]{'runtime':<10}[/cyan] -  [green](applied)[/green]\n"
-            f"    workspace_directory = {escape(config.runtime_workspace_pin)}  "
-            f"[dim](pinned by the active project)[/dim]"
-        )
+        console.print(f"  [cyan]{'runtime':<10}[/cyan] -  [green](applied: pinned by the active project)[/green]")
+        console.print(f"    workspace_directory = {escape(config.runtime_workspace_pin)}")
 
     if config.environment_overrides:
         console.print(f"  [cyan]{'env':<10}[/cyan] -  [green](applied)[/green]")
@@ -269,6 +253,25 @@ def _print_config_layers(report: DiagnosticsReport) -> None:
             console.print(f"    {escape(name)}")
 
     console.print()
+
+
+def _layer_status(entry: ConfigFileDiagnostics) -> str:
+    """Say whether one file layer reached the merged settings, and if not, why not.
+
+    Every way a layer can contribute nothing comes first, because "applied" is the only
+    answer that needs no qualification -- and each of the others is a layer the user
+    edited and is entitled to think is in effect.
+    """
+    if not entry.exists:
+        return "[dim](not present)[/dim]"
+    if entry.parse_error:
+        # Skipped by the merge, which logs and moves on. The error itself is printed below.
+        return "[red](not read)[/red]"
+    if not entry.contributes:
+        # The workspace directory is the project directory: one file, read once, as
+        # `project`. Saying "applied" twice would read as two layers in the merge.
+        return "[dim](same file as project)[/dim]"
+    return "[green](applied)[/green]"
 
 
 def _print_configuration(report: DiagnosticsReport) -> None:

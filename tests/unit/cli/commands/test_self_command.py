@@ -364,8 +364,13 @@ class TestConfigLayers:
         assert "(applied)" in printed
         assert "(not present)" in printed
 
-    def test_a_layer_that_failed_to_parse_says_why(self) -> None:
-        """A broken file is skipped silently, so the merged settings alone never reveal it."""
+    def test_a_layer_that_failed_to_parse_says_why_and_is_not_called_applied(self) -> None:
+        """A broken file is skipped by the merge, so the settings alone never reveal it.
+
+        The file exists, which is the whole trap: calling it applied and then printing a
+        parse error under it tells the user both that their edit took effect and that it
+        could not be read.
+        """
         files = [
             ConfigFileDiagnostics(
                 path="~/GriptapeNodes/griptape_nodes_config.json",
@@ -378,6 +383,8 @@ class TestConfigLayers:
         printed = _printed(_report(config=ConfigDiagnostics(files=files)))
 
         assert "parse error: Expecting ',' delimiter: line 4 column 3 (char 61)" in printed
+        assert "(not read)" in printed
+        assert "(applied)" not in printed
 
     def test_a_file_the_project_layer_already_read_is_not_claimed_twice(self) -> None:
         """The workspace dir can be the project dir: one file, read once, as `project`."""
@@ -390,7 +397,7 @@ class TestConfigLayers:
 
         printed = _printed(_report(config=ConfigDiagnostics(files=files)))
 
-        assert "superseded by the project layer" in printed
+        assert "(same file as project)" in printed
 
     def test_a_workspace_pinned_by_the_active_project_is_shown_as_its_own_layer(self) -> None:
         """No file holds the pin, so a settings write cannot reach it. Saying so is the point."""
