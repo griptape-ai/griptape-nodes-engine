@@ -70,10 +70,6 @@ class Options(Trait):
                 state[key] = ui_options[key]
         return state
 
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["options", "models"]
-
     def converters_for_trait(self) -> list[Callable]:
         # The choices are hints, so there is nothing to snap a typed value back to.
         if self.allow_custom:

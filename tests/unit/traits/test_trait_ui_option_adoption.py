@@ -163,10 +163,6 @@ class _MisdeclaredTrait(Trait):
         super().__init__()
         self.level = level
 
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["misdeclared"]
-
     def ui_options_for_trait(self) -> dict:
         return {"misdeclared": self.level}
 

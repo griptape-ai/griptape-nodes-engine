@@ -9,10 +9,6 @@ class ColorPicker(Trait):
         super().__init__()
         self.format = format
 
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["color_picker"]
-
     def ui_options_for_trait(self) -> dict:
         return {"color_picker": {"format": self.format}}
 

@@ -39,10 +39,6 @@ class FileSystemPicker(Trait):
         self.allow_create = allow_create
         self.allow_rename = allow_rename
 
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["fileSystemPicker", "file_picker", "folder_picker"]
-
     def ui_options_for_trait(self) -> dict[str, Any]:
         """Generate the fileSystemPicker UI options dictionary."""
         options: dict[str, Any] = {

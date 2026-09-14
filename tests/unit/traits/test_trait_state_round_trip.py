@@ -69,10 +69,6 @@ class _UndeclaredCallbackTrait(Trait):
     def ui_options_for_trait(self) -> dict:
         return {}
 
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["undeclared_callback"]
-
 
 class _UnaliasedAttributeTrait(Trait):
     """Stands in for a third-party trait that forgot to declare STATE_ALIASES."""
@@ -83,10 +79,6 @@ class _UnaliasedAttributeTrait(Trait):
 
     def ui_options_for_trait(self) -> dict:
         return {}
-
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["unaliased_attribute"]
 
 
 class TestMisdeclaredTraitStateDegradesInsteadOfFailingTheSave:
@@ -136,10 +128,6 @@ class _UnsaveableValueTrait(Trait):
     def ui_options_for_trait(self) -> dict:
         return {}
 
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["unsaveable_value"]
-
 
 class _ExtensionsTrait(Trait):
     """Stands in for a trait whose constructor takes a set, as a file picker's extensions are."""
@@ -150,10 +138,6 @@ class _ExtensionsTrait(Trait):
 
     def ui_options_for_trait(self) -> dict:
         return {}
-
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["extensions"]
 
 
 class TestStateIsWhatADataFormatCanHold:
@@ -184,10 +168,6 @@ class _InheritedConstructorBase(Trait):
         super().__init__()
         self.low = low
 
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["inherited_base"]
-
 
 @dataclass(eq=False)
 class _ForwardingSubclass(_InheritedConstructorBase):
@@ -199,10 +179,6 @@ class _ForwardingSubclass(_InheritedConstructorBase):
         super().__init__(**kwargs)
         self.high = high
 
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["forwarding"]
-
 
 @dataclass(eq=False)
 class _NarrowingSubclass(_InheritedConstructorBase):
@@ -211,18 +187,10 @@ class _NarrowingSubclass(_InheritedConstructorBase):
     def __init__(self) -> None:
         super().__init__(low=7)
 
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["narrowing"]
-
 
 @dataclass(eq=False)
 class _NoConstructorTrait(Trait):
     """Declares no __init__, so @dataclass generates one over inherited element fields."""
-
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["no_constructor"]
 
 
 class TestInheritedConstructorArguments:

@@ -22,10 +22,6 @@ class Twin(Trait):
     def ui_options_for_trait(self) -> dict:
         return {}
 
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["twin"]
-
 
 @pytest.fixture
 def foreign_twin() -> Generator[ModuleType, None, None]:

@@ -12,10 +12,6 @@ class MinMax(Trait):
         self.min = min_val
         self.max = max_val
 
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["min", "max", "minmax", "min_max"]
-
     def ui_options_for_trait(self) -> dict:
         return {"multiline": True}
 

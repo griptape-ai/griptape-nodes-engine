@@ -12,10 +12,6 @@ class Clamp(Trait):
         self.min: float | None = min_val
         self.max: float | None = max_val
 
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["clamp"]
-
     def _clamp_number(self, value: float) -> float:
         # Keep this as a tiny helper so the converter stays readable and so we can
         # consistently apply one-sided bounds (min-only or max-only) everywhere.
