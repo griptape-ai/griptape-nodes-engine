@@ -163,6 +163,30 @@ class TestRuntimeWorkspacePin:
 
         assert section.runtime_workspace_pin is None
 
+    @pytest.mark.parametrize(
+        "pinned",
+        [
+            "/home/samantha/projects/demo/workspace/",
+            "/home/samantha/projects//demo/workspace",
+            r"C:\Users\samantha\projects\demo",
+        ],
+    )
+    def test_a_pin_is_reported_as_the_project_file_spells_it(self, engine: Mock, pinned: str) -> None:
+        """A pin is a config value, not a path this machine resolved and can restate.
+
+        Read through `Path` first, every one of these comes back as something nobody wrote:
+        the trailing separator and the doubled one are dropped on any platform, and on
+        Windows a POSIX-spelled pin comes back with backslashes -- so a project authored on
+        a colleague's Mac is reported to its author as a path they would not recognize, in
+        the one field whose point is naming a setting no file holds.
+        """
+        section = _section(
+            engine,
+            [ConfigLayer(layer="runtime", path=None, present=True, values={"workspace_directory": pinned})],
+        )
+
+        assert section.runtime_workspace_pin == pinned
+
     def test_the_pin_goes_through_the_redactor(
         self, engine: Mock, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:

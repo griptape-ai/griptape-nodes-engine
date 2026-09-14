@@ -752,7 +752,11 @@ class DiagnosticsManager(EngineScoped):
         pinned = runtime.values.get("workspace_directory")
         if pinned is None:
             return None
-        return redactor.redact_path(Path(str(pinned)))
+        # Reported as the string the project file holds, not laundered through `Path` first.
+        # This is a config value rather than a path this machine resolved, and on Windows
+        # `str(Path("/home/sam/work"))` rewrites the separators, so a project authored on one
+        # platform would be reported back as something nobody wrote.
+        return redactor.redact_path(str(pinned))
 
     def _build_secrets_section(self, warnings: list[str]) -> list[SecretDiagnostics]:
         """Report which secrets exist and where, never what they are.
