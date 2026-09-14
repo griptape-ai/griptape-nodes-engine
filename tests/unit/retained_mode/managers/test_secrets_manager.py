@@ -13,7 +13,7 @@ from griptape_nodes.retained_mode.events.secrets_events import (
     GetAllSecretValuesResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
-from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
+from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager, merge_env_file_values
 
 
 @pytest.mark.skipif(
@@ -608,7 +608,7 @@ class TestSecretsManager:
         """
 
         def assert_invariant(secrets_manager: SecretsManager) -> None:
-            merged = secrets_manager._read_merged_env_files()
+            merged = secrets_manager.read_merged_env_files()
             for key in secrets_manager._managed_env_keys:
                 assert key in os.environ, f"managed key {key!r} missing from os.environ"
                 if key in merged:
@@ -793,3 +793,46 @@ class TestGetAllSecretValuesRequest:
                     result = secrets_manager.on_handle_get_all_secret_values_request(GetAllSecretValuesRequest())
 
             assert isinstance(result, GetAllSecretValuesResultFailure)
+
+
+class TestMergeEnvFileValues:
+    """The precedence between the two `.env` files, stated in exactly one place.
+
+    `get_secret` resolves from these files and the diagnostics report says which file each
+    key came from, and the two have to agree -- forever, not just today. Written out by hand
+    in both, a later change to the layering could be applied to secret resolution and not to
+    the report of it, leaving the report quietly wrong about the file a support engineer
+    should be looking at.
+    """
+
+    def test_the_workspace_file_wins(self) -> None:
+        merged = merge_env_file_values(
+            global_values={"SHARED_KEY": "from_global"}, workspace_values={"SHARED_KEY": "from_workspace"}
+        )
+
+        assert merged == {"SHARED_KEY": "from_workspace"}
+
+    def test_a_key_in_only_one_file_survives_from_either(self) -> None:
+        merged = merge_env_file_values(global_values={"GLOBAL_ONLY": "a"}, workspace_values={"WORKSPACE_ONLY": "b"})
+
+        assert merged == {"GLOBAL_ONLY": "a", "WORKSPACE_ONLY": "b"}
+
+    def test_an_empty_workspace_value_still_wins(self) -> None:
+        """`FOO=` in the workspace file is a deliberate blanking, not an absence.
+
+        Falling back to the global value here would make a key the user emptied on purpose go
+        on working, from a file they were not editing.
+        """
+        merged = merge_env_file_values(global_values={"SHARED_KEY": "from_global"}, workspace_values={"SHARED_KEY": ""})
+
+        assert merged == {"SHARED_KEY": ""}
+
+    def test_the_arguments_are_left_alone(self) -> None:
+        """Both come from a file read; a merge that mutated one would corrupt the layer."""
+        global_values = {"SHARED_KEY": "from_global"}
+        workspace_values = {"SHARED_KEY": "from_workspace"}
+
+        merge_env_file_values(global_values=global_values, workspace_values=workspace_values)
+
+        assert global_values == {"SHARED_KEY": "from_global"}
+        assert workspace_values == {"SHARED_KEY": "from_workspace"}

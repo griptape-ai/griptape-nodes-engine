@@ -85,7 +85,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     ListAllWorkflowsResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.config_manager import USER_CONFIG_PATH
-from griptape_nodes.retained_mode.managers.secrets_manager import ENV_VAR_PATH
+from griptape_nodes.retained_mode.managers.secrets_manager import ENV_VAR_PATH, merge_env_file_values
 from griptape_nodes.retained_mode.managers.settings import (
     LOG_RETENTION_DAYS_KEY,
     LOG_TO_FILE_KEY,
@@ -479,10 +479,18 @@ class DiagnosticsManager(EngineScoped):
         encoding raises ``UnicodeDecodeError`` rather than an ``OSError``. Both are exactly
         the situation these checks exist to report, so either must cost the connection
         check rather than the whole run.
+
+        Caught broadly on purpose, and this is the one place in this manager that is. The
+        read happens while the health-check context is being built, which is outside
+        ``run_health_checks``'s per-check guard, so anything this raises takes down all six
+        checks instead of one. It resolves a workspace and parses two files the user hand
+        edits, so it can fail in as many ways as a filesystem can, and every one of those
+        ways is something a user runs ``gtn doctor`` to be told about. A key that cannot be
+        read costs the connection check, which reports that it has no key to connect with.
         """
         try:
             return self.engine.secrets_manager.get_secret(CLOUD_API_KEY_NAME, should_error_on_not_found=False)
-        except (OSError, UnicodeDecodeError):
+        except Exception:
             logger.warning(
                 "Could not read the Griptape Cloud API key while running health checks.",
                 exc_info=True,
@@ -653,9 +661,22 @@ class DiagnosticsManager(EngineScoped):
             "log_directory": self.engine.config_manager.log_directory,
         }
 
-        missing = [redactor.redact_path(path) for path in candidates.values() if path is not None and not path.exists()]
+        # Each path is redacted exactly once and the result reused. The redactor counts
+        # every match it makes, so redacting a path a second time for the missing list
+        # counted its home directory twice, and the manifest then claimed more values had
+        # been hidden than there were -- worst for the workspace directory, which is both
+        # reported and, on a machine worth collecting a bundle from, often the missing one.
+        redacted: dict[str, str | None] = {}
+        missing: list[str] = []
+        for name, path in candidates.items():
+            if path is None:
+                redacted[name] = None
+                continue
+            shown = redactor.redact_path(path)
+            redacted[name] = shown
+            if not path.exists():
+                missing.append(shown)
 
-        redacted = {name: redactor.redact_path(path) if path is not None else None for name, path in candidates.items()}
         return PathDiagnostics(
             **redacted,
             missing_paths=missing,
@@ -994,7 +1015,7 @@ class DiagnosticsManager(EngineScoped):
     def _env_file_secret_values(self) -> dict[str, str]:
         """Return the merged ``.env`` contents, or an empty mapping when they cannot be read."""
         try:
-            return self.engine.secrets_manager._read_merged_env_files()
+            return self.engine.secrets_manager.read_merged_env_files()
         except (OSError, UnicodeDecodeError):
             # An unreadable .env file means less thorough scrubbing, not a failed report.
             # The generic credential patterns still apply.
@@ -1027,8 +1048,10 @@ class DiagnosticsManager(EngineScoped):
         workspace_values = self._read_env_file(self._workspace_env_path(warnings), warnings)
         global_values = self._read_env_file(ENV_VAR_PATH, warnings)
 
-        # Workspace beats global, matching SecretsManager._read_merged_env_files.
-        file_values = {**global_values, **workspace_values}
+        # Layered by the secrets manager's own function rather than by a copy of it here.
+        # The report exists to say which file a key really came from, so it has to agree
+        # with `get_secret` about which file wins -- forever, not just today.
+        file_values = merge_env_file_values(global_values=global_values, workspace_values=workspace_values)
 
         candidate_names = {*file_values, *declared_names}
         os_values = {

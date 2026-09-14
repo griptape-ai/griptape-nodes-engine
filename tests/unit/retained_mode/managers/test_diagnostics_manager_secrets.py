@@ -351,7 +351,7 @@ class TestKnownSecretValues:
         The engine is the only thing that knows these, which makes it the only thing that
         can find one a library logged verbatim.
         """
-        layout.engine.secrets_manager._read_merged_env_files.return_value = {
+        layout.engine.secrets_manager.read_merged_env_files.return_value = {
             _SECRET_NAME: _GLOBAL_VALUE,
             _OTHER_NAME: "",
         }
@@ -369,7 +369,7 @@ class TestKnownSecretValues:
         built from the files alone left those engines' keys in their own bundled logs.
         """
         layout.declare(_SECRET_NAME)
-        layout.engine.secrets_manager._read_merged_env_files.return_value = {}
+        layout.engine.secrets_manager.read_merged_env_files.return_value = {}
         monkeypatch.setenv(_SECRET_NAME, _OS_VALUE)
 
         assert layout.manager._known_secret_values() == [_OS_VALUE]
@@ -383,7 +383,7 @@ class TestKnownSecretValues:
         pattern would replace most of a bundle with `<redacted>`.
         """
         layout.declare(_SECRET_NAME)
-        layout.engine.secrets_manager._read_merged_env_files.return_value = {}
+        layout.engine.secrets_manager.read_merged_env_files.return_value = {}
         monkeypatch.setenv(_SECRET_NAME, _OS_VALUE)
         monkeypatch.setenv("GTN_TEST_DIAGNOSTICS_UNDECLARED", "an-unrelated-value")
 
@@ -393,20 +393,20 @@ class TestKnownSecretValues:
         self, layout: _Layout, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The engine copies `.env` entries into the environment, so most values are found twice."""
-        layout.engine.secrets_manager._read_merged_env_files.return_value = {_SECRET_NAME: _GLOBAL_VALUE}
+        layout.engine.secrets_manager.read_merged_env_files.return_value = {_SECRET_NAME: _GLOBAL_VALUE}
         monkeypatch.setenv(_SECRET_NAME, _GLOBAL_VALUE)
 
         assert layout.manager._known_secret_values() == [_GLOBAL_VALUE]
 
     def test_an_unreadable_env_file_costs_thoroughness_not_the_report(self, layout: _Layout) -> None:
         """Pattern-based redaction still applies, so this degrades rather than fails."""
-        layout.engine.secrets_manager._read_merged_env_files.side_effect = OSError("permission denied")
+        layout.engine.secrets_manager.read_merged_env_files.side_effect = OSError("permission denied")
 
         assert layout.manager._known_secret_values() == []
 
     def test_an_env_file_that_is_not_utf8_costs_thoroughness_not_the_report(self, layout: _Layout) -> None:
         """`dotenv` decodes as UTF-8, so a file in another encoding raises a `ValueError`, not an `OSError`."""
-        layout.engine.secrets_manager._read_merged_env_files.side_effect = UnicodeDecodeError(
+        layout.engine.secrets_manager.read_merged_env_files.side_effect = UnicodeDecodeError(
             "utf-8", b"a-value-\xe9", 8, 9, "invalid continuation byte"
         )
 
@@ -415,6 +415,6 @@ class TestKnownSecretValues:
     def test_a_declared_name_with_no_value_anywhere_adds_no_pattern(self, layout: _Layout) -> None:
         """An empty value as a search pattern would match everywhere and redact the whole bundle."""
         layout.declare(_SECRET_NAME)
-        layout.engine.secrets_manager._read_merged_env_files.return_value = {_SECRET_NAME: ""}
+        layout.engine.secrets_manager.read_merged_env_files.return_value = {_SECRET_NAME: ""}
 
         assert layout.manager._known_secret_values() == []

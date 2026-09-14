@@ -231,3 +231,33 @@ class TestCloudApiKey:
 
         assert key is None
         assert "Griptape Cloud API key" in caplog.text
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            RuntimeError("the workspace could not be resolved"),
+            KeyError("HOME"),
+            AttributeError("'NoneType' object has no attribute 'workspace_path'"),
+            ValueError("python-dotenv could not parse the file"),
+        ],
+    )
+    def test_a_failure_of_any_kind_costs_one_check_not_the_whole_run(
+        self, caplog: pytest.LogCaptureFixture, failure: Exception
+    ) -> None:
+        """This read is the one place in the manager that catches broadly, and needs to be.
+
+        It happens while the health-check context is being built, which is *outside*
+        `run_health_checks`'s per-check guard -- so anything it raises takes down all six
+        checks rather than one. What it does is resolve a workspace and parse two files the
+        user hand edits, so it can fail in as many ways as a filesystem can, and every one of
+        those ways is something a user runs `gtn doctor` to be told about.
+        """
+        engine = Mock()
+        engine.secrets_manager.get_secret.side_effect = failure
+        manager = DiagnosticsManager(Mock(), engine=engine)
+
+        with caplog.at_level("WARNING", logger="griptape_nodes"):
+            key = manager._cloud_api_key()
+
+        assert key is None
+        assert "Griptape Cloud API key" in caplog.text
