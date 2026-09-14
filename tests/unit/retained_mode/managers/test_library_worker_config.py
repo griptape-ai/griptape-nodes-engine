@@ -728,6 +728,12 @@ class TestExecutionDependenciesOfDeclaredLibraries:
         monkeypatch.setattr(manager, "load_library_metadata_from_file_request", fake_load)
         return manager
 
+    def _collect(self, manager: LibraryManager, library_name: str) -> list[str]:
+        """What `library_name`'s dependencies contribute, given the caller already holds its manifest."""
+        schema = manager._library_schema_for_name(library_name)
+        assert schema is not None
+        return manager._execution_dependencies_of_declared_libraries(schema)
+
     def test_a_dependency_execution_set_is_collected(self, monkeypatch: pytest.MonkeyPatch) -> None:
         manager = self._manager_with(
             monkeypatch,
@@ -745,7 +751,7 @@ class TestExecutionDependenciesOfDeclaredLibraries:
             },
         )
 
-        collected = manager._execution_dependencies_of_declared_libraries("Consumer Library")
+        collected = self._collect(manager, "Consumer Library")
 
         # Its own set is added by the caller, so only the dependency's appears here.
         assert collected == ["openexr==3.2"]
@@ -772,7 +778,7 @@ class TestExecutionDependenciesOfDeclaredLibraries:
             },
         )
 
-        assert manager._execution_dependencies_of_declared_libraries("A") == ["b-pin==1.0", "c-pin==2.0"]
+        assert self._collect(manager, "A") == ["b-pin==1.0", "c-pin==2.0"]
 
     def test_a_library_with_no_declarations_collects_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         manager = self._manager_with(
@@ -782,7 +788,7 @@ class TestExecutionDependenciesOfDeclaredLibraries:
             },
         )
 
-        assert manager._execution_dependencies_of_declared_libraries("Solo Library") == []
+        assert self._collect(manager, "Solo Library") == []
 
     def test_a_pin_declared_by_two_dependencies_appears_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """It becomes one resolution, so a repeat is noise the install does not need."""
@@ -810,7 +816,7 @@ class TestExecutionDependenciesOfDeclaredLibraries:
             },
         )
 
-        assert manager._execution_dependencies_of_declared_libraries("Consumer Library") == ["shared==1.0"]
+        assert self._collect(manager, "Consumer Library") == ["shared==1.0"]
 
     @pytest.mark.asyncio
     async def test_the_worker_load_path_applies_the_expansion(self, monkeypatch: pytest.MonkeyPatch) -> None:
