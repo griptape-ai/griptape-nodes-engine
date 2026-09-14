@@ -167,9 +167,9 @@ class ActivateProjectRequest(RequestPayload, SkipTheLineMixin):
     """
 
     project_id: str
-    # Generation of the orchestrator's committed activation. The worker adopts strictly
-    # increasing generations only, which orders a switch fan-out against the registration
-    # reply deterministically -- the two arrive on different loops in arbitrary order.
+    # Generation of the orchestrator's committed activation. The worker adopts strictly increasing
+    # generations only, so two activations that overlap resolve to the newer one regardless of the
+    # order they arrive or finish in.
     generation: int = 0
 
 
@@ -484,7 +484,7 @@ def register_broadcast_handlers(
     config_manager: ConfigManager,
     secrets_manager: SecretsManager,
     project_manager: ProjectManager,
-) -> None:
+) -> asyncio.Event:
     """Install worker-side handlers for orchestrator-originated broadcasts.
 
     Workers receive ``ReloadConfigRequest`` / ``RefreshSecretsRequest`` /
@@ -492,7 +492,14 @@ def register_broadcast_handlers(
     the shared on-disk state or adopting the orchestrator's current project. The
     actual work is delegated to the corresponding manager so domain logic stays
     in the manager and routing decisions stay here.
+
+    Returns:
+        An event set once this worker has settled an activation from the orchestrator, whether by
+        adopting it or by finding it already stale. A worker must not load libraries before that:
+        libraries resolve against the workspace a project decides, and the orchestrator sends the
+        activation rather than answering registration with it, so nothing else orders the two.
     """
+    project_activation_settled = asyncio.Event()
 
     def handle_reload_config(request: ReloadConfigRequest) -> ResultPayload:  # noqa: ARG001
         try:
@@ -512,12 +519,12 @@ def register_broadcast_handlers(
             return RefreshSecretsResultFailure(result_details=details)
         return RefreshSecretsResultSuccess(result_details="Refreshed secrets from shared .env file.")
 
-    # Serializes adoptions against each other. The registration-reply adoption and a switch
-    # fan-out run as separate tasks on this loop, and without the lock an older activation can
-    # pass the staleness check, suspend at an await inside activation, and FINISH after a newer
-    # one -- leaving the worker on the older project while both replies report success. The
-    # staleness check must not be hoisted out of the lock: it reads the generation the previous
-    # holder records.
+    # Serializes adoptions against each other. Activation awaits internally, so two that arrive
+    # close together each run as their own task and interleave: the older can pass the staleness
+    # check, suspend, and FINISH after the newer, leaving the worker on the older project while
+    # both replies report success. One sender does not fix this -- overlap is a property of the
+    # await, not of who sent it. The staleness check must not be hoisted out of the lock: it reads
+    # the generation the previous holder records.
     adoption_lock = asyncio.Lock()
 
     async def handle_activate_project(request: ActivateProjectRequest) -> ResultPayload:
@@ -537,6 +544,9 @@ def register_broadcast_handlers(
         # stale project while reporting success is exactly the divergence we must avoid.
         async with adoption_lock:
             if project_manager.is_stale_adoption(request.project_id, request.generation):
+                # Settled, not adopted: a newer activation already landed, so whatever is waiting
+                # on this has the answer it needs.
+                project_activation_settled.set()
                 return ActivateProjectResultSuccess(
                     result_details=(
                         f"Skipped adopting project '{request.project_id}' (generation "
@@ -563,8 +573,10 @@ def register_broadcast_handlers(
                 logger.error(details)
                 return ActivateProjectResultFailure(result_details=details)
             project_manager.record_adopted_generation(request.generation)
+            project_activation_settled.set()
         return ActivateProjectResultSuccess(result_details=f"Adopted project from orchestrator: {request.project_id}.")
 
     event_manager.assign_manager_to_request_type(ReloadConfigRequest, handle_reload_config)
     event_manager.assign_manager_to_request_type(RefreshSecretsRequest, handle_refresh_secrets)
     event_manager.assign_manager_to_request_type(ActivateProjectRequest, handle_activate_project)
+    return project_activation_settled

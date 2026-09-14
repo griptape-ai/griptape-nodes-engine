@@ -3091,11 +3091,7 @@ class ProjectManager(EngineScoped):
         # and are inert. Gating on initialization instead left a switch that landed after
         # a worker registered but before init finished un-fanned-out for the session.
         if previous_project_id != resolved_project_id:
-            # The generation is read here, with no await between the commit inside
-            # _activate_project and this line, so the (id, generation) pair is atomic. Reading
-            # it later -- in the fan-out handler -- can pair this id with a NEWER switch's
-            # generation, and this project would then beat that one on the workers.
-            changed = CurrentProjectChanged(project_id=resolved_project_id, generation=self._project_generation)
+            changed = CurrentProjectChanged(project_id=resolved_project_id)
             # The wire copy goes up first, still synchronous with the commit, so GUI clients
             # see switches in commit order even when two overlap.
             self._event_manager.put_event(AppEvent(payload=changed))
