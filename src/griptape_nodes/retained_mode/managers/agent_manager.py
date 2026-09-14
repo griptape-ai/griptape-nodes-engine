@@ -554,9 +554,8 @@ class AgentManager(EngineScoped):
         cancel_event = asyncio.Event()
         self._active_runs[thread_id] = _ActiveRun(cancel_event=cancel_event, loop=asyncio.get_running_loop())
         try:
-            # Acquired here, with nothing between it and the `async with` that
-            # releases it: the lease holds a use count on every MCP server it
-            # names, and a server left with a stray count can never be shut down.
+            # Nothing may sit between this and the `async with` that releases
+            # it: a server left with a stray use count is never shut down.
             mcp = await self._acquire_mcp_toolsets(request.additional_mcp_servers)
             async with mcp.lease:
                 result = await runner.run(
@@ -1198,11 +1197,9 @@ class AgentManager(EngineScoped):
         configs = [{**enabled[name], "name": name} for name in server_names if name in enabled]
         lease = await self._mcp_toolsets.acquire(configs)
         instructions = _compose_server_rules(configs)
-        # Servers with their config digests, which is what answers "an edit
-        # didn't take effect" reports: a digest that moved between two runs says
-        # the run really did read the new config. The rules text itself is
-        # deliberately never logged - it is a free-text box, so whatever the user
-        # pasted into it would end up in logs attached to support reports.
+        # Config digests answer "my edit didn't take effect": a digest that moved
+        # between runs says the new config really was read. The rules text is
+        # never logged - free-text the user may have pasted anything into.
         logger.debug(
             "Agent run attached MCP server(s) %s",
             ", ".join(f"{server.name}@{server.digest}" for server in lease.resolved) or "none",
@@ -1217,9 +1214,7 @@ class AgentManager(EngineScoped):
         while ``None`` means we could not find out and must leave them alone.
         """
         # Not broadcast: the answer carries each server's `env` and `headers`
-        # verbatim, and this runs once per message now rather than once per
-        # runner build. Nothing listens for the result of this internal lookup -
-        # a client wanting the list asks for it itself.
+        # verbatim, and nothing listens for this internal lookup's result.
         result = self.engine.handle_request(GetEnabledMCPServersRequest(broadcast_result=False))
         if not isinstance(result, GetEnabledMCPServersResultSuccess):
             logger.warning("Could not load enabled MCP servers; agent will run without extras.")

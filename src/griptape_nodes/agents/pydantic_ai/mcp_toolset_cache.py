@@ -1,32 +1,14 @@
 """Cache of live MCP toolsets, keyed by the configuration behind them.
 
-An MCP toolset is cheap to build (~0.1 ms) but expensive to *run*: a stdio
-server's transport keeps its subprocess alive between runs, so a toolset held
-across runs saves a process spawn and an ``initialize`` round-trip. That reuse
-is only correct while the configuration behind it is unchanged - the command,
-args, env, cwd, url and headers are baked into the transport when it is built,
-so a cached toolset speaks to a server launched from the *old* config forever.
+A stdio transport keeps its subprocess alive between runs, and the connection
+config is baked in when the toolset is built - so a cached toolset talks to a
+server launched from the *old* config until something rebuilds it.
 
-Entries are keyed by server name and carry a fingerprint of the config, so an
-unchanged server keeps its warm subprocess and an edited one is rebuilt.
-Comparing per run rather than listening for a config-change event keeps the
-cache correct however the config came to be different. Note the limit: a config
-*file* edited behind the engine's back is not picked up at all, because nothing
-re-reads it until something calls ``load_configs``.
-
-Two questions are asked of each config, because respawning a subprocess is
-expensive and most edits don't need one:
-
-* *Do we have to reconnect?* - :func:`connection_fingerprint`, over only the
-  keys baked into the transport at build time. A ``rules`` edit is prompt-side
-  and leaves it untouched.
-* *Which configuration did this run use?* - :func:`digest_config`, over the
-  whole config, since ``rules`` change the answer without changing the
-  connection.
-
-:func:`fingerprint_config` output contains ``env`` and ``headers``, so it is a
-comparison key that must never be logged or persisted. Only the short digest is
-opaque enough for a log line, disk, or a client.
+Two values are derived per config: :func:`connection_fingerprint`, over only
+the baked-in keys, decides whether to reconnect; :func:`digest_config`, over
+the whole config, records which configuration a run used. The fingerprint
+contains ``env`` and ``headers``, so it must never be logged or persisted -
+only the digest is opaque.
 """
 
 from __future__ import annotations
@@ -50,36 +32,23 @@ logger = logging.getLogger("griptape_nodes")
 
 
 DIGEST_LENGTH = 12
-"""Characters of hex kept from the fingerprint hash.
-
-Long enough that two configurations of one server won't collide in practice,
-short enough to read in a log line or a thread's metadata.
-"""
+"""Hex characters kept from the fingerprint hash - short enough to read in a log."""
 
 
 CONNECTION_KEYS: frozenset[str] = frozenset({"transport", "command", "args", "env", "cwd", "url", "headers", "timeout"})
-"""Config keys that are baked in when a toolset is built, and so require a restart.
+"""Config keys baked in when a toolset is built, and so requiring a restart.
 
-Everything `mcp_server_from_config` reads to construct a transport, plus
-``timeout``, which becomes the toolset's ``init_timeout``. A change to any of
-them cannot reach a server that is already running, so the only way to apply it
-is to tear the server down and build a new one.
-
-Every *other* key - ``rules``, ``description``, ``enabled``, and anything added
-later - is prompt-side or bookkeeping and is re-read from the config on each
-run, so editing it must not cost a reconnect. Adding a field here is therefore a
-deliberate choice to trade warm reuse for correctness; the default of leaving it
-out is only wrong if the field ends up passed to `mcp_server_from_config`.
+Everything `mcp_server_from_config` reads, plus ``timeout`` (its
+``init_timeout``). Every other key is prompt-side and re-read each run, so add
+one here only if the builder starts reading it - a test enforces that.
 """
 
 
 def connection_fingerprint(config: Mapping[str, Any]) -> str:
     """Return the comparison form of only the parts of ``config`` a connection depends on.
 
-    Two configs with the same connection fingerprint can share one running
-    server, however much the rest of them differs. Like
-    :func:`fingerprint_config`, the result embeds ``env`` and ``headers``: treat
-    it as a secret.
+    Two configs matching here can share one running server. Embeds ``env`` and
+    ``headers``: treat as a secret.
     """
     connection = {key: value for key, value in config.items() if key in CONNECTION_KEYS}
     return fingerprint_config(connection)
@@ -88,9 +57,8 @@ def connection_fingerprint(config: Mapping[str, Any]) -> str:
 def fingerprint_config(config: Mapping[str, Any]) -> str:
     """Return the canonical comparison form of a resolved MCP server config.
 
-    Sorted keys make the result independent of dict ordering, and ``default=str``
-    keeps a config carrying a non-JSON value comparable instead of raising. The
-    result contains ``env`` and ``headers``: treat it as a secret.
+    ``default=str`` keeps a non-JSON value comparable instead of raising.
+    Contains ``env`` and ``headers``: treat as a secret.
     """
     return json.dumps(config, sort_keys=True, default=str)
 
@@ -107,11 +75,7 @@ def digest_of_fingerprint(fingerprint: str) -> str:
 
 @dataclass
 class ResolvedMCPServer:
-    """One MCP server as it was actually used for a run.
-
-    ``digest`` identifies the configuration, so two runs of the same named
-    server can be told apart when the config changed between them.
-    """
+    """One MCP server as it was actually used for a run, identified by config digest."""
 
     name: str
     digest: str
@@ -119,29 +83,21 @@ class ResolvedMCPServer:
 
 @dataclass
 class _Entry:
-    """A live toolset, the transport under it, and the config it was built from.
+    """A live toolset, the transport under it, and the connection it was built from.
 
-    Holds only what the running server owns. Anything that varies per run -
-    notably which whole config a given run supplied - belongs on the lease, not
-    here, because one entry is shared by every run using that server.
+    Holds only what the running server owns; anything per-run lives on the lease,
+    since one entry is shared by every run using that server.
     """
 
     name: str
     toolset: AbstractToolset[Any]
     transport: ClientTransport
-    # What the running server was launched from: if this changes, the server has
-    # to be replaced, because there is no way to tell a live subprocess about it.
-    # Kept out of `repr` because it embeds `env` and `headers`: a dataclass repr
-    # would otherwise put credentials into pytest output and any log line that
-    # formats an entry or the cache holding it.
+    # `repr=False` because this embeds `env` and `headers`.
     connection_fingerprint: str = field(repr=False)
-    # Runs currently inside `async with toolset`. A transport cannot be
-    # disconnected out from under a live session, so eviction waits for zero.
+    # Runs currently inside `async with toolset`; eviction waits for zero,
+    # because a transport cannot be disconnected mid-session.
     users: int = 0
-    # Set when eviction was requested while `users` was non-zero; the last
-    # user out does the teardown. A retired entry is already out of the cache
-    # dict, so it is reachable only through the leases still holding it - which
-    # is why a lease holds entries rather than names.
+    # Eviction was requested while still in use; the last user out tears down.
     retired: bool = False
 
 
@@ -149,10 +105,9 @@ class _Entry:
 class _LeasedServer:
     """One entry as one run borrowed it, with the config *that* run supplied.
 
-    The digest lives here rather than on the entry because two overlapping runs
-    share the entry while each having its own config: a prompt-side edit between
-    them changes the digest without changing the server, so an entry-level field
-    would make both runs report whichever acquired last.
+    The digest belongs here, not on the shared entry: two overlapping runs can
+    differ in a prompt-side field while sharing the server, and an entry-level
+    digest would make both report whichever acquired last.
     """
 
     entry: _Entry
@@ -184,11 +139,9 @@ class MCPToolsetCache:
         """
         servers: list[_LeasedServer] = []
         async with self._lock:
-            # Two passes on purpose. Resolving an entry can raise, and there is
-            # no lease yet to release what came before it, so nothing takes a use
-            # count until every entry is in hand. An entry built before the raise
-            # stays cached at `users == 0`, which is reusable and still reapable;
-            # one left at `users > 0` with no lease could never be disconnected.
+            # Two passes on purpose: resolving can raise, and there is no lease
+            # yet to release what came before, so nothing takes a use count
+            # until every entry is in hand. A stray count is never reapable.
             for config in configs:
                 entry = await self._entry_for(str(config["name"]), config)
                 if entry is not None:
@@ -200,9 +153,8 @@ class MCPToolsetCache:
     async def retain_only(self, names: Iterable[str]) -> None:
         """Drop cached servers that are no longer configured or enabled.
 
-        A server the user simply didn't ask for on this run keeps its warm
-        subprocess; one that has been deleted or disabled should not keep a
-        process alive, so it is torn down here.
+        A server merely not asked for on this run keeps its warm subprocess; a
+        deleted or disabled one should not keep a process alive.
         """
         keep = set(names)
         async with self._lock:
@@ -215,11 +167,9 @@ class MCPToolsetCache:
     async def aclose(self) -> None:
         """Disconnect every cached server.
 
-        Nothing calls this in the engine today: managers have no shutdown hook,
-        so cached servers are reaped by the process exiting. It exists for tests
-        and for embedders that outlive an engine, and is the hook to wire up if a
-        manager shutdown path is ever added - until then, do not assume a warm
-        subprocess is ever shut down cleanly.
+        Nothing in the engine calls this - managers have no shutdown hook, so
+        cached servers are reaped by the process exiting. For tests, embedders,
+        and whenever a manager shutdown path does appear.
         """
         async with self._lock:
             for name in list(self._entries):
@@ -230,9 +180,7 @@ class MCPToolsetCache:
         connection = connection_fingerprint(config)
         cached = self._entries.get(name)
         if cached is not None and cached.connection_fingerprint == connection:
-            # The connection is still valid, so the subprocess is kept, whatever
-            # else in the config moved. Which config this run supplied is the
-            # lease's business, not the entry's.
+            # Connection unchanged, so the subprocess is kept whatever else moved.
             return cached
         if cached is not None:
             logger.info("MCP server '%s' connection settings changed; restarting it for this run.", name)
@@ -252,9 +200,8 @@ class MCPToolsetCache:
     async def _retire(self, name: str) -> None:
         """Remove ``name`` from the cache, disconnecting it once nobody is using it.
 
-        Callers must hold ``self._lock``. An entry still inside a run is left
-        connected and marked ``retired``; :meth:`_release` finishes the job when
-        the last user exits, so an in-flight run never loses its server.
+        Callers must hold ``self._lock``. An entry still inside a run is marked
+        ``retired`` and left connected; :meth:`_release` finishes the job.
         """
         entry = self._entries.pop(name, None)
         if entry is None:
@@ -277,11 +224,8 @@ class MCPToolsetCache:
 class MCPToolsetLease:
     """Borrowed toolsets, held against eviction for the duration of one run.
 
-    Holds the cache entries themselves rather than server names: an entry
-    retired mid-run is removed from the cache immediately, and the lease is
-    what keeps it reachable long enough to be disconnected on release. Each is
-    paired with the config digest *this* run supplied, which the shared entry
-    cannot answer for.
+    Holds entries rather than names: an entry retired mid-run leaves the cache
+    at once, and the lease is what keeps it reachable long enough to disconnect.
     """
 
     cache: MCPToolsetCache

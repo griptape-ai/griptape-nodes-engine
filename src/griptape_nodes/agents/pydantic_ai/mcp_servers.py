@@ -18,13 +18,11 @@ combinators rather than hand-rolled logic:
 Connection handling is left to Pydantic AI: if a server is unreachable the
 run fails. Graceful per-server degradation can be layered on later.
 
-**Transport lifetime.** Pydantic AI enters and exits a toolset once per
-``Agent.run``, but ``StdioTransport`` defaults to ``keep_alive=True``, so the
-subprocess outlives the session and the next run reuses it. A toolset pins one
-subprocess, launched from the config it was *built* with, until something calls
-:func:`disconnect_transport`. See
-:class:`~griptape_nodes.agents.pydantic_ai.mcp_toolset_cache.MCPToolsetCache`,
-which owns that decision.
+**Transport lifetime.** Pydantic AI enters and exits a toolset per
+``Agent.run``, but ``StdioTransport`` defaults to ``keep_alive=True``: the
+subprocess outlives the session, so a toolset pins one server launched from the
+config it was *built* with until :func:`disconnect_transport` is called. See
+:class:`~griptape_nodes.agents.pydantic_ai.mcp_toolset_cache.MCPToolsetCache`.
 """
 
 from __future__ import annotations
@@ -139,8 +137,8 @@ def _http_server_from_config(name: str, config: Mapping[str, Any], transport: st
         return None
     try:
         client = _HTTP_TRANSPORTS[transport](url=url, headers=dict(config.get("headers") or {}))
-    # The transport constructor rejects a URL that isn't http:// or https://,
-    # and nothing validates the field on the way in, so a plain typo lands here.
+    # The constructor rejects a URL that isn't http(s), and nothing validates
+    # the field on the way in, so a typo lands here.
     except ValueError as e:
         logger.warning(
             "Attempted to reach MCP server '%s' at '%s'. That is not a usable web address, so the server "
@@ -170,8 +168,7 @@ async def disconnect_transport(name: str, transport: ClientTransport) -> None:
         return
     try:
         await transport.disconnect()
-    # Teardown must not fail the caller: a server that will not shut down
-    # cleanly is a warning, not a reason to abandon the run that outlived it.
+    # A server that won't shut down cleanly is a warning, not a failed run.
     except Exception as e:
         logger.warning("Attempted to shut down MCP server '%s'. Failed because of: %s", name, e)
 
