@@ -3476,7 +3476,8 @@ class Trait(ABC, BaseNodeElement):
                 continue
             setattr(self, attribute_name, getattr(interpreted, attribute_name))
 
-    def state_from_ui_options(self, ui_options: dict[str, Any]) -> dict[str, Any]:  # noqa: ARG002
+    @classmethod
+    def state_from_ui_options(cls, ui_options: dict[str, Any]) -> dict[str, Any]:  # noqa: ARG003
         """Return the state an inbound ``ui_options`` write is asking this trait to take on.
 
         The inverse of ``ui_options_for_trait``, for the writers that do not know about
@@ -3484,6 +3485,10 @@ class Trait(ABC, BaseNodeElement):
         shape, and a workflow saved before trait state was carried in its own right holds a
         trait's options there too. Either way a key this trait renders is this trait's state,
         so a write to it is a request to change the trait.
+
+        A classmethod because it also answers the question for a trait that is not attached:
+        reading a pre-trait-state file has to decide which trait a flat key describes before
+        there is an instance to ask.
 
         Return only what the incoming dict actually mentions. Empty by default, which means a
         trait that does not implement this ignores such a write; ``{}`` is also the right

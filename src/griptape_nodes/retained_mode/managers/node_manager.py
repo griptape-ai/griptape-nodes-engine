@@ -241,6 +241,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointSubjectType,
 )
 from griptape_nodes.retained_mode.retained_mode import RetainedMode
+from griptape_nodes.traits.legacy_ui_options import reconstruct_traits_from_ui_options
 from griptape_nodes.traits.trait_registry import TraitRegistry
 from griptape_nodes.utils.exception_utils import readable_exception_message
 
@@ -1920,6 +1921,17 @@ class NodeManager(EngineScoped):
         restored_traits: list[RestoredTrait] = []
         if request.traits:
             restored_traits = NodeManager._apply_trait_states(new_param, request.traits)
+        elif request.traits is None:
+            # No traits field at all means the file predates trait state, so whatever controls
+            # this parameter had are recorded only as ui_options keys. An empty list is a
+            # current save saying there are none, which is not the same thing.
+            rebuilt = reconstruct_traits_from_ui_options(new_param)
+            if rebuilt:
+                logger.debug(
+                    "Parameter '%s' had %s rebuilt from the ui_options a pre-trait-state save wrote.",
+                    final_param_name,
+                    ", ".join(type(trait).__name__ for trait in rebuilt),
+                )
         try:
             with sanctioned_parameter_mutation():
                 if request.parent_container_name and request.initial_setup:

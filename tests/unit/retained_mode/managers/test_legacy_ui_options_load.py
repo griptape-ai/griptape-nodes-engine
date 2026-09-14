@@ -11,7 +11,7 @@ from collections.abc import Generator
 
 import pytest
 
-from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
+from griptape_nodes.exe_types.core_types import Parameter, ParameterMode, Trait
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.node_library.library_registry import (
     LibraryMetadata,
@@ -26,6 +26,8 @@ from griptape_nodes.retained_mode.events.context_events import (
 )
 from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
 from griptape_nodes.retained_mode.events.parameter_events import (
+    AddParameterToNodeRequest,
+    AddParameterToNodeResultSuccess,
     AlterParameterDetailsRequest,
     AlterParameterDetailsResultSuccess,
     SetParameterValueRequest,
@@ -143,3 +145,67 @@ class TestALegacyDropdownSurvivesTheLoad:
         assert parameter is not None
 
         assert parameter.authored_ui_options() == {"hide": True}
+
+
+def _added_runtime_parameter(engine: Engine, **request_fields) -> Parameter:
+    """Replay what a file holds for a parameter the node created at run time."""
+    context = engine.handle_request(
+        EnsureWorkflowAndFlowRequest(workflow_name="legacy_runtime_param_test", display_name="legacy_runtime_param")
+    )
+    assert isinstance(context, EnsureWorkflowAndFlowResultSuccess)
+    created = engine.handle_request(
+        CreateNodeRequest(node_type=_ModelNode.__name__, specific_library_name=_LIBRARY_NAME, node_name="picker")
+    )
+    assert isinstance(created, CreateNodeResultSuccess)
+    node = engine.object_manager.get_object_by_name(created.node_name)
+    assert isinstance(node, _ModelNode)
+
+    added = engine.handle_request(
+        AddParameterToNodeRequest(
+            node_name=node.name,
+            parameter_name="extra_model",
+            type="str",
+            tooltip="t",
+            is_user_defined=True,
+            mode_allowed_input=False,
+            mode_allowed_output=False,
+            initial_setup=True,
+            **request_fields,
+        )
+    )
+    assert isinstance(added, AddParameterToNodeResultSuccess)
+    parameter = node.get_parameter_by_name("extra_model")
+    assert parameter is not None
+    return parameter
+
+
+class TestARuntimeCreatedControlIsRebuilt:
+    """A parameter the node created at run time had no ``traits`` field written for it.
+
+    Its trait lived only in the file, as the ui_options keys the trait rendered. Without
+    rebuilding it the parameter loads as a bare field that still looks like a dropdown, because
+    the editor renders one from those keys, while nothing constrains the value any more.
+    """
+
+    def test_a_dropdown_with_no_traits_field_is_rebuilt(self, engine: Engine) -> None:
+        parameter = _added_runtime_parameter(engine, ui_options={"simple_dropdown": ["a", "b"], "hide": True})
+
+        assert [type(trait) for trait in parameter.find_elements_by_type(Trait)] == [Options]
+        assert parameter.find_elements_by_type(Options)[0].choices == ["a", "b"]
+
+    def test_the_rebuilt_dropdown_constrains_the_value_again(self, engine: Engine) -> None:
+        parameter = _added_runtime_parameter(engine, ui_options={"simple_dropdown": ["a", "b"]})
+
+        assert [converter("zzz") for converter in parameter.converters] == ["a"]
+
+    def test_it_is_saved_as_trait_state_from_now_on(self, engine: Engine) -> None:
+        parameter = _added_runtime_parameter(engine, ui_options={"simple_dropdown": ["a", "b"], "hide": True})
+
+        assert parameter.trait_states()[0]["trait_state"]["choices"] == ["a", "b"]
+        assert parameter.authored_ui_options() == {"hide": True}
+
+    def test_an_empty_traits_list_is_a_current_save_saying_there_are_none(self, engine: Engine) -> None:
+        """The discriminator. A missing field predates trait state; an empty one is a decision."""
+        parameter = _added_runtime_parameter(engine, traits=[], ui_options={"simple_dropdown": ["a", "b"]})
+
+        assert parameter.find_elements_by_type(Trait) == []

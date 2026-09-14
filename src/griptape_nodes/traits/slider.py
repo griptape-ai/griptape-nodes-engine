@@ -19,7 +19,8 @@ class Slider(Trait):
     def ui_options_for_trait(self) -> dict:
         return {"slider": {"min_val": self.min, "max_val": self.max}}
 
-    def state_from_ui_options(self, ui_options: dict) -> dict[str, Any]:
+    @classmethod
+    def state_from_ui_options(cls, ui_options: dict) -> dict[str, Any]:
         """Adopt slider bounds written straight into the parameter's ``ui_options``.
 
         The editor's parameter properties panel writes ``slider`` as the same pair
