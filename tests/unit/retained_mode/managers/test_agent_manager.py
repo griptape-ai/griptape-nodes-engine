@@ -77,7 +77,12 @@ from griptape_nodes.retained_mode.events.agent_events import (
     UpdateAgentProviderResultSuccess,
     UpdateProviderPayload,
 )
-from griptape_nodes.retained_mode.events.mcp_events import GetEnabledMCPServersResultSuccess
+from griptape_nodes.retained_mode.events.mcp_events import (
+    GetEnabledMCPServersRequest,
+    GetEnabledMCPServersResultFailure,
+    GetEnabledMCPServersResultSuccess,
+    MCPServerConfig,
+)
 from griptape_nodes.retained_mode.managers.agent_manager import (
     _PROTECTED_PROVIDER_NAME,
     _SKILLS_README,
@@ -182,6 +187,49 @@ class TestComposeServerRules:
             [{"name": "a"}, {"name": "b", "rules": "   "}, {"name": "c", "rules": None}, {"name": "d", "rules": "go"}],
         )
         assert composed == "Rules for MCP server 'd':\ngo"
+
+
+class _RecordingEngine:
+    """An engine stand-in that answers with `result` and keeps what it was asked."""
+
+    def __init__(self, result: object) -> None:
+        self.result = result
+        self.seen: list[GetEnabledMCPServersRequest] = []
+
+    def handle_request(self, request: GetEnabledMCPServersRequest) -> object:
+        self.seen.append(request)
+        return self.result
+
+
+class TestLookupEnabledMCPServers:
+    """Reading the enabled servers must not publish them."""
+
+    @staticmethod
+    def _manager(engine: _RecordingEngine) -> AgentManager:
+        """A manager wired to nothing but `engine`, which is all the lookup touches."""
+        manager = AgentManager.__new__(AgentManager)
+        manager._engine = engine  # type: ignore[assignment]
+        return manager
+
+    def test_the_lookup_is_not_broadcast_to_clients(self) -> None:
+        """The reply carries every server's `env` and `headers` verbatim.
+
+        This runs once per message, and a broadcast result is fanned out to
+        every connected websocket client. Nothing listens for the result of this
+        internal read - a client wanting the list asks for it itself - so
+        broadcasting it is pure credential exposure.
+        """
+        servers: dict[str, MCPServerConfig] = {"a": {"name": "a", "env": {"TOKEN": "hunter2"}}}
+        engine = _RecordingEngine(GetEnabledMCPServersResultSuccess(servers=servers, result_details="ok"))
+
+        assert self._manager(engine)._lookup_enabled_mcp_servers() == servers
+        assert [request.broadcast_result for request in engine.seen] == [False]
+
+    def test_an_unreadable_config_is_distinguishable_from_no_servers(self) -> None:
+        """`None` means "could not find out", so cached servers are left alone."""
+        engine = _RecordingEngine(GetEnabledMCPServersResultFailure(result_details="nope"))
+
+        assert self._manager(engine)._lookup_enabled_mcp_servers() is None
 
 
 class TestOnHandleListAgentModelsRequest:

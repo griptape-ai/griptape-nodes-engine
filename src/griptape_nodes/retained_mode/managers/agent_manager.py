@@ -1216,7 +1216,11 @@ class AgentManager(EngineScoped):
         the user has no enabled servers and any cached ones should be shut down,
         while ``None`` means we could not find out and must leave them alone.
         """
-        result = self.engine.handle_request(GetEnabledMCPServersRequest())
+        # Not broadcast: the answer carries each server's `env` and `headers`
+        # verbatim, and this runs once per message now rather than once per
+        # runner build. Nothing listens for the result of this internal lookup -
+        # a client wanting the list asks for it itself.
+        result = self.engine.handle_request(GetEnabledMCPServersRequest(broadcast_result=False))
         if not isinstance(result, GetEnabledMCPServersResultSuccess):
             logger.warning("Could not load enabled MCP servers; agent will run without extras.")
             return None
