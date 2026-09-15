@@ -7,6 +7,7 @@ shadowed at read time and dropped at save time, so the write has to be routed to
 
 import logging
 
+import attrs
 import pytest
 
 from griptape_nodes.exe_types.core_types import Parameter, Trait
@@ -145,12 +146,68 @@ class TestATraitWithNothingToAdopt:
 
         assert parameter.ui_options["button_label"] == "Go"
 
+    def test_the_dropped_write_is_reported(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The write is neither applied nor saved, so silence loses it without a trace."""
+        parameter = Parameter(name="go", type="str", tooltip="t", traits={Button(label="Go")})
+        caplog.set_level(logging.WARNING, logger="griptape_nodes")
+
+        parameter.adopt_ui_options({"button_label": "Written"})
+
+        assert any(
+            "'button_label'" in record.getMessage() and "'go'" in record.getMessage() for record in caplog.records
+        )
+
+    def test_a_write_matching_what_it_renders_is_not_reported(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The editor echoing back what it was given changes nothing."""
+        parameter = Parameter(name="go", type="str", tooltip="t", traits={Button(label="Go")})
+        caplog.set_level(logging.WARNING, logger="griptape_nodes")
+
+        parameter.adopt_ui_options({"button_label": "Go"})
+
+        assert caplog.records == []
+
+    def test_a_write_to_a_key_no_trait_renders_is_not_reported(self, caplog: pytest.LogCaptureFixture) -> None:
+        parameter = Parameter(name="go", type="str", tooltip="t", traits={Button(label="Go")})
+        caplog.set_level(logging.WARNING, logger="griptape_nodes")
+
+        parameter.adopt_ui_options({"hide": True})
+
+        assert caplog.records == []
+
     def test_a_parameter_with_no_traits_stores_the_whole_write(self) -> None:
         parameter = Parameter(name="steps", type="int", tooltip="t")
 
         parameter.adopt_ui_options({"simple_dropdown": ["a", "b"], "hide": True})
 
         assert parameter.authored_ui_options() == {"simple_dropdown": ["a", "b"], "hide": True}
+
+
+_ADOPTED_RANK = 3
+
+
+class TestAdoptionFollowsTheDeclaredFields:
+    """A trait adopts the fields it declares, so a field added later needs no second edit.
+
+    Listing the keys by hand is how a trait's two directions drift apart: the field renders
+    and then silently stops being adopted.
+    """
+
+    def test_a_field_a_subclass_adds_is_adopted(self) -> None:
+        class RankedOptions(Options):
+            rank: int = attrs.field(default=0)
+
+        trait = RankedOptions(choices=["a"])
+        parameter = Parameter(name="model", type="str", tooltip="t", traits={trait})
+
+        parameter.adopt_ui_options({"rank": _ADOPTED_RANK})
+
+        assert trait.rank == _ADOPTED_RANK
+
+    def test_a_dropdown_adopts_every_field_it_declares(self) -> None:
+        assert set(Options.state_keys()) == {"choices", "show_search", "search_filter", "allow_custom"}
+
+    def test_slider_bounds_adopt_every_field_it_declares(self) -> None:
+        assert set(Slider.state_keys()) == {"min_val", "max_val"}
 
 
 _UNTOUCHED_LEVEL = 3

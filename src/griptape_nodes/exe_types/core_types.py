@@ -2038,6 +2038,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         for trait in self.find_elements_by_type(Trait):
             adopted = trait.state_from_ui_options(value)
             if not adopted:
+                self._report_unadopted_trait_options(trait, value)
                 continue
             # Supply complete constructor state when the input mentions only some fields.
             try:
@@ -2050,6 +2051,26 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
                     self.name,
                 )
         self.ui_options = value
+
+    def _report_unadopted_trait_options(self, trait: Trait, value: dict) -> None:
+        """Report a write the trait renders over, which is neither applied nor saved.
+
+        A write matching what the trait already renders is the editor echoing it back, and
+        changes nothing.
+        """
+        ignored = sorted(
+            key for key, rendered in trait.ui_options_for_trait().items() if key in value and value[key] != rendered
+        )
+        if not ignored:
+            return
+        logger.warning(
+            "Attempted to set %s on parameter '%s', but its %s control renders those keys and does "
+            "not read them back, so the change has no effect and is not saved. Set the control's own "
+            "state instead, or give the control a 'state_from_ui_options' that accepts these keys.",
+            ", ".join(f"'{key}'" for key in ignored),
+            self.name,
+            type(trait).__name__,
+        )
 
     def authored_ui_options(self) -> dict[str, Any]:
         """Remove options rendered by attached traits.
@@ -3393,10 +3414,10 @@ class Trait(ABC, BaseNodeElement):
         """
         if not state:
             return
-        state = type(self).migrate_state(state)
-        interpreted = type(self).from_state(state)
+        migrated = type(self).migrate_state(state)
+        interpreted = type(self)._construct(migrated)
         for attribute in self._state_fields():
-            if self.saved_key(attribute) in state:
+            if self.saved_key(attribute) in migrated:
                 setattr(self, attribute.name, getattr(interpreted, attribute.name))
 
     @classmethod
@@ -3447,14 +3468,22 @@ class Trait(ABC, BaseNodeElement):
 
     @classmethod
     def migrate_state(cls, state: dict[str, Any]) -> dict[str, Any]:
-        """Migrate saved field names or values before construction."""
+        """Migrate saved field names or values before construction.
+
+        Runs once per load, so an override may rename or convert unconditionally.
+        """
         return state
 
     @classmethod
     def from_state(cls, state: dict[str, Any]) -> Self:
         """Construct a detached trait from saved state."""
+        return cls._construct(cls.migrate_state(state))
+
+    @classmethod
+    def _construct(cls, migrated_state: dict[str, Any]) -> Self:
+        """Construct from state already passed through ``migrate_state``."""
         with BaseNodeElement.detached():
-            return cls(**cls.migrate_state(state))
+            return cls(**migrated_state)
 
     @staticmethod
     def saved_key(attribute: attrs.Attribute) -> str:
@@ -3471,7 +3500,8 @@ class Trait(ABC, BaseNodeElement):
         """
         declared = {attribute.name for attribute in attrs.fields(cls)}
         for name, annotation in inspect.get_annotations(cls).items():
-            if name in declared or get_origin(annotation) is ClassVar:
+            # Bare ``ClassVar`` has no origin to read.
+            if name in declared or annotation is ClassVar or get_origin(annotation) is ClassVar:
                 continue
             msg = (
                 f"Trait '{cls.__name__}' annotates '{name}' but never declares it. A trait's fields are its "
