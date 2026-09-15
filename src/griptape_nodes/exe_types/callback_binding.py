@@ -1,4 +1,9 @@
-"""Save node callbacks by method name and bind them on load."""
+"""Save node callbacks by method name and bind them on load.
+
+A name resolves through ``getattr`` on the owning node, unguarded because every channel
+carrying one is the workflow owner's own session: a saved workflow is a Python file the
+engine executes, and an editor request arrives on that session's own connection.
+"""
 
 from __future__ import annotations
 

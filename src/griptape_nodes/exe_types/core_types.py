@@ -3424,7 +3424,9 @@ class Trait(ABC, BaseNodeElement):
     def state_from_ui_options(cls, ui_options: dict[str, Any]) -> dict[str, Any]:  # noqa: ARG003
         """Map flat UI options to the mentioned state fields.
 
-        The default ignores writes for traits with no state behind their rendered keys.
+        The default ignores writes for traits with no state behind their rendered keys, which
+        is why class creation does not require this to invert ``ui_options_for_trait``. A write
+        to a rendered key no trait accepts is logged rather than dropped in silence.
         """
         return {}
 
