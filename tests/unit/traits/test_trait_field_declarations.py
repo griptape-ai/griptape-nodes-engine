@@ -50,6 +50,14 @@ def test_a_trait_is_an_attrs_class_without_declaring_it(trait_class: type[Trait]
 
 
 @pytest.mark.parametrize("trait_class", IN_TREE_TRAITS, ids=lambda cls: cls.__name__)
+def test_a_trait_module_does_not_stringify_its_annotations(trait_class: type[Trait]) -> None:
+    """``from __future__ import annotations`` hides a ClassVar behind a string the checks cannot read."""
+    module = importlib.import_module(trait_class.__module__)
+
+    assert "annotations" not in vars(module)
+
+
+@pytest.mark.parametrize("trait_class", IN_TREE_TRAITS, ids=lambda cls: cls.__name__)
 def test_a_trait_constructs_with_its_element_attributes_set(trait_class: type[Trait]) -> None:
     """Default-constructible traits must come out as usable elements."""
     try:
@@ -153,6 +161,13 @@ class TestAnAnnotationThatIsNotAFieldIsRefused:
             DEFAULTS: ClassVar[list[str]] = ["a"]
 
         assert Constant.state_keys() == []
+
+    def test_a_stringified_class_constant_is_refused(self) -> None:
+        """What a trait module under ``from __future__ import annotations`` would hit."""
+        with pytest.raises(TypeError, match="from __future__ import annotations"):
+
+            class Stringified(Trait):
+                DEFAULTS: "ClassVar[list[str]]" = ["a"]  # noqa: RUF012
 
     def test_a_declared_field_is_allowed(self) -> None:
         class Declared(Trait):

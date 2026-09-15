@@ -3440,17 +3440,6 @@ class ParameterDictionary(ParameterContainer):
 # TODO: https://github.com/griptape-ai/griptape-nodes/issues/858
 
 
-def _is_class_var(annotation: Any) -> bool:
-    """Whether an annotation declares a class constant rather than an attribute.
-
-    Handles the string form too, because a module under ``from __future__ import annotations``
-    never evaluates its annotations.
-    """
-    if isinstance(annotation, str):
-        return annotation.startswith(("ClassVar", "typing.ClassVar", "t.ClassVar"))
-    return get_origin(annotation) is ClassVar
-
-
 class Trait(ABC, BaseNodeElement):
     """A control attached to a parameter: a slider, a dropdown, a button.
 
@@ -3683,15 +3672,20 @@ class Trait(ABC, BaseNodeElement):
         every annotation is a field, so ``threshold: int = 5`` type-checks as a constructor
         argument that does not exist. Caught here, where the message can name the fix, rather
         than at the first construction as an unexpected-keyword error.
+
+        Reads the annotations as written, so the module defining a trait must not use
+        ``from __future__ import annotations``: a stringified ``ClassVar`` is unrecognizable
+        without evaluating it, and evaluating it breaks on a name the module has not bound yet.
         """
         declared = {attribute.name for attribute in attrs.fields(cls)}
         for name, annotation in inspect.get_annotations(cls).items():
-            if name in declared or _is_class_var(annotation):
+            if name in declared or get_origin(annotation) is ClassVar:
                 continue
             msg = (
                 f"Trait '{cls.__name__}' annotates '{name}' but never declares it. A trait's fields are its "
                 f"saved state, so declare it with attrs.field(), mark it ClassVar if it is a constant, or "
-                f"annotate it where it is assigned if it is neither."
+                f"annotate it where it is assigned if it is neither. A ClassVar already marked as one means "
+                f"the module uses 'from __future__ import annotations'; a trait's module cannot."
             )
             raise TypeError(msg)
 
