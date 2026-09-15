@@ -10,6 +10,7 @@ from griptape_nodes.retained_mode.events.execution_events import (
     ExecuteNodeResultSuccess,
     NodeMetadata,
 )
+from griptape_nodes.retained_mode.events.worker_events import WorkerGoneError
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.managers.node_manager import NodeManager
 
@@ -436,6 +437,40 @@ class TestExecuteNodeWorkerRoute:
         wm.route_to_worker.assert_awaited_once()
         # The orchestrator stub must not have run aprocess; the worker did.
         mock_node.aprocess.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_worker_going_away_becomes_a_failure_carrying_the_reason(self) -> None:
+        """A retired worker must fail the node, not cancel it, and say why.
+
+        Letting the cancellation through would have the resolution machine reap it as CANCELED:
+        no NodeErrorEvent, one unnamed log line, and the node handed back UNRESOLVED with nothing
+        anywhere explaining it. The reason is authored by whoever retired the worker, so it has to
+        survive onto the result rather than being reconstructed here.
+        """
+        mock_node = self._make_mock_node()
+        mock_obj_mgr = self._make_mock_obj_mgr(existing_node=mock_node)
+
+        gone = WorkerGoneError("worker 'eng-id' stopped responding and was shut down")
+        wm = MagicMock()
+        wm.route_to_worker = AsyncMock(side_effect=gone)
+        lib_mgr = MagicMock()
+        lib_mgr.is_worker = False
+        lib_mgr._is_worker = False
+        lib_mgr.wait_for_worker_library_load = AsyncMock()
+        lib_mgr.get_worker_for_library.return_value = ("eng-id", "topic")
+
+        node_manager = _make_node_manager(object_manager=mock_obj_mgr, library_manager=lib_mgr, worker_manager=wm)
+
+        request = ExecuteNodeRequest(
+            node_name="worker_node",
+            node_metadata=cast("NodeMetadata", {"node_type": "WorkerNode", "library": "worker_library"}),
+        )
+        result = await node_manager.on_execute_node_request(request)
+
+        assert isinstance(result, ExecuteNodeResultFailure)
+        assert "stopped responding and was shut down" in str(result.result_details)
+        # Rides on `exception` so the node-failure formatting can reach it.
+        assert result.exception is gone
 
     @pytest.mark.asyncio
     async def test_worker_failure_returns_failure(self) -> None:
