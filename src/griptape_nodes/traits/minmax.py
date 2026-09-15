@@ -1,26 +1,14 @@
 from collections.abc import Callable
-from dataclasses import dataclass, field
 from typing import Any
 
-from griptape_nodes.exe_types.core_types import Parameter, ParameterMode, Trait
+import attrs
+
+from griptape_nodes.exe_types.core_types import Parameter, Trait
 
 
-@dataclass(eq=False)
 class MinMax(Trait):
-    min: Any = 10
-    max: Any = 30
-    element_id: str = field(default_factory=lambda: "MinMaxTrait")
-
-    _allowed_modes: set = field(default_factory=lambda: {ParameterMode.PROPERTY})
-
-    def __init__(self, min_val: float, max_val: float) -> None:
-        super().__init__()
-        self.min = min_val
-        self.max = max_val
-
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["min", "max", "minmax", "min_max"]
+    min: float = attrs.field(alias="min_val")
+    max: float = attrs.field(alias="max_val")
 
     def ui_options_for_trait(self) -> dict:
         return {"multiline": True}

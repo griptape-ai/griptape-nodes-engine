@@ -1,11 +1,11 @@
 from collections.abc import Callable
-from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
+
+import attrs
 
 from griptape_nodes.exe_types.core_types import Parameter, Trait
 
 
-@dataclass(eq=False)
 class Options(Trait):
     """Offers a parameter's value as a list of choices.
 
@@ -39,30 +39,13 @@ class Options(Trait):
     # 3. This ensures serialized ui_options data is used after deserialization
     # 4. _choices provides safety fallback if ui_options is missing/corrupted
 
-    _choices: list = field(default_factory=lambda: ["choice 1", "choice 2", "choice 3"])
-    element_id: str = field(default_factory=lambda: "Options")
-    show_search: bool = field(default=True)
-    search_filter: str = field(default="")
+    DEFAULT_CHOICES: ClassVar[list[str]] = ["choice 1", "choice 2", "choice 3"]
 
-    # Unlike choices, this needs no ui_options round trip: it is fixed in node code, so the
-    # trait a node rebuilds on load carries the right value without consulting what was saved.
-    allow_custom: bool = field(default=False)
-
-    def __init__(
-        self,
-        *,
-        choices: list | None = None,
-        show_search: bool = True,
-        search_filter: str = "",
-        allow_custom: bool = False,
-    ) -> None:
-        super().__init__()
-        # Set choices through property to ensure dual sync from the start
-        if choices is not None:
-            self.choices = choices
-        self.show_search = show_search
-        self.search_filter = search_filter
-        self.allow_custom = allow_custom
+    # Preserve ``choices`` as the constructor and saved-state key behind the property.
+    _choices: list = attrs.field(factory=lambda: list(Options.DEFAULT_CHOICES), alias="choices")
+    show_search: bool = attrs.field(default=True)
+    search_filter: str = attrs.field(default="")
+    allow_custom: bool = attrs.field(default=False)
 
     @property
     def choices(self) -> list:
@@ -112,20 +95,12 @@ class Options(Trait):
             # Write choices to ui_options (this gets serialized and survives reload)
             self._parent.ui_options["simple_dropdown"] = value  # type: ignore[attr-defined]
 
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["options", "models"]
-
     def converters_for_trait(self) -> list[Callable]:
         # The choices are hints, so there is nothing to snap a typed value back to.
         if self.allow_custom:
             return []
 
         def converter(value: Any) -> Any:
-            # CRITICAL: This converter uses self.choices property (not _choices field)
-            # The property reads from ui_options first, ensuring we use post-deserialization
-            # choices data instead of stale trait field data. This prevents the bug where
-            # selected values revert to first choice after save/reload.
             if value not in self.choices:
                 return self.choices[0]
             return value
@@ -138,8 +113,6 @@ class Options(Trait):
             return []
 
         def validator(param: Parameter, value: Any) -> None:  # noqa: ARG001
-            # CRITICAL: This validator uses self.choices property (not _choices field)
-            # Same reasoning as converter - use live ui_options data after deserialization
             if value not in self.choices:
                 msg = "Choice not allowed"
                 raise ValueError(msg)
@@ -147,22 +120,9 @@ class Options(Trait):
         return [validator]
 
     def ui_options_for_trait(self) -> dict:
-        """Provide UI options for trait initialization.
+        """Render the dropdown.
 
-        IMPORTANT: This method uses _choices (not self.choices property) to avoid
-        circular dependency during Parameter.ui_options property construction:
-
-        Circular dependency would be:
-        1. Parameter.ui_options calls trait.ui_options_for_trait()
-        2. ui_options_for_trait() calls self.choices property
-        3. choices property tries to read parent.ui_options
-        4. This triggers Parameter.ui_options again → infinite recursion
-
-        Using _choices directly breaks this cycle while still providing the correct
-        initial choices for UI rendering. The property-based sync handles runtime updates.
-
-        ``allow_custom`` is published only when set so that every already-saved dropdown
-        keeps serializing exactly the keys it does today.
+        Omit false ``allow_custom`` to preserve the existing serialized shape.
         """
         options: dict[str, Any] = {
             "simple_dropdown": self._choices,

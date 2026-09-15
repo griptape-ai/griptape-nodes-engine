@@ -1,15 +1,28 @@
 from __future__ import annotations
 
+import inspect
 import logging
 import uuid
 import warnings
-from abc import ABC, abstractmethod
+from abc import ABC, ABCMeta, abstractmethod
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum, StrEnum, auto
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, NamedTuple, Self, TypeVar, get_args
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ClassVar,
+    Literal,
+    NamedTuple,
+    Self,
+    TypeVar,
+    dataclass_transform,
+    get_args,
+    get_origin,
+)
 
+import attrs
 from pydantic import BaseModel
 
 logger = logging.getLogger("griptape_nodes")
@@ -278,29 +291,85 @@ class ParameterType:
         return ParameterType.KeyValueTypePair(key_type=key_type, value_type=value_type)
 
 
-@dataclass(kw_only=True)
-class BaseNodeElement:
-    element_id: str = field(default_factory=lambda: str(uuid.uuid4().hex))
-    element_type: str = field(default_factory=lambda: BaseNodeElement.__name__)
-    name: str = field(default_factory=lambda: str(f"{BaseNodeElement.__name__}_{uuid.uuid4().hex}"))
-    parent_group_name: str | None = None
-    _changes: dict[str, Any] = field(default_factory=dict)
+# Marks the element's own wiring, as opposed to a subclass's declared state.
+WIRING: dict[str, bool] = {"wiring": True}
 
-    _children: list[BaseNodeElement] = field(default_factory=list)
+
+def default_element_id(element_id: str | None) -> str:
+    """Generate an ID for ``None``.
+
+    Public because subclasses that fix ``element_id`` must retain this conversion.
+    """
+    if element_id is None:
+        return uuid.uuid4().hex
+    return element_id
+
+
+def default_element_type(element_type: str | None) -> str:
+    """Preserve the hand-written constructor's fallback element type."""
+    # ``to_dict()`` reports the class name, but alter-element events read this attribute.
+    if element_type is None:
+        return "BaseNodeElement"
+    return element_type
+
+
+def default_element_name(name: str | None) -> str:
+    """Generate an element name for ``None``."""
+    if name is None:
+        return f"BaseNodeElement_{uuid.uuid4().hex}"
+    return name
+
+
+# Runtime type returned by ``attrs.field()``.
+_DECLARED_FIELD = type(attrs.field())
+
+
+@dataclass_transform(field_specifiers=(field, attrs.field, attrs.Factory), eq_default=False, kw_only_default=True)
+class ElementMeta(ABCMeta):
+    """Apply attrs to every element class.
+
+    Classes declaring fields get generated keyword-only constructors. Classes with explicit
+    constructors keep them, and classes declaring neither inherit their parent's constructor.
+
+    ``auto_attribs=False`` keeps bare annotations from becoming fields. ``slots=False`` lets
+    elements hold non-field attributes. ``eq=False`` preserves identity comparison.
+    """
+
+    def __new__(cls, name: str, bases: tuple[type, ...], namespace: dict[str, Any], **kwargs: Any) -> ElementMeta:
+        created = super().__new__(cls, name, bases, namespace, **kwargs)
+        declares_fields = any(isinstance(value, _DECLARED_FIELD) for value in namespace.values())
+        generate_init = declares_fields and "__init__" not in namespace
+        return attrs.define(eq=False, slots=False, auto_attribs=False, kw_only=True, init=generate_init)(created)
+
+
+class BaseNodeElement(metaclass=ElementMeta):
+    """Base for parameters, groups, messages, and traits.
+
+    Public fields convert ``None`` to their defaults so subclasses may forward optional
+    arguments. Subclasses may use generated attrs constructors or define their own.
+    """
+
     _stack: ClassVar[list[BaseNodeElement]] = []
-    _parent: BaseNodeElement | None = field(default=None)
-    _node_context: BaseNode | None = field(default=None)
-    _badge: BadgeData | None = field(default=None)
+
+    element_id: str = attrs.field(default=None, converter=default_element_id, metadata=WIRING)
+    element_type: str = attrs.field(default=None, converter=default_element_type, metadata=WIRING)
+    name: str = attrs.field(default=None, converter=default_element_name, metadata=WIRING)
+    parent_group_name: str | None = attrs.field(default=None, metadata=WIRING)
+    _changes: dict[str, Any] = attrs.field(factory=dict, init=False)
+    _children: list[BaseNodeElement] = attrs.field(factory=list, init=False)
+    _parent: BaseNodeElement | None = attrs.field(default=None, init=False)
+    _node_context: BaseNode | None = attrs.field(default=None, init=False)
+    _badge: BadgeData | None = attrs.field(default=None, init=False)
+
+    def __attrs_post_init__(self) -> None:
+        # Adopt only after construction so the parent sees a complete child.
+        current = BaseNodeElement.get_current()
+        if current is not None:
+            current.add_child(self)
 
     @property
     def children(self) -> list[BaseNodeElement]:
         return self._children
-
-    def __post_init__(self) -> None:
-        # If there's currently an active element, add this new element as a child
-        current = BaseNodeElement.get_current()
-        if current is not None:
-            current.add_child(self)
 
     def __enter__(self) -> Self:
         # Push this element onto the global stack
@@ -364,28 +433,27 @@ class BaseNodeElement:
             self._badge.hide = hide
         if hide_clear_button is not None:
             self._badge.hide_clear_button = hide_clear_button
-        self._changes["badge"] = self._badge.to_dict()
-        # Batch UI updates: add to node's tracked list so emit_parameter_changes() sends our _changes later.
-        # Only when attached to a node and not already in the list (avoids duplicate events).
-        if self._node_context is not None and self not in self._node_context._tracked_parameters:
-            self._node_context._tracked_parameters.append(self)
+        self.track_change("badge", self._badge.to_dict())
 
     def clear_badge(self) -> None:
         """Set badge to None (cleared)."""
         self._badge = None
-        self._changes["badge"] = None
-        # Batch UI updates: add to node's tracked list so emit_parameter_changes() sends our _changes later.
-        # Only when attached to a node and not already in the list (avoids duplicate events).
-        if self._node_context is not None and self not in self._node_context._tracked_parameters:
-            self._node_context._tracked_parameters.append(self)
+        self.track_change("badge", None)
 
     def dismiss_badge(self) -> None:
         """Hide the badge indicator (hide=True). Frontend can send clear_badge_display to trigger this."""
         if self._badge is None:
             return
         self._badge.hide = True
-        self._changes["badge"] = self._badge.to_dict()
-        # Batch UI updates: add to node's tracked list so emit_parameter_changes() sends our _changes later.
+        self.track_change("badge", self._badge.to_dict())
+
+    def track_change(self, key: str, value: Any) -> None:
+        """Record a changed field and queue this element for the next batched UI update.
+
+        A queue rather than a send: ``emit_parameter_changes()`` picks the element up later
+        and reports every change recorded since the last flush.
+        """
+        self._changes[key] = value
         # Only when attached to a node and not already in the list (avoids duplicate events).
         if self._node_context is not None and self not in self._node_context._tracked_parameters:
             self._node_context._tracked_parameters.append(self)
@@ -402,11 +470,7 @@ class BaseNodeElement:
                 new_value = getattr(self, f"{func.__name__}", None) if hasattr(self, f"{func.__name__}") else None
                 # Track change if different
                 if old_value != new_value:
-                    self._changes[func.__name__] = new_value
-                    # Batch UI updates: add to node's tracked list so emit_parameter_changes() sends our _changes later.
-                    # Only when attached to a node and not already in the list (avoids duplicate events).
-                    if self._node_context is not None and self not in self._node_context._tracked_parameters:
-                        self._node_context._tracked_parameters.append(self)
+                    self.track_change(func.__name__, new_value)
                 return result
             return func(self, *args, **kwargs)
 
@@ -583,7 +647,7 @@ class BaseNodeElement:
         }
         return event_data
 
-    def _apply_badge_from_message_data(self, data: dict) -> None:  # noqa: C901
+    def _apply_badge_from_message_data(self, data: dict) -> None:
         """Apply badge fields from a message data dict and track change."""
         if self._badge is None:
             self._badge = BadgeData()
@@ -608,11 +672,7 @@ class BaseNodeElement:
             self._badge.hide = data["hide"]
         if "hide_clear_button" in data:
             self._badge.hide_clear_button = data["hide_clear_button"]
-        self._changes["badge"] = self._badge.to_dict()
-        # Batch UI updates: add to node's tracked list so emit_parameter_changes() sends our _changes later.
-        # Only when attached to a node and not already in the list (avoids duplicate events).
-        if self._node_context is not None and self not in self._node_context._tracked_parameters:
-            self._node_context._tracked_parameters.append(self)
+        self.track_change("badge", self._badge.to_dict())
 
     def _on_badge_message_received(
         self, message_type: str, message: NodeMessagePayload | None
@@ -786,18 +846,17 @@ class ParameterMessage(BaseNodeElement, UIOptionsMixin):
     type ButtonAlignType = Literal["full-width", "left", "center", "right"]
     type ButtonVariantType = Literal["default", "destructive", "outline", "secondary", "ghost", "link"]
 
-    element_type: str = field(default_factory=lambda: ParameterMessage.__name__)
-    _variant: VariantType = field(init=False)
-    _title: str | None = field(default=None, init=False)
-    _value: str = field(init=False)
-    _message_icon: str | None = field(default="__DEFAULT__", init=False)
-    _button_link: str | None = field(default=None, init=False)
-    _button_text: str | None = field(default=None, init=False)
-    _button_icon: str | None = field(default=None, init=False)
-    _button_variant: ButtonVariantType = field(default="outline", init=False)
-    _button_align: ButtonAlignType = field(default="full-width", init=False)
-    _full_width: bool = field(default=False, init=False)
-    _ui_options: dict = field(default_factory=dict, init=False)
+    _variant: VariantType
+    _title: str | None
+    _value: str
+    _message_icon: str | None
+    _button_link: str | None
+    _button_text: str | None
+    _button_icon: str | None
+    _button_variant: ButtonVariantType
+    _button_align: ButtonAlignType
+    _full_width: bool
+    _ui_options: dict
 
     def __init__(  # noqa: PLR0913
         self,
@@ -1070,9 +1129,6 @@ class ParameterMessage(BaseNodeElement, UIOptionsMixin):
 
 class DeprecationMessage(ParameterMessage):
     """A specialized ParameterMessage for deprecation warnings with default warning styling."""
-
-    # Keep the same element_type as ParameterMessage so UI recognizes it
-    element_type: str = "ParameterMessage"
 
     def __init__(
         self,
@@ -1481,13 +1537,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
     private: bool = False
     exclude_from_metadata: bool = False
     allow_variable_substitution: bool = True
-    _allowed_modes: set = field(
-        default_factory=lambda: {
-            ParameterMode.OUTPUT,
-            ParameterMode.INPUT,
-            ParameterMode.PROPERTY,
-        }
-    )
+    _allowed_modes: set
     _converters: list[Callable[[Any], Any]]
     _validators: list[Callable[[Parameter, Any], None]]
     _on_incoming_connection_removed: list[Callable[[Parameter, str, str], None]]
@@ -3132,16 +3182,12 @@ class ParameterDictionary(ParameterContainer):
 # TODO: https://github.com/griptape-ai/griptape-nodes/issues/858
 
 
-@dataclass(eq=False)
 class Trait(ABC, BaseNodeElement):
-    def __hash__(self) -> int:
-        # Use a unique, immutable attribute for hashing
-        return hash(self.element_id)
+    """A parameter control declared as attrs fields."""
 
-    def __eq__(self, other: object) -> bool:
-        if not (isinstance(other, Trait)):
-            return False
-        return self.to_dict() == other.to_dict()
+    @classmethod
+    def __attrs_init_subclass__(cls) -> None:
+        cls._reject_annotations_that_are_not_fields()
 
     def to_dict(self) -> dict[str, Any]:
         updated = super().to_dict()
@@ -3151,9 +3197,24 @@ class Trait(ABC, BaseNodeElement):
         return updated
 
     @classmethod
-    @abstractmethod
-    def get_trait_keys(cls) -> list[str]:
-        """This will return keys that trigger this trait."""
+    def _reject_annotations_that_are_not_fields(cls) -> None:
+        """Reject bare annotations that type check as nonexistent constructor fields.
+
+        Trait modules cannot postpone annotations because stringified ``ClassVar`` values
+        cannot be distinguished from fields without evaluating possibly unbound names.
+        """
+        declared = {attribute.name for attribute in attrs.fields(cls)}
+        for name, annotation in inspect.get_annotations(cls).items():
+            # Bare ``ClassVar`` has no origin to read.
+            if name in declared or annotation is ClassVar or get_origin(annotation) is ClassVar:
+                continue
+            msg = (
+                f"Trait '{cls.__name__}' annotates '{name}' but never declares it. A trait's fields are its "
+                f"saved state, so declare it with attrs.field(), mark it ClassVar if it is a constant, or "
+                f"annotate it where it is assigned if it is neither. A ClassVar already marked as one means "
+                f"the module uses 'from __future__ import annotations'; a trait's module cannot."
+            )
+            raise TypeError(msg)
 
     def ui_options_for_trait(self) -> dict:
         """Returns a list of UI options for the parameter as a list of strings or dictionaries."""

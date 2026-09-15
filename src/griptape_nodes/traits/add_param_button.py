@@ -1,21 +1,16 @@
-from dataclasses import dataclass, field
+import attrs
 
-from griptape_nodes.exe_types.core_types import Trait
+from griptape_nodes.exe_types.core_types import WIRING, Trait, default_element_id
 from griptape_nodes.traits.button import Button
 
 
-@dataclass(eq=False)
 class AddParameterButton(Trait):
-    type: str = field(default_factory=lambda: "AddParameter")
-    element_id: str = field(default_factory=lambda: "Button")
+    element_id: str = attrs.field(default="AddParameterButton", converter=default_element_id, metadata=WIRING)
 
-    def __init__(self) -> None:
-        super().__init__(element_id="AddParameterButton")
+    def __attrs_post_init__(self) -> None:
+        super().__attrs_post_init__()
+        self.type = "AddParameter"
         self.add_child(Button(label="AddParameter"))
-
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["button", "addbutton"]
 
     def ui_options_for_trait(self) -> dict:
         return {"button": self.type}

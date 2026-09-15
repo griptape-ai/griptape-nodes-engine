@@ -1,5 +1,46 @@
 # Unreleased
 
+## A `Trait` declares fields, not a constructor
+
+`BaseNodeElement` is an [attrs](https://www.attrs.org) class, and its metaclass makes every
+element one. A trait declares `attrs.field()` attributes and the constructor is generated,
+element wiring included. There is no decorator to remember and no `super().__init__()` to call:
+
+```python
+import attrs
+
+from griptape_nodes.exe_types.core_types import Trait
+
+
+class Threshold(Trait):
+    level: int = attrs.field(default=5, alias="threshold")
+```
+
+`Threshold(threshold=8)` sets `self.level`. Every element field is keyword-only, so a trait that
+took positional arguments (`Slider(0, 100)`) now takes `Slider(min_val=0, max_val=100)`.
+
+`alias` covers a keyword that differs from the attribute it lands on, which is also how a field
+sits behind a property: a field named `_choices` takes the keyword `choices`, leaving `choices`
+free to be a property.
+
+A subclass inherits its base's fields and declares only its own. To fix an inherited field
+instead of taking an argument for it, re-declare it `init=False`.
+
+**An annotation is not a declaration.** `threshold: int = 5` is a field to a type checker and
+nothing at all to the engine, so it raises at class creation. Declare it with `attrs.field()`,
+mark it `ClassVar` if it is a constant, or annotate it where it is assigned if it is neither.
+The check runs when the class is built, so a mistake costs a library its import rather than an
+artist's saved work.
+
+Two smaller consequences:
+
+- **Elements compare by identity.** `Button(label="Go") == Button(label="Go")` is now False, and
+    a `set` holds both. `Button` and `AddParameterButton` fixed their `element_id`, which used to
+    give them value equality and quietly collapse a pair of identical buttons into one.
+- **`Widget` takes `widget_name`.** It used to overload the element's own `name`, which a
+    generated constructor cannot do: the element base already takes that keyword. A workflow
+    saved under the old key still loads.
+
 ## Branched workflows show a title instead of a file path
 
 Branching a workflow used to set the new workflow's `metadata.name` — the human-readable display
