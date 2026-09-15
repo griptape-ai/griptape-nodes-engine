@@ -72,7 +72,7 @@ class TestLibraryDependencyDeclaration:
         assert not hasattr(deps, "library_dependencies")
 
     def test_schema_version_bumped(self) -> None:
-        assert LibrarySchema.LATEST_SCHEMA_VERSION == "0.12.0"
+        assert LibrarySchema.LATEST_SCHEMA_VERSION == "0.13.0"
 
 
 class TestLibraryDependencyProblem:
