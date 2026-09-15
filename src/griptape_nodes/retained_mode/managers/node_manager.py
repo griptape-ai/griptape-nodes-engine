@@ -1914,6 +1914,11 @@ class NodeManager(EngineScoped):
             details = f"Couldn't add parameter with name {request.parameter_name} to Node '{node_name}'. Error: {e}"
             return AddParameterToNodeResultFailure(result_details=details)
 
+        # A saved callback names a method on the owning node, which the parameter can only
+        # reach once it is attached.
+        if request.value_callbacks:
+            new_param.apply_value_callback_names(request.value_callbacks, node)
+
         details = f"Successfully added Parameter '{final_param_name}' to Node '{node_name}'."
         log_level = logging.DEBUG
         if final_param_name != requested_parameter_name:
@@ -2267,6 +2272,8 @@ class NodeManager(EngineScoped):
                 parameter.tooltip_as_property = request.tooltip_as_property
             if request.tooltip_as_output is not None:
                 parameter.tooltip_as_output = request.tooltip_as_output
+            if request.value_callbacks is not None:
+                parameter.apply_value_callback_names(request.value_callbacks, parameter.get_node())
         if request.ui_options is not None and hasattr(parameter, "ui_options"):
             parameter.ui_options = request.ui_options  # type: ignore[attr-defined]
 
@@ -3701,9 +3708,7 @@ class NodeManager(EngineScoped):
                 # Create the parameter, or alter it on the existing node
                 if parameter.user_defined:
                     # Always serialize user-defined parameters regardless of node type
-                    param_dict = parameter.to_dict()
-                    param_dict["initial_setup"] = True
-                    add_param_request = AddParameterToNodeRequest.create(**param_dict)
+                    add_param_request = AddParameterToNodeRequest.create(**self._parameter_save_dict(parameter, node))
                     element_modification_commands.append(add_param_request)
                 elif isinstance(node, ErrorProxyNode):
                     # For ErrorProxyNode, replay all recorded initialization requests for this parameter
@@ -3719,9 +3724,7 @@ class NodeManager(EngineScoped):
                     element_modification_commands.extend(matching_requests)
                 elif reference_node is None:
                     # Normal node with no reference - treat all parameters as needing serialization
-                    param_dict = parameter.to_dict()
-                    param_dict["initial_setup"] = True
-                    add_param_request = AddParameterToNodeRequest.create(**param_dict)
+                    add_param_request = AddParameterToNodeRequest.create(**self._parameter_save_dict(parameter, node))
                     element_modification_commands.append(add_param_request)
                 else:
                     # Normal node - compare against reference node
@@ -4312,6 +4315,31 @@ class NodeManager(EngineScoped):
         return DuplicateSelectedNodesResultSuccess(
             result.node_names,
             result_details=f"Successfully duplicated {len(serialize_result.node_names_serialized)} nodes.",
+        )
+
+    def _parameter_save_dict(self, parameter: Parameter, node: BaseNode) -> dict[str, Any]:
+        """Build fields that recreate a parameter, warning about omitted callbacks."""
+        param_dict = parameter.to_dict()
+        param_dict["initial_setup"] = True
+        param_dict["value_callbacks"] = parameter.value_callback_names(node)
+        NodeManager._report_unsaveable_callbacks(parameter)
+        return param_dict
+
+    @staticmethod
+    def _report_unsaveable_callbacks(parameter: Parameter) -> None:
+        """Warn about runtime callbacks that cannot be restored by method name."""
+        owner = parameter.get_node()
+        locations: list[str] = []
+        for kind, count in parameter.unnameable_value_callbacks(owner).items():
+            locations.append(f"{count} {kind[:-1] if count == 1 else kind}")
+        if not locations:
+            return
+        logger.warning(
+            "Parameter '%s' attaches %s that cannot be saved. Pass a method of the node "
+            "(self.my_handler) rather than a lambda or a local function, so the saved workflow "
+            "can find it again on load.",
+            parameter.name,
+            "; ".join(locations),
         )
 
     @staticmethod

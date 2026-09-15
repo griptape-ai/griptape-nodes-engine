@@ -25,6 +25,8 @@ from typing import (
 import attrs
 from pydantic import BaseModel
 
+from griptape_nodes.exe_types.callback_binding import name_callback, resolve_callback
+
 logger = logging.getLogger("griptape_nodes")
 
 
@@ -1887,6 +1889,43 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         """
         return bool(self._validators)
 
+    def value_callback_names(self, owner: BaseNode | None) -> dict[str, list[str]]:
+        """Return directly attached callbacks by method name.
+
+        Each callback list is omitted unless every member is nameable because restoring a
+        partial converter or validator pipeline would change its behavior.
+        """
+        names: dict[str, list[str]] = {}
+        for key, callbacks in (("converters", self._converters), ("validators", self._validators)):
+            if not callbacks:
+                continue
+            resolved = [name_callback(callback, owner) for callback in callbacks]
+            if any(name is None for name in resolved):
+                continue
+            names[key] = [name for name in resolved if name is not None]
+        return names
+
+    def unnameable_value_callbacks(self, owner: BaseNode | None) -> dict[str, int]:
+        """Count directly attached callbacks that cannot be saved by name."""
+        unnameable: dict[str, int] = {}
+        for key, callbacks in (("converters", self._converters), ("validators", self._validators)):
+            count = sum(1 for callback in callbacks if name_callback(callback, owner) is None)
+            if count:
+                unnameable[key] = count
+        return unnameable
+
+    def apply_value_callback_names(self, names: dict[str, list[str]], owner: BaseNode | None) -> None:
+        """Bind saved callbacks not already attached."""
+        for key, target in (("converters", self._converters), ("validators", self._validators)):
+            attached = {name_callback(callback, owner) for callback in target}
+            for method_name in names.get(key, []):
+                if method_name in attached:
+                    continue
+                described_as = f"the '{method_name}' {key[:-1]} of parameter '{self.name}'"
+                callback = resolve_callback(method_name, owner, described_as=described_as)
+                if callback is not None:
+                    target.append(callback)
+
     @property
     def has_traits(self) -> bool:
         """Any Trait child is attached.
@@ -2259,6 +2298,9 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
     def equals(self, other: Parameter) -> dict:
         self_dict = self.to_dict().copy()
         other_dict = other.to_dict().copy()
+        # Converters and validators are code, compared by the method names they resolve to.
+        self_dict["value_callbacks"] = self.value_callback_names(self.get_node())
+        other_dict["value_callbacks"] = other.value_callback_names(other.get_node())
         self_dict.pop("next", None)
         self_dict.pop("prev", None)
         self_dict.pop("element_id", None)

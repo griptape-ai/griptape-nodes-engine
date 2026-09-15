@@ -72,6 +72,7 @@ class AddParameterToNodeRequest(RequestPayload):
     allow_variable_substitution: bool = field(default=True)
     parent_container_name: str | None = None
     parent_element_name: str | None = None
+    value_callbacks: dict[str, list[str]] | None = None
     # initial_setup prevents unnecessary work when we are loading a workflow from a file.
     initial_setup: bool = False
 
@@ -401,6 +402,7 @@ class AlterParameterDetailsRequest(RequestPayload):
     allow_variable_substitution: bool | None = None
     ui_options: dict | None = None
     traits: set[str] | None = None
+    value_callbacks: dict[str, list[str]] | None = None
     # initial_setup prevents unnecessary work when we are loading a workflow from a file.
     initial_setup: bool = False
 
@@ -441,6 +443,7 @@ class AlterParameterDetailsRequest(RequestPayload):
             "allow_variable_substitution",
             "ui_options",
             "traits",
+            "value_callbacks",
         ]
 
 
