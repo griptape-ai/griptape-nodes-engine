@@ -24,6 +24,9 @@ class Options(Trait):
 
     DEFAULT_CHOICES: ClassVar[list[str]] = ["choice 1", "choice 2", "choice 3"]
 
+    # Rendered keys carrying the choices, newest first.
+    CHOICES_KEYS: ClassVar[tuple[str, ...]] = ("simple_dropdown", "enum_choices")
+
     # Preserve ``choices`` as the constructor and saved-state key behind the property.
     _choices: list = attrs.field(factory=lambda: list(Options.DEFAULT_CHOICES), alias="choices")
     show_search: bool = attrs.field(default=True)
@@ -37,6 +40,19 @@ class Options(Trait):
     @choices.setter
     def choices(self, value: list) -> None:
         self._choices = value
+
+    @classmethod
+    def state_from_ui_options(cls, ui_options: dict[str, Any]) -> dict[str, Any]:
+        """Map flat dropdown options to trait state.
+
+        ``choices`` renders under its own key, so the field loop never picks it up.
+        """
+        state = {key: ui_options[key] for key in cls.state_keys() if key in ui_options}
+        for choices_key in cls.CHOICES_KEYS:
+            if choices_key in ui_options:
+                state["choices"] = ui_options[choices_key]
+                break
+        return state
 
     def converters_for_trait(self) -> list[Callable]:
         # The choices are hints, so there is nothing to snap a typed value back to.

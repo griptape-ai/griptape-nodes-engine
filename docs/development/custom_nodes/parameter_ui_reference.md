@@ -117,7 +117,7 @@ For a bounded slider, use the `Slider` trait rather than writing `ui_options["sl
 
 ## Traits
 
-Traits live in `griptape_nodes.traits` and are attached with `add_trait()` or `traits={...}` on the parameter. Each row lists what the trait renders and, where relevant, the `ui_options` keys it manages — set the trait rather than the keys.
+Traits live in `griptape_nodes.traits` and are attached with `add_trait()` or `traits={...}` on the parameter. Each row lists what the trait renders and any `ui_options` keys it manages. Set the trait rather than those keys. Writes from the editor or a saved file are routed to the trait through [`state_from_ui_options`](parameters.md#traits).
 
 | Trait                | Typical types             | What it does                                                                                                   | `ui_options` it writes                                            |
 | -------------------- | ------------------------- | -------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |

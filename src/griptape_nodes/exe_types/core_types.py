@@ -2018,6 +2018,27 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
     def ui_options(self, value: dict) -> None:
         self._ui_options = value
 
+    def adopt_ui_options(self, value: dict) -> None:
+        """Route inbound trait-owned options to their traits.
+
+        Keep the flat input stored so detaching a trait reveals the written value.
+        """
+        for trait in self.find_elements_by_type(Trait):
+            adopted = trait.state_from_ui_options(value)
+            if not adopted:
+                continue
+            # Supply complete constructor state when the input mentions only some fields.
+            try:
+                trait.apply_state({**trait.to_state(), **adopted})
+            except TypeError:
+                logger.warning(
+                    "Attempted to update the %s control on parameter '%s' from a UI option change, "
+                    "but it would not accept those values, so the control is unchanged.",
+                    type(trait).__name__,
+                    self.name,
+                )
+        self.ui_options = value
+
     @property
     def hide(self) -> bool:
         """Get whether the entire parameter is hidden in the UI.
@@ -3335,6 +3356,16 @@ class Trait(ABC, BaseNodeElement):
         for attribute in self._state_fields():
             if self.saved_key(attribute) in migrated:
                 setattr(self, attribute.name, getattr(interpreted, attribute.name))
+
+    @classmethod
+    def state_from_ui_options(cls, ui_options: dict[str, Any]) -> dict[str, Any]:  # noqa: ARG003
+        """Map flat UI options to the mentioned state fields.
+
+        The default ignores writes for traits with no state behind their rendered keys, which
+        is why class creation does not require this to invert ``ui_options_for_trait``. A write
+        to a rendered key no trait accepts is logged rather than dropped in silence.
+        """
+        return {}
 
     def callback_names(self, owner: BaseNode | None) -> dict[str, str]:
         """Return nameable behavior fields as owning-node method names."""

@@ -13,6 +13,14 @@ class Slider(Trait):
     def ui_options_for_trait(self) -> dict:
         return {"slider": {"min_val": self.min, "max_val": self.max}}
 
+    @classmethod
+    def state_from_ui_options(cls, ui_options: dict) -> dict[str, Any]:
+        """Map flat slider options to trait state."""
+        written = ui_options.get("slider")
+        if not isinstance(written, dict):
+            return {}
+        return {key: written[key] for key in cls.state_keys() if key in written}
+
     def validators_for_trait(self) -> list[Callable[..., Any]]:
         def validate(param: Parameter, value: Any) -> None:  # noqa: ARG001
             if hasattr(value, "__gt__") and hasattr(value, "__lt__") and (value > self.max or value < self.min):
