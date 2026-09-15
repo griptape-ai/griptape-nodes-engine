@@ -186,6 +186,7 @@ The permission list is a catalog of capabilities grouped by category. Each row c
 | **Models**    | Use model providers               | Every model under a provider. Denied models are filtered out of model pickers and blocked from invocation; nodes stay creatable. | Specific providers |
 | **Models**    | Use model families                | Models in specific families (e.g. Claude 4, GPT-4). Same picker filtering and invocation blocking as providers.                  | Specific families  |
 | **Models**    | Use specific models               | Individual models by id. Same picker filtering and invocation blocking.                                                          | Specific models    |
+| **Video**     | Use video codecs                  | Reading and writing video by codec (for example `h264`, `hevc`, `prores`).                                                       | Specific codecs    |
 
 When a template's settings collide with another template or access group that applies to the same license keys — for example, this template allows a capability that an assigned group's template denies — the affected rows are flagged with a conflict warning naming the conflicting templates and keys. Remember: a deny always wins.
 
@@ -193,11 +194,13 @@ When a template's settings collide with another template or access group that ap
 
 #### Compiled Cedar
 
-Under the hood the builder compiles your choices into [Cedar](https://www.cedarpolicy.com/) policy statements, which are what the engine actually enforces. The **Compiled Cedar Policy** section (collapsed by default) shows the Cedar from the last save, for auditing.
+Under the hood the builder compiles your choices into [Cedar](https://www.cedarpolicy.com/) policy statements, which are what the engine actually enforces. The **Compiled Cedar Policy** section (collapsed by default) shows the Cedar from the last save, for auditing. See [Cedar Policies](cedar_policies.md) for what those statements mean.
 
 ### Raw Cedar templates
 
 Templates created in **Raw Cedar** mode skip the builder and expose a Cedar editor with syntax validation — a template with syntax errors cannot be saved. A read-only statement summary above the editor breaks the policy down per statement, and the same **Assign to** controls apply. New raw templates start with `permit(principal, action, resource);` (allow everything), mirroring the builder's exploration default.
+
+Write raw templates when the capability catalog does not cover the rule you need. [Cedar Policies](cedar_policies.md) documents the checkpoints, resource attributes, and context facts a statement can match on, with worked examples.
 
 ### Griptape-managed templates
 
