@@ -16,8 +16,7 @@ def _known_icon_size(icon_size: str) -> str:
 class MultiOptions(Trait):
     DEFAULT_CHOICES: ClassVar[list[str]] = ["choice 1", "choice 2", "choice 3"]
 
-    # The field is _choices, so the ``choices`` property below is unobstructed. The alias is
-    # what keeps the constructor argument and the saved key ``choices``.
+    # Preserve ``choices`` as the constructor and saved-state key behind the property.
     _choices: list = attrs.field(factory=lambda: list(MultiOptions.DEFAULT_CHOICES), alias="choices")
     placeholder: str = attrs.field(default="Select options...")
     max_selected_display: int = attrs.field(default=3)
@@ -36,12 +35,7 @@ class MultiOptions(Trait):
 
     @classmethod
     def state_from_ui_options(cls, ui_options: dict) -> dict[str, Any]:
-        """Adopt a multi-select written straight into the parameter's ``ui_options``.
-
-        A workflow saved before trait state was carried in its own right mirrored a run-time
-        ``choices`` update into ``multi_options`` so that it would survive the save. The
-        nested keys are this trait's constructor arguments, which is what makes them state.
-        """
+        """Map flat multi-select options to trait state."""
         written = ui_options.get("multi_options")
         if not isinstance(written, dict):
             return {}

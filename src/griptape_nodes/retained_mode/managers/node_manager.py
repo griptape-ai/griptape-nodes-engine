@@ -276,11 +276,9 @@ class _FlowCancelOutcome:
 
 
 class RestoredTrait(NamedTuple):
-    """One saved trait entry paired with the trait it landed on, or None when it landed nowhere.
+    """Pair a saved trait entry with its restored instance.
 
-    Restoring runs in two passes, because a saved callback names a method on the owning node
-    and the parameter only reaches that node after it is attached. This is what the first pass
-    hands the second, so nothing has to re-resolve or re-align the entries.
+    Callbacks restore after parameter attachment because they require the owning node.
     """
 
     entry: TraitStateEntry
@@ -4505,13 +4503,7 @@ class NodeManager(EngineScoped):
         )
 
     def _parameter_save_dict(self, parameter: Parameter, node: BaseNode) -> dict[str, Any]:
-        """Build the request fields that recreate ``parameter`` from scratch on load.
-
-        Trait identity and state travel separately from the scalar fields, and only the
-        options authored on the parameter are saved: the trait regenerates its own on load.
-        Reporting what cannot be saved belongs here too, so every from-scratch save path
-        warns about the same losses.
-        """
+        """Build fields that recreate a parameter, warning about omitted callbacks."""
         param_dict = parameter.to_dict()
         param_dict["initial_setup"] = True
         param_dict["ui_options"] = parameter.authored_ui_options()
@@ -4521,14 +4513,7 @@ class NodeManager(EngineScoped):
         return param_dict
 
     def _stabilize_trait_modules(self, trait_states: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Rewrite each saved trait's module to the stable namespace a library reloads under.
-
-        A trait class defined in a library file carries the dynamic, per-process module name
-        it happened to import under; that name is worthless once the process ends. The
-        stable namespace is the same import path across processes and reloads, so
-        ``TraitRegistry.resolve`` can find the same class again on load. A module that isn't
-        dynamic (an in-tree trait) is left untouched.
-        """
+        """Replace process-local library module names with stable namespaces."""
         library_manager = self.engine.library_manager
         for entry in trait_states:
             trait_module = entry.get("trait_module")
@@ -4543,13 +4528,7 @@ class NodeManager(EngineScoped):
 
     @staticmethod
     def _report_unsaveable_callbacks(parameter: Parameter) -> None:
-        """Warn about callbacks on this parameter that saving cannot record.
-
-        Called while serializing a run-time parameter, which is the moment the loss
-        happens: a lambda or closure has no method name to write down, so the behavior comes
-        back missing. A declared parameter is exempt because its node's ``__init__`` rebuilds
-        its callbacks on load.
-        """
+        """Warn about runtime callbacks that cannot be restored by method name."""
         owner = parameter.get_node()
         locations: list[str] = []
         for trait in parameter.find_elements_by_type(Trait):
@@ -4570,17 +4549,10 @@ class NodeManager(EngineScoped):
 
     @staticmethod
     def _apply_trait_states(parameter: Parameter, trait_states: list[dict[str, Any]]) -> list[RestoredTrait]:
-        """Restore saved trait state onto a parameter, and report where each entry landed.
+        """Apply state to matching traits and build missing traits.
 
-        A trait the node's ``__init__`` already built is updated in place rather than
-        replaced, so whatever the constructor attached to that instance survives. A trait
-        with no counterpart on the parameter is built fresh. An unresolvable trait name is
-        logged and skipped: the parameter loses that trait's behavior, which is worth
-        saying out loud rather than failing the whole load.
-
-        Callbacks are handled separately by ``_apply_trait_callbacks``, which has to run
-        after the parameter is attached to its node. The returned pairing is what it consumes,
-        so resolving a saved name to a class happens once per load rather than once per pass.
+        Existing instances are preserved with constructor wiring. Unresolvable traits are
+        skipped. The returned pairing lets callbacks restore after node attachment.
         """
         entries = NodeManager._parse_trait_entries(parameter, trait_states)
         paired = NodeManager._pair_saved_traits(parameter, entries)
@@ -4599,7 +4571,6 @@ class NodeManager(EngineScoped):
 
     @staticmethod
     def _parse_trait_entries(parameter: Parameter, trait_states: list[dict[str, Any]]) -> list[TraitStateEntry]:
-        """Read the saved entries, dropping any that names no trait."""
         entries: list[TraitStateEntry] = []
         for state in trait_states:
             entry = TraitStateEntry.from_dict(state)
@@ -4615,7 +4586,6 @@ class NodeManager(EngineScoped):
 
     @staticmethod
     def _build_saved_trait(parameter: Parameter, entry: TraitStateEntry) -> Trait | None:
-        """Build and attach the trait an entry describes, or None when it cannot be built."""
         trait_class = NodeManager._resolve_saved_trait(entry)
         if trait_class is None:
             logger.warning(
@@ -4636,14 +4606,7 @@ class NodeManager(EngineScoped):
 
     @staticmethod
     def _pair_saved_traits(parameter: Parameter, entries: list[TraitStateEntry]) -> list[Trait | None]:
-        """Match each saved entry to the attached trait it describes, in entry order.
-
-        Matches on the resolved class rather than the saved name, so two traits sharing a
-        name across libraries stay distinct, and consumes each match, so a parameter carrying
-        two traits of the same class has both updated instead of both entries landing on
-        whichever one came first. A slot is None when nothing attached corresponds to that
-        entry, which tells the caller to build it.
-        """
+        """Match by resolved class, consuming each attached trait at most once."""
         unmatched = parameter.find_elements_by_type(Trait)
         paired: list[Trait | None] = []
         for entry in entries:
@@ -4660,14 +4623,12 @@ class NodeManager(EngineScoped):
 
     @staticmethod
     def _resolve_saved_trait(entry: TraitStateEntry) -> type[Trait] | None:
-        """Resolve one saved entry to its trait class, or None when it names nothing loadable."""
         if entry.trait_module is None:
             return None
         return TraitRegistry.resolve(entry.trait_name, entry.trait_module)
 
     @staticmethod
     def _warn_unsatisfiable_trait_state(parameter: Parameter, trait_name: str) -> None:
-        """Report saved state the trait's own constructor will not accept."""
         logger.warning(
             "Parameter '%s' was saved with the '%s' trait, but its saved state is missing "
             "something the trait requires. The parameter will load without it. Check that the "
@@ -4678,15 +4639,9 @@ class NodeManager(EngineScoped):
 
     @staticmethod
     def _apply_trait_callbacks(parameter: Parameter, restored: list[RestoredTrait]) -> None:
-        """Re-bind saved trait callbacks to methods on the parameter's node.
+        """Bind callbacks after the parameter can reach its owning node.
 
-        Separate from ``_apply_trait_states`` because a saved callback is the name of a
-        method on the owning node, so the parameter has to be attached before the name can
-        be resolved. ``restored`` is that call's return value, which pairs each saved entry
-        with the trait it landed on.
-
-        A callback the node's ``__init__`` already supplied is left alone by
-        ``apply_callback_names``: live code beats a saved name.
+        Constructor-supplied callbacks take precedence over saved names.
         """
         owner = parameter.get_node()
         for entry, trait in restored:

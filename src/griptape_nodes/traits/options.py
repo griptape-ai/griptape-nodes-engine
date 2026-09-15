@@ -24,8 +24,7 @@ class Options(Trait):
 
     DEFAULT_CHOICES: ClassVar[list[str]] = ["choice 1", "choice 2", "choice 3"]
 
-    # The field is _choices, so the ``choices`` property below is unobstructed. The alias is
-    # what keeps the constructor argument and the saved key ``choices``.
+    # Preserve ``choices`` as the constructor and saved-state key behind the property.
     _choices: list = attrs.field(factory=lambda: list(Options.DEFAULT_CHOICES), alias="choices")
     show_search: bool = attrs.field(default=True)
     search_filter: str = attrs.field(default="")
@@ -41,17 +40,7 @@ class Options(Trait):
 
     @classmethod
     def state_from_ui_options(cls, ui_options: dict[str, Any]) -> dict[str, Any]:
-        """Adopt a dropdown written straight into the parameter's ``ui_options``.
-
-        Two writers do this. The editor's fixed-options panel sends these keys back flat, and
-        a workflow saved before trait state was carried in its own right mirrored a run-time
-        ``choices`` update into ``simple_dropdown`` so that it would survive the save. Without
-        adopting it, such a file loads with whatever choices the node's ``__init__`` builds,
-        and the converter below then rewrites the saved value to the first of those.
-
-        ``enum_choices`` is what a dropdown was called before this trait existed. The editor
-        still falls back to reading it, so a file old enough to hold it is still openable.
-        """
+        """Map flat dropdown options to trait state, including legacy ``enum_choices``."""
         state: dict[str, Any] = {}
         if "simple_dropdown" in ui_options:
             state["choices"] = ui_options["simple_dropdown"]
@@ -87,10 +76,9 @@ class Options(Trait):
         return [validator]
 
     def ui_options_for_trait(self) -> dict:
-        """Render the dropdown for the editor.
+        """Render the dropdown.
 
-        ``allow_custom`` is published only when set so that every already-saved dropdown
-        keeps serializing exactly the keys it does today.
+        Omit false ``allow_custom`` to preserve the existing serialized shape.
         """
         options: dict[str, Any] = {
             "simple_dropdown": self.choices,

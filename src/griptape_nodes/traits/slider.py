@@ -15,11 +15,7 @@ class Slider(Trait):
 
     @classmethod
     def state_from_ui_options(cls, ui_options: dict) -> dict[str, Any]:
-        """Adopt slider bounds written straight into the parameter's ``ui_options``.
-
-        The editor's parameter properties panel writes ``slider`` as the same pair
-        ``ui_options_for_trait`` renders, so moving a bound there moves the validator with it.
-        """
+        """Map flat slider options to trait state."""
         written = ui_options.get("slider")
         if not isinstance(written, dict):
             return {}
