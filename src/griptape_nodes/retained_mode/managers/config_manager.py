@@ -8,6 +8,12 @@ from typing import Any, Literal, NamedTuple
 from pydantic import ValidationError
 from xdg_base_dirs import xdg_config_home
 
+from griptape_nodes.common.log_capture import (
+    DEFAULT_BUFFER_LINES,
+    DEFAULT_RETENTION_DAYS,
+    configure_diagnostic_logging,
+    resolve_log_directory,
+)
 from griptape_nodes.files.path_utils import resolve_workspace_path
 from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.retained_mode.engine import Engine, EngineScoped
@@ -62,7 +68,12 @@ from griptape_nodes.retained_mode.managers.settings import (
     DEFAULT_LIBRARIES_DIRECTORY,
     DISCOVERY_MAX_DEPTH_KEY,
     LIBRARIES_DIRECTORY_KEY,
+    LOG_DIRECTORY_KEY,
+    LOG_RETENTION_DAYS_KEY,
+    LOG_TO_FILE_KEY,
+    SESSION_LOG_BUFFER_LINES_KEY,
     WORKFLOWS_TO_REGISTER_KEY,
+    LogLevel,
     Settings,
 )
 from griptape_nodes.utils.dict_utils import drop_blank_values, get_dot_value, merge_dicts, set_dot_value
@@ -244,6 +255,28 @@ class _LayerProbe(NamedTuple):
     path: Path | None
 
 
+class _LoggingSettings(NamedTuple):
+    """Everything the shared logger and its diagnostic sinks are configured from.
+
+    Held as one value so a config reload can tell whether any of it actually changed:
+    every reload would otherwise re-scan the log directory for files to age out.
+
+    Attributes:
+        log_level: Verbosity of the ``griptape_nodes`` logger, which bounds what any
+            sink can receive.
+        buffer_lines: Lines of this session held in memory. Zero disables the buffer.
+        log_to_file: Whether a rotating log file is written.
+        log_directory: Resolved directory that file holds.
+        retention_days: How long log files are kept. Zero keeps them forever.
+    """
+
+    log_level: str
+    buffer_lines: int
+    log_to_file: bool
+    log_directory: Path
+    retention_days: int
+
+
 class ConfigManager(EngineScoped):
     """A class to manage application configuration and file pathing.
 
@@ -317,13 +350,13 @@ class ConfigManager(EngineScoped):
         # compute_*_provisioning_config previews, which read some other project's config and
         # would otherwise clobber the live layer's error.
         self._layer_parse_errors: dict[ConfigLayerName, str | None] = {}
+        # Set before the first load, because loading is what applies these.
+        self._applied_logging_settings: _LoggingSettings | None = None
         self.load_configs()
 
         # Once per engine process, before any project YAML is read. See the method docstring for why
         # this cannot live in load_configs().
         self._publish_default_libraries_root()
-
-        self._set_log_level(self.merged_config.get("log_level", logging.INFO))
 
         # Store event manager reference for broadcasting config change events
         self._event_manager = event_manager
@@ -365,6 +398,24 @@ class ConfigManager(EngineScoped):
             path: The path to set as the base file path.
         """
         self._workspace_path = str(Path(path).expanduser().resolve())
+
+    @property
+    def log_directory(self) -> Path:
+        """Directory the engine's log files are written to.
+
+        Resolved from the ``logging.log_directory`` setting, empty meaning the default
+        location. Exposed as a property so a report of where logs go and the sink that
+        puts them there cannot disagree.
+
+        Read with secret expansion off. A value beginning with ``$`` would otherwise be
+        looked up through the secrets manager, and this property is read while the
+        ``ConfigManager`` is being constructed -- before the engine has a secrets manager to
+        ask. A log directory written as ``$LOG_DIR`` would take the engine down at startup,
+        with no log to say why. A leading ``$`` is treated as part of the directory name.
+        """
+        return resolve_log_directory(
+            self.get_config_value(LOG_DIRECTORY_KEY, default="", cast_type=str, should_load_env_var_if_detected=False)
+        )
 
     def set_workspace_override(self, path: Path | None, *, supplied_by_config: bool = False) -> None:
         """Set a runtime workspace directory override.
@@ -1091,6 +1142,13 @@ class ConfigManager(EngineScoped):
             self.merged_config = self.default_config
             self._merged_config_rejection = _MergedConfigRejection(paths=_offending_paths(e, merged_config))
 
+        # Last, from whatever config actually survived above. Any config file can carry a
+        # logging setting -- the user, project, or workspace file -- so applying these only
+        # when the user config is written would leave the engine logging somewhere other
+        # than where it reports it is. `GTN_CONFIG_LOG_LEVEL` reaches this too; the settings
+        # nested under `logging.` do not, because the env layer is a flat mapping.
+        self._apply_logging_settings()
+
     def load_project_config(self, project_dir: Path) -> None:
         """Load the project-adjacent config from the given project directory and remerge all configs.
 
@@ -1383,9 +1441,7 @@ class ConfigManager(EngineScoped):
         old_value = self.get_config_value(key, should_load_env_var_if_detected=False)
 
         delta = set_dot_value({}, key, value)
-        if key == "log_level":
-            self._set_log_level(value)
-        elif key == "workspace_directory":
+        if key == "workspace_directory":
             self.workspace_path = value
         self.user_config = merge_dicts(self.merged_config, delta)
         write_succeeded = self._write_user_config_delta(delta)
@@ -1396,6 +1452,9 @@ class ConfigManager(EngineScoped):
         # We need to fully reload the user config because we need to regenerate the merged config.
         # Also eventually need to reload registered workflows.
         # TODO: https://github.com/griptape-ai/griptape-nodes/issues/437
+        # Reapplies the log level and sinks as a side effect, from the reloaded merged
+        # config rather than from `value`: logging is configured from several related
+        # settings at once, and a value this write did not persist must not take effect.
         self.load_configs()
         logger.debug("Config value '%s' set to '%s'", key, value)
 
@@ -1456,6 +1515,11 @@ class ConfigManager(EngineScoped):
                     "file could not be written; see prior logs for the underlying I/O error."
                 )
                 return SetConfigCategoryResultFailure(result_details=result_details)
+
+            # Reloaded so the merged config, the workspace path, and the log sinks
+            # describe what was just written. Without this the engine keeps running on
+            # the config it had, while every reader of `merged_config` reports the new one.
+            self.load_configs()
 
             result_details = "Successfully assigned the entire config dictionary."
 
@@ -1572,8 +1636,8 @@ class ConfigManager(EngineScoped):
 
     def on_handle_reset_config_request(self, request: ResetConfigRequest) -> ResultPayload:  # noqa: ARG002
         try:
+            # Reloads, which reapplies the log level and sinks from the reset config.
             self.reset_user_config()
-            self._set_log_level(str(self.merged_config["log_level"]))
 
             result_details = "Successfully reset user configuration."
             # Reset is a full replacement; emit the same shape of ConfigChanged
@@ -2160,3 +2224,74 @@ class ConfigManager(EngineScoped):
         except (ValueError, AttributeError):
             logger.error("Invalid log level %s. Defaulting to INFO.", level)
             logger.setLevel(logging.INFO)
+
+    def _apply_logging_settings(self) -> None:
+        """Point the shared logger and its diagnostic sinks at what the config now says.
+
+        The one place logging is configured from, called at the end of every config load
+        so no caller has to remember to. Like ``_set_log_level``, it reaches the
+        process-wide ``griptape_nodes`` logger, so the last engine to load a config in a
+        process wins: there is one logger, so there is one answer to where its output goes.
+
+        Does nothing when nothing relevant changed. Every config write reloads, and
+        re-applying would re-scan the log directory for files to age out each time.
+        """
+        settings = self._resolve_logging_settings()
+        if settings == self._applied_logging_settings:
+            return
+
+        self._set_log_level(settings.log_level)
+        installed = configure_diagnostic_logging(
+            buffer_lines=settings.buffer_lines,
+            log_to_file=settings.log_to_file,
+            log_directory=settings.log_directory,
+            retention_days=settings.retention_days,
+        )
+
+        # Recorded only once the sinks asked for are the ones actually installed. Failing to
+        # open the log file is usually temporary -- a volume not mounted yet, a directory a
+        # permission fix is coming for -- and remembering the attempt as done would short-
+        # circuit every later load, so the engine would never write a log file again for the
+        # rest of its life. Assigned after the call rather than before for the same reason.
+        if installed:
+            self._applied_logging_settings = settings
+
+    def _resolve_logging_settings(self) -> _LoggingSettings:
+        """Read the settings the logger and its sinks are built from.
+
+        Every one is read with secret expansion off, for the reason the ``log_directory``
+        property gives: expansion looks a ``$``-prefixed value up through
+        ``self.engine.secrets_manager``, and this runs at the end of every config load --
+        including the one inside ``ConfigManager.__init__``, which ``Engine.__init__``
+        performs before it has a ``SecretsManager`` to look anything up in. The
+        ``AttributeError`` would come out of a constructor: not a broken log file, an engine
+        that refuses to start, reported with no log behind it to say why. Nothing is lost by
+        reading these literally, because none of them is a credential -- a line count, a day
+        count, a flag, and a directory.
+
+        Each is also coerced to the type this returns it as. ``load_configs`` validates the
+        merged config against ``Settings``, but keeps the values as written rather than as
+        pydantic parsed them, so a config file saying ``"log_to_file": "false"`` passes
+        validation and leaves a *string* in the config -- one that is perfectly truthy, so
+        file logging would stay on for a user who turned it off. The counts arrive the same
+        way, and reach a comparison against zero that a string cannot be part of.
+        """
+        return _LoggingSettings(
+            log_level=str(self.merged_config.get("log_level", LogLevel.INFO.value)),
+            buffer_lines=self.get_config_value(
+                SESSION_LOG_BUFFER_LINES_KEY,
+                default=DEFAULT_BUFFER_LINES,
+                cast_type=int,
+                should_load_env_var_if_detected=False,
+            ),
+            log_to_file=self.get_config_value(
+                LOG_TO_FILE_KEY, default=True, cast_type=bool, should_load_env_var_if_detected=False
+            ),
+            log_directory=self.log_directory,
+            retention_days=self.get_config_value(
+                LOG_RETENTION_DAYS_KEY,
+                default=DEFAULT_RETENTION_DAYS,
+                cast_type=int,
+                should_load_env_var_if_detected=False,
+            ),
+        )
