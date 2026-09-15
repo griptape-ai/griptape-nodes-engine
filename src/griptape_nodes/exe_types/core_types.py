@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import contextlib
 import inspect
 import logging
 import uuid
 import warnings
 from abc import ABC, ABCMeta, abstractmethod
 from collections.abc import Callable
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum, StrEnum, auto
@@ -26,6 +28,7 @@ import attrs
 from pydantic import BaseModel
 
 from griptape_nodes.exe_types.callback_binding import name_callback, resolve_callback
+from griptape_nodes.exe_types.trait_state import CALLBACK_TYPE, TraitStateEntry, as_saved_state_value, unsaveable_type
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -58,7 +61,7 @@ class NodeMessageResult(BaseModel):
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
     from types import TracebackType
 
     from griptape_nodes.exe_types.node_types import BaseNode
@@ -293,8 +296,11 @@ class ParameterType:
         return ParameterType.KeyValueTypePair(key_type=key_type, value_type=value_type)
 
 
-# Marks the element's own wiring, as opposed to a subclass's declared state.
+# Excludes element wiring from trait state.
 WIRING: dict[str, bool] = {"wiring": True}
+
+# Saves callbacks by owning-node method name rather than as data.
+BEHAVIOR: dict[str, bool] = {"behavior": True}
 
 
 def default_element_id(element_id: str | None) -> str:
@@ -377,6 +383,20 @@ class BaseNodeElement(metaclass=ElementMeta):
         # Push this element onto the global stack
         BaseNodeElement._stack.append(self)
         return self
+
+    @staticmethod
+    @contextmanager
+    def detached() -> Iterator[None]:
+        """Suppress adoption by an open element context.
+
+        Mutate the stack in place so nested ``__exit__`` calls retain their references.
+        """
+        open_elements = BaseNodeElement._stack[:]
+        BaseNodeElement._stack.clear()
+        try:
+            yield
+        finally:
+            BaseNodeElement._stack[:] = open_elements
 
     def __exit__(
         self,
@@ -1889,6 +1909,21 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         """
         return bool(self._validators)
 
+    def trait_states(self) -> list[dict[str, Any]]:
+        """Return save-only trait identity and constructor state.
+
+        ``NodeManager`` stabilizes dynamic library module names before saving.
+        """
+        states: list[dict[str, Any]] = []
+        for trait in self.find_elements_by_type(Trait):
+            entry = TraitStateEntry(
+                trait_name=type(trait).__name__,
+                trait_module=type(trait).__module__,
+                trait_state=trait.to_state(),
+            )
+            states.append(entry.to_dict())
+        return states
+
     def value_callback_names(self, owner: BaseNode | None) -> dict[str, list[str]]:
         """Return directly attached callbacks by method name.
 
@@ -2298,6 +2333,8 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
     def equals(self, other: Parameter) -> dict:
         self_dict = self.to_dict().copy()
         other_dict = other.to_dict().copy()
+        self_dict["traits"] = self.trait_states()
+        other_dict["traits"] = other.trait_states()
         # Converters and validators are code, compared by the method names they resolve to.
         self_dict["value_callbacks"] = self.value_callback_names(self.get_node())
         other_dict["value_callbacks"] = other.value_callback_names(other.get_node())
@@ -3225,11 +3262,34 @@ class ParameterDictionary(ParameterContainer):
 
 
 class Trait(ABC, BaseNodeElement):
-    """A parameter control declared as attrs fields."""
+    """A parameter control whose attrs fields define its saved contract.
+
+    Normal fields are saved as data. ``metadata=BEHAVIOR`` fields are saved by owning-node
+    method name. ``init=False`` fields are not saved.
+    """
 
     @classmethod
     def __attrs_init_subclass__(cls) -> None:
+        """Reject state that cannot round-trip through a saved workflow."""
         cls._reject_annotations_that_are_not_fields()
+        # Forward references are checked by value while saving.
+        with contextlib.suppress(NameError):
+            attrs.resolve_types(cls)
+        for attribute in cls._state_fields():
+            unsaveable = unsaveable_type(attribute.type)
+            if unsaveable == CALLBACK_TYPE:
+                msg = (
+                    f"Trait '{cls.__name__}' declares '{attribute.name}' as state, but its type is a callback. "
+                    f"Declare it with metadata=BEHAVIOR so it is carried by method name instead of saved as data."
+                )
+                raise TypeError(msg)
+            if unsaveable is not None:
+                msg = (
+                    f"Trait '{cls.__name__}' declares '{attribute.name}' as state, but a {unsaveable} cannot be "
+                    f"written to a saved workflow. Trait state holds text, numbers, true/false, and lists or "
+                    f"dictionaries of those. Convert it in the field, or declare it init=False if it is derived."
+                )
+                raise TypeError(msg)
 
     def to_dict(self) -> dict[str, Any]:
         updated = super().to_dict()
@@ -3237,6 +3297,67 @@ class Trait(ABC, BaseNodeElement):
         updated["trait_name"] = self.__class__.__name__
         updated["trait_display_options"] = self.display_options_for_trait()
         return updated
+
+    def to_state(self) -> dict[str, Any]:
+        """Return constructor arguments, omitting and warning about unsupported values."""
+        state: dict[str, Any] = {}
+        for attribute in self._state_fields():
+            saved = as_saved_state_value(getattr(self, attribute.name))
+            if saved.unsupported_type is not None:
+                logger.warning(
+                    "Trait '%s' holds a %s in '%s', which cannot be written to a saved workflow. Trait state "
+                    "holds text, numbers, true/false, and lists or dictionaries of those. The parameter will "
+                    "load without this trait's '%s'.",
+                    type(self).__name__,
+                    saved.unsupported_type,
+                    self.saved_key(attribute),
+                    self.saved_key(attribute),
+                )
+                continue
+            state[self.saved_key(attribute)] = saved.value
+        return state
+
+    def apply_state(self, state: dict[str, Any]) -> None:
+        """Apply saved fields through the constructor without replacing the trait.
+
+        Only supplied fields are copied, preserving constructor wiring and defaults for fields
+        absent from older files. Constructor converters and validators still apply.
+
+        Raises:
+            TypeError: If ``state`` cannot satisfy the constructor.
+        """
+        if not state:
+            return
+        migrated = type(self).migrate_state(state)
+        interpreted = type(self)._construct(migrated)
+        for attribute in self._state_fields():
+            if self.saved_key(attribute) in migrated:
+                setattr(self, attribute.name, getattr(interpreted, attribute.name))
+
+    @classmethod
+    def migrate_state(cls, state: dict[str, Any]) -> dict[str, Any]:
+        """Migrate saved field names or values before construction.
+
+        Runs once per load, so an override may rename or convert unconditionally.
+        """
+        return state
+
+    @classmethod
+    def from_state(cls, state: dict[str, Any]) -> Self:
+        """Construct a detached trait from saved state."""
+        return cls._construct(cls.migrate_state(state))
+
+    @classmethod
+    def _construct(cls, migrated_state: dict[str, Any]) -> Self:
+        """Construct from state already passed through ``migrate_state``."""
+        with BaseNodeElement.detached():
+            return cls(**migrated_state)
+
+    @staticmethod
+    def saved_key(attribute: attrs.Attribute) -> str:
+        if attribute.alias is None:
+            return attribute.name
+        return attribute.alias
 
     @classmethod
     def _reject_annotations_that_are_not_fields(cls) -> None:
@@ -3257,6 +3378,22 @@ class Trait(ABC, BaseNodeElement):
                 f"the module uses 'from __future__ import annotations'; a trait's module cannot."
             )
             raise TypeError(msg)
+
+    @classmethod
+    def state_keys(cls) -> list[str]:
+        return [cls.saved_key(attribute) for attribute in cls._state_fields()]
+
+    @classmethod
+    def _state_fields(cls) -> list[attrs.Attribute]:
+        return [
+            attribute
+            for attribute in attrs.fields(cls)
+            if attribute.init and not attribute.metadata.get("wiring") and not attribute.metadata.get("behavior")
+        ]
+
+    @classmethod
+    def _behavior_fields(cls) -> list[attrs.Attribute]:
+        return [attribute for attribute in attrs.fields(cls) if attribute.metadata.get("behavior")]
 
     def ui_options_for_trait(self) -> dict:
         """Returns a list of UI options for the parameter as a list of strings or dictionaries."""

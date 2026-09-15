@@ -322,45 +322,6 @@ class TestTraitToDict:
 
         assert multi_options["choices"] == ["x", "y", "z"]
 
-    def test_explicit_ui_options_win_over_stale_trait_choices(self) -> None:
-        """A saved parameter's own `ui_options` is the source of truth over a trait's default.
-
-        Intended contract per the "SERIALIZATION BUG FIX" note on `Options`: after reload,
-        a node rebuilds its trait with its ORIGINAL constructor choices (there is no
-        mechanism to persist a runtime `trait.choices` mutation back into node source), so
-        `Parameter._ui_options` -- populated from the saved `ui_options` during load -- must
-        win the merge over the trait's now-stale default list.
-        """
-        param = Parameter(
-            name="p",
-            tooltip="t",
-            traits={Options(choices=["stale default 1", "stale default 2"])},
-            ui_options={"simple_dropdown": ["restored choice 1", "restored choice 2"]},
-        )
-
-        assert param.to_dict()["ui_options"]["simple_dropdown"] == ["restored choice 1", "restored choice 2"]
-
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "DATA-LOSS: Bug: Options.choices setter's 'dual sync' write of "
-            "self._parent.ui_options['simple_dropdown'] = value is a no-op. Parameter.ui_options "
-            "is a computed property that rebuilds a brand-new dict via `|` on every access "
-            "(core_types.py ~:1878), so subscript-assigning into its return value never persists "
-            "to Parameter._ui_options. A dynamic runtime update of trait.choices AFTER the trait "
-            "is attached to a parameter should be reflected in that parameter's persisted "
-            "ui_options (the whole point of the documented 'dual sync' fix), but it is not. "
-            "- see #5440"
-        ),
-    )
-    def test_dynamic_choices_update_after_attachment_persists_to_parameter_ui_options(self) -> None:
-        options = Options(choices=["initial 1", "initial 2"])
-        param = Parameter(name="p", tooltip="t", traits={options})
-
-        options.choices = ["updated 1", "updated 2"]
-
-        assert param._ui_options.get("simple_dropdown") == ["updated 1", "updated 2"]
-
 
 class TestParamTypeSubclassUiOptions:
     """Each convenience Parameter subclass's constructor sugar lands in `ui_options`."""

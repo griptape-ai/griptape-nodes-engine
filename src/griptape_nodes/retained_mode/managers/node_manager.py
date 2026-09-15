@@ -40,6 +40,7 @@ from griptape_nodes.exe_types.core_types import (
     ParameterMode,
     ParameterType,
     ParameterTypeBuiltin,
+    Trait,
 )
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_groups import NodeGroupMembershipError, SubflowNodeGroup
@@ -55,6 +56,7 @@ from griptape_nodes.exe_types.node_types import (
     aprocess_scope,
     sanctioned_parameter_mutation,
 )
+from griptape_nodes.exe_types.trait_state import TraitStateEntry
 from griptape_nodes.node_library.library_declarations import (
     ArbitraryPythonExecutionNodeProperty,
     LifecycleStageLibraryProperty,
@@ -239,6 +241,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointSubjectType,
 )
 from griptape_nodes.retained_mode.retained_mode import RetainedMode
+from griptape_nodes.traits.trait_registry import TraitRegistry
 from griptape_nodes.utils.exception_utils import readable_exception_message
 
 logger = logging.getLogger("griptape_nodes")
@@ -1900,6 +1903,10 @@ class NodeManager(EngineScoped):
             settable=request.settable,
             allow_variable_substitution=request.allow_variable_substitution,
         )
+        # Rebuild traits from saved state so their converters, validators,
+        # and ui_options come back with the class.
+        if request.traits:
+            NodeManager._apply_trait_states(new_param, request.traits)
         try:
             with sanctioned_parameter_mutation():
                 if request.parent_container_name and request.initial_setup:
@@ -2272,6 +2279,8 @@ class NodeManager(EngineScoped):
                 parameter.tooltip_as_property = request.tooltip_as_property
             if request.tooltip_as_output is not None:
                 parameter.tooltip_as_output = request.tooltip_as_output
+            if request.traits is not None:
+                NodeManager._apply_trait_states(parameter, request.traits)
             if request.value_callbacks is not None:
                 parameter.apply_value_callback_names(request.value_callbacks, parameter.get_node())
         if request.ui_options is not None and hasattr(parameter, "ui_options"):
@@ -3737,6 +3746,8 @@ class NodeManager(EngineScoped):
                     if relevant:
                         diff["parameter_name"] = parameter.name
                         diff["initial_setup"] = True
+                        if "traits" in diff:
+                            diff["traits"] = self._stabilize_trait_modules(diff["traits"])
                         alter_param_request = AlterParameterDetailsRequest.create(**diff)
                         element_modification_commands.append(alter_param_request)
 
@@ -4321,9 +4332,110 @@ class NodeManager(EngineScoped):
         """Build fields that recreate a parameter, warning about omitted callbacks."""
         param_dict = parameter.to_dict()
         param_dict["initial_setup"] = True
+        param_dict["traits"] = self._stabilize_trait_modules(parameter.trait_states())
         param_dict["value_callbacks"] = parameter.value_callback_names(node)
         NodeManager._report_unsaveable_callbacks(parameter)
         return param_dict
+
+    def _stabilize_trait_modules(self, trait_states: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Replace process-local library module names with stable namespaces."""
+        library_manager = self.engine.library_manager
+        for entry in trait_states:
+            trait_module = entry.get("trait_module")
+            if trait_module is None:
+                continue
+            if not library_manager.is_dynamic_module(trait_module):
+                continue
+            stable_namespace = library_manager.get_stable_namespace_for_dynamic_module(trait_module)
+            if stable_namespace is not None:
+                entry["trait_module"] = stable_namespace
+        return trait_states
+
+    @staticmethod
+    def _apply_trait_states(parameter: Parameter, trait_states: list[dict[str, Any]]) -> None:
+        """Apply state to matching traits and build missing traits.
+
+        Existing instances are preserved with constructor wiring. Unresolvable traits are
+        skipped. The returned pairing lets callbacks restore after node attachment.
+        """
+        entries = NodeManager._parse_trait_entries(parameter, trait_states)
+        paired = NodeManager._pair_saved_traits(parameter, entries)
+        for entry, existing in zip(entries, paired, strict=True):
+            if existing is None:
+                NodeManager._build_saved_trait(parameter, entry)
+                continue
+            try:
+                existing.apply_state(entry.trait_state)
+            except TypeError:
+                NodeManager._warn_unsatisfiable_trait_state(parameter, entry.trait_name)
+
+    @staticmethod
+    def _parse_trait_entries(parameter: Parameter, trait_states: list[dict[str, Any]]) -> list[TraitStateEntry]:
+        entries: list[TraitStateEntry] = []
+        for state in trait_states:
+            entry = TraitStateEntry.from_dict(state)
+            if entry is None:
+                logger.warning(
+                    "Parameter '%s' was saved with a trait entry that names no trait, so it is skipped. "
+                    "The parameter will load without whatever control that entry described.",
+                    parameter.name,
+                )
+                continue
+            entries.append(entry)
+        return entries
+
+    @staticmethod
+    def _build_saved_trait(parameter: Parameter, entry: TraitStateEntry) -> Trait | None:
+        trait_class = NodeManager._resolve_saved_trait(entry)
+        if trait_class is None:
+            logger.warning(
+                "Parameter '%s' was saved with the '%s' trait from '%s', but that trait could not be loaded. "
+                "The parameter will load without it. Check that the library providing it is installed.",
+                parameter.name,
+                entry.trait_name,
+                entry.trait_module,
+            )
+            return None
+        try:
+            trait = trait_class.from_state(entry.trait_state)
+        except TypeError:
+            NodeManager._warn_unsatisfiable_trait_state(parameter, entry.trait_name)
+            return None
+        parameter.add_trait(trait)
+        return trait
+
+    @staticmethod
+    def _pair_saved_traits(parameter: Parameter, entries: list[TraitStateEntry]) -> list[Trait | None]:
+        """Match by resolved class, consuming each attached trait at most once."""
+        unmatched = parameter.find_elements_by_type(Trait)
+        paired: list[Trait | None] = []
+        for entry in entries:
+            trait_class = NodeManager._resolve_saved_trait(entry)
+            match = None
+            for candidate in unmatched:
+                if type(candidate) is trait_class:
+                    match = candidate
+                    break
+            if match is not None:
+                unmatched.remove(match)
+            paired.append(match)
+        return paired
+
+    @staticmethod
+    def _resolve_saved_trait(entry: TraitStateEntry) -> type[Trait] | None:
+        if entry.trait_module is None:
+            return None
+        return TraitRegistry.resolve(entry.trait_name, entry.trait_module)
+
+    @staticmethod
+    def _warn_unsatisfiable_trait_state(parameter: Parameter, trait_name: str) -> None:
+        logger.warning(
+            "Parameter '%s' was saved with the '%s' trait, but its saved state is missing "
+            "something the trait requires. The parameter will load without it. Check that the "
+            "library providing it is up to date.",
+            parameter.name,
+            trait_name,
+        )
 
     @staticmethod
     def _report_unsaveable_callbacks(parameter: Parameter) -> None:

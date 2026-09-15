@@ -9,15 +9,26 @@ element wiring included. There is no decorator to remember and no `super().__ini
 ```python
 import attrs
 
-from griptape_nodes.exe_types.core_types import Trait
+from griptape_nodes.exe_types.core_types import BEHAVIOR, Trait
 
 
 class Threshold(Trait):
     level: int = attrs.field(default=5, alias="threshold")
+    on_cross: Callable | None = attrs.field(default=None, metadata=BEHAVIOR)
 ```
 
-`Threshold(threshold=8)` sets `self.level`. Every element field is keyword-only, so a trait that
-took positional arguments (`Slider(0, 100)`) now takes `Slider(min_val=0, max_val=100)`.
+`Threshold(threshold=8)` sets `self.level`, and a save records `{"threshold": 8}`. Every element
+field is keyword-only, so a trait that took positional arguments (`Slider(0, 100)`) now takes
+`Slider(min_val=0, max_val=100)`.
+
+The fields *are* the saved contract, so there is nothing else to declare and nothing to keep in
+step. Three kinds:
+
+- **state**, the default. Saved as data and handed back to the constructor on load.
+- **behavior**, `metadata=BEHAVIOR`. A callback, which is code rather than data, so it is not
+    saved as state.
+- **neither**, `init=False`. Not saved, not a constructor argument. For a value the trait
+    derives.
 
 `alias` covers a keyword that differs from the attribute it lands on, which is also how a field
 sits behind a property: a field named `_choices` takes the keyword `choices`, leaving `choices`
@@ -29,8 +40,45 @@ instead of taking an argument for it, re-declare it `init=False`.
 **An annotation is not a declaration.** `threshold: int = 5` is a field to a type checker and
 nothing at all to the engine, so it raises at class creation. Declare it with `attrs.field()`,
 mark it `ClassVar` if it is a constant, or annotate it where it is assigned if it is neither.
-The check runs when the class is built, so a mistake costs a library its import rather than an
-artist's saved work.
+
+**Renaming a field keeps reading the old key** by overriding `migrate_state`, which every load
+passes its saved state through once:
+
+```python
+class Threshold(Trait):
+    level: int = attrs.field(default=5)
+
+    @classmethod
+    def migrate_state(cls, state: dict[str, Any]) -> dict[str, Any]:
+        if "threshold" not in state:
+            return state
+        migrated = dict(state)
+        migrated["level"] = migrated.pop("threshold")
+        return migrated
+```
+
+**The declaration is checked when the class is built**, so a mistake costs a library its import
+rather than an artist's saved work. A state field's type has to be something a saved workflow can
+hold: text, numbers, true/false, and lists or dictionaries of those. These raise `TypeError` at
+class creation:
+
+```python
+class Broken(Trait):
+    root: Path | None = attrs.field(default=None)  # no saved form
+    on_ping: Callable | None = attrs.field(default=None)  # a callback: use metadata=BEHAVIOR
+    derived: str = attrs.field(default="x", init=False)  # fine: init=False is not state
+```
+
+A set or a tuple is saved as a list, which is what the constructor is handed on load, so convert
+in the field if the trait wants a set:
+
+```python
+class Extensions(Trait):
+    extensions: set[str] = attrs.field(converter=set, factory=set)
+```
+
+A value whose type passed the check but whose contents cannot be written, a `list[Any]` holding
+an object, is dropped from the state with a warning, and the parameter loads without it.
 
 Two smaller consequences:
 

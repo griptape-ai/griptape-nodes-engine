@@ -72,6 +72,7 @@ class AddParameterToNodeRequest(RequestPayload):
     allow_variable_substitution: bool = field(default=True)
     parent_container_name: str | None = None
     parent_element_name: str | None = None
+    traits: list[dict[str, Any]] | None = None
     value_callbacks: dict[str, list[str]] | None = None
     # initial_setup prevents unnecessary work when we are loading a workflow from a file.
     initial_setup: bool = False
@@ -377,7 +378,6 @@ class AlterParameterDetailsRequest(RequestPayload):
         settable: Whether parameter can be set directly by the user or not
         allow_variable_substitution: Whether {VAR} tokens in this parameter's value are substituted at execution time
         ui_options: New UI configuration options
-        traits: Set of parameter traits
         initial_setup: Skip setup work when loading from file
 
     Results: AlterParameterDetailsResultSuccess | AlterParameterDetailsResultFailure
@@ -401,7 +401,7 @@ class AlterParameterDetailsRequest(RequestPayload):
     settable: bool | None = None
     allow_variable_substitution: bool | None = None
     ui_options: dict | None = None
-    traits: set[str] | None = None
+    traits: list[dict[str, Any]] | None = None
     value_callbacks: dict[str, list[str]] | None = None
     # initial_setup prevents unnecessary work when we are loading a workflow from a file.
     initial_setup: bool = False

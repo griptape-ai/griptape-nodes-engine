@@ -5,6 +5,7 @@ from typing import Literal, get_args
 import attrs
 
 from griptape_nodes.exe_types.core_types import (
+    BEHAVIOR,
     WIRING,
     NodeMessagePayload,
     NodeMessageResult,
@@ -110,9 +111,11 @@ class Button(Trait):
 
     button_link: str | None = attrs.field(default=None)
 
-    on_click_callback: OnClickCallback | None = attrs.field(default=None, alias="on_click", kw_only=True)
+    on_click_callback: OnClickCallback | None = attrs.field(
+        default=None, alias="on_click", metadata=BEHAVIOR, kw_only=True
+    )
     get_button_state_callback: GetButtonStateCallback | None = attrs.field(
-        default=None, alias="get_button_state", kw_only=True
+        default=None, alias="get_button_state", metadata=BEHAVIOR, kw_only=True
     )
 
     def __attrs_post_init__(self) -> None:
