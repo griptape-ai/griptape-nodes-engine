@@ -148,6 +148,16 @@ class ObjectManager(EngineScoped):
             details = f"Attempted to clear all object state and delete everything. Failed with exception: {e}"
             logger.error(details)
             return ClearAllObjectStateResultFailure(result_details=details)
+        finally:
+            # The local release happens inside clear_current_workflow_data, which is the chokepoint every
+            # teardown shares. The worker half has to be awaited, so it lives here in the async handler
+            # rather than there: that method is sync, and scheduling the fan-out instead would let it be
+            # created on a transient loop and destroyed when the loop closes.
+            #
+            # In the finally because nothing retries this request: its callers abort the load or reload
+            # it was part of, so a worker that was never told keeps its objects for the life of the
+            # process, whether or not the teardown that triggered this got all the way through.
+            await self.engine.worker_manager.broadcast_drop_all_local_objects()
 
         if self._name_to_objects:
             details = f"Attempted to clear all object state, but {len(self._name_to_objects)} object(s) remained after workflow teardown."

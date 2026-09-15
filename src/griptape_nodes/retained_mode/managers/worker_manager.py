@@ -702,6 +702,35 @@ class WorkerManager(EngineScoped):
             return
         await self.broadcast_to_workers(EventRequest(request=ReloadConfigRequest()))
 
+    async def broadcast_drop_all_local_objects(self) -> None:
+        """Tell every worker to release the objects its libraries parked in it.
+
+        Awaited rather than scheduled, for the reason recorded on `_on_config_changed` above: a
+        fire-and-forget task created from a transient side loop is destroyed when that loop closes, and
+        the caller here is a workflow teardown that can be dispatched synchronously. Losing the message
+        silently would leave a worker holding gigabytes with nothing logged.
+
+        Never raises. Its callers are teardowns that have already destroyed nodes and flows, one of them
+        with a registry delete still to come, so a send failure -- likeliest against a dying worker,
+        which is exactly when a workflow is closing -- must not abort them or displace the failure they
+        were already reporting.
+
+        Lazy import breaks the same cycle as its siblings: `app.worker_routing` imports `EventManager`
+        from this package.
+        """
+        from griptape_nodes.app.worker_routing import DropAllLocalObjectsRequest
+
+        if self._transport is None or not self._workers:
+            return
+        try:
+            await self.broadcast_to_workers(EventRequest(request=DropAllLocalObjectsRequest()))
+        except Exception as e:
+            logger.warning(
+                "Could not tell the workers to release the objects held for their libraries: %s. "
+                "A worker that did not get the message keeps them until a later teardown.",
+                e,
+            )
+
     async def _on_secret_changed(self, _event: SecretChanged) -> None:
         """Fan out a RefreshSecretsRequest after the orchestrator's secret mutation succeeded.
 

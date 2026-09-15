@@ -16,14 +16,20 @@ These tests pin down the two invariants that replaced the old
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+from unittest.mock import patch
 
 import pytest
 
 from griptape_nodes.app.worker_routing import (
     FORWARDED_REQUEST_TYPES,
+    DropAllLocalObjectsRequest,
+    DropAllLocalObjectsResultFailure,
+    DropAllLocalObjectsResultSuccess,
     RemoteHandler,
+    _handle_drop_all_local_objects,
     register_remote_handlers,
 )
 from griptape_nodes.retained_mode.events.base_events import (
@@ -36,6 +42,7 @@ from griptape_nodes.retained_mode.events.parameter_events import AddParameterToN
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 
 if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 
 
@@ -207,3 +214,56 @@ class TestInstallRemoteHandlersSwap:
 
         assert result_event.result.succeeded()
         assert len(local_calls) == 1
+
+
+class TestDropAllLocalObjectsHandler:
+    """The worker half of workflow teardown: release what this process is holding.
+
+    Objects held here are the reason the cache exists (a pipeline the orchestrator has no torch to
+    hold), so the branch that declines to release them is the one that decides whether gigabytes stay
+    resident.
+    """
+
+    @pytest.mark.asyncio
+    async def test_declines_while_executing_a_node(self, engine: Engine) -> None:
+        """Releasing mid-execution would free the pipeline under a forward pass already running."""
+        held = object()
+        key = engine.resource_manager.put_local_object(held, owner_library="Lib A", producing_node="N")
+
+        with engine.event_manager.worker_node_execution_scope():
+            result = await _handle_drop_all_local_objects(
+                DropAllLocalObjectsRequest(), event_manager=engine.event_manager
+            )
+
+        assert isinstance(result, DropAllLocalObjectsResultSuccess)
+        assert engine.resource_manager.get_local_object(key, owner_library="Lib A") is held
+
+    @pytest.mark.asyncio
+    async def test_releases_off_the_event_loop(self, engine: Engine) -> None:
+        """A release hook is `del model` plus a CUDA cache flush.
+
+        Running that on the worker's loop blocks its heartbeat, and a worker that misses heartbeats is
+        evicted mid-load, so the hook must run on a worker thread.
+        """
+        release_threads: list[int] = []
+        engine.resource_manager.put_local_object(
+            object(),
+            owner_library="Lib A",
+            producing_node="N",
+            on_drop=lambda _value: release_threads.append(threading.get_ident()),
+        )
+
+        result = await _handle_drop_all_local_objects(DropAllLocalObjectsRequest(), event_manager=engine.event_manager)
+
+        assert isinstance(result, DropAllLocalObjectsResultSuccess)
+        assert release_threads
+        assert release_threads[0] != threading.get_ident()
+
+    @pytest.mark.asyncio
+    async def test_reports_failure_rather_than_raising_at_the_transport(self, engine: Engine) -> None:
+        with patch.object(engine.resource_manager, "drop_all_local_objects", side_effect=RuntimeError("boom")):
+            result = await _handle_drop_all_local_objects(
+                DropAllLocalObjectsRequest(), event_manager=engine.event_manager
+            )
+
+        assert isinstance(result, DropAllLocalObjectsResultFailure)
