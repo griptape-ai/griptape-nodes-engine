@@ -16,6 +16,8 @@ from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.base_events import AppEvent
 from griptape_nodes.retained_mode.events.context_events import (
     CurrentWorkflowChanged,
+    GetWorkflowContextRequest,
+    GetWorkflowContextSuccess,
     SetWorkflowContextFailure,
     SetWorkflowContextRequest,
     SetWorkflowContextSuccess,
@@ -24,6 +26,26 @@ from griptape_nodes.retained_mode.events.project_events import (
     GetPathForMacroRequest,
     GetPathForMacroResultSuccess,
 )
+
+
+def _notified_workflow_names(put_event: Mock) -> list[str | None]:
+    """The workflow_name off every CurrentWorkflowChanged put on the queue, in order."""
+    names: list[str | None] = []
+    for put_call in put_event.call_args_list:
+        event = put_call.args[0]
+        if isinstance(event, AppEvent) and isinstance(event.payload, CurrentWorkflowChanged):
+            names.append(event.payload.workflow_name)
+    return names
+
+
+def _notified_is_saved_flags(put_event: Mock) -> list[bool | None]:
+    """The is_saved off every CurrentWorkflowChanged put on the queue, in order."""
+    flags: list[bool | None] = []
+    for put_call in put_event.call_args_list:
+        event = put_call.args[0]
+        if isinstance(event, AppEvent) and isinstance(event.payload, CurrentWorkflowChanged):
+            flags.append(event.payload.is_saved)
+    return flags
 
 
 class TestPushWorkflow:
@@ -556,16 +578,6 @@ class TestCurrentWorkflowChangedNotification:
         """
         engine.event_manager.initialize_queue(asyncio.Queue())
 
-    @staticmethod
-    def _notified_workflow_names(put_event: Mock) -> list[str | None]:
-        """The workflow_name off every CurrentWorkflowChanged put on the queue, in order."""
-        names: list[str | None] = []
-        for put_call in put_event.call_args_list:
-            event = put_call.args[0]
-            if isinstance(event, AppEvent) and isinstance(event.payload, CurrentWorkflowChanged):
-                names.append(event.payload.workflow_name)
-        return names
-
     def test_push_workflow_notifies_with_the_new_name(self, engine: Engine) -> None:
         """Entering a workflow tells clients which one is now current."""
         context_manager = engine.context_manager
@@ -573,7 +585,7 @@ class TestCurrentWorkflowChangedNotification:
         with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
             context_manager.push_workflow(workflow_name="opened_workflow")
 
-        assert self._notified_workflow_names(put_event) == ["opened_workflow"]
+        assert _notified_workflow_names(put_event) == ["opened_workflow"]
 
         context_manager.pop_workflow()
 
@@ -585,7 +597,7 @@ class TestCurrentWorkflowChangedNotification:
         with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
             context_manager.pop_workflow()
 
-        assert self._notified_workflow_names(put_event) == [None]
+        assert _notified_workflow_names(put_event) == [None]
 
     def test_pop_workflow_notifies_with_the_workflow_underneath(self, engine: Engine) -> None:
         """Popping a nested workflow reports the one it uncovered, not None."""
@@ -596,7 +608,7 @@ class TestCurrentWorkflowChangedNotification:
         with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
             context_manager.pop_workflow()
 
-        assert self._notified_workflow_names(put_event) == ["outer_workflow"]
+        assert _notified_workflow_names(put_event) == ["outer_workflow"]
 
         context_manager.pop_workflow()
 
@@ -608,7 +620,7 @@ class TestCurrentWorkflowChangedNotification:
         with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
             context_manager.push_workflow(workflow_name="same_workflow")
 
-        assert self._notified_workflow_names(put_event) == []
+        assert _notified_workflow_names(put_event) == []
 
         context_manager.pop_workflow()
         context_manager.pop_workflow()
@@ -627,7 +639,7 @@ class TestCurrentWorkflowChangedNotification:
         with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
             context_manager.set_current_workflow_name("after_rename")
 
-        assert self._notified_workflow_names(put_event) == ["after_rename"]
+        assert _notified_workflow_names(put_event) == ["after_rename"]
 
         context_manager.pop_workflow()
 
@@ -639,7 +651,7 @@ class TestCurrentWorkflowChangedNotification:
         with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
             context_manager.set_current_workflow_name("unchanged_name")
 
-        assert self._notified_workflow_names(put_event) == []
+        assert _notified_workflow_names(put_event) == []
 
         context_manager.pop_workflow()
 
@@ -651,7 +663,7 @@ class TestCurrentWorkflowChangedNotification:
         with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
             context_manager.set_current_workflow_file_path("/somewhere/else/path_only_change.py")
 
-        assert self._notified_workflow_names(put_event) == []
+        assert _notified_workflow_names(put_event) == []
 
         context_manager.pop_workflow()
 
@@ -665,7 +677,7 @@ class TestCurrentWorkflowChangedNotification:
             )
 
         assert isinstance(result, SetWorkflowContextSuccess)
-        assert self._notified_workflow_names(put_event) == ["requested_workflow"]
+        assert _notified_workflow_names(put_event) == ["requested_workflow"]
 
         context_manager.pop_workflow()
 
@@ -683,7 +695,7 @@ class TestCurrentWorkflowChangedNotification:
             context_manager.pop_workflow()
             context_manager.push_workflow(workflow_name="revisited_workflow")
 
-        assert self._notified_workflow_names(put_event) == ["revisited_workflow", None, "revisited_workflow"]
+        assert _notified_workflow_names(put_event) == ["revisited_workflow", None, "revisited_workflow"]
 
         context_manager.pop_workflow()
 
@@ -709,7 +721,7 @@ class TestCurrentWorkflowChangedNotification:
                 old_name="unsaved:abc-123", new_name="my_flow", new_file_path="/workspace/my_flow.py"
             )
 
-        assert self._notified_workflow_names(put_event) == ["my_flow"]
+        assert _notified_workflow_names(put_event) == ["my_flow"]
         assert state_when_sent == {"name": "my_flow", "file_path": "/workspace/my_flow.py"}
         assert context_manager.get_current_workflow_name() == "my_flow"
         # The retained path moves with the key; `workflow_dir` answers from it.
@@ -728,7 +740,7 @@ class TestCurrentWorkflowChangedNotification:
                 old_name="unsaved:buried", new_name="saved_below", new_file_path="/workspace/saved_below.py"
             )
 
-        assert self._notified_workflow_names(put_event) == []
+        assert _notified_workflow_names(put_event) == []
         assert context_manager.get_current_workflow_name() == "nested_on_top"
         # Buried or not, the entry was still rekeyed -- popping back to it uncovers the new name.
         context_manager.pop_workflow()
@@ -744,7 +756,7 @@ class TestCurrentWorkflowChangedNotification:
         with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
             context_manager.rekey_workflow(old_name="not_in_context", new_name="whatever", new_file_path=None)
 
-        assert self._notified_workflow_names(put_event) == []
+        assert _notified_workflow_names(put_event) == []
         assert context_manager.get_current_workflow_name() == "untouched_workflow"
 
         context_manager.pop_workflow()
@@ -786,7 +798,7 @@ class TestCurrentWorkflowChangedNotification:
         with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
             context_manager.push_workflow(workflow_name="announced_late")
 
-        assert self._notified_workflow_names(put_event) == ["announced_late"]
+        assert _notified_workflow_names(put_event) == ["announced_late"]
 
         context_manager.pop_workflow()
         context_manager.pop_workflow()
@@ -809,10 +821,176 @@ class TestCurrentWorkflowChangedNotification:
         with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
             context_manager.push_workflow(workflow_name="pushed_before_anyone_listened")
 
-        assert self._notified_workflow_names(put_event) == ["pushed_before_anyone_listened"]
+        assert _notified_workflow_names(put_event) == ["pushed_before_anyone_listened"]
 
         context_manager.pop_workflow()
         context_manager.pop_workflow()
+
+
+class TestCurrentWorkflowChangedIsSaved:
+    """Tests for the is_saved the CurrentWorkflowChanged payload carries alongside the key.
+
+    It is there so an editor can draw its save affordance from the switch itself. The alternative
+    -- following the event with GetWorkflowContextRequest -- is async, so a client doing it has to
+    survive a second switch landing mid-probe. These pin the answer at each site instead.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _engine_with_a_client_attached(self, engine: Engine) -> None:
+        """Give the engine an event queue, as a session with a client attached has."""
+        engine.event_manager.initialize_queue(asyncio.Queue())
+
+    @staticmethod
+    def _register_saved_workflow(key: str, file_path: str) -> None:
+        """Register a workflow that has a file behind it, as the workspace scan does at startup."""
+        metadata = WorkflowMetadata(
+            name=key,
+            schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
+            engine_version_created_with="test",
+            node_libraries_referenced=[],
+            creation_date=datetime.now(UTC),
+        )
+        WorkflowRegistry.generate_new_workflow(registry_key=key, metadata=metadata, file_path=file_path)
+
+    def test_opening_a_saved_workflow_reports_it_as_saved(self, engine: Engine, tmp_path: Path) -> None:
+        """The ordinary open: the workflow has a file, so the editor shows no unsaved-work state."""
+        context_manager = engine.context_manager
+        config_manager = engine.config_manager
+
+        workspace = tmp_path.resolve()
+        (workspace / "saved_flow.py").write_text("# stub")
+        original_workspace = config_manager.workspace_path
+        config_manager.workspace_path = workspace
+        try:
+            with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+                self._register_saved_workflow(key="saved_flow", file_path="saved_flow.py")
+
+                with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
+                    context_manager.push_workflow(workflow_name="saved_flow")
+
+                assert _notified_is_saved_flags(put_event) == [True]
+
+                context_manager.pop_workflow()
+        finally:
+            config_manager.workspace_path = original_workspace
+
+    def test_starting_a_scratch_workflow_reports_it_as_unsaved(self, engine: Engine) -> None:
+        """A blank canvas is an "unsaved:" entry, and the editor has to know its work is unsaved."""
+        context_manager = engine.context_manager
+
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
+                result = context_manager.on_set_workflow_context_request(SetWorkflowContextRequest())
+
+            assert isinstance(result, SetWorkflowContextSuccess)
+            assert _notified_is_saved_flags(put_event) == [False]
+
+            context_manager.pop_workflow()
+
+    def test_the_first_save_of_a_scratch_workflow_reports_it_as_saved(self, engine: Engine) -> None:
+        """The one switch where is_saved flips, and it flips in the same operation as the key.
+
+        Mirrors what `on_save_workflow_request` does: the registry entry moves to the path-derived
+        key and gains its file_path, and only then does the context rekey. A notification sent
+        before the file_path landed would tell the editor its freshly saved workflow is unsaved --
+        worse than telling it nothing, since it drives the save affordance.
+        """
+        context_manager = engine.context_manager
+
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            WorkflowRegistry.ensure_unsaved(key="unsaved:abc-123", display_name="Untitled")
+            context_manager.push_workflow(workflow_name="unsaved:abc-123")
+
+            WorkflowRegistry.rekey_workflow(old_key="unsaved:abc-123", new_key="my_flow")
+            WorkflowRegistry.get_workflow_by_name("my_flow").file_path = "my_flow.py"
+
+            with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
+                context_manager.rekey_workflow(
+                    old_name="unsaved:abc-123", new_name="my_flow", new_file_path="/workspace/my_flow.py"
+                )
+
+            assert _notified_is_saved_flags(put_event) == [True]
+
+            context_manager.pop_workflow()
+
+    def test_closing_everything_reports_is_saved_as_unknown(self, engine: Engine) -> None:
+        """With nothing open there is no workflow to be saved or unsaved, so neither is claimed."""
+        context_manager = engine.context_manager
+
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            WorkflowRegistry.ensure_unsaved(key="unsaved:closing", display_name="Untitled")
+            context_manager.push_workflow(workflow_name="unsaved:closing")
+
+            with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
+                context_manager.pop_workflow()
+
+            assert _notified_workflow_names(put_event) == [None]
+            assert _notified_is_saved_flags(put_event) == [None]
+
+    def test_a_key_the_registry_does_not_have_reports_is_saved_as_unknown(self, engine: Engine) -> None:
+        """None means "the engine cannot say", not "unsaved", so a client never mislabels the state.
+
+        Reached by replaying a saved workflow file as a plain script: its own bootstrap pushes a
+        context keyed off `__file__`, which resolves to no registry entry when the file was never
+        registered against this workspace.
+        """
+        context_manager = engine.context_manager
+
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
+                context_manager.push_workflow(workflow_name="never_registered")
+
+            assert _notified_workflow_names(put_event) == ["never_registered"]
+            assert _notified_is_saved_flags(put_event) == [None]
+
+            context_manager.pop_workflow()
+
+    def test_the_event_says_what_get_workflow_context_would_have_said(self, engine: Engine) -> None:
+        """The whole point of carrying the field: the probe it replaces cannot give a different answer.
+
+        Both read `_read_current_workflow`. Pinned because the client deletes its probe on the
+        strength of this, and a divergence would surface as an editor whose save state is wrong
+        only for workflows in whichever state the two disagreed about.
+        """
+        context_manager = engine.context_manager
+
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            WorkflowRegistry.ensure_unsaved(key="unsaved:compare", display_name="Untitled")
+
+            with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
+                context_manager.push_workflow(workflow_name="unsaved:compare")
+
+            probe_result = context_manager.on_get_workflow_context_request(GetWorkflowContextRequest())
+
+            assert isinstance(probe_result, GetWorkflowContextSuccess)
+            assert _notified_workflow_names(put_event) == [probe_result.workflow_name]
+            assert _notified_is_saved_flags(put_event) == [probe_result.is_saved]
+
+            context_manager.pop_workflow()
+
+    def test_becoming_saved_under_an_unchanged_key_is_still_announced(self, engine: Engine) -> None:
+        """The dedupe covers is_saved too, so no payload field can silently go stale on the wire.
+
+        No engine path does this today -- a first save always rekeys -- so this pins the dedupe
+        rather than a behavior any caller relies on. Were the dedupe still name-only, a future
+        save-in-place would leave every editor showing unsaved work that is on disk.
+        """
+        context_manager = engine.context_manager
+
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            WorkflowRegistry.ensure_unsaved(key="unsaved:in-place", display_name="Untitled")
+            context_manager.push_workflow(workflow_name="unsaved:in-place")
+
+            WorkflowRegistry.get_workflow_by_name("unsaved:in-place").file_path = "in_place.py"
+
+            with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
+                context_manager.push_workflow(workflow_name="unsaved:in-place")
+
+            assert _notified_workflow_names(put_event) == ["unsaved:in-place"]
+            assert _notified_is_saved_flags(put_event) == [True]
+
+            context_manager.pop_workflow()
+            context_manager.pop_workflow()
 
 
 class TestSetWorkflowContextAlreadyInContextMessage:
