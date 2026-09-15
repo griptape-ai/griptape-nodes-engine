@@ -214,7 +214,7 @@ class Engine:
         )
 
         self._event_manager = EventManager(engine=self)
-        self._resource_manager = ResourceManager(self._event_manager)
+        self._resource_manager = ResourceManager(self._event_manager, engine=self)
         self._config_manager = ConfigManager(self._event_manager, engine=self)
         self._os_manager = OSManager(self._event_manager, engine=self)
         self._secrets_manager = SecretsManager(self._config_manager, self._event_manager)
@@ -562,6 +562,22 @@ class Engine:
                 context_manager.pop_node()
             context_manager.pop_flow()
         context_manager.pop_workflow()
+
+        # Release objects libraries parked in a process, keyed by values that lived on the nodes just
+        # deleted. Every key is now unreachable, so each entry would otherwise hold what it holds -- a
+        # multi-gigabyte pipeline, for the case this exists for -- until something else clears it.
+        #
+        # Placed here rather than in the clear-all-object-state handler because this is the chokepoint
+        # every teardown shares: deleting the open workflow reaches this directly, without going
+        # through that handler.
+        #
+        # Both halves are needed. The local call covers libraries running in this process; the broadcast
+        # covers workers, which is where a library declaring execution dependencies actually holds them,
+        # and which never see this otherwise (forwarding runs worker to orchestrator, and only during
+        # node execution).
+        dropped = self._resource_manager.drop_all_local_objects()
+        if dropped:
+            logger.debug("Released %d held object(s) while tearing down the workflow.", dropped)
 
     def handle_engine_version_request(self, request: GetEngineVersionRequest) -> ResultPayload:  # noqa: ARG002
         try:

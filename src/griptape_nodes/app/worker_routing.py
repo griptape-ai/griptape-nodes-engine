@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, Any, cast
 
 from griptape_nodes.common.strict_mode import STRICT_MODE
@@ -88,7 +89,7 @@ from griptape_nodes.retained_mode.events.variable_events import (
     SetVariablesRequest,
 )
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
-from griptape_nodes.utils.async_utils import call_function
+from griptape_nodes.utils.async_utils import call_function, to_thread
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -170,6 +171,37 @@ class ReloadConfigResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
 @PayloadRegistry.register
 class ReloadConfigResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Worker failed to reload its config from disk."""
+
+
+@dataclass
+@PayloadRegistry.register
+class DropAllLocalObjectsRequest(RequestPayload, SkipTheLineMixin):
+    """Sent by the orchestrator to each registered worker when workflow object state is cleared.
+
+    A library parks unserializable values (a loaded pipeline, a latent) in the process that built them,
+    referenced by a key that travels as a parameter value. Clearing workflow state deletes every node
+    and therefore every key, so those objects become unreachable while still holding what they hold --
+    gigabytes of GPU memory, in the case this exists for.
+
+    It has to be a broadcast rather than a local hook, because the orchestrator does not hold them: a
+    library declaring execution dependencies runs its nodes in a worker, so that is the process with
+    the objects, and workflow loading happens over here.
+
+    Uses SkipTheLineMixin for the same reason as its siblings: the alternative is a queued
+    ExecuteNodeRequest running against objects belonging to a workflow that is already gone.
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class DropAllLocalObjectsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Worker released every object it was holding for its libraries."""
+
+
+@dataclass
+@PayloadRegistry.register
+class DropAllLocalObjectsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Worker failed to release the objects it was holding."""
 
 
 @dataclass
@@ -309,6 +341,49 @@ def register_remote_handlers(event_manager: EventManager) -> None:
         event_manager.assign_manager_to_request_type(request_type, remote)
 
 
+async def _handle_drop_all_local_objects(
+    request: DropAllLocalObjectsRequest,  # noqa: ARG001
+    *,
+    event_manager: EventManager,
+) -> ResultPayload:
+    """Release every object this process is holding for its libraries.
+
+    Module level rather than nested in the installer so that function stays within its complexity
+    budget; it takes the event manager because that is how it reaches this engine.
+    """
+    # Reached through the event manager already passed in, rather than a new argument (this is
+    # called from the app repo, so the signature is a cross-repo contract) and rather than the
+    # process-global engine (which silently no-ops for an engine an embedder built directly).
+    resource_manager = event_manager.engine.resource_manager
+
+    # Refuse while this worker is executing a node. The release hooks free what the object holds --
+    # GPU memory, for the case this exists for -- and this request is SkipTheLine, so it lands
+    # inline rather than queued: dropping here would pull the pipeline out from under a forward pass
+    # already running on a worker thread. The orchestrator's pre-teardown cancel is best-effort and
+    # a torch inference does not cancel, so that is a reachable UI action, not library misuse.
+    # Nothing re-issues this drop when the execution ends, so what is skipped stays resident until some
+    # later teardown, not until this render finishes. That is the accepted cost of not killing a render
+    # in progress; the objects go when the next workflow is torn down.
+    if event_manager.in_node_execution():
+        details = "Declined to release held objects: this worker is executing a node. They will be released at a later teardown."
+        logger.info(details)
+        return DropAllLocalObjectsResultSuccess(result_details=details)
+
+    try:
+        # Off the loop: teardown is library code, documented as possibly slow, and for this feature
+        # it is `del model` plus a CUDA cache flush. Blocking the worker's loop past the heartbeat
+        # timeout gets the worker evicted mid-load. Same reason event_manager offloads sync library
+        # callbacks.
+        dropped = await to_thread(resource_manager.drop_all_local_objects)
+    except Exception as e:
+        details = (
+            f"Attempted to release objects held for this worker's libraries. Failed because of {type(e).__name__}: {e}."
+        )
+        logger.error(details)
+        return DropAllLocalObjectsResultFailure(result_details=details)
+    return DropAllLocalObjectsResultSuccess(result_details=f"Released {dropped} held object(s).")
+
+
 def register_broadcast_handlers(
     event_manager: EventManager,
     *,
@@ -382,3 +457,7 @@ def register_broadcast_handlers(
     event_manager.assign_manager_to_request_type(ReloadConfigRequest, handle_reload_config)
     event_manager.assign_manager_to_request_type(RefreshSecretsRequest, handle_refresh_secrets)
     event_manager.assign_manager_to_request_type(ActivateProjectRequest, handle_activate_project)
+    event_manager.assign_manager_to_request_type(
+        DropAllLocalObjectsRequest,
+        partial(_handle_drop_all_local_objects, event_manager=event_manager),
+    )

@@ -125,6 +125,11 @@ class ParameterTypeBuiltin(StrEnum):
     NONE = "none"
     CONTROL_TYPE = "parametercontroltype"
     ALL = "all"
+    # A reference to an object held in one process, not a value. Use it parameterised by what is
+    # held -- `handle[DiffusionPipeline]` -- so two kinds of handle cannot be wired together: the
+    # generic rules below already make `handle[X]` reach `handle` and `handle[any]` but not
+    # `handle[Y]`. The bare form accepts any handle, which is occasionally what a consumer wants.
+    HANDLE = "handle"
 
 
 class ParameterType:
@@ -150,6 +155,7 @@ class ParameterType:
         "none": ParameterTypeBuiltin.NONE,
         "parametercontroltype": ParameterTypeBuiltin.CONTROL_TYPE,
         "all": ParameterTypeBuiltin.ALL,
+        "handle": ParameterTypeBuiltin.HANDLE,
     }
 
     @staticmethod
