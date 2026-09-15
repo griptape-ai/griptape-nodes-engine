@@ -43,7 +43,7 @@ If you’ve never built a Griptape Node before, this is the fastest path to a wo
 - Build a single `DataNode` first (no control flow).
 - Prefer the built-in `Parameter*` helper constructs for common types.
 - Validate inputs with `validate_before_node_run()`.
-- Add secrets through `GriptapeNodes.SecretsManager()` when needed.
+- Read secrets with `GetSecretValueRequest` when needed, not `GriptapeNodes.SecretsManager()`.
 
 ## Your first node (minimal example)
 
@@ -185,14 +185,16 @@ Examples you can reference in the docs:
 
 - **`get_parameter_list_value()` drops falsey items**: if your list can contain `0` or `False`, use `get_parameter_value()` and flatten manually.
 - **`ui_options` conflicts**: if you pass both `hide=...` and `ui_options={"hide": ...}`, the `ui_options` value wins.
-- **Secrets**: do not hardcode API keys. Use `GriptapeNodes.SecretsManager().get_secret(...)`.
+- **Secrets**: do not hardcode API keys. Use `GriptapeNodes.handle_request(GetSecretValueRequest(key=...))`.
 
 ## Secrets and configuration
 
 When a node needs an API key or other secret:
 
 - Register secrets in the library configuration (`griptape_nodes_library.json`)
-- Read secrets via `GriptapeNodes.SecretsManager().get_secret("NAME")`
+- Read secrets via `GriptapeNodes.handle_request(GetSecretValueRequest(key="NAME"))`. The
+    manager accessor is refused while a node executes in a worker; the request is answered by
+    the engine that owns the secrets, in either process.
 
 ## Where to look for real examples
 

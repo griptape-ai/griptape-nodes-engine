@@ -16,6 +16,7 @@ from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.node_library.library_declarations import (
     KeySupport,
+    LibraryDependencyDeclaration,
     LifecycleStage,
     LifecycleStageNodeProperty,
     Model,
@@ -25,6 +26,7 @@ from griptape_nodes.node_library.library_declarations import (
     ModelUsageNodeProperty,
 )
 from griptape_nodes.node_library.library_registry import (
+    Dependencies,
     LibraryMetadata,
     LibraryRegistry,
     LibrarySchema,
@@ -1121,6 +1123,137 @@ class TestLibraryManagerInstallLibraryDependencies:
         assert isinstance(result, InstallLibraryDependenciesResultFailure)
         mock_reset.assert_called_once()
         assert mock_subprocess.await_count == expected_attempts
+
+    def _worker_schema_without_its_own_execution_set(self, mgr: _LibraryManager) -> MagicMock:
+        """A worker serving `test_lib`, whose manifest declares no execution dependencies."""
+        schema = MagicMock()
+        schema.name = "test_lib"
+        schema.metadata.library_version = "1.0.0"
+        schema.metadata.dependencies.pip_dependencies = []
+        schema.metadata.dependencies.pip_install_flags = []
+        schema.metadata.dependencies.pip_dependencies_exec = None
+        mgr._is_worker = True
+        mgr._target_library_names = ["test_lib"]
+        return schema
+
+    @pytest.mark.asyncio
+    async def test_a_dependency_execution_set_builds_this_library_environment(self, engine: Engine) -> None:
+        """A library declaring no execution set of its own still needs one when a dependency does.
+
+        Retirement runs ahead of every gate, so reading only this library's own set removed the
+        environment the dependency's pins were about to be installed into.
+        """
+        mgr = engine.library_manager
+        schema = self._worker_schema_without_its_own_execution_set(mgr)
+
+        with (
+            patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
+            patch.object(mgr, "_execution_dependencies_of_declared_libraries", return_value=["openexr==3.2"]),
+            patch.object(mgr, "_retire_execution_env", new_callable=AsyncMock) as mock_retire,
+            patch.object(mgr, "_install_dependency_set", new_callable=AsyncMock) as mock_install,
+            patch.object(mgr, "_this_process_owns_the_edit_venv", return_value=False),
+        ):
+            result = await mgr.install_library_dependencies_request(
+                InstallLibraryDependenciesRequest(library_file_path="/mock.json")
+            )
+
+        mock_retire.assert_not_called()
+        assert isinstance(result, InstallLibraryDependenciesResultSuccess)
+        # One resolution, so the dependency's pins go in beside this library's own edit-time set.
+        assert mock_install.await_args is not None
+        assert mock_install.await_args.kwargs["execution"] is True
+        assert "openexr==3.2" in mock_install.await_args.kwargs["pip_dependencies"]
+
+    @pytest.mark.asyncio
+    async def test_no_execution_set_anywhere_still_retires(self, engine: Engine) -> None:
+        """The combined set must not keep an environment alive for a library that needs none."""
+        mgr = engine.library_manager
+        schema = self._worker_schema_without_its_own_execution_set(mgr)
+
+        with (
+            patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
+            patch.object(mgr, "_execution_dependencies_of_declared_libraries", return_value=[]),
+            patch.object(mgr, "_retire_execution_env", new_callable=AsyncMock) as mock_retire,
+            patch.object(mgr, "_install_dependency_set", new_callable=AsyncMock) as mock_install,
+            patch.object(mgr, "_this_process_owns_the_edit_venv", return_value=False),
+        ):
+            result = await mgr.install_library_dependencies_request(
+                InstallLibraryDependenciesRequest(library_file_path="/mock.json")
+            )
+
+        mock_retire.assert_called_once()
+        mock_install.assert_not_awaited()
+        assert isinstance(result, InstallLibraryDependenciesResultSuccess)
+
+    @pytest.mark.asyncio
+    async def test_a_declared_dependency_pin_reaches_the_execution_install(self, engine: Engine) -> None:
+        """Collection and install are wired to each other, not merely each correct alone.
+
+        The tests above patch the collection, so a break BETWEEN the two -- reading the wrong
+        library's declarations, resolving a repo name to nothing, dropping the combined set before
+        the install -- passes all of them. This drives the real path instead: two discovered
+        manifests, and nothing patched between the request and the installer.
+        """
+        mgr = engine.library_manager
+        mgr._is_worker = True
+        mgr._target_library_names = ["Consumer Library"]
+
+        consumer_path = "/libs/consumer/griptape-nodes-library.json"
+        # The declaration names a REPO while the registry is keyed by library NAME, so the repo
+        # name has to appear in the path for resolution to find it.
+        dependency_path = "/libs/griptape-nodes-library-openexr/griptape-nodes-library.json"
+        for path, name in ((consumer_path, "Consumer Library"), (dependency_path, "OpenEXR Library")):
+            mgr._library_file_path_to_info[path] = _LibraryManager.LibraryInfo(
+                lifecycle_state=_LibraryManager.LibraryLifecycleState.DISCOVERED,
+                fitness=_LibraryManager.LibraryFitness.NOT_EVALUATED,
+                library_path=path,
+                is_sandbox=False,
+                library_name=name,
+            )
+
+        def _schema(name: str, declarations: list, exec_deps: list[str] | None) -> MagicMock:
+            schema = MagicMock()
+            schema.name = name
+            schema.metadata = LibraryMetadata(
+                author="test",
+                description="test",
+                library_version="1.0.0",
+                engine_version="1.0.0",
+                tags=[],
+                declarations=declarations,
+                dependencies=Dependencies(pip_dependencies=[], pip_dependencies_exec=exec_deps),
+            )
+            return schema
+
+        # The consumer declares NO execution dependencies of its own, so nothing but the
+        # dependency's set can put a pin in the execution install.
+        schemas = {
+            consumer_path: _schema(
+                "Consumer Library",
+                [LibraryDependencyDeclaration(url="https://github.com/o/griptape-nodes-library-openexr.git")],
+                None,
+            ),
+            dependency_path: _schema("OpenEXR Library", [], ["openexr==3.2"]),
+        }
+
+        with (
+            patch.object(
+                mgr,
+                "load_library_metadata_from_file_request",
+                side_effect=lambda request: self._metadata_result(schemas[request.file_path]),
+            ),
+            patch.object(mgr, "_install_dependency_set", new_callable=AsyncMock) as mock_install,
+            patch.object(mgr, "_this_process_owns_the_edit_venv", return_value=False),
+            patch.object(mgr, "_get_library_venv_path", return_value=_ABSENT_VENV_PATH),
+        ):
+            result = await mgr.install_library_dependencies_request(
+                InstallLibraryDependenciesRequest(library_file_path=consumer_path)
+            )
+
+        assert isinstance(result, InstallLibraryDependenciesResultSuccess)
+        assert mock_install.await_args is not None
+        assert mock_install.await_args.kwargs["execution"] is True
+        assert "openexr==3.2" in mock_install.await_args.kwargs["pip_dependencies"]
 
 
 def _fake_config_value(key: str, **_: object) -> object:
@@ -3473,8 +3606,8 @@ class TestLibraryManagerMetadataLoadFailureSurfacing:
         file_path = str(lib_json)
 
         library_info = LibraryManager.LibraryInfo(
-            lifecycle_state=LibraryManager.LibraryLifecycleState.DISCOVERED,
-            fitness=LibraryManager.LibraryFitness.NOT_EVALUATED,
+            lifecycle_state=_LibraryManager.LibraryLifecycleState.DISCOVERED,
+            fitness=_LibraryManager.LibraryFitness.NOT_EVALUATED,
             library_path=file_path,
             is_sandbox=False,
         )
@@ -3506,8 +3639,8 @@ class TestLibraryManagerMetadataLoadFailureSurfacing:
 
         file_path = str(tmp_path / "does_not_exist" / "griptape_nodes_library.json")
         library_info = LibraryManager.LibraryInfo(
-            lifecycle_state=LibraryManager.LibraryLifecycleState.DISCOVERED,
-            fitness=LibraryManager.LibraryFitness.NOT_EVALUATED,
+            lifecycle_state=_LibraryManager.LibraryLifecycleState.DISCOVERED,
+            fitness=_LibraryManager.LibraryFitness.NOT_EVALUATED,
             library_path=file_path,
             is_sandbox=False,
         )
@@ -3543,7 +3676,7 @@ class TestCollectLibraryLoadStatuses:
         )
         disabled = LibraryManager.LibraryInfo(
             lifecycle_state=LibraryManager.LibraryLifecycleState.DISABLED,
-            fitness=LibraryManager.LibraryFitness.NOT_EVALUATED,
+            fitness=_LibraryManager.LibraryFitness.NOT_EVALUATED,
             library_path="/libs/off.json",
             is_sandbox=False,
             library_name="Disabled Library",
