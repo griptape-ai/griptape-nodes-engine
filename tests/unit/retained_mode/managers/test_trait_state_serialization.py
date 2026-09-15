@@ -5,12 +5,14 @@ can replay onto a fresh node.
 """
 
 import logging
-from collections.abc import Generator
+from collections.abc import Callable, Generator
+from typing import Any
 from unittest.mock import patch
 
+import attrs
 import pytest
 
-from griptape_nodes.exe_types.core_types import Parameter, ParameterMode, Trait
+from griptape_nodes.exe_types.core_types import BEHAVIOR, Parameter, ParameterMode, Trait
 from griptape_nodes.exe_types.node_types import BaseNode, sanctioned_parameter_mutation
 from griptape_nodes.node_library.library_registry import (
     LibraryMetadata,
@@ -333,12 +335,14 @@ class TestTraitModuleStabilization:
         assert model_traits[0]["trait_module"] == "griptape_nodes.node_libraries.some_library.traits"
 
 
-class _UndeclaredCallbackTrait(Trait):
-    """Stands in for a third-party trait that forgot to declare STATE_EXCLUDE."""
+class _UnsaveableValueTrait(Trait):
+    """Stands in for a trait holding something no saved workflow can express.
 
-    def __init__(self, *, on_ping: object = None) -> None:
-        super().__init__(element_id="_UndeclaredCallbackTrait")
-        self.on_ping = on_ping
+    A declared type is checked when the class is built, so the way through that check is a
+    container the check cannot judge: ``list[Any]`` holding a callable.
+    """
+
+    items: list[Any] = attrs.field(factory=list)
 
     def ui_options_for_trait(self) -> dict:
         return {}
@@ -360,7 +364,7 @@ class _MisdeclaredTraitNode(BaseNode):
                     tooltip="t",
                     user_defined=True,
                     allowed_modes={ParameterMode.PROPERTY},
-                    traits={_UndeclaredCallbackTrait(on_ping=lambda: None)},
+                    traits={_UnsaveableValueTrait(items=[lambda: None])},
                 )
             )
 
@@ -374,8 +378,8 @@ def _registered_misdeclared_node_type(_registered_node_type: None) -> None:
     )
 
 
-class TestMisdeclaredTraitDegradesTheSaveInsteadOfFailingIt:
-    """A library author's forgotten STATE_EXCLUDE costs one callback, not the whole save."""
+class TestAnUnsaveableTraitValueDegradesTheSaveInsteadOfFailingIt:
+    """A value with no saved form costs that one value, not the whole save."""
 
     def test_serializing_still_succeeds(self, engine: Engine, caplog: pytest.LogCaptureFixture) -> None:
         context = engine.handle_request(
@@ -396,26 +400,23 @@ class TestMisdeclaredTraitDegradesTheSaveInsteadOfFailingIt:
         broken_command = commands["broken"]
         assert broken_command.traits == [
             {
-                "trait_name": "_UndeclaredCallbackTrait",
+                "trait_name": "_UnsaveableValueTrait",
                 "trait_module": "tests.unit.retained_mode.managers.test_trait_state_serialization",
                 "trait_state": {},
             }
         ]
-        assert any("on_ping" in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+        assert any("items" in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
 
 
 class _RequiredCallbackTrait(Trait):
-    """Stands in for a third-party trait whose saved state is short a required constructor argument.
+    """Stands in for a trait whose saved state is short a required constructor argument.
 
-    ``to_state()`` omits ``on_ping`` because it is an undeclared callback (see
-    ``TestMisdeclaredTraitDegradesTheSaveInsteadOfFailingIt``), but here ``on_ping`` is also
-    required, so the resulting saved state can never satisfy this constructor on load.
+    ``on_ping`` is behavior, so ``to_state()`` omits it, but it is also mandatory, so the
+    resulting saved state can never satisfy this constructor on load.
     """
 
-    def __init__(self, on_ping, *, label: str = "hi") -> None:  # noqa: ANN001
-        super().__init__(element_id="_RequiredCallbackTrait")
-        self.on_ping = on_ping
-        self.label = label
+    on_ping: Callable = attrs.field(metadata=BEHAVIOR)
+    label: str = attrs.field(default="hi")
 
     def ui_options_for_trait(self) -> dict:
         return {}

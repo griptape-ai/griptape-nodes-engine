@@ -1,40 +1,30 @@
 from collections.abc import Callable
 from typing import Any, ClassVar
 
+import attrs
+
 from griptape_nodes.exe_types.core_types import Parameter, Trait
+
+
+def _known_icon_size(icon_size: str) -> str:
+    """Snap an unrecognized size to the smaller one, rather than sending the editor nonsense."""
+    if icon_size not in ("small", "large"):
+        return "small"
+    return icon_size
 
 
 class MultiOptions(Trait):
     DEFAULT_CHOICES: ClassVar[list[str]] = ["choice 1", "choice 2", "choice 3"]
 
-    def __init__(  # noqa: PLR0913
-        self,
-        *,
-        choices: list | None = None,
-        placeholder: str = "Select options...",
-        max_selected_display: int = 3,
-        show_search: bool = True,
-        search_filter: str = "",
-        icon_size: str = "small",
-        allow_user_created_options: bool = False,
-    ) -> None:
-        super().__init__()
-        if choices is None:
-            self.choices = list(self.DEFAULT_CHOICES)
-        else:
-            self.choices = choices
-
-        self.placeholder = placeholder
-        self.max_selected_display = max_selected_display
-        self.show_search = show_search
-        self.search_filter = search_filter
-        self.allow_user_created_options = allow_user_created_options
-
-        # Validate icon_size
-        if icon_size not in ["small", "large"]:
-            self.icon_size = "small"
-        else:
-            self.icon_size = icon_size
+    # The field is _choices, so the ``choices`` property below is unobstructed. The alias is
+    # what keeps the constructor argument and the saved key ``choices``.
+    _choices: list = attrs.field(factory=lambda: list(MultiOptions.DEFAULT_CHOICES), alias="choices")
+    placeholder: str = attrs.field(default="Select options...")
+    max_selected_display: int = attrs.field(default=3)
+    show_search: bool = attrs.field(default=True)
+    search_filter: str = attrs.field(default="")
+    icon_size: str = attrs.field(default="small", converter=_known_icon_size)
+    allow_user_created_options: bool = attrs.field(default=False)
 
     @property
     def choices(self) -> list:
@@ -55,7 +45,7 @@ class MultiOptions(Trait):
         written = ui_options.get("multi_options")
         if not isinstance(written, dict):
             return {}
-        return {key: written[key] for key in cls._state_parameter_names() if key in written}
+        return {key: written[key] for key in cls.state_keys() if key in written}
 
     def converters_for_trait(self) -> list[Callable]:
         def converter(value: Any) -> Any:

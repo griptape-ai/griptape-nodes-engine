@@ -1,6 +1,8 @@
 from collections.abc import Callable
 from typing import Any, ClassVar
 
+import attrs
+
 from griptape_nodes.exe_types.core_types import Parameter, Trait
 
 
@@ -22,22 +24,12 @@ class Options(Trait):
 
     DEFAULT_CHOICES: ClassVar[list[str]] = ["choice 1", "choice 2", "choice 3"]
 
-    def __init__(
-        self,
-        *,
-        choices: list | None = None,
-        show_search: bool = True,
-        search_filter: str = "",
-        allow_custom: bool = False,
-    ) -> None:
-        super().__init__()
-        if choices is None:
-            self.choices = list(self.DEFAULT_CHOICES)
-        else:
-            self.choices = choices
-        self.show_search = show_search
-        self.search_filter = search_filter
-        self.allow_custom = allow_custom
+    # The field is _choices, so the ``choices`` property below is unobstructed. The alias is
+    # what keeps the constructor argument and the saved key ``choices``.
+    _choices: list = attrs.field(factory=lambda: list(Options.DEFAULT_CHOICES), alias="choices")
+    show_search: bool = attrs.field(default=True)
+    search_filter: str = attrs.field(default="")
+    allow_custom: bool = attrs.field(default=False)
 
     @property
     def choices(self) -> list:

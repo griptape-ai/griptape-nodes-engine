@@ -4,6 +4,7 @@ import sys
 from collections.abc import Generator
 from types import ModuleType
 
+import attrs
 import pytest
 
 from griptape_nodes.exe_types.core_types import Parameter, Trait
@@ -15,9 +16,7 @@ from griptape_nodes.traits.slider import Slider
 class Twin(Trait):
     """Stands in for a trait whose name another library also uses."""
 
-    def __init__(self, *, tag: str = "local") -> None:
-        super().__init__()
-        self.tag = tag
+    tag: str = attrs.field(default="local", kw_only=True)
 
     def ui_options_for_trait(self) -> dict:
         return {}

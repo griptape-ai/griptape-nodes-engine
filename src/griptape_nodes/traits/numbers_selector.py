@@ -1,22 +1,16 @@
 from collections.abc import Callable
 from typing import Any
 
+import attrs
+
 from griptape_nodes.exe_types.core_types import Parameter, Trait
 
 
 class NumbersSelector(Trait):
-    def __init__(
-        self,
-        defaults: dict[str, float],
-        step: float = 1.0,
-        overall_min: float | None = None,
-        overall_max: float | None = None,
-    ) -> None:
-        super().__init__()
-        self.defaults = defaults
-        self.step = step
-        self.overall_min = overall_min
-        self.overall_max = overall_max
+    defaults: dict[str, float] = attrs.field()
+    step: float = attrs.field(default=1.0)
+    overall_min: float | None = attrs.field(default=None)
+    overall_max: float | None = attrs.field(default=None)
 
     def ui_options_for_trait(self) -> dict:
         return {

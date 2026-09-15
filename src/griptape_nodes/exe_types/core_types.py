@@ -1,21 +1,34 @@
 from __future__ import annotations
 
+import contextlib
 import inspect
 import logging
 import uuid
 import warnings
-from abc import ABC, abstractmethod
+from abc import ABC, ABCMeta, abstractmethod
 from collections.abc import Callable
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum, StrEnum, auto
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, NamedTuple, Self, TypeVar, get_args
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ClassVar,
+    Literal,
+    NamedTuple,
+    Self,
+    TypeVar,
+    dataclass_transform,
+    get_args,
+    get_origin,
+)
 
+import attrs
 from pydantic import BaseModel
 
 from griptape_nodes.exe_types.callback_binding import name_callback, resolve_callback
-from griptape_nodes.exe_types.trait_state import TraitStateEntry, as_saved_state_value
+from griptape_nodes.exe_types.trait_state import CALLBACK_TYPE, TraitStateEntry, as_saved_state_value, unsaveable_type
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -283,41 +296,120 @@ class ParameterType:
         return ParameterType.KeyValueTypePair(key_type=key_type, value_type=value_type)
 
 
-class BaseNodeElement:
+# Marks a field as element wiring rather than a subclass's own state. The element base
+# declares its fields with this, so a trait's state is only what the trait itself declared.
+WIRING: dict[str, bool] = {"wiring": True}
+
+# Marks a trait field as behavior rather than state: a callback, saved as the name of a method
+# on the owning node instead of as data.
+BEHAVIOR: dict[str, bool] = {"behavior": True}
+
+
+def default_element_id(element_id: str | None) -> str:
+    """Generate an element id when the caller passed none. A field converter on the base.
+
+    Public because a subclass fixing its own ``element_id`` re-declares that field, and has to
+    keep the None handling its callers rely on: ``Button`` is spelled
+    ``attrs.field(default="Button", converter=default_element_id)``.
+    """
+    if element_id is None:
+        return uuid.uuid4().hex
+    return element_id
+
+
+def default_element_type(element_type: str | None) -> str:
+    """Name the element type when the caller passed none. A field converter on the base."""
+    # Falls back to "BaseNodeElement" rather than the subclass name, which is what the
+    # hand-written constructor did. to_dict() reports the class name instead, so the two
+    # disagree; the alter-element event reads this attribute.
+    if element_type is None:
+        return "BaseNodeElement"
+    return element_type
+
+
+def default_element_name(name: str | None) -> str:
+    """Generate an element name when the caller passed none. A field converter on the base."""
+    if name is None:
+        return f"BaseNodeElement_{uuid.uuid4().hex}"
+    return name
+
+
+# The object ``attrs.field()`` returns, which is how the metaclass tells a class that declares
+# fields from one that only annotates attributes.
+_DECLARED_FIELD = type(attrs.field())
+
+
+@dataclass_transform(field_specifiers=(field, attrs.field, attrs.Factory), eq_default=False, kw_only_default=True)
+class ElementMeta(ABCMeta):
+    """Makes every element class an attrs class, so none of them carries a decorator.
+
+    A subclass declares fields and gets a constructor, or hand-writes a constructor and keeps
+    it. That is what lets ``Parameter`` keep its own twenty-argument constructor while a trait
+    declares two fields and no constructor at all.
+
+    A constructor is generated only for a class that declares fields in its own body and no
+    ``__init__`` of its own. A class that declares neither inherits whatever constructor its
+    parent has, hand-written or generated, which is what a subclass of a hand-written element
+    class expects.
+
+    Applying this here rather than as a decorator per class means a class cannot opt out by
+    accident. A trait that forgot the decorator would have no fields, and so would silently
+    save none of its state.
+
+    ``kw_only=True`` because an element's fields are a description rather than a signature, and
+    because it is what leaves a subclass free to declare a mandatory field: attrs refuses one
+    declared after a defaulted field, and the wiring fields below all have defaults.
+
+    ``auto_attribs=False`` makes a field opt-in: an attribute becomes one by being assigned
+    ``attrs.field(...)``, never by carrying a bare annotation. Element classes annotate plenty
+    of attributes that are not constructor arguments, and guessing would turn every one of them
+    into a mandatory field.
+
+    ``slots=False`` keeps attrs mutating the class in place instead of rebuilding it, so the
+    class this returns is the one Python just created, and an element stays free to hold an
+    attribute that is not a field. ``eq=False`` leaves elements comparing by identity: two
+    sliders with the same bounds are two different elements.
+
+    ``dataclass_transform`` is how a type checker learns that a field declaration becomes a
+    constructor argument. It is the same mechanism attrs declares on ``define`` itself.
+
+    Derives from ``ABCMeta`` because several element classes are abstract (``ParameterBase``,
+    ``Trait``); a plain ``type`` metaclass would collide with theirs.
+    """
+
+    def __new__(cls, name: str, bases: tuple[type, ...], namespace: dict[str, Any], **kwargs: Any) -> ElementMeta:
+        created = super().__new__(cls, name, bases, namespace, **kwargs)
+        declares_fields = any(isinstance(value, _DECLARED_FIELD) for value in namespace.values())
+        generate_init = declares_fields and "__init__" not in namespace
+        return attrs.define(eq=False, slots=False, auto_attribs=False, kw_only=True, init=generate_init)(created)
+
+
+class BaseNodeElement(metaclass=ElementMeta):
     """Base of the node element tree: parameters, groups, messages, and traits.
 
-    Deliberately not a dataclass. Its five private attributes are internal wiring, and a
-    generated ``__init__`` would publish them as constructor arguments to every subclass,
-    which is why each subclass used to hand-write an ``__init__`` purely to hide them again.
+    An attrs class, so a subclass can declare its fields and let the constructor be generated,
+    which is what makes a trait's fields the single declaration of its saved state. A subclass
+    with construction work to do hand-writes ``__init__`` and calls ``super().__init__()`` as
+    before, or overrides ``__attrs_post_init__``.
 
-    A subclass hand-writes its own ``__init__`` and calls ``super().__init__()``. It is not
-    a dataclass either: a generated constructor would set the subclass's fields and never
-    reach this one, leaving the element without an ``element_id``.
+    Each of the four public fields converts None to its default, so a subclass forwarding
+    ``element_id=None`` from its own optional argument gets a generated one, as it did when
+    this constructor was hand-written.
     """
 
     _stack: ClassVar[list[BaseNodeElement]] = []
 
-    def __init__(
-        self,
-        *,
-        element_id: str | None = None,
-        element_type: str | None = None,
-        name: str | None = None,
-        parent_group_name: str | None = None,
-    ) -> None:
-        # element_type and name fall back to "BaseNodeElement" rather than the subclass name,
-        # which is what the generated constructor did. to_dict() reports the class name
-        # instead, so the two disagree; the alter-element event reads this attribute.
-        self.element_id: str = element_id if element_id is not None else uuid.uuid4().hex
-        self.element_type: str = element_type if element_type is not None else BaseNodeElement.__name__
-        self.name: str = name if name is not None else f"{BaseNodeElement.__name__}_{uuid.uuid4().hex}"
-        self.parent_group_name: str | None = parent_group_name
-        self._changes: dict[str, Any] = {}
-        self._children: list[BaseNodeElement] = []
-        self._parent: BaseNodeElement | None = None
-        self._node_context: BaseNode | None = None
-        self._badge: BadgeData | None = None
+    element_id: str = attrs.field(default=None, converter=default_element_id, metadata=WIRING)
+    element_type: str = attrs.field(default=None, converter=default_element_type, metadata=WIRING)
+    name: str = attrs.field(default=None, converter=default_element_name, metadata=WIRING)
+    parent_group_name: str | None = attrs.field(default=None, metadata=WIRING)
+    _changes: dict[str, Any] = attrs.field(factory=dict, init=False)
+    _children: list[BaseNodeElement] = attrs.field(factory=list, init=False)
+    _parent: BaseNodeElement | None = attrs.field(default=None, init=False)
+    _node_context: BaseNode | None = attrs.field(default=None, init=False)
+    _badge: BadgeData | None = attrs.field(default=None, init=False)
 
+    def __attrs_post_init__(self) -> None:
         # Adopt into the element open as a context manager, if there is one. Runs last so a
         # parent's add_child sees a fully built child.
         current = BaseNodeElement.get_current()
@@ -1140,9 +1232,6 @@ class ParameterMessage(BaseNodeElement, UIOptionsMixin):
 
 class DeprecationMessage(ParameterMessage):
     """A specialized ParameterMessage for deprecation warnings with default warning styling."""
-
-    # Keep the same element_type as ParameterMessage so UI recognizes it
-    element_type: str = "ParameterMessage"
 
     def __init__(
         self,
@@ -3351,32 +3440,70 @@ class ParameterDictionary(ParameterContainer):
 # TODO: https://github.com/griptape-ai/griptape-nodes/issues/858
 
 
-class AuthoredInit(NamedTuple):
-    """The constructor a Trait subclass declared in its own body."""
+def _is_class_var(annotation: Any) -> bool:
+    """Whether an annotation declares a class constant rather than an attribute.
 
-    parameter_names: tuple[str, ...]
-    # Whether the constructor takes **kwargs, and so can forward to an ancestor's.
-    forwards_keywords: bool
+    Handles the string form too, because a module under ``from __future__ import annotations``
+    never evaluates its annotations.
+    """
+    if isinstance(annotation, str):
+        return annotation.startswith(("ClassVar", "typing.ClassVar", "t.ClassVar"))
+    return get_origin(annotation) is ClassVar
 
 
 class Trait(ABC, BaseNodeElement):
-    # Maps an ``__init__`` parameter name to the attribute that holds its
-    # value, for traits whose constructor arguments are spelled differently from their
-    # fields (``Slider(min_val=...)`` stores ``self.min``). Empty means the two agree.
-    STATE_ALIASES: ClassVar[dict[str, str]] = {}
+    """A control attached to a parameter: a slider, a dropdown, a button.
 
-    # ``__init__`` parameters that are behavior, not state, and so are never saved
-    # (``Button(on_click=...)``).
-    STATE_EXCLUDE: ClassVar[frozenset[str]] = frozenset()
+    A trait's fields are its saved state. Declare each one with ``attrs.field()``, and the
+    metaclass turns them into the constructor; there is no second list to keep in step, and a
+    field's type is what says whether a save could hold it.
 
-    def __hash__(self) -> int:
-        # Use a unique, immutable attribute for hashing
-        return hash(self.element_id)
+    Three things a field can be:
 
-    def __eq__(self, other: object) -> bool:
-        if not (isinstance(other, Trait)):
-            return False
-        return self.to_dict() == other.to_dict()
+    - state, the default. Saved as data, and handed back to the constructor on load, so it
+      must be something a saved workflow can hold: text, numbers, true/false, and lists or
+      dictionaries of those.
+    - behavior, declared ``metadata=BEHAVIOR``. A callback, saved as the name of a method on
+      the owning node rather than as data.
+    - neither, declared ``init=False``. Not saved, and not a constructor argument.
+
+    A field whose constructor keyword differs from the attribute it lands on declares it:
+    ``min: float = attrs.field(alias="min_val")``, which is also how a field sits behind a
+    property (a field named ``_choices`` takes the keyword ``choices``).
+
+    ``__attrs_init_subclass__`` checks all of this when the class is built, so a declaration
+    that could never round-trip fails at import rather than at an artist's save.
+    """
+
+    @classmethod
+    def __attrs_init_subclass__(cls) -> None:
+        """Reject a state declaration a save could not hold or a load could not replay.
+
+        attrs calls this once per subclass, after its fields are collected, which is the first
+        moment the whole declaration exists. Raising here costs a library its import, which is
+        the right time to find out: the alternative is an artist saving a workflow and finding
+        the control gone when they open it again.
+        """
+        cls._reject_annotations_that_are_not_fields()
+        # A NameError means an annotation naming something defined later in its module. Nothing
+        # to check here; the value is still checked when it is saved.
+        with contextlib.suppress(NameError):
+            attrs.resolve_types(cls)
+        for attribute in cls._state_fields():
+            unsaveable = unsaveable_type(attribute.type)
+            if unsaveable == CALLBACK_TYPE:
+                msg = (
+                    f"Trait '{cls.__name__}' declares '{attribute.name}' as state, but its type is a callback. "
+                    f"Declare it with metadata=BEHAVIOR so it is carried by method name instead of saved as data."
+                )
+                raise TypeError(msg)
+            if unsaveable is not None:
+                msg = (
+                    f"Trait '{cls.__name__}' declares '{attribute.name}' as state, but a {unsaveable} cannot be "
+                    f"written to a saved workflow. Trait state holds text, numbers, true/false, and lists or "
+                    f"dictionaries of those. Convert it in the field, or declare it init=False if it is derived."
+                )
+                raise TypeError(msg)
 
     def to_dict(self) -> dict[str, Any]:
         updated = super().to_dict()
@@ -3388,56 +3515,28 @@ class Trait(ABC, BaseNodeElement):
     def to_state(self) -> dict[str, Any]:
         """Return the constructor arguments that reproduce this trait.
 
-        Derived from ``__init__``'s signature rather than the dataclass fields, so
-        restoring goes back through the real constructor and keeps whatever invariants
-        it enforces. A parameter declared in ``STATE_EXCLUDE`` may hold a callable; that
-        callback is carried separately, by name, through ``callback_names``.
+        Keyed by constructor keyword rather than by attribute, so restoring goes back through
+        the real constructor and keeps whatever converters and validators it applies.
 
-        A parameter this trait cannot account for is logged and omitted rather than raised:
-        one missing its attribute, one holding an undeclared callback, and one holding a value
-        no saved artifact can express. This runs on every save; failing the whole save over
-        one misdeclared trait would cost the artist their work for a library-authoring mistake
-        they cannot fix.
+        A value whose type checked out but whose contents cannot be written is logged and
+        omitted rather than raised: a ``list[Any]`` holding an object, for one. This runs on
+        every save, and failing the whole save would cost the artist their work over one value.
         """
         state: dict[str, Any] = {}
-        for name in self._state_parameter_names():
-            attribute_name = self.STATE_ALIASES.get(name, name)
-            if not hasattr(self, attribute_name):
-                logger.warning(
-                    "Trait '%s' takes '%s' but stores no matching attribute. "
-                    "Declare STATE_ALIASES = {'%s': '<attribute>'} so its value can be saved. "
-                    "The parameter will load without this trait's '%s'.",
-                    type(self).__name__,
-                    name,
-                    name,
-                    name,
-                )
-                continue
-            value = getattr(self, attribute_name)
-            if callable(value):
-                logger.warning(
-                    "Trait '%s' takes '%s' but it holds a callback, not state. "
-                    "Declare STATE_EXCLUDE = {'%s', ...} so it is carried by name instead of "
-                    "saved as data. The parameter will load without this trait's '%s'.",
-                    type(self).__name__,
-                    name,
-                    name,
-                    name,
-                )
-                continue
-            saved = as_saved_state_value(value)
+        for attribute in self._state_fields():
+            saved = as_saved_state_value(getattr(self, attribute.name))
             if saved.unsupported_type is not None:
                 logger.warning(
-                    "Trait '%s' takes '%s', but its value holds a %s, which cannot be written to a saved "
-                    "workflow. Trait state can hold text, numbers, true/false, and lists or dictionaries "
-                    "of those. The parameter will load without this trait's '%s'.",
+                    "Trait '%s' holds a %s in '%s', which cannot be written to a saved workflow. Trait state "
+                    "holds text, numbers, true/false, and lists or dictionaries of those. The parameter will "
+                    "load without this trait's '%s'.",
                     type(self).__name__,
-                    name,
                     saved.unsupported_type,
-                    name,
+                    self.saved_key(attribute),
+                    self.saved_key(attribute),
                 )
                 continue
-            state[name] = saved.value
+            state[self.saved_key(attribute)] = saved.value
         return state
 
     def apply_state(self, state: dict[str, Any]) -> None:
@@ -3452,8 +3551,8 @@ class Trait(ABC, BaseNodeElement):
         ``state``, so a coercion or a default the constructor applies lands here too.
         Otherwise the two restore paths disagree: ``MultiOptions`` snaps an unknown
         ``icon_size`` back to "small" when built fresh, and a raw assignment would keep the
-        bad value. A state key the constructor accepts but stores nowhere is skipped, which
-        is the load-side counterpart of the warning ``to_state`` logs for it.
+        bad value. A key this trait does not declare as a field is skipped: nothing says where
+        to write it.
 
         Only the keys ``state`` carries are written. A key it omits, because the file predates
         the trait gaining that argument, keeps whatever the node's ``__init__`` chose rather
@@ -3469,12 +3568,11 @@ class Trait(ABC, BaseNodeElement):
         """
         if not state:
             return
+        state = type(self).migrate_state(state)
         interpreted = type(self).from_state(state)
-        for name in state:
-            attribute_name = self.STATE_ALIASES.get(name, name)
-            if not hasattr(interpreted, attribute_name):
-                continue
-            setattr(self, attribute_name, getattr(interpreted, attribute_name))
+        for attribute in self._state_fields():
+            if self.saved_key(attribute) in state:
+                setattr(self, attribute.name, getattr(interpreted, attribute.name))
 
     @classmethod
     def state_from_ui_options(cls, ui_options: dict[str, Any]) -> dict[str, Any]:  # noqa: ARG003
@@ -3499,16 +3597,16 @@ class Trait(ABC, BaseNodeElement):
     def callback_names(self, owner: BaseNode | None) -> dict[str, str]:
         """Return each attached callback as the name of a method on ``owner``.
 
-        Covers the ``STATE_EXCLUDE`` parameters, which is where a trait declares the
-        arguments that are behavior rather than state. A callback that cannot be named is
-        omitted; ``unnameable_callbacks`` reports those.
+        Covers the fields declared ``metadata=BEHAVIOR``, which is how a trait says an argument
+        is behavior rather than state. A callback that cannot be named is omitted;
+        ``unnameable_callbacks`` reports those.
         """
         names: dict[str, str] = {}
-        for parameter_name in self.STATE_EXCLUDE:
-            callback = getattr(self, self.STATE_ALIASES.get(parameter_name, parameter_name), None)
+        for attribute in self._behavior_fields():
+            callback = getattr(self, attribute.name, None)
             name = name_callback(callback, owner)
             if name is not None:
-                names[parameter_name] = name
+                names[self.saved_key(attribute)] = name
         return names
 
     def unnameable_callbacks(self, owner: BaseNode | None) -> list[str]:
@@ -3521,14 +3619,13 @@ class Trait(ABC, BaseNodeElement):
         the state is what gets saved, so there is nothing to warn about.
         """
         unnameable: list[str] = []
-        for parameter_name in sorted(self.STATE_EXCLUDE):
-            attribute_name = self.STATE_ALIASES.get(parameter_name, parameter_name)
-            callback = getattr(self, attribute_name, None)
+        for attribute in self._behavior_fields():
+            callback = getattr(self, attribute.name, None)
             if callback is None:
                 continue
             if name_callback(callback, owner) is None:
-                unnameable.append(parameter_name)
-        return unnameable
+                unnameable.append(self.saved_key(attribute))
+        return sorted(unnameable)
 
     def apply_callback_names(self, names: dict[str, str], owner: BaseNode | None) -> None:
         """Re-bind saved callback names to ``owner``'s methods.
@@ -3538,14 +3635,27 @@ class Trait(ABC, BaseNodeElement):
         the constructor's wiring wins, which is what a node that rewired a button in a new
         version should get.
         """
-        for parameter_name, method_name in names.items():
-            attribute_name = self.STATE_ALIASES.get(parameter_name, parameter_name)
-            if getattr(self, attribute_name, None) is not None:
+        for attribute in self._behavior_fields():
+            saved_key = self.saved_key(attribute)
+            method_name = names.get(saved_key)
+            if method_name is None:
                 continue
-            described_as = f"the '{parameter_name}' behavior of the '{type(self).__name__}' control"
+            if getattr(self, attribute.name, None) is not None:
+                continue
+            described_as = f"the '{saved_key}' behavior of the '{type(self).__name__}' control"
             callback = resolve_callback(method_name, owner, described_as=described_as)
             if callback is not None:
-                setattr(self, attribute_name, callback)
+                setattr(self, attribute.name, callback)
+
+    @classmethod
+    def migrate_state(cls, state: dict[str, Any]) -> dict[str, Any]:
+        """Bring a saved state written by an older version of this trait up to date.
+
+        Identity by default. A trait that renamed one of its fields overrides this, so a file
+        saved under the old key still loads: live code decides what the old name meant, which is
+        the only place that knows.
+        """
+        return state
 
     @classmethod
     def from_state(cls, state: dict[str, Any]) -> Self:
@@ -3556,62 +3666,57 @@ class Trait(ABC, BaseNodeElement):
         into whatever element happens to be open as a context manager would do neither.
         """
         with BaseNodeElement.detached():
-            return cls(**state)
-
-    @classmethod
-    def _state_parameter_names(cls) -> list[str]:
-        """Return the constructor parameters this trait's authors declared, nearest first.
-
-        Reads each class's own ``__init__``, and stops at ``Trait``, so the base element
-        constructor's parameters are never mistaken for trait state.
-
-        Merges up the MRO instead of stopping at the nearest declaration, so a trait that
-        inherits part of its constructor keeps the inherited arguments. The walk stops at a
-        constructor that takes no ``**kwargs``: without a passthrough, an ancestor's extra
-        parameters cannot be reached through this one, so saving them would produce state
-        the constructor rejects.
-        """
-        names: list[str] = []
-        for klass in cls.__mro__:
-            if klass in (Trait, BaseNodeElement):
-                break
-            declared = cls._authored_init(klass)
-            if declared is None:
-                continue
-            for name in declared.parameter_names:
-                if name not in cls.STATE_EXCLUDE and name not in names:
-                    names.append(name)
-            if not declared.forwards_keywords:
-                break
-        return names
+            return cls(**cls.migrate_state(state))
 
     @staticmethod
-    def _authored_init(klass: type) -> AuthoredInit | None:
-        """Describe the ``__init__`` in ``klass``'s own body, or None when it declares none.
+    def saved_key(attribute: attrs.Attribute) -> str:
+        """The keyword a field is saved under: its alias, or its own name when it has none."""
+        if attribute.alias is None:
+            return attribute.name
+        return attribute.alias
 
-        Nothing in the element hierarchy is a dataclass, so there is no generated constructor
-        to mistake for a hand-written one, and the question can be asked where the answer is
-        used rather than captured at class creation.
+    @classmethod
+    def _reject_annotations_that_are_not_fields(cls) -> None:
+        """Reject an attribute this trait annotated but never declared with ``attrs.field()``.
 
-        A trait subclass free to be a dataclass would report the right names here, since its
-        generated constructor takes the fields it declared and nothing inherited. It would
-        still have to reach ``BaseNodeElement.__init__`` some other way, because a generated
-        constructor does not call ``super().__init__()``.
+        A field is opt-in, and a type checker cannot see that: ``dataclass_transform`` tells it
+        every annotation is a field, so ``threshold: int = 5`` type-checks as a constructor
+        argument that does not exist. Caught here, where the message can name the fix, rather
+        than at the first construction as an unexpected-keyword error.
         """
-        authored_init = klass.__dict__.get("__init__")
-        if authored_init is None:
-            return None
-        parameters = inspect.signature(authored_init).parameters.values()
-        return AuthoredInit(
-            parameter_names=tuple(
-                parameter.name
-                for parameter in parameters
-                if parameter.name != "self"
-                and parameter.kind is not inspect.Parameter.VAR_POSITIONAL
-                and parameter.kind is not inspect.Parameter.VAR_KEYWORD
-            ),
-            forwards_keywords=any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters),
-        )
+        declared = {attribute.name for attribute in attrs.fields(cls)}
+        for name, annotation in inspect.get_annotations(cls).items():
+            if name in declared or _is_class_var(annotation):
+                continue
+            msg = (
+                f"Trait '{cls.__name__}' annotates '{name}' but never declares it. A trait's fields are its "
+                f"saved state, so declare it with attrs.field(), mark it ClassVar if it is a constant, or "
+                f"annotate it where it is assigned if it is neither."
+            )
+            raise TypeError(msg)
+
+    @classmethod
+    def state_keys(cls) -> list[str]:
+        """The constructor keywords a save records, in declaration order.
+
+        For a trait reading its own state out of a flat ``ui_options`` write, which is the one
+        caller that needs the names without an instance to ask.
+        """
+        return [cls.saved_key(attribute) for attribute in cls._state_fields()]
+
+    @classmethod
+    def _state_fields(cls) -> list[attrs.Attribute]:
+        """The fields a save records: the trait's own constructor arguments, minus its callbacks."""
+        return [
+            attribute
+            for attribute in attrs.fields(cls)
+            if attribute.init and not attribute.metadata.get("wiring") and not attribute.metadata.get("behavior")
+        ]
+
+    @classmethod
+    def _behavior_fields(cls) -> list[attrs.Attribute]:
+        """The fields carried as the name of a method on the owning node."""
+        return [attribute for attribute in attrs.fields(cls) if attribute.metadata.get("behavior")]
 
     def ui_options_for_trait(self) -> dict:
         """Returns a list of UI options for the parameter as a list of strings or dictionaries."""

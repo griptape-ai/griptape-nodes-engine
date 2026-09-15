@@ -1,16 +1,14 @@
 from collections.abc import Callable
-from typing import Any, ClassVar
+from typing import Any
+
+import attrs
 
 from griptape_nodes.exe_types.core_types import Trait
 
 
 class Clamp(Trait):
-    STATE_ALIASES: ClassVar[dict[str, str]] = {"min_val": "min", "max_val": "max"}
-
-    def __init__(self, min_val: float | None = None, max_val: float | None = None) -> None:
-        super().__init__()
-        self.min: float | None = min_val
-        self.max: float | None = max_val
+    min: float | None = attrs.field(default=None, alias="min_val")
+    max: float | None = attrs.field(default=None, alias="max_val")
 
     def _clamp_number(self, value: float) -> float:
         # Keep this as a tiny helper so the converter stays readable and so we can
