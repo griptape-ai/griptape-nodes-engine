@@ -356,18 +356,24 @@ class RequestClient:
         """
         return await self._track_request(request_id, tag=tag, resolve_failures_as_payload=resolve_failures_as_payload)
 
-    async def cancel_requests_by_tag(self, tag: str) -> None:
-        """Cancel all pending futures that were registered with the given tag.
+    async def fail_requests_by_tag(self, tag: str, error: Exception) -> None:
+        """Fail every pending request registered with `tag`, with the reason it will never answer.
+
+        Raised at the awaiter rather than cancelling it, so a CancelledError keeps its single
+        meaning -- the caller was cancelled -- and the awaiter needs no rule for telling a
+        cancellation it asked for from one it did not. The caller supplies `error` because only it
+        knows the story.
 
         Args:
             tag: The tag value used when track_request was called (e.g. worker_engine_id)
+            error: Raised at whatever is awaiting each of those requests.
         """
         with self._lock:
-            to_cancel = [rid for rid, entry in self._pending_requests.items() if entry.tag == tag]
-            for rid in to_cancel:
+            to_fail = [rid for rid, entry in self._pending_requests.items() if entry.tag == tag]
+            for rid in to_fail:
                 entry = self._pending_requests.pop(rid)
-                RequestClient._settle(entry.future.cancel)
-                logger.debug("Cancelled request %s (tag=%s)", rid, tag)
+                RequestClient._settle(lambda entry=entry: entry.future.set_exception(error))
+                logger.debug("Failed request %s (tag=%s): %s", rid, tag, error)
 
     async def _track_request(
         self,

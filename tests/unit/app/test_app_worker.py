@@ -52,12 +52,12 @@ class _FakeRequestClient:
         )
         return future
 
-    async def cancel_requests_by_tag(self, tag: str) -> None:
-        to_cancel = [rid for rid, entry in self._pending_requests.items() if entry.tag == tag]
-        for rid in to_cancel:
+    async def fail_requests_by_tag(self, tag: str, error: Exception) -> None:
+        to_fail = [rid for rid, entry in self._pending_requests.items() if entry.tag == tag]
+        for rid in to_fail:
             entry = self._pending_requests.pop(rid)
             if not entry.future.done():
-                entry.future.cancel()
+                entry.future.set_exception(error)
 
 
 @pytest.fixture
@@ -843,13 +843,12 @@ class TestRouteToWorker:
         worker_manager._tx.send_message.assert_called_once()  # type: ignore[union-attr]
 
     @pytest.mark.asyncio
-    async def test_evicted_worker_raises_rather_than_cancelling(self, worker_manager: WorkerManager) -> None:
-        """A worker evicted mid-request must surface as an error, not a bare cancellation.
+    async def test_evicted_worker_raises_with_the_reason(self, worker_manager: WorkerManager) -> None:
+        """A worker taken away mid-request surfaces as WorkerGoneError, carrying why.
 
-        Eviction cancels the pending future. Left as CancelledError it is indistinguishable from
-        the artist pressing stop, and the resolution machine reaps those silently as CANCELED --
-        no NodeErrorEvent, only an unnamed INFO line, so the node comes back UNRESOLVED with
-        nothing anywhere saying why.
+        Cancelling instead would be indistinguishable from the artist pressing stop, and the
+        resolution machine reaps those silently as CANCELED -- no NodeErrorEvent, only an unnamed
+        INFO line, so the node comes back UNRESOLVED with nothing anywhere saying why.
         """
         assert isinstance(worker_manager._tx.request_client, _FakeRequestClient)
         fake_rc = worker_manager._tx.request_client
@@ -857,11 +856,13 @@ class TestRouteToWorker:
 
         async def evict_mid_flight() -> None:
             await asyncio.sleep(0)
-            await fake_rc.cancel_requests_by_tag(_ENGINE)
+            await fake_rc.fail_requests_by_tag(
+                _ENGINE, worker_events.WorkerGoneError(f"worker '{_ENGINE}' stopped responding and was shut down")
+            )
 
         asyncio.create_task(evict_mid_flight())  # noqa: RUF006
 
-        with pytest.raises(RuntimeError, match="stopped responding and was shut down"):
+        with pytest.raises(worker_events.WorkerGoneError, match="stopped responding and was shut down"):
             await worker_manager.route_to_worker(event_request, _ENGINE, _WORKER_REQUEST_TOPIC)
 
     @pytest.mark.asyncio
@@ -882,7 +883,7 @@ class TestRouteToWorker:
 
         asyncio.create_task(reset_mid_flight())  # noqa: RUF006
 
-        with pytest.raises(RuntimeError, match="stopped responding and was shut down"):
+        with pytest.raises(worker_events.WorkerGoneError, match="shut down to reload library 'Lib'"):
             await worker_manager.route_to_worker(event_request, _ENGINE, _WORKER_REQUEST_TOPIC)
 
     @pytest.mark.asyncio
