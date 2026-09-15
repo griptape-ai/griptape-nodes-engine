@@ -737,9 +737,11 @@ class TestSpawnWorker:
         """
         worker_manager.engine.library_manager.execution_site_packages.return_value = None  # type: ignore[union-attr]
 
-        with patch("asyncio.create_subprocess_exec", side_effect=OSError("no interpreter")):
-            with pytest.raises(OSError, match="no interpreter"):
-                await worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "My Library")
+        with (
+            patch("asyncio.create_subprocess_exec", side_effect=OSError("no interpreter")),
+            pytest.raises(OSError, match="no interpreter"),
+        ):
+            await worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "My Library")
 
         assert "My Library" not in worker_manager._spawns_in_flight
 
@@ -834,7 +836,7 @@ class TestOrchestratorStaticServerBaseUrl:
         A blocking wait handed to a thread cannot be cancelled, so taking it when nothing needs it
         parks a default-executor thread that teardown then joins.
         """
-        static_files_manager = worker_manager.engine.static_files_manager  # type: ignore[union-attr]
+        static_files_manager = cast("MagicMock", worker_manager.engine.static_files_manager)
         static_files_manager.static_server_base_url_settled = True
         static_files_manager.wait_for_static_server_base_url.return_value = "http://orchestrator:4242"
 
@@ -848,7 +850,7 @@ class TestOrchestratorStaticServerBaseUrl:
     @pytest.mark.asyncio
     async def test_an_undecided_url_is_waited_for_off_the_loop(self, worker_manager: WorkerManager) -> None:
         """The blocking wait must not run on the event loop, which is serving everything else."""
-        static_files_manager = worker_manager.engine.static_files_manager  # type: ignore[union-attr]
+        static_files_manager = cast("MagicMock", worker_manager.engine.static_files_manager)
         static_files_manager.static_server_base_url_settled = False
         static_files_manager.wait_for_static_server_base_url.return_value = "http://orchestrator:4242"
 
@@ -866,7 +868,7 @@ class TestOrchestratorStaticServerBaseUrl:
         Blaming the settle timeout for it points an operator at slow startup when the real lead is
         an earlier resolution failure, which under local storage is the only way to reach here.
         """
-        static_files_manager = worker_manager.engine.static_files_manager  # type: ignore[union-attr]
+        static_files_manager = cast("MagicMock", worker_manager.engine.static_files_manager)
         static_files_manager.static_server_base_url_settled = True
         static_files_manager.wait_for_static_server_base_url.return_value = None
         static_files_manager.storage_driver = MagicMock(spec=LocalStorageDriver)
@@ -881,7 +883,7 @@ class TestOrchestratorStaticServerBaseUrl:
     async def test_a_url_that_never_arrives_blames_the_wait(
         self, worker_manager: WorkerManager, caplog: pytest.LogCaptureFixture
     ) -> None:
-        static_files_manager = worker_manager.engine.static_files_manager  # type: ignore[union-attr]
+        static_files_manager = cast("MagicMock", worker_manager.engine.static_files_manager)
         static_files_manager.static_server_base_url_settled = False
         static_files_manager.wait_for_static_server_base_url.return_value = None
         static_files_manager.storage_driver = MagicMock(spec=LocalStorageDriver)
@@ -901,7 +903,7 @@ class TestOrchestratorStaticServerBaseUrl:
         There is nothing to warn about, and warning anyway trains people to ignore the case where
         the URLs really do die with the worker.
         """
-        static_files_manager = worker_manager.engine.static_files_manager  # type: ignore[union-attr]
+        static_files_manager = cast("MagicMock", worker_manager.engine.static_files_manager)
         static_files_manager.static_server_base_url_settled = True
         static_files_manager.wait_for_static_server_base_url.return_value = None
         static_files_manager.storage_driver = MagicMock()
