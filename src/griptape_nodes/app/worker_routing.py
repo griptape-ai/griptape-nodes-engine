@@ -27,6 +27,7 @@ routing metadata.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from dataclasses import fields as dc_fields
@@ -166,6 +167,10 @@ class ActivateProjectRequest(RequestPayload, SkipTheLineMixin):
     """
 
     project_id: str
+    # Generation of the orchestrator's committed activation. The worker adopts strictly increasing
+    # generations only, so two activations that overlap resolve to the newer one regardless of the
+    # order they arrive or finish in.
+    generation: int = 0
 
 
 @dataclass
@@ -479,7 +484,7 @@ def register_broadcast_handlers(
     config_manager: ConfigManager,
     secrets_manager: SecretsManager,
     project_manager: ProjectManager,
-) -> None:
+) -> asyncio.Event:
     """Install worker-side handlers for orchestrator-originated broadcasts.
 
     Workers receive ``ReloadConfigRequest`` / ``RefreshSecretsRequest`` /
@@ -487,7 +492,14 @@ def register_broadcast_handlers(
     the shared on-disk state or adopting the orchestrator's current project. The
     actual work is delegated to the corresponding manager so domain logic stays
     in the manager and routing decisions stay here.
+
+    Returns:
+        An event set once this worker has settled an activation from the orchestrator, whether by
+        adopting it or by finding it already stale. A worker must not load libraries before that:
+        libraries resolve against the workspace a project decides, and the orchestrator sends the
+        activation rather than answering registration with it, so nothing else orders the two.
     """
+    project_activation_settled = asyncio.Event()
 
     def handle_reload_config(request: ReloadConfigRequest) -> ResultPayload:  # noqa: ARG001
         try:
@@ -507,6 +519,14 @@ def register_broadcast_handlers(
             return RefreshSecretsResultFailure(result_details=details)
         return RefreshSecretsResultSuccess(result_details="Refreshed secrets from shared .env file.")
 
+    # Serializes adoptions against each other. Activation awaits internally, so two that arrive
+    # close together each run as their own task and interleave: the older can pass the staleness
+    # check, suspend, and FINISH after the newer, leaving the worker on the older project while
+    # both replies report success. One sender does not fix this -- overlap is a property of the
+    # await, not of who sent it. The staleness check must not be hoisted out of the lock: it reads
+    # the generation the previous holder records.
+    adoption_lock = asyncio.Lock()
+
     async def handle_activate_project(request: ActivateProjectRequest) -> ResultPayload:
         # A ReloadConfigRequest may land concurrently: a post-init orchestrator switch
         # persists project_file, which emits ConfigChanged -> ReloadConfigRequest to every
@@ -522,27 +542,41 @@ def register_broadcast_handlers(
         # the shared config and re-run registered-project discovery (engine-style) so the
         # worker learns it. Fail loud if the id is still unknown -- silently landing on a
         # stale project while reporting success is exactly the divergence we must avoid.
-        if not await project_manager.ensure_project_loaded(request.project_id):
-            details = (
-                f"Attempted to adopt orchestrator project '{request.project_id}'. "
-                f"Failed because the id is absent from the worker's registry even after "
-                f"reloading config and re-running registered-project discovery."
-            )
-            logger.error(details)
-            return ActivateProjectResultFailure(result_details=details)
+        async with adoption_lock:
+            if project_manager.is_stale_adoption(request.project_id, request.generation):
+                # Settled, not adopted: a newer activation already landed, so whatever is waiting
+                # on this has the answer it needs.
+                project_activation_settled.set()
+                return ActivateProjectResultSuccess(
+                    result_details=(
+                        f"Skipped adopting project '{request.project_id}' (generation "
+                        f"{request.generation}): a newer activation was already adopted."
+                    )
+                )
+            if not await project_manager.ensure_project_loaded(request.project_id):
+                details = (
+                    f"Attempted to adopt orchestrator project '{request.project_id}'. "
+                    f"Failed because the id is absent from the worker's registry even after "
+                    f"reloading config and re-running registered-project discovery."
+                )
+                logger.error(details)
+                return ActivateProjectResultFailure(result_details=details)
 
-        set_result = await project_manager.on_set_current_project_request(
-            SetCurrentProjectRequest(project_id=request.project_id)
-        )
-        if set_result.failed():
-            details = (
-                f"Attempted to adopt orchestrator project '{request.project_id}'. "
-                f"Failed with result: {set_result.result_details}"
+            set_result = await project_manager.on_set_current_project_request(
+                SetCurrentProjectRequest(project_id=request.project_id)
             )
-            logger.error(details)
-            return ActivateProjectResultFailure(result_details=details)
+            if set_result.failed():
+                details = (
+                    f"Attempted to adopt orchestrator project '{request.project_id}'. "
+                    f"Failed with result: {set_result.result_details}"
+                )
+                logger.error(details)
+                return ActivateProjectResultFailure(result_details=details)
+            project_manager.record_adopted_generation(request.generation)
+            project_activation_settled.set()
         return ActivateProjectResultSuccess(result_details=f"Adopted project from orchestrator: {request.project_id}.")
 
     event_manager.assign_manager_to_request_type(ReloadConfigRequest, handle_reload_config)
     event_manager.assign_manager_to_request_type(RefreshSecretsRequest, handle_refresh_secrets)
     event_manager.assign_manager_to_request_type(ActivateProjectRequest, handle_activate_project)
+    return project_activation_settled
