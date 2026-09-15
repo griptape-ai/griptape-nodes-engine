@@ -1246,7 +1246,8 @@ class BaseNode(ABC):
         return None
 
     def get_config_value(self, service: str, value: str) -> str:
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        # Lazy: exe_types cannot import the retained_mode package at module scope.
+        from griptape_nodes.retained_mode.engine import current_engine
 
         warnings.warn(
             "get_config_value() is deprecated. Use GriptapeNodes.SecretsManager().get_secret() for secrets/API keys "
@@ -1255,11 +1256,12 @@ class BaseNode(ABC):
             stacklevel=2,
         )
 
-        config_value = GriptapeNodes.ConfigManager().get_config_value(f"nodes.{service}.{value}")
+        config_value = current_engine().config_manager.get_config_value(f"nodes.{service}.{value}")
         return config_value
 
     def set_config_value(self, service: str, value: str, new_value: str) -> None:
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        # Lazy: exe_types cannot import the retained_mode package at module scope.
+        from griptape_nodes.retained_mode.engine import current_engine
 
         warnings.warn(
             "set_config_value() is deprecated. Use GriptapeNodes.SecretsManager().set_secret() for secrets/API keys "
@@ -1268,7 +1270,7 @@ class BaseNode(ABC):
             stacklevel=2,
         )
 
-        GriptapeNodes.ConfigManager().set_config_value(f"nodes.{service}.{value}", new_value)
+        current_engine().config_manager.set_config_value(f"nodes.{service}.{value}", new_value)
 
     def clear_node(self) -> None:
         # set state to unresolved

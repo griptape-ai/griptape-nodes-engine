@@ -3146,6 +3146,12 @@ class NodeManager(EngineScoped):
         # scope, not ours. Decide forwarding first; only open a local scope when
         # this process is actually going to execute the node.
         if not is_worker:
+            # The worker registers before it has loaded its library; routing in that window
+            # fails in the worker with "Library not found". Wait for the worker's
+            # LibraryLoadedNotification first -- immediate for any library without a
+            # spawned worker.
+            if library_name:
+                await library_manager.wait_for_worker_library_load(library_name)
             worker = library_manager.get_worker_for_library(library_name) if library_name else None
             wm = self.engine.worker_manager
             if wm is not None and worker is not None:
@@ -3359,7 +3365,7 @@ class NodeManager(EngineScoped):
         # installed (register_remote_handlers is worker-only), so opening the
         # scope there would just bump a refcount that nothing reads. Skip it
         # to keep the depth counter accurate to its name.
-        is_worker = self.engine.library_manager._is_worker
+        is_worker = self.engine.library_manager.is_worker
         scope_cm = self.engine.event_manager.worker_node_execution_scope() if is_worker else contextlib.nullcontext()
         with scope_cm:
             # Rehydrate serialized artifacts that crossed the orchestrator->worker JSON boundary.
@@ -3411,10 +3417,38 @@ class NodeManager(EngineScoped):
                     result_details=f"Attempted to execute node '{node_name}'. Failed with error: {e}",
                     exception=e,
                 )
+        if self.engine.library_manager.is_worker:
+            unshippable = self._unshippable_output_names(node)
+            if unshippable:
+                library_name = node.metadata.get("library", "its library")
+                details = (
+                    f"Node '{node_name}' produced {', '.join(unshippable)}, which cannot leave "
+                    f"'{library_name}'s isolated process. Either make the value serializable, or keep "
+                    f"it inside the library: cache it library-side and output a small serializable "
+                    f"descriptor that the consuming node trades back."
+                )
+                return ExecuteNodeResultFailure(result_details=details)
+
         return ExecuteNodeResultSuccess(
             parameter_output_values=dict(node.parameter_output_values),
             result_details=f"Node '{node_name}' executed successfully.",
         )
+
+    @staticmethod
+    def _unshippable_output_names(node: BaseNode) -> list[str]:
+        """Output parameter names holding values that cannot cross the process boundary.
+
+        ``serializable=False`` is the author declaring the value unreasonable to move (a live
+        tensor, an open pipeline). In a worker those outputs would be dropped or mangled on
+        the wire, so producing one is a failure with an actionable message rather than a
+        silent hole in the graph.
+        """
+        names = []
+        for parameter_name in node.parameter_output_values:
+            parameter = node.get_parameter_by_name(parameter_name)
+            if parameter is not None and not parameter.serializable:
+                names.append(f"'{parameter_name}'")
+        return names
 
     def on_validate_node_dependencies_request(self, request: ValidateNodeDependenciesRequest) -> ResultPayload:
         node_name = request.node_name

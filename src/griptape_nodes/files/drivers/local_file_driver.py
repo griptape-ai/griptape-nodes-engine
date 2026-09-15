@@ -13,7 +13,7 @@ from griptape_nodes.files.path_utils import (
     resolve_path_safely,
     sanitize_path_string,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.retained_mode.engine import current_engine
 
 
 class LocalFileDriver(BaseFileDriver):
@@ -91,7 +91,7 @@ class LocalFileDriver(BaseFileDriver):
         # Anchor a relative path on the workspace directory. Mirrors File.resolve()
         # logic so reported path matches opened path.
         if not path.is_absolute():
-            workspace_path = GriptapeNodes.ConfigManager().workspace_path
+            workspace_path = current_engine().config_manager.workspace_path
             # Normalise joined path without evaluating symlinks en route.
             path = resolve_path_safely(workspace_path / path)
 

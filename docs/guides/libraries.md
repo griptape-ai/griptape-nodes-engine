@@ -165,6 +165,50 @@ isolation is the same.
 pip resolution conflicts.** This is the most important guarantee on
 this page.
 
+#### Edit-time vs. execution dependencies
+
+A library can split its dependencies into two sets in its manifest:
+
+- `pip_dependencies` — **edit-time**: what's needed to show the
+    library's nodes in the editor, place them on the canvas, and
+    edit their parameters. Keep this set light.
+- `pip_dependencies_exec` — **execution**: the heavy packages
+    (torch, diffusers, and friends) that are only needed when a
+    node actually *runs*.
+
+Execution dependencies are installed into a separate environment
+(`.venv-exec`, next to the library's `.venv`) and are only loaded
+in the process where nodes execute — never in the main engine
+process. That means a library can depend on multi-gigabyte ML
+stacks while the editor stays light, and two libraries with
+clashing heavy pins can still be edited side by side.
+
+Declaring no `pip_dependencies_exec` is always safe: every
+dependency is treated as edit-time, and the library installs and
+runs as a single-environment library.
+
+#### What declaring execution dependencies changes
+
+A library that declares them runs differently, in three ways:
+
+- **Its nodes execute in the library's own process.** The main
+    engine can show, edit, and save them (it has the edit-time
+    dependencies), but running them happens where the heavy
+    packages live. If that process isn't up yet, running the node
+    reports that rather than failing strangely.
+- **Node code asks the engine for state instead of reading it.**
+    Inside `process()`, reaching for a manager directly (config,
+    secrets, files) raises an error telling you the request to use
+    instead. The library's process holds no settings or secrets of
+    its own, so a direct read would be answering from the wrong
+    place. Saving static files still works normally.
+- **Values that can't leave the process must stay inside it.** If a
+    node outputs something marked `serializable=False` (a live
+    model handle, a tensor), you'll get an error explaining the two
+    ways forward: make the value serializable, or keep it inside
+    the library by caching it library-side and outputting a small
+    descriptor that the next node trades back.
+
 ### Process isolation: the Isolated mode
 
 Running a library **Isolated** (in its own dedicated process,
