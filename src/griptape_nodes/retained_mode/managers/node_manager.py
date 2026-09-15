@@ -3682,6 +3682,9 @@ class NodeManager(EngineScoped):
             # Now creation or alteration of all of the elements.
             element_modification_commands = []
 
+            # Parameters the node class does not declare; see the serialization loop below.
+            undeclared_parameter_names: set[str] = set()
+
             # Serialize only user-defined ParameterGroups (like parameters)
             all_groups = node.root_ui_element.find_elements_by_type(ParameterGroup)
             for group in all_groups:
@@ -3723,6 +3726,18 @@ class NodeManager(EngineScoped):
                     param_dict["initial_setup"] = True
                     add_param_request = AddParameterToNodeRequest.create(**param_dict)
                     element_modification_commands.append(add_param_request)
+                elif reference_node.get_parameter_by_name(parameter.name) is None:
+                    # The class does not declare this parameter, so the reference instance has no
+                    # counterpart to diff against and the recreated node will not have one either.
+                    # Emitting an alter here targets a parameter that does not exist and fails the
+                    # whole deserialize. Nodes acquire such parameters transiently — a scratch
+                    # parameter added mid-run and torn down when the run ends — so they are not part
+                    # of the node's persistent shape and are left out of the copy.
+                    #
+                    # An add is not the answer: a node that rebuilds its dynamic parameters in
+                    # ``__init__`` from its own metadata already has them by the time the command
+                    # replays, and adding again renames the second one to ``<name>_1``.
+                    undeclared_parameter_names.add(parameter.name)
                 else:
                     # Normal node - compare against reference node
                     diff = NodeManager._manage_alter_details(parameter, reference_node)
@@ -3761,6 +3776,9 @@ class NodeManager(EngineScoped):
             # Only AlterParameterDetailsRequest commands are recorded and replayed
             # Normal node - use current parameter values
             for parameter in node.parameters:
+                # No parameter to receive the value: it was left out of the commands above.
+                if parameter.name in undeclared_parameter_names:
+                    continue
                 # SetParameterValueRequest event
                 set_param_value_requests = NodeManager.handle_parameter_value_saving(
                     parameter=parameter,
