@@ -4308,7 +4308,7 @@ class TestScrubForAstConstant:
         # and the surviving ui_options must keep its safe keys with an emptied traits list.
         assert "<function" not in content
         assert "at 0x" not in content
-        assert "_create_button_link_handler" not in content
+        assert "_build_link_handler" not in content
         ast.parse(content)
         assert "'traits': []" in content
         assert "'display_name': 'Custom Voice ID'" in content

@@ -1,16 +1,34 @@
 from __future__ import annotations
 
+import contextlib
+import inspect
 import logging
 import uuid
 import warnings
-from abc import ABC, abstractmethod
+from abc import ABC, ABCMeta, abstractmethod
 from collections.abc import Callable
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum, StrEnum, auto
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, NamedTuple, Self, TypeVar, get_args
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ClassVar,
+    Literal,
+    NamedTuple,
+    Self,
+    TypeVar,
+    dataclass_transform,
+    get_args,
+    get_origin,
+)
 
+import attrs
 from pydantic import BaseModel
+
+from griptape_nodes.exe_types.callback_binding import name_callback, resolve_callback
+from griptape_nodes.exe_types.trait_state import CALLBACK_TYPE, TraitStateEntry, as_saved_state_value, unsaveable_type
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -43,7 +61,7 @@ class NodeMessageResult(BaseModel):
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
     from types import TracebackType
 
     from griptape_nodes.exe_types.node_types import BaseNode
@@ -278,34 +296,107 @@ class ParameterType:
         return ParameterType.KeyValueTypePair(key_type=key_type, value_type=value_type)
 
 
-@dataclass(kw_only=True)
-class BaseNodeElement:
-    element_id: str = field(default_factory=lambda: str(uuid.uuid4().hex))
-    element_type: str = field(default_factory=lambda: BaseNodeElement.__name__)
-    name: str = field(default_factory=lambda: str(f"{BaseNodeElement.__name__}_{uuid.uuid4().hex}"))
-    parent_group_name: str | None = None
-    _changes: dict[str, Any] = field(default_factory=dict)
+# Excludes element wiring from trait state.
+WIRING: dict[str, bool] = {"wiring": True}
 
-    _children: list[BaseNodeElement] = field(default_factory=list)
+# Saves callbacks by owning-node method name rather than as data.
+BEHAVIOR: dict[str, bool] = {"behavior": True}
+
+
+def default_element_id(element_id: str | None) -> str:
+    """Generate an ID for ``None``.
+
+    Public because subclasses that fix ``element_id`` must retain this conversion.
+    """
+    if element_id is None:
+        return uuid.uuid4().hex
+    return element_id
+
+
+def default_element_type(element_type: str | None) -> str:
+    """Preserve the hand-written constructor's fallback element type."""
+    # ``to_dict()`` reports the class name, but alter-element events read this attribute.
+    if element_type is None:
+        return "BaseNodeElement"
+    return element_type
+
+
+def default_element_name(name: str | None) -> str:
+    """Generate an element name for ``None``."""
+    if name is None:
+        return f"BaseNodeElement_{uuid.uuid4().hex}"
+    return name
+
+
+# Runtime type returned by ``attrs.field()``.
+_DECLARED_FIELD = type(attrs.field())
+
+
+@dataclass_transform(field_specifiers=(field, attrs.field, attrs.Factory), eq_default=False, kw_only_default=True)
+class ElementMeta(ABCMeta):
+    """Apply attrs to every element class.
+
+    Classes declaring fields get generated keyword-only constructors. Classes with explicit
+    constructors keep them, and classes declaring neither inherit their parent's constructor.
+
+    ``auto_attribs=False`` keeps bare annotations from becoming fields. ``slots=False`` lets
+    elements hold non-field attributes. ``eq=False`` preserves identity comparison.
+    """
+
+    def __new__(cls, name: str, bases: tuple[type, ...], namespace: dict[str, Any], **kwargs: Any) -> ElementMeta:
+        created = super().__new__(cls, name, bases, namespace, **kwargs)
+        declares_fields = any(isinstance(value, _DECLARED_FIELD) for value in namespace.values())
+        generate_init = declares_fields and "__init__" not in namespace
+        return attrs.define(eq=False, slots=False, auto_attribs=False, kw_only=True, init=generate_init)(created)
+
+
+class BaseNodeElement(metaclass=ElementMeta):
+    """Base for parameters, groups, messages, and traits.
+
+    Public fields convert ``None`` to their defaults so subclasses may forward optional
+    arguments. Subclasses may use generated attrs constructors or define their own.
+    """
+
     _stack: ClassVar[list[BaseNodeElement]] = []
-    _parent: BaseNodeElement | None = field(default=None)
-    _node_context: BaseNode | None = field(default=None)
-    _badge: BadgeData | None = field(default=None)
+
+    element_id: str = attrs.field(default=None, converter=default_element_id, metadata=WIRING)
+    element_type: str = attrs.field(default=None, converter=default_element_type, metadata=WIRING)
+    name: str = attrs.field(default=None, converter=default_element_name, metadata=WIRING)
+    parent_group_name: str | None = attrs.field(default=None, metadata=WIRING)
+    _changes: dict[str, Any] = attrs.field(factory=dict, init=False)
+    _children: list[BaseNodeElement] = attrs.field(factory=list, init=False)
+    _parent: BaseNodeElement | None = attrs.field(default=None, init=False)
+    _node_context: BaseNode | None = attrs.field(default=None, init=False)
+    _badge: BadgeData | None = attrs.field(default=None, init=False)
+
+    def __attrs_post_init__(self) -> None:
+        # Adopt only after construction so the parent sees a complete child.
+        current = BaseNodeElement.get_current()
+        if current is not None:
+            current.add_child(self)
 
     @property
     def children(self) -> list[BaseNodeElement]:
         return self._children
 
-    def __post_init__(self) -> None:
-        # If there's currently an active element, add this new element as a child
-        current = BaseNodeElement.get_current()
-        if current is not None:
-            current.add_child(self)
-
     def __enter__(self) -> Self:
         # Push this element onto the global stack
         BaseNodeElement._stack.append(self)
         return self
+
+    @staticmethod
+    @contextmanager
+    def detached() -> Iterator[None]:
+        """Suppress adoption by an open element context.
+
+        Mutate the stack in place so nested ``__exit__`` calls retain their references.
+        """
+        open_elements = BaseNodeElement._stack[:]
+        BaseNodeElement._stack.clear()
+        try:
+            yield
+        finally:
+            BaseNodeElement._stack[:] = open_elements
 
     def __exit__(
         self,
@@ -364,28 +455,27 @@ class BaseNodeElement:
             self._badge.hide = hide
         if hide_clear_button is not None:
             self._badge.hide_clear_button = hide_clear_button
-        self._changes["badge"] = self._badge.to_dict()
-        # Batch UI updates: add to node's tracked list so emit_parameter_changes() sends our _changes later.
-        # Only when attached to a node and not already in the list (avoids duplicate events).
-        if self._node_context is not None and self not in self._node_context._tracked_parameters:
-            self._node_context._tracked_parameters.append(self)
+        self.track_change("badge", self._badge.to_dict())
 
     def clear_badge(self) -> None:
         """Set badge to None (cleared)."""
         self._badge = None
-        self._changes["badge"] = None
-        # Batch UI updates: add to node's tracked list so emit_parameter_changes() sends our _changes later.
-        # Only when attached to a node and not already in the list (avoids duplicate events).
-        if self._node_context is not None and self not in self._node_context._tracked_parameters:
-            self._node_context._tracked_parameters.append(self)
+        self.track_change("badge", None)
 
     def dismiss_badge(self) -> None:
         """Hide the badge indicator (hide=True). Frontend can send clear_badge_display to trigger this."""
         if self._badge is None:
             return
         self._badge.hide = True
-        self._changes["badge"] = self._badge.to_dict()
-        # Batch UI updates: add to node's tracked list so emit_parameter_changes() sends our _changes later.
+        self.track_change("badge", self._badge.to_dict())
+
+    def track_change(self, key: str, value: Any) -> None:
+        """Record a changed field and queue this element for the next batched UI update.
+
+        A queue rather than a send: ``emit_parameter_changes()`` picks the element up later
+        and reports every change recorded since the last flush.
+        """
+        self._changes[key] = value
         # Only when attached to a node and not already in the list (avoids duplicate events).
         if self._node_context is not None and self not in self._node_context._tracked_parameters:
             self._node_context._tracked_parameters.append(self)
@@ -402,11 +492,7 @@ class BaseNodeElement:
                 new_value = getattr(self, f"{func.__name__}", None) if hasattr(self, f"{func.__name__}") else None
                 # Track change if different
                 if old_value != new_value:
-                    self._changes[func.__name__] = new_value
-                    # Batch UI updates: add to node's tracked list so emit_parameter_changes() sends our _changes later.
-                    # Only when attached to a node and not already in the list (avoids duplicate events).
-                    if self._node_context is not None and self not in self._node_context._tracked_parameters:
-                        self._node_context._tracked_parameters.append(self)
+                    self.track_change(func.__name__, new_value)
                 return result
             return func(self, *args, **kwargs)
 
@@ -583,7 +669,7 @@ class BaseNodeElement:
         }
         return event_data
 
-    def _apply_badge_from_message_data(self, data: dict) -> None:  # noqa: C901
+    def _apply_badge_from_message_data(self, data: dict) -> None:
         """Apply badge fields from a message data dict and track change."""
         if self._badge is None:
             self._badge = BadgeData()
@@ -608,11 +694,7 @@ class BaseNodeElement:
             self._badge.hide = data["hide"]
         if "hide_clear_button" in data:
             self._badge.hide_clear_button = data["hide_clear_button"]
-        self._changes["badge"] = self._badge.to_dict()
-        # Batch UI updates: add to node's tracked list so emit_parameter_changes() sends our _changes later.
-        # Only when attached to a node and not already in the list (avoids duplicate events).
-        if self._node_context is not None and self not in self._node_context._tracked_parameters:
-            self._node_context._tracked_parameters.append(self)
+        self.track_change("badge", self._badge.to_dict())
 
     def _on_badge_message_received(
         self, message_type: str, message: NodeMessagePayload | None
@@ -733,17 +815,29 @@ class UIOptionsMixin:
             )
             logger.warning(msg)
 
+    def authored_ui_options(self) -> dict[str, Any]:
+        """Return stored options without values derived by subclasses."""
+        return dict(self._ui_options)  # type: ignore[attr-defined]
+
     def update_ui_options_key(self, key: str, value: Any) -> None:
         """Update a single UI option key."""
-        ui_options = self.ui_options
-        ui_options[key] = value
-        self.ui_options = ui_options
+        self.update_ui_options({key: value})
 
     def update_ui_options(self, updates: dict[str, Any]) -> None:
-        """Update multiple UI options at once."""
-        ui_options = self.ui_options
-        ui_options.update(updates)
-        self.ui_options = ui_options
+        """Update stored options without copying derived options into them."""
+        authored = self.authored_ui_options()
+        authored.update(updates)
+        self.ui_options = authored  # type: ignore[attr-defined]
+
+    def remove_ui_options_key(self, key: str) -> None:
+        """Remove a stored option without copying derived options into storage."""
+        authored = self.authored_ui_options()
+        authored.pop(key, None)
+        self.ui_options = authored  # type: ignore[attr-defined]
+
+    def report_ui_options_change(self) -> None:
+        """Report derived UI options without storing them."""
+        self.track_change("ui_options", self.ui_options)  # type: ignore[attr-defined]
 
 
 class ParameterMessage(BaseNodeElement, UIOptionsMixin):
@@ -786,18 +880,17 @@ class ParameterMessage(BaseNodeElement, UIOptionsMixin):
     type ButtonAlignType = Literal["full-width", "left", "center", "right"]
     type ButtonVariantType = Literal["default", "destructive", "outline", "secondary", "ghost", "link"]
 
-    element_type: str = field(default_factory=lambda: ParameterMessage.__name__)
-    _variant: VariantType = field(init=False)
-    _title: str | None = field(default=None, init=False)
-    _value: str = field(init=False)
-    _message_icon: str | None = field(default="__DEFAULT__", init=False)
-    _button_link: str | None = field(default=None, init=False)
-    _button_text: str | None = field(default=None, init=False)
-    _button_icon: str | None = field(default=None, init=False)
-    _button_variant: ButtonVariantType = field(default="outline", init=False)
-    _button_align: ButtonAlignType = field(default="full-width", init=False)
-    _full_width: bool = field(default=False, init=False)
-    _ui_options: dict = field(default_factory=dict, init=False)
+    _variant: VariantType
+    _title: str | None
+    _value: str
+    _message_icon: str | None
+    _button_link: str | None
+    _button_text: str | None
+    _button_icon: str | None
+    _button_variant: ButtonVariantType
+    _button_align: ButtonAlignType
+    _full_width: bool
+    _ui_options: dict
 
     def __init__(  # noqa: PLR0913
         self,
@@ -1070,9 +1163,6 @@ class ParameterMessage(BaseNodeElement, UIOptionsMixin):
 
 class DeprecationMessage(ParameterMessage):
     """A specialized ParameterMessage for deprecation warnings with default warning styling."""
-
-    # Keep the same element_type as ParameterMessage so UI recognizes it
-    element_type: str = "ParameterMessage"
 
     def __init__(
         self,
@@ -1365,9 +1455,7 @@ class ParameterButtonGroup(BaseNodeElement, UIOptionsMixin):
     @BaseNodeElement.emits_update_on_write
     def display_name(self, value: str | None) -> None:
         if value is None:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("display_name", None)
-            self.ui_options = ui_options
+            self.remove_ui_options_key("display_name")
         else:
             self.update_ui_options_key("display_name", value)
 
@@ -1481,13 +1569,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
     private: bool = False
     exclude_from_metadata: bool = False
     allow_variable_substitution: bool = True
-    _allowed_modes: set = field(
-        default_factory=lambda: {
-            ParameterMode.OUTPUT,
-            ParameterMode.INPUT,
-            ParameterMode.PROPERTY,
-        }
-    )
+    _allowed_modes: set
     _converters: list[Callable[[Any], Any]]
     _validators: list[Callable[[Parameter, Any], None]]
     _on_incoming_connection_removed: list[Callable[[Parameter, str, str], None]]
@@ -1756,6 +1838,23 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
 
         return our_dict
 
+    def trait_states(self) -> list[dict[str, Any]]:
+        """Return save-only trait identity, constructor state, and callbacks.
+
+        ``NodeManager`` stabilizes dynamic library module names before saving.
+        """
+        owner = self.get_node()
+        states: list[dict[str, Any]] = []
+        for trait in self.find_elements_by_type(Trait):
+            entry = TraitStateEntry(
+                trait_name=type(trait).__name__,
+                trait_module=type(trait).__module__,
+                trait_state=trait.to_state(),
+                trait_callbacks=trait.callback_names(owner),
+            )
+            states.append(entry.to_dict())
+        return states
+
     def to_event(self, node: BaseNode) -> dict:
         event_dict = self.to_dict()
         event_data = super().to_event(node)
@@ -1837,6 +1936,43 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         """
         return bool(self._validators)
 
+    def value_callback_names(self, owner: BaseNode | None) -> dict[str, list[str]]:
+        """Return directly attached callbacks by method name.
+
+        Each callback list is omitted unless every member is nameable because restoring a
+        partial converter or validator pipeline would change its behavior.
+        """
+        names: dict[str, list[str]] = {}
+        for key, callbacks in (("converters", self._converters), ("validators", self._validators)):
+            if not callbacks:
+                continue
+            resolved = [name_callback(callback, owner) for callback in callbacks]
+            if any(name is None for name in resolved):
+                continue
+            names[key] = [name for name in resolved if name is not None]
+        return names
+
+    def unnameable_value_callbacks(self, owner: BaseNode | None) -> dict[str, int]:
+        """Count directly attached callbacks that cannot be saved by name."""
+        unnameable: dict[str, int] = {}
+        for key, callbacks in (("converters", self._converters), ("validators", self._validators)):
+            count = sum(1 for callback in callbacks if name_callback(callback, owner) is None)
+            if count:
+                unnameable[key] = count
+        return unnameable
+
+    def apply_value_callback_names(self, names: dict[str, list[str]], owner: BaseNode | None) -> None:
+        """Bind saved callbacks not already attached."""
+        for key, target in (("converters", self._converters), ("validators", self._validators)):
+            attached = {name_callback(callback, owner) for callback in target}
+            for method_name in names.get(key, []):
+                if method_name in attached:
+                    continue
+                described_as = f"the '{method_name}' {key[:-1]} of parameter '{self.name}'"
+                callback = resolve_callback(method_name, owner, described_as=described_as)
+                if callback is not None:
+                    target.append(callback)
+
     @property
     def has_traits(self) -> bool:
         """Any Trait child is attached.
@@ -1880,17 +2016,75 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
 
     @property
     def ui_options(self) -> dict:
-        ui_options = {}
-        traits = self.find_elements_by_type(Trait)
-        for trait in traits:
+        """Overlay trait-rendered options on stored options.
+
+        Trait state wins over stale stored copies. Only authored options are persisted.
+        """
+        ui_options = self.authored_ui_options()
+        for trait in self.find_elements_by_type(Trait):
             ui_options = ui_options | trait.ui_options_for_trait()
-        ui_options = ui_options | self._ui_options
         return ui_options
 
     @ui_options.setter
     @BaseNodeElement.emits_update_on_write
     def ui_options(self, value: dict) -> None:
         self._ui_options = value
+
+    def adopt_ui_options(self, value: dict) -> None:
+        """Route inbound trait-owned options to their traits.
+
+        Keep the flat input stored so detaching a trait reveals the written value.
+        """
+        for trait in self.find_elements_by_type(Trait):
+            adopted = trait.state_from_ui_options(value)
+            if not adopted:
+                self._report_unadopted_trait_options(trait, value)
+                continue
+            # Supply complete constructor state when the input mentions only some fields.
+            try:
+                trait.apply_state({**trait.to_state(), **adopted})
+            except TypeError:
+                logger.warning(
+                    "Attempted to update the %s control on parameter '%s' from a UI option change, "
+                    "but it would not accept those values, so the control is unchanged.",
+                    type(trait).__name__,
+                    self.name,
+                )
+        self.ui_options = value
+
+    def _report_unadopted_trait_options(self, trait: Trait, value: dict) -> None:
+        """Report a write the trait renders over, which is neither applied nor saved.
+
+        A write matching what the trait already renders is the editor echoing it back, and
+        changes nothing.
+        """
+        ignored = sorted(
+            key for key, rendered in trait.ui_options_for_trait().items() if key in value and value[key] != rendered
+        )
+        if not ignored:
+            return
+        logger.warning(
+            "Attempted to set %s on parameter '%s', but its %s control renders those keys and does "
+            "not read them back, so the change has no effect and is not saved. Set the control's own "
+            "state instead, or give the control a 'state_from_ui_options' that accepts these keys.",
+            ", ".join(f"'{key}'" for key in ignored),
+            self.name,
+            type(trait).__name__,
+        )
+
+    def authored_ui_options(self) -> dict[str, Any]:
+        """Remove options rendered by attached traits.
+
+        Filtering on read handles keys written before or after trait attachment while
+        preserving stored values if the trait is detached.
+        """
+        return self._without_trait_owned_keys(super().authored_ui_options())
+
+    def _without_trait_owned_keys(self, value: dict) -> dict:
+        trait_owned: set[str] = set()
+        for trait in self.find_elements_by_type(Trait):
+            trait_owned.update(trait.ui_options_for_trait())
+        return {key: option for key, option in value.items() if key not in trait_owned}
 
     @property
     def hide(self) -> bool:
@@ -1967,9 +2161,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
             value: Display name string, or None to use the default (parameter name)
         """
         if value is None:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("display_name", None)
-            self.ui_options = ui_options
+            self.remove_ui_options_key("display_name")
         else:
             self.update_ui_options_key("display_name", value)
 
@@ -2209,6 +2401,16 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
     def equals(self, other: Parameter) -> dict:
         self_dict = self.to_dict().copy()
         other_dict = other.to_dict().copy()
+        # Compare the save view of UI options, not the merged one. Trait-derived keys belong
+        # to the trait, and are carried between the two parameters by ``traits`` below;
+        # diffing them here would emit them as stored options on the parameter instead.
+        self_dict["ui_options"] = self.authored_ui_options()
+        other_dict["ui_options"] = other.authored_ui_options()
+        self_dict["traits"] = self.trait_states()
+        other_dict["traits"] = other.trait_states()
+        # Converters and validators are code, compared by the method names they resolve to.
+        self_dict["value_callbacks"] = self.value_callback_names(self.get_node())
+        other_dict["value_callbacks"] = other.value_callback_names(other.get_node())
         self_dict.pop("next", None)
         self_dict.pop("prev", None)
         self_dict.pop("element_id", None)
@@ -2590,11 +2792,29 @@ class ParameterList(ParameterContainer):
     @property
     def ui_options(self) -> dict:
         """Override ui_options to merge convenience parameters in real-time."""
-        # Get base ui_options from parent
-        base_ui_options = super().ui_options
+        return {
+            **super().ui_options,
+            **self._convenience_ui_options(),
+        }
 
-        # Build convenience options from instance parameters
-        convenience_options = {}
+    def authored_ui_options(self) -> dict[str, Any]:
+        """Add back the layout options this class holds outside ``_ui_options``.
+
+        ``collapsed``, ``child_prefix``, and the grid keys are authored, not derived: they
+        come from constructor arguments and the properties above. Leaving them out would
+        drop a list's layout from the save, and would make any other UI option write erase
+        it, since the setter below reads grid mode back out of the dict it is handed.
+
+        Trait-owned keys are still subtracted, by ``Parameter``'s override above.
+        """
+        return {
+            **super().authored_ui_options(),
+            **self._convenience_ui_options(),
+        }
+
+    def _convenience_ui_options(self) -> dict[str, Any]:
+        """Render the layout fields kept as attributes as the ui_options keys they map to."""
+        convenience_options: dict[str, Any] = {}
 
         if self._collapsed is not None:
             convenience_options["collapsed"] = self._collapsed
@@ -2602,17 +2822,12 @@ class ParameterList(ParameterContainer):
         if self._child_prefix is not None:
             convenience_options["child_prefix"] = self._child_prefix
 
-        if self._grid is not None and self._grid:
+        if self._grid:
             convenience_options["display"] = "grid"
+            if self._grid_columns is not None:
+                convenience_options["columns"] = self._grid_columns
 
-        if self._grid_columns is not None and self._grid:
-            convenience_options["columns"] = self._grid_columns
-
-        # Merge convenience options with base ui_options
-        return {
-            **base_ui_options,
-            **convenience_options,
-        }
+        return convenience_options
 
     @ui_options.setter
     @BaseNodeElement.emits_update_on_write
@@ -3132,16 +3347,35 @@ class ParameterDictionary(ParameterContainer):
 # TODO: https://github.com/griptape-ai/griptape-nodes/issues/858
 
 
-@dataclass(eq=False)
 class Trait(ABC, BaseNodeElement):
-    def __hash__(self) -> int:
-        # Use a unique, immutable attribute for hashing
-        return hash(self.element_id)
+    """A parameter control whose attrs fields define its saved contract.
 
-    def __eq__(self, other: object) -> bool:
-        if not (isinstance(other, Trait)):
-            return False
-        return self.to_dict() == other.to_dict()
+    Normal fields are saved as data. ``metadata=BEHAVIOR`` fields are saved by owning-node
+    method name. ``init=False`` fields are not saved.
+    """
+
+    @classmethod
+    def __attrs_init_subclass__(cls) -> None:
+        """Reject state that cannot round-trip through a saved workflow."""
+        cls._reject_annotations_that_are_not_fields()
+        # Forward references are checked by value while saving.
+        with contextlib.suppress(NameError):
+            attrs.resolve_types(cls)
+        for attribute in cls._state_fields():
+            unsaveable = unsaveable_type(attribute.type)
+            if unsaveable == CALLBACK_TYPE:
+                msg = (
+                    f"Trait '{cls.__name__}' declares '{attribute.name}' as state, but its type is a callback. "
+                    f"Declare it with metadata=BEHAVIOR so it is carried by method name instead of saved as data."
+                )
+                raise TypeError(msg)
+            if unsaveable is not None:
+                msg = (
+                    f"Trait '{cls.__name__}' declares '{attribute.name}' as state, but a {unsaveable} cannot be "
+                    f"written to a saved workflow. Trait state holds text, numbers, true/false, and lists or "
+                    f"dictionaries of those. Convert it in the field, or declare it init=False if it is derived."
+                )
+                raise TypeError(msg)
 
     def to_dict(self) -> dict[str, Any]:
         updated = super().to_dict()
@@ -3150,10 +3384,150 @@ class Trait(ABC, BaseNodeElement):
         updated["trait_display_options"] = self.display_options_for_trait()
         return updated
 
+    def to_state(self) -> dict[str, Any]:
+        """Return constructor arguments, omitting and warning about unsupported values."""
+        state: dict[str, Any] = {}
+        for attribute in self._state_fields():
+            saved = as_saved_state_value(getattr(self, attribute.name))
+            if saved.unsupported_type is not None:
+                logger.warning(
+                    "Trait '%s' holds a %s in '%s', which cannot be written to a saved workflow. Trait state "
+                    "holds text, numbers, true/false, and lists or dictionaries of those. The parameter will "
+                    "load without this trait's '%s'.",
+                    type(self).__name__,
+                    saved.unsupported_type,
+                    self.saved_key(attribute),
+                    self.saved_key(attribute),
+                )
+                continue
+            state[self.saved_key(attribute)] = saved.value
+        return state
+
+    def apply_state(self, state: dict[str, Any]) -> None:
+        """Apply saved fields through the constructor without replacing the trait.
+
+        Only supplied fields are copied, preserving constructor wiring and defaults for fields
+        absent from older files. Constructor converters and validators still apply.
+
+        Raises:
+            TypeError: If ``state`` cannot satisfy the constructor.
+        """
+        if not state:
+            return
+        migrated = type(self).migrate_state(state)
+        interpreted = type(self)._construct(migrated)
+        for attribute in self._state_fields():
+            if self.saved_key(attribute) in migrated:
+                setattr(self, attribute.name, getattr(interpreted, attribute.name))
+
     @classmethod
-    @abstractmethod
-    def get_trait_keys(cls) -> list[str]:
-        """This will return keys that trigger this trait."""
+    def state_from_ui_options(cls, ui_options: dict[str, Any]) -> dict[str, Any]:  # noqa: ARG003
+        """Map flat UI options to the mentioned state fields.
+
+        The default ignores writes for traits with no state behind their rendered keys, which
+        is why class creation does not require this to invert ``ui_options_for_trait``. A write
+        to a rendered key no trait accepts is logged rather than dropped in silence.
+        """
+        return {}
+
+    def callback_names(self, owner: BaseNode | None) -> dict[str, str]:
+        """Return nameable behavior fields as owning-node method names."""
+        names: dict[str, str] = {}
+        for attribute in self._behavior_fields():
+            callback = getattr(self, attribute.name, None)
+            name = name_callback(callback, owner)
+            if name is not None:
+                names[self.saved_key(attribute)] = name
+        return names
+
+    def unnameable_callbacks(self, owner: BaseNode | None) -> list[str]:
+        """Return behavior fields whose callbacks cannot be saved by name."""
+        unnameable: list[str] = []
+        for attribute in self._behavior_fields():
+            callback = getattr(self, attribute.name, None)
+            if callback is None:
+                continue
+            if name_callback(callback, owner) is None:
+                unnameable.append(self.saved_key(attribute))
+        return sorted(unnameable)
+
+    def apply_callback_names(self, names: dict[str, str], owner: BaseNode | None) -> None:
+        """Bind missing behavior fields to saved owning-node methods.
+
+        Existing callbacks take precedence over saved names.
+        """
+        for attribute in self._behavior_fields():
+            saved_key = self.saved_key(attribute)
+            method_name = names.get(saved_key)
+            if method_name is None:
+                continue
+            if getattr(self, attribute.name, None) is not None:
+                continue
+            described_as = f"the '{saved_key}' behavior of the '{type(self).__name__}' control"
+            callback = resolve_callback(method_name, owner, described_as=described_as)
+            if callback is not None:
+                setattr(self, attribute.name, callback)
+
+    @classmethod
+    def migrate_state(cls, state: dict[str, Any]) -> dict[str, Any]:
+        """Migrate saved field names or values before construction.
+
+        Runs once per load, so an override may rename or convert unconditionally.
+        """
+        return state
+
+    @classmethod
+    def from_state(cls, state: dict[str, Any]) -> Self:
+        """Construct a detached trait from saved state."""
+        return cls._construct(cls.migrate_state(state))
+
+    @classmethod
+    def _construct(cls, migrated_state: dict[str, Any]) -> Self:
+        """Construct from state already passed through ``migrate_state``."""
+        with BaseNodeElement.detached():
+            return cls(**migrated_state)
+
+    @staticmethod
+    def saved_key(attribute: attrs.Attribute) -> str:
+        if attribute.alias is None:
+            return attribute.name
+        return attribute.alias
+
+    @classmethod
+    def _reject_annotations_that_are_not_fields(cls) -> None:
+        """Reject bare annotations that type check as nonexistent constructor fields.
+
+        Trait modules cannot postpone annotations because stringified ``ClassVar`` values
+        cannot be distinguished from fields without evaluating possibly unbound names.
+        """
+        declared = {attribute.name for attribute in attrs.fields(cls)}
+        for name, annotation in inspect.get_annotations(cls).items():
+            # Bare ``ClassVar`` has no origin to read.
+            if name in declared or annotation is ClassVar or get_origin(annotation) is ClassVar:
+                continue
+            msg = (
+                f"Trait '{cls.__name__}' annotates '{name}' but never declares it. A trait's fields are its "
+                f"saved state, so declare it with attrs.field(), mark it ClassVar if it is a constant, or "
+                f"annotate it where it is assigned if it is neither. A ClassVar already marked as one means "
+                f"the module uses 'from __future__ import annotations'; a trait's module cannot."
+            )
+            raise TypeError(msg)
+
+    @classmethod
+    def state_keys(cls) -> list[str]:
+        return [cls.saved_key(attribute) for attribute in cls._state_fields()]
+
+    @classmethod
+    def _state_fields(cls) -> list[attrs.Attribute]:
+        return [
+            attribute
+            for attribute in attrs.fields(cls)
+            if attribute.init and not attribute.metadata.get("wiring") and not attribute.metadata.get("behavior")
+        ]
+
+    @classmethod
+    def _behavior_fields(cls) -> list[attrs.Attribute]:
+        return [attribute for attribute in attrs.fields(cls) if attribute.metadata.get("behavior")]
 
     def ui_options_for_trait(self) -> dict:
         """Returns a list of UI options for the parameter as a list of strings or dictionaries."""

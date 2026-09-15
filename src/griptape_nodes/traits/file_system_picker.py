@@ -1,65 +1,32 @@
 from collections.abc import Callable
-from dataclasses import dataclass, field
 from typing import Any
+
+import attrs
 
 from griptape_nodes.exe_types.core_types import Parameter, Trait
 
 
-@dataclass(eq=False)
+def _pattern_list(patterns: list[str] | None) -> list[str]:
+    if patterns is None:
+        return []
+    return patterns
+
+
 class FileSystemPicker(Trait):
-    allow_files: bool = False
-    allow_directories: bool = True
-    allow_sequences: bool = False
-    multiple: bool = False
-    file_types: list[str] = field(default_factory=list)
-    file_extensions: list[str] = field(default_factory=list)
-    exclude_patterns: list[str] = field(default_factory=list)
-    include_patterns: list[str] = field(default_factory=list)
-    max_file_size: int | None = None
-    min_file_size: int | None = None
-    workspace_only: bool = False
-    initial_path: str | None = None
-    allow_create: bool = False
-    allow_rename: bool = False
-    element_id: str = field(default_factory=lambda: "FileSystemPicker")
-
-    def __init__(  # noqa: PLR0913
-        self,
-        *,
-        allow_files: bool = False,
-        allow_directories: bool = True,
-        allow_sequences: bool = False,
-        multiple: bool = False,
-        file_types: list[str] | None = None,
-        file_extensions: list[str] | None = None,
-        exclude_patterns: list[str] | None = None,
-        include_patterns: list[str] | None = None,
-        max_file_size: int | None = None,
-        min_file_size: int | None = None,
-        workspace_only: bool = False,
-        initial_path: str | None = None,
-        allow_create: bool = False,
-        allow_rename: bool = False,
-    ) -> None:
-        super().__init__()
-        self.allow_files = allow_files
-        self.allow_directories = allow_directories
-        self.allow_sequences = allow_sequences
-        self.multiple = multiple
-        self.file_types = file_types or []
-        self.file_extensions = file_extensions or []
-        self.exclude_patterns = exclude_patterns or []
-        self.include_patterns = include_patterns or []
-        self.max_file_size = max_file_size
-        self.min_file_size = min_file_size
-        self.workspace_only = workspace_only
-        self.initial_path = initial_path
-        self.allow_create = allow_create
-        self.allow_rename = allow_rename
-
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["fileSystemPicker", "file_picker", "folder_picker"]
+    allow_files: bool = attrs.field(default=False)
+    allow_directories: bool = attrs.field(default=True)
+    allow_sequences: bool = attrs.field(default=False)
+    multiple: bool = attrs.field(default=False)
+    file_types: list[str] = attrs.field(default=None, converter=_pattern_list)
+    file_extensions: list[str] = attrs.field(default=None, converter=_pattern_list)
+    exclude_patterns: list[str] = attrs.field(default=None, converter=_pattern_list)
+    include_patterns: list[str] = attrs.field(default=None, converter=_pattern_list)
+    max_file_size: int | None = attrs.field(default=None)
+    min_file_size: int | None = attrs.field(default=None)
+    workspace_only: bool = attrs.field(default=False)
+    initial_path: str | None = attrs.field(default=None)
+    allow_create: bool = attrs.field(default=False)
+    allow_rename: bool = attrs.field(default=False)
 
     def ui_options_for_trait(self) -> dict[str, Any]:
         """Generate the fileSystemPicker UI options dictionary."""

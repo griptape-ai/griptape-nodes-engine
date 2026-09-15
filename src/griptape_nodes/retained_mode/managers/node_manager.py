@@ -40,6 +40,7 @@ from griptape_nodes.exe_types.core_types import (
     ParameterMode,
     ParameterType,
     ParameterTypeBuiltin,
+    Trait,
 )
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_groups import NodeGroupMembershipError, SubflowNodeGroup
@@ -55,6 +56,7 @@ from griptape_nodes.exe_types.node_types import (
     aprocess_scope,
     sanctioned_parameter_mutation,
 )
+from griptape_nodes.exe_types.trait_state import TraitStateEntry
 from griptape_nodes.node_library.library_declarations import (
     ArbitraryPythonExecutionNodeProperty,
     LifecycleStageLibraryProperty,
@@ -239,6 +241,8 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointSubjectType,
 )
 from griptape_nodes.retained_mode.retained_mode import RetainedMode
+from griptape_nodes.traits.legacy_ui_options import reconstruct_traits_from_ui_options
+from griptape_nodes.traits.trait_registry import TraitRegistry
 from griptape_nodes.utils.exception_utils import readable_exception_message
 
 logger = logging.getLogger("griptape_nodes")
@@ -246,6 +250,16 @@ logger = logging.getLogger("griptape_nodes")
 # Sentinel for "key not present in node.parameter_values". Distinct from None
 # so a legitimately-stored None does not collide with "missing".
 _PARAM_MISSING = object()
+
+
+class RestoredTrait(NamedTuple):
+    """Pair a saved trait entry with its restored instance.
+
+    Callbacks restore after parameter attachment because they require the owning node.
+    """
+
+    entry: TraitStateEntry
+    trait: Trait | None
 
 
 class SerializedParameterValues(NamedTuple):
@@ -1900,6 +1914,22 @@ class NodeManager(EngineScoped):
             settable=request.settable,
             allow_variable_substitution=request.allow_variable_substitution,
         )
+        # Rebuild traits from saved state so their converters, validators,
+        # and ui_options come back with the class.
+        restored_traits: list[RestoredTrait] = []
+        if request.traits:
+            restored_traits = NodeManager._apply_trait_states(new_param, request.traits)
+        elif request.traits is None:
+            # No traits field at all means the file predates trait state, so whatever controls
+            # this parameter had are recorded only as ui_options keys. An empty list is a
+            # current save saying there are none, which is not the same thing.
+            rebuilt = reconstruct_traits_from_ui_options(new_param)
+            if rebuilt:
+                logger.debug(
+                    "Parameter '%s' had %s rebuilt from the ui_options a pre-trait-state save wrote.",
+                    final_param_name,
+                    ", ".join(type(trait).__name__ for trait in rebuilt),
+                )
         try:
             with sanctioned_parameter_mutation():
                 if request.parent_container_name and request.initial_setup:
@@ -1913,6 +1943,13 @@ class NodeManager(EngineScoped):
         except Exception as e:
             details = f"Couldn't add parameter with name {request.parameter_name} to Node '{node_name}'. Error: {e}"
             return AddParameterToNodeResultFailure(result_details=details)
+
+        # Re-bind trait callbacks now that the parameter is attached: a saved callback names
+        # a method on the owning node, which the parameter can only reach once it has one.
+        if request.traits:
+            NodeManager._apply_trait_callbacks(new_param, restored_traits)
+        if request.value_callbacks:
+            new_param.apply_value_callback_names(request.value_callbacks, node)
 
         details = f"Successfully added Parameter '{final_param_name}' to Node '{node_name}'."
         log_level = logging.DEBUG
@@ -2267,8 +2304,20 @@ class NodeManager(EngineScoped):
                 parameter.tooltip_as_property = request.tooltip_as_property
             if request.tooltip_as_output is not None:
                 parameter.tooltip_as_output = request.tooltip_as_output
+            if request.traits is not None:
+                # An altered parameter is already attached to its node, so state and
+                # callbacks can both be restored here.
+                restored = NodeManager._apply_trait_states(parameter, request.traits)
+                NodeManager._apply_trait_callbacks(parameter, restored)
+            if request.value_callbacks is not None:
+                parameter.apply_value_callback_names(request.value_callbacks, parameter.get_node())
         if request.ui_options is not None and hasattr(parameter, "ui_options"):
-            parameter.ui_options = request.ui_options  # type: ignore[attr-defined]
+            if isinstance(parameter, Parameter):
+                # An inbound write comes from the editor or a saved file, neither of which
+                # knows which keys an attached trait owns, so route those to their owner.
+                parameter.adopt_ui_options(request.ui_options)
+            else:
+                parameter.ui_options = request.ui_options  # type: ignore[attr-defined]
 
     def modify_key_parameter_fields(self, request: AlterParameterDetailsRequest, parameter: Parameter) -> None:  # noqa: C901, PLR0912
         if request.type is not None:
@@ -3701,9 +3750,7 @@ class NodeManager(EngineScoped):
                 # Create the parameter, or alter it on the existing node
                 if parameter.user_defined:
                     # Always serialize user-defined parameters regardless of node type
-                    param_dict = parameter.to_dict()
-                    param_dict["initial_setup"] = True
-                    add_param_request = AddParameterToNodeRequest.create(**param_dict)
+                    add_param_request = AddParameterToNodeRequest.create(**self._parameter_save_dict(parameter, node))
                     element_modification_commands.append(add_param_request)
                 elif isinstance(node, ErrorProxyNode):
                     # For ErrorProxyNode, replay all recorded initialization requests for this parameter
@@ -3719,9 +3766,7 @@ class NodeManager(EngineScoped):
                     element_modification_commands.extend(matching_requests)
                 elif reference_node is None:
                     # Normal node with no reference - treat all parameters as needing serialization
-                    param_dict = parameter.to_dict()
-                    param_dict["initial_setup"] = True
-                    add_param_request = AddParameterToNodeRequest.create(**param_dict)
+                    add_param_request = AddParameterToNodeRequest.create(**self._parameter_save_dict(parameter, node))
                     element_modification_commands.append(add_param_request)
                 else:
                     # Normal node - compare against reference node
@@ -3734,6 +3779,8 @@ class NodeManager(EngineScoped):
                     if relevant:
                         diff["parameter_name"] = parameter.name
                         diff["initial_setup"] = True
+                        if "traits" in diff:
+                            diff["traits"] = self._stabilize_trait_modules(diff["traits"])
                         alter_param_request = AlterParameterDetailsRequest.create(**diff)
                         element_modification_commands.append(alter_param_request)
 
@@ -4313,6 +4360,153 @@ class NodeManager(EngineScoped):
             result.node_names,
             result_details=f"Successfully duplicated {len(serialize_result.node_names_serialized)} nodes.",
         )
+
+    def _parameter_save_dict(self, parameter: Parameter, node: BaseNode) -> dict[str, Any]:
+        """Build fields that recreate a parameter, warning about omitted callbacks."""
+        param_dict = parameter.to_dict()
+        param_dict["initial_setup"] = True
+        param_dict["ui_options"] = parameter.authored_ui_options()
+        param_dict["traits"] = self._stabilize_trait_modules(parameter.trait_states())
+        param_dict["value_callbacks"] = parameter.value_callback_names(node)
+        NodeManager._report_unsaveable_callbacks(parameter)
+        return param_dict
+
+    def _stabilize_trait_modules(self, trait_states: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Replace process-local library module names with stable namespaces."""
+        library_manager = self.engine.library_manager
+        for entry in trait_states:
+            trait_module = entry.get("trait_module")
+            if trait_module is None:
+                continue
+            if not library_manager.is_dynamic_module(trait_module):
+                continue
+            stable_namespace = library_manager.get_stable_namespace_for_dynamic_module(trait_module)
+            if stable_namespace is not None:
+                entry["trait_module"] = stable_namespace
+        return trait_states
+
+    @staticmethod
+    def _report_unsaveable_callbacks(parameter: Parameter) -> None:
+        """Warn about runtime callbacks that cannot be restored by method name."""
+        owner = parameter.get_node()
+        locations: list[str] = []
+        for trait in parameter.find_elements_by_type(Trait):
+            unnameable = trait.unnameable_callbacks(owner)
+            if unnameable:
+                locations.append(f"{', '.join(unnameable)} on the '{type(trait).__name__}' control")
+        for kind, count in parameter.unnameable_value_callbacks(owner).items():
+            locations.append(f"{count} {kind[:-1] if count == 1 else kind}")
+        if not locations:
+            return
+        logger.warning(
+            "Parameter '%s' attaches %s that cannot be saved. Pass a method of the node "
+            "(self.my_handler) rather than a lambda or a local function, so the saved workflow "
+            "can find it again on load.",
+            parameter.name,
+            "; ".join(locations),
+        )
+
+    @staticmethod
+    def _apply_trait_states(parameter: Parameter, trait_states: list[dict[str, Any]]) -> list[RestoredTrait]:
+        """Apply state to matching traits and build missing traits.
+
+        Existing instances are preserved with constructor wiring. Unresolvable traits are
+        skipped. The returned pairing lets callbacks restore after node attachment.
+        """
+        entries = NodeManager._parse_trait_entries(parameter, trait_states)
+        paired = NodeManager._pair_saved_traits(parameter, entries)
+        restored: list[RestoredTrait] = []
+        for entry, existing in zip(entries, paired, strict=True):
+            trait = existing
+            if existing is None:
+                trait = NodeManager._build_saved_trait(parameter, entry)
+            else:
+                try:
+                    existing.apply_state(entry.trait_state)
+                except TypeError:
+                    NodeManager._warn_unsatisfiable_trait_state(parameter, entry.trait_name)
+            restored.append(RestoredTrait(entry=entry, trait=trait))
+        return restored
+
+    @staticmethod
+    def _parse_trait_entries(parameter: Parameter, trait_states: list[dict[str, Any]]) -> list[TraitStateEntry]:
+        entries: list[TraitStateEntry] = []
+        for state in trait_states:
+            entry = TraitStateEntry.from_dict(state)
+            if entry is None:
+                logger.warning(
+                    "Parameter '%s' was saved with a trait entry that names no trait, so it is skipped. "
+                    "The parameter will load without whatever control that entry described.",
+                    parameter.name,
+                )
+                continue
+            entries.append(entry)
+        return entries
+
+    @staticmethod
+    def _build_saved_trait(parameter: Parameter, entry: TraitStateEntry) -> Trait | None:
+        trait_class = NodeManager._resolve_saved_trait(entry)
+        if trait_class is None:
+            logger.warning(
+                "Parameter '%s' was saved with the '%s' trait from '%s', but that trait could not be loaded. "
+                "The parameter will load without it. Check that the library providing it is installed.",
+                parameter.name,
+                entry.trait_name,
+                entry.trait_module,
+            )
+            return None
+        try:
+            trait = trait_class.from_state(entry.trait_state)
+        except TypeError:
+            NodeManager._warn_unsatisfiable_trait_state(parameter, entry.trait_name)
+            return None
+        parameter.add_trait(trait)
+        return trait
+
+    @staticmethod
+    def _pair_saved_traits(parameter: Parameter, entries: list[TraitStateEntry]) -> list[Trait | None]:
+        """Match by resolved class, consuming each attached trait at most once."""
+        unmatched = parameter.find_elements_by_type(Trait)
+        paired: list[Trait | None] = []
+        for entry in entries:
+            trait_class = NodeManager._resolve_saved_trait(entry)
+            match = None
+            for candidate in unmatched:
+                if type(candidate) is trait_class:
+                    match = candidate
+                    break
+            if match is not None:
+                unmatched.remove(match)
+            paired.append(match)
+        return paired
+
+    @staticmethod
+    def _resolve_saved_trait(entry: TraitStateEntry) -> type[Trait] | None:
+        if entry.trait_module is None:
+            return None
+        return TraitRegistry.resolve(entry.trait_name, entry.trait_module)
+
+    @staticmethod
+    def _warn_unsatisfiable_trait_state(parameter: Parameter, trait_name: str) -> None:
+        logger.warning(
+            "Parameter '%s' was saved with the '%s' trait, but its saved state is missing "
+            "something the trait requires. The parameter will load without it. Check that the "
+            "library providing it is up to date.",
+            parameter.name,
+            trait_name,
+        )
+
+    @staticmethod
+    def _apply_trait_callbacks(parameter: Parameter, restored: list[RestoredTrait]) -> None:
+        """Bind callbacks after the parameter can reach its owning node.
+
+        Constructor-supplied callbacks take precedence over saved names.
+        """
+        owner = parameter.get_node()
+        for entry, trait in restored:
+            if not entry.trait_callbacks or trait is None:
+                continue
+            trait.apply_callback_names(entry.trait_callbacks, owner)
 
     @staticmethod
     def _manage_alter_details(parameter: Parameter, base_node_obj: BaseNode) -> dict:
