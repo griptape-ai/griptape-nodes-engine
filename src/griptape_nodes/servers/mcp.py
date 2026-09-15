@@ -88,6 +88,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
 )
 from griptape_nodes.retained_mode.events.workflow_events import (
     ListAllWorkflowsRequest,
+    RunWorkflowFromRegistryRequest,
     RunWorkflowWithCurrentStateRequest,
     SaveWorkflowRequest,
 )
@@ -97,6 +98,12 @@ from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
 
 SUPPORTED_REQUEST_EVENTS: dict[str, type[RequestPayload]] = {
     # Workflows
+    # RunWorkflowFromRegistryRequest is how an external client OPENS a workflow: it loads the
+    # saved file's nodes, connections, and values into the engine and puts it in the Current
+    # Context. SetWorkflowContextRequest only does the bookkeeping half, so without this an
+    # agent had no way to open anything -- and, because the editor always keeps a workflow in
+    # context, no way to get past SetWorkflowContext's already-in-context refusal either.
+    "RunWorkflowFromRegistryRequest": RunWorkflowFromRegistryRequest,
     "RunWorkflowWithCurrentStateRequest": RunWorkflowWithCurrentStateRequest,
     "ListAllWorkflowsRequest": ListAllWorkflowsRequest,
     # Workflow context
@@ -170,21 +177,28 @@ EVENT_REQUEST_BATCH_DESCRIPTION = (
     "Args:\n"
     "    requests: ordered list of inner calls. Each entry is\n"
     "        {request_type: <name of a supported tool>, request: <that tool's argument object>}.\n"
-    "    timeout_ms: overall timeout for the whole batch in milliseconds. Defaults to\n"
-    "        30000 ms per inner request, capped at 300000 ms.\n\n"
+    "    timeout_ms: overall timeout for the whole batch in milliseconds. Defaults to the sum of\n"
+    "        the inner requests' own timeouts -- 30000 ms each, except the slower tools that ask\n"
+    "        for more (RunWorkflowFromRegistryRequest gets 300000 ms) -- capped at 300000 ms.\n\n"
     "Returns:\n"
     "    list of trimmed responses in submission order. Each entry has the same shape as a\n"
     "    single tool call ({ok, details, ...payload fields}). Failures appear as\n"
     "    {ok: false, details: ...} in their slot rather than aborting the rest of the batch.\n"
 )
-# Timeout applied to a single (non-batch) tool call.
+# Timeout applied to a single (non-batch) tool call, unless the tool asks for more below.
 _SINGLE_REQUEST_TIMEOUT_MS = 30000
-# Per-inner-request timeout used when the caller does not pass timeout_ms. Mirrors the timeout the
-# single-request path applies so a batch of one behaves identically.
-_BATCH_PER_REQUEST_TIMEOUT_MS = _SINGLE_REQUEST_TIMEOUT_MS
 # Hard ceiling for an auto-computed batch timeout. Long enough to accommodate a large build phase
 # without letting a runaway batch hold the connection open indefinitely.
 _BATCH_MAX_AUTO_TIMEOUT_MS = 300000
+# Tools that routinely need longer than the default, and what they get instead. Opening a workflow
+# resolves the node libraries it needs and replays the whole saved file, which on a large workflow --
+# the kind this tool exists for -- is minutes of work. Timing it out is worse than slow: dispatch
+# shields the engine-side coroutine, so the open runs to completion either way and the agent only
+# stops hearing how it went, which invites the one response that does damage -- a retry whose clean
+# slate lands partway through the first replay.
+_REQUEST_TIMEOUT_OVERRIDES_MS: dict[str, int] = {
+    "RunWorkflowFromRegistryRequest": _BATCH_MAX_AUTO_TIMEOUT_MS,
+}
 
 GTN_MCP_SERVER_HOST = os.getenv("GTN_MCP_SERVER_HOST", "localhost")
 # Port of the MCP server (where uvicorn binds). Stable by default so external MCP clients
@@ -331,14 +345,24 @@ def _build_batch_pairs(raw_requests: object) -> list[tuple[str, dict[str, Any]]]
     return pairs
 
 
-def _resolve_batch_timeout_ms(override: object, num_requests: int) -> int:
+def _timeout_ms_for_request(request_type: str) -> int:
+    """Return how long to wait for one request of this type, in milliseconds.
+
+    Both dispatch paths ask here, so a slow tool gets the same budget alone as it does inside a
+    batch and an agent does not have to know which envelope it picked.
+    """
+    return _REQUEST_TIMEOUT_OVERRIDES_MS.get(request_type, _SINGLE_REQUEST_TIMEOUT_MS)
+
+
+def _resolve_batch_timeout_ms(override: object, request_types: list[str]) -> int:
     """Return the timeout_ms to apply to a batch, validating any caller override.
 
-    Without an override, scales the per-request timeout linearly with batch size and clamps to a
-    ceiling so a malformed call cannot hold the connection open indefinitely.
+    Without an override, adds up what each inner request would be allowed on its own and clamps the
+    total to a ceiling so a malformed call cannot hold the connection open indefinitely.
     """
     if override is None:
-        return min(_BATCH_PER_REQUEST_TIMEOUT_MS * num_requests, _BATCH_MAX_AUTO_TIMEOUT_MS)
+        summed_timeout_ms = sum(_timeout_ms_for_request(request_type) for request_type in request_types)
+        return min(summed_timeout_ms, _BATCH_MAX_AUTO_TIMEOUT_MS)
     # bool is a subclass of int; reject explicitly so True does not get treated as 1ms.
     if not isinstance(override, int) or isinstance(override, bool):
         msg = (
@@ -404,6 +428,10 @@ async def _dispatch_to_engine(request_payload: RequestPayload, timeout_ms: int |
     (griptape-nodes-engine#4883). The pre-in-process WebSocket transport let the engine run a
     request to completion even after the client stopped waiting, and shielding preserves that
     contract: the caller still sees a ``TimeoutError`` and can poll for state afterwards.
+
+    A bare ``TimeoutError`` stringifies to the empty string, and ``call_tool`` reports whatever it
+    catches, so the timeout is re-raised carrying a message: an agent that gets back an error with
+    nothing in it learns neither that it timed out nor that retrying is the wrong move.
     """
     engine_loop = GriptapeNodes.EventManager().event_loop
     if engine_loop is None:
@@ -416,7 +444,17 @@ async def _dispatch_to_engine(request_payload: RequestPayload, timeout_ms: int |
         asyncio.run_coroutine_threadsafe(_handle_request_on_engine_loop(request_payload), engine_loop)
     )
     if timeout_ms:
-        return await asyncio.wait_for(asyncio.shield(response_future), timeout=timeout_ms / 1000)
+        try:
+            return await asyncio.wait_for(asyncio.shield(response_future), timeout=timeout_ms / 1000)
+        except TimeoutError as exc:
+            msg = (
+                f"Attempted to run {type(request_payload).__name__} on the engine. "
+                f"Failed because the engine did not answer within {timeout_ms / 1000:g} seconds. "
+                f"It is still working on the request -- nothing was cancelled -- so sending the same "
+                f"request again would run it a second time on top of the first. Wait, then read the "
+                f"state back instead."
+            )
+            raise TimeoutError(msg) from exc
     return await asyncio.shield(response_future)
 
 
@@ -452,7 +490,9 @@ async def _call_tool_payload(name: str, arguments: dict[str, Any]) -> str:
     """Dispatch one tool call and return its JSON text payload."""
     if name == EVENT_REQUEST_BATCH_TOOL_NAME:
         pairs = _build_batch_pairs(arguments.get("requests"))
-        timeout_ms = _resolve_batch_timeout_ms(arguments.get("timeout_ms"), len(pairs))
+        timeout_ms = _resolve_batch_timeout_ms(
+            arguments.get("timeout_ms"), [request_type for request_type, _payload in pairs]
+        )
         raw_results = await _dispatch_batch_to_engine(pairs, timeout_ms)
         mcp_server_logger.debug("Got %d batch results", len(raw_results))
         return json.dumps(_trim_batch_results(raw_results))
@@ -462,7 +502,7 @@ async def _call_tool_payload(name: str, arguments: dict[str, Any]) -> str:
         raise ValueError(msg)
 
     request_payload = SUPPORTED_REQUEST_EVENTS[name](**arguments)
-    result = await _dispatch_to_engine(request_payload, timeout_ms=_SINGLE_REQUEST_TIMEOUT_MS)
+    result = await _dispatch_to_engine(request_payload, timeout_ms=_timeout_ms_for_request(name))
     mcp_server_logger.debug("Got result: %s", result)
     return json.dumps(_trim_response(result))
 
@@ -472,11 +512,23 @@ async def _dispatch_batch_to_engine(pairs: list[tuple[str, dict[str, Any]]], tim
 
     Mirrors the single-request path but gathers the per-request futures. Failures are returned
     in their slot (return_exceptions semantics) so one bad inner request does not abort the rest;
-    _trim_batch_results maps those exceptions to ok=false responses.
+    _trim_batch_results maps those exceptions to ok=false responses. The batch-wide timeout is
+    re-raised with a message for the same reason the single-request one is: an empty error tells
+    the agent nothing about what happened or what to do next.
     """
     coros = [_dispatch_to_engine(SUPPORTED_REQUEST_EVENTS[request_type](**payload)) for request_type, payload in pairs]
     gather = asyncio.gather(*coros, return_exceptions=True)
-    return await asyncio.wait_for(gather, timeout=timeout_ms / 1000)
+    try:
+        return await asyncio.wait_for(gather, timeout=timeout_ms / 1000)
+    except TimeoutError as exc:
+        msg = (
+            f"Attempted to run a batch of {len(pairs)} requests on the engine. "
+            f"Failed because the batch did not finish within {timeout_ms / 1000:g} seconds. "
+            f"The engine is still working through it -- nothing was cancelled -- so resending the "
+            f"batch would run its requests a second time. Wait, then read the state back instead, or "
+            f"resend with a larger timeout_ms if the work genuinely needs longer."
+        )
+        raise TimeoutError(msg) from exc
 
 
 def start_mcp_server(sock: socket.socket) -> None:

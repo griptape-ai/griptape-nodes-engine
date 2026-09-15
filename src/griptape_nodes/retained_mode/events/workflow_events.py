@@ -111,16 +111,42 @@ class RunWorkflowWithCurrentStateResultFailure(ResultPayloadFailure):
 @dataclass
 @PayloadRegistry.register
 class RunWorkflowFromRegistryRequest(RequestPayload):
-    """Run a workflow from the registry.
+    """Open a saved workflow from the registry and make it the Current Context.
 
-    Use when: Executing registered workflows, running workflows by name,
-    using workflow templates, automated workflow execution.
+    Use when: Opening a workflow by name, switching which workflow is open, loading a
+    workflow template. This is the request that OPENS a workflow: it replays the saved `.py`
+    file, rebuilding the workflow's nodes, connections, and parameter values in the engine,
+    and leaves that workflow in the Current Context. SetWorkflowContextRequest only records a
+    name, so it would leave you holding an empty engine -- and it refuses outright while
+    another workflow is open.
+
+    DESTRUCTIVE BY DEFAULT. With run_with_clean_slate=True this first wipes the engine,
+    which throws away unsaved changes in whatever workflow is currently open -- including
+    work an artist has in front of them right now in the editor, which cannot be
+    recovered. Save first (SaveWorkflowRequest) if that matters.
+
+    Building the graph is where this stops. It does NOT execute the workflow; issue a
+    StartFlowRequest afterwards to do that. It also cannot open an unsaved workflow,
+    because there is no file to replay.
+
+    The engine emits CurrentWorkflowChanged app events as the Current Context moves; that event
+    documents how many to expect and what each one means. Wait for the workflow you asked for
+    rather than for a fixed number of events. Opening a large workflow can take a while, since it
+    resolves node libraries and replays the whole file, and a timeout on your side does not cancel
+    it -- so wait and read the graph back (ListNodesInFlowRequest against the current flow) rather
+    than sending the request again, which would replay the file a second time.
 
     Args:
-        workflow_name: Name of the workflow in the registry to execute
-        run_with_clean_slate: Whether to start with a clean state (default: True)
+        workflow_name: Registry key of the workflow to open. These are the keys of the
+            dict returned by ListAllWorkflowsRequest, not the display name inside each
+            entry's metadata.
+        run_with_clean_slate: Whether to discard everything currently in the engine before
+            opening (default: True). True is the normal "open this workflow" behavior.
+            False loads the workflow's objects alongside whatever is already there and
+            nests it on top of the existing Current Context rather than replacing it, so
+            the workflow underneath stays on the stack. Rarely what you want.
 
-    Results: RunWorkflowFromRegistryResultSuccess | RunWorkflowFromRegistryResultFailure (workflow not found, execution error)
+    Results: RunWorkflowFromRegistryResultSuccess | RunWorkflowFromRegistryResultFailure (workflow not found, workflow unsaved, execution error)
     """
 
     workflow_name: str
