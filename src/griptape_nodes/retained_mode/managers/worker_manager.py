@@ -539,7 +539,15 @@ class WorkerManager(EngineScoped):
         # wrap_future adapts it for this loop and installs the threadsafe wakeup. A CancelledError
         # out of here means only one thing -- the caller was cancelled -- because a worker going
         # away raises WorkerGoneError instead.
-        return await asyncio.wrap_future(future)
+        try:
+            return await asyncio.wrap_future(future)
+        except asyncio.CancelledError:
+            # The other ways out of this await remove the request themselves: a response pops it in
+            # _try_match, eviction in cancel_requests_by_tag. A cancelled caller does not, so
+            # without this the entry outlives the run -- one per cancelled node execution, each
+            # still carrying its worker's tag for cancel_requests_by_tag to walk.
+            self._tx.request_client.discard_request(request_id)
+            raise
 
     async def _orchestrator_static_server_base_url(self) -> str | None:
         """The base URL this engine serves the workspace on, awaited until initialization decides it.

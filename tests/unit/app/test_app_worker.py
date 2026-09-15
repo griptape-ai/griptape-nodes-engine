@@ -64,6 +64,11 @@ class _FakeRequestClient:
             if not entry.future.done():
                 entry.future.set_exception(error)
 
+    def discard_request(self, request_id: str) -> None:
+        entry = self._pending_requests.pop(request_id, None)
+        if entry is not None and not entry.future.done():
+            entry.future.cancel()
+
 
 @pytest.fixture
 def worker_manager() -> WorkerManager:
@@ -1233,6 +1238,30 @@ class TestRouteToWorker:
 
         with pytest.raises(asyncio.CancelledError):
             await task
+
+    @pytest.mark.asyncio
+    async def test_flow_cancellation_stops_tracking_the_request(self, worker_manager: WorkerManager) -> None:
+        """A cancelled run must not leave its request behind in the pending map.
+
+        Nothing else pops it on this path, so the entry would outlive the run -- one per cancelled
+        node execution for the life of the process -- and each keeps its worker's tag, so a later
+        cancel_requests_by_tag walks and re-settles long-dead requests.
+        """
+        assert isinstance(worker_manager._tx.request_client, _FakeRequestClient)
+        fake_rc = worker_manager._tx.request_client
+        event_request = EventRequest(request=ExecuteNodeRequest(node_name="MyNode", parameter_values={}))
+
+        task = asyncio.create_task(worker_manager.route_to_worker(event_request, _ENGINE, _WORKER_REQUEST_TOPIC))
+        # Long enough to be parked on the response, which is the await the cancellation has to
+        # unwind from for the entry to be the caller's to remove.
+        await asyncio.sleep(0.01)
+        assert len(fake_rc._pending_requests) == 1
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert fake_rc._pending_requests == {}
 
 
 class TestGetTopicsToSubscribe:
