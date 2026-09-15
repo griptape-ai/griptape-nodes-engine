@@ -31,15 +31,22 @@ The builder's postures use those rules differently:
 
 A Production template creates a *soft* deny. Because it contains no `forbid`, another template attached to the same license key can permit anything the Production template leaves out. A `forbid` creates a hard block that no permit can override. This also applies to forbids in Griptape-managed platform policies, which you cannot edit or override with your own templates.
 
-!!! warning "A `forbid` on its own does not make a blocklist"
+!!! warning "Building a blocklist"
 
-    Cedar does not allow anything implicitly. If the templates attached to a license key contain no matching `permit`, Cedar denies everything, including operations not named by a `forbid`.
+    A blocklist needs both an allowance and exceptions: a `permit` for everything allowed by default, followed by `forbid` statements for the exclusions. Without a matching `permit`, Cedar allows nothing. This template therefore denies every operation, not only the LABS libraries it names:
 
-    Cedar evaluates every template attached to a key as one policy set. The catch-all permit and the forbids can live in different templates. An Exploration template supplies the catch-all:
+    ```cedar
+    forbid(principal, action, resource)
+    when { resource has lifecycle_stage && resource.lifecycle_stage == "LABS" };
+    ```
+
+    Pair the `forbid` with a catch-all permit to make it an exception:
 
     ```cedar
     permit(principal, action, resource);
     ```
+
+    The statements can live in separate templates. Cedar evaluates all templates attached to a license key as one policy set, so an Exploration template can supply the catch-all for a `forbid` elsewhere on the same key.
 
 ## Checkpoints
 
@@ -56,7 +63,7 @@ Each action below identifies an operation that the engine gates. The result of a
 | `Action::"ReadVideoCodec"`  | Video is about to be read, and when a picker is built.    | `VideoCodec` | The read is refused, or the codec is filtered out.                                                            |
 | `Action::"WriteVideoCodec"` | Video is about to be written, and when a picker is built. | `VideoCodec` | The write is refused, or the codec is filtered out.                                                           |
 
-Use both `OfferModel` and `InvokeModel` when restricting model access. The first removes a denied model from dropdowns. The second prevents a node already bound to that model from calling it.
+When restricting a model, name both `OfferModel` and `InvokeModel`. `OfferModel` removes it from pickers, but without `InvokeModel`, nodes already bound to it can still call it.
 
 !!! note "Reserved action names"
 
@@ -93,7 +100,11 @@ The three set attributes let you block a node based on the models it binds to be
 | `id`      | string | Always. The project's opaque id, a GUID for projects created in the editor. |
 | `name`    | string | The template has loaded far enough to know its name.                        |
 
-Never construct a project `id` or assume it is a file path. The policy matches it verbatim, and the editor generates it. Copy the value from the project picker in the Permission Editor. Older projects created before explicit ids were added use their file path instead, so project ids can take either form.
+Never construct a project `id` or assume it is a file path. The policy matches it verbatim, and the editor generates it. Copy the value from the project picker in the Permission Editor.
+
+!!! warning "Legacy project ids"
+
+    Projects that predate explicit ids use their file path as the id. They do not match rules written for GUIDs, just as newer projects do not match rules written for paths. Copy each project's id from the project picker before naming it in a rule.
 
 Use `name` for a human-readable rule and `id` when the match must be exact. Prefer `id` in a `permit`. The project name becomes available only after the template has loaded, and a permit that does not match results in a denial.
 
@@ -106,9 +117,9 @@ Use `name` for a human-readable rule and `id` when the match must be exact. Pref
 | `model_families` | set<string> | The resolved model declares a family. Carries that one family.       |
 | `node_type`      | string      | An `OfferModel` check made on behalf of a node. Names the node type. |
 
-The engine fills `node_type` at runtime, but the declared entity model does not include it. Guard this attribute and expect it to move. The other attributes in the table are stable.
+`node_type` identifies the node for which an `OfferModel` check is running; it does not describe the model. It appears only when the check is made on behalf of a node. A catalog-wide picker has no node to attribute, so it omits `node_type` and any rule that reads the attribute does not apply there. Match on `id` or `provider_id` when a rule must apply everywhere.
 
-The entity hierarchy places each `Model` under its provider. For example, `resource in ModelProvider::"anthropic"` matches every model offered by that provider.
+Unlike the other attributes in the table, `node_type` is not declared in the entity model. Treat it as unstable and always guard it with `has`.
 
 ### `VideoCodec`
 
@@ -116,6 +127,26 @@ The entity hierarchy places each `Model` under its provider. For example, `resou
 | ------------------ | ------ | ------------------------------------------------------ |
 | `id`               | string | Always. The codec name as probed, e.g. `h264`, `hevc`. |
 | `container_format` | string | The container was known, e.g. `mp4`, `mov`.            |
+
+### Entity hierarchy
+
+The hierarchy has one parent entity: `ModelProvider`. Each `Model` sits under the provider that offers it, so `in` can cover all of a provider's models without naming them individually:
+
+```cedar
+forbid(principal, action, resource)
+unless { resource in ModelProvider::"anthropic" };
+```
+
+Provider ids are the provider keys in a library's [`model_catalog`](../development/custom_nodes/authoring_libraries.md#model_catalog), such as `anthropic` or `ollama`.
+
+Model families and libraries are not parent entities. The analogous expressions below match nothing:
+
+| Expression                            | Use instead                                                     |
+| ------------------------------------- | --------------------------------------------------------------- |
+| `resource in ModelFamily::"Claude 4"` | `resource.model_families.contains("Claude 4")`                  |
+| `resource in Library::"My Library"`   | The node's `id`, or gate the library itself with `LoadLibrary`. |
+
+Project inheritance is also separate from ancestor matching. The engine evaluates the policy once for each project in the chain, as described under [Project scope](#project-scope).
 
 ## Context facts
 
@@ -324,13 +355,6 @@ when {
 ### Check names for typos
 
 The Raw Cedar editor checks syntax when you save and rejects templates that do not parse. It does not know whether `resource.lifecycle_stge` is a real attribute or `Action::"LoadLibrry"` is a real checkpoint. Both typos parse successfully but match nothing, leaving you with a rule that appears not to work. Copy attribute and action names from the tables on this page.
-
-### Know the hierarchy limits
-
-`resource in ModelProvider::"anthropic"` works because the engine places each model under its provider. Similar-looking expressions do not work for families or libraries:
-
-- `resource in ModelFamily::"Claude 4"` matches nothing. Use `resource.model_families.contains("Claude 4")`.
-- `resource in Library::"My Library"` matches nothing when the resource is a `NodeType`. Match the node's `id`, or gate its library with `LoadLibrary`.
 
 ### Permit every checkpoint
 
