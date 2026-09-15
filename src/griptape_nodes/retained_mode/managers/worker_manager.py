@@ -809,6 +809,11 @@ class WorkerManager(EngineScoped):
         caller cannot tell that a bad interpreter or an OSError stopped the worker ever existing.
         Refusals that return rather than raise are invisible here and record themselves.
         """
+        # Asked before `task.exception()`, which raises on a cancelled task. From a done-callback
+        # that surfaces as loop-level "Exception in callback" noise and skips the refusal below.
+        # Cancellation reaches here at loop teardown, where no run is waiting on a worker.
+        if task.cancelled():
+            return
         exc = task.exception()
         if exc is None:
             return

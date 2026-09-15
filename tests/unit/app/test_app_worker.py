@@ -1050,6 +1050,40 @@ class TestHandleStartWorkerRequest:
         assert isinstance(result, worker_events.StartWorkerResultSuccess)
 
 
+class TestLogSpawnError:
+    @pytest.mark.asyncio
+    async def test_a_cancelled_spawn_does_not_raise_from_the_callback(self, worker_manager: WorkerManager) -> None:
+        """A cancelled spawn task must not make its own done-callback raise.
+
+        `task.exception()` raises on a cancelled task, and a done-callback that raises becomes
+        loop-level "Exception in callback" noise with the refusal below it skipped.
+        """
+
+        async def _never() -> None:
+            await asyncio.sleep(3600)
+
+        task = asyncio.create_task(_never())
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        assert task.cancelled()
+
+        worker_manager._log_spawn_error(task, "My Library")
+
+    @pytest.mark.asyncio
+    async def test_a_failed_spawn_still_records_a_refusal(self, worker_manager: WorkerManager) -> None:
+        async def _raise() -> None:
+            msg = "no interpreter"
+            raise OSError(msg)
+
+        task = asyncio.create_task(_raise())
+        await asyncio.gather(task, return_exceptions=True)
+
+        with patch.object(worker_manager, "note_worker_unavailable") as mock_refuse:
+            worker_manager._log_spawn_error(task, "My Library")
+
+        mock_refuse.assert_called_once()
+
+
 class TestSpawnWhenSessionReady:
     @pytest.mark.asyncio
     async def test_skips_wait_when_session_already_active(self, worker_manager: WorkerManager) -> None:
