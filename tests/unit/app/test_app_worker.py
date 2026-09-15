@@ -8,6 +8,7 @@ the route_to_worker / pending-future mechanism.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import sys
 import threading
@@ -44,19 +45,19 @@ class _FakeRequestClient:
 
     async def track_request(
         self, request_id: str, tag: str = "", *, resolve_failures_as_payload: bool = False
-    ) -> asyncio.Future:
-        future: asyncio.Future = asyncio.Future()
+    ) -> concurrent.futures.Future:
+        future: concurrent.futures.Future = concurrent.futures.Future()
         self._pending_requests[request_id] = _PendingRequest(
             future, tag, resolve_failures_as_payload=resolve_failures_as_payload
         )
         return future
 
-    async def cancel_requests_by_tag(self, tag: str) -> None:
-        to_cancel = [rid for rid, entry in self._pending_requests.items() if entry.tag == tag]
-        for rid in to_cancel:
+    async def fail_requests_by_tag(self, tag: str, error: Exception) -> None:
+        to_fail = [rid for rid, entry in self._pending_requests.items() if entry.tag == tag]
+        for rid in to_fail:
             entry = self._pending_requests.pop(rid)
             if not entry.future.done():
-                entry.future.cancel()
+                entry.future.set_exception(error)
 
 
 @pytest.fixture
@@ -840,6 +841,63 @@ class TestRouteToWorker:
         assert result["result_type"] == ExecuteNodeResultSuccess.__name__
         assert result["result"]["parameter_output_values"] == {"out": 99}
         worker_manager._tx.send_message.assert_called_once()  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_evicted_worker_raises_with_the_reason(self, worker_manager: WorkerManager) -> None:
+        """A worker taken away mid-request surfaces as WorkerGoneError, carrying why.
+
+        Cancelling instead would be indistinguishable from the artist pressing stop, and the
+        resolution machine reaps those silently as CANCELED -- no NodeErrorEvent, only an unnamed
+        INFO line, so the node comes back UNRESOLVED with nothing anywhere saying why.
+        """
+        assert isinstance(worker_manager._tx.request_client, _FakeRequestClient)
+        fake_rc = worker_manager._tx.request_client
+        event_request = EventRequest(request=ExecuteNodeRequest(node_name="MyNode", parameter_values={}))
+
+        async def evict_mid_flight() -> None:
+            await asyncio.sleep(0)
+            await fake_rc.fail_requests_by_tag(
+                _ENGINE, worker_events.WorkerGoneError(f"worker '{_ENGINE}' stopped responding and was shut down")
+            )
+
+        asyncio.create_task(evict_mid_flight())  # noqa: RUF006
+
+        with pytest.raises(worker_events.WorkerGoneError, match="stopped responding and was shut down"):
+            await worker_manager.route_to_worker(event_request, _ENGINE, _WORKER_REQUEST_TOPIC)
+
+    @pytest.mark.asyncio
+    async def test_reset_settles_in_flight_requests_too(self, worker_manager: WorkerManager) -> None:
+        """reset_workers is the other path that takes a worker away, and it clears the registry.
+
+        Eviction is not reachable afterwards -- the heartbeat loop can only evict ids it can still
+        see -- and route_to_worker has no wall-clock ceiling, so a node dispatched into a worker a
+        library reload terminates would await a future nothing ever settles: RESOLVING forever.
+        """
+        assert isinstance(worker_manager._tx.request_client, _FakeRequestClient)
+        worker_manager._workers = {_ENGINE: WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key="Lib")}
+        event_request = EventRequest(request=ExecuteNodeRequest(node_name="MyNode", parameter_values={}))
+
+        async def reset_mid_flight() -> None:
+            await asyncio.sleep(0)
+            await worker_manager.reset_workers()
+
+        asyncio.create_task(reset_mid_flight())  # noqa: RUF006
+
+        with pytest.raises(worker_events.WorkerGoneError, match="shut down to reload library 'Lib'"):
+            await worker_manager.route_to_worker(event_request, _ENGINE, _WORKER_REQUEST_TOPIC)
+
+    @pytest.mark.asyncio
+    async def test_flow_cancellation_still_cancels(self, worker_manager: WorkerManager) -> None:
+        """Cancelling the awaiting task must still raise CancelledError, so stop stays stop."""
+        assert isinstance(worker_manager._tx.request_client, _FakeRequestClient)
+        event_request = EventRequest(request=ExecuteNodeRequest(node_name="MyNode", parameter_values={}))
+
+        task = asyncio.create_task(worker_manager.route_to_worker(event_request, _ENGINE, _WORKER_REQUEST_TOPIC))
+        await asyncio.sleep(0)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
 
 class TestGetTopicsToSubscribe:
