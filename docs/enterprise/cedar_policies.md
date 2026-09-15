@@ -2,7 +2,7 @@
 
 Permission templates are written in [Cedar](https://www.cedarpolicy.com/), Amazon's open-source authorization language. The [Permission Editor](admin_dashboard.md#permission-editor)'s **Permission Builder** compiles your choices into Cedar for you. This page is the reference for the other path: **Raw Cedar** templates you write by hand, and auditing the Cedar a builder template produced.
 
-You need this page when the builder's capability catalog does not cover a rule you want. Everything else is better done in the builder, which cannot produce a policy that fails to parse.
+Reach for Raw Cedar when the builder's capability catalog does not cover a rule you want. If the builder can express the rule, let it: builder output always parses.
 
 ## What a policy decides on
 
@@ -17,7 +17,7 @@ Cedar evaluates every decision as a `(principal, action, resource, context)` tup
 
 A rule keyed to a specific principal matches nothing, because there is one anonymous principal for everybody. Per-user rules do not exist yet; give a user their own license key and attach different templates to it instead.
 
-## Cedar decides by default deny, and deny wins
+## How decisions combine
 
 Two rules govern every template:
 
@@ -147,7 +147,7 @@ Two things follow from how the engine binds `active_project`.
 
 **The blank canvas is exempt from allow-list misses.** Before you open a project, the engine sits on a blank canvas whose project id is `<system-defaults>`. An allow-list that never names it still permits work there, otherwise the engine could not load a single library at boot. An explicit `forbid` on `<system-defaults>` is still honored, so guardrails keep working on the blank canvas. The exemption does not extend to opening a project *from* the blank canvas: that is evaluated against the project you are opening, so an allow-list still decides which projects are reachable.
 
-## Annotations that explain a denial
+## Annotations
 
 Cedar tells the engine *which* rule denied something, not what the user is missing. Three annotations close that gap. All three are a Griptape convention, and Cedar ignores them during evaluation.
 
@@ -319,22 +319,22 @@ when {
 }
 ```
 
-### The editor checks syntax, not spelling
+### Typos in names
 
-Saving a Raw Cedar template parse-checks it, so a template with a syntax error cannot be saved. It does not check that `resource.lifecycle_stge` is a real attribute or that `Action::"LodLibrary"` is a real checkpoint. A typo like that parses cleanly and then matches nothing, which reads as a rule that silently does not work. Copy attribute and action names from the tables above.
+Saving a Raw Cedar template parse-checks it, so a template with a syntax error cannot be saved. It does not check that `resource.lifecycle_stge` is a real attribute or that `Action::"LoadLibrry"` is a real checkpoint. A typo like that parses cleanly and then matches nothing, which reads as a rule that silently does not work. Copy attribute and action names from the tables above.
 
-### Hierarchy works for providers, not families or libraries
+### Hierarchy limits
 
 `resource in ModelProvider::"anthropic"` resolves, because the engine attaches a model's provider edge. Two shapes that look similar do not resolve:
 
 - `resource in ModelFamily::"Claude 4"` matches nothing. Use `resource.model_families.contains("Claude 4")`.
 - `resource in Library::"My Library"` matches nothing on a `NodeType`. Match the node's `id`, or gate the library with `LoadLibrary`.
 
-### Production posture needs a permit per checkpoint
+### One permit per checkpoint
 
 A Production template that permits only `LoadLibrary` leaves node instantiation, project loading, model use, and codec use to default deny. If it is the only template on a license key, nothing works. Either name every checkpoint the user needs or pair the template with another that supplies the rest.
 
-### Templates are enforced in the engine
+### Engine-tier enforcement
 
 The Permission Editor stores every template tagged `enforce_at: ["engine"]`, which is the tier that can see resolved libraries, node types, projects, models, and codecs. Do not hand-edit the tag.
 
