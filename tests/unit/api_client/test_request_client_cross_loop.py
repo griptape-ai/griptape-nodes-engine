@@ -112,7 +112,7 @@ class TestCrossLoopSettlement:
             pending = asyncio.run_coroutine_threadsafe(track_and_wait(), waiter_loop)
             time.sleep(0.2)
 
-            # cancel_requests_by_tag is async only for its lock; drive its body from here.
+            # fail_requests_by_tag is async only for its lock; drive a cancel from here instead.
             entry = client._pending_requests.pop("req-3")
             RequestClient._settle(entry.future.cancel)
             elapsed = pending.result(timeout=WAITER_TIMEOUT_S + 5)
@@ -141,7 +141,9 @@ class TestLockCrossesLoops:
             asyncio.run_coroutine_threadsafe(client.track_request("req-b", tag="worker-b"), other_loop).result(
                 timeout=5
             )
-            asyncio.run_coroutine_threadsafe(client.cancel_requests_by_tag("worker-a"), other_loop).result(timeout=5)
+            asyncio.run_coroutine_threadsafe(
+                client.fail_requests_by_tag("worker-a", RuntimeError("gone")), other_loop
+            ).result(timeout=5)
 
             assert "req-a" not in client._pending_requests
             assert "req-b" in client._pending_requests
@@ -209,12 +211,12 @@ class TestSettlingAnAlreadyFinishedRequest:
         assert client.pending_count == 0
 
     @pytest.mark.asyncio
-    async def test_a_rejection_arriving_after_a_cancel_by_tag_is_dropped(self) -> None:
+    async def test_a_rejection_arriving_after_a_failure_by_tag_is_dropped(self) -> None:
         client = _client()
         await client.track_request("late-2", tag="worker-a")
 
-        await client.cancel_requests_by_tag("worker-a")
-        # cancel_requests_by_tag already popped the entry, so this is the unknown-request path.
+        await client.fail_requests_by_tag("worker-a", RuntimeError("gone"))
+        # fail_requests_by_tag already popped the entry, so this is the unknown-request path.
         await client._reject_request("late-2", RuntimeError("worker died"))
 
         assert client.pending_count == 0
