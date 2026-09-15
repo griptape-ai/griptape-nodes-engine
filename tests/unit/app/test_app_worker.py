@@ -691,6 +691,53 @@ class TestSpawnWorker:
         mock_exec.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_concurrent_spawns_for_one_key_fork_once(self, worker_manager: WorkerManager) -> None:
+        """Two spawns racing for one library must produce one subprocess.
+
+        The registry entry is written only once the process exists, and the work in between
+        suspends, so checking the registry alone lets the second caller through. The loser's
+        process would then be untracked, holding its library's dependencies until its own
+        heartbeat lapsed.
+        """
+        worker_manager.engine.library_manager.execution_site_packages.return_value = None  # type: ignore[union-attr]
+
+        async def _suspend_then_answer() -> None:
+            # Yields inside the window between the duplicate check and the registry write.
+            await asyncio.sleep(0)
+
+        with (
+            patch.object(worker_manager, "_orchestrator_static_server_base_url", _suspend_then_answer),
+            patch("asyncio.create_subprocess_exec", return_value=_managed_proc_mock()) as mock_exec,
+        ):
+            await asyncio.gather(
+                worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "My Library"),
+                worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "My Library"),
+            )
+
+        mock_exec.assert_called_once()
+        assert list(worker_manager._managed_worker_processes) == ["My Library"]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_fork_does_not_keep_the_key_claimed(self, worker_manager: WorkerManager) -> None:
+        """A spawn that raises must leave the key spawnable.
+
+        The claim outliving a failed fork would silently refuse every later attempt for that
+        library, which reads as a worker that never starts and never says why.
+        """
+        worker_manager.engine.library_manager.execution_site_packages.return_value = None  # type: ignore[union-attr]
+
+        with patch("asyncio.create_subprocess_exec", side_effect=OSError("no interpreter")):
+            with pytest.raises(OSError, match="no interpreter"):
+                await worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "My Library")
+
+        assert "My Library" not in worker_manager._spawns_in_flight
+
+        with patch("asyncio.create_subprocess_exec", return_value=_managed_proc_mock()) as mock_exec:
+            await worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "My Library")
+
+        mock_exec.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_spawns_subprocess_with_provided_args(self, worker_manager: WorkerManager) -> None:
         mock_proc = MagicMock()
         mock_proc.pid = 12345

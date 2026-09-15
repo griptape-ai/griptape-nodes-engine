@@ -122,6 +122,11 @@ class WorkerManager(EngineScoped):
         # Subprocesses spawned by this orchestrator (library_name → process)
         self._managed_worker_processes: dict[str, asyncio.subprocess.Process] = {}
 
+        # Worker keys whose spawn has been claimed but has not yet reached the registry above.
+        # The registry entry cannot serve as the claim: it is only written once the subprocess
+        # exists, and the work in between suspends.
+        self._spawns_in_flight: set[str] = set()
+
         # The event loop that spawned the worker subprocesses. asyncio.subprocess.Process
         # binds its exit Future to its creating loop, so proc.wait() is only legal on this
         # loop. Eviction can run on a different loop (the websocket-tasks loop), which is
@@ -368,75 +373,85 @@ class WorkerManager(EngineScoped):
         worker_key is an opaque identifier used to track the process and prevent
         duplicate spawns. Callers are responsible for constructing the args list.
         """
-        if worker_key in self._managed_worker_processes:
+        if worker_key in self._managed_worker_processes or worker_key in self._spawns_in_flight:
             logger.error("Worker for key '%s' already spawned; refusing duplicate spawn.", worker_key)
             return
-        # Spawn with the orchestrator's PRE-project environ so the worker boots with the
-        # same clean env baseline a fresh engine would have. Inheriting the live os.environ
-        # would bake the orchestrator's current-project env vars into the worker's restore
-        # baseline, leaving the worker unable to unset them on a later project switch.
-        base_environ = self.engine.project_manager.get_pre_project_environ()
-        worker_environ = {**base_environ, "GTN_ENGINE_ID": str(uuid.uuid4())}
-        # Stamp the spawning orchestrator's id so the worker can report it in its discovery
-        # heartbeat (orchestrator_engine_id), letting clients identify and nest worker engines.
-        # The orchestrator always has an id by the time it spawns a worker; guard the None
-        # case anyway so a subprocess env value is never None.
-        orchestrator_engine_id = self.engine.engine_identity_manager.active_engine_id
-        if orchestrator_engine_id is not None:
-            worker_environ["GTN_ORCHESTRATOR_ENGINE_ID"] = orchestrator_engine_id
-        # Worker stdout is a pipe when the orchestrator is hosted by a GUI app (e.g. the
-        # desktop app); unbuffered output keeps worker log lines from stalling in Python's
-        # block buffer and from being lost on a crash.
-        worker_environ["PYTHONUNBUFFERED"] = "1"
+        # Claimed here, in the same step as the check above, so no await separates them. Two
+        # spawns for one key would otherwise both get past a registry-only guard and both fork,
+        # and only one can be recorded -- leaving the other's process untracked, holding its
+        # library's dependencies in memory until its own heartbeat lapses.
+        self._spawns_in_flight.add(worker_key)
+        try:
+            # Spawn with the orchestrator's PRE-project environ so the worker boots with the
+            # same clean env baseline a fresh engine would have. Inheriting the live os.environ
+            # would bake the orchestrator's current-project env vars into the worker's restore
+            # baseline, leaving the worker unable to unset them on a later project switch.
+            base_environ = self.engine.project_manager.get_pre_project_environ()
+            worker_environ = {**base_environ, "GTN_ENGINE_ID": str(uuid.uuid4())}
+            # Stamp the spawning orchestrator's id so the worker can report it in its discovery
+            # heartbeat (orchestrator_engine_id), letting clients identify and nest worker engines.
+            # The orchestrator always has an id by the time it spawns a worker; guard the None
+            # case anyway so a subprocess env value is never None.
+            orchestrator_engine_id = self.engine.engine_identity_manager.active_engine_id
+            if orchestrator_engine_id is not None:
+                worker_environ["GTN_ORCHESTRATOR_ENGINE_ID"] = orchestrator_engine_id
+            # Worker stdout is a pipe when the orchestrator is hosted by a GUI app (e.g. the
+            # desktop app); unbuffered output keeps worker log lines from stalling in Python's
+            # block buffer and from being lost on a crash.
+            worker_environ["PYTHONUNBUFFERED"] = "1"
 
-        # PYTHONPATH precedes site-packages, making this library-first with the engine's own
-        # environment as the fallback. It must be the environment rather than a later sys.path
-        # splice: sys.modules never reconsiders a module this process has already imported.
-        execution_site_packages = self.engine.library_manager.execution_site_packages(worker_key)
-        if execution_site_packages is not None:
-            # Prepended, not assigned: a launcher-set PYTHONPATH (embedding hosts, source checkouts)
-            # is part of the environment the engine itself booted with, and dropping it only in
-            # exec-deps workers would lose those modules in exactly one process kind.
-            inherited_pythonpath = worker_environ.get("PYTHONPATH")
-            worker_environ["PYTHONPATH"] = (
-                execution_site_packages + os.pathsep + inherited_pythonpath
-                if inherited_pythonpath
-                else execution_site_packages
+            # PYTHONPATH precedes site-packages, making this library-first with the engine's own
+            # environment as the fallback. It must be the environment rather than a later sys.path
+            # splice: sys.modules never reconsiders a module this process has already imported.
+            execution_site_packages = self.engine.library_manager.execution_site_packages(worker_key)
+            if execution_site_packages is not None:
+                # Prepended, not assigned: a launcher-set PYTHONPATH (embedding hosts, source checkouts)
+                # is part of the environment the engine itself booted with, and dropping it only in
+                # exec-deps workers would lose those modules in exactly one process kind.
+                inherited_pythonpath = worker_environ.get("PYTHONPATH")
+                worker_environ["PYTHONPATH"] = (
+                    execution_site_packages + os.pathsep + inherited_pythonpath
+                    if inherited_pythonpath
+                    else execution_site_packages
+                )
+                logger.debug(
+                    "Worker for library '%s' will resolve imports from %s first",
+                    worker_key,
+                    execution_site_packages,
+                )
+
+            # No workspace variable here: GTN_CONFIG_ outranks the runtime project override, so a worker
+            # handed one could never follow its orchestrator onto a project's workspace again. The
+            # workspace arrives with the project, adopted from the registration reply.
+
+            # Hand the worker the URL of the static server the orchestrator is ALREADY serving
+            # this workspace on. Without it the worker starts its own server, wins an arbitrary
+            # OS-assigned port, and hands back asset URLs on that port -- which die when the
+            # worker is evicted and are already dead by the time a saved workflow is reopened.
+            # Both processes share the workspace on disk, so the orchestrator's long-lived
+            # server is the right place to serve anything a worker writes.
+            static_base_url = await self._orchestrator_static_server_base_url()
+            if static_base_url is not None:
+                worker_environ[ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV] = static_base_url
+            # Hand the orchestrator's own stdout/stderr to the worker explicitly so worker log
+            # lines land in the same stream as orchestrator logs. Implicit inheritance is
+            # POSIX-only: on Windows, redirected std handles (e.g. the desktop app's pipes) are
+            # not passed to a child unless subprocess sends them via STARTF_USESTDHANDLES, so
+            # the worker would log to an invisible console instead.
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                env=worker_environ,
+                stdout=sys.stdout,
+                stderr=sys.stderr,
             )
-            logger.debug(
-                "Worker for library '%s' will resolve imports from %s first",
-                worker_key,
-                execution_site_packages,
-            )
-
-        # No workspace variable here: GTN_CONFIG_ outranks the runtime project override, so a worker
-        # handed one could never follow its orchestrator onto a project's workspace again. The
-        # workspace arrives with the project, adopted from the registration reply.
-
-        # Hand the worker the URL of the static server the orchestrator is ALREADY serving
-        # this workspace on. Without it the worker starts its own server, wins an arbitrary
-        # OS-assigned port, and hands back asset URLs on that port -- which die when the
-        # worker is evicted and are already dead by the time a saved workflow is reopened.
-        # Both processes share the workspace on disk, so the orchestrator's long-lived
-        # server is the right place to serve anything a worker writes.
-        static_base_url = await self._orchestrator_static_server_base_url()
-        if static_base_url is not None:
-            worker_environ[ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV] = static_base_url
-        # Hand the orchestrator's own stdout/stderr to the worker explicitly so worker log
-        # lines land in the same stream as orchestrator logs. Implicit inheritance is
-        # POSIX-only: on Windows, redirected std handles (e.g. the desktop app's pipes) are
-        # not passed to a child unless subprocess sends them via STARTF_USESTDHANDLES, so
-        # the worker would log to an invisible console instead.
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            env=worker_environ,
-            stdout=sys.stdout,
-            stderr=sys.stderr,
-        )
-        # Record the loop that owns this subprocess so termination can hop back to it.
-        # All spawns run on the engine event-queue loop, so this is idempotent.
-        self._spawn_loop = asyncio.get_running_loop()
-        self._managed_worker_processes[worker_key] = proc
+            # Record the loop that owns this subprocess so termination can hop back to it.
+            # All spawns run on the engine event-queue loop, so this is idempotent.
+            self._spawn_loop = asyncio.get_running_loop()
+            self._managed_worker_processes[worker_key] = proc
+        finally:
+            # Released even when the fork raises: the claim outliving a failed spawn would
+            # silently refuse every later attempt for this library.
+            self._spawns_in_flight.discard(worker_key)
         logger.info("Spawned worker for key '%s' (pid %s)", worker_key, proc.pid)
 
     async def reset_workers(self) -> None:
