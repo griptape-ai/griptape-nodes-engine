@@ -37,6 +37,9 @@ IN_TREE_TRAITS = _in_tree_traits()
 
 ELEMENT_WIRING = ("element_id", "element_type", "parent_group_name", "_children", "_parent")
 
+_DECLARED_THRESHOLD = 9
+_DECLARED_LEVEL = 3
+
 
 def test_the_element_base_carries_the_metaclass() -> None:
     """The premise the rest of this file rests on: a trait is an attrs class without saying so."""
@@ -162,6 +165,14 @@ class TestAnAnnotationThatIsNotAFieldIsRefused:
 
         assert Constant.state_keys() == []
 
+    def test_an_unsubscripted_class_constant_is_allowed(self) -> None:
+        """A bare ``ClassVar`` has no origin to read, so it has to be recognized on its own."""
+
+        class BareConstant(Trait):
+            DEFAULTS: ClassVar = ["a"]
+
+        assert BareConstant.state_keys() == []
+
     def test_a_stringified_class_constant_is_refused(self) -> None:
         """What a trait module under ``from __future__ import annotations`` would hit."""
         with pytest.raises(TypeError, match="from __future__ import annotations"):
@@ -180,3 +191,46 @@ class TestAnAnnotationThatIsNotAFieldIsRefused:
             element_id: str = attrs.field(default="Fixed", converter=default_element_id, metadata=WIRING)
 
         assert Fixed().element_id == "Fixed"
+
+
+class TestWhoGetsAGeneratedConstructor:
+    """Declaring a field is what asks for a constructor.
+
+    The metaclass reads that off the value ``attrs.field()`` returns. An attrs release that
+    changed that value would otherwise stop generating constructors quietly, leaving every
+    trait taking its parent's arguments instead of its own.
+    """
+
+    def test_a_declared_field_becomes_a_keyword_argument(self) -> None:
+        class Declared(Trait):
+            threshold: int = attrs.field(default=5)
+
+        assert Declared(threshold=9).threshold == _DECLARED_THRESHOLD
+
+    def test_a_declared_field_is_keyword_only(self) -> None:
+        class Declared(Trait):
+            threshold: int = attrs.field(default=5)
+
+        with pytest.raises(TypeError):
+            Declared(9)  # type: ignore[misc]
+
+    def test_a_hand_written_constructor_is_kept(self) -> None:
+        class HandWritten(Trait):
+            def __init__(self, level: int = 1) -> None:
+                super().__init__()
+                self.level = level
+
+        assert HandWritten(_DECLARED_LEVEL).level == _DECLARED_LEVEL
+
+    def test_a_subclass_declaring_nothing_inherits_that_constructor(self) -> None:
+        """A generated constructor here would take the parent's fields and drop its arguments."""
+
+        class HandWritten(Trait):
+            def __init__(self, level: int = 1) -> None:
+                super().__init__()
+                self.level = level
+
+        class Inheriting(HandWritten):
+            pass
+
+        assert Inheriting.__init__ is HandWritten.__init__

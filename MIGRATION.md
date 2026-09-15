@@ -42,7 +42,7 @@ nothing at all to the engine, so it raises at class creation. Declare it with `a
 mark it `ClassVar` if it is a constant, or annotate it where it is assigned if it is neither.
 
 **Renaming a field keeps reading the old key** by overriding `migrate_state`, which every load
-passes its saved state through:
+passes its saved state through once:
 
 ```python
 class Threshold(Trait):
@@ -50,7 +50,7 @@ class Threshold(Trait):
 
     @classmethod
     def migrate_state(cls, state: dict[str, Any]) -> dict[str, Any]:
-        if "threshold" not in state or "level" in state:
+        if "threshold" not in state:
             return state
         migrated = dict(state)
         migrated["level"] = migrated.pop("threshold")
@@ -126,7 +126,9 @@ class Threshold(Trait):
 ```
 
 Without it a trait ignores such a write, which is the right answer for a key with no state behind
-it, such as a widget-type marker. `Options`, `MultiOptions`, and `Slider` adopt theirs.
+it, such as a widget-type marker. A write that would have changed what the trait renders is
+logged, since it is neither applied nor saved. `Options`, `MultiOptions`, and `Slider` adopt
+theirs.
 
 **Workflows already on disk.** A file that predates trait state carries a dropdown's choices in
 `ui_options`, since that was the only field a save wrote. The load adopts them onto the trait, so a

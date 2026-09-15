@@ -19,7 +19,7 @@ class Slider(Trait):
         written = ui_options.get("slider")
         if not isinstance(written, dict):
             return {}
-        return {key: written[key] for key in ("min_val", "max_val") if key in written}
+        return {key: written[key] for key in cls.state_keys() if key in written}
 
     def validators_for_trait(self) -> list[Callable[..., Any]]:
         def validate(param: Parameter, value: Any) -> None:  # noqa: ARG001

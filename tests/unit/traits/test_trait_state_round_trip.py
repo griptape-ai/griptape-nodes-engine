@@ -295,3 +295,54 @@ class TestWidgetReadsItsOlderSavedKey:
         rebuilt = Widget.from_state({"name": "stale", "widget_name": "editor", "library": "my-lib"})
 
         assert rebuilt.widget_name == "editor"
+
+
+_MIGRATED_LEVEL = 4
+_MIGRATED_SECONDS = 120
+
+
+class _RenamedField(Trait):
+    """Renames a saved key the way a trait author would, without guarding against a rerun."""
+
+    level: int = attrs.field(default=0)
+
+    @classmethod
+    def migrate_state(cls, state: dict[str, Any]) -> dict[str, Any]:
+        migrated = dict(state)
+        migrated["level"] = migrated.pop("threshold")
+        return migrated
+
+
+class _ScaledField(Trait):
+    """Converts a saved value's units, which double-applying would corrupt rather than raise."""
+
+    seconds: float = attrs.field(default=0)
+
+    @classmethod
+    def migrate_state(cls, state: dict[str, Any]) -> dict[str, Any]:
+        return {"seconds": state["seconds"] * 60}
+
+
+class TestAMigrationRunsOncePerLoad:
+    """Otherwise every migration has to be written to survive being run on its own output.
+
+    ``apply_state`` builds a throwaway to interpret the state it was handed, and that
+    throwaway must not migrate a second time.
+    """
+
+    def test_a_rename_applied_to_an_existing_trait_does_not_rerun(self) -> None:
+        trait = _RenamedField(level=1)
+
+        trait.apply_state({"threshold": 4})
+
+        assert trait.level == _MIGRATED_LEVEL
+
+    def test_a_rename_loaded_into_a_fresh_trait_does_not_rerun(self) -> None:
+        assert _RenamedField.from_state({"threshold": 4}).level == _MIGRATED_LEVEL
+
+    def test_a_unit_conversion_is_applied_once(self) -> None:
+        trait = _ScaledField(seconds=0)
+
+        trait.apply_state({"seconds": 2})
+
+        assert trait.seconds == _MIGRATED_SECONDS

@@ -44,7 +44,7 @@ For the full list of traits, the widgets they render, and the `ui_options` keys 
 
 **Saving trait state**: Trait constructor arguments may contain text, numbers, booleans, and lists or dictionaries of those values. Sets and tuples load as lists. Unsupported values are omitted with a warning.
 
-**Accepting UI option writes**: Implement `state_from_ui_options` to map editor and saved-file `ui_options` to trait state. It is the inverse of `ui_options_for_trait`. The default ignores writes, which suits rendered keys with no state.
+**Accepting UI option writes**: Implement `state_from_ui_options` to map editor and saved-file `ui_options` to trait state. It is the inverse of `ui_options_for_trait`. The default ignores writes, which suits rendered keys with no state; a write that would have changed what the trait renders is logged, since it is neither applied nor saved.
 
 ## Parameter helper constructs (`ParameterString`, `ParameterInt`, ...)
 
