@@ -499,7 +499,8 @@ class RequestClient:
         Returns:
             Count of pending requests
         """
-        return len(self._pending_requests)
+        with self._lock:
+            return len(self._pending_requests)
 
     @property
     def pending_request_ids(self) -> list[str]:
@@ -508,7 +509,11 @@ class RequestClient:
         Returns:
             List of request_id strings
         """
-        return list(self._pending_requests.keys())
+        # Building the list iterates the map, so an insert or pop from another loop raises
+        # "dictionary changed size during iteration". A diagnostic that can raise is worse than
+        # one that answers a moment out of date.
+        with self._lock:
+            return list(self._pending_requests.keys())
 
     async def _try_match(self, message: dict[str, Any]) -> bool:
         """Attempt to match an incoming message to a pending request.
