@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands
 
 from griptape_nodes.exe_types.core_types import Parameter
+from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_types import NodeDependencies
 from griptape_nodes.node_library.workflow_registry import (
     Workflow,
@@ -64,6 +65,8 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     RegisterWorkflowResultSuccess,
     ResetWorkflowBranchRequest,
     ResetWorkflowBranchResultSuccess,
+    RunWorkflowWithCurrentStateRequest,
+    RunWorkflowWithCurrentStateResultFailure,
     SetWorkflowMetadataRequest,
     SetWorkflowMetadataResultSuccess,
     WorkflowDependencyInfo,
@@ -2986,6 +2989,96 @@ class TestRunResultRendering:
 
         assert details[-1].message == "Successfully imported workflow 'x' as referenced sub flow 'y'"
         assert "Library A" in details[0].message
+
+
+class TestRunWorkflowWithCurrentStateRequest:
+    """The handler refuses to load a workflow while a flow is still on the Current Context.
+
+    A saved workflow file asks for its own top-level flow with ``parent_flow_name=None``. Replayed
+    while a flow is open, that ``None`` reads as "use the current context", so the incoming flow is
+    adopted as an invisible child of the flow already on screen.
+    """
+
+    _WORKFLOW_FILE = "some_workflow.py"
+    _OPEN_FLOW_NAME = "ControlFlow_1"
+
+    @pytest.fixture
+    def context_manager(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> Mock:
+        """The engine's ContextManager, so each test states the flow stack it is loading into."""
+        context_manager = Mock(spec=ContextManager)
+        monkeypatch.setattr(engine, "_context_manager", context_manager)
+        return context_manager
+
+    @pytest.fixture
+    def run_workflow(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+        """WorkflowManager.run_workflow, so no workflow file is ever exec'd."""
+        run_workflow = AsyncMock(
+            spec=engine.workflow_manager.run_workflow,
+            return_value=WorkflowManager.WorkflowExecutionResult(
+                execution_successful=True, execution_details="ran the file"
+            ),
+        )
+        monkeypatch.setattr(engine.workflow_manager, "run_workflow", run_workflow)
+        return run_workflow
+
+    @pytest.fixture
+    def get_complete_file_path(self, monkeypatch: pytest.MonkeyPatch) -> Mock:
+        """Workspace path resolution, so no workspace config is needed."""
+        get_complete_file_path = Mock(
+            spec=WorkflowRegistry.get_complete_file_path, return_value=f"/workspace/{self._WORKFLOW_FILE}"
+        )
+        monkeypatch.setattr(WorkflowRegistry, "get_complete_file_path", get_complete_file_path)
+        return get_complete_file_path
+
+    @pytest.fixture
+    def anyio_path(self, monkeypatch: pytest.MonkeyPatch) -> Mock:
+        """The file-exists check, reporting a file so the test touches no filesystem."""
+        path = Mock(spec=anyio.Path)
+        path.is_file = AsyncMock(spec=anyio.Path.is_file, return_value=True)
+        anyio_path = Mock(spec=anyio.Path, return_value=path)
+        monkeypatch.setattr(anyio, "Path", anyio_path)
+        return anyio_path
+
+    @pytest.mark.asyncio
+    async def test_refuses_while_a_flow_is_open(
+        self,
+        engine: Engine,
+        context_manager: Mock,
+        run_workflow: AsyncMock,
+        get_complete_file_path: Mock,  # noqa: ARG002
+        anyio_path: Mock,  # noqa: ARG002
+    ) -> None:
+        open_flow = Mock(spec=ControlFlow)
+        open_flow.name = self._OPEN_FLOW_NAME
+        context_manager.has_current_flow.return_value = True
+        context_manager.get_current_flow.return_value = open_flow
+
+        result = await engine.workflow_manager.on_run_workflow_with_current_state_request(
+            RunWorkflowWithCurrentStateRequest(file_path=self._WORKFLOW_FILE)
+        )
+
+        assert isinstance(result, RunWorkflowWithCurrentStateResultFailure), result
+        # The guard is a precondition on engine state, so the file never gets exec'd.
+        run_workflow.assert_not_called()
+        assert self._OPEN_FLOW_NAME in str(result.result_details), result.result_details
+
+    @pytest.mark.asyncio
+    async def test_allows_a_workflow_context_with_no_open_flow(
+        self,
+        engine: Engine,
+        context_manager: Mock,
+        run_workflow: AsyncMock,
+        get_complete_file_path: Mock,  # noqa: ARG002
+        anyio_path: Mock,  # noqa: ARG002
+    ) -> None:
+        context_manager.has_current_flow.return_value = False
+
+        await engine.workflow_manager.on_run_workflow_with_current_state_request(
+            RunWorkflowWithCurrentStateRequest(file_path=self._WORKFLOW_FILE)
+        )
+
+        # Getting past the guard is the behaviour under test; what the run then does is mocked away.
+        run_workflow.assert_called_once_with(relative_file_path=self._WORKFLOW_FILE)
 
 
 class TestWorkflowsLoadingGate:

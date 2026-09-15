@@ -75,13 +75,20 @@ class RunWorkflowFromScratchResultFailure(ResultPayloadFailure):
 class RunWorkflowWithCurrentStateRequest(RequestPayload):
     """Run a workflow from file, preserving current state.
 
-    Use when: Loading workflows while keeping existing node values, updating workflow structure
-    without losing progress, iterative workflow development.
+    Use when: Loading workflows into a prepared but unpopulated workflow context,
+    loading unregistered workflows.
+
+    Fails if any flow is active on the current context. A current workflow with no
+    flow on it -- the state SetWorkflowContextRequest leaves behind -- is fine; a
+    current flow is not. Use DeleteFlowRequest, ClearAllObjectStateRequest, or similar
+    first to remove any active flow.
 
     Args:
         file_path: Path to the workflow file to load while preserving current state
 
-    Results: RunWorkflowWithCurrentStateResultSuccess | RunWorkflowWithCurrentStateResultFailure (file not found, merge error)
+    Results: RunWorkflowWithCurrentStateResultSuccess |
+        RunWorkflowWithCurrentStateResultFailure (flow already active, file not found,
+        merge error)
     """
 
     file_path: str
@@ -105,7 +112,11 @@ class RunWorkflowWithCurrentStateResultSuccess(WorkflowAlteredMixin, ResultPaylo
 @dataclass
 @PayloadRegistry.register
 class RunWorkflowWithCurrentStateResultFailure(ResultPayloadFailure):
-    """Workflow execution with current state failed. Common causes: file not found, state merge conflict, load error."""
+    """Workflow execution with current state failed.
+
+    Common causes: a flow is already active on the current context, file not found,
+    state merge conflict, load error.
+    """
 
 
 @dataclass
