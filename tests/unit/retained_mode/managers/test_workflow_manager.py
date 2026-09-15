@@ -100,6 +100,19 @@ def _register_unsaved_workflow(key: str, name: str) -> None:
     WorkflowRegistry.generate_new_workflow(registry_key=key, metadata=metadata, file_path=None)
 
 
+def _saved_registry_entry(file_path: str = "my_workflow.py") -> MagicMock:
+    """A stand-in registry entry for a saved workflow: it has a file behind it, so `is_saved` is True.
+
+    Spelled out rather than left to MagicMock, which would answer `is_saved` with a freshly created
+    truthy Mock -- a value never equal to the one read before it, so anything comparing successive
+    reads (the CurrentWorkflowChanged dedupe) would see a change that is purely an artifact.
+    """
+    entry = MagicMock()
+    entry.file_path = file_path
+    entry.is_saved = True
+    return entry
+
+
 def _notified_workflow_names(put_event: Mock) -> list[str | None]:
     """The workflow_name off every CurrentWorkflowChanged put on the queue, in order."""
     names: list[str | None] = []
@@ -108,6 +121,16 @@ def _notified_workflow_names(put_event: Mock) -> list[str | None]:
         if isinstance(event, AppEvent) and isinstance(event.payload, CurrentWorkflowChanged):
             names.append(event.payload.workflow_name)
     return names
+
+
+def _notified_is_saved_flags(put_event: Mock) -> list[bool | None]:
+    """The is_saved off every CurrentWorkflowChanged put on the queue, in order."""
+    flags: list[bool | None] = []
+    for put_call in put_event.call_args_list:
+        event = put_call.args[0]
+        if isinstance(event, AppEvent) and isinstance(event.payload, CurrentWorkflowChanged):
+            flags.append(event.payload.is_saved)
+    return flags
 
 
 def _attach_event_queue(engine: Engine) -> None:
@@ -738,6 +761,9 @@ class TestWorkflowManager:
                     # clients hear about it -- exactly once, from the single rekey that moves the
                     # key and the retained path together.
                     assert _notified_workflow_names(put_event) == ["subdir/my_workflow"]
+                    # A moved workflow is still a saved one; the registry entry's file_path is
+                    # repointed before the rekey, so nothing observes it mid-move looking unsaved.
+                    assert _notified_is_saved_flags(put_event) == [True]
                 finally:
                     context_manager.pop_workflow()
         finally:
@@ -857,6 +883,12 @@ class TestWorkflowManager:
                 # requests against a workflow that no longer exists, so the switch has to be on
                 # the wire like every other one.
                 assert _notified_workflow_names(put_event) == [saved_key]
+                # The same event says the workflow now has a file behind it. This is the one
+                # operation where is_saved flips, and it flips here rather than in a later event:
+                # `on_save_workflow_request` lands `file_path` on the rekeyed registry entry
+                # before it rekeys the context, so nothing can observe the new key paired with
+                # the old unsaved state and leave the editor offering to save what it just saved.
+                assert _notified_is_saved_flags(put_event) == [True]
             finally:
                 if context_manager.has_current_workflow():
                     context_manager.pop_workflow()
@@ -1036,8 +1068,7 @@ class TestWorkflowManager:
             SaveWorkflowResultSuccess,
         )
 
-        mock_source = MagicMock()
-        mock_source.file_path = scenario.source_file_path
+        mock_source = _saved_registry_entry(scenario.source_file_path)
         mock_source.metadata.name = scenario.source_display_name
         captured: dict[str, object] = {}
 
@@ -1300,7 +1331,14 @@ class TestWorkflowManager:
         """
         context_manager = engine.context_manager
         _attach_event_queue(engine)
-        context_manager.push_workflow(workflow_name="my_workflow")
+        # Enter under a registry that already reports the workflow saved, which is where a rename of
+        # a saved workflow starts from and what the bookkeeping reports on the way out. The event
+        # carries the key AND is_saved, so the dedupe only swallows this when neither has moved.
+        with (
+            patch.object(WorkflowRegistry, "has_workflow_with_name", return_value=True),
+            patch.object(WorkflowRegistry, "get_workflow_by_name", return_value=_saved_registry_entry()),
+        ):
+            context_manager.push_workflow(workflow_name="my_workflow")
         context_manager.set_current_workflow_file_path("/workspace/my_workflow.py")
 
         try:

@@ -90,7 +90,9 @@ class GetWorkflowContextSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     Args:
         workflow_name: Name of the current workflow context (None if no context set)
         is_saved: Whether the current workflow is backed by a file on disk. None when
-                  no context is set or the context key is not in the registry.
+                  no context is set or the context key is not in the registry. Reported
+                  identically by the CurrentWorkflowChanged app event, which carries both
+                  fields, so a client following that event does not need to poll this.
     """
 
     workflow_name: str | None
@@ -213,6 +215,16 @@ class CurrentWorkflowChanged(AppPayload):
             saved reports its "unsaved:<uuid>" key. Deliberately has no default: None
             means "nothing is open", so a field that never arrived must not be able to
             deserialize into it.
+        is_saved: Whether that workflow is backed by a file on disk. False for one that
+            has never been saved, None when no workflow is open or the key is not in the
+            registry -- the same three answers, computed the same way, that
+            GetWorkflowContextRequest gives, so a client can drive its save/dirty UI from
+            this event alone rather than following it with a probe. Describes the workflow
+            as of the switch; the one transition that flips it -- the first save of a
+            scratch workflow -- rekeys the workflow, so it arrives as a switch of its own.
+            No default, for the same reason as workflow_name: None is a meaningful answer
+            here too, so a missing field must not be able to masquerade as one.
     """
 
     workflow_name: str | None
+    is_saved: bool | None

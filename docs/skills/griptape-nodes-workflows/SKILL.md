@@ -399,9 +399,9 @@ editor is attached there always is one, because a blank canvas is itself an
 a file, so on its own it would leave you holding a workflow name and none of its nodes.
 
 Either way the engine broadcasts a `CurrentWorkflowChanged` app event carrying the
-`workflow_name` now in context (`None` when the engine has none), so every attached
-editor follows along when an agent switches workflows out from under it. Two things to
-know about it:
+`workflow_name` now in context (`None` when the engine has none) and `is_saved` for that
+workflow, so every attached editor follows along when an agent switches workflows out from
+under it. Three things to know about it:
 
 - **The last one is the truth.** A clean-slate open of a workflow while another one is open
     emits `None` from the wipe and then the opened workflow, so a `None` in the middle of an
@@ -410,6 +410,10 @@ know about it:
     particular number of events.
 - **It says which workflow, not that the workflow is loaded.** An open switches the
     context first and replays the file afterwards, so the nodes arrive behind the event.
+- **`is_saved` comes with it, so there is nothing to follow up with.** It is the same answer
+    `GetWorkflowContextRequest` gives -- `False` for a workflow that has never been saved,
+    `None` when nothing is open -- and the first save of a scratch workflow rekeys it, so the
+    flip to `True` arrives as its own event rather than silently going stale.
 
 ### Agents cannot be interrupted mid-run
 

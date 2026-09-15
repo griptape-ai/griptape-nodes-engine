@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.files.path_utils import canonicalize_for_identity, derive_registry_key
@@ -43,7 +43,19 @@ class ContextManager(EngineScoped):
     """
 
     _workflow_stack: list[ContextManager.WorkflowContextState]
-    _last_notified_workflow_name: str | None
+    _last_notified_workflow: ContextManager.CurrentWorkflow
+
+    class CurrentWorkflow(NamedTuple):
+        """Everything the engine reports about which Workflow is current.
+
+        The payload of CurrentWorkflowChanged, and the answer GetWorkflowContextRequest gives,
+        are both this. Kept as one value read by one method (`_read_current_workflow`) so the
+        event and the request cannot drift: a client that switched from probing after the event
+        to reading the event's own fields must get the same answer either way.
+        """
+
+        workflow_name: str | None
+        is_saved: bool | None
 
     class WorkflowContextError(Exception):
         """Base exception for workflow context errors."""
@@ -269,15 +281,15 @@ class ContextManager(EngineScoped):
         """Initialize the context manager with empty workflow and flow stacks."""
         super().__init__(engine)
         self._workflow_stack = []
-        # The workflow name the last CurrentWorkflowChanged actually carried onto the event queue.
-        # Starts as None, which is exactly what an empty stack reports, so a fresh engine owes
-        # nobody a notification. It records what went out rather than what the stack holds, so a
-        # switch whose event never left the engine is re-sent at the next one instead of being
-        # deduped away -- see `_notify_current_workflow_changed`. It is not a record of what any
+        # What the last CurrentWorkflowChanged actually carried onto the event queue. Starts as
+        # all-None, which is exactly what an empty stack reports, so a fresh engine owes nobody a
+        # notification. It records what went out rather than what the stack holds, so a switch
+        # whose event never left the engine is re-sent at the next one instead of being deduped
+        # away -- see `_notify_current_workflow_changed`. It is not a record of what any
         # particular client received, though: a client that connects mid-session has missed
         # whatever went out before it arrived, so it reads GetWorkflowContextRequest once on
         # connect and follows the event stream from there.
-        self._last_notified_workflow_name = None
+        self._last_notified_workflow = self.CurrentWorkflow(workflow_name=None, is_saved=None)
         event_manager.assign_manager_to_request_type(
             request_type=SetWorkflowContextRequest, callback=self.on_set_workflow_context_request
         )
@@ -349,16 +361,11 @@ class ContextManager(EngineScoped):
         return SetWorkflowContextSuccess(workflow_name=resolved_name, result_details=msg)
 
     def on_get_workflow_context_request(self, request: GetWorkflowContextRequest) -> ResultPayload:  # noqa: ARG002
-        workflow_name = None
-        is_saved = None
-        if self.has_current_workflow():
-            workflow_name = self.get_current_workflow_name()
-            if WorkflowRegistry.has_workflow_with_name(workflow_name):
-                is_saved = WorkflowRegistry.get_workflow_by_name(workflow_name).is_saved
+        current_workflow = self._read_current_workflow()
         return GetWorkflowContextSuccess(
-            workflow_name=workflow_name,
-            is_saved=is_saved,
-            result_details=f"Successfully retrieved workflow context: {workflow_name or 'None'}",
+            workflow_name=current_workflow.workflow_name,
+            is_saved=current_workflow.is_saved,
+            result_details=f"Successfully retrieved workflow context: {current_workflow.workflow_name or 'None'}",
         )
 
     def on_ensure_workflow_and_flow_request(self, request: EnsureWorkflowAndFlowRequest) -> ResultPayload:
@@ -961,32 +968,43 @@ class ContextManager(EngineScoped):
         RunWorkflowFromRegistry pushes before it replays the saved file, so this event goes out
         first and the workflow's nodes arrive behind it as ordinary creation events.
 
-        Reports the registry key only, because the key is what identifies the workflow to every
-        other request. A client that also needs the display name reads it with
-        GetWorkflowMetadataRequest, and the location from the entry ListAllWorkflowsRequest
-        returns for that key. That is why `set_current_workflow_file_path` does not notify: the
-        path is not in this payload, so a notification from the path setter would compute an
-        unchanged name and dedupe away to nothing anyway. Anything that changes the name and the
-        path together goes through `rekey_workflow`, which lands both before it notifies.
+        Reports the registry key and whether that workflow has a file behind it, because those
+        are the two things an editor needs to draw its title bar and its save affordance the
+        moment the switch lands. Both come from `_read_current_workflow`, the same method
+        GetWorkflowContextRequest answers from, so the event and the probe cannot disagree. A
+        client that also needs the display name reads it with GetWorkflowMetadataRequest, and the
+        location from the entry ListAllWorkflowsRequest returns for that key. The path is
+        deliberately not here, which is why `set_current_workflow_file_path` does not notify: a
+        notification from the path setter would compute an unchanged payload and dedupe away to
+        nothing anyway. Anything that changes the name and the path together goes through
+        `rekey_workflow`, which lands both before it notifies.
+
+        `is_saved` is correct at every site that reaches here, because every operation that gives
+        an open workflow a file lands that file on the registry entry before it moves the context:
+        the first save of a scratch workflow writes `file_path` onto the rekeyed entry and then
+        rekeys the context, and Move does the same. There is no I/O in the answer -- `is_saved` is
+        `file_path is not None` on an entry already in memory -- so no site has to choose between
+        reporting it and staying cheap.
 
         Deduped so "changed" means what it says: re-entering the workflow that is already
         current, or renaming it to the name clients were already told, is not something
-        anyone needs to act on.
+        anyone needs to act on. The dedupe covers the whole payload rather than just the name, so
+        a workflow that becomes saved without its key moving would still be announced. Nothing in
+        the engine does that today -- a first save always rekeys -- but a payload field that the
+        dedupe cannot see is a field that can go stale on the wire.
 
         A switch that could not be broadcast stays owed, whichever way the broadcast failed: the
         dedupe field advances only once the event is on the queue, so the next switch compares
-        against the older name and re-sends rather than deduping the missed one into silence.
+        against the older payload and re-sends rather than deduping the missed one into silence.
         """
-        workflow_name = None
-        if self.has_current_workflow():
-            workflow_name = self.get_current_workflow_name()
+        current_workflow = self._read_current_workflow()
 
-        if workflow_name == self._last_notified_workflow_name:
+        if current_workflow == self._last_notified_workflow:
             return
 
         switched_to = "no workflow is open any more"
-        if workflow_name is not None:
-            switched_to = f"the open workflow is now '{workflow_name}'"
+        if current_workflow.workflow_name is not None:
+            switched_to = f"the open workflow is now '{current_workflow.workflow_name}'"
 
         # Emitted on `self.engine`'s bus, which is the bus whose `assign_manager_to_request_type`
         # calls in `__init__` routed the requests that get us here -- `Engine` hands both from the
@@ -1003,7 +1021,12 @@ class ContextManager(EngineScoped):
         # ignore an AppEvent.
         try:
             event_was_queued = self.engine.event_manager.put_event(
-                AppEvent(payload=CurrentWorkflowChanged(workflow_name=workflow_name))
+                AppEvent(
+                    payload=CurrentWorkflowChanged(
+                        workflow_name=current_workflow.workflow_name,
+                        is_saved=current_workflow.is_saved,
+                    )
+                )
             )
         except RuntimeError as e:
             logger.warning(
@@ -1027,4 +1050,25 @@ class ContextManager(EngineScoped):
             )
             return
 
-        self._last_notified_workflow_name = workflow_name
+        self._last_notified_workflow = current_workflow
+
+    def _read_current_workflow(self) -> ContextManager.CurrentWorkflow:
+        """Read which Workflow is current and whether it has a file behind it.
+
+        The single source for both the CurrentWorkflowChanged payload and
+        GetWorkflowContextRequest's answer. `is_saved` is None, rather than False, when nothing is
+        open or when the key in context is not a registry entry -- "unknown", not "unsaved". The
+        latter is not a state the editor reaches: it takes pushing a context by a key the registry
+        never had, which happens when a saved workflow file is replayed as a plain script outside
+        the workspace it was registered against.
+        """
+        if not self.has_current_workflow():
+            return self.CurrentWorkflow(workflow_name=None, is_saved=None)
+
+        workflow_name = self.get_current_workflow_name()
+        if not WorkflowRegistry.has_workflow_with_name(workflow_name):
+            return self.CurrentWorkflow(workflow_name=workflow_name, is_saved=None)
+
+        return self.CurrentWorkflow(
+            workflow_name=workflow_name, is_saved=WorkflowRegistry.get_workflow_by_name(workflow_name).is_saved
+        )
