@@ -396,13 +396,20 @@ class WorkerManager(EngineScoped):
         )
         # Settle anything still awaiting one of these workers, BEFORE the registry is cleared.
         # Clearing it is what makes this the last chance: the heartbeat loop can only evict ids it
-        # can still see, so after this nothing reaches cancel_requests_by_tag for them. route_to_worker
-        # has no wall-clock ceiling, so a node dispatched into a worker this call terminates would
-        # await a future that never settles. Surfaces there as a worker-died error rather than a
-        # cancellation, because it is not aimed at the awaiting task.
+        # can still see, so after this nothing reaches these requests at all. route_to_worker has no
+        # wall-clock ceiling, so a node dispatched into a worker this call terminates would await a
+        # future that never settles.
         if self._transport is not None:
             for wid in list(self._workers):
-                await self._tx.request_client.cancel_requests_by_tag(wid)
+                registration = self._workers[wid]
+                await self._tx.request_client.fail_requests_by_tag(
+                    wid,
+                    worker_events.WorkerGoneError(
+                        f"worker '{wid}' was shut down to reload library '{registration.worker_key}'"
+                        if registration.worker_key
+                        else f"worker '{wid}' was shut down to reload libraries"
+                    ),
+                )
         session_id = self.engine.get_session_id()
         if session_id and self._transport is not None:
             for wid in list(self._workers):
@@ -444,33 +451,16 @@ class WorkerManager(EngineScoped):
             worker_engine_id=worker_engine_id,
             worker_request_topic=worker_request_topic,
         )
-        # No wall-clock timeout here: long-running AI workloads (diffusion,
-        # multi-pass refinement) routinely exceed any sensible default. Worker
-        # liveness is enforced by the heartbeat loop, which evicts silent
-        # workers and cancels their in-flight requests via
-        # RequestClient.cancel_requests_by_tag, so a dead worker still surfaces
-        # to the caller without a per-request ceiling.
-        try:
-            # The future is settled by whichever loop the transport runs on, which is not this one.
-            # wrap_future adapts it for this loop and installs the threadsafe wakeup.
-            return await asyncio.wrap_future(future)
-        except asyncio.CancelledError:
-            # Eviction cancels this future from underneath the awaiting task. A bare
-            # CancelledError is indistinguishable from the artist pressing stop, and the
-            # resolution machine reaps those as CANCELED: it emits no NodeErrorEvent and logs
-            # only an unnamed line, so the node is given back as UNRESOLVED with nothing
-            # anywhere saying why. Only a cancellation aimed at THIS task is the flow
-            # cancelling; anything else means the future died under us, which for this future
-            # means the worker is gone.
-            task = asyncio.current_task()
-            if task is not None and task.cancelling() > 0:
-                raise
-            msg = (
-                f"Attempted to run a node in the separate process for worker '{worker_engine_id}'. "
-                "Failed because that process stopped responding and was shut down before it "
-                "returned a result. Editing the node still works and your workflow keeps it."
-            )
-            raise RuntimeError(msg) from None
+        # No wall-clock timeout here: long-running AI workloads (diffusion, multi-pass refinement)
+        # routinely exceed any sensible default. Worker liveness is enforced by the heartbeat loop,
+        # which evicts a silent worker and fails its in-flight requests with WorkerGoneError, so a
+        # dead worker still surfaces to the caller without a per-request ceiling.
+        #
+        # The future is settled by whichever loop the transport runs on, which is not this one.
+        # wrap_future adapts it for this loop and installs the threadsafe wakeup. A CancelledError
+        # out of here means only one thing -- the caller was cancelled -- because a worker going
+        # away raises WorkerGoneError instead.
+        return await asyncio.wrap_future(future)
 
     async def _orchestrator_static_server_base_url(self) -> str | None:
         """The base URL this engine serves the workspace on, awaited until initialization decides it.
@@ -535,8 +525,12 @@ class WorkerManager(EngineScoped):
             proc = self._managed_worker_processes.pop(lib_name, None)
             if proc is not None:
                 await self._terminate_via_spawn_loop(lib_name, proc)
-        # Cancel any requests that were awaiting a result from this worker.
-        await self._tx.request_client.cancel_requests_by_tag(worker_engine_id)
+        # Fail anything awaiting this worker, with the reason, so the awaiter reports why rather
+        # than inferring it from a bare cancellation.
+        await self._tx.request_client.fail_requests_by_tag(
+            worker_engine_id,
+            worker_events.WorkerGoneError(f"worker '{worker_engine_id}' stopped responding and was shut down"),
+        )
 
         # Notify registered callbacks that this worker has been evicted.
         for cb in self._worker_evicted_callbacks:
