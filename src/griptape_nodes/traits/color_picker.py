@@ -1,13 +1,13 @@
 from collections.abc import Callable
 from typing import Any, Literal
 
+import attrs
+
 from griptape_nodes.exe_types.core_types import Parameter, Trait
 
 
 class ColorPicker(Trait):
-    def __init__(self, format: Literal["hex", "hexa", "rgb", "rgba", "hsl", "hsla", "hsv", "hsva"] = "hex") -> None:  # noqa: A002
-        super().__init__()
-        self.format = format
+    format: Literal["hex", "hexa", "rgb", "rgba", "hsl", "hsla", "hsv", "hsva"] = attrs.field(default="hex")
 
     def ui_options_for_trait(self) -> dict:
         return {"color_picker": {"format": self.format}}

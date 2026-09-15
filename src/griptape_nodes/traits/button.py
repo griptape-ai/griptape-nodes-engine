@@ -1,8 +1,19 @@
+from __future__ import annotations
+
 import logging
 from collections.abc import Callable
-from typing import ClassVar, Literal, get_args
+from typing import Literal, get_args
 
-from griptape_nodes.exe_types.core_types import NodeMessagePayload, NodeMessageResult, Trait
+import attrs
+
+from griptape_nodes.exe_types.core_types import (
+    BEHAVIOR,
+    WIRING,
+    NodeMessagePayload,
+    NodeMessageResult,
+    Trait,
+    default_element_id,
+)
 
 # Don't export callback types - let users import explicitly
 
@@ -101,42 +112,37 @@ def _build_link_handler(url: str) -> Callable:
     return handler
 
 
-class _ClickAction:
-    """What a button does when clicked: open a link, or run the node's own handler.
+def _link_yields_to_a_handler(button: Button, _attribute: attrs.Attribute, url: str | None) -> str | None:
+    """Drop a link written onto a button whose node already wired its own handler.
 
-    One field rather than two, because the two are saved through different channels. A link
-    is data and a handler is a method name, so holding both meant restoring either one had
-    to reason about what the other already held, and keep them from drifting apart. A single
-    field cannot drift, so the one-or-the-other rule is a property of the representation
-    instead of an invariant re-checked after every write.
+    Silent rather than an error because this is the load path: a saved link belongs to a
+    version of the node that wired this button differently, and live code outranks it. Nothing
+    has to clear the link afterwards, since a button running a handler reports none.
+
+    Rebuilds the handler the link opens, so ``on_click_callback`` can report the same callable
+    every time it is read: callers compare it by identity.
     """
+    if url is not None and button.on_click_handler is not None:
+        return button.button_link
+    button._link_handler = _link_handler_for(url)
+    return url
 
 
-class _Link(_ClickAction):
-    """Opens a URL. The URL is saved; the handler is rebuilt from it."""
-
-    def __init__(self, url: str) -> None:
-        self.url = url
-        self.handler = _build_link_handler(url)
+def _link_handler_for(url: str | None) -> Callable | None:
+    if url is None:
+        return None
+    return _build_link_handler(url)
 
 
-class _NodeHandler(_ClickAction):
-    """Runs a callback the owning node supplied. Saved as a method name, never as a callable."""
-
-    def __init__(self, callback: Callable) -> None:
-        self.callback = callback
+def _handler_clears_the_link(button: Button, _attribute: attrs.Attribute, callback: Callable | None) -> Callable | None:
+    """Drop the link when a handler is attached, so the two can never both be live."""
+    if callback is not None:
+        button.button_link = None
+        button._link_handler = None
+    return callback
 
 
 class Button(Trait):
-    # Both are behavior rather than state, so they are carried by method name.
-    STATE_EXCLUDE: ClassVar[frozenset[str]] = frozenset({"on_click", "get_button_state"})
-    # on_click reads the node-supplied handler alone. A link's handler is derived from
-    # button_link, which is saved as state, so it needs no name of its own.
-    STATE_ALIASES: ClassVar[dict[str, str]] = {
-        "on_click": "on_click_handler",
-        "get_button_state": "get_button_state_callback",
-    }
-
     # Specific callback types for better type safety and clarity
     type OnClickCallback = Callable[[Button, ButtonDetailsMessagePayload], NodeMessageResult | None]
     type GetButtonStateCallback = Callable[[Button, ButtonDetailsMessagePayload], NodeMessageResult | None]
@@ -146,102 +152,55 @@ class Button(Trait):
     GET_BUTTON_STATUS_MESSAGE_TYPE = "get_button_status"
     SET_BUTTON_STATUS_MESSAGE_TYPE = "set_button_status"
 
-    def __init__(  # noqa: PLR0913
-        self,
-        *,
-        label: str = "",  # Allows a button with no text.
-        variant: ButtonVariant = "secondary",
-        size: ButtonSize = "default",
-        state: ButtonState = "normal",
-        icon: str | None = None,
-        icon_class: str | None = None,
-        icon_position: IconPosition | None = None,
-        full_width: bool = False,
-        loading_label: str | None = None,
-        loading_icon: str | None = None,
-        loading_icon_class: str | None = None,
-        tooltip: str | None = None,
-        button_link: str | None = None,
-        on_click: OnClickCallback | None = None,
-        get_button_state: GetButtonStateCallback | None = None,
-    ) -> None:
-        super().__init__(element_id="Button")
-        # Annotated here because setattr in on_message_received tells the type checker
-        # nothing about what these hold.
-        self.label: str = label
-        self.variant: ButtonVariant = variant
-        self.size: ButtonSize = size
-        self.state: ButtonState = state
-        self.icon: str | None = icon
-        self.icon_class: str | None = icon_class
-        self.icon_position: IconPosition | None = icon_position
-        self.full_width: bool = full_width
-        self.loading_label: str | None = loading_label
-        self.loading_icon: str | None = loading_icon
-        self.loading_icon_class: str | None = loading_icon_class
-        self.tooltip: str | None = tooltip
+    element_id: str = attrs.field(default="Button", converter=default_element_id, metadata=WIRING)
 
-        # Validate that both button_link and on_click are not provided simultaneously
-        if button_link is not None and on_click is not None:
+    label: str = attrs.field(default="")  # Allows a button with no text.
+    variant: ButtonVariant = attrs.field(default="secondary")
+    size: ButtonSize = attrs.field(default="default")
+    state: ButtonState = attrs.field(default="normal")
+    icon: str | None = attrs.field(default=None)
+    icon_class: str | None = attrs.field(default=None)
+    icon_position: IconPosition | None = attrs.field(default=None)
+    full_width: bool = attrs.field(default=False)
+    loading_label: str | None = attrs.field(default=None)
+    loading_icon: str | None = attrs.field(default=None)
+    loading_icon_class: str | None = attrs.field(default=None)
+    tooltip: str | None = attrs.field(default=None)
+
+    # A link is state: the handler that opens it is rebuilt from the URL on load, which is why
+    # ``on_click_callback`` derives one rather than storing it.
+    button_link: str | None = attrs.field(default=None, on_setattr=_link_yields_to_a_handler)
+
+    # The handler a link opens, held rather than rebuilt per read so it keeps one identity.
+    # Derived from button_link, never saved, and kept in step by the hook above.
+    _link_handler: Callable | None = attrs.field(default=None, init=False)
+
+    # Both are behavior, so they are carried by method name. The field is on_click_handler
+    # because that is the node-supplied handler alone, and a link's handler must never be
+    # named: it would either fail to resolve on load or shadow the link it came from.
+    on_click_handler: OnClickCallback | None = attrs.field(
+        default=None, alias="on_click", metadata=BEHAVIOR, on_setattr=_handler_clears_the_link, kw_only=True
+    )
+    get_button_state_callback: GetButtonStateCallback | None = attrs.field(
+        default=None, alias="get_button_state", metadata=BEHAVIOR, kw_only=True
+    )
+
+    def __attrs_post_init__(self) -> None:
+        # Before the element is adopted, so a rejected button is never half-attached.
+        if self.button_link is not None and self.on_click_handler is not None:
             error_msg = (
                 "Cannot specify both 'button_link' and 'on_click' for Button. "
                 "Use 'button_link' for simple URL navigation or 'on_click' for custom behavior."
             )
             raise ValueError(error_msg)
-
-        self._action: _ClickAction | None = None
-        if button_link is not None:
-            self._action = _Link(button_link)
-        elif on_click is not None:
-            self._action = _NodeHandler(on_click)
-        self.get_button_state_callback = get_button_state
-
-    @property
-    def button_link(self) -> str | None:
-        """The URL a click opens, or None when a click runs the node's handler instead."""
-        if isinstance(self._action, _Link):
-            return self._action.url
-        return None
-
-    @button_link.setter
-    def button_link(self, url: str | None) -> None:
-        """Point the button at a URL, unless the node already wired its own handler.
-
-        A node's handler outranks a saved link, which belongs to a version of the node that
-        wired this button differently. Nothing has to clear the link afterwards: a button
-        running a handler reports no link, so the next save records none.
-        """
-        if isinstance(self._action, _NodeHandler):
-            return
-        if url is None:
-            self._action = None
-            return
-        self._action = _Link(url)
-
-    @property
-    def on_click_handler(self) -> OnClickCallback | None:
-        """The handler the owning node supplied, or None when this button opens a link.
-
-        What a save reads for ``on_click``. A link's handler is deliberately not reported
-        here: it is rebuilt from ``button_link`` on load, so naming a method for it would
-        either fail to resolve or shadow the link it came from.
-        """
-        if isinstance(self._action, _NodeHandler):
-            return self._action.callback
-        return None
-
-    @on_click_handler.setter
-    def on_click_handler(self, callback: OnClickCallback | None) -> None:
-        if callback is None:
-            self._action = None
-            return
-        self._action = _NodeHandler(callback)
+        self._link_handler = _link_handler_for(self.button_link)
+        super().__attrs_post_init__()
 
     @property
     def on_click_callback(self) -> OnClickCallback | None:
         """The callback a click fires, whether the node supplied it or a link derived it."""
-        if isinstance(self._action, _Link):
-            return self._action.handler
+        if self._link_handler is not None:
+            return self._link_handler
         return self.on_click_handler
 
     @on_click_callback.setter

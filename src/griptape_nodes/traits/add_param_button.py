@@ -1,10 +1,14 @@
-from griptape_nodes.exe_types.core_types import Trait
+import attrs
+
+from griptape_nodes.exe_types.core_types import WIRING, Trait, default_element_id
 from griptape_nodes.traits.button import Button
 
 
 class AddParameterButton(Trait):
-    def __init__(self) -> None:
-        super().__init__(element_id="AddParameterButton")
+    element_id: str = attrs.field(default="AddParameterButton", converter=default_element_id, metadata=WIRING)
+
+    def __attrs_post_init__(self) -> None:
+        super().__attrs_post_init__()
         self.type = "AddParameter"
         self.add_child(Button(label="AddParameter"))
 

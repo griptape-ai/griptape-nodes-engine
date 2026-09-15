@@ -4,11 +4,11 @@ import json
 import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+import attrs
 import pytest
 
 from griptape_nodes.exe_types.core_types import BaseNodeElement, ParameterGroup, Trait
@@ -18,6 +18,7 @@ from griptape_nodes.traits.compare import Compare
 from griptape_nodes.traits.minmax import MinMax
 from griptape_nodes.traits.multi_options import MultiOptions
 from griptape_nodes.traits.slider import Slider
+from griptape_nodes.traits.widget import Widget
 
 
 class TestAliasedConstructorState:
@@ -43,11 +44,11 @@ class TestAliasedConstructorState:
         assert rebuilt.to_state() == source.to_state()
 
 
-class TestTraitWithNoHandWrittenInit:
-    """Compare declares no __init__ of its own, so it has no constructor state to save."""
+class TestTraitWithNoDeclaredState:
+    """Compare declares no fields, so it has nothing to save."""
 
-    def test_state_parameter_names_is_empty(self) -> None:
-        assert Compare._state_parameter_names() == []
+    def test_state_is_empty(self) -> None:
+        assert Compare.state_keys() == []
 
     def test_to_state_is_empty(self) -> None:
         assert Compare().to_state() == {}
@@ -58,86 +59,36 @@ class TestTraitWithNoHandWrittenInit:
         assert isinstance(rebuilt, Compare)
 
 
-class _UndeclaredCallbackTrait(Trait):
-    """Stands in for a third-party trait that forgot to declare STATE_EXCLUDE."""
+class _UnsaveableItemTrait(Trait):
+    """A field a save cannot hold in full: the declared type passes, the contents do not.
 
-    def __init__(self, *, label: str = "hi", on_ping: object = None) -> None:
-        super().__init__(element_id="_UndeclaredCallbackTrait")
-        self.label = label
-        self.on_ping = on_ping
+    ``list[Any]`` is the escape hatch the class-creation check cannot judge, so this is the one
+    case left for a save-time warning.
+    """
 
-    def ui_options_for_trait(self) -> dict:
-        return {}
+    items: list[Any] = attrs.field(factory=list)
 
 
-class _UnaliasedAttributeTrait(Trait):
-    """Stands in for a third-party trait that forgot to declare STATE_ALIASES."""
+class _ExtensionsTrait(Trait):
+    """Stands in for a trait taking a set, as a file picker's extensions are."""
 
-    def __init__(self, *, threshold: int = 0) -> None:
-        super().__init__(element_id="_UnaliasedAttributeTrait")
-        self._level = threshold  # stored under a different name, no STATE_ALIASES declared
-
-    def ui_options_for_trait(self) -> dict:
-        return {}
+    extensions: set[str] | list[str] | None = attrs.field(default=None)
 
 
-class TestMisdeclaredTraitStateDegradesInsteadOfFailingTheSave:
-    """A trait author's mistake costs that one key, not the whole workflow save."""
+class TestAValueNoSavedFileCanHoldIsOmittedAndWarnedAbout:
+    """One value's worth of loss, not the artist's whole save."""
 
-    def test_an_undeclared_callback_is_omitted_and_warned_about(self, caplog: pytest.LogCaptureFixture) -> None:
-        trait = _UndeclaredCallbackTrait(label="x", on_ping=lambda: None)
-
-        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
-            state = trait.to_state()
-
-        assert state == {"label": "x"}
-        assert "on_ping" in caplog.text
-        assert "STATE_EXCLUDE" in caplog.text
-
-    def test_an_unaliased_attribute_is_omitted_and_warned_about(self, caplog: pytest.LogCaptureFixture) -> None:
-        trait = _UnaliasedAttributeTrait(threshold=5)
+    def test_the_warning_names_the_field_and_the_type(self, caplog: pytest.LogCaptureFixture) -> None:
+        # Path is PosixPath or WindowsPath depending on the platform, so name it from the value.
+        root = Path("/tmp/somewhere")  # noqa: S108
+        trait = _UnsaveableItemTrait(items=[root])
 
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
             state = trait.to_state()
 
         assert state == {}
-        assert "threshold" in caplog.text
-        assert "STATE_ALIASES" in caplog.text
-
-    def test_a_value_no_saved_file_can_hold_is_omitted_and_warned_about(self, caplog: pytest.LogCaptureFixture) -> None:
-        # Path is PosixPath or WindowsPath depending on the platform, so name it from the value.
-        root = Path("/tmp/somewhere")  # noqa: S108
-        trait = _UnsaveableValueTrait(label="x", root=root)
-
-        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
-            state = trait.to_state()
-
-        assert state == {"label": "x"}
-        assert "root" in caplog.text
+        assert "items" in caplog.text
         assert type(root).__name__ in caplog.text
-
-
-class _UnsaveableValueTrait(Trait):
-    """Stands in for a trait whose constructor takes something no data format holds."""
-
-    def __init__(self, *, label: str = "hi", root: Path | None = None) -> None:
-        super().__init__(element_id="_UnsaveableValueTrait")
-        self.label = label
-        self.root = root
-
-    def ui_options_for_trait(self) -> dict:
-        return {}
-
-
-class _ExtensionsTrait(Trait):
-    """Stands in for a trait whose constructor takes a set, as a file picker's extensions are."""
-
-    def __init__(self, *, extensions: set[str] | list[str] | None = None) -> None:
-        super().__init__(element_id="_ExtensionsTrait")
-        self.extensions = extensions
-
-    def ui_options_for_trait(self) -> dict:
-        return {}
 
 
 class TestStateIsWhatADataFormatCanHold:
@@ -149,7 +100,7 @@ class TestStateIsWhatADataFormatCanHold:
         assert trait.to_state() == {"extensions": [".avi", ".mp4"]}
 
     def test_the_constructor_is_handed_that_list_on_load(self) -> None:
-        """A trait wanting a set builds one in its constructor, which is where coercion belongs."""
+        """A trait wanting a set converts in the field, which is where coercion belongs."""
         source = _ExtensionsTrait(extensions={".mp4", ".avi"})
 
         rebuilt = _ExtensionsTrait.from_state(json.loads(json.dumps(source.to_state())))
@@ -158,82 +109,66 @@ class TestStateIsWhatADataFormatCanHold:
         assert rebuilt.to_state() == source.to_state()
 
 
-@dataclass(eq=False)
-class _InheritedConstructorBase(Trait):
-    """A trait meant to be subclassed, contributing one constructor argument."""
+class _InheritedStateBase(Trait):
+    """A trait meant to be subclassed, contributing one field."""
 
-    low: Any = 0
-
-    def __init__(self, *, low: Any = 0) -> None:
-        super().__init__()
-        self.low = low
+    low: Any = attrs.field(default=0)
 
 
-@dataclass(eq=False)
-class _ForwardingSubclass(_InheritedConstructorBase):
-    """Declares one argument of its own and forwards the rest to its base."""
+class _InheritingSubclass(_InheritedStateBase):
+    """Declares one field of its own. attrs collects its base's too, with nothing to restate."""
 
-    high: Any = 10
-
-    def __init__(self, *, high: Any = 10, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        self.high = high
+    high: Any = attrs.field(default=10)
 
 
-@dataclass(eq=False)
-class _NarrowingSubclass(_InheritedConstructorBase):
-    """Fixes its base's argument instead of forwarding it, so it takes none of its own."""
+class _FixingSubclass(_InheritedStateBase):
+    """Fixes its base's field instead of taking an argument for it, so it is no longer state."""
 
-    def __init__(self) -> None:
-        super().__init__(low=7)
+    low: Any = attrs.field(default=7, init=False)
 
 
-@dataclass(eq=False)
-class _NoConstructorTrait(Trait):
-    """Declares no __init__, so @dataclass generates one over inherited element fields."""
+class _NoDeclaredStateTrait(Trait):
+    """Declares no fields, so it has no state."""
 
 
-class TestInheritedConstructorArguments:
-    """State comes from every constructor the authors wrote, not just the nearest one."""
+class TestInheritedFields:
+    """A subclass gets its base's fields, and can fix one rather than pass it on."""
 
-    def test_a_forwarded_base_argument_is_saved(self) -> None:
-        trait = _ForwardingSubclass(high=99, low=5)
+    def test_a_base_field_is_saved_without_being_restated(self) -> None:
+        trait = _InheritingSubclass(high=99, low=5)
 
         assert trait.to_state() == {"high": 99, "low": 5}
 
-    def test_a_forwarded_base_argument_survives_a_round_trip(self) -> None:
-        source = _ForwardingSubclass(high=99, low=5)
+    def test_a_base_field_survives_a_round_trip(self) -> None:
+        source = _InheritingSubclass(high=99, low=5)
 
-        restored = _ForwardingSubclass.from_state(source.to_state())
+        restored = _InheritingSubclass.from_state(source.to_state())
 
         assert restored.high == source.high
         assert restored.low == source.low
         assert restored.to_state() == source.to_state()
 
-    def test_a_base_argument_the_subclass_cannot_forward_is_not_saved(self) -> None:
-        # Without **kwargs there is no way to pass 'low' back in, so saving it would
-        # produce state from_state() could not replay.
-        trait = _NarrowingSubclass()
+    def test_a_base_field_the_subclass_fixed_is_not_saved(self) -> None:
+        # The constructor takes no argument for 'low', so saving it would produce state
+        # from_state() could not replay.
+        trait = _FixingSubclass()
 
         assert trait.to_state() == {}
-        # The constructor fixes 'low', so restoring reproduces it without carrying it.
-        assert _NarrowingSubclass.from_state(trait.to_state()).low == trait.low
+        # The field fixes 'low', so restoring reproduces it without carrying it.
+        assert _FixingSubclass.from_state(trait.to_state()).low == trait.low
 
 
-class TestGeneratedConstructorsAreNotState:
-    """A @dataclass-generated __init__ says nothing about what the author considers state."""
+class TestATraitDeclaringNoStateSavesNothing:
+    """State is what a trait declares, so one that declares nothing carries nothing."""
 
-    def test_a_trait_declaring_no_constructor_has_no_state(self) -> None:
-        assert _NoConstructorTrait().to_state() == {}
+    def test_state_is_empty(self) -> None:
+        assert _NoDeclaredStateTrait().to_state() == {}
 
     def test_engine_internals_never_appear_in_state(self) -> None:
-        state = _NoConstructorTrait().to_state()
+        state = _NoDeclaredStateTrait().to_state()
 
         for internal in ("_children", "_parent", "element_id", "element_type"):
             assert internal not in state
-
-    def test_compare_declares_no_constructor_and_stays_empty(self) -> None:
-        assert Compare().to_state() == {}
 
 
 class TestApplyStateGoesThroughTheConstructor:
@@ -325,3 +260,38 @@ class TestTheThrowawayIsNeverObservable:
             trait.apply_state({})
 
         assert built == []
+
+
+class TestWidgetReadsItsOlderSavedKey:
+    """Widget's name moved off the element's own ``name`` and onto a field of its own.
+
+    A file saved before that wrote the widget's name as ``name``, so ``migrate_state`` reads it
+    back rather than leaving those parameters with a control that renders nothing.
+    """
+
+    def test_the_older_key_still_loads(self) -> None:
+        rebuilt = Widget.from_state({"name": "editor", "library": "my-lib"})
+
+        assert (rebuilt.widget_name, rebuilt.library) == ("editor", "my-lib")
+
+    def test_it_is_saved_under_the_current_key(self) -> None:
+        rebuilt = Widget.from_state({"name": "editor", "library": "my-lib"})
+
+        assert rebuilt.to_state() == {"widget_name": "editor", "library": "my-lib"}
+
+    def test_the_element_name_stays_engine_wiring(self) -> None:
+        rebuilt = Widget.from_state({"name": "editor", "library": "my-lib"})
+
+        assert rebuilt.name != "editor"
+
+    def test_it_applies_in_place_too(self) -> None:
+        widget = Widget(widget_name="old", library="my-lib")
+
+        widget.apply_state({"name": "editor", "library": "my-lib"})
+
+        assert widget.widget_name == "editor"
+
+    def test_the_current_key_wins_when_a_file_holds_both(self) -> None:
+        rebuilt = Widget.from_state({"name": "stale", "widget_name": "editor", "library": "my-lib"})
+
+        assert rebuilt.widget_name == "editor"

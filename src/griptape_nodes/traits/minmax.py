@@ -1,16 +1,14 @@
 from collections.abc import Callable
-from typing import Any, ClassVar
+from typing import Any
+
+import attrs
 
 from griptape_nodes.exe_types.core_types import Parameter, Trait
 
 
 class MinMax(Trait):
-    STATE_ALIASES: ClassVar[dict[str, str]] = {"min_val": "min", "max_val": "max"}
-
-    def __init__(self, min_val: float, max_val: float) -> None:
-        super().__init__()
-        self.min = min_val
-        self.max = max_val
+    min: float = attrs.field(alias="min_val")
+    max: float = attrs.field(alias="max_val")
 
     def ui_options_for_trait(self) -> dict:
         return {"multiline": True}

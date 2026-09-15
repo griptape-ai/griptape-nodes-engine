@@ -1,53 +1,93 @@
 # Unreleased
 
-## A `Trait` subclass writes its own `__init__`
+## A `Trait` declares fields, not a constructor
 
-`Trait` and `BaseNodeElement` are no longer dataclasses, so a trait that relied on a generated
-constructor never reaches `BaseNodeElement.__init__` and loads without an `element_id`:
-
-```python
-@dataclass(eq=False)  # generated __init__ sets threshold and stops there
-class Threshold(Trait):
-    threshold: int = field(default=5)
-
-
-Threshold().element_id  # AttributeError
-```
-
-Drop the decorator and write the constructor:
+`BaseNodeElement` is an [attrs](https://www.attrs.org) class, and its metaclass makes every
+element one. A trait declares `attrs.field()` attributes and the constructor is generated,
+element wiring included. There is no decorator to remember and no `super().__init__()` to call:
 
 ```python
+import attrs
+
+from griptape_nodes.exe_types.core_types import BEHAVIOR, Trait
+
+
 class Threshold(Trait):
-    def __init__(self, threshold: int = 5) -> None:
-        super().__init__()
-        self.threshold = threshold
+    level: int = attrs.field(default=5, alias="threshold")
+    on_cross: Callable | None = attrs.field(default=None, metadata=BEHAVIOR)
 ```
 
-The constructor is now also what saving reads: a trait's state is its `__init__` parameters,
-read off the attributes of the same name. Two things to declare when they do not line up:
+`Threshold(threshold=8)` sets `self.level`, and a save records `{"threshold": 8}`. Every element
+field is keyword-only, so a trait that took positional arguments (`Slider(0, 100)`) now takes
+`Slider(min_val=0, max_val=100)`.
 
-- `STATE_ALIASES` when an argument is stored under another name, as `Slider(min_val=...)`
-    stores `self.min`.
-- `STATE_EXCLUDE` for an argument that is behavior rather than state, as `Button(on_click=...)`.
-    Those are saved by method name instead, so pass a method of the node (`self.my_handler`);
-    a lambda has no name to resolve on load.
+The fields *are* the saved contract, so there is nothing else to declare and nothing to keep in
+step. Three kinds:
 
-State is written into a saved workflow as data, so it can hold text, numbers, true/false, and
-lists or dictionaries of those. A set or a tuple is saved as a list, which is what the
-constructor is handed on load, so coerce there if the trait wants a set:
+- **state**, the default. Saved as data and handed back to the constructor on load.
+- **behavior**, `metadata=BEHAVIOR`. A callback, saved as the name of a method on the owning
+    node, so pass a method (`self.my_handler`); a lambda has no name to resolve on load.
+- **neither**, `init=False`. Not saved, not a constructor argument. For a value the trait
+    derives.
+
+`alias` covers a keyword that differs from the attribute it lands on, which is also how a field
+sits behind a property: a field named `_choices` takes the keyword `choices`, leaving `choices`
+free to be a property.
+
+A subclass inherits its base's fields and declares only its own. To fix an inherited field
+instead of taking an argument for it, re-declare it `init=False`.
+
+**An annotation is not a declaration.** `threshold: int = 5` is a field to a type checker and
+nothing at all to the engine, so it raises at class creation. Declare it with `attrs.field()`,
+mark it `ClassVar` if it is a constant, or annotate it where it is assigned if it is neither.
+
+**Renaming a field keeps reading the old key** by overriding `migrate_state`, which every load
+passes its saved state through:
+
+```python
+class Threshold(Trait):
+    level: int = attrs.field(default=5)
+
+    @classmethod
+    def migrate_state(cls, state: dict[str, Any]) -> dict[str, Any]:
+        if "threshold" not in state or "level" in state:
+            return state
+        migrated = dict(state)
+        migrated["level"] = migrated.pop("threshold")
+        return migrated
+```
+
+**The declaration is checked when the class is built**, so a mistake costs a library its import
+rather than an artist's saved work. A state field's type has to be something a saved workflow can
+hold: text, numbers, true/false, and lists or dictionaries of those. These raise `TypeError` at
+class creation:
+
+```python
+class Broken(Trait):
+    root: Path | None = attrs.field(default=None)  # no saved form
+    on_ping: Callable | None = attrs.field(default=None)  # a callback: use metadata=BEHAVIOR
+    derived: str = attrs.field(default="x", init=False)  # fine: init=False is not state
+```
+
+A set or a tuple is saved as a list, which is what the constructor is handed on load, so convert
+in the field if the trait wants a set:
 
 ```python
 class Extensions(Trait):
-    def __init__(self, extensions: set[str] | list[str]) -> None:
-        super().__init__()
-        self.extensions = set(extensions)
+    extensions: set[str] = attrs.field(converter=set, factory=set)
 ```
 
-Anything else, a `Path` or any other object, is dropped from the state with a warning, and the
-parameter loads without that one value.
+A value whose type passed the check but whose contents cannot be written, a `list[Any]` holding
+an object, is dropped from the state with a warning, and the parameter loads without it.
 
-A leftover `field(...)` on a class that is no longer a dataclass is a `Field` object, not the
-default it looks like, and gets saved as the trait's state. Delete those along with the decorator.
+Two smaller consequences:
+
+- **Elements compare by identity.** `Button(label="Go") == Button(label="Go")` is now False, and
+    a `set` holds both. `Button` and `AddParameterButton` fixed their `element_id`, which used to
+    give them value equality and quietly collapse a pair of identical buttons into one.
+- **`Widget` takes `widget_name`.** It used to overload the element's own `name`, which a
+    generated constructor cannot do: the element base already takes that keyword. A workflow
+    saved under the old key still loads.
 
 ## A trait owns the `ui_options` keys it renders
 

@@ -5,9 +5,6 @@ from griptape_nodes.exe_types.core_types import Parameter, Trait
 
 
 class CompareImagesTrait(Trait):
-    def __init__(self) -> None:
-        super().__init__()
-
     def validators_for_trait(self) -> list[Callable[[Parameter, Any], Any]]:
         def validate_image_comparison(parameter: Parameter, value: Any) -> Any:
             if not isinstance(value, dict):
