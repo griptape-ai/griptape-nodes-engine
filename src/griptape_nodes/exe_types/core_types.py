@@ -1910,16 +1910,18 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         return bool(self._validators)
 
     def trait_states(self) -> list[dict[str, Any]]:
-        """Return save-only trait identity and constructor state.
+        """Return save-only trait identity, constructor state, and callbacks.
 
         ``NodeManager`` stabilizes dynamic library module names before saving.
         """
+        owner = self.get_node()
         states: list[dict[str, Any]] = []
         for trait in self.find_elements_by_type(Trait):
             entry = TraitStateEntry(
                 trait_name=type(trait).__name__,
                 trait_module=type(trait).__module__,
                 trait_state=trait.to_state(),
+                trait_callbacks=trait.callback_names(owner),
             )
             states.append(entry.to_dict())
         return states
@@ -3333,6 +3335,44 @@ class Trait(ABC, BaseNodeElement):
         for attribute in self._state_fields():
             if self.saved_key(attribute) in migrated:
                 setattr(self, attribute.name, getattr(interpreted, attribute.name))
+
+    def callback_names(self, owner: BaseNode | None) -> dict[str, str]:
+        """Return nameable behavior fields as owning-node method names."""
+        names: dict[str, str] = {}
+        for attribute in self._behavior_fields():
+            callback = getattr(self, attribute.name, None)
+            name = name_callback(callback, owner)
+            if name is not None:
+                names[self.saved_key(attribute)] = name
+        return names
+
+    def unnameable_callbacks(self, owner: BaseNode | None) -> list[str]:
+        """Return behavior fields whose callbacks cannot be saved by name."""
+        unnameable: list[str] = []
+        for attribute in self._behavior_fields():
+            callback = getattr(self, attribute.name, None)
+            if callback is None:
+                continue
+            if name_callback(callback, owner) is None:
+                unnameable.append(self.saved_key(attribute))
+        return sorted(unnameable)
+
+    def apply_callback_names(self, names: dict[str, str], owner: BaseNode | None) -> None:
+        """Bind missing behavior fields to saved owning-node methods.
+
+        Existing callbacks take precedence over saved names.
+        """
+        for attribute in self._behavior_fields():
+            saved_key = self.saved_key(attribute)
+            method_name = names.get(saved_key)
+            if method_name is None:
+                continue
+            if getattr(self, attribute.name, None) is not None:
+                continue
+            described_as = f"the '{saved_key}' behavior of the '{type(self).__name__}' control"
+            callback = resolve_callback(method_name, owner, described_as=described_as)
+            if callback is not None:
+                setattr(self, attribute.name, callback)
 
     @classmethod
     def migrate_state(cls, state: dict[str, Any]) -> dict[str, Any]:

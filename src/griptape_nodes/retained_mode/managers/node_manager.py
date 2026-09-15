@@ -251,6 +251,16 @@ logger = logging.getLogger("griptape_nodes")
 _PARAM_MISSING = object()
 
 
+class RestoredTrait(NamedTuple):
+    """Pair a saved trait entry with its restored instance.
+
+    Callbacks restore after parameter attachment because they require the owning node.
+    """
+
+    entry: TraitStateEntry
+    trait: Trait | None
+
+
 class SerializedParameterValues(NamedTuple):
     """Result of serializing parameter output values.
 
@@ -1905,8 +1915,9 @@ class NodeManager(EngineScoped):
         )
         # Rebuild traits from saved state so their converters, validators,
         # and ui_options come back with the class.
+        restored_traits: list[RestoredTrait] = []
         if request.traits:
-            NodeManager._apply_trait_states(new_param, request.traits)
+            restored_traits = NodeManager._apply_trait_states(new_param, request.traits)
         try:
             with sanctioned_parameter_mutation():
                 if request.parent_container_name and request.initial_setup:
@@ -1923,6 +1934,8 @@ class NodeManager(EngineScoped):
 
         # A saved callback names a method on the owning node, which the parameter can only
         # reach once it is attached.
+        if request.traits:
+            NodeManager._apply_trait_callbacks(new_param, restored_traits)
         if request.value_callbacks:
             new_param.apply_value_callback_names(request.value_callbacks, node)
 
@@ -2280,7 +2293,10 @@ class NodeManager(EngineScoped):
             if request.tooltip_as_output is not None:
                 parameter.tooltip_as_output = request.tooltip_as_output
             if request.traits is not None:
-                NodeManager._apply_trait_states(parameter, request.traits)
+                # An altered parameter is already attached to its node, so state and
+                # callbacks can both be restored here.
+                restored = NodeManager._apply_trait_states(parameter, request.traits)
+                NodeManager._apply_trait_callbacks(parameter, restored)
             if request.value_callbacks is not None:
                 parameter.apply_value_callback_names(request.value_callbacks, parameter.get_node())
         if request.ui_options is not None and hasattr(parameter, "ui_options"):
@@ -4352,7 +4368,7 @@ class NodeManager(EngineScoped):
         return trait_states
 
     @staticmethod
-    def _apply_trait_states(parameter: Parameter, trait_states: list[dict[str, Any]]) -> None:
+    def _apply_trait_states(parameter: Parameter, trait_states: list[dict[str, Any]]) -> list[RestoredTrait]:
         """Apply state to matching traits and build missing traits.
 
         Existing instances are preserved with constructor wiring. Unresolvable traits are
@@ -4360,14 +4376,18 @@ class NodeManager(EngineScoped):
         """
         entries = NodeManager._parse_trait_entries(parameter, trait_states)
         paired = NodeManager._pair_saved_traits(parameter, entries)
+        restored: list[RestoredTrait] = []
         for entry, existing in zip(entries, paired, strict=True):
+            trait = existing
             if existing is None:
-                NodeManager._build_saved_trait(parameter, entry)
-                continue
-            try:
-                existing.apply_state(entry.trait_state)
-            except TypeError:
-                NodeManager._warn_unsatisfiable_trait_state(parameter, entry.trait_name)
+                trait = NodeManager._build_saved_trait(parameter, entry)
+            else:
+                try:
+                    existing.apply_state(entry.trait_state)
+                except TypeError:
+                    NodeManager._warn_unsatisfiable_trait_state(parameter, entry.trait_name)
+            restored.append(RestoredTrait(entry=entry, trait=trait))
+        return restored
 
     @staticmethod
     def _parse_trait_entries(parameter: Parameter, trait_states: list[dict[str, Any]]) -> list[TraitStateEntry]:
@@ -4442,6 +4462,10 @@ class NodeManager(EngineScoped):
         """Warn about runtime callbacks that cannot be restored by method name."""
         owner = parameter.get_node()
         locations: list[str] = []
+        for trait in parameter.find_elements_by_type(Trait):
+            unnameable = trait.unnameable_callbacks(owner)
+            if unnameable:
+                locations.append(f"{', '.join(unnameable)} on the '{type(trait).__name__}' control")
         for kind, count in parameter.unnameable_value_callbacks(owner).items():
             locations.append(f"{count} {kind[:-1] if count == 1 else kind}")
         if not locations:
@@ -4453,6 +4477,18 @@ class NodeManager(EngineScoped):
             parameter.name,
             "; ".join(locations),
         )
+
+    @staticmethod
+    def _apply_trait_callbacks(parameter: Parameter, restored: list[RestoredTrait]) -> None:
+        """Bind callbacks after the parameter can reach its owning node.
+
+        Constructor-supplied callbacks take precedence over saved names.
+        """
+        owner = parameter.get_node()
+        for entry, trait in restored:
+            if not entry.trait_callbacks or trait is None:
+                continue
+            trait.apply_callback_names(entry.trait_callbacks, owner)
 
     @staticmethod
     def _manage_alter_details(parameter: Parameter, base_node_obj: BaseNode) -> dict:

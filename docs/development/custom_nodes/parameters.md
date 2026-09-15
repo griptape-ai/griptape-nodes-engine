@@ -40,7 +40,7 @@ Add functionality via `add_trait()`:
 
 For the full list of traits, the widgets they render, and the `ui_options` keys they manage, see the [Parameter UI Reference](parameter_ui_reference.md).
 
-**Saving callbacks**: Parameter converters and validators must be bound node methods, such as `self.my_handler`. A lambda or local function cannot be resolved when loading, so its behavior is omitted with a warning.
+**Saving callbacks**: `Button` callbacks and parameter converters or validators must be bound node methods, such as `self.my_handler`. A lambda or local function cannot be resolved when loading, so its behavior is omitted with a warning.
 
 **Saving trait state**: Trait constructor arguments may contain text, numbers, booleans, and lists or dictionaries of those values. Sets and tuples load as lists. Unsupported values are omitted with a warning.
 

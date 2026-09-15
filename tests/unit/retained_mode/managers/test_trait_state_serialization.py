@@ -173,6 +173,34 @@ class TestUnresolvableTraitName:
 
         assert any("NoSuchTrait" in record.getMessage() for record in caplog.records)
 
+
+class TestUnsaveableCallbackWarning:
+    def test_serializing_a_lambda_callback_logs_a_warning(
+        self, engine: Engine, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        node = _add_node(engine, "picker")
+        node.discover()
+        caplog.set_level(logging.WARNING, logger="griptape_nodes")
+
+        result = engine.node_manager.on_serialize_node_to_commands(SerializeNodeToCommandsRequest(node_name=node.name))
+
+        assert isinstance(result, SerializeNodeToCommandsResultSuccess)
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("unsaveable" in r.getMessage() and "cannot be saved" in r.getMessage() for r in warnings)
+
+    def test_a_nameable_callback_logs_nothing(self, engine: Engine, caplog: pytest.LogCaptureFixture) -> None:
+        node = _add_node(engine, "picker")
+        node.discover()
+        caplog.set_level(logging.WARNING, logger="griptape_nodes")
+
+        engine.node_manager.on_serialize_node_to_commands(SerializeNodeToCommandsRequest(node_name=node.name))
+
+        assert not any("'reload'" in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+
+
+class TestSerializeThenReplay:
+    """The scenario the deleted demo script covered: build, serialize, replay onto a fresh node."""
+
     def test_emitted_commands_carry_traits_and_value_callbacks(self, engine: Engine) -> None:
         node = _add_node(engine, "picker")
         node.discover()
@@ -216,10 +244,11 @@ class TestUnresolvableTraitName:
                     "tooltip": None,
                     "button_link": None,
                 },
+                "trait_callbacks": {"on_click": "reload_models"},
             }
         ]
 
-    def test_replaying_the_commands_restores_trait_state(self, engine: Engine) -> None:
+    def test_replaying_the_commands_restores_state_and_callbacks(self, engine: Engine) -> None:
         node = _add_node(engine, "picker")
         node.discover()
         node.set_parameter_value("model", "flux")
@@ -247,7 +276,15 @@ class TestUnresolvableTraitName:
             trait
             for trait in target.get_parameter_by_name("reload").find_elements_by_type(Button)  # type: ignore[union-attr]
         )
-        assert reload_button.label == "Reload"
+        assert reload_button.on_click_callback is not None
+        assert reload_button.on_click_callback.__self__ is target  # type: ignore[attr-defined]
+
+        unsaveable_button = next(
+            trait
+            for trait in target.get_parameter_by_name("unsaveable").find_elements_by_type(Button)  # type: ignore[union-attr]
+        )
+        assert unsaveable_button.on_click_callback is None
+        assert unsaveable_button.label == "Lambda"
 
 
 class TestTraitModuleStabilization:

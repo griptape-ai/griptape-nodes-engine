@@ -86,6 +86,53 @@ class SetButtonStatusMessagePayload(NodeMessagePayload):
     updates: dict[str, str | bool | None]
 
 
+def _build_link_handler(url: str) -> Callable:
+    """Build a link callback from saved URL state."""
+
+    def handler(
+        button: "Button",  # noqa: ARG001
+        button_details: ButtonDetailsMessagePayload,
+    ) -> NodeMessageResult:
+        return NodeMessageResult(
+            success=True,
+            details="Opening URL",
+            response=OnClickMessageResultPayload(
+                button_details=button_details,
+                href=url,
+            ),
+            altered_workflow_state=False,
+        )
+
+    return handler
+
+
+def _link_yields_to_a_handler(button: "Button", _attribute: attrs.Attribute, url: str | None) -> str | None:
+    """Ignore saved links when node code supplies a handler.
+
+    Cache derived handlers because callers compare callback identity.
+    """
+    if url is not None and button.on_click_handler is not None:
+        return button.button_link
+    button._link_handler = _link_handler_for(url)
+    return url
+
+
+def _link_handler_for(url: str | None) -> Callable | None:
+    if url is None:
+        return None
+    return _build_link_handler(url)
+
+
+def _handler_clears_the_link(
+    button: "Button", _attribute: attrs.Attribute, callback: Callable | None
+) -> Callable | None:
+    """Drop the link when a handler is attached, so the two can never both be live."""
+    if callback is not None:
+        button.button_link = None
+        button._link_handler = None
+    return callback
+
+
 class Button(Trait):
     type OnClickCallback = Callable[[Button, ButtonDetailsMessagePayload], NodeMessageResult | None]
     type GetButtonStateCallback = Callable[[Button, ButtonDetailsMessagePayload], NodeMessageResult | None]
@@ -109,10 +156,15 @@ class Button(Trait):
     loading_icon_class: str | None = attrs.field(default=None)
     tooltip: str | None = attrs.field(default=None)
 
-    button_link: str | None = attrs.field(default=None)
+    # Link URL is state; its callback is derived.
+    button_link: str | None = attrs.field(default=None, on_setattr=_link_yields_to_a_handler)
 
-    on_click_callback: OnClickCallback | None = attrs.field(
-        default=None, alias="on_click", metadata=BEHAVIOR, kw_only=True
+    # Derived handler cached for stable callback identity.
+    _link_handler: Callable | None = attrs.field(default=None, init=False)
+
+    # A link callback is derived state and must not be saved as node behavior.
+    on_click_handler: OnClickCallback | None = attrs.field(
+        default=None, alias="on_click", metadata=BEHAVIOR, on_setattr=_handler_clears_the_link, kw_only=True
     )
     get_button_state_callback: GetButtonStateCallback | None = attrs.field(
         default=None, alias="get_button_state", metadata=BEHAVIOR, kw_only=True
@@ -120,34 +172,25 @@ class Button(Trait):
 
     def __attrs_post_init__(self) -> None:
         # Before the element is adopted, so a rejected button is never half-attached.
-        if self.button_link is not None and self.on_click_callback is not None:
+        if self.button_link is not None and self.on_click_handler is not None:
             error_msg = (
                 "Cannot specify both 'button_link' and 'on_click' for Button. "
                 "Use 'button_link' for simple URL navigation or 'on_click' for custom behavior."
             )
             raise ValueError(error_msg)
-        if self.button_link is not None:
-            self.on_click_callback = self._create_button_link_handler(self.button_link)
+        self._link_handler = _link_handler_for(self.button_link)
         super().__attrs_post_init__()
 
-    def _create_button_link_handler(self, url: str) -> OnClickCallback:
-        """Create a default handler for button_link URLs."""
+    @property
+    def on_click_callback(self) -> OnClickCallback | None:
+        """The callback a click fires, whether the node supplied it or a link derived it."""
+        if self._link_handler is not None:
+            return self._link_handler
+        return self.on_click_handler
 
-        def handler(
-            button: Button,  # noqa: ARG001
-            button_details: ButtonDetailsMessagePayload,
-        ) -> NodeMessageResult:
-            return NodeMessageResult(
-                success=True,
-                details="Opening URL",
-                response=OnClickMessageResultPayload(
-                    button_details=button_details,
-                    href=url,
-                ),
-                altered_workflow_state=False,
-            )
-
-        return handler
+    @on_click_callback.setter
+    def on_click_callback(self, callback: OnClickCallback | None) -> None:
+        self.on_click_handler = callback
 
     def get_button_details(self, state: ButtonState | None = None) -> ButtonDetailsMessagePayload:
         """Create a ButtonDetailsMessagePayload with current or specified button state."""

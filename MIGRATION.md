@@ -25,8 +25,8 @@ The fields *are* the saved contract, so there is nothing else to declare and not
 step. Three kinds:
 
 - **state**, the default. Saved as data and handed back to the constructor on load.
-- **behavior**, `metadata=BEHAVIOR`. A callback, which is code rather than data, so it is not
-    saved as state.
+- **behavior**, `metadata=BEHAVIOR`. A callback, saved as the name of a method on the owning
+    node, so pass a method (`self.my_handler`); a lambda has no name to resolve on load.
 - **neither**, `init=False`. Not saved, not a constructor argument. For a value the trait
     derives.
 

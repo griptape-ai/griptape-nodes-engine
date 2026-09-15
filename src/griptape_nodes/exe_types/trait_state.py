@@ -112,7 +112,7 @@ def _as_saved_sequence(value: list | tuple | set | frozenset) -> SavedStateValue
 
 @dataclass(frozen=True)
 class TraitStateEntry:
-    """Saved trait identity and state.
+    """Saved trait identity, state, and callbacks.
 
     ``trait_module`` distinguishes same-named traits from different libraries.
     """
@@ -120,6 +120,7 @@ class TraitStateEntry:
     trait_name: str
     trait_module: str | None = None
     trait_state: dict[str, Any] = field(default_factory=dict)
+    trait_callbacks: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, entry: dict[str, Any]) -> Self | None:
@@ -133,10 +134,14 @@ class TraitStateEntry:
         trait_state = entry.get("trait_state")
         if not isinstance(trait_state, dict):
             trait_state = {}
+        trait_callbacks = entry.get("trait_callbacks")
+        if not isinstance(trait_callbacks, dict):
+            trait_callbacks = {}
         return cls(
             trait_name=trait_name,
             trait_module=trait_module,
             trait_state=trait_state,
+            trait_callbacks=trait_callbacks,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -145,4 +150,6 @@ class TraitStateEntry:
             "trait_module": self.trait_module,
             "trait_state": self.trait_state,
         }
+        if self.trait_callbacks:
+            entry["trait_callbacks"] = self.trait_callbacks
         return entry
