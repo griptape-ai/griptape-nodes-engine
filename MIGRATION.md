@@ -89,6 +89,20 @@ Two smaller consequences:
     generated constructor cannot do: the element base already takes that keyword. A workflow
     saved under the old key still loads.
 
+## Workflows saved before trait state still load their controls
+
+A file that predates trait state carries a dropdown's choices in `ui_options`, since that was the
+only field a save wrote. The load adopts them onto the trait, so a dropdown its node filled in at
+run time keeps its choices and its saved selection, and the next save records them as trait state.
+
+A parameter the node created at run time has no trait to adopt them onto: the trait lived only in
+the file, as those keys. Such a parameter is rebuilt from them, so its dropdown, multi-select, or
+slider constrains the value again instead of rendering as a control with nothing behind it. Only
+`simple_dropdown` (and `enum_choices`, its older spelling), `multi_options`, and `slider` are read
+this way, because those are the only keys a save could round-trip. A missing `traits` field is what
+marks a file as predating trait state; an empty one is a current save saying the parameter has no
+traits, and is left alone.
+
 ## Branched workflows show a title instead of a file path
 
 Branching a workflow used to set the new workflow's `metadata.name` — the human-readable display
