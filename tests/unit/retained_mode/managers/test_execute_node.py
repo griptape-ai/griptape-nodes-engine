@@ -457,7 +457,7 @@ class TestExecuteNodeWorkerRoute:
         lib_mgr = MagicMock()
         lib_mgr.is_worker = False
         lib_mgr._is_worker = False
-        lib_mgr.wait_for_worker_library_load = AsyncMock()
+        lib_mgr.wait_for_worker_ready = AsyncMock()
         lib_mgr.get_worker_for_library.return_value = ("eng-id", "topic")
 
         node_manager = _make_node_manager(object_manager=mock_obj_mgr, library_manager=lib_mgr, worker_manager=wm)
