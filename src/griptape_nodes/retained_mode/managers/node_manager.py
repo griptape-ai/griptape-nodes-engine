@@ -1354,9 +1354,21 @@ class NodeManager(EngineScoped):
         that consumer. A node reached only by data connections has no control connections of its own,
         so the walk above can never find it -- it is not on the control graph at all. For those, the
         run arriving is a fact about their consumers rather than about the node, which is why this
-        recurses. Control connections are excluded from that recursion on purpose: control
-        reachability was already answered exhaustively above, over every branch including untaken
-        ones, so following a control edge again could only add a false positive.
+        recurses, asking each consumer the same pair of questions `_find_entangled_live_node` asks of
+        a direct target: already in the DAG and uncollected, or absent but still coming. Control
+        connections are excluded from that recursion on purpose: control reachability was already
+        answered exhaustively above, over every branch including untaken ones, so following a control
+        edge again could only add a false positive.
+
+        The recursion stops at any consumer the run has already placed in the DAG. Such a node is not
+        going to be pulled in again as somebody's dependency, and if it is not uncollected then it
+        took its inputs at its own dispatch -- so anything past it is reached through a value that was
+        never wrong.
+
+        One way to be here is conservative rather than necessary: an intermediate node absent because
+        it is already RESOLVED will not be rebuilt into this DAG, so the consumer would collect its
+        last-good value rather than a parameter default. Cancelling in the safe direction is the
+        policy, so that case cancels too.
         """
         if visited is None:
             visited = set()
@@ -1376,7 +1388,11 @@ class NodeManager(EngineScoped):
         for connection in connections.get_all_outgoing_connections(node):
             if connection.source_parameter.output_type == ParameterTypeBuiltin.CONTROL_TYPE.value:
                 continue
-            if self._run_will_reach(connection.target_node, visited):
+            consumer = connection.target_node
+            consumer_dag_node = dag_builder.node_to_reference.get(consumer.name)
+            if consumer_dag_node is not None and consumer_dag_node.node_state in _UNCOLLECTED_NODE_STATES:
+                return True
+            if consumer_dag_node is None and self._run_will_reach(consumer, visited):
                 return True
 
         return False

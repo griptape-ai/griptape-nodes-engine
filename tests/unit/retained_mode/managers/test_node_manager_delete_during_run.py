@@ -7,6 +7,7 @@ input that makes a healthy engine fail to cancel; and the exact shape of the for
 control graph, which a run reaches only through whichever topology it happens to be executing.
 """
 
+from dataclasses import dataclass
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -208,6 +209,102 @@ def test_a_consumer_the_control_graph_never_reaches_is_free() -> None:
     node_manager = _node_manager(engine)
 
     assert node_manager._find_entangled_live_node(deleted) is None
+
+
+@dataclass
+class _QueuedSiblingScene:
+    """A run parked with one sibling queued, and a supplier feeding it from off the chain."""
+
+    node_manager: NodeManager
+    supplier: BaseNode
+
+
+def _queued_sibling_scene(*, via_data_hop: bool) -> _QueuedSiblingScene:
+    """`Start` (done) led to `Fast` (queued) and `Slow` (running); `Loader` feeds `Fast`.
+
+    Nothing live leads *to* `Fast` any more -- `Start` has settled, and `Slow` is off on its own
+    branch -- so the only thing that knows `Fast` has not collected yet is its DAG state. The two
+    tests differ by exactly one data node standing between the supplier and `Fast`.
+    """
+    start = _ChainNode("Start")
+    fast = _ChainNode("Fast")
+    slow = _ChainNode("Slow")
+    loader = _ChainNode("Loader")
+
+    connections = Connections()
+    _connect_control(connections, start, "exec_out", fast)
+    _connect_control(connections, start, LOOP_BACK_PARAMETER, slow)
+    if via_data_hop:
+        resizer = _ChainNode("Resizer")
+        _connect_data(connections, loader, resizer)
+        _connect_data(connections, resizer, fast)
+    else:
+        _connect_data(connections, loader, fast)
+
+    dag_builder = DagBuilder(MagicMock())
+    dag_builder.node_to_reference["Start"] = DagNode(node_reference=start, node_state=NodeState.DONE)
+    dag_builder.node_to_reference["Fast"] = DagNode(node_reference=fast, node_state=NodeState.QUEUED)
+    dag_builder.node_to_reference["Slow"] = DagNode(node_reference=slow, node_state=NodeState.PROCESSING)
+
+    engine = _engine(dag_builder)
+    engine.flow_manager.get_connections.return_value = connections
+    return _QueuedSiblingScene(node_manager=_node_manager(engine), supplier=loader)
+
+
+def test_direct_data_connection_to_a_queued_sibling_cancels() -> None:
+    """Wired straight in, the queued consumer is found by its DAG state alone.
+
+    The control walk cannot help here and does not need to: the consumer is already in the DAG, and
+    `QUEUED` says it has not collected its inputs yet. This is the shape the hop test is measured
+    against, so that the hop is the only difference between them.
+    """
+    scene = _queued_sibling_scene(via_data_hop=False)
+
+    assert scene.node_manager._find_entangled_live_node(scene.supplier) == "Fast"
+
+
+def test_a_queued_sibling_reached_through_a_data_hop_also_cancels() -> None:
+    """One data node in between must not hide it.
+
+    `Resizer` is absent from the DAG because it is pulled in as `Fast`'s dependency when `Fast` is
+    dispatched, so the question about `Resizer` is really the question about `Fast` -- and `Fast` is
+    sitting there uncollected. The name reported is the direct target, `Resizer`, because that is the
+    node whose own connection the artist deleted.
+    """
+    scene = _queued_sibling_scene(via_data_hop=True)
+
+    assert scene.node_manager._find_entangled_live_node(scene.supplier) == "Resizer"
+
+
+def test_the_walk_stops_at_a_consumer_that_has_already_collected() -> None:
+    """A consumer already dispatched holds the good value, so nothing past it is damaged.
+
+    `Fast` is running, which means it collected `Resizer`'s output before the delete. `Beyond` is
+    further downstream and the run is still going to arrive at it, but only through a value that was
+    never wrong -- so continuing the walk past `Fast` would cancel a run that is fine. Paired with the
+    test above: without this one, answering True for anything reachable would still look correct.
+    """
+    fast = _ChainNode("Fast")
+    slow = _ChainNode("Slow")
+    loader = _ChainNode("Loader")
+    resizer = _ChainNode("Resizer")
+    beyond = _ChainNode("Beyond")
+
+    connections = Connections()
+    _connect_data(connections, loader, resizer)
+    _connect_data(connections, resizer, fast)
+    _connect_data(connections, fast, beyond)
+    _connect_control(connections, slow, "exec_out", beyond)
+
+    dag_builder = DagBuilder(MagicMock())
+    dag_builder.node_to_reference["Fast"] = DagNode(node_reference=fast, node_state=NodeState.PROCESSING)
+    dag_builder.node_to_reference["Slow"] = DagNode(node_reference=slow, node_state=NodeState.PROCESSING)
+
+    engine = _engine(dag_builder)
+    engine.flow_manager.get_connections.return_value = connections
+    node_manager = _node_manager(engine)
+
+    assert node_manager._find_entangled_live_node(loader) is None
 
 
 @pytest.mark.asyncio
