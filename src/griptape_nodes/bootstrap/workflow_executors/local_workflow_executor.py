@@ -38,8 +38,10 @@ from griptape_nodes.retained_mode.events.project_events import (
 )
 from griptape_nodes.retained_mode.events.workflow_events import (
     RunWorkflowFromScratchRequest,
+    RunWorkflowFromScratchResultSuccess,
     SaveWorkflowFileFromSerializedFlowRequest,
     SaveWorkflowFileFromSerializedFlowResultSuccess,
+    WorkflowStatus,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
@@ -202,6 +204,17 @@ class LocalWorkflowExecutor(WorkflowExecutor):
 
         if result.failed():
             msg = f"Failed to load workflow from path {workflow_path}"
+            _raise_load_error(msg)
+
+        # A FLAWED load succeeded but is missing pieces -- placeholders stand in for nodes whose
+        # library would not register. That trade is right in the editor, where an artist can see
+        # the placeholders and decide; here there is nobody to see them, so a run would silently
+        # produce output from an incomplete graph.
+        if isinstance(result, RunWorkflowFromScratchResultSuccess) and result.status is not WorkflowStatus.GOOD:
+            msg = (
+                f"Loaded workflow from path {workflow_path} with status {result.status}, "
+                f"which cannot be executed: {result.result_details}"
+            )
             _raise_load_error(msg)
 
     async def _handle_event_request(self, event: EventRequest) -> None:
