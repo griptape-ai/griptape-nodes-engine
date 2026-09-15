@@ -32,6 +32,9 @@ from griptape_nodes.exe_types.base_iterative_nodes import (
 )
 from griptape_nodes.exe_types.core_types import (
     BaseNodeElement,
+    ControlParameter,
+    ControlParameterInput,
+    ControlParameterOutput,
     Parameter,
     ParameterContainer,
     ParameterGroup,
@@ -1881,25 +1884,86 @@ class NodeManager(EngineScoped):
         if request.mode_allowed_output:
             allowed_modes.add(ParameterMode.OUTPUT)
 
-        # Let's roll, I guess.
-        new_param = Parameter(
-            name=final_param_name,
-            type=request.type,
-            input_types=request.input_types,
-            output_type=request.output_type,
-            default_value=request.default_value,
-            user_defined=request.is_user_defined,
-            tooltip=request.tooltip,
-            tooltip_as_input=request.tooltip_as_input,
-            tooltip_as_property=request.tooltip_as_property,
-            tooltip_as_output=request.tooltip_as_output,
-            allowed_modes=allowed_modes,
-            ui_options=request.ui_options,
-            parent_container_name=request.parent_container_name,
-            parent_element_name=parent_group.name if parent_group is not None else None,
-            settable=request.settable,
-            allow_variable_substitution=request.allow_variable_substitution,
-        )
+        # Let's roll, I guess. Preserve the control parameter element type when a request is
+        # replayed (for example, while rebuilding a node-group boundary). A plain Parameter has
+        # the right type information but loses the control-port shape the editor and executor use.
+        if has_control_type:
+            input_shaped = (request.input_types is not None and request.output_type is None) or (
+                request.input_types is None
+                and request.output_type is None
+                and ParameterMode.INPUT in allowed_modes
+                and ParameterMode.OUTPUT not in allowed_modes
+            )
+            output_shaped = (request.output_type is not None and request.input_types is None) or (
+                request.input_types is None
+                and request.output_type is None
+                and ParameterMode.OUTPUT in allowed_modes
+                and ParameterMode.INPUT not in allowed_modes
+            )
+
+            if input_shaped:
+                new_param = ControlParameterInput(
+                    name=final_param_name,
+                    tooltip=request.tooltip,
+                    tooltip_as_input=request.tooltip_as_input,
+                    tooltip_as_property=request.tooltip_as_property,
+                    tooltip_as_output=request.tooltip_as_output,
+                    user_defined=request.is_user_defined,
+                )
+            elif output_shaped:
+                new_param = ControlParameterOutput(
+                    name=final_param_name,
+                    tooltip=request.tooltip,
+                    tooltip_as_input=request.tooltip_as_input,
+                    tooltip_as_property=request.tooltip_as_property,
+                    tooltip_as_output=request.tooltip_as_output,
+                    user_defined=request.is_user_defined,
+                )
+            else:
+                new_param = ControlParameter(
+                    name=final_param_name,
+                    tooltip=request.tooltip,
+                    input_types=request.input_types,
+                    output_type=request.output_type,
+                    tooltip_as_input=request.tooltip_as_input,
+                    tooltip_as_property=request.tooltip_as_property,
+                    tooltip_as_output=request.tooltip_as_output,
+                    allowed_modes=allowed_modes,
+                    ui_options=request.ui_options,
+                    user_defined=request.is_user_defined,
+                )
+            # ControlParameter's convenience subclasses intentionally expose a small, purpose-
+            # built constructor. Apply the request-only lifecycle fields after construction so
+            # dynamic control parameters retain the same persistence semantics as data parameters.
+            new_param.allowed_modes = allowed_modes
+            if request.ui_options is not None:
+                merged_ui_options = new_param.ui_options.copy()
+                merged_ui_options.update(request.ui_options)
+                new_param.ui_options = merged_ui_options
+            new_param.default_value = request.default_value
+            new_param.settable = request.settable
+            new_param.allow_variable_substitution = request.allow_variable_substitution
+            new_param.parent_container_name = request.parent_container_name
+            new_param.parent_element_name = parent_group.name if parent_group is not None else None
+        else:
+            new_param = Parameter(
+                name=final_param_name,
+                type=request.type,
+                input_types=request.input_types,
+                output_type=request.output_type,
+                default_value=request.default_value,
+                user_defined=request.is_user_defined,
+                tooltip=request.tooltip,
+                tooltip_as_input=request.tooltip_as_input,
+                tooltip_as_property=request.tooltip_as_property,
+                tooltip_as_output=request.tooltip_as_output,
+                allowed_modes=allowed_modes,
+                ui_options=request.ui_options,
+                parent_container_name=request.parent_container_name,
+                parent_element_name=parent_group.name if parent_group is not None else None,
+                settable=request.settable,
+                allow_variable_substitution=request.allow_variable_substitution,
+            )
         try:
             with sanctioned_parameter_mutation():
                 if request.parent_container_name and request.initial_setup:
