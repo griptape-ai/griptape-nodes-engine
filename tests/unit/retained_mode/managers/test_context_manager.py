@@ -826,6 +826,52 @@ class TestCurrentWorkflowChangedNotification:
         context_manager.pop_workflow()
         context_manager.pop_workflow()
 
+    def test_closing_a_workflow_pushed_before_the_queue_existed_is_still_announced(self, engine: Engine) -> None:
+        """The workflow nobody was told about is closed out loud, not in silence.
+
+        A close reports no-workflow, which is also what an engine that has announced nothing reports.
+        If those two shared one field, a workflow pushed before the queue existed -- engine
+        construction, or a workflow file the CLI replays -- would be closed against a value that
+        matches, and the close would dedupe away. A client attached by then read the workflow off
+        GetWorkflowContextRequest on connect, so it would be left showing work the engine has
+        dropped: the exact state the trailing no-workflow event exists to prevent.
+        """
+        context_manager = engine.context_manager
+
+        with patch.object(engine.event_manager, "put_event", Mock(return_value=False)):
+            context_manager.push_workflow(workflow_name="opened_at_startup")
+
+        with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
+            context_manager.pop_workflow()
+
+        assert _notified_workflow_names(put_event) == [None]
+
+    def test_a_switch_that_landed_is_not_re_sent_by_the_one_after_it(self, engine: Engine) -> None:
+        """Owing a switch is cleared by sending one, so a settled engine still dedupes.
+
+        The guard rail on the two tests above: if the owed flag were only ever set, every later
+        notification would bypass the dedupe and re-entering the open workflow would wake every
+        attached editor for a switch that did not happen.
+        """
+        context_manager = engine.context_manager
+
+        with patch.object(engine.event_manager, "put_event", Mock(return_value=False)):
+            context_manager.push_workflow(workflow_name="announced_on_the_second_try")
+
+        with patch.object(engine.event_manager, "put_event", Mock()) as first_put_event:
+            context_manager.push_workflow(workflow_name="announced_on_the_second_try")
+
+        assert _notified_workflow_names(first_put_event) == ["announced_on_the_second_try"]
+
+        with patch.object(engine.event_manager, "put_event", Mock()) as second_put_event:
+            context_manager.push_workflow(workflow_name="announced_on_the_second_try")
+
+        assert _notified_workflow_names(second_put_event) == []
+
+        context_manager.pop_workflow()
+        context_manager.pop_workflow()
+        context_manager.pop_workflow()
+
 
 class TestCurrentWorkflowChangedIsSaved:
     """Tests for the is_saved the CurrentWorkflowChanged payload carries alongside the key.
