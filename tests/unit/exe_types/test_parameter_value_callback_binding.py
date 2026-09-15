@@ -95,6 +95,8 @@ class TestRebindingValueCallbacks:
         engine.object_manager.add_object_by_name(target.name, target)
         parameter_dict = source.to_dict()
         parameter_dict["initial_setup"] = True
+        parameter_dict["ui_options"] = source.authored_ui_options()
+        parameter_dict["traits"] = source.trait_states()
         parameter_dict["value_callbacks"] = source.value_callback_names(source.get_node())
         result = engine.handle_request(AddParameterToNodeRequest.create(node_name=target.name, **parameter_dict))
         assert isinstance(result, AddParameterToNodeResultSuccess)

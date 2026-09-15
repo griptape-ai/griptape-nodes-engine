@@ -1944,8 +1944,8 @@ class NodeManager(EngineScoped):
             details = f"Couldn't add parameter with name {request.parameter_name} to Node '{node_name}'. Error: {e}"
             return AddParameterToNodeResultFailure(result_details=details)
 
-        # A saved callback names a method on the owning node, which the parameter can only
-        # reach once it is attached.
+        # Re-bind trait callbacks now that the parameter is attached: a saved callback names
+        # a method on the owning node, which the parameter can only reach once it has one.
         if request.traits:
             NodeManager._apply_trait_callbacks(new_param, restored_traits)
         if request.value_callbacks:
@@ -4365,6 +4365,7 @@ class NodeManager(EngineScoped):
         """Build fields that recreate a parameter, warning about omitted callbacks."""
         param_dict = parameter.to_dict()
         param_dict["initial_setup"] = True
+        param_dict["ui_options"] = parameter.authored_ui_options()
         param_dict["traits"] = self._stabilize_trait_modules(parameter.trait_states())
         param_dict["value_callbacks"] = parameter.value_callback_names(node)
         NodeManager._report_unsaveable_callbacks(parameter)
@@ -4383,6 +4384,27 @@ class NodeManager(EngineScoped):
             if stable_namespace is not None:
                 entry["trait_module"] = stable_namespace
         return trait_states
+
+    @staticmethod
+    def _report_unsaveable_callbacks(parameter: Parameter) -> None:
+        """Warn about runtime callbacks that cannot be restored by method name."""
+        owner = parameter.get_node()
+        locations: list[str] = []
+        for trait in parameter.find_elements_by_type(Trait):
+            unnameable = trait.unnameable_callbacks(owner)
+            if unnameable:
+                locations.append(f"{', '.join(unnameable)} on the '{type(trait).__name__}' control")
+        for kind, count in parameter.unnameable_value_callbacks(owner).items():
+            locations.append(f"{count} {kind[:-1] if count == 1 else kind}")
+        if not locations:
+            return
+        logger.warning(
+            "Parameter '%s' attaches %s that cannot be saved. Pass a method of the node "
+            "(self.my_handler) rather than a lambda or a local function, so the saved workflow "
+            "can find it again on load.",
+            parameter.name,
+            "; ".join(locations),
+        )
 
     @staticmethod
     def _apply_trait_states(parameter: Parameter, trait_states: list[dict[str, Any]]) -> list[RestoredTrait]:
@@ -4472,27 +4494,6 @@ class NodeManager(EngineScoped):
             "library providing it is up to date.",
             parameter.name,
             trait_name,
-        )
-
-    @staticmethod
-    def _report_unsaveable_callbacks(parameter: Parameter) -> None:
-        """Warn about runtime callbacks that cannot be restored by method name."""
-        owner = parameter.get_node()
-        locations: list[str] = []
-        for trait in parameter.find_elements_by_type(Trait):
-            unnameable = trait.unnameable_callbacks(owner)
-            if unnameable:
-                locations.append(f"{', '.join(unnameable)} on the '{type(trait).__name__}' control")
-        for kind, count in parameter.unnameable_value_callbacks(owner).items():
-            locations.append(f"{count} {kind[:-1] if count == 1 else kind}")
-        if not locations:
-            return
-        logger.warning(
-            "Parameter '%s' attaches %s that cannot be saved. Pass a method of the node "
-            "(self.my_handler) rather than a lambda or a local function, so the saved workflow "
-            "can find it again on load.",
-            parameter.name,
-            "; ".join(locations),
         )
 
     @staticmethod

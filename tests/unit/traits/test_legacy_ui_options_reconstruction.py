@@ -75,7 +75,8 @@ class TestRebuildingAControl:
         reconstruct_traits_from_ui_options(parameter)
 
         assert parameter.trait_states()[0]["trait_state"]["choices"] == ["a", "b"]
-        assert parameter.ui_options["hide"] is True
+        # The rendered keys stop being stored on the parameter; the authored one stays.
+        assert parameter.authored_ui_options() == {"hide": True}
 
 
 class TestLeavingAParameterAlone:

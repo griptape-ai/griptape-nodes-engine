@@ -8,13 +8,15 @@ that cannot be expressed as a per-trait test: they hold for every trait in the t
 
 import importlib
 import pkgutil
-from typing import ClassVar
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any, ClassVar
 
 import attrs
 import pytest
 
 import griptape_nodes.traits
-from griptape_nodes.exe_types.core_types import WIRING, Trait, default_element_id
+from griptape_nodes.exe_types.core_types import BEHAVIOR, WIRING, Trait, default_element_id
 
 
 def _in_tree_traits() -> list[type[Trait]]:
@@ -32,6 +34,8 @@ def _in_tree_traits() -> list[type[Trait]]:
 
 
 IN_TREE_TRAITS = _in_tree_traits()
+
+ELEMENT_WIRING = ("element_id", "element_type", "parent_group_name", "_children", "_parent")
 
 _DECLARED_THRESHOLD = 9
 _DECLARED_LEVEL = 3
@@ -71,6 +75,18 @@ def test_a_trait_constructs_with_its_element_attributes_set(trait_class: type[Tr
 
 
 @pytest.mark.parametrize("trait_class", IN_TREE_TRAITS, ids=lambda cls: cls.__name__)
+def test_a_trait_does_not_report_element_wiring_as_state(trait_class: type[Trait]) -> None:
+    """State is what the trait declared, never what the element base did.
+
+    ``Widget`` is the one trait that re-declares ``name`` as its own field, which is a
+    deliberate override: which widget to render is state. Everything else stays wiring.
+    """
+    state_keys = trait_class.state_keys()
+
+    assert set(ELEMENT_WIRING).isdisjoint(state_keys)
+
+
+@pytest.mark.parametrize("trait_class", IN_TREE_TRAITS, ids=lambda cls: cls.__name__)
 def test_a_trait_is_identified_rather_than_compared(trait_class: type[Trait]) -> None:
     """Two traits of one class are two controls, even when they hold the same values.
 
@@ -84,6 +100,44 @@ def test_a_trait_is_identified_rather_than_compared(trait_class: type[Trait]) ->
 
     assert first != second
     assert len({first, second}) == 2  # noqa: PLR2004
+
+
+class TestTheContractIsCheckedWhenTheClassIsBuilt:
+    """A declaration that could never round-trip costs a library its import, not an artist's save."""
+
+    def test_a_callback_declared_as_state_is_refused(self) -> None:
+        with pytest.raises(TypeError, match="metadata=BEHAVIOR"):
+
+            class Handler(Trait):
+                on_ping: Callable | None = attrs.field(default=None)
+
+    def test_a_state_type_no_saved_workflow_can_hold_is_refused(self) -> None:
+        with pytest.raises(TypeError, match="Path cannot be written"):
+
+            class Rooted(Trait):
+                root: Path | None = attrs.field(default=None)
+
+    def test_an_unsaveable_type_inside_a_container_is_refused(self) -> None:
+        with pytest.raises(TypeError, match="Path cannot be written"):
+
+            class ManyRoots(Trait):
+                roots: list[Path] = attrs.field(factory=list)
+
+    def test_a_saveable_declaration_is_accepted(self) -> None:
+        class Fine(Trait):
+            label: str | None = attrs.field(default=None)
+            counts: dict[str, int] = attrs.field(factory=dict)
+            on_ping: Any = attrs.field(default=None, metadata=BEHAVIOR)
+
+        assert Fine.state_keys() == ["label", "counts"]
+
+    def test_a_derived_field_is_neither_state_nor_a_constructor_argument(self) -> None:
+        class Derived(Trait):
+            label: str = attrs.field(default="")
+            _cached: object = attrs.field(default=None, init=False)
+
+        assert Derived.state_keys() == ["label"]
+        assert Derived(label="x")._cached is None
 
 
 class TestAnAnnotationThatIsNotAFieldIsRefused:
@@ -109,7 +163,7 @@ class TestAnAnnotationThatIsNotAFieldIsRefused:
         class Constant(Trait):
             DEFAULTS: ClassVar[list[str]] = ["a"]
 
-        assert Constant.DEFAULTS == ["a"]
+        assert Constant.state_keys() == []
 
     def test_an_unsubscripted_class_constant_is_allowed(self) -> None:
         """A bare ``ClassVar`` has no origin to read, so it has to be recognized on its own."""
@@ -117,7 +171,7 @@ class TestAnAnnotationThatIsNotAFieldIsRefused:
         class BareConstant(Trait):
             DEFAULTS: ClassVar = ["a"]
 
-        assert BareConstant.DEFAULTS == ["a"]
+        assert BareConstant.state_keys() == []
 
     def test_a_stringified_class_constant_is_refused(self) -> None:
         """What a trait module under ``from __future__ import annotations`` would hit."""
@@ -130,7 +184,7 @@ class TestAnAnnotationThatIsNotAFieldIsRefused:
         class Declared(Trait):
             threshold: int = attrs.field(default=5)
 
-        assert Declared(threshold=9).threshold == _DECLARED_THRESHOLD
+        assert Declared(threshold=9).to_state() == {"threshold": 9}
 
     def test_an_inherited_field_may_be_re_annotated(self) -> None:
         class Fixed(Trait):

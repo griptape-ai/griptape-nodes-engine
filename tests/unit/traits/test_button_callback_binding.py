@@ -91,6 +91,7 @@ class TestRebindingCallbacks:
 
         parameter_dict = source.to_dict()
         parameter_dict["initial_setup"] = True
+        parameter_dict["ui_options"] = source.authored_ui_options()
         parameter_dict["traits"] = source.trait_states()
         result = engine.handle_request(AddParameterToNodeRequest.create(node_name=target.name, **parameter_dict))
         assert isinstance(result, AddParameterToNodeResultSuccess)
@@ -111,6 +112,7 @@ class TestRebindingCallbacks:
 
         parameter_dict = source.to_dict()
         parameter_dict["initial_setup"] = True
+        parameter_dict["ui_options"] = source.authored_ui_options()
         parameter_dict["traits"] = source.trait_states()
         engine.handle_request(AddParameterToNodeRequest.create(node_name=target.name, **parameter_dict))
 

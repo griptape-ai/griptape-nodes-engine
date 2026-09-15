@@ -89,11 +89,51 @@ Two smaller consequences:
     generated constructor cannot do: the element base already takes that keyword. A workflow
     saved under the old key still loads.
 
-## Workflows saved before trait state still load their controls
+## A trait owns the `ui_options` keys it renders
 
-A file that predates trait state carries a dropdown's choices in `ui_options`, since that was the
-only field a save wrote. The load adopts them onto the trait, so a dropdown its node filled in at
-run time keeps its choices and its saved selection, and the next save records them as trait state.
+A trait's options used to be merged into `Parameter.ui_options` and saved as part of it, where
+any stored copy won. The copy could predate the trait's current state, so narrowing a `Slider`
+moved its validator but not the slider an artist sees. Trait state is now saved in its own right,
+and the trait wins:
+
+|                                | before                | after                  |
+| ------------------------------ | --------------------- | ---------------------- |
+| reported to the editor         | stored copy           | what the trait renders |
+| saved                          | merged, copy included | authored options only  |
+| runtime `trait.choices` update | lost unless mirrored  | saved as trait state   |
+
+Setting a trait-rendered key on the parameter in node code no longer has any effect: set it on
+the trait.
+
+```python
+parameter.ui_options = {"simple_dropdown": choices}  # dropped at save, shadowed at read
+trait.choices = choices  # saved, and reported to the editor
+```
+
+**A write arriving from the editor or a saved file is routed to the trait**, so the flat shape
+keeps working for the writers that do not know about traits. A trait declares what it will adopt
+by implementing `state_from_ui_options`, the inverse of `ui_options_for_trait`:
+
+```python
+class Threshold(Trait):
+    def ui_options_for_trait(self) -> dict:
+        return {"threshold": self.threshold}
+
+    def state_from_ui_options(self, ui_options: dict) -> dict:
+        if "threshold" not in ui_options:
+            return {}
+        return {"threshold": ui_options["threshold"]}
+```
+
+Without it a trait ignores such a write, which is the right answer for a key with no state behind
+it, such as a widget-type marker. A write that would have changed what the trait renders is
+logged, since it is neither applied nor saved. `Options`, `MultiOptions`, and `Slider` adopt
+theirs.
+
+**Workflows already on disk.** A file that predates trait state carries a dropdown's choices in
+`ui_options`, since that was the only field a save wrote. The load adopts them onto the trait, so a
+dropdown its node filled in at run time keeps its choices and its saved selection, and the next
+save records them as trait state.
 
 A parameter the node created at run time has no trait to adopt them onto: the trait lived only in
 the file, as those keys. Such a parameter is rebuilt from them, so its dropdown, multi-select, or

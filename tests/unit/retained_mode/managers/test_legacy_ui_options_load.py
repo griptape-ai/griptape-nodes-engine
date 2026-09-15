@@ -144,7 +144,7 @@ class TestALegacyDropdownSurvivesTheLoad:
         parameter = node.get_parameter_by_name("model")
         assert parameter is not None
 
-        assert parameter.ui_options["hide"] is True
+        assert parameter.authored_ui_options() == {"hide": True}
 
 
 def _added_runtime_parameter(engine: Engine, **request_fields) -> Parameter:
@@ -202,7 +202,7 @@ class TestARuntimeCreatedControlIsRebuilt:
         parameter = _added_runtime_parameter(engine, ui_options={"simple_dropdown": ["a", "b"], "hide": True})
 
         assert parameter.trait_states()[0]["trait_state"]["choices"] == ["a", "b"]
-        assert parameter.ui_options["hide"] is True
+        assert parameter.authored_ui_options() == {"hide": True}
 
     def test_an_empty_traits_list_is_a_current_save_saying_there_are_none(self, engine: Engine) -> None:
         """The discriminator. A missing field predates trait state; an empty one is a decision."""

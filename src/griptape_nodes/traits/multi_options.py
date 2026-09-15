@@ -16,9 +16,6 @@ def _known_icon_size(icon_size: str) -> str:
 class MultiOptions(Trait):
     DEFAULT_CHOICES: ClassVar[list[str]] = ["choice 1", "choice 2", "choice 3"]
 
-    # Rendered keys carrying the choices, newest first.
-    CHOICES_KEYS: ClassVar[tuple[str, ...]] = ("simple_dropdown", "enum_choices")
-
     # Preserve ``choices`` as the constructor and saved-state key behind the property.
     _choices: list = attrs.field(factory=lambda: list(MultiOptions.DEFAULT_CHOICES), alias="choices")
     placeholder: str = attrs.field(default="Select options...")

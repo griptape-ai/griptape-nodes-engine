@@ -815,17 +815,29 @@ class UIOptionsMixin:
             )
             logger.warning(msg)
 
+    def authored_ui_options(self) -> dict[str, Any]:
+        """Return stored options without values derived by subclasses."""
+        return dict(self._ui_options)  # type: ignore[attr-defined]
+
     def update_ui_options_key(self, key: str, value: Any) -> None:
         """Update a single UI option key."""
-        ui_options = self.ui_options
-        ui_options[key] = value
-        self.ui_options = ui_options
+        self.update_ui_options({key: value})
 
     def update_ui_options(self, updates: dict[str, Any]) -> None:
-        """Update multiple UI options at once."""
-        ui_options = self.ui_options
-        ui_options.update(updates)
-        self.ui_options = ui_options
+        """Update stored options without copying derived options into them."""
+        authored = self.authored_ui_options()
+        authored.update(updates)
+        self.ui_options = authored  # type: ignore[attr-defined]
+
+    def remove_ui_options_key(self, key: str) -> None:
+        """Remove a stored option without copying derived options into storage."""
+        authored = self.authored_ui_options()
+        authored.pop(key, None)
+        self.ui_options = authored  # type: ignore[attr-defined]
+
+    def report_ui_options_change(self) -> None:
+        """Report derived UI options without storing them."""
+        self.track_change("ui_options", self.ui_options)  # type: ignore[attr-defined]
 
 
 class ParameterMessage(BaseNodeElement, UIOptionsMixin):
@@ -1443,9 +1455,7 @@ class ParameterButtonGroup(BaseNodeElement, UIOptionsMixin):
     @BaseNodeElement.emits_update_on_write
     def display_name(self, value: str | None) -> None:
         if value is None:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("display_name", None)
-            self.ui_options = ui_options
+            self.remove_ui_options_key("display_name")
         else:
             self.update_ui_options_key("display_name", value)
 
@@ -1828,6 +1838,23 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
 
         return our_dict
 
+    def trait_states(self) -> list[dict[str, Any]]:
+        """Return save-only trait identity, constructor state, and callbacks.
+
+        ``NodeManager`` stabilizes dynamic library module names before saving.
+        """
+        owner = self.get_node()
+        states: list[dict[str, Any]] = []
+        for trait in self.find_elements_by_type(Trait):
+            entry = TraitStateEntry(
+                trait_name=type(trait).__name__,
+                trait_module=type(trait).__module__,
+                trait_state=trait.to_state(),
+                trait_callbacks=trait.callback_names(owner),
+            )
+            states.append(entry.to_dict())
+        return states
+
     def to_event(self, node: BaseNode) -> dict:
         event_dict = self.to_dict()
         event_data = super().to_event(node)
@@ -1909,23 +1936,6 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         """
         return bool(self._validators)
 
-    def trait_states(self) -> list[dict[str, Any]]:
-        """Return save-only trait identity, constructor state, and callbacks.
-
-        ``NodeManager`` stabilizes dynamic library module names before saving.
-        """
-        owner = self.get_node()
-        states: list[dict[str, Any]] = []
-        for trait in self.find_elements_by_type(Trait):
-            entry = TraitStateEntry(
-                trait_name=type(trait).__name__,
-                trait_module=type(trait).__module__,
-                trait_state=trait.to_state(),
-                trait_callbacks=trait.callback_names(owner),
-            )
-            states.append(entry.to_dict())
-        return states
-
     def value_callback_names(self, owner: BaseNode | None) -> dict[str, list[str]]:
         """Return directly attached callbacks by method name.
 
@@ -2006,11 +2016,13 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
 
     @property
     def ui_options(self) -> dict:
-        ui_options = {}
-        traits = self.find_elements_by_type(Trait)
-        for trait in traits:
+        """Overlay trait-rendered options on stored options.
+
+        Trait state wins over stale stored copies. Only authored options are persisted.
+        """
+        ui_options = self.authored_ui_options()
+        for trait in self.find_elements_by_type(Trait):
             ui_options = ui_options | trait.ui_options_for_trait()
-        ui_options = ui_options | self._ui_options
         return ui_options
 
     @ui_options.setter
@@ -2026,6 +2038,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         for trait in self.find_elements_by_type(Trait):
             adopted = trait.state_from_ui_options(value)
             if not adopted:
+                self._report_unadopted_trait_options(trait, value)
                 continue
             # Supply complete constructor state when the input mentions only some fields.
             try:
@@ -2038,6 +2051,40 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
                     self.name,
                 )
         self.ui_options = value
+
+    def _report_unadopted_trait_options(self, trait: Trait, value: dict) -> None:
+        """Report a write the trait renders over, which is neither applied nor saved.
+
+        A write matching what the trait already renders is the editor echoing it back, and
+        changes nothing.
+        """
+        ignored = sorted(
+            key for key, rendered in trait.ui_options_for_trait().items() if key in value and value[key] != rendered
+        )
+        if not ignored:
+            return
+        logger.warning(
+            "Attempted to set %s on parameter '%s', but its %s control renders those keys and does "
+            "not read them back, so the change has no effect and is not saved. Set the control's own "
+            "state instead, or give the control a 'state_from_ui_options' that accepts these keys.",
+            ", ".join(f"'{key}'" for key in ignored),
+            self.name,
+            type(trait).__name__,
+        )
+
+    def authored_ui_options(self) -> dict[str, Any]:
+        """Remove options rendered by attached traits.
+
+        Filtering on read handles keys written before or after trait attachment while
+        preserving stored values if the trait is detached.
+        """
+        return self._without_trait_owned_keys(super().authored_ui_options())
+
+    def _without_trait_owned_keys(self, value: dict) -> dict:
+        trait_owned: set[str] = set()
+        for trait in self.find_elements_by_type(Trait):
+            trait_owned.update(trait.ui_options_for_trait())
+        return {key: option for key, option in value.items() if key not in trait_owned}
 
     @property
     def hide(self) -> bool:
@@ -2114,9 +2161,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
             value: Display name string, or None to use the default (parameter name)
         """
         if value is None:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("display_name", None)
-            self.ui_options = ui_options
+            self.remove_ui_options_key("display_name")
         else:
             self.update_ui_options_key("display_name", value)
 
@@ -2356,6 +2401,11 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
     def equals(self, other: Parameter) -> dict:
         self_dict = self.to_dict().copy()
         other_dict = other.to_dict().copy()
+        # Compare the save view of UI options, not the merged one. Trait-derived keys belong
+        # to the trait, and are carried between the two parameters by ``traits`` below;
+        # diffing them here would emit them as stored options on the parameter instead.
+        self_dict["ui_options"] = self.authored_ui_options()
+        other_dict["ui_options"] = other.authored_ui_options()
         self_dict["traits"] = self.trait_states()
         other_dict["traits"] = other.trait_states()
         # Converters and validators are code, compared by the method names they resolve to.
@@ -2742,11 +2792,29 @@ class ParameterList(ParameterContainer):
     @property
     def ui_options(self) -> dict:
         """Override ui_options to merge convenience parameters in real-time."""
-        # Get base ui_options from parent
-        base_ui_options = super().ui_options
+        return {
+            **super().ui_options,
+            **self._convenience_ui_options(),
+        }
 
-        # Build convenience options from instance parameters
-        convenience_options = {}
+    def authored_ui_options(self) -> dict[str, Any]:
+        """Add back the layout options this class holds outside ``_ui_options``.
+
+        ``collapsed``, ``child_prefix``, and the grid keys are authored, not derived: they
+        come from constructor arguments and the properties above. Leaving them out would
+        drop a list's layout from the save, and would make any other UI option write erase
+        it, since the setter below reads grid mode back out of the dict it is handed.
+
+        Trait-owned keys are still subtracted, by ``Parameter``'s override above.
+        """
+        return {
+            **super().authored_ui_options(),
+            **self._convenience_ui_options(),
+        }
+
+    def _convenience_ui_options(self) -> dict[str, Any]:
+        """Render the layout fields kept as attributes as the ui_options keys they map to."""
+        convenience_options: dict[str, Any] = {}
 
         if self._collapsed is not None:
             convenience_options["collapsed"] = self._collapsed
@@ -2754,17 +2822,12 @@ class ParameterList(ParameterContainer):
         if self._child_prefix is not None:
             convenience_options["child_prefix"] = self._child_prefix
 
-        if self._grid is not None and self._grid:
+        if self._grid:
             convenience_options["display"] = "grid"
+            if self._grid_columns is not None:
+                convenience_options["columns"] = self._grid_columns
 
-        if self._grid_columns is not None and self._grid:
-            convenience_options["columns"] = self._grid_columns
-
-        # Merge convenience options with base ui_options
-        return {
-            **base_ui_options,
-            **convenience_options,
-        }
+        return convenience_options
 
     @ui_options.setter
     @BaseNodeElement.emits_update_on_write

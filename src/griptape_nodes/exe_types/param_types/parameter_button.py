@@ -190,10 +190,6 @@ class ParameterButton(Parameter):
         # Store href for property access
         self._href = href
 
-        # Merge button UI options into parameter UI options
-        button_ui_options = button_trait.ui_options_for_trait()
-        ui_options.update(button_ui_options)
-
         # Add button trait to traits set
         # Button is a Trait, so it can be added to the traits set
         if traits is None:
@@ -276,10 +272,10 @@ class ParameterButton(Parameter):
     @label.setter
     def label(self, value: str) -> None:
         """Set the button label (display text only - separate from parameter value)."""
-        # Update button trait (primary source of truth for display)
+        # The trait owns every styling option below: it renders them into the parameter's
+        # ui_options, so setting the trait and reporting the change is the whole write.
         self._get_button_trait().label = value
-        # Update UI options
-        self.update_ui_options_key("button_label", value)
+        self.report_ui_options_change()
 
     @property
     def variant(self) -> ButtonVariant:
@@ -290,7 +286,7 @@ class ParameterButton(Parameter):
     def variant(self, value: ButtonVariant) -> None:
         """Set the button variant."""
         self._get_button_trait().variant = value
-        self.update_ui_options_key("variant", value)
+        self.report_ui_options_change()
 
     @property
     def size(self) -> ButtonSize:
@@ -301,7 +297,7 @@ class ParameterButton(Parameter):
     def size(self, value: ButtonSize) -> None:
         """Set the button size."""
         self._get_button_trait().size = value
-        self.update_ui_options_key("size", value)
+        self.report_ui_options_change()
 
     @property
     def state(self) -> ButtonState:
@@ -312,7 +308,7 @@ class ParameterButton(Parameter):
     def state(self, value: ButtonState) -> None:
         """Set the button state."""
         self._get_button_trait().state = value
-        self.update_ui_options_key("state", value)
+        self.report_ui_options_change()
 
     @property
     def icon(self) -> str | None:
@@ -323,12 +319,7 @@ class ParameterButton(Parameter):
     def icon(self, value: str | None) -> None:
         """Set the button icon."""
         self._get_button_trait().icon = value
-        if value is None:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("button_icon", None)
-            self.ui_options = ui_options
-        else:
-            self.update_ui_options_key("button_icon", value)
+        self.report_ui_options_change()
 
     @property
     def icon_class(self) -> str | None:
@@ -339,12 +330,7 @@ class ParameterButton(Parameter):
     def icon_class(self, value: str | None) -> None:
         """Set the button icon class."""
         self._get_button_trait().icon_class = value
-        if value is None:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("icon_class", None)
-            self.ui_options = ui_options
-        else:
-            self.update_ui_options_key("icon_class", value)
+        self.report_ui_options_change()
 
     @property
     def icon_position(self) -> IconPosition | None:
@@ -355,12 +341,7 @@ class ParameterButton(Parameter):
     def icon_position(self, value: IconPosition | None) -> None:
         """Set the button icon position."""
         self._get_button_trait().icon_position = value
-        if value is None:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("iconPosition", None)
-            self.ui_options = ui_options
-        else:
-            self.update_ui_options_key("iconPosition", value)
+        self.report_ui_options_change()
 
     @property
     def full_width(self) -> bool:
@@ -371,7 +352,7 @@ class ParameterButton(Parameter):
     def full_width(self, value: bool) -> None:
         """Set whether the button is full width."""
         self._get_button_trait().full_width = value
-        self.update_ui_options_key("full_width", value)
+        self.report_ui_options_change()
 
     @property
     def loading_label(self) -> str | None:
@@ -382,12 +363,7 @@ class ParameterButton(Parameter):
     def loading_label(self, value: str | None) -> None:
         """Set the loading label."""
         self._get_button_trait().loading_label = value
-        if value is None:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("loading_label", None)
-            self.ui_options = ui_options
-        else:
-            self.update_ui_options_key("loading_label", value)
+        self.report_ui_options_change()
 
     @property
     def loading_icon(self) -> str | None:
@@ -398,12 +374,7 @@ class ParameterButton(Parameter):
     def loading_icon(self, value: str | None) -> None:
         """Set the loading icon."""
         self._get_button_trait().loading_icon = value
-        if value is None:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("loading_icon", None)
-            self.ui_options = ui_options
-        else:
-            self.update_ui_options_key("loading_icon", value)
+        self.report_ui_options_change()
 
     @property
     def loading_icon_class(self) -> str | None:
@@ -414,12 +385,7 @@ class ParameterButton(Parameter):
     def loading_icon_class(self, value: str | None) -> None:
         """Set the loading icon class."""
         self._get_button_trait().loading_icon_class = value
-        if value is None:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("loading_icon_class", None)
-            self.ui_options = ui_options
-        else:
-            self.update_ui_options_key("loading_icon_class", value)
+        self.report_ui_options_change()
 
     @property
     def on_click_callback(self) -> Button.OnClickCallback | None:

@@ -98,6 +98,7 @@ class TestPublishedUiOptions:
 
 class TestChoicesDefault:
     def test_choices_default_applies(self) -> None:
+        # Options declares its own __init__, so the dataclass field default never runs.
         assert Options().choices == Options.DEFAULT_CHOICES
 
     def test_choices_are_held_by_the_trait(self) -> None:
@@ -108,4 +109,4 @@ class TestChoicesDefault:
         options.choices = ["new"]
 
         assert param.ui_options["simple_dropdown"] == ["new"]
-        assert param.trait_states()[0]["trait_state"]["choices"] == ["new"]
+        assert "simple_dropdown" not in param.authored_ui_options()

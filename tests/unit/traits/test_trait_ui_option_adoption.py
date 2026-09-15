@@ -53,7 +53,7 @@ class TestAdoptingADropdown:
 
         parameter.adopt_ui_options({"simple_dropdown": ["a", "b"], "hide": True})
 
-        assert parameter.ui_options["hide"] is True
+        assert parameter.authored_ui_options() == {"hide": True}
 
     def test_a_converter_accepts_a_value_from_the_written_choices(self) -> None:
         # The point of adopting: the converter reads trait.choices, so a value the write made
@@ -131,8 +131,6 @@ class TestAdoptingAMultiSelect:
 
 
 class TestATraitWithNothingToAdopt:
-    """A rendered key with no state behind it, such as a button's label."""
-
     def test_a_write_to_its_key_changes_nothing(self) -> None:
         trait = Button(label="Go")
         parameter = Parameter(name="go", type="str", tooltip="t", traits={trait})
@@ -141,12 +139,47 @@ class TestATraitWithNothingToAdopt:
 
         assert trait.label == "Go"
 
+    def test_the_trait_still_owns_the_reported_value(self) -> None:
+        parameter = Parameter(name="go", type="str", tooltip="t", traits={Button(label="Go")})
+
+        parameter.adopt_ui_options({"button_label": "Written"})
+
+        assert parameter.ui_options["button_label"] == "Go"
+
+    def test_the_dropped_write_is_reported(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The write is neither applied nor saved, so silence loses it without a trace."""
+        parameter = Parameter(name="go", type="str", tooltip="t", traits={Button(label="Go")})
+        caplog.set_level(logging.WARNING, logger="griptape_nodes")
+
+        parameter.adopt_ui_options({"button_label": "Written"})
+
+        assert any(
+            "'button_label'" in record.getMessage() and "'go'" in record.getMessage() for record in caplog.records
+        )
+
+    def test_a_write_matching_what_it_renders_is_not_reported(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The editor echoing back what it was given changes nothing."""
+        parameter = Parameter(name="go", type="str", tooltip="t", traits={Button(label="Go")})
+        caplog.set_level(logging.WARNING, logger="griptape_nodes")
+
+        parameter.adopt_ui_options({"button_label": "Go"})
+
+        assert caplog.records == []
+
+    def test_a_write_to_a_key_no_trait_renders_is_not_reported(self, caplog: pytest.LogCaptureFixture) -> None:
+        parameter = Parameter(name="go", type="str", tooltip="t", traits={Button(label="Go")})
+        caplog.set_level(logging.WARNING, logger="griptape_nodes")
+
+        parameter.adopt_ui_options({"hide": True})
+
+        assert caplog.records == []
+
     def test_a_parameter_with_no_traits_stores_the_whole_write(self) -> None:
         parameter = Parameter(name="steps", type="int", tooltip="t")
 
         parameter.adopt_ui_options({"simple_dropdown": ["a", "b"], "hide": True})
 
-        assert parameter.ui_options == {"simple_dropdown": ["a", "b"], "hide": True}
+        assert parameter.authored_ui_options() == {"simple_dropdown": ["a", "b"], "hide": True}
 
 
 _ADOPTED_RANK = 3
@@ -224,4 +257,4 @@ class TestStateTheTraitWillNotAccept:
 
         parameter.adopt_ui_options({"misdeclared": 9, "hide": True})
 
-        assert parameter.ui_options["hide"] is True
+        assert parameter.authored_ui_options()["hide"] is True

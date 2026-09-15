@@ -66,11 +66,12 @@ class TestTheSavedShape:
             trait_name="Button",
             trait_module="griptape_nodes.traits.button",
             trait_state={"label": "Refresh"},
+            trait_callbacks={"on_click": "refresh"},
         )
 
         assert TraitStateEntry.from_dict(entry.to_dict()) == entry
 
-    def test_an_entry_with_no_state_saves_an_empty_one(self) -> None:
+    def test_the_callbacks_key_is_absent_when_there_are_none(self) -> None:
         entry = TraitStateEntry(trait_name="Options", trait_module="griptape_nodes.traits.options")
 
         assert entry.to_dict() == {
@@ -94,3 +95,4 @@ class TestTheSavedShape:
 
         assert entry is not None
         assert entry.trait_state == {}
+        assert entry.trait_callbacks == {}
