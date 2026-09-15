@@ -525,21 +525,35 @@ class WorkerManager(EngineScoped):
             request_id, tag=worker_engine_id, resolve_failures_as_payload=True
         )
 
-        await self.forward_event_to_worker(
-            event_request.model_copy(update={"request_id": request_id}),
-            worker_engine_id=worker_engine_id,
-            worker_request_topic=worker_request_topic,
-        )
-        # No wall-clock timeout here: long-running AI workloads (diffusion, multi-pass refinement)
-        # routinely exceed any sensible default. Worker liveness is enforced by the heartbeat loop,
-        # which evicts a silent worker and fails its in-flight requests with WorkerGoneError, so a
-        # dead worker still surfaces to the caller without a per-request ceiling.
+        # The publish is inside the `try` because it is an await like any other: a cancellation
+        # delivered while it is parked on send_message, or a raise out of the transport, would
+        # otherwise leave the entry tracked with nobody left to settle it.
+        #
+        # No wall-clock timeout on the response: long-running AI workloads (diffusion, multi-pass
+        # refinement) routinely exceed any sensible default. Worker liveness is enforced by the
+        # heartbeat loop, which evicts a silent worker and fails its in-flight requests with
+        # WorkerGoneError, so a dead worker still surfaces to the caller without a per-request
+        # ceiling.
         #
         # The future is settled by whichever loop the transport runs on, which is not this one.
         # wrap_future adapts it for this loop and installs the threadsafe wakeup. A CancelledError
-        # out of here means only one thing -- the caller was cancelled -- because a worker going
-        # away raises WorkerGoneError instead.
-        return await asyncio.wrap_future(future)
+        # out of the response await means only one thing -- the caller was cancelled -- because a
+        # worker going away raises WorkerGoneError instead.
+        try:
+            await self.forward_event_to_worker(
+                event_request.model_copy(update={"request_id": request_id}),
+                worker_engine_id=worker_engine_id,
+                worker_request_topic=worker_request_topic,
+            )
+            return await asyncio.wrap_future(future)
+        except BaseException:
+            # BaseException, not Exception: cancellation is the common case and it is not an
+            # Exception. The other ways out remove the request themselves -- a response pops it in
+            # _try_match, eviction in fail_requests_by_tag -- so this is the one exit that has to
+            # clean up after itself. Without it the entry outlives the run, one per cancelled node
+            # execution, each still carrying its worker's tag for fail_requests_by_tag to walk.
+            self._tx.request_client.discard_request(request_id)
+            raise
 
     async def _orchestrator_static_server_base_url(self) -> str | None:
         """The base URL this engine serves the workspace on, awaited until initialization decides it.
