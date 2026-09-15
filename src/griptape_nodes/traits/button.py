@@ -87,11 +87,7 @@ class SetButtonStatusMessagePayload(NodeMessagePayload):
 
 
 def _build_link_handler(url: str) -> Callable:
-    """Build the click handler that opens ``url``.
-
-    Derived from the link rather than supplied by a node, so it is never saved by name: the
-    URL travels as trait state and this is rebuilt from it on load.
-    """
+    """Build a link callback from saved URL state."""
 
     def handler(
         button: "Button",  # noqa: ARG001
@@ -111,14 +107,9 @@ def _build_link_handler(url: str) -> Callable:
 
 
 def _link_yields_to_a_handler(button: "Button", _attribute: attrs.Attribute, url: str | None) -> str | None:
-    """Drop a link written onto a button whose node already wired its own handler.
+    """Ignore saved links when node code supplies a handler.
 
-    Silent rather than an error because this is the load path: a saved link belongs to a
-    version of the node that wired this button differently, and live code outranks it. Nothing
-    has to clear the link afterwards, since a button running a handler reports none.
-
-    Rebuilds the handler the link opens, so ``on_click_callback`` can report the same callable
-    every time it is read: callers compare it by identity.
+    Cache derived handlers because callers compare callback identity.
     """
     if url is not None and button.on_click_handler is not None:
         return button.button_link
@@ -143,11 +134,9 @@ def _handler_clears_the_link(
 
 
 class Button(Trait):
-    # Specific callback types for better type safety and clarity
     type OnClickCallback = Callable[[Button, ButtonDetailsMessagePayload], NodeMessageResult | None]
     type GetButtonStateCallback = Callable[[Button, ButtonDetailsMessagePayload], NodeMessageResult | None]
 
-    # Static message type constants
     ON_CLICK_MESSAGE_TYPE = "on_click"
     GET_BUTTON_STATUS_MESSAGE_TYPE = "get_button_status"
     SET_BUTTON_STATUS_MESSAGE_TYPE = "set_button_status"
@@ -167,17 +156,13 @@ class Button(Trait):
     loading_icon_class: str | None = attrs.field(default=None)
     tooltip: str | None = attrs.field(default=None)
 
-    # A link is state: the handler that opens it is rebuilt from the URL on load, which is why
-    # ``on_click_callback`` derives one rather than storing it.
+    # Link URL is state; its callback is derived.
     button_link: str | None = attrs.field(default=None, on_setattr=_link_yields_to_a_handler)
 
-    # The handler a link opens, held rather than rebuilt per read so it keeps one identity.
-    # Derived from button_link, never saved, and kept in step by the hook above.
+    # Derived handler cached for stable callback identity.
     _link_handler: Callable | None = attrs.field(default=None, init=False)
 
-    # Both are behavior, so they are carried by method name. The field is on_click_handler
-    # because that is the node-supplied handler alone, and a link's handler must never be
-    # named: it would either fail to resolve on load or shadow the link it came from.
+    # A link callback is derived state and must not be saved as node behavior.
     on_click_handler: OnClickCallback | None = attrs.field(
         default=None, alias="on_click", metadata=BEHAVIOR, on_setattr=_handler_clears_the_link, kw_only=True
     )

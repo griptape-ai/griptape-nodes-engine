@@ -18,16 +18,10 @@ class TraitRegistry:
 
     @classmethod
     def resolve(cls, trait_name: str, trait_module: str) -> type[Trait] | None:
-        """Resolve a saved trait entry to its class by importing the module it names.
+        """Resolve a trait by module and class name.
 
-        The module is the whole answer: a name alone cannot tell two libraries' same-named
-        traits apart. A library trait's module is rewritten to that library's stable
-        namespace before saving, and importing a stable namespace goes through the same
-        machinery a saved workflow's own imports use, so a lazily loaded library resolves
-        here too.
-
-        Returns None when the module will not import, or holds no trait by that name. The
-        caller reports it and loads the parameter without that trait.
+        The module distinguishes same-named traits from different libraries. Return ``None``
+        when the module or class is unavailable.
         """
         module = sys.modules.get(trait_module)
         if module is None:
@@ -41,15 +35,10 @@ class TraitRegistry:
 
     @classmethod
     def _import_trait_module(cls, trait_module: str, trait_name: str) -> ModuleType | None:
-        """Import a saved trait's module, or return None when it cannot be loaded.
+        """Import a trait module without failing the workflow load.
 
-        A module that is simply gone passes quietly, because the caller already reports the
-        trait it could not restore.
-
-        Any other failure means the module exists but its own code raised. Catching broadly
-        is deliberate: this executes a library author's module-level code, which can fail in
-        any way their file can fail, and a trait that will not load costs the parameter one
-        control while letting the failure escape would cost the artist the whole workflow.
+        Missing modules are reported by the caller. Other failures are logged here because
+        arbitrary library module code may raise any exception.
         """
         try:
             return importlib.import_module(trait_module)
