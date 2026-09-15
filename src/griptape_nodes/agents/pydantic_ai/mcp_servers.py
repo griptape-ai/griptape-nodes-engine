@@ -17,15 +17,22 @@ combinators rather than hand-rolled logic:
 
 Connection handling is left to Pydantic AI: if a server is unreachable the
 run fails. Graceful per-server degradation can be layered on later.
+
+**Transport lifetime.** Pydantic AI enters and exits a toolset per
+``Agent.run``, but ``StdioTransport`` defaults to ``keep_alive=True``: the
+subprocess outlives the session, so a toolset pins one server launched from the
+config it was *built* with until :func:`disconnect_transport` is called. See
+:class:`~griptape_nodes.agents.pydantic_ai.mcp_toolset_cache.MCPToolsetCache`.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from fastmcp.client.transports import SSETransport, StdioTransport, StreamableHttpTransport
+from fastmcp.client.transports import ClientTransport, SSETransport, StdioTransport, StreamableHttpTransport
 from pydantic_ai.mcp import MCPToolset
 
 if TYPE_CHECKING:
@@ -60,52 +67,110 @@ that want to hide specific tools (e.g. tests, alternate harnesses).
 """
 
 
-def mcp_server_from_config(name: str, config: Mapping[str, Any]) -> AbstractToolset[Any] | None:  # noqa: PLR0911
+@dataclass(frozen=True)
+class BuiltMCPServer:
+    """A composed MCP toolset paired with the transport it speaks over.
+
+    The transport is carried alongside the toolset because whoever caches the
+    toolset also owns tearing it down, and reaching the transport back through
+    the toolset means walking Pydantic AI and FastMCP internals
+    (``toolset.wrapped.client.transport``). Returning it explicitly keeps that
+    coupling in one place.
+    """
+
+    toolset: AbstractToolset[Any]
+    transport: ClientTransport
+
+
+_HTTP_TRANSPORTS: dict[str, type[SSETransport | StreamableHttpTransport]] = {
+    "sse": SSETransport,
+    "streamable_http": StreamableHttpTransport,
+}
+"""The URL-based transports, which differ only in the class they instantiate."""
+
+
+def mcp_server_from_config(name: str, config: Mapping[str, Any]) -> BuiltMCPServer | None:
     """Build a Pydantic AI MCP toolset from an engine ``MCPServerConfig``.
 
-    Returns ``None`` and logs a warning when the config is missing required
-    fields for its declared transport. The returned toolset is prefixed with
-    ``name`` so tools from different servers can't collide.
+    Never raises: returns ``None`` and logs a warning for any config it cannot
+    build from, so one bad server doesn't stop the others being attached. The
+    returned toolset is prefixed with ``name``.
     """
     transport = config.get("transport", "stdio")
 
     if transport == "stdio":
-        command = config.get("command")
-        if not command:
-            logger.warning("MCP server %r: stdio transport requires `command`; skipping.", name)
-            return None
-        client = StdioTransport(
-            command=command,
-            args=list(config.get("args") or []),
-            env=_stdio_env(config.get("env")),
-            cwd=config.get("cwd"),
-        )
-        return _compose(name, MCPToolset(client, max_retries=DEFAULT_TOOL_MAX_RETRIES))
+        return _stdio_server_from_config(name, config)
 
-    if transport == "sse":
-        url = config.get("url")
-        if not url:
-            logger.warning("MCP server %r: sse transport requires `url`; skipping.", name)
-            return None
-        client = SSETransport(url=url, headers=dict(config.get("headers") or {}))
-        return _compose(
-            name,
-            MCPToolset(client, max_retries=DEFAULT_TOOL_MAX_RETRIES, init_timeout=_connect_timeout(config)),
-        )
-
-    if transport == "streamable_http":
-        url = config.get("url")
-        if not url:
-            logger.warning("MCP server %r: %s transport requires `url`; skipping.", name, transport)
-            return None
-        client = StreamableHttpTransport(url=url, headers=dict(config.get("headers") or {}))
-        return _compose(
-            name,
-            MCPToolset(client, max_retries=DEFAULT_TOOL_MAX_RETRIES, init_timeout=_connect_timeout(config)),
-        )
+    if transport in _HTTP_TRANSPORTS:
+        return _http_server_from_config(name, config, str(transport))
 
     logger.warning("MCP server %r: unsupported transport %r; skipping.", name, transport)
     return None
+
+
+def _stdio_server_from_config(name: str, config: Mapping[str, Any]) -> BuiltMCPServer | None:
+    """Build a subprocess-backed MCP server.
+
+    Deliberately no ``init_timeout`` - there is no network handshake to bound.
+    """
+    command = config.get("command")
+    if not command:
+        logger.warning("MCP server %r: stdio transport requires `command`; skipping.", name)
+        return None
+    client = StdioTransport(
+        command=command,
+        args=list(config.get("args") or []),
+        env=_stdio_env(config.get("env")),
+        cwd=config.get("cwd"),
+    )
+    return BuiltMCPServer(
+        toolset=_compose(name, MCPToolset(client, max_retries=DEFAULT_TOOL_MAX_RETRIES)),
+        transport=client,
+    )
+
+
+def _http_server_from_config(name: str, config: Mapping[str, Any], transport: str) -> BuiltMCPServer | None:
+    """Build a URL-backed MCP server (``sse`` or ``streamable_http``)."""
+    url = config.get("url")
+    if not url:
+        logger.warning("MCP server %r: %s transport requires `url`; skipping.", name, transport)
+        return None
+    try:
+        client = _HTTP_TRANSPORTS[transport](url=url, headers=dict(config.get("headers") or {}))
+    # The constructor rejects a URL that isn't http(s), and nothing validates
+    # the field on the way in, so a typo lands here.
+    except ValueError as e:
+        logger.warning(
+            "Attempted to reach MCP server '%s' at '%s'. That is not a usable web address, so the server "
+            "will be skipped. Check it starts with http:// or https://. Failed due to: %s",
+            name,
+            url,
+            e,
+        )
+        return None
+    return BuiltMCPServer(
+        toolset=_compose(
+            name,
+            MCPToolset(client, max_retries=DEFAULT_TOOL_MAX_RETRIES, init_timeout=_connect_timeout(config)),
+        ),
+        transport=client,
+    )
+
+
+async def disconnect_transport(name: str, transport: ClientTransport) -> None:
+    """Tear down ``transport``, if its kind holds anything to tear down.
+
+    Only :class:`StdioTransport` does - it keeps a subprocess alive between
+    sessions. A deliberate no-op for the HTTP transports, which hold no process
+    and expose no ``disconnect``.
+    """
+    if not isinstance(transport, StdioTransport):
+        return
+    try:
+        await transport.disconnect()
+    # A server that won't shut down cleanly is a warning, not a failed run.
+    except Exception as e:
+        logger.warning("Attempted to shut down MCP server '%s'. Failed because of: %s", name, e)
 
 
 def streamable_http_local(url: str, *, name: str | None = None) -> AbstractToolset[Any]:

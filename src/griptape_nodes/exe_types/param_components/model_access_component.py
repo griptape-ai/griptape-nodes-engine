@@ -1,10 +1,15 @@
 """Model-access parameter component for license/policy-gated dropdowns.
 
 Owns the model list and decorates a node's model-selection ``Parameter`` with
-an ``Options`` trait, an inline ``Button`` refresh trait, per-row entitlement
-icons + subtitles, an error badge on denied selections, and runtime denial
-queries. Node identity (parameter name, type, input_types, tooltip) stays with
-the node so saved workflows round-trip byte-identically.
+an ``Options`` trait, an inline ``Button`` refresh trait, per-row readable
+labels, per-row entitlement icons + subtitles, an error badge on denied
+selections, and runtime denial queries. Node identity (parameter name, type,
+input_types, tooltip) stays with the node so saved workflows round-trip
+byte-identically.
+
+Labels are display-only. A row's ``name`` remains the ``provider_model_id``, so
+what the parameter stores, what the proxy receives, and what provenance metadata
+records are all unchanged by how a row reads. See ``_build_ui_options``.
 
 ``model_choices`` are ``provider_model_id``s, which the component resolves to
 the catalog ``model_id`` the permission layer gates on. ``deprecated_values``
@@ -126,6 +131,27 @@ if TYPE_CHECKING:
     from griptape_nodes.traits.button import ButtonDetailsMessagePayload
 
 _REFRESH_ICON = "list-restart"
+
+
+def _comparable(value: str) -> str:
+    """``value`` reduced to its letters and digits, lowercased.
+
+    Collapses the ways a catalog name and a provider id spell the same thing, so
+    "GPT-5.5" and ``gpt-5.5`` compare equal.
+    """
+    return "".join(character for character in value.lower() if character.isalnum())
+
+
+def _id_adds_detail(display_name: str, provider_model_id: str) -> bool:
+    """Whether ``provider_model_id`` carries something its display name drops.
+
+    "Seedream 5.0 Pro" hides the vendor prefix and build date in
+    ``dola-seedream-5-0-pro-260628``, so the id earns a second line on the row.
+    Most of the catalog does not: "GPT-5.5" and ``gpt-5.5`` differ only in
+    punctuation, and ``o3``'s display name IS ``o3``, so repeating the id there
+    only doubles the row height with the text already above it.
+    """
+    return _comparable(display_name) != _comparable(provider_model_id)
 
 
 class ModelAccessComponent:
@@ -583,13 +609,35 @@ class ModelAccessComponent:
         Built from ``model_choices`` alone, never ``deprecated_values`` -- a
         legacy value is accepted when assigned but never offered as a fresh
         selection.
+
+        ``name`` stays the provider id on every row: it is what the UI pairs
+        against ``Options.choices``, what the parameter stores, and what the
+        node sends. ``label`` is the catalog's readable name and is the ONLY
+        place a display string is written -- it is deliberately not assigned to
+        the parameter, so provenance metadata (which reads the stored value)
+        keeps recording the exact provider id rather than a prettified name.
+        A choice the catalog does not describe carries no ``label`` and renders
+        as its id, which is what a dropdown did before labels existed.
+
+        The id repeats as a ``subtitle`` only where it says something the label
+        does not -- see ``_id_adds_detail``. Most of the catalog names a model
+        the way its id spells it, and a second line reading ``gpt-5.5`` under
+        "GPT-5.5" costs every row twice the height to say nothing.
         """
         data: list[dict[str, str]] = []
         for choice in self._model_choices:
+            row: dict[str, str] = {"name": choice}
+            display_name = self._snapshot.display_name_for(choice)
+            if display_name is not None and display_name.strip():
+                row["label"] = display_name
+                if _id_adds_detail(display_name, choice):
+                    row["subtitle"] = choice
             if self._cached_denial(choice) is not None:
-                data.append({"name": choice, "icon": DENIED_ROW_ICON, "subtitle": DENIED_ROW_SUBTITLE})
-            else:
-                data.append({"name": choice})
+                row["icon"] = DENIED_ROW_ICON
+                # Outranks the id: it is the actionable line, and it keeps a denied row
+                # identical to HuggingFace's. The badge still quotes the id verbatim.
+                row["subtitle"] = DENIED_ROW_SUBTITLE
+            data.append(row)
         return {
             "data": data,
             "dropdown_row_icons": True,
