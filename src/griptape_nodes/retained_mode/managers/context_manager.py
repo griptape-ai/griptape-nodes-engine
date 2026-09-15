@@ -44,6 +44,7 @@ class ContextManager(EngineScoped):
 
     _workflow_stack: list[ContextManager.WorkflowContextState]
     _last_notified_workflow: ContextManager.CurrentWorkflow
+    _switch_owed: bool
 
     class CurrentWorkflow(NamedTuple):
         """Everything the engine reports about which Workflow is current.
@@ -283,13 +284,18 @@ class ContextManager(EngineScoped):
         self._workflow_stack = []
         # What the last CurrentWorkflowChanged actually carried onto the event queue. Starts as
         # all-None, which is exactly what an empty stack reports, so a fresh engine owes nobody a
-        # notification. It records what went out rather than what the stack holds, so a switch
-        # whose event never left the engine is re-sent at the next one instead of being deduped
-        # away -- see `_notify_current_workflow_changed`. It is not a record of what any
-        # particular client received, though: a client that connects mid-session has missed
-        # whatever went out before it arrived, so it reads GetWorkflowContextRequest once on
-        # connect and follows the event stream from there.
+        # notification. It records what went out rather than what the stack holds. It is not a
+        # record of what any particular client received, though: a client that connects mid-session
+        # has missed whatever went out before it arrived, so it reads GetWorkflowContextRequest
+        # once on connect and follows the event stream from there.
         self._last_notified_workflow = self.CurrentWorkflow(workflow_name=None, is_saved=None)
+        # Whether a switch was computed but never reached the queue, so the next notification has
+        # to go out even if it carries the same payload as the last one that did. Tracked apart
+        # from the value above because the two states it would otherwise collapse into one --
+        # "clients were told nothing is open" and "clients have been told nothing at all" -- both
+        # read as all-None, and a workflow pushed before the queue existed is closed by an event
+        # that reports exactly that. See `_notify_current_workflow_changed`.
+        self._switch_owed = False
         event_manager.assign_manager_to_request_type(
             request_type=SetWorkflowContextRequest, callback=self.on_set_workflow_context_request
         )
@@ -643,9 +649,9 @@ class ContextManager(EngineScoped):
         workflow, so the top entry matches; no entry matching at all is therefore not expected, and
         is quietly treated as nothing to do.
 
-        A notification follows unless the key did not actually move -- a rename whose new name
-        sanitizes back to the current key repoints the path here and is deduped into silence by
-        `_notify_current_workflow_changed`, because the payload carries the key and nothing else.
+        A notification follows unless nothing clients can see actually moved -- a rename whose new
+        name sanitizes back to the current key repoints the path here and is deduped into silence by
+        `_notify_current_workflow_changed`, because the path is not in the payload.
 
         Args:
             old_name: The registry key the context currently holds.
@@ -667,8 +673,8 @@ class ContextManager(EngineScoped):
         survives a workspace switch -- so leaving it at the pre-move value keeps `workflow_dir`
         pointing at the old directory even though the registry is correct.
 
-        Use when the path is all that changes; no CurrentWorkflowChanged goes out, because the
-        payload clients receive carries the registry key and nothing else. Anything that relocates
+        Use when the path is all that changes; no CurrentWorkflowChanged goes out, because the path
+        is not one of the things that payload carries. Anything that relocates
         the file *and* rekeys it (Move, Rename, a first save) calls `rekey_workflow` instead, so
         both halves land before the switch goes out.
 
@@ -993,13 +999,18 @@ class ContextManager(EngineScoped):
         the engine does that today -- a first save always rekeys -- but a payload field that the
         dedupe cannot see is a field that can go stale on the wire.
 
-        A switch that could not be broadcast stays owed, whichever way the broadcast failed: the
-        dedupe field advances only once the event is on the queue, so the next switch compares
-        against the older payload and re-sends rather than deduping the missed one into silence.
+        A switch that could not be broadcast stays owed, whichever way the broadcast failed -- the
+        engine's loop has closed, or the queue does not exist yet. `_switch_owed` is what makes the
+        next notification go out even when it computes the same payload as the last one that landed,
+        and it is deliberately separate from the last-announced value: an engine that has told
+        clients nothing is open and an engine that has told them nothing at all both read as
+        all-None, so folding the two together would let a workflow pushed before the queue existed
+        be closed in silence. That close is the event a client most needs, since without it it is
+        left showing a workflow the engine no longer has open.
         """
         current_workflow = self._read_current_workflow()
 
-        if current_workflow == self._last_notified_workflow:
+        if not self._switch_owed and current_workflow == self._last_notified_workflow:
             return
 
         switched_to = "no workflow is open any more"
@@ -1029,6 +1040,7 @@ class ContextManager(EngineScoped):
                 )
             )
         except RuntimeError as e:
+            self._switch_owed = True
             logger.warning(
                 "Attempted to tell connected editors that %s. They will be told at the next switch, "
                 "if the engine is still running to make one. Failed due to: %s",
@@ -1042,6 +1054,7 @@ class ContextManager(EngineScoped):
         # replays before the queue exists -- which is why it is logged quietly. It is still a
         # dropped event, and it is left owed for the same reason as the raise above.
         if not event_was_queued:
+            self._switch_owed = True
             logger.debug(
                 "Did not tell connected editors that %s: the engine has no event queue yet. They will be "
                 "told at the next switch; a client that connects in between reads the current workflow "
@@ -1050,6 +1063,7 @@ class ContextManager(EngineScoped):
             )
             return
 
+        self._switch_owed = False
         self._last_notified_workflow = current_workflow
 
     def _read_current_workflow(self) -> ContextManager.CurrentWorkflow:
