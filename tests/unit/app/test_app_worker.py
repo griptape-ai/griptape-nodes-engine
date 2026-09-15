@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import json
+import logging
 import os
 import sys
 import threading
@@ -21,6 +22,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 import pytest
 
 from griptape_nodes.api_client.request_client import _PendingRequest
+from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
 from griptape_nodes.retained_mode.events import worker_events
 from griptape_nodes.retained_mode.events.app_events import CurrentProjectChanged
 from griptape_nodes.retained_mode.events.base_events import EventRequest
@@ -29,7 +31,11 @@ from griptape_nodes.retained_mode.events.execution_events import (
     ExecuteNodeResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
-from griptape_nodes.retained_mode.managers.worker_manager import WorkerManager, WorkerRegistration
+from griptape_nodes.retained_mode.managers.worker_manager import (
+    _STATIC_URL_SETTLE_TIMEOUT_S,
+    WorkerManager,
+    WorkerRegistration,
+)
 from griptape_nodes.utils.version_utils import engine_version
 
 _SESSION = "sess-abc"
@@ -810,6 +816,101 @@ class TestSpawnWorker:
 
         env = mock_exec.call_args.kwargs["env"]
         assert "GTN_ORCHESTRATOR_ENGINE_ID" not in env
+
+
+class TestOrchestratorStaticServerBaseUrl:
+    """The spawn side of the static-URL handover.
+
+    Resolution and spawn are both listeners on AppInitializationComplete and fan out as unordered
+    concurrent tasks, so the URL is awaited rather than sampled. Which wait runs, and which of the
+    two warnings a missing URL earns, are what an operator reads when a worker's asset URLs come
+    back dead, so both choices are pinned here.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_settled_url_is_read_without_a_thread_hop(self, worker_manager: WorkerManager) -> None:
+        """The decision is normally already in, and the hop is the path with a cost.
+
+        A blocking wait handed to a thread cannot be cancelled, so taking it when nothing needs it
+        parks a default-executor thread that teardown then joins.
+        """
+        static_files_manager = worker_manager.engine.static_files_manager  # type: ignore[union-attr]
+        static_files_manager.static_server_base_url_settled = True
+        static_files_manager.wait_for_static_server_base_url.return_value = "http://orchestrator:4242"
+
+        with patch("asyncio.to_thread", new=AsyncMock()) as mock_to_thread:
+            result = await worker_manager._orchestrator_static_server_base_url()
+
+        assert result == "http://orchestrator:4242"
+        mock_to_thread.assert_not_called()
+        static_files_manager.wait_for_static_server_base_url.assert_called_once_with(0)
+
+    @pytest.mark.asyncio
+    async def test_an_undecided_url_is_waited_for_off_the_loop(self, worker_manager: WorkerManager) -> None:
+        """The blocking wait must not run on the event loop, which is serving everything else."""
+        static_files_manager = worker_manager.engine.static_files_manager  # type: ignore[union-attr]
+        static_files_manager.static_server_base_url_settled = False
+        static_files_manager.wait_for_static_server_base_url.return_value = "http://orchestrator:4242"
+
+        result = await worker_manager._orchestrator_static_server_base_url()
+
+        assert result == "http://orchestrator:4242"
+        static_files_manager.wait_for_static_server_base_url.assert_called_once_with(_STATIC_URL_SETTLE_TIMEOUT_S)
+
+    @pytest.mark.asyncio
+    async def test_a_settled_absence_blames_resolution_rather_than_the_wait(
+        self, worker_manager: WorkerManager, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Initialization deciding there is no server settles in microseconds.
+
+        Blaming the settle timeout for it points an operator at slow startup when the real lead is
+        an earlier resolution failure, which under local storage is the only way to reach here.
+        """
+        static_files_manager = worker_manager.engine.static_files_manager  # type: ignore[union-attr]
+        static_files_manager.static_server_base_url_settled = True
+        static_files_manager.wait_for_static_server_base_url.return_value = None
+        static_files_manager.storage_driver = MagicMock(spec=LocalStorageDriver)
+
+        with caplog.at_level(logging.WARNING):
+            result = await worker_manager._orchestrator_static_server_base_url()
+
+        assert result is None
+        assert "Check for an earlier failure resolving the static server" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_a_url_that_never_arrives_blames_the_wait(
+        self, worker_manager: WorkerManager, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        static_files_manager = worker_manager.engine.static_files_manager  # type: ignore[union-attr]
+        static_files_manager.static_server_base_url_settled = False
+        static_files_manager.wait_for_static_server_base_url.return_value = None
+        static_files_manager.storage_driver = MagicMock(spec=LocalStorageDriver)
+
+        with caplog.at_level(logging.WARNING):
+            result = await worker_manager._orchestrator_static_server_base_url()
+
+        assert result is None
+        assert "never decided" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_a_cloud_backend_without_a_url_says_nothing(
+        self, worker_manager: WorkerManager, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """On a cloud backend a worker's URLs come from the same bucket and outlive it.
+
+        There is nothing to warn about, and warning anyway trains people to ignore the case where
+        the URLs really do die with the worker.
+        """
+        static_files_manager = worker_manager.engine.static_files_manager  # type: ignore[union-attr]
+        static_files_manager.static_server_base_url_settled = True
+        static_files_manager.wait_for_static_server_base_url.return_value = None
+        static_files_manager.storage_driver = MagicMock()
+
+        with caplog.at_level(logging.WARNING):
+            result = await worker_manager._orchestrator_static_server_base_url()
+
+        assert result is None
+        assert caplog.records == []
 
 
 class TestResetWorkers:
