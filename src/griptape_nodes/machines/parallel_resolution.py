@@ -209,6 +209,7 @@ class ExecuteDagState(State):
         # Remove it from the network so the end node can process control flow
         if isinstance(current_node, BaseIterativeStartNode):
             current_node.state = NodeResolutionState.RESOLVED
+            ExecuteDagState._unresolve_if_an_input_was_torn_down(current_node)
 
             # Remove start node from ALL networks where it appears
             for network in list(context.networks.values()):
@@ -219,6 +220,7 @@ class ExecuteDagState(State):
 
         # Publish all parameter updates.
         current_node.state = NodeResolutionState.RESOLVED
+        ExecuteDagState._unresolve_if_an_input_was_torn_down(current_node)
         # Track this as the last resolved node
         context.last_resolved_node = current_node
         # Mark the priority queue as needing recalculation
@@ -289,6 +291,23 @@ class ExecuteDagState(State):
         # Now the final thing to do, is to take their directed graph and update it.
         ExecuteDagState.get_next_control_graph(context, current_node, network_name)
         ExecuteDagState.check_for_new_start_nodes(context, current_node.name, network_name)
+
+    @staticmethod
+    def _unresolve_if_an_input_was_torn_down(node: BaseNode) -> None:
+        """Undo this node's resolved state if it finished on an input whose connection is now gone.
+
+        Deleting a connection into a node that is mid-execution defers clearing the value, so the node
+        finishes on what it was actually running on rather than on its parameter default. The value is
+        cleared by the executor once execution ends, but resolution state cannot be settled there: the
+        driver stamps RESOLVED afterwards and would overwrite it. So it is settled here instead.
+
+        Leaving the node RESOLVED would mean every later run skips rebuilding it and its consumers keep
+        receiving outputs derived from a connection the artist deleted.
+        """
+        if not node.consume_deferred_reset_flag():
+            return
+
+        node.make_node_unresolved(current_states_to_trigger_change_event={NodeResolutionState.RESOLVED})
 
     @staticmethod
     def get_next_control_graph(context: ParallelResolutionContext, node: BaseNode, network_name: str) -> None:
@@ -497,13 +516,18 @@ class ExecuteDagState(State):
             leaf_nodes.update(network_leaf_nodes)
         canceled_nodes = set()
         for node in leaf_nodes:
-            node_reference = context.node_to_reference[node]
+            # Deleting a node during a run drops it from `node_to_reference` (DagBuilder.remove_node),
+            # so a name taken from a graph is no longer guaranteed to have a reference. Skip rather
+            # than subscript: a node that has gone away has no state worth collecting.
+            node_reference = context.node_to_reference.get(node)
+            if node_reference is None:
+                continue
             if node_reference.node_state == NodeState.CANCELED:
                 canceled_nodes.add(node)
         return NodeStatesResult(canceled_nodes=canceled_nodes, leaf_nodes=leaf_nodes)
 
     @staticmethod
-    async def pop_done_states(context: ParallelResolutionContext) -> None:
+    async def pop_done_states(context: ParallelResolutionContext) -> None:  # noqa: C901 (one over, from tolerating a deleted node)
         generation = context.generation
         networks = context.networks
         handled_nodes = set()  # Track nodes we've already processed to avoid duplicates
@@ -516,7 +540,14 @@ class ExecuteDagState(State):
             # We removed nodes from the network. There may be new leaf nodes.
             leaf_nodes = [n for n in network.nodes() if network.in_degree(n) == 0]
             for node in leaf_nodes:
-                node_reference = context.node_to_reference[node]
+                # `leaf_nodes` is a snapshot, and the await below is a window in which a node can be
+                # deleted -- `DagBuilder.remove_node` drops it from `node_to_reference` while this
+                # list still names it. The `was_reset_since` guards do not cover that: a delete
+                # deliberately does not bump `generation`, because the run is meant to carry on
+                # rather than be abandoned. So tolerate the name having gone away.
+                node_reference = context.node_to_reference.get(node)
+                if node_reference is None:
+                    continue
                 node_state = node_reference.node_state
                 # If the node is locked, mark it as done so it skips execution
                 if node_reference.node_reference.lock or node_state == NodeState.DONE:
@@ -537,7 +568,7 @@ class ExecuteDagState(State):
                     if node not in handled_nodes:
                         handled_nodes.add(node)
                         # handle_done_nodes will append control successors to the set
-                        await ExecuteDagState.handle_done_nodes(context, context.node_to_reference[node], network_name)
+                        await ExecuteDagState.handle_done_nodes(context, node_reference, network_name)
                         if context.was_reset_since(generation):
                             # `networks` is a snapshot, so its graphs still name
                             # nodes a teardown dropped from node_to_reference.
