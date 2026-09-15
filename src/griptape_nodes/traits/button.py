@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import logging
 from collections.abc import Callable
 from typing import Literal, get_args
@@ -96,7 +94,7 @@ def _build_link_handler(url: str) -> Callable:
     """
 
     def handler(
-        button: Button,  # noqa: ARG001
+        button: "Button",  # noqa: ARG001
         button_details: ButtonDetailsMessagePayload,
     ) -> NodeMessageResult:
         return NodeMessageResult(
@@ -112,7 +110,7 @@ def _build_link_handler(url: str) -> Callable:
     return handler
 
 
-def _link_yields_to_a_handler(button: Button, _attribute: attrs.Attribute, url: str | None) -> str | None:
+def _link_yields_to_a_handler(button: "Button", _attribute: attrs.Attribute, url: str | None) -> str | None:
     """Drop a link written onto a button whose node already wired its own handler.
 
     Silent rather than an error because this is the load path: a saved link belongs to a
@@ -134,7 +132,9 @@ def _link_handler_for(url: str | None) -> Callable | None:
     return _build_link_handler(url)
 
 
-def _handler_clears_the_link(button: Button, _attribute: attrs.Attribute, callback: Callable | None) -> Callable | None:
+def _handler_clears_the_link(
+    button: "Button", _attribute: attrs.Attribute, callback: Callable | None
+) -> Callable | None:
     """Drop the link when a handler is attached, so the two can never both be live."""
     if callback is not None:
         button.button_link = None
