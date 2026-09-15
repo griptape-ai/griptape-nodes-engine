@@ -47,10 +47,12 @@ class ModelPolicySnapshot:
     Frozen and replaced wholesale by ``query_model_policy()``, so the tables cannot drift apart:
     there is no window where denials describe one query and declared ids another.
 
-    Both tables are keyed by ``provider_model_id`` -- the upstream provider's name for the model --
-    because that is the handle a dropdown value can be reduced to. ``denial_by_provider_id`` holds
-    only what policy denied; ``catalog_ids_by_provider_id`` maps every resolved handle to the stable
-    catalog keys policy gates on.
+    All three tables are keyed by ``provider_model_id`` -- the upstream provider's name for the
+    model -- because that is the handle a dropdown value can be reduced to.
+    ``denial_by_provider_id`` holds only what policy denied; ``catalog_ids_by_provider_id`` maps
+    every resolved handle to the stable catalog keys policy gates on;
+    ``display_name_by_provider_id`` maps it to the catalog's readable name, for decorating a row a
+    person reads.
 
     That key is deliberately NOT unique: ``Model``'s contract allows two catalog entries to describe
     the same ``provider_model_id`` with different ``key_support`` (e.g. a BYOK entry and a
@@ -60,6 +62,13 @@ class ModelPolicySnapshot:
     there is exactly one catalog table rather than a handle-to-single-id map beside it: a second
     table holding "whichever entry was seen first" would be the shape this one exists to replace,
     and keeping both invites an edit that updates one and not the other.
+
+    ``display_name_by_provider_id`` is a handle-to-single-value map, which is the shape the
+    paragraph above rejects, and it is safe only because a name decides nothing. It keeps the first
+    name declared for a shared handle: there is no any-wins rule to inherit, because a name is not a
+    verdict, and picking the "wrong" twin's name changes how a row reads rather than what may run.
+    A name must never be used as an identity -- what a dropdown stores and what a payload sends is
+    the handle itself.
 
     ``failure_detail`` is set when the engine could not answer at all (unregistered node class,
     missing manifest declaration). Both tables are then empty, and a caller must not read "no
@@ -88,6 +97,7 @@ class ModelPolicySnapshot:
     denial_by_provider_id: dict[str, CheckpointDenial] = field(default_factory=dict)
     # Every catalog id behind a shared provider_model_id, for callers that re-ask policy live.
     catalog_ids_by_provider_id: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    display_name_by_provider_id: dict[str, str] = field(default_factory=dict)
     failure_detail: str | None = None
     has_unmatchable_entries: bool = False
     unmatchable_denials: tuple[str, ...] = ()
@@ -96,6 +106,15 @@ class ModelPolicySnapshot:
     def catalog_ids_for(self, provider_model_id: str) -> tuple[str, ...]:
         """Every catalog id declared against ``provider_model_id``, in declaration order."""
         return self.catalog_ids_by_provider_id.get(provider_model_id, ())
+
+    def display_name_for(self, provider_model_id: str) -> str | None:
+        """The catalog's readable name for ``provider_model_id``, or ``None`` if it has none.
+
+        ``None`` means the catalog does not describe this handle, which is a legitimate state for a
+        choice the catalog never declared. Callers render the handle itself in that case; they must
+        not synthesize a name.
+        """
+        return self.display_name_by_provider_id.get(provider_model_id)
 
     @property
     def declares_models(self) -> bool:
@@ -230,6 +249,7 @@ def query_model_policy(node_type: str, *, fail_closed: bool = True) -> ModelPoli
 
     denials: dict[str, CheckpointDenial] = {}
     all_catalog_ids: dict[str, list[str]] = {}
+    display_names: dict[str, str] = {}
     unmatchable = False
     unmatchable_denials: list[str] = []
     for verdict in result.verdicts:
@@ -241,6 +261,10 @@ def query_model_policy(node_type: str, *, fail_closed: bool = True) -> ModelPoli
                 unmatchable_denials.append(verdict.model_id)
             continue
         all_catalog_ids.setdefault(verdict.provider_model_id, []).append(verdict.model_id)
+        # First-name-wins for a shared handle, per ModelPolicySnapshot's contract: a name is not a
+        # verdict, so there is nothing here to fail closed on.
+        if verdict.display_name is not None:
+            display_names.setdefault(verdict.provider_model_id, verdict.display_name)
         # Any-denial-wins: two entries can share this handle, and the permitted one must not
         # overwrite the denied one.
         if verdict.denial is not None:
@@ -258,6 +282,7 @@ def query_model_policy(node_type: str, *, fail_closed: bool = True) -> ModelPoli
     return ModelPolicySnapshot(
         denial_by_provider_id=denials,
         catalog_ids_by_provider_id={k: tuple(v) for k, v in all_catalog_ids.items()},
+        display_name_by_provider_id=display_names,
         has_unmatchable_entries=unmatchable,
         unmatchable_denials=tuple(unmatchable_denials),
     )

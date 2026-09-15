@@ -18,6 +18,7 @@ import pytest
 from pydantic_ai.exceptions import ModelHTTPError, ModelRetry
 from pydantic_ai.messages import BinaryContent, ImageUrl, ModelMessage, ModelRequest, UserPromptPart
 
+from griptape_nodes.agents.pydantic_ai.mcp_toolset_cache import MCPToolsetCache
 from griptape_nodes.agents.pydantic_ai.runner import (
     AgentRunResult,
     RunEvent,
@@ -76,6 +77,12 @@ from griptape_nodes.retained_mode.events.agent_events import (
     UpdateAgentProviderResultSuccess,
     UpdateProviderPayload,
 )
+from griptape_nodes.retained_mode.events.mcp_events import (
+    GetEnabledMCPServersRequest,
+    GetEnabledMCPServersResultFailure,
+    GetEnabledMCPServersResultSuccess,
+    MCPServerConfig,
+)
 from griptape_nodes.retained_mode.managers.agent_manager import (
     _PROTECTED_PROVIDER_NAME,
     _SKILLS_README,
@@ -84,12 +91,15 @@ from griptape_nodes.retained_mode.managers.agent_manager import (
     AgentManager,
     ComposedPrompt,
     _ActiveRun,
+    _build_agent_instructions,
     _cloud_http_status_of,
     _compose_prompt,
+    _compose_server_rules,
     _friendly_list_models_error,
     _message_has_image_url,
     _rehydrate_history,
     _run_event_to_payload,
+    _RunnerCacheKey,
 )
 
 _AGENT_MANAGER_MODULE = "griptape_nodes.retained_mode.managers.agent_manager"
@@ -147,26 +157,79 @@ class TestEnsureSkillsDirectory:
         agent_manager._ensure_skills_directory(blocker)
 
 
-class TestComposeInstructions:
-    """Per-MCP-server `rules` are folded into the instructions string, not dropped."""
+class TestBuildAgentInstructions:
+    """The agent's baked-in instructions describe only what cannot change mid-session."""
 
-    def test_no_rules_returns_base_instructions(self, agent_manager: AgentManager) -> None:
-        result = agent_manager._compose_instructions([], include_image_tool=False)
+    def test_base_instructions_describe_the_engine_tools(self) -> None:
+        result = _build_agent_instructions(include_image_tool=False)
         assert "GriptapeNodes" in result
         assert "generate_image" not in result
 
-    def test_image_tool_included_when_requested(self, agent_manager: AgentManager) -> None:
-        result = agent_manager._compose_instructions([], include_image_tool=True)
+    def test_image_tool_included_when_requested(self) -> None:
+        result = _build_agent_instructions(include_image_tool=True)
         assert "generate_image" in result
 
-    def test_rules_are_appended_to_base_instructions(self, agent_manager: AgentManager) -> None:
-        composed = agent_manager._compose_instructions(
-            ["Rules for MCP server 'a':\nbe terse", "Rules for MCP server 'b':\nbe kind"],
-            include_image_tool=False,
+
+class TestComposeServerRules:
+    """Per-MCP-server `rules` become run-level instructions, not dropped."""
+
+    def test_no_servers_contributes_nothing(self) -> None:
+        assert _compose_server_rules([]) == ""
+
+    def test_each_server_is_labelled_with_its_name(self) -> None:
+        composed = _compose_server_rules(
+            [{"name": "a", "rules": "be terse"}, {"name": "b", "rules": "be kind"}],
         )
-        assert "GriptapeNodes" in composed
-        assert "be terse" in composed
-        assert "be kind" in composed
+        assert composed == "Rules for MCP server 'a':\nbe terse\n\nRules for MCP server 'b':\nbe kind"
+
+    def test_servers_without_rules_are_skipped(self) -> None:
+        composed = _compose_server_rules(
+            [{"name": "a"}, {"name": "b", "rules": "   "}, {"name": "c", "rules": None}, {"name": "d", "rules": "go"}],
+        )
+        assert composed == "Rules for MCP server 'd':\ngo"
+
+
+class _RecordingEngine:
+    """An engine stand-in that answers with `result` and keeps what it was asked."""
+
+    def __init__(self, result: object) -> None:
+        self.result = result
+        self.seen: list[GetEnabledMCPServersRequest] = []
+
+    def handle_request(self, request: GetEnabledMCPServersRequest) -> object:
+        self.seen.append(request)
+        return self.result
+
+
+class TestLookupEnabledMCPServers:
+    """Reading the enabled servers must not publish them."""
+
+    @staticmethod
+    def _manager(engine: _RecordingEngine) -> AgentManager:
+        """A manager wired to nothing but `engine`, which is all the lookup touches."""
+        manager = AgentManager.__new__(AgentManager)
+        manager._engine = engine  # type: ignore[assignment]
+        return manager
+
+    def test_the_lookup_is_not_broadcast_to_clients(self) -> None:
+        """The reply carries every server's `env` and `headers` verbatim.
+
+        This runs once per message, and a broadcast result is fanned out to
+        every connected websocket client. Nothing listens for the result of this
+        internal read - a client wanting the list asks for it itself - so
+        broadcasting it is pure credential exposure.
+        """
+        servers: dict[str, MCPServerConfig] = {"a": {"name": "a", "env": {"TOKEN": "hunter2"}}}
+        engine = _RecordingEngine(GetEnabledMCPServersResultSuccess(servers=servers, result_details="ok"))
+
+        assert self._manager(engine)._lookup_enabled_mcp_servers() == servers
+        assert [request.broadcast_result for request in engine.seen] == [False]
+
+    def test_an_unreadable_config_is_distinguishable_from_no_servers(self) -> None:
+        """`None` means "could not find out", so cached servers are left alone."""
+        engine = _RecordingEngine(GetEnabledMCPServersResultFailure(result_details="nope"))
+
+        assert self._manager(engine)._lookup_enabled_mcp_servers() is None
 
 
 class TestOnHandleListAgentModelsRequest:
@@ -596,7 +659,7 @@ class TestCreateAgentProvider:
         assert any(p.name == "home-ollama" for p in providers_manager._providers)
 
     def test_create_clears_runner_cache(self, providers_manager: AgentManager) -> None:
-        providers_manager._runner_cache[("griptape_cloud", "gpt-4o", "img", "", "", ())] = object()  # type: ignore[assignment]
+        providers_manager._runner_cache[_RunnerCacheKey("griptape_cloud", "gpt-4o", "img", "", "")] = object()  # type: ignore[assignment]
 
         providers_manager.on_handle_create_agent_provider_request(
             CreateAgentProviderRequest(provider=CreateProviderPayload(name="new", type="ollama"))
@@ -695,7 +758,7 @@ class TestUpdateAgentProvider:
         assert "renamed" not in names
 
     def test_update_clears_runner_cache(self, providers_manager: AgentManager) -> None:
-        providers_manager._runner_cache[("ollama", "llama3.2", "img", "http://x", "", ())] = object()  # type: ignore[assignment]
+        providers_manager._runner_cache[_RunnerCacheKey("ollama", "llama3.2", "img", "http://x", "")] = object()  # type: ignore[assignment]
 
         providers_manager.on_handle_update_agent_provider_request(
             UpdateAgentProviderRequest(name="my-ollama", provider=UpdateProviderPayload(model="gemma2"))
@@ -793,7 +856,7 @@ class TestDeleteAgentProvider:
         assert not any(p.name == "my-ollama" for p in providers_manager._providers)
 
     def test_delete_clears_runner_cache(self, providers_manager: AgentManager) -> None:
-        providers_manager._runner_cache[("ollama", "llama3.2", "img", "http://x", "", ())] = object()  # type: ignore[assignment]
+        providers_manager._runner_cache[_RunnerCacheKey("ollama", "llama3.2", "img", "http://x", "")] = object()  # type: ignore[assignment]
 
         providers_manager.on_handle_delete_agent_provider_request(DeleteAgentProviderRequest(name="my-ollama"))
 
@@ -1084,7 +1147,7 @@ class TestConfigureAgentActiveProvider:
         assert providers_manager._active_provider_name == "griptape_cloud"
 
     def test_switching_active_provider_clears_runner_cache(self, providers_manager: AgentManager) -> None:
-        providers_manager._runner_cache[("griptape_cloud", "gpt-4o", "img", "", "", ())] = object()  # type: ignore[assignment]
+        providers_manager._runner_cache[_RunnerCacheKey("griptape_cloud", "gpt-4o", "img", "", "")] = object()  # type: ignore[assignment]
 
         providers_manager.on_handle_configure_agent_request(ConfigureAgentRequest(active_provider="my-ollama"))
 
@@ -1092,7 +1155,7 @@ class TestConfigureAgentActiveProvider:
 
     def test_switching_to_same_active_provider_does_not_clear_cache(self, providers_manager: AgentManager) -> None:
         sentinel = object()
-        key = ("griptape_cloud", "gpt-4o", "img", "", "", ())
+        key = _RunnerCacheKey("griptape_cloud", "gpt-4o", "img", "", "")
         providers_manager._runner_cache[key] = sentinel  # type: ignore[assignment]
 
         # Switching to the already-active provider should not count as a change.
@@ -1131,7 +1194,7 @@ class TestBuildRunnerCredential:
         providers_manager._thread_storage = object()  # type: ignore[assignment]
         providers_manager.static_files_manager = None  # type: ignore[assignment]
 
-        providers_manager._build_runner([], provider_name="griptape_cloud")
+        providers_manager._build_runner(provider_name="griptape_cloud")
 
         assert captured["api_key"] == "the-license"
 
@@ -1141,7 +1204,7 @@ class TestBuildRunnerCredential:
         monkeypatch.setattr(_AGENT_MANAGER_MODULE + ".resolve_cloud_credential", lambda *_a, **_k: None)
 
         with pytest.raises(ValueError, match="Sign in with your Griptape license") as excinfo:
-            providers_manager._build_runner([], provider_name="griptape_cloud")
+            providers_manager._build_runner(provider_name="griptape_cloud")
 
         assert "GT_CLOUD_API_KEY" in str(excinfo.value)
 
@@ -1262,6 +1325,7 @@ class TestRunAgentResultPayloadContract:
         """An AgentManager whose runner returns `result` and whose I/O is stubbed."""
         manager = AgentManager.__new__(AgentManager)
         manager._active_runs = {}
+        manager._mcp_toolsets = MCPToolsetCache()
 
         async def fake_run(*_args: object, **_kwargs: object) -> AgentRunResult:
             return result
@@ -1282,7 +1346,10 @@ class TestRunAgentResultPayloadContract:
         )
         # `engine` is a read-only property over `_engine`; set the backing field.
         manager._engine = SimpleNamespace(  # type: ignore[assignment]
-            event_manager=SimpleNamespace(put_event=lambda _e: None)
+            event_manager=SimpleNamespace(put_event=lambda _e: None),
+            # `_run_agent` reads the enabled MCP servers on every run; these
+            # tests are about the result payload, so report none configured.
+            handle_request=lambda _r: GetEnabledMCPServersResultSuccess(servers={}, result_details="none"),
         )
         return manager
 
