@@ -96,13 +96,20 @@ class _Run:
         return [type(request).__name__ for request in self.requests]
 
 
-def _run(result: object, **kwargs: object) -> _Run:
+def _run(result: object, *, library_load: object = None, **kwargs: object) -> _Run:
     """Invoke the command with a stubbed engine and capture what it did.
 
     ``collect`` is called as a plain function rather than through Typer's runner: the
     defaults are Typer ``OptionInfo`` objects, so every keyword the test does not set has to
     be passed explicitly anyway, and calling it directly keeps the request objects
     themselves within reach instead of only their effect on an exit code.
+
+    Args:
+        result: What the collection request returns, or an exception for it to raise.
+            Raising stands for an engine that could not be built at all, since dispatching
+            the request is what builds one.
+        library_load: The same, for the library load that runs before it.
+        kwargs: Flags to override on the command.
     """
     console = _recording_console()
     options: dict[str, object] = {
@@ -118,8 +125,12 @@ def _run(result: object, **kwargs: object) -> _Run:
         # changes how many requests there are and a positional list would then hand the
         # library load's answer to the collection.
         if isinstance(request, CollectDiagnosticsRequest):
+            if isinstance(result, Exception):
+                raise result
             return result
-        return None
+        if isinstance(library_load, Exception):
+            raise library_load
+        return library_load
 
     exit_code: int | None = None
     with (
@@ -239,3 +250,49 @@ class TestFailure:
         run = _run(CollectDiagnosticsResultFailure(result_details="could not write to '/tmp/[archive] logs'"))
 
         assert "[archive] logs" in run.printed
+
+
+class TestAnEngineThatWillNotStart:
+    """A broken engine is the usual reason somebody is collecting a bundle at all.
+
+    Either request the command makes can be the one that builds the engine, so a config file
+    it cannot get past, or a node library that raises on import, surfaces as an exception out
+    of a dispatch. Unguarded, the command that exists to package that answer for a bug report
+    answered with a traceback -- the thing the user already had.
+    """
+
+    def test_an_engine_that_cannot_be_built_is_explained_rather_than_traced(self) -> None:
+        run = _run(RuntimeError("the config file could not be parsed"))
+
+        assert run.exit_code == 1
+        assert "The engine itself could not be started" in run.printed
+        assert "the config file could not be parsed" in run.printed
+
+    def test_libraries_that_will_not_load_do_not_stop_the_collection(self) -> None:
+        """Which libraries are broken is what the bundle is being collected to show.
+
+        A library that raises on import is recorded in the bundle, and every other section
+        still describes the machine somebody is asking about, so the load is reported and
+        the collection goes ahead.
+        """
+        run = _run(_success(), library_load=RuntimeError("a node library raised on import"))
+
+        assert run.exit_code is None
+        assert "a node library raised on import" in run.printed
+        assert "Diagnostics bundle written to:" in run.printed
+
+    def test_the_text_of_a_failure_holding_markup_is_shown_as_written(self) -> None:
+        """These messages quote an exception raised while reading the user's own files.
+
+        A config path or a library name can hold square brackets, which Rich reads as a style
+        tag: unescaped, the part of the message naming what broke is dropped silently, or an
+        unknown tag raises a second error on top of the first.
+        """
+        run = _run(RuntimeError("could not read [beta] settings"))
+
+        assert "could not read [beta] settings" in run.printed
+
+    def test_a_library_load_failure_holding_markup_is_shown_as_written(self) -> None:
+        run = _run(_success(), library_load=RuntimeError("library [v2] raised on import"))
+
+        assert "library [v2] raised on import" in run.printed

@@ -69,25 +69,43 @@ def collect(
 
 
 async def _collect_async(output: Path, *, include_logs: bool, load_libraries: bool, normalize_identity: bool) -> None:
-    """Collect a diagnostics bundle and report where it landed."""
+    """Collect a diagnostics bundle and report where it landed.
+
+    Both requests below are guarded, and guarded broadly, because either one can be the call
+    that starts the engine -- and a broken engine is the usual reason somebody is collecting
+    a bundle to attach to a bug report. A node library that raises on import, a config file
+    the engine cannot get past: left unguarded, the command that exists to package that
+    answer instead hands back a traceback, which is what the user already had.
+    """
     if load_libraries:
         # Libraries are loaded so the bundle can say which ones failed, which is usually
         # the answer. Skipping it leaves the libraries section empty, not wrong.
-        with console.status("Loading libraries..."):
-            await GriptapeNodes.ahandle_request(LoadLibrariesRequest())
+        try:
+            with console.status("Loading libraries..."):
+                await GriptapeNodes.ahandle_request(LoadLibrariesRequest())
+        except Exception as err:
+            # Not fatal. The bundle records which libraries are missing, and the rest of it
+            # still describes the machine somebody is asking about.
+            console.print(f"[yellow]Attempted to load the libraries. Failed: {escape(str(err))}[/yellow]")
+            console.print("[yellow]The bundle is collected anyway, without them.[/yellow]")
 
-    with console.status("Collecting diagnostics..."):
-        result = await GriptapeNodes.ahandle_request(
-            CollectDiagnosticsRequest(
-                include_logs=include_logs,
-                # Nothing is open in a CLI-launched engine, so asking for the current
-                # workflow could only ever add a warning saying there wasn't one.
-                include_current_workflow=False,
-                normalize_identity=normalize_identity,
-                output_path=str(output),
-                broadcast_result=False,
+    try:
+        with console.status("Collecting diagnostics..."):
+            result = await GriptapeNodes.ahandle_request(
+                CollectDiagnosticsRequest(
+                    include_logs=include_logs,
+                    # Nothing is open in a CLI-launched engine, so asking for the current
+                    # workflow could only ever add a warning saying there wasn't one.
+                    include_current_workflow=False,
+                    normalize_identity=normalize_identity,
+                    output_path=str(output),
+                    broadcast_result=False,
+                )
             )
-        )
+    except Exception as err:
+        console.print("[red]Attempted to collect a diagnostics bundle. The engine itself could not be started.[/red]")
+        console.print(f"[red]{escape(str(err))}[/red]")
+        raise typer.Exit(code=1) from err
 
     if not isinstance(result, CollectDiagnosticsResultSuccess):
         console.print("[red]Attempted to collect a diagnostics bundle. Failed to write it.[/red]")
