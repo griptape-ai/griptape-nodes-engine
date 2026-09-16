@@ -6,14 +6,16 @@ Choose Raw Cedar only when the builder's capability catalog cannot express the r
 
 ## Policy inputs
 
-Cedar makes each decision from four inputs: `(principal, action, resource, context)`. Griptape Nodes requests these decisions at **checkpoints**, just before privileged operations happen.
+Cedar makes each decision from four inputs: `(principal, action, resource, context)`. The engine creates an authorization checkpoint just before a privileged operation. The Griptape Nodes app maps that checkpoint and its license data into these Cedar inputs:
 
-| Part        | What it holds                                                        | Use it for                                           |
-| ----------- | -------------------------------------------------------------------- | ---------------------------------------------------- |
-| `principal` | A single anonymous user, `User::"<anonymous>"`.                      | Nothing. Leave it unconstrained.                     |
-| `action`    | The checkpoint, e.g. `Action::"LoadLibrary"`.                        | Naming which operation a rule covers.                |
-| `resource`  | The resolved library, node type, project, model, or codec.           | Matching a specific thing, or a fact about it.       |
-| `context`   | Ambient facts: the active project, the engine, the license identity. | Scoping a rule to one project, or to a license type. |
+| Part        | What it holds                                                                | Use it for                                           |
+| ----------- | ---------------------------------------------------------------------------- | ---------------------------------------------------- |
+| `principal` | A fixed placeholder, `User::"<anonymous>"`.                                  | Nothing. Leave it unconstrained.                     |
+| `action`    | The engine checkpoint, e.g. `Action::"LoadLibrary"`.                         | Naming which operation a rule covers.                |
+| `resource`  | The checkpoint's resolved library, node type, project, model, or codec.      | Matching a specific thing, or a fact about it.       |
+| `context`   | Facts added by the app: active project, engine, libraries, and license data. | Scoping a rule to one project, or to a license type. |
+
+The app evaluates the policy and returns a verdict at each checkpoint. The engine does not parse Cedar. It enforces the app's verdict.
 
 ## Combining decisions
 
@@ -139,7 +141,7 @@ Provider ids are the provider keys in a library's [`model_catalog`](../developme
 
 !!! warning "Guard context facts"
 
-    All context facts are optional. The engine includes the facts it can resolve and omits the rest, so check each one with `has` before reading it.
+    All context facts are optional. The app includes the facts it can resolve and omits the rest, so check each one with `has` before reading it.
 
     Guard the record, then read through it:
 
@@ -152,7 +154,7 @@ Provider ids are the provider keys in a library's [`model_catalog`](../developme
 
 | Fact                     | Type        | Notes                                                                      |
 | ------------------------ | ----------- | -------------------------------------------------------------------------- |
-| `active_project.id`      | string      | Canonical key of the project the engine is working in.                     |
+| `active_project.id`      | string      | Opaque project id used as the engine registry key.                         |
 | `active_project.name`    | string      | Its display name, when the template has loaded. Needs its own `has` guard. |
 | `engine.id`              | string      | The active engine's id.                                                    |
 | `loaded_libraries.names` | set<string> | Names of the libraries loaded so far.                                      |
@@ -168,7 +170,7 @@ The builder adds this condition to every statement in a Project-scoped template,
 when { context has active_project && context.active_project.id == "<project id>" }
 ```
 
-The way the engine binds `active_project` has two consequences.
+The app derives `active_project` from the engine's project chain. This has two consequences.
 
 **Include ancestor projects.** When a project inherits from a parent, the policy runs for each project in the chain: first the active project, then each ancestor. Every run must allow the operation. A `forbid` scoped to a parent therefore blocks its children, and a project allow-list must include every project in the chain.
 
@@ -390,15 +392,15 @@ when {
 
 The engine does not validate Cedar policies against a schema. Typos such as `resource.lifecycle_stge` or `Action::"LoadLibrry"` parse successfully but match nothing, leaving you with a rule that appears not to work.
 
-### Permit every checkpoint
+### Permit every required checkpoint
 
-If a Production template permits only `LoadLibrary`, default deny still blocks node instantiation, project loading, model use, and codec use. When that is the only template attached to a license key, nothing works. Name every checkpoint the user needs, or attach another template that permits the remaining operations.
+If a Production template permits only `LoadLibrary`, library loading works, but default deny blocks other checkpointed operations. Name every operation the workflow needs, or attach another template that permits them.
 
 ```cedar
-// Wrong. Libraries load, then nothing else does.
+// Permits only library loading.
 permit(principal, action == Action::"LoadLibrary", resource);
 
-// Right. Every checkpoint needed to open a project and render it.
+// Broad permit covering every current checkpoint.
 permit(principal, action in [
   Action::"LoadLibrary",
   Action::"InstantiateNode",
