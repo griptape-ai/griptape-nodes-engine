@@ -1381,10 +1381,14 @@ class BaseNode(ABC):
         # either, so it gets the same treatment.
         owner = self._local_object_owner()
         if not isinstance(key, str) or not key.startswith(f"{owner}:"):
-            # Type before emptiness: a tensor wired into this input in place of its key is the mistake
-            # this branch exists to catch, and asking whether one is empty raises out of numpy rather
-            # than reporting anything.
-            if not isinstance(key, str):
+            # `is None` before the type check, and emptiness after it: "you wired nothing in" and "you
+            # wired the wrong thing in" are the two failures a library author hits most, so each needs
+            # its own message, and asking whether a tensor is empty raises out of numpy rather than
+            # reporting anything.
+            if key is None:
+                cause = "nothing is connected to it"
+                remedy = "Connect a node that produces one."
+            elif not isinstance(key, str):
                 cause = "the value it received is not a reference to a held object"
                 remedy = "Connect a node that produces one."
             elif not key:
@@ -1430,6 +1434,11 @@ class BaseNode(ABC):
         library is refused rather than honoured: running their teardown under them would leave their
         own still-valid keys reporting the object as gone.
         """
+        # A key arrives from a parameter value, so it can be anything, and an unhashable one -- the held
+        # object itself, wired in place of its key -- would raise out of the map lookup. Nothing was
+        # released either way, which is what False already means here.
+        if not isinstance(key, str):
+            return False
         return self._resource_manager_for_local_objects().drop_local_object(
             key, owner_library=self._local_object_owner()
         )

@@ -26,11 +26,14 @@ class Held:
 
 
 class _ArrayLike:
-    """Stands in for a tensor: truthiness raises unless it holds exactly one element.
+    """Stands in for a tensor: truthiness raises unless it holds exactly one element, and it is unhashable.
 
-    numpy is not an engine dependency, and this is the behaviour that matters -- an array is the value
-    a library most easily wires into a handle input by mistake.
+    numpy is not an engine dependency, and these are the two behaviours that matter -- an array is the
+    value a library most easily wires into a handle input by mistake, and both what asks whether a key is
+    empty and what looks one up in a map break on it.
     """
+
+    __hash__ = None  # type: ignore[assignment]
 
     def __init__(self, elements: int) -> None:
         self.elements = elements
@@ -146,6 +149,19 @@ class TestRequireLocalObject:
         assert "not a reference to a held object" in message
         assert "nothing is connected" not in message
 
+    def test_an_unwired_input_is_told_that_nothing_is_connected(self, node: _Holder) -> None:
+        """`get_parameter_value` returns None for an unwired input, which is the likeliest way here.
+
+        Distinct from the wrong-value message: "you wired nothing in" and "you wired the wrong thing in"
+        are the two mistakes a library author makes most, and they call for different fixes.
+        """
+        with pytest.raises(RuntimeError) as caught:
+            node.require_local_object(None, parameter_name="pipeline")  # type: ignore[arg-type]
+
+        message = str(caught.value)
+        assert "nothing is connected to it" in message
+        assert "not a reference to a held object" not in message
+
     def test_a_held_falsy_value_is_not_treated_as_missing(self, node: _Holder) -> None:
         """A held falsy value is not mistaken for a missing one.
 
@@ -163,6 +179,15 @@ class TestNodeDrop:
 
         assert node.drop_local_object(key) is True
         assert node.get_local_object(key) is None
+
+    @pytest.mark.parametrize("wrong_value", [_ArrayLike(elements=4), ["not", "a", "key"], None])
+    def test_dropping_something_that_is_not_a_key_releases_nothing(self, node: _Holder, wrong_value: object) -> None:
+        """A clear-cache node reads its key from a parameter, so it can be handed anything.
+
+        An unhashable value -- the held object itself, wired in place of its key -- would otherwise raise
+        `TypeError: unhashable type` out of the map lookup.
+        """
+        assert node.drop_local_object(wrong_value) is False  # type: ignore[arg-type]
 
     def test_drop_all_is_scoped_to_this_library(self, node: _Holder) -> None:
         """This is what a clear-cache node calls, and it must not reach another library's objects."""
