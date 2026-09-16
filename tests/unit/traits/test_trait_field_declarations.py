@@ -78,8 +78,8 @@ def test_a_trait_constructs_with_its_element_attributes_set(trait_class: type[Tr
 def test_a_trait_does_not_report_element_wiring_as_state(trait_class: type[Trait]) -> None:
     """State is what the trait declared, never what the element base did.
 
-    ``Widget`` is the one trait that re-declares ``name`` as its own field, which is a
-    deliberate override: which widget to render is state. Everything else stays wiring.
+    ``Widget`` takes ``widget_name`` rather than overloading the element's own ``name`` for
+    exactly this reason: which widget to render is state, and a name is wiring.
     """
     state_keys = trait_class.state_keys()
 

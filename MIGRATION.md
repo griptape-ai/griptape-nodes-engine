@@ -86,8 +86,7 @@ Two smaller consequences:
     a `set` holds both. `Button` and `AddParameterButton` fixed their `element_id`, which used to
     give them value equality and quietly collapse a pair of identical buttons into one.
 - **`Widget` takes `widget_name`.** It used to overload the element's own `name`, which a
-    generated constructor cannot do: the element base already takes that keyword. A workflow
-    saved under the old key still loads.
+    generated constructor cannot do: the element base already takes that keyword.
 
 ## A trait owns the `ui_options` keys it renders
 

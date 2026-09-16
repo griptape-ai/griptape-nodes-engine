@@ -262,39 +262,18 @@ class TestTheThrowawayIsNeverObservable:
         assert built == []
 
 
-class TestWidgetReadsItsOlderSavedKey:
-    """Widget's name moved off the element's own ``name`` and onto a field of its own.
+class TestWidgetNamesItsWidgetItself:
+    """Which widget to render is the trait's own state, not the element's wiring name."""
 
-    A file saved before that wrote the widget's name as ``name``, so ``migrate_state`` reads it
-    back rather than leaving those parameters with a control that renders nothing.
-    """
-
-    def test_the_older_key_still_loads(self) -> None:
-        rebuilt = Widget.from_state({"name": "editor", "library": "my-lib"})
-
-        assert (rebuilt.widget_name, rebuilt.library) == ("editor", "my-lib")
-
-    def test_it_is_saved_under_the_current_key(self) -> None:
-        rebuilt = Widget.from_state({"name": "editor", "library": "my-lib"})
+    def test_the_widget_name_round_trips(self) -> None:
+        rebuilt = Widget.from_state({"widget_name": "editor", "library": "my-lib"})
 
         assert rebuilt.to_state() == {"widget_name": "editor", "library": "my-lib"}
 
     def test_the_element_name_stays_engine_wiring(self) -> None:
-        rebuilt = Widget.from_state({"name": "editor", "library": "my-lib"})
+        rebuilt = Widget.from_state({"widget_name": "editor", "library": "my-lib"})
 
         assert rebuilt.name != "editor"
-
-    def test_it_applies_in_place_too(self) -> None:
-        widget = Widget(widget_name="old", library="my-lib")
-
-        widget.apply_state({"name": "editor", "library": "my-lib"})
-
-        assert widget.widget_name == "editor"
-
-    def test_the_current_key_wins_when_a_file_holds_both(self) -> None:
-        rebuilt = Widget.from_state({"name": "stale", "widget_name": "editor", "library": "my-lib"})
-
-        assert rebuilt.widget_name == "editor"
 
 
 _MIGRATED_LEVEL = 4
