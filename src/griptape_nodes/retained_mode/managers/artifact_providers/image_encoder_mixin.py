@@ -26,19 +26,25 @@ class ImageArtifactEncoderMixin(ABC):
     """
 
     @abstractmethod
-    def encode(self, decoded_artifact: DecodedImageArtifact, situation: ImageArtifactSituation) -> bytes:
+    def encode(
+        self,
+        decoded_artifact: DecodedImageArtifact,
+        situation: ImageArtifactSituation,
+        format: str | None = None,  # noqa: A002
+    ) -> bytes:
         """Encode ``decoded_artifact`` to displayable raster bytes for the given situation.
 
         ``situation`` drives format/strategy internally (mirroring ``decode()``'s
-        use of ``situation`` for e.g. ``THUMBNAIL`` downsampling) rather than
-        taking a separate format parameter - this keeps the two mixins symmetric
-        and keeps format-selection logic in the provider, not pushed onto every
-        caller. ``ORIGINAL`` never reaches this method - ``ArtifactManager`` skips
-        encode entirely for that situation.
+        use of ``situation`` for e.g. ``THUMBNAIL`` downsampling). ``format``
+        selects the output container (e.g. "webp", "png"); ``None`` uses the
+        provider's own ``get_default_preview_format()``. ``ORIGINAL`` never
+        reaches this method - ``ArtifactManager`` skips encode entirely for that
+        situation.
 
         Args:
             decoded_artifact: Pixels plus colour metadata, as returned by ``decode()``.
             situation: The context this encode is being requested for.
+            format: Desired output format, or ``None`` for the provider's default.
 
         Returns:
             Encoded image bytes (e.g. webp/png) ready to hand back to a caller.
