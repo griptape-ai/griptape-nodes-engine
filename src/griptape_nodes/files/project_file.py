@@ -6,7 +6,7 @@ from pathlib import Path
 from griptape_nodes.common.macro_parser import ParsedMacro
 from griptape_nodes.common.project_templates.situation import SituationFilePolicy
 from griptape_nodes.files.file import File, FileDestination
-from griptape_nodes.files.path_utils import FilenameParts
+from griptape_nodes.files.path_utils import FilenameParts, is_url, parse_file_uri
 from griptape_nodes.retained_mode.events.os_events import ExistingFilePolicy
 from griptape_nodes.retained_mode.events.project_events import (
     AttemptMapAbsolutePathToProjectRequest,
@@ -105,7 +105,39 @@ class ProjectFileDestination(FileDestination):
             filename: Filename to parse into base and extension components.
             situation: Situation name to look up in the current project.
             **extra_vars: Additional macro variables (e.g., node_name="MyNode", _index=1).
+
+        Raises:
+            ValueError: If the filename is a URL that names no local file.
         """
+        # Classify the input before any path handling: FilenameParts.from_filename is a
+        # plain Path() split with no URL awareness, so a URL that reaches it is mangled
+        # rather than rejected. `file:///something.png` split that way yields
+        # directory=Path("file:"), which is neither "." nor absolute, so the sub_dirs
+        # branch below would fire and produce `{outputs}/file:/something.png` -- a path
+        # pointing nowhere, with no error raised.
+        #
+        # The read side already classifies its input this way (`_resolve_plain_path`
+        # calls parse_file_uri first), so doing it here is what makes build_file() and
+        # File.resolve() agree about what a `file://` string means.
+        # https://github.com/griptape-ai/griptape-nodes-engine/issues/5360
+        local_path_from_uri = parse_file_uri(filename)
+        if local_path_from_uri is None and is_url(filename):
+            msg = (
+                f"Attempted to save to '{filename}'. Failed because that is a web address rather than a "
+                f"place on this computer. Enter a file name, a folder path, or a 'file://' address that "
+                f"points at a file on this machine."
+            )
+            raise ValueError(msg)
+        if local_path_from_uri is not None:
+            # A file:// URI names an explicit on-disk location, so swap in the local path
+            # it names and take the same verbatim route an absolute filename takes at the
+            # bottom of this method. Tracked as its own flag rather than re-deriving it
+            # from `Path(...).is_absolute()`: parse_file_uri returns the Windows form of
+            # `file:///C:/renders/out.png` as `C:/renders/out.png`, which a POSIX host does
+            # not consider absolute, and falling through would put the drive letter back
+            # into sub_dirs -- the same class of mangling this branch exists to stop.
+            filename = local_path_from_uri
+
         result = GriptapeNodes.handle_request(GetSituationRequest(situation_name=situation))
 
         if isinstance(result, GetSituationResultSuccess):
@@ -122,6 +154,22 @@ class ProjectFileDestination(FileDestination):
             create_dirs = True
 
         parts = FilenameParts.from_filename(filename)
+
+        # An explicit on-disk location bypasses the situation macro: the caller is
+        # declaring where the file goes, so honor it verbatim rather than treating the
+        # leading-slash directory as sub_dirs within {outputs}/etc. Two shapes qualify --
+        # an absolute filename, and a file:// URI, whose local path we substituted above.
+        # No sidecar metadata: the situation macro + variables won't re-resolve to the
+        # actual on-disk location, so recording them would produce a dishonest
+        # provenance trail.
+        if local_path_from_uri is not None or parts.directory.is_absolute():
+            return cls(
+                filename,
+                existing_file_policy=existing_file_policy,
+                create_parents=create_dirs,
+                file_metadata=None,
+            )
+
         variables: dict[str, str | int] = {
             "file_name_base": parts.stem,
             "file_extension": parts.extension,
@@ -130,11 +178,9 @@ class ProjectFileDestination(FileDestination):
         # When the filename carries its own relative directory component (e.g.
         # "foo/bar/output.png"), populate sub_dirs so situations with {sub_dirs?:/}
         # route the file into that sub-directory. An explicit sub_dirs kwarg in
-        # extra_vars takes precedence. Absolute filenames still flow through the
-        # macro; we skip the sub_dirs override for them so we don't feed a
-        # leading-slash value into the macro substitution.
+        # extra_vars takes precedence.
         directory_str = str(parts.directory)
-        if directory_str and directory_str != "." and not parts.directory.is_absolute() and "sub_dirs" not in variables:
+        if directory_str and directory_str != "." and "sub_dirs" not in variables:
             variables["sub_dirs"] = directory_str
 
         # Derived variables (e.g. file_extension_directory) are injected by the
@@ -159,20 +205,6 @@ class ProjectFileDestination(FileDestination):
             if situation_obj is not None
             else None
         )
-
-        # Absolute filenames bypass the situation macro: the caller is declaring
-        # an explicit on-disk location, so honor it verbatim rather than treating
-        # the leading-slash directory as sub_dirs within {outputs}/etc. Drop the
-        # sidecar metadata too -- the situation macro + variables we computed
-        # above won't re-resolve to the actual on-disk location, so recording
-        # them would produce a dishonest provenance trail.
-        if parts.directory.is_absolute():
-            return cls(
-                filename,
-                existing_file_policy=existing_file_policy,
-                create_parents=create_dirs,
-                file_metadata=None,
-            )
 
         return cls(
             macro_path,
