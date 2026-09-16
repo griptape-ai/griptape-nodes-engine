@@ -606,7 +606,7 @@ class TestConcurrentAccess:
 
     def test_putting_while_clearing_neither_raises_nor_corrupts(self, engine: Engine) -> None:
         manager = engine.resource_manager
-        errors: list[BaseException] = []
+        errors: list[Exception] = []
         stop = threading.Event()
 
         def keep_putting() -> None:
@@ -615,14 +615,14 @@ class TestConcurrentAccess:
                 while not stop.is_set():
                     manager.put_local_object(Held(str(index)), owner_library="Lib A", producing_node=f"N{index % 20}")
                     index += 1
-            except BaseException as exc:
+            except Exception as exc:
                 errors.append(exc)
 
         def keep_clearing() -> None:
             try:
                 while not stop.is_set():
                     manager.drop_local_objects_for_library("Lib A")
-            except BaseException as exc:
+            except Exception as exc:
                 errors.append(exc)
 
         threads = [threading.Thread(target=keep_putting), threading.Thread(target=keep_clearing)]
@@ -652,13 +652,13 @@ class TestConcurrentAccess:
         manager._local_objects = _DeleteAfterSecondRead(manager._local_objects)
         barrier = threading.Barrier(2)
         reported: list[bool] = []
-        errors: list[BaseException] = []
+        errors: list[Exception] = []
 
         def drop() -> None:
             barrier.wait()
             try:
                 reported.append(manager.drop_local_object(key))
-            except BaseException as exc:
+            except Exception as exc:
                 errors.append(exc)
 
         threads = [threading.Thread(target=drop) for _ in range(2)]
