@@ -122,10 +122,10 @@ class WorkerManager(EngineScoped):
         # Subprocesses spawned by this orchestrator (library_name → process)
         self._managed_worker_processes: dict[str, asyncio.subprocess.Process] = {}
 
-        # Worker keys whose spawn has been claimed but has not yet reached the registry above.
-        # The registry entry cannot serve as the claim: it is only written once the subprocess
-        # exists, and the work in between suspends.
-        self._spawns_in_flight: set[str] = set()
+        # Worker keys whose spawn has been claimed but has not yet reached the registry above,
+        # each mapped to a token identifying the attempt that holds it. Keyed by attempt rather
+        # than by name alone so a spawn can only ever release its own claim.
+        self._spawns_in_flight: dict[str, object] = {}
 
         # The event loop that spawned the worker subprocesses. asyncio.subprocess.Process
         # binds its exit Future to its creating loop, so proc.wait() is only legal on this
@@ -376,11 +376,12 @@ class WorkerManager(EngineScoped):
         if worker_key in self._managed_worker_processes or worker_key in self._spawns_in_flight:
             logger.error("Worker for key '%s' already spawned; refusing duplicate spawn.", worker_key)
             return
-        # Claimed here, in the same step as the check above, so no await separates them. Two
-        # spawns for one key would otherwise both get past a registry-only guard and both fork,
-        # and only one can be recorded -- leaving the other's process untracked, holding its
-        # library's dependencies in memory until its own heartbeat lapses.
-        self._spawns_in_flight.add(worker_key)
+        # Claimed in the same step as the check above, so no await separates them. The registry
+        # entry cannot serve as this guard: it is written only once the subprocess exists, and the
+        # work in between suspends. A second fork for one library leaves one of the two processes
+        # untracked, holding that library's dependencies until its own heartbeat lapses.
+        claim = object()
+        self._spawns_in_flight[worker_key] = claim
         try:
             # Spawn with the orchestrator's PRE-project environ so the worker boots with the
             # same clean env baseline a fresh engine would have. Inheriting the live os.environ
@@ -449,9 +450,12 @@ class WorkerManager(EngineScoped):
             self._spawn_loop = asyncio.get_running_loop()
             self._managed_worker_processes[worker_key] = proc
         finally:
-            # Released even when the fork raises: the claim outliving a failed spawn would
-            # silently refuse every later attempt for this library.
-            self._spawns_in_flight.discard(worker_key)
+            # Released even when the fork raises, or the claim would silently refuse every later
+            # attempt for this library -- but only while this attempt still holds it. A reset drops
+            # the claims so a reload can spawn again, so a spawn suspended across one resumes to
+            # find the key belonging to the reload's spawn, and freeing that admits a third fork.
+            if self._spawns_in_flight.get(worker_key) is claim:
+                del self._spawns_in_flight[worker_key]
         logger.info("Spawned worker for key '%s' (pid %s)", worker_key, proc.pid)
 
     async def reset_workers(self) -> None:

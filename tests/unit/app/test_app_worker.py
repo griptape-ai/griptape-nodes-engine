@@ -751,6 +751,48 @@ class TestSpawnWorker:
         mock_exec.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_a_spawn_outlived_by_a_reset_does_not_free_the_next_claim(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        """A spawn only releases a claim it still holds.
+
+        A reset drops the claims so a reload can spawn again, which leaves a spawn suspended across
+        it resuming to find the key claimed by the reload's spawn. Releasing by name alone frees
+        that one, and the library is admitted for a third fork while a spawn is genuinely in flight.
+        """
+        worker_manager.engine.library_manager.execution_site_packages.return_value = None  # type: ignore[union-attr]
+        released = asyncio.Event()
+
+        async def _park_until_released() -> None:
+            await released.wait()
+
+        # The stale spawn, parked mid-flight between its claim and the registry write. Its fork
+        # fails, so no registry entry is left behind to shadow a wrongly-freed claim.
+        with (
+            patch.object(worker_manager, "_orchestrator_static_server_base_url", _park_until_released),
+            patch("asyncio.create_subprocess_exec", side_effect=OSError("stale spawn died")),
+        ):
+            stale = asyncio.create_task(worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "My Library"))
+            await asyncio.sleep(0.01)
+            assert "My Library" in worker_manager._spawns_in_flight
+
+            await worker_manager.reset_workers()
+            reload_claim = object()
+            worker_manager._spawns_in_flight["My Library"] = reload_claim
+
+            released.set()
+            with pytest.raises(OSError, match="stale spawn died"):
+                await stale
+
+        # The stale spawn has finished and must have left the reload's claim standing.
+        assert worker_manager._spawns_in_flight.get("My Library") is reload_claim
+
+        with patch("asyncio.create_subprocess_exec") as mock_exec:
+            await worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "My Library")
+
+        mock_exec.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_spawns_subprocess_with_provided_args(self, worker_manager: WorkerManager) -> None:
         mock_proc = MagicMock()
         mock_proc.pid = 12345
@@ -935,7 +977,7 @@ class TestResetWorkers:
         the next run would wait out the whole startup grace and then blame the library load.
         """
         worker_manager.engine.library_manager.execution_site_packages.return_value = None  # type: ignore[union-attr]
-        worker_manager._spawns_in_flight.add("My Library")
+        worker_manager._spawns_in_flight["My Library"] = object()
 
         await worker_manager.reset_workers()
 
