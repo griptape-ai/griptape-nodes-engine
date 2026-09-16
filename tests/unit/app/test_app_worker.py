@@ -534,6 +534,33 @@ class TestRelayWorkerResult:
 
 class TestEvictWorker:
     @pytest.mark.asyncio
+    async def test_records_why_its_library_can_no_longer_execute(self, worker_manager: WorkerManager) -> None:
+        """A recorded reason is what stops the next run blaming a worker that is already gone.
+
+        Nothing respawns an evicted worker, so without it the next run reports that the worker "may
+        still be starting up" for the rest of the session, and anything already waiting on it waits
+        out the whole startup grace first.
+        """
+        worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key="Lib")
+        worker_manager.expect_worker("Lib")
+
+        await worker_manager.evict_worker(_ENGINE)
+
+        reason = worker_manager.worker_unavailable_reason("Lib")
+        assert reason is not None
+        assert "stopped responding" in reason
+        assert worker_manager.has_settled("Lib"), "a waiter must not hold on for a worker already gone"
+
+    @pytest.mark.asyncio
+    async def test_forget_library_drops_the_recorded_reason(self, worker_manager: WorkerManager) -> None:
+        """Keyed by a bare name, so it has to be dropped with the library rather than outlive it."""
+        worker_manager.note_worker_unavailable("Lib", "the worker stopped responding.")
+
+        worker_manager.forget_library("Lib")
+
+        assert worker_manager.worker_unavailable_reason("Lib") is None
+
+    @pytest.mark.asyncio
     async def test_removes_worker_from_state(self, worker_manager: WorkerManager) -> None:
         worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
         worker_manager._worker_last_seen[_ENGINE] = 100.0
@@ -1512,7 +1539,6 @@ class TestWorkerExecutionPath:
         # resolves anything the library does not carry.
         assert env["PYTHONPATH"] == f"/libs/mine/.venv-exec/sp{os.pathsep}/host/libs"
 
-    @pytest.mark.asyncio
     @pytest.mark.asyncio
     async def test_no_execution_environment_means_no_pythonpath(self, worker_manager: WorkerManager) -> None:
         """A library with no execution dependencies, or one whose environment is not built yet.
