@@ -22,6 +22,7 @@ from griptape_nodes.retained_mode.managers.artifact_providers.image_decoder_mixi
     DecodedImageArtifact,
     ImageArtifactDecoderMixin,
 )
+from griptape_nodes.retained_mode.managers.artifact_providers.image_encoder_mixin import ImageArtifactEncoderMixin
 from griptape_nodes.retained_mode.managers.artifact_providers.image_situation import ImageArtifactSituation
 
 if TYPE_CHECKING:
@@ -45,7 +46,7 @@ class ImageArtifactMetadata(BaseArtifactMetadata):
     file_size: int
 
 
-class ImageArtifactProvider(BaseArtifactProvider, ImageArtifactDecoderMixin):
+class ImageArtifactProvider(BaseArtifactProvider, ImageArtifactDecoderMixin, ImageArtifactEncoderMixin):
     """Provider for image artifacts.
 
     Instance attributes may hold heavyweight image processing dependencies
@@ -251,6 +252,44 @@ class ImageArtifactProvider(BaseArtifactProvider, ImageArtifactDecoderMixin):
                 bit_depth=self.get_bit_depth(img.mode),
                 channel_layout=channel_layout,
             )
+
+    def encode(self, decoded_artifact: DecodedImageArtifact, situation: ImageArtifactSituation) -> bytes:  # noqa: ARG002
+        """Encode a DecodedImageArtifact to raster bytes for VIEWER/THUMBNAIL.
+
+        ORIGINAL is never passed in - ArtifactManager skips encode for it - so this
+        method does not special-case it, mirroring decode()'s contract. situation
+        does not currently change the output format; every situation encodes to
+        get_default_preview_format().
+        """
+        pixel_data = self._normalize_to_uint8(decoded_artifact.pixel_data)
+        img = Image.fromarray(pixel_data)
+
+        output_buffer = BytesIO()
+        img.save(output_buffer, format=self.get_default_preview_format().upper())
+        return output_buffer.getvalue()
+
+    @staticmethod
+    def _normalize_to_uint8(pixel_data: np.ndarray) -> np.ndarray:
+        """Flatten arbitrary-dtype pixel data to a displayable 8-bit raster.
+
+        decode() preserves native dtype (_PIL_MODE_BIT_DEPTH: I/F -> 32-bit), so
+        pixel_data from a PIL "I"/"F"-mode source is int32/float32, not uint8.
+        Image.fromarray() won't save that cleanly to webp/png without this. uint8
+        arrays pass through untouched. Min-max normalization is used rather than a
+        fixed scale: "F" mode has no fixed value range at all, and assuming "I"
+        mode is always 0-65535 would be an unverified assumption about this
+        provider's actual inputs.
+        """
+        if pixel_data.dtype == np.uint8:
+            return pixel_data
+
+        minimum = float(pixel_data.min())
+        maximum = float(pixel_data.max())
+        if maximum <= minimum:
+            return np.zeros_like(pixel_data, dtype=np.uint8)
+
+        normalized = (pixel_data - minimum) / (maximum - minimum)
+        return (normalized * 255).astype(np.uint8)
 
     def prepare_content_for_write(self, data: bytes, file_name: str) -> bytes:  # noqa: PLR0911
         ext = Path(file_name).suffix.lstrip(".").lower()
