@@ -4834,7 +4834,7 @@ class FlowManager(EngineScoped):
                 "workflow_execution_mode", default=WorkflowExecutionMode.SEQUENTIAL
             )
             if execution_type == WorkflowExecutionMode.SEQUENTIAL:
-                involved_nodes = list(flow.nodes.keys())
+                involved_nodes = self.get_involved_node_names(flow)
             else:
                 involved_nodes = list(self._global_dag_builder.node_to_reference.keys())
             # Send a InvolvedNodesRequest
@@ -4958,13 +4958,42 @@ class FlowManager(EngineScoped):
         if self._global_single_node_resolution:
             involved_nodes = list(self._global_dag_builder.node_to_reference.keys())
         else:
-            involved_nodes = list(flow.nodes.keys())
+            involved_nodes = self.get_involved_node_names(flow)
 
         # Get currently resolving nodes from the resolution machine (always ParallelResolutionMachine)
         current_resolving_nodes = [
             node.node_reference.name for node in control_flow_context.resolution_machine.context.task_to_node.values()
         ]
         return current_control_nodes, current_resolving_nodes, involved_nodes
+
+    def get_involved_node_names(self, flow: ControlFlow) -> list[str]:
+        """The nodes an editor should treat as involved in a run of `flow`.
+
+        A group's children live in the group's own `nodes` dict rather than the flow's, so
+        `flow.nodes` names the group but nothing inside it. The editor gates a node's run
+        status on involvement, so without this expansion the children of a running group can
+        never light up. Nested groups are walked to any depth.
+
+        Args:
+            flow: The flow whose run is being announced
+
+        Returns:
+            Every node name in the flow, including nodes nested inside groups
+        """
+        involved_node_names: list[str] = []
+        nodes_to_visit = list(flow.nodes.values())
+        # Guard against a malformed group cycle rather than looping forever, the same way
+        # BaseNodeGroup.get_enclosing_groups does.
+        visited_node_ids: set[int] = set()
+        while nodes_to_visit:
+            node = nodes_to_visit.pop()
+            if id(node) in visited_node_ids:
+                continue
+            visited_node_ids.add(id(node))
+            involved_node_names.append(node.name)
+            if isinstance(node, BaseNodeGroup):
+                nodes_to_visit.extend(node.nodes.values())
+        return involved_node_names
 
     def get_start_node_from_node(self, flow: ControlFlow, node: BaseNode) -> BaseNode | None:
         # backwards chain in control outputs.
