@@ -1381,11 +1381,14 @@ class BaseNode(ABC):
         # either, so it gets the same treatment.
         owner = self._local_object_owner()
         if not isinstance(key, str) or not key.startswith(f"{owner}:"):
-            if not key:
-                cause = "nothing is connected to it"
-                remedy = "Connect a node that produces one."
-            elif not isinstance(key, str):
+            # Type before emptiness: a tensor wired into this input in place of its key is the mistake
+            # this branch exists to catch, and asking whether one is empty raises out of numpy rather
+            # than reporting anything.
+            if not isinstance(key, str):
                 cause = "the value it received is not a reference to a held object"
+                remedy = "Connect a node that produces one."
+            elif not key:
+                cause = "nothing is connected to it"
                 remedy = "Connect a node that produces one."
             else:
                 cause = "it was produced by a different node library, and values of this kind cannot be passed between libraries"

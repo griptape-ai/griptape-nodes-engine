@@ -100,9 +100,9 @@ class ResourceManager(EngineScoped):
         # code that may be slow or may call back in.
         #
         # Scope of the guarantee, because it is narrower than "thread-safe": the MAP is consistent, so
-        # concurrent puts and drops cannot corrupt it or raise. The held OBJECT is not protected. A drop
-        # can run a release hook on an object another node is still using, and nothing here prevents
-        # that; a borrow or lease would, and is deliberately not in this change.
+        # concurrent puts and drops cannot corrupt it or raise. The held OBJECT is not protected. A
+        # reader is not protected against a concurrent drop, which can run a release hook on an object
+        # another node is still using; there is no borrow or lease.
         self._local_objects_lock = threading.Lock()
 
         # Register event handlers
@@ -344,11 +344,11 @@ class ResourceManager(EngineScoped):
 
     # Process-Local Object Cache
     #
-    # Deliberately NOT request handlers. A request carrying a live object would have to be excluded
-    # from worker forwarding by hand, because the derivation in `app/worker_routing.py` matches a
-    # `type[...]` annotation and cannot see an instance-typed field. Forgetting that entry sends the
-    # object through `json.dumps(default=str)`, which stringifies it with no error on either side.
-    # These are plain calls, so there is nothing to forward and nothing to remember.
+    # Plain calls, not request handlers. A request carrying a live object has to be excluded from
+    # worker forwarding by hand: the derivation in `app/worker_routing.py` matches a `type[...]`
+    # annotation and cannot see an instance-typed field, so a missing entry sends the object through
+    # `json.dumps(default=str)`, which stringifies it with no error on either side. A call has nothing
+    # to forward and nothing to remember.
 
     def put_local_object(
         self,

@@ -25,6 +25,23 @@ class Held:
         self.label = label
 
 
+class _ArrayLike:
+    """Stands in for a tensor: truthiness raises unless it holds exactly one element.
+
+    numpy is not an engine dependency, and this is the behaviour that matters -- an array is the value
+    a library most easily wires into a handle input by mistake.
+    """
+
+    def __init__(self, elements: int) -> None:
+        self.elements = elements
+
+    def __bool__(self) -> bool:
+        if self.elements != 1:
+            message = "The truth value of an array with more than one element is ambiguous."
+            raise ValueError(message)
+        return False
+
+
 @pytest.fixture
 def node() -> _Holder:
     """A node belonging to a library, which is what supplies key scoping."""
@@ -113,6 +130,21 @@ class TestRequireLocalObject:
         assert "different node library" in message
         assert "cannot be passed between libraries" in message
         assert "Re-run" not in message
+
+    @pytest.mark.parametrize("wrong_value", [_ArrayLike(elements=4), _ArrayLike(elements=1), 42, object()])
+    def test_a_value_that_is_not_a_key_reports_that(self, node: _Holder, wrong_value: object) -> None:
+        """Wiring the object itself into a handle input is the mistake this branch exists to catch.
+
+        So it must survive the object being a tensor: asking whether a multi-element array is empty
+        raises out of numpy, and a single-element one answers falsy, which would report that nothing is
+        connected when something is.
+        """
+        with pytest.raises(RuntimeError) as caught:
+            node.require_local_object(wrong_value, parameter_name="pipeline")  # type: ignore[arg-type]
+
+        message = str(caught.value)
+        assert "not a reference to a held object" in message
+        assert "nothing is connected" not in message
 
     def test_a_held_falsy_value_is_not_treated_as_missing(self, node: _Holder) -> None:
         """A held falsy value is not mistaken for a missing one.

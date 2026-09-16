@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from functools import partial
 from typing import TYPE_CHECKING, Any, cast
 
 from griptape_nodes.common.strict_mode import STRICT_MODE
@@ -348,12 +347,9 @@ async def _handle_drop_all_local_objects(
 ) -> ResultPayload:
     """Release every object this process is holding for its libraries.
 
-    Module level rather than nested in the installer so that function stays within its complexity
-    budget; it takes the event manager because that is how it reaches this engine.
+    Takes the event manager because that is how it reaches this engine. The process-global engine would
+    silently no-op for an engine an embedder built directly.
     """
-    # Reached through the event manager already passed in, rather than a new argument (this is
-    # called from the app repo, so the signature is a cross-repo contract) and rather than the
-    # process-global engine (which silently no-ops for an engine an embedder built directly).
     resource_manager = event_manager.engine.resource_manager
 
     # Refuse while this worker is executing a node. The release hooks free what the object holds --
@@ -457,7 +453,8 @@ def register_broadcast_handlers(
     event_manager.assign_manager_to_request_type(ReloadConfigRequest, handle_reload_config)
     event_manager.assign_manager_to_request_type(RefreshSecretsRequest, handle_refresh_secrets)
     event_manager.assign_manager_to_request_type(ActivateProjectRequest, handle_activate_project)
-    event_manager.assign_manager_to_request_type(
-        DropAllLocalObjectsRequest,
-        partial(_handle_drop_all_local_objects, event_manager=event_manager),
-    )
+
+    async def handle_drop_all_local_objects(request: DropAllLocalObjectsRequest) -> ResultPayload:
+        return await _handle_drop_all_local_objects(request, event_manager=event_manager)
+
+    event_manager.assign_manager_to_request_type(DropAllLocalObjectsRequest, handle_drop_all_local_objects)
