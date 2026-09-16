@@ -12,6 +12,7 @@ from .duplicate_model_id_problem import DuplicateModelIdProblem
 from .duplicate_node_registration_problem import DuplicateNodeRegistrationProblem
 from .duplicate_widget_registration_problem import DuplicateWidgetRegistrationProblem
 from .engine_version_error_problem import EngineVersionErrorProblem
+from .import_machinery_damaged_problem import ImportMachineryDamagedProblem
 from .incompatible_requirements_problem import IncompatibleRequirementsProblem
 from .insufficient_disk_space_problem import InsufficientDiskSpaceProblem
 from .invalid_version_string_problem import InvalidVersionStringProblem
@@ -58,6 +59,7 @@ __all__ = [
     "DuplicateNodeRegistrationProblem",
     "DuplicateWidgetRegistrationProblem",
     "EngineVersionErrorProblem",
+    "ImportMachineryDamagedProblem",
     "IncompatibleRequirementsProblem",
     "InsufficientDiskSpaceProblem",
     "InvalidVersionStringProblem",
