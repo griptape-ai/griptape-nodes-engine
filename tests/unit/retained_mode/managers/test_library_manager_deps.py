@@ -1,6 +1,5 @@
 """Tests for inter-library dependency resolution (GH#4740)."""
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -21,6 +20,7 @@ from griptape_nodes.retained_mode.events.library_events import (
     DownloadLibraryRequest,
     DownloadLibraryResultFailure,
     DownloadLibraryResultSuccess,
+    InstallLibraryDependenciesRequest,
     InstallLibraryDependenciesResultFailure,
     LoadLibraryMetadataFromFileResultSuccess,
     RegisterLibraryFromFileRequest,
@@ -973,52 +973,77 @@ class TestExecutionEnvironmentResolvesBothSets:
 
     Resolved apart, uv can pick a different version of anything the two share -- numpy declared as
     an edit-time dependency and numpy pulled in by torch -- and the worker would then run against
-    one version while the orchestrator built the node against another. Covered here rather than on
-    disk: a synchronous caller runs the handler under `asyncio.run`, so the loop closes before the
-    scheduled build can finish and no in-process test can inspect the directory.
+    one version while the orchestrator built the node against another.
     """
+
+    def _orchestrator_schema(self, mgr: LibraryManager, exec_deps: list[str]) -> MagicMock:
+        """An orchestrator registering `test_lib`, which declares `exec_deps` as its heavy set."""
+        schema = MagicMock()
+        schema.name = "test_lib"
+        schema.metadata.library_version = "1.0.0"
+        schema.metadata.dependencies.pip_dependencies = ["fakeedit", "numpy"]
+        schema.metadata.dependencies.pip_install_flags = ["--no-index"]
+        schema.metadata.dependencies.pip_dependencies_exec = exec_deps
+        schema.metadata.declarations = []
+        mgr._is_worker = False
+        mgr._library_file_path_to_info["/mock.json"] = _make_lib_info()
+        return schema
+
+    def _metadata_result(self, schema: MagicMock) -> LoadLibraryMetadataFromFileResultSuccess:
+        return LoadLibraryMetadataFromFileResultSuccess(
+            library_schema=schema,
+            file_path="/mock.json",
+            git_remote=None,
+            git_ref=None,
+            enabled=True,
+            is_registered=False,
+            result_details=ResultDetails(message="OK", level=20),
+        )
 
     @pytest.mark.asyncio
     async def test_the_execution_install_receives_the_union_of_both_sets(self, engine: Engine) -> None:
         mgr = engine.library_manager
-        lib_info = _make_lib_info()
-        ready_event = asyncio.Event()
-        lib_info.execution_env_ready = ready_event
+        schema = self._orchestrator_schema(mgr, ["faketorch"])
 
-        with patch.object(mgr, "_install_dependency_set", new=AsyncMock(return_value=None)) as install:
-            await mgr._build_execution_env(
-                library_info=lib_info,
-                pip_dependencies=["fakeedit", "numpy"],
-                pip_dependencies_exec=["faketorch"],
-                pip_install_flags=["--no-index"],
-                ready_event=ready_event,
+        with (
+            patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
+            patch.object(mgr, "_this_process_owns_the_edit_venv", return_value=False),
+            patch.object(mgr, "_install_dependency_set", new=AsyncMock(return_value=None)) as install,
+        ):
+            await mgr.install_library_dependencies_request(
+                InstallLibraryDependenciesRequest(library_file_path="/mock.json")
             )
 
-        kwargs = install.call_args.kwargs
+        assert install.await_args is not None
+        kwargs = install.await_args.kwargs
         assert kwargs["pip_dependencies"] == ["fakeedit", "numpy", "faketorch"]
         # Targets the execution venv, not the edit-time one the orchestrator imports from.
         assert kwargs["execution"] is True
 
     @pytest.mark.asyncio
-    async def test_a_failed_build_records_the_reason_and_still_releases_waiters(self, engine: Engine) -> None:
-        """Spawn waits on this event, so a build that never releases it holds the loop open."""
-        mgr = engine.library_manager
-        lib_info = _make_lib_info()
-        ready_event = asyncio.Event()
-        lib_info.execution_env_ready = ready_event
+    async def test_a_failed_build_records_the_reason(self, engine: Engine) -> None:
+        """The build is awaited now, so a failure is recorded before registration returns.
 
-        with patch.object(
-            mgr, "_install_dependency_set", new=AsyncMock(side_effect=DependencyInstallError("no solution found"))
+        Nothing waits on an event any more; the spawn refusal reads the recorded reason instead.
+        """
+        mgr = engine.library_manager
+        schema = self._orchestrator_schema(mgr, ["faketorch"])
+
+        with (
+            patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
+            patch.object(mgr, "_this_process_owns_the_edit_venv", return_value=False),
+            patch.object(
+                mgr,
+                "_install_dependency_set",
+                new=AsyncMock(side_effect=DependencyInstallError("no solution found")),
+            ),
         ):
-            await mgr._build_execution_env(
-                library_info=lib_info,
-                pip_dependencies=["fakeedit"],
-                pip_dependencies_exec=["faketorch"],
-                pip_install_flags=[],
-                ready_event=ready_event,
+            await mgr.install_library_dependencies_request(
+                InstallLibraryDependenciesRequest(library_file_path="/mock.json")
             )
 
-        assert ready_event.is_set()
-        # Both: the refusal to spawn reads execution_env_failure, the next run reports the other.
-        assert lib_info.execution_env_failure == "no solution found"
-        assert lib_info.execution_unavailable_reason == "no solution found"
+        # Read by the spawn refusal, and deliberately not execution_unavailable_reason, which
+        # _start_workers clears before every attempt.
+        reason = mgr.execution_env_failure_reason("test_lib")
+        assert reason is not None
+        assert "no solution found" in reason
