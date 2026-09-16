@@ -3891,7 +3891,7 @@ class NodeManager(EngineScoped):
                 # Create the parameter, or alter it on the existing node
                 if parameter.user_defined:
                     # Always serialize user-defined parameters regardless of node type
-                    add_param_request = AddParameterToNodeRequest.create(**self._parameter_save_dict(parameter, node))
+                    add_param_request = AddParameterToNodeRequest.create(**self._parameter_save_dict(parameter))
                     element_modification_commands.append(add_param_request)
                 elif isinstance(node, ErrorProxyNode):
                     # For ErrorProxyNode, replay all recorded initialization requests for this parameter
@@ -3907,7 +3907,7 @@ class NodeManager(EngineScoped):
                     element_modification_commands.extend(matching_requests)
                 elif reference_node is None:
                     # Normal node with no reference - treat all parameters as needing serialization
-                    add_param_request = AddParameterToNodeRequest.create(**self._parameter_save_dict(parameter, node))
+                    add_param_request = AddParameterToNodeRequest.create(**self._parameter_save_dict(parameter))
                     element_modification_commands.append(add_param_request)
                 else:
                     # Normal node - compare against reference node
@@ -4502,13 +4502,11 @@ class NodeManager(EngineScoped):
             result_details=f"Successfully duplicated {len(serialize_result.node_names_serialized)} nodes.",
         )
 
-    def _parameter_save_dict(self, parameter: Parameter, node: BaseNode) -> dict[str, Any]:
+    def _parameter_save_dict(self, parameter: Parameter) -> dict[str, Any]:
         """Build fields that recreate a parameter, warning about omitted callbacks."""
-        param_dict = parameter.to_dict()
+        param_dict = parameter.save_dict()
         param_dict["initial_setup"] = True
-        param_dict["ui_options"] = parameter.authored_ui_options()
-        param_dict["traits"] = self._stabilize_trait_modules(parameter.trait_states())
-        param_dict["value_callbacks"] = parameter.value_callback_names(node)
+        param_dict["traits"] = self._stabilize_trait_modules(param_dict["traits"])
         NodeManager._report_unsaveable_callbacks(parameter)
         return param_dict
 

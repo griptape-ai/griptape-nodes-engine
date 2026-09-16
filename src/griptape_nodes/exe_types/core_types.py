@@ -1855,6 +1855,21 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
             states.append(entry.to_dict())
         return states
 
+    def save_dict(self) -> dict[str, Any]:
+        """Return ``to_dict()`` with trait-owned and code-only fields in their saved form.
+
+        ``equals()`` and ``NodeManager`` both need this view, and it has to be the same view
+        in both places or a diff-based save writes the wrong thing.
+        """
+        our_dict = self.to_dict()
+        # Trait-derived keys belong to the trait, not the parameter: ``traits`` below carries
+        # them, so the merged ``ui_options`` would duplicate them as stored options.
+        our_dict["ui_options"] = self.authored_ui_options()
+        our_dict["traits"] = self.trait_states()
+        # Converters and validators are code, represented by the method names they resolve to.
+        our_dict["value_callbacks"] = self.value_callback_names(self.get_node())
+        return our_dict
+
     def to_event(self, node: BaseNode) -> dict:
         event_dict = self.to_dict()
         event_data = super().to_event(node)
@@ -2399,18 +2414,8 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
 
     # intentionally not overwriting __eq__ because I want to return a dict not true or false
     def equals(self, other: Parameter) -> dict:
-        self_dict = self.to_dict().copy()
-        other_dict = other.to_dict().copy()
-        # Compare the save view of UI options, not the merged one. Trait-derived keys belong
-        # to the trait, and are carried between the two parameters by ``traits`` below;
-        # diffing them here would emit them as stored options on the parameter instead.
-        self_dict["ui_options"] = self.authored_ui_options()
-        other_dict["ui_options"] = other.authored_ui_options()
-        self_dict["traits"] = self.trait_states()
-        other_dict["traits"] = other.trait_states()
-        # Converters and validators are code, compared by the method names they resolve to.
-        self_dict["value_callbacks"] = self.value_callback_names(self.get_node())
-        other_dict["value_callbacks"] = other.value_callback_names(other.get_node())
+        self_dict = self.save_dict()
+        other_dict = other.save_dict()
         self_dict.pop("next", None)
         self_dict.pop("prev", None)
         self_dict.pop("element_id", None)
