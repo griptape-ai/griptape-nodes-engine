@@ -799,7 +799,7 @@ class WorkerManager(EngineScoped):
     def _refuse_spawn(self, library_name: str, reason: str) -> None:
         """Record why no worker is coming for `library_name`, and release anything waiting on one.
 
-        `_start_workers` clears `execution_unavailable_reason` and installs a fresh `worker_ready`
+        `_start_workers` clears `execution_unavailable_reason` and installs a fresh `library_ready`
         before scheduling a spawn, so a refusal that records neither leaves the next run waiting
         out the whole startup grace and then blaming a library load that never began.
         """
@@ -807,8 +807,8 @@ class WorkerManager(EngineScoped):
         if library_info is None:
             return
         library_info.execution_unavailable_reason = reason
-        if library_info.worker_ready is not None:
-            library_info.worker_ready.set()
+        if library_info.library_ready is not None:
+            library_info.library_ready.set()
 
     def get_topics_to_subscribe(self, *, is_worker: bool) -> list[str]:
         """Build the list of topics to subscribe to at connection start.

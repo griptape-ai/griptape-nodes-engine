@@ -3300,7 +3300,7 @@ class NodeManager(EngineScoped):
             # over there. Bounded by the startup grace, which surfaces here as a node failure.
             try:
                 if library_name:
-                    await library_manager.wait_for_worker_ready(library_name)
+                    await library_manager.wait_for_library_ready(library_name)
                 worker = library_manager.get_worker_for_library(library_name) if library_name else None
             except RuntimeError as err:
                 return ExecuteNodeResultFailure(result_details=str(err), exception=err)
