@@ -1,8 +1,10 @@
 from __future__ import annotations
+import __future__
 
 import contextlib
 import inspect
 import logging
+import sys
 import uuid
 import warnings
 from abc import ABC, ABCMeta, abstractmethod
@@ -3511,13 +3513,31 @@ class Trait(ABC, BaseNodeElement):
             # Bare ``ClassVar`` has no origin to read.
             if name in declared or annotation is ClassVar or get_origin(annotation) is ClassVar:
                 continue
+            if cls._uses_postponed_annotations():
+                msg = (
+                    f"Trait '{cls.__name__}' annotates '{name}' in a module with 'from __future__ import "
+                    f"annotations', which turns every annotation into a string and hides whether it is a "
+                    f"field. Remove that import from the trait's module."
+                )
+                raise TypeError(msg)
             msg = (
                 f"Trait '{cls.__name__}' annotates '{name}' but never declares it. A trait's fields are its "
                 f"saved state, so declare it with attrs.field(), mark it ClassVar if it is a constant, or "
-                f"annotate it where it is assigned if it is neither. A ClassVar already marked as one means "
-                f"the module uses 'from __future__ import annotations'; a trait's module cannot."
+                f"annotate it where it is assigned if it is neither."
             )
             raise TypeError(msg)
+
+    @classmethod
+    def _uses_postponed_annotations(cls) -> bool:
+        """True when the trait's defining module wrote ``from __future__ import annotations``.
+
+        That statement is a real import: it binds the name ``annotations`` in the module's
+        namespace to this singleton, which nothing else binds.
+        """
+        module = sys.modules.get(cls.__module__)
+        if module is None:
+            return False
+        return getattr(module, "annotations", None) is __future__.annotations
 
     @classmethod
     def state_keys(cls) -> list[str]:

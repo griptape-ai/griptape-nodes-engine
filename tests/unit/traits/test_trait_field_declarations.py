@@ -8,6 +8,8 @@ that cannot be expressed as a per-trait test: they hold for every trait in the t
 
 import importlib
 import pkgutil
+import sys
+import types
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, ClassVar
@@ -173,12 +175,39 @@ class TestAnAnnotationThatIsNotAFieldIsRefused:
 
         assert BareConstant.state_keys() == []
 
-    def test_a_stringified_class_constant_is_refused(self) -> None:
-        """What a trait module under ``from __future__ import annotations`` would hit."""
-        with pytest.raises(TypeError, match="from __future__ import annotations"):
+    def test_a_manually_stringified_class_constant_is_still_bare(self) -> None:
+        """Quoting one annotation does not make it a field.
+
+        Only the module's own future import, checked separately below, changes what the error
+        says.
+        """
+        with pytest.raises(TypeError, match="annotates 'DEFAULTS' but never declares it"):
 
             class Stringified(Trait):
                 DEFAULTS: "ClassVar[list[str]]" = ["a"]  # noqa: RUF012
+
+    def test_a_trait_modules_future_import_is_named_as_the_cause(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The class body above cannot reproduce a real future import.
+
+        ``from __future__ import annotations`` stringifies every annotation in the module, so
+        this has to run in a module that actually wrote the import, not one field quoted by
+        hand.
+        """
+        module_name = "griptape_nodes_test_trait_with_postponed_annotations"
+        module = types.ModuleType(module_name)
+        monkeypatch.setitem(sys.modules, module_name, module)
+        source = (
+            "from __future__ import annotations\n"
+            "import attrs\n"
+            "from griptape_nodes.exe_types.core_types import Trait\n"
+            "class Postponed(Trait):\n"
+            "    threshold: int = attrs.field(default=5)\n"
+            "    extra: int\n"
+        )
+        code = compile(source, module_name, "exec")
+
+        with pytest.raises(TypeError, match="from __future__ import annotations"):
+            exec(code, module.__dict__)  # noqa: S102
 
     def test_a_declared_field_is_allowed(self) -> None:
         class Declared(Trait):
