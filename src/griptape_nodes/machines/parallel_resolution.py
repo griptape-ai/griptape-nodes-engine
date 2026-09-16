@@ -306,7 +306,14 @@ class ExecuteDagState(State):
     def _should_skip_control_flow(
         context: ParallelResolutionContext, node: BaseNode, network_name: str, flow_manager: FlowManager
     ) -> bool:
-        """Check if control flow processing should be skipped."""
+        """Check if control flow processing should be skipped.
+
+        A node that was only pulled into a graph to supply data must not advance control: it did
+        not receive the control token, so following its control output would run a successor early
+        (or, in a branch, run the successor of a branch that was never taken). Whether that applies
+        is recorded per node on ``DagNode.data_dependency_only``, not inferred from graph state --
+        a node can legitimately hold the control token in a graph that still has work left in it.
+        """
         # Get network once to avoid duplicate lookups
         if context.dag_builder is None:
             msg = "DAG builder is not initialized"
@@ -323,7 +330,9 @@ class ExecuteDagState(State):
                 ExecuteDagState._emit_involved_nodes_update(context)
             return True
 
-        return bool(len(network) > 0 or node.stop_flow)
+        node_reference = context.dag_builder.node_to_reference.get(node.name)
+        is_data_dependency_only = node_reference is not None and node_reference.data_dependency_only
+        return bool(is_data_dependency_only or node.stop_flow)
 
     @staticmethod
     def _process_next_control_node(
@@ -692,6 +701,11 @@ class ExecuteDagState(State):
                         # BaseIterativeEndNode already exists in DAG, just get reference and queue it
                         end_node_reference = context.dag_builder.node_to_reference[end_loop_node.name]
                         end_node_reference.node_state = NodeState.QUEUED
+                        # Handing the end node the control token authorizes it to advance control,
+                        # whatever it was first added to the DAG for. Without this, a data-only node
+                        # reading the loop's results adopts the end node as its dependency and the
+                        # advance out of the loop is dropped.
+                        end_node_reference.data_dependency_only = False
                         context.node_priority_queue.add_node(end_node_reference)
                         node_reference = end_node_reference
                     else:

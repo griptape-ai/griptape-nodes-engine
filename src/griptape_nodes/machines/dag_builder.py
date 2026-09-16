@@ -55,11 +55,21 @@ class NodeState(StrEnum):
 
 @dataclass(kw_only=True)
 class DagNode:
-    """Represents a node in the DAG with runtime references."""
+    """Represents a node in the DAG with runtime references.
+
+    Attributes:
+        task_reference: The running task, once the node has been dispatched.
+        node_state: Where the node is in its execution lifecycle.
+        node_reference: The node itself.
+        data_dependency_only: True when the node was pulled into a graph solely to feed someone
+            else's data input, so it must not advance control when it finishes. See
+            ``ExecuteDagState._should_skip_control_flow``.
+    """
 
     task_reference: asyncio.Task | None = field(default=None)
     node_state: NodeState = field(default=NodeState.WAITING)
     node_reference: BaseNode
+    data_dependency_only: bool = field(default=False)
 
 
 class DagBuilder(EngineScoped):
@@ -122,8 +132,14 @@ class DagBuilder(EngineScoped):
 
             if current_node.name in self.node_to_reference:
                 return
-            # Add current node to tracking
-            dag_node = DagNode(node_reference=current_node, node_state=NodeState.WAITING)
+            # Add current node to tracking. Anything reached by the upstream walk below is here to
+            # supply data, not because control reached it, so record that it must not fire its own
+            # control output when it finishes; see _should_skip_control_flow.
+            dag_node = DagNode(
+                node_reference=current_node,
+                node_state=NodeState.WAITING,
+                data_dependency_only=current_node is not node,
+            )
             self.node_to_reference[current_node.name] = dag_node
             added_nodes.append(current_node)
 
@@ -163,6 +179,13 @@ class DagBuilder(EngineScoped):
 
                 # Add edge from upstream to current
                 graph.add_edge(upstream_node.name, current_node.name)
+
+        # Being passed in as the root is what authorizes a node to advance control. Clear the flag
+        # if an earlier caller already adopted this node as its own data dependency, because the
+        # recursion below early-returns on nodes it has already seen and cannot clear it there.
+        root_reference = self.node_to_reference.get(node.name)
+        if root_reference is not None:
+            root_reference.data_dependency_only = False
 
         _add_node_recursive(node, set(), graph)
 

@@ -1153,6 +1153,18 @@ class WorkflowManager(EngineScoped):
         self, request: RunWorkflowWithCurrentStateRequest
     ) -> ResultPayload:
         relative_file_path = request.file_path
+        if self.engine.context_manager.has_current_flow():
+            # Disallow opening a workflow inside another workflow this way. It would
+            # become an invisible child flow (no way to reach it in the UI), persisted
+            # with the parent workflow on save, and executed invisibly whenever the
+            # parent workflow was executed.
+            open_flow_name = self.engine.context_manager.get_current_flow().name
+            details = (
+                f"Attempted to open workflow '{relative_file_path}' while the flow '{open_flow_name}' is still open. "
+                "Close the current workflow first, before opening this one."
+            )
+            return RunWorkflowWithCurrentStateResultFailure(result_details=details)
+
         complete_file_path = WorkflowRegistry.get_complete_file_path(relative_file_path=relative_file_path)
         if not await anyio.Path(complete_file_path).is_file():
             details = f"Failed to find file. Path '{complete_file_path}' doesn't exist."
