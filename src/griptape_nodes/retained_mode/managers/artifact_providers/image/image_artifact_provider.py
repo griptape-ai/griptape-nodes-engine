@@ -7,6 +7,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
+import numpy as np
 from PIL import Image, ImageOps
 
 from griptape_nodes.drivers.image_metadata.image_metadata_driver_registry import (
@@ -17,6 +18,11 @@ from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_prov
     BaseArtifactMetadata,
     BaseArtifactProvider,
 )
+from griptape_nodes.retained_mode.managers.artifact_providers.image_decoder_mixin import (
+    DecodedImageArtifact,
+    ImageArtifactDecoderMixin,
+)
+from griptape_nodes.retained_mode.managers.artifact_providers.image_situation import ImageArtifactSituation
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
@@ -39,7 +45,7 @@ class ImageArtifactMetadata(BaseArtifactMetadata):
     file_size: int
 
 
-class ImageArtifactProvider(BaseArtifactProvider):
+class ImageArtifactProvider(BaseArtifactProvider, ImageArtifactDecoderMixin):
     """Provider for image artifacts.
 
     Instance attributes may hold heavyweight image processing dependencies
@@ -80,6 +86,32 @@ class ImageArtifactProvider(BaseArtifactProvider):
         "RGBX": (4, "RGB"),
     }
 
+    # TODO(DH): No external colour management exists yet; this is an identity-passthrough
+    # assumption. Revisit once colour-management provider registration (transform())
+    # has been implemented.
+    _PIL_MODE_COLOR_SPACE: ClassVar[dict[str, str]] = {
+        "L": "Grayscale",
+        "LA": "Grayscale",
+        "I": "Grayscale",
+        "F": "Grayscale",
+        "RGB": "sRGB",
+        "RGBA": "sRGB",
+        "RGBa": "sRGB",  # spellchecker:disable-line
+        "RGBX": "sRGB",
+        "P": "sRGB",
+        "CMYK": "CMYK",
+        "YCbCr": "YCbCr",
+        "LAB": "Lab",
+        "HSV": "HSV",
+    }
+
+    _STANDARD_BIT_DEPTH: ClassVar[int] = 8
+    _PIL_MODE_BIT_DEPTH: ClassVar[dict[str, int]] = {"I": 32, "F": 32}
+
+    # Situation-driven thumbnail decode bound; mirrors PILThumbnailGenerator's default.
+    _THUMBNAIL_MAX_WIDTH: ClassVar[int] = 1024
+    _THUMBNAIL_MAX_HEIGHT: ClassVar[int] = 1024
+
     @classmethod
     def get_supported_formats(cls) -> set[str]:
         return {"png", "jpg", "jpeg", "gif", "bmp", "webp", "tiff", "tif", "tga"}
@@ -93,6 +125,21 @@ class ImageArtifactProvider(BaseArtifactProvider):
     def get_mode_info(cls, mode: str) -> tuple[int, str]:
         """Return (channels, color_space) for a PIL image mode, with a sensible fallback."""
         return cls._PIL_MODE_INFO.get(mode, (3, mode))
+
+    @classmethod
+    def get_color_space(cls, mode: str) -> str:
+        """Return the assumed source colour space for a PIL mode."""
+        return cls._PIL_MODE_COLOR_SPACE.get(mode, "Unknown")
+
+    @classmethod
+    def get_bit_depth(cls, mode: str) -> int:
+        """Return bits-per-channel for a PIL mode (8 for standard modes, 32 for I/F)."""
+        return cls._PIL_MODE_BIT_DEPTH.get(mode, cls._STANDARD_BIT_DEPTH)
+
+    @classmethod
+    def get_thumbnail_max_size(cls) -> tuple[int, int]:
+        """Return the (max_width, max_height) bound applied when decoding for THUMBNAIL."""
+        return (cls._THUMBNAIL_MAX_WIDTH, cls._THUMBNAIL_MAX_HEIGHT)
 
     @classmethod
     def get_artifact_metadata(cls, source_path: str) -> ImageArtifactMetadata | None:
@@ -177,6 +224,33 @@ class ImageArtifactProvider(BaseArtifactProvider):
             Set of lowercase file extensions WITHOUT leading dots
         """
         return {"png"}
+
+    def decode(self, source_path: str, situation: ImageArtifactSituation) -> DecodedImageArtifact:
+        """Decode the image at source_path for VIEWER/THUMBNAIL.
+
+        ORIGINAL is never passed in - ArtifactManager skips decode for it - so this
+        method does not special-case it. get_image_situation_fallback() is an
+        orchestration-level retry concern (once something calls decode()); a single
+        call here always directly satisfies whichever situation it's given.
+        """
+        path = Path(source_path)
+        with Image.open(path) as raw_img:
+            img = ImageOps.exif_transpose(raw_img)
+
+            if img.mode == "P":
+                img = img.convert("RGBA") if "transparency" in img.info else img.convert("RGB")
+
+            if situation is ImageArtifactSituation.THUMBNAIL:
+                img.thumbnail(self.get_thumbnail_max_size(), Image.Resampling.LANCZOS)
+
+            _, channel_layout = self.get_mode_info(img.mode)
+
+            return DecodedImageArtifact(
+                pixel_data=np.asarray(img),
+                source_color_space=self.get_color_space(img.mode),
+                bit_depth=self.get_bit_depth(img.mode),
+                channel_layout=channel_layout,
+            )
 
     def prepare_content_for_write(self, data: bytes, file_name: str) -> bytes:  # noqa: PLR0911
         ext = Path(file_name).suffix.lstrip(".").lower()
