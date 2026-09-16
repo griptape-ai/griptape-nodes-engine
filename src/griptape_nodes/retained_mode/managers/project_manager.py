@@ -687,6 +687,11 @@ class ProjectManager(EngineScoped):
         # rolled back, and a worker registering in that window would adopt an abandoned one.
         # Registration replies and switch fan-outs carry this pair instead.
         self._committed_project_id: ProjectID = SYSTEM_DEFAULTS_KEY
+        # TODO(https://github.com/griptape-ai/internal/issues/266): delete the generation counters.
+        # They exist only to order adoptions that overlap, and they overlap only because each
+        # inbound message becomes its own coroutine while adoption awaits internally. Draining
+        # activations from a single-consumer queue makes ordering structural -- the wire already
+        # delivers in order -- at which point nothing needs a counter to reconstruct it.
         self._project_generation: int = 0
         # Worker-side: the highest generation this engine has adopted, so a stale activation
         # (an older fan-out, or a registration reply racing a newer switch) is skipped.
