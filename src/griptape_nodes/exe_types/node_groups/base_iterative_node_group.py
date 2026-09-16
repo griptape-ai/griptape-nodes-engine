@@ -79,9 +79,7 @@ class BaseIterativeNodeGroup(SubflowNodeGroup):
         self.add_parameter(self.exec_in)
         # The GroupNode renderer orders rail params by their position in LEFT/RIGHT_PARAMETERS_KEY.
         # Inserting at index 0 pins the control port to the top of the rail, above data parameters.
-        if LEFT_PARAMETERS_KEY not in self.metadata:
-            self.metadata[LEFT_PARAMETERS_KEY] = []
-        self.metadata[LEFT_PARAMETERS_KEY].insert(0, self.exec_in.name)
+        self._register_side_parameter(LEFT_PARAMETERS_KEY, self.exec_in.name, at_front=True)
 
         # Per-iteration control output — pairs visually with exec_in on the LEFT rail.
         # Connect this to the first body node to make that node each iteration's entry point.
@@ -92,7 +90,7 @@ class BaseIterativeNodeGroup(SubflowNodeGroup):
         )
         self.on_each.ui_options = {"display_name": "On Each"}
         self.add_parameter(self.on_each)
-        self.metadata[LEFT_PARAMETERS_KEY].append(self.on_each.name)
+        self._register_side_parameter(LEFT_PARAMETERS_KEY, self.on_each.name)
 
         self.exec_out = ControlParameterOutput(
             tooltip="Fired after all iterations complete",
@@ -101,9 +99,7 @@ class BaseIterativeNodeGroup(SubflowNodeGroup):
         self.exec_out.ui_options = {"display_name": "On Complete"}
         self.add_parameter(self.exec_out)
         # Insert at index 0 so exec_out appears at the top of the right rail (see LEFT_PARAMETERS_KEY comment above).
-        if RIGHT_PARAMETERS_KEY not in self.metadata:
-            self.metadata[RIGHT_PARAMETERS_KEY] = []
-        self.metadata[RIGHT_PARAMETERS_KEY].insert(0, self.exec_out.name)
+        self._register_side_parameter(RIGHT_PARAMETERS_KEY, self.exec_out.name, at_front=True)
 
         # Initialize iteration state
         self._items = []
@@ -146,9 +142,7 @@ class BaseIterativeNodeGroup(SubflowNodeGroup):
         self.add_parameter(self.index_param)
 
         # Track left parameters for UI layout
-        if LEFT_PARAMETERS_KEY not in self.metadata:
-            self.metadata[LEFT_PARAMETERS_KEY] = []
-        self.metadata[LEFT_PARAMETERS_KEY].append(self.index_param.name)
+        self._register_side_parameter(LEFT_PARAMETERS_KEY, self.index_param.name)
 
         # Control input for loop completion (right side - primary loop completion path)
         self.loop_complete = ControlParameterInput(
@@ -191,17 +185,14 @@ class BaseIterativeNodeGroup(SubflowNodeGroup):
         self.add_parameter(self.results)
 
         # Track right parameters for UI layout
-        if RIGHT_PARAMETERS_KEY not in self.metadata:
-            self.metadata[RIGHT_PARAMETERS_KEY] = []
-        self.metadata[RIGHT_PARAMETERS_KEY].extend(
-            [
-                self.loop_complete.name,
-                self.new_item_to_add.name,
-                self.skip_iteration.name,
-                self.break_loop.name,
-                self.results.name,
-            ]
-        )
+        for parameter_name in (
+            self.loop_complete.name,
+            self.new_item_to_add.name,
+            self.skip_iteration.name,
+            self.break_loop.name,
+            self.results.name,
+        ):
+            self._register_side_parameter(RIGHT_PARAMETERS_KEY, parameter_name)
 
     def after_value_set(self, parameter: Parameter, value: Any) -> None:
         """Handle parameter value changes."""
