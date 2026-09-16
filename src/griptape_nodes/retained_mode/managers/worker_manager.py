@@ -754,14 +754,14 @@ class WorkerManager(EngineScoped):
             self._refuse_spawn(library_name, "no session was available to start its worker process.")
             return
         # The worker is handed its library's execution environment as PYTHONPATH, so that directory
-        # has to exist before the process starts. The orchestrator builds it in the background to
-        # keep a torch install off the boot path; this is where the two meet.
-        await self.engine.library_manager.wait_for_execution_env(library_name)
-        # A failed build records why and leaves the venv directory behind, so spawning anyway
-        # would put a partial or stale site-packages at the front of the worker's import path --
-        # the exact unpinned execution the edit/exec split exists to prevent -- and the raw
-        # ModuleNotFoundError would bury the recorded uv error. Refusing here keeps the reason
-        # as the thing the next run reports.
+        # has to exist before the process starts. It does: the orchestrator builds it while
+        # registering the library, before any spawn is scheduled, so there is nothing to wait for.
+        #
+        # A failed build records why and leaves the venv directory behind, so spawning anyway would
+        # put a partial or stale site-packages at the front of the worker's import path -- the exact
+        # unpinned execution the edit/exec split exists to prevent -- and the raw ModuleNotFoundError
+        # would bury the recorded uv error. Refusing here keeps the reason as the thing the next run
+        # reports.
         failed_env_reason = self.engine.library_manager.execution_env_failure_reason(library_name)
         if failed_env_reason is not None:
             logger.error(

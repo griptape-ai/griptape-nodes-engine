@@ -1205,9 +1205,8 @@ class TestLibraryManagerInstallLibraryDependencies:
             patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
             patch.object(mgr, "_execution_dependencies_of_declared_libraries", return_value=["openexr==3.2"]),
             patch.object(mgr, "_retire_execution_env", new_callable=AsyncMock) as mock_retire,
-            patch.object(mgr, "_replace_execution_env_build", new_callable=AsyncMock) as mock_build,
-            patch.object(mgr, "_this_process_owns_the_edit_venv", return_value=True),
-            patch.object(mgr, "_install_dependency_set", new_callable=AsyncMock),
+            patch.object(mgr, "_install_dependency_set", new_callable=AsyncMock) as mock_build,
+            patch.object(mgr, "_this_process_owns_the_edit_venv", return_value=False),
         ):
             result = await mgr.install_library_dependencies_request(
                 InstallLibraryDependenciesRequest(library_file_path="/mock.json")
@@ -1217,7 +1216,8 @@ class TestLibraryManagerInstallLibraryDependencies:
         assert isinstance(result, InstallLibraryDependenciesResultSuccess)
         # One resolution, so the dependency's pins are scheduled alongside this library's own.
         assert mock_build.await_args is not None
-        assert "openexr==3.2" in mock_build.await_args.kwargs["pip_dependencies_exec"]
+        assert mock_build.await_args.kwargs["execution"] is True
+        assert "openexr==3.2" in mock_build.await_args.kwargs["pip_dependencies"]
 
     @pytest.mark.asyncio
     async def test_no_execution_set_anywhere_still_retires(self, engine: Engine) -> None:
@@ -1296,9 +1296,8 @@ class TestLibraryManagerInstallLibraryDependencies:
                 "load_library_metadata_from_file_request",
                 side_effect=lambda request: self._metadata_result(schemas[request.file_path]),
             ),
-            patch.object(mgr, "_replace_execution_env_build", new_callable=AsyncMock) as mock_build,
-            patch.object(mgr, "_install_dependency_set", new_callable=AsyncMock),
-            patch.object(mgr, "_this_process_owns_the_edit_venv", return_value=True),
+            patch.object(mgr, "_install_dependency_set", new_callable=AsyncMock) as mock_build,
+            patch.object(mgr, "_this_process_owns_the_edit_venv", return_value=False),
             patch.object(mgr, "_get_library_venv_path", return_value=_ABSENT_VENV_PATH),
         ):
             result = await mgr.install_library_dependencies_request(
@@ -1307,7 +1306,8 @@ class TestLibraryManagerInstallLibraryDependencies:
 
         assert isinstance(result, InstallLibraryDependenciesResultSuccess)
         assert mock_build.await_args is not None
-        assert "openexr==3.2" in mock_build.await_args.kwargs["pip_dependencies_exec"]
+        assert mock_build.await_args.kwargs["execution"] is True
+        assert "openexr==3.2" in mock_build.await_args.kwargs["pip_dependencies"]
 
 
 def _fake_config_value(key: str, **_: object) -> object:
