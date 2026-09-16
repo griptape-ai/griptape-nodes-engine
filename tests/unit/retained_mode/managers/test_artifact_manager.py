@@ -41,6 +41,7 @@ from griptape_nodes.retained_mode.managers.artifact_providers import (
     BaseArtifactProvider,
     ImageArtifactProvider,
 )
+from griptape_nodes.retained_mode.managers.artifact_providers.image_situation import ImageArtifactSituation
 from griptape_nodes.utils import ffmpeg_cache
 
 if TYPE_CHECKING:
@@ -1826,3 +1827,29 @@ class TestFfmpegCacheRedirect:
         await second_engine.artifact_manager.on_app_initialization_complete(AppInitializationComplete())
 
         assert Path(static_ffmpeg.run.SELF_DIR) == tmp_path / "first"
+
+
+class TestImageArtifactSituation:
+    """Test the ImageArtifactSituation enum and its fallback mapping on ArtifactManager."""
+
+    def test_enum_values_are_closed_set(self) -> None:
+        """The situation set is exactly viewer/thumbnail/original, string-comparable."""
+        assert {situation.value for situation in ImageArtifactSituation} == {"viewer", "thumbnail", "original"}
+        assert ImageArtifactSituation.VIEWER == "viewer"
+        assert ImageArtifactSituation.THUMBNAIL == "thumbnail"
+        assert ImageArtifactSituation.ORIGINAL == "original"
+
+    def test_thumbnail_falls_back_to_viewer(self) -> None:
+        manager = ArtifactManager()
+
+        assert manager.get_image_situation_fallback(ImageArtifactSituation.THUMBNAIL) == ImageArtifactSituation.VIEWER
+
+    def test_viewer_has_no_fallback(self) -> None:
+        manager = ArtifactManager()
+
+        assert manager.get_image_situation_fallback(ImageArtifactSituation.VIEWER) is None
+
+    def test_original_has_no_fallback(self) -> None:
+        manager = ArtifactManager()
+
+        assert manager.get_image_situation_fallback(ImageArtifactSituation.ORIGINAL) is None
