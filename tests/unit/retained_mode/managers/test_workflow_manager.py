@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands
 
 from griptape_nodes.exe_types.core_types import Parameter
+from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_types import NodeDependencies
 from griptape_nodes.node_library.workflow_registry import (
     WORKSPACE_WORKFLOW_SOURCE,
@@ -66,6 +67,8 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     RegisterWorkflowResultSuccess,
     ResetWorkflowBranchRequest,
     ResetWorkflowBranchResultSuccess,
+    RunWorkflowWithCurrentStateRequest,
+    RunWorkflowWithCurrentStateResultFailure,
     SetWorkflowMetadataRequest,
     SetWorkflowMetadataResultSuccess,
     WorkflowDependencyInfo,
@@ -76,6 +79,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 from griptape_nodes.retained_mode.managers.context_manager import ContextManager
 from griptape_nodes.retained_mode.managers.fitness_problems.workflows import (
     InvalidTomlFormatProblem,
+    LibraryNotRegisteredProblem,
     MissingTomlSectionProblem,
 )
 from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
@@ -1609,6 +1613,76 @@ class TestWorkflowManager:
             assert info.status is WorkflowManager.WorkflowStatus.UNUSABLE, file_name
             assert any(isinstance(problem, MissingTomlSectionProblem) for problem in info.problems), file_name
 
+    @pytest.mark.asyncio
+    async def test_unregistered_library_reports_flawed_not_unusable(self, engine: Engine, tmp_path: Path) -> None:
+        """A header naming a library that is not registered leaves the workflow FLAWED.
+
+        Such a workflow opens, with ErrorProxyNode placeholders standing in for that library's
+        nodes (issue #5505). UNUSABLE would tell the artist not to bother opening the thing they
+        can in fact open and edit.
+        """
+        workflow_manager = engine.workflow_manager
+        engine.config_manager.workspace_path = tmp_path
+        engine.library_manager._libraries_loading_complete.set()
+
+        header = WorkflowManager.WORKFLOW_METADATA_HEADER
+        (tmp_path / "missing_library.py").write_text(
+            "\n".join(
+                [
+                    f"# /// {header}",
+                    "# [tool.griptape-nodes]",
+                    '# name = "missing_library"',
+                    f'# schema_version = "{WorkflowMetadata.LATEST_SCHEMA_VERSION}"',
+                    '# engine_version_created_with = "0.0.0"',
+                    '# node_libraries_referenced = [["Nowhere Library", "1.0.0"]]',
+                    "# ///",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        result = await workflow_manager.on_load_workflow_metadata_request(
+            LoadWorkflowMetadata(file_name="missing_library.py")
+        )
+
+        assert isinstance(result, LoadWorkflowMetadataResultSuccess)
+        info = workflow_manager._workflow_file_path_to_info[str(tmp_path / "missing_library.py")]
+        assert info.status is WorkflowManager.WorkflowStatus.FLAWED
+        assert any(isinstance(problem, LibraryNotRegisteredProblem) for problem in info.problems)
+
+    @pytest.mark.asyncio
+    async def test_a_malformed_dependency_version_is_still_unusable(self, engine: Engine, tmp_path: Path) -> None:
+        """Only the not-registered case was downgraded; a header the engine cannot parse still is not loadable."""
+        workflow_manager = engine.workflow_manager
+        engine.config_manager.workspace_path = tmp_path
+        engine.library_manager._libraries_loading_complete.set()
+
+        header = WorkflowManager.WORKFLOW_METADATA_HEADER
+        (tmp_path / "bad_version.py").write_text(
+            "\n".join(
+                [
+                    f"# /// {header}",
+                    "# [tool.griptape-nodes]",
+                    '# name = "bad_version"',
+                    f'# schema_version = "{WorkflowMetadata.LATEST_SCHEMA_VERSION}"',
+                    '# engine_version_created_with = "0.0.0"',
+                    '# node_libraries_referenced = [["Nowhere Library", "not-a-version"]]',
+                    "# ///",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        result = await workflow_manager.on_load_workflow_metadata_request(
+            LoadWorkflowMetadata(file_name="bad_version.py")
+        )
+
+        assert isinstance(result, LoadWorkflowMetadataResultSuccess)
+        info = workflow_manager._workflow_file_path_to_info[str(tmp_path / "bad_version.py")]
+        assert info.status is WorkflowManager.WorkflowStatus.UNUSABLE
+
     # --- WorkflowInfo payload helpers ---
 
     def test_build_workflow_info_key_uses_workspace_join(self, engine: Engine) -> None:
@@ -2112,11 +2186,15 @@ class TestWorkflowManager:
         assert len(build_workflow.body) == 1
         assert isinstance(build_workflow.body[0], ast.Pass)
 
-    def test_generate_workflow_file_content_aexecute_awaits_build_workflow_first(self, engine: Engine) -> None:
-        """aexecute_workflow must `await build_workflow()` before running the executor.
+    def test_generate_workflow_file_content_aexecute_builds_inside_executor_context(self, engine: Engine) -> None:
+        """aexecute_workflow must `await build_workflow()` inside the executor's `async with`.
 
-        Shape-bearing workflows emit execute_workflow + aexecute_workflow, and the async
-        version is expected to construct the graph before invoking the executor.
+        Entering the executor context is what activates the project passed via
+        `--project-file-path`, and only then is a packaged bundle's own
+        griptape_nodes_config.json read -- which is what registers the bundle's libraries.
+        Building the graph before entering would create nodes from libraries nothing has
+        registered yet, so a bundle run on a machine that does not already know those
+        libraries comes up full of Error Proxy nodes.
         """
         content = self._generate(engine, with_shape=True)
         module = ast.parse(content)
@@ -2124,7 +2202,17 @@ class TestWorkflowManager:
         aexecute = next(
             node for node in module.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "aexecute_workflow"
         )
-        first_stmt = aexecute.body[0]
+        async_with = next(stmt for stmt in aexecute.body if isinstance(stmt, ast.AsyncWith))
+
+        # Nothing may await build_workflow() outside the executor context.
+        outside = [stmt for stmt in aexecute.body if stmt is not async_with]
+        assert not any(
+            isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "build_workflow"
+            for stmt in outside
+            for node in ast.walk(stmt)
+        ), ast.unparse(aexecute)
+
+        first_stmt = async_with.body[0]
         # Expected shape: `await build_workflow()`
         assert isinstance(first_stmt, ast.Expr)
         assert isinstance(first_stmt.value, ast.Await)
@@ -2643,27 +2731,37 @@ class TestVariableReferenceAccess:
 class TestLibraryResolutionOnLoad:
     """run_workflow resolves declared libraries before exec via the metadata header."""
 
-    def test_ensure_libraries_dispatches_ahandle_request_per_library(self, engine: Engine) -> None:
-        """_ensure_libraries_for_workflow dispatches one RegisterLibraryFromFileRequest per declared library."""
+    @staticmethod
+    def _metadata(*libraries: tuple[str, str]) -> WorkflowMetadata:
         from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
-        from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
-        from griptape_nodes.retained_mode.events.library_events import (
-            RegisterLibraryFromFileRequest,
-            RegisterLibraryFromFileResultSuccess,
-        )
-        from griptape_nodes.retained_mode.events.workflow_events import LoadWorkflowMetadataResultSuccess
 
-        workflow_manager = engine.workflow_manager
-        metadata = WorkflowMetadata(
+        return WorkflowMetadata(
             name="t",
             schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
             engine_version_created_with="0.0.0",
             node_libraries_referenced=[
-                LibraryNameAndVersion(library_name="Example Library", library_version="0.1.0"),
-                LibraryNameAndVersion(library_name="Other Library", library_version="0.2.0"),
+                LibraryNameAndVersion(library_name=name, library_version=version) for name, version in libraries
             ],
         )
+
+    def _resolve(self, engine: Engine, metadata: WorkflowMetadata, ahandle_request: object) -> list:
+        """Drive _ensure_libraries_for_workflow against a stubbed metadata header and dispatcher."""
+        from griptape_nodes.retained_mode.events.workflow_events import LoadWorkflowMetadataResultSuccess
+
+        workflow_manager = engine.workflow_manager
         load_result = LoadWorkflowMetadataResultSuccess(metadata=metadata, result_details="ok")
+        with (
+            patch.object(workflow_manager, "on_load_workflow_metadata_request", AsyncMock(return_value=load_result)),
+            patch.object(engine, "ahandle_request", ahandle_request),
+        ):
+            return asyncio.run(workflow_manager._ensure_libraries_for_workflow(relative_file_path="whatever.py"))
+
+    def test_ensure_libraries_dispatches_ahandle_request_per_library(self, engine: Engine) -> None:
+        """_ensure_libraries_for_workflow dispatches one RegisterLibraryFromFileRequest per declared library."""
+        from griptape_nodes.retained_mode.events.library_events import (
+            RegisterLibraryFromFileRequest,
+            RegisterLibraryFromFileResultSuccess,
+        )
 
         dispatched: list[RegisterLibraryFromFileRequest] = []
 
@@ -2674,80 +2772,94 @@ class TestLibraryResolutionOnLoad:
                 result_details="ok",
             )
 
-        with (
-            patch.object(workflow_manager, "on_load_workflow_metadata_request", AsyncMock(return_value=load_result)),
-            patch.object(engine, "ahandle_request", side_effect=fake_ahandle_request),
-        ):
-            result = asyncio.run(
-                workflow_manager._ensure_libraries_for_workflow(
-                    relative_file_path="whatever.py",
-                    complete_file_path=Path("whatever.py"),
-                )
-            )
+        problems = self._resolve(
+            engine,
+            self._metadata(("Example Library", "0.1.0"), ("Other Library", "0.2.0")),
+            fake_ahandle_request,
+        )
 
-        assert result is None
+        assert problems == []
         assert [r.library_name for r in dispatched] == ["Example Library", "Other Library"]
         assert all(r.perform_discovery_if_not_found for r in dispatched)
 
-    def test_ensure_libraries_returns_failure_when_registration_fails(self, engine: Engine) -> None:
-        """A failed library registration short-circuits with a WorkflowExecutionResult failure."""
-        from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
-        from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
+    def test_ensure_libraries_reports_the_library_instead_of_refusing_the_load(self, engine: Engine) -> None:
+        """A failed registration becomes a problem, not a refusal: the caller still execs the file.
+
+        A library that will not register costs execution, never editing (issue #5505). The nodes
+        it owns come back as placeholders, which is only possible if the load continues.
+        """
         from griptape_nodes.retained_mode.events.library_events import RegisterLibraryFromFileResultFailure
-        from griptape_nodes.retained_mode.events.workflow_events import LoadWorkflowMetadataResultSuccess
+        from griptape_nodes.retained_mode.managers.fitness_problems.workflows import LibraryNotRegisteredProblem
 
-        workflow_manager = engine.workflow_manager
-        metadata = WorkflowMetadata(
-            name="t",
-            schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
-            engine_version_created_with="0.0.0",
-            node_libraries_referenced=[
-                LibraryNameAndVersion(library_name="Missing Library", library_version="0.1.0"),
-            ],
+        problems = self._resolve(
+            engine,
+            self._metadata(("Missing Library", "0.1.0")),
+            AsyncMock(return_value=RegisterLibraryFromFileResultFailure(result_details="not found")),
         )
-        load_result = LoadWorkflowMetadataResultSuccess(metadata=metadata, result_details="ok")
 
-        with (
-            patch.object(workflow_manager, "on_load_workflow_metadata_request", AsyncMock(return_value=load_result)),
-            patch.object(
-                engine,
-                "ahandle_request",
-                AsyncMock(return_value=RegisterLibraryFromFileResultFailure(result_details="not found")),
+        assert problems == [LibraryNotRegisteredProblem(library_name="Missing Library", reason="not found")]
+
+    def test_ensure_libraries_records_the_registration_reason(self, engine: Engine) -> None:
+        """The reason travels on the problem, so "it's switched off" isn't left for the reader to guess.
+
+        The disabled case is the one that needs it: the library is on disk and named in the
+        user's config, so a bare "not registered" sends them hunting for something already there.
+        """
+        from griptape_nodes.retained_mode.events.library_events import RegisterLibraryFromFileResultFailure
+        from griptape_nodes.retained_mode.managers.fitness_problems.workflows import LibraryNotRegisteredProblem
+
+        disabled = "Library at '/libs/x/griptape_nodes_library.json' is disabled in libraries_to_register"
+        problems = self._resolve(
+            engine,
+            self._metadata(("Missing Library", "0.1.0")),
+            AsyncMock(return_value=RegisterLibraryFromFileResultFailure(result_details=disabled)),
+        )
+
+        assert problems[0].reason == disabled
+        collated = LibraryNotRegisteredProblem.collate_problems_for_display(problems)
+        assert "disabled in libraries_to_register" in collated
+
+    def test_ensure_libraries_attempts_every_library_after_one_fails(self, engine: Engine) -> None:
+        """One unresolvable library does not stop the others from registering.
+
+        Short-circuiting here would strand libraries later in the list, turning their perfectly
+        loadable nodes into placeholders too.
+        """
+        from griptape_nodes.retained_mode.events.library_events import (
+            RegisterLibraryFromFileRequest,
+            RegisterLibraryFromFileResultFailure,
+            RegisterLibraryFromFileResultSuccess,
+        )
+
+        dispatched: list[RegisterLibraryFromFileRequest] = []
+
+        async def fake_ahandle_request(request: object) -> object:
+            dispatched.append(request)  # type: ignore[arg-type]
+            library_name = request.library_name  # type: ignore[attr-defined]
+            if library_name == "Present Library":
+                return RegisterLibraryFromFileResultSuccess(library_name=library_name, result_details="ok")
+            return RegisterLibraryFromFileResultFailure(result_details="not found")
+
+        problems = self._resolve(
+            engine,
+            self._metadata(
+                ("Missing Library", "0.1.0"), ("Present Library", "0.2.0"), ("Also Missing Library", "0.3.0")
             ),
-        ):
-            result = asyncio.run(
-                workflow_manager._ensure_libraries_for_workflow(
-                    relative_file_path="whatever.py",
-                    complete_file_path=Path("whatever.py"),
-                )
-            )
+            fake_ahandle_request,
+        )
 
-        assert result is not None
-        assert result.execution_successful is False
-        assert "Missing Library" in result.execution_details
+        assert [r.library_name for r in dispatched] == ["Missing Library", "Present Library", "Also Missing Library"]
+        # The library that loaded is not reported as a problem.
+        assert [p.library_name for p in problems] == ["Missing Library", "Also Missing Library"]
 
-    def test_ensure_libraries_failure_message_uses_filename_and_renders_semver(self, engine: Engine) -> None:
-        """Failure message uses the workflow file name (not full path) and renders v<version> for semver values."""
+    def test_ensure_libraries_suppresses_the_inner_registration_toast(self, engine: Engine) -> None:
+        """The run result names the library, so the inner request must not toast on top of it."""
         import logging as _logging
 
-        from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
-        from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
         from griptape_nodes.retained_mode.events.library_events import (
             RegisterLibraryFromFileRequest,
             RegisterLibraryFromFileResultFailure,
         )
-        from griptape_nodes.retained_mode.events.workflow_events import LoadWorkflowMetadataResultSuccess
-
-        workflow_manager = engine.workflow_manager
-        metadata = WorkflowMetadata(
-            name="t",
-            schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
-            engine_version_created_with="0.0.0",
-            node_libraries_referenced=[
-                LibraryNameAndVersion(library_name="Missing Library", library_version="1.2.3"),
-            ],
-        )
-        load_result = LoadWorkflowMetadataResultSuccess(metadata=metadata, result_details="ok")
 
         dispatched: list[RegisterLibraryFromFileRequest] = []
 
@@ -2755,110 +2867,46 @@ class TestLibraryResolutionOnLoad:
             dispatched.append(request)  # type: ignore[arg-type]
             return RegisterLibraryFromFileResultFailure(result_details="not found")
 
-        with (
-            patch.object(workflow_manager, "on_load_workflow_metadata_request", AsyncMock(return_value=load_result)),
-            patch.object(engine, "ahandle_request", side_effect=fake_ahandle_request),
-        ):
-            result = asyncio.run(
-                workflow_manager._ensure_libraries_for_workflow(
-                    relative_file_path="nested/dir/corridorKey.py",
-                    complete_file_path=Path("/abs/path/to/nested/dir/corridorKey.py"),
-                )
-            )
+        self._resolve(engine, self._metadata(("Missing Library", "1.2.3")), fake_ahandle_request)
 
-        assert result is not None
-        assert result.execution_successful is False
-        # Filename only, not the absolute path
-        assert "corridorKey.py" in result.execution_details
-        assert "/abs/path/to" not in result.execution_details
-        # Semver version renders with v-prefix
-        assert "v1.2.3" in result.execution_details
-        assert "Missing Library" in result.execution_details
-        # Inner request is suppressed at DEBUG so the GUI doesn't double-toast.
         assert len(dispatched) == 1
         assert dispatched[0].failure_log_level == _logging.DEBUG
 
-    def test_ensure_libraries_failure_message_omits_non_semver_version(self, engine: Engine) -> None:
-        """Non-semver `library_version` values (e.g. unavailable-library placeholder) are not rendered as v<...>."""
-        from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
-        from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
-        from griptape_nodes.retained_mode.events.library_events import RegisterLibraryFromFileResultFailure
-        from griptape_nodes.retained_mode.events.workflow_events import LoadWorkflowMetadataResultSuccess
-
-        workflow_manager = engine.workflow_manager
-        placeholder = "<version unavailable; workflow was saved when library was unable to be loaded>"
-        metadata = WorkflowMetadata(
-            name="t",
-            schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
-            engine_version_created_with="0.0.0",
-            node_libraries_referenced=[
-                LibraryNameAndVersion(library_name="Missing Library", library_version=placeholder),
-            ],
-        )
-        load_result = LoadWorkflowMetadataResultSuccess(metadata=metadata, result_details="ok")
-
-        with (
-            patch.object(workflow_manager, "on_load_workflow_metadata_request", AsyncMock(return_value=load_result)),
-            patch.object(
-                engine,
-                "ahandle_request",
-                AsyncMock(return_value=RegisterLibraryFromFileResultFailure(result_details="not found")),
+    @pytest.mark.parametrize(
+        ("case_name", "stored_version"),
+        [
+            ("semver", "1.2.3"),
+            (
+                "unavailable_placeholder",
+                "<version unavailable; workflow was saved when library was unable to be loaded>",
             ),
-        ):
-            result = asyncio.run(
-                workflow_manager._ensure_libraries_for_workflow(
-                    relative_file_path="corridorKey.py",
-                    complete_file_path=Path("corridorKey.py"),
-                )
-            )
+        ],
+    )
+    def test_ensure_libraries_never_reports_the_declared_version(
+        self, engine: Engine, case_name: str, stored_version: str
+    ) -> None:
+        """A library that never registered has no version to compare against, so none is rendered.
 
-        assert result is not None
-        assert result.execution_successful is False
-        assert "Missing Library" in result.execution_details
-        # Placeholder must not leak into the user-facing message in any form
-        assert placeholder not in result.execution_details
-        assert " v" not in result.execution_details.split("Missing Library", 1)[1]
-
-    def test_ensure_libraries_failure_message_omits_empty_version(self, engine: Engine) -> None:
-        """An empty `library_version` falls through the semver check and renders no version suffix."""
-        from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
-        from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
+        The version-mismatch problems cover a library that IS present at the wrong version. Not
+        rendering it here also keeps the non-semver placeholder a workflow stores when saved
+        without its library from ever reaching the reader.
+        """
+        del case_name
         from griptape_nodes.retained_mode.events.library_events import RegisterLibraryFromFileResultFailure
-        from griptape_nodes.retained_mode.events.workflow_events import LoadWorkflowMetadataResultSuccess
+        from griptape_nodes.retained_mode.managers.fitness_problems.workflows import LibraryNotRegisteredProblem
 
-        workflow_manager = engine.workflow_manager
-        metadata = WorkflowMetadata(
-            name="t",
-            schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
-            engine_version_created_with="0.0.0",
-            node_libraries_referenced=[
-                LibraryNameAndVersion(library_name="Missing Library", library_version=""),
-            ],
+        problems = self._resolve(
+            engine,
+            self._metadata(("Missing Library", stored_version)),
+            AsyncMock(return_value=RegisterLibraryFromFileResultFailure(result_details="not found")),
         )
-        load_result = LoadWorkflowMetadataResultSuccess(metadata=metadata, result_details="ok")
 
-        with (
-            patch.object(workflow_manager, "on_load_workflow_metadata_request", AsyncMock(return_value=load_result)),
-            patch.object(
-                engine,
-                "ahandle_request",
-                AsyncMock(return_value=RegisterLibraryFromFileResultFailure(result_details="not found")),
-            ),
-        ):
-            result = asyncio.run(
-                workflow_manager._ensure_libraries_for_workflow(
-                    relative_file_path="corridorKey.py",
-                    complete_file_path=Path("corridorKey.py"),
-                )
-            )
-
-        assert result is not None
-        assert result.execution_successful is False
-        assert "Missing Library" in result.execution_details
-        assert " v" not in result.execution_details.split("Missing Library", 1)[1]
+        collated = LibraryNotRegisteredProblem.collate_problems_for_display(problems)
+        assert "Missing Library" in collated
+        assert stored_version not in collated
 
     def test_ensure_libraries_is_noop_when_metadata_missing(self, engine: Engine) -> None:
-        """If metadata can't be loaded, _ensure_libraries_for_workflow returns None (tolerant fallback)."""
+        """If metadata can't be loaded, _ensure_libraries_for_workflow reports nothing (tolerant fallback)."""
         from griptape_nodes.retained_mode.events.workflow_events import LoadWorkflowMetadataResultFailure
 
         workflow_manager = engine.workflow_manager
@@ -2869,15 +2917,170 @@ class TestLibraryResolutionOnLoad:
             patch.object(workflow_manager, "on_load_workflow_metadata_request", AsyncMock(return_value=load_result)),
             patch.object(engine, "ahandle_request", ahandle_spy),
         ):
-            result = asyncio.run(
-                workflow_manager._ensure_libraries_for_workflow(
-                    relative_file_path="whatever.py",
-                    complete_file_path=Path("whatever.py"),
-                )
-            )
+            problems = asyncio.run(workflow_manager._ensure_libraries_for_workflow(relative_file_path="whatever.py"))
 
-        assert result is None
+        assert problems == []
         ahandle_spy.assert_not_awaited()
+
+
+class TestRunResultRendering:
+    """A run's problems reach the caller as warnings, ahead of its own detail."""
+
+    _PLACEHOLDERS = (
+        "Nodes from the libraries above opened as placeholders. "
+        "They preserve the graph but cannot run until their library is available."
+    )
+
+    def _result(self, *, successful: bool, libraries: tuple[str, ...]) -> WorkflowManager.WorkflowExecutionResult:
+        from griptape_nodes.retained_mode.events.workflow_events import WorkflowStatus
+        from griptape_nodes.retained_mode.managers.fitness_problems.workflows import LibraryNotRegisteredProblem
+
+        problems = tuple(LibraryNotRegisteredProblem(library_name=name, reason="not found") for name in libraries)
+        if successful:
+            status = WorkflowStatus.FLAWED if problems else WorkflowStatus.GOOD
+        else:
+            status = WorkflowStatus.UNUSABLE
+        return WorkflowManager.WorkflowExecutionResult(
+            execution_successful=successful,
+            execution_details="ran the file",
+            status=status,
+            problems=problems,
+        )
+
+    def test_problems_of_one_type_are_collated_into_a_single_warning(self, engine: Engine) -> None:
+        """Grouping is what lets five unregistered libraries say so once instead of five times."""
+        details = engine.workflow_manager._execution_result_details(
+            self._result(successful=True, libraries=("Library A", "Library B")), level=logging.DEBUG
+        )
+
+        assert [detail.level for detail in details] == [logging.WARNING, logging.WARNING, logging.DEBUG]
+        assert "Library A" in details[0].message
+        assert "Library B" in details[0].message
+        assert details[1].message == self._PLACEHOLDERS
+        assert details[2].message == "ran the file"
+
+    def test_a_failed_load_is_not_told_its_nodes_became_placeholders(self, engine: Engine) -> None:
+        """Nothing opened, so promising placeholders next to an ERROR would misinform.
+
+        The failure branch of on_run_workflow_from_registry_request clears all object state, so
+        the canvas the message would be describing does not exist.
+        """
+        details = engine.workflow_manager._execution_result_details(
+            self._result(successful=False, libraries=("Library A",)), level=logging.ERROR
+        )
+
+        assert [(detail.level, detail.message) for detail in details] == [
+            (logging.WARNING, "'Library A' not registered. not found"),
+            (logging.ERROR, "ran the file"),
+        ]
+
+    def test_a_clean_run_renders_only_its_own_detail(self, engine: Engine) -> None:
+        details = engine.workflow_manager._execution_result_details(
+            self._result(successful=True, libraries=()), level=logging.DEBUG
+        )
+
+        assert [(detail.level, detail.message) for detail in details] == [(logging.DEBUG, "ran the file")]
+
+    def test_an_explicit_message_replaces_the_run_detail(self, engine: Engine) -> None:
+        """A wrapping handler keeps its own wording and still reports the problems."""
+        details = engine.workflow_manager._execution_result_details(
+            self._result(successful=True, libraries=("Library A",)),
+            level=logging.DEBUG,
+            message="Successfully imported workflow 'x' as referenced sub flow 'y'",
+        )
+
+        assert details[-1].message == "Successfully imported workflow 'x' as referenced sub flow 'y'"
+        assert "Library A" in details[0].message
+
+
+class TestRunWorkflowWithCurrentStateRequest:
+    """The handler refuses to load a workflow while a flow is still on the Current Context.
+
+    A saved workflow file asks for its own top-level flow with ``parent_flow_name=None``. Replayed
+    while a flow is open, that ``None`` reads as "use the current context", so the incoming flow is
+    adopted as an invisible child of the flow already on screen.
+    """
+
+    _WORKFLOW_FILE = "some_workflow.py"
+    _OPEN_FLOW_NAME = "ControlFlow_1"
+
+    @pytest.fixture
+    def context_manager(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> Mock:
+        """The engine's ContextManager, so each test states the flow stack it is loading into."""
+        context_manager = Mock(spec=ContextManager)
+        monkeypatch.setattr(engine, "_context_manager", context_manager)
+        return context_manager
+
+    @pytest.fixture
+    def run_workflow(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+        """WorkflowManager.run_workflow, so no workflow file is ever exec'd."""
+        run_workflow = AsyncMock(
+            spec=engine.workflow_manager.run_workflow,
+            return_value=WorkflowManager.WorkflowExecutionResult(
+                execution_successful=True, execution_details="ran the file"
+            ),
+        )
+        monkeypatch.setattr(engine.workflow_manager, "run_workflow", run_workflow)
+        return run_workflow
+
+    @pytest.fixture
+    def get_complete_file_path(self, monkeypatch: pytest.MonkeyPatch) -> Mock:
+        """Workspace path resolution, so no workspace config is needed."""
+        get_complete_file_path = Mock(
+            spec=WorkflowRegistry.get_complete_file_path, return_value=f"/workspace/{self._WORKFLOW_FILE}"
+        )
+        monkeypatch.setattr(WorkflowRegistry, "get_complete_file_path", get_complete_file_path)
+        return get_complete_file_path
+
+    @pytest.fixture
+    def anyio_path(self, monkeypatch: pytest.MonkeyPatch) -> Mock:
+        """The file-exists check, reporting a file so the test touches no filesystem."""
+        path = Mock(spec=anyio.Path)
+        path.is_file = AsyncMock(spec=anyio.Path.is_file, return_value=True)
+        anyio_path = Mock(spec=anyio.Path, return_value=path)
+        monkeypatch.setattr(anyio, "Path", anyio_path)
+        return anyio_path
+
+    @pytest.mark.asyncio
+    async def test_refuses_while_a_flow_is_open(
+        self,
+        engine: Engine,
+        context_manager: Mock,
+        run_workflow: AsyncMock,
+        get_complete_file_path: Mock,  # noqa: ARG002
+        anyio_path: Mock,  # noqa: ARG002
+    ) -> None:
+        open_flow = Mock(spec=ControlFlow)
+        open_flow.name = self._OPEN_FLOW_NAME
+        context_manager.has_current_flow.return_value = True
+        context_manager.get_current_flow.return_value = open_flow
+
+        result = await engine.workflow_manager.on_run_workflow_with_current_state_request(
+            RunWorkflowWithCurrentStateRequest(file_path=self._WORKFLOW_FILE)
+        )
+
+        assert isinstance(result, RunWorkflowWithCurrentStateResultFailure), result
+        # The guard is a precondition on engine state, so the file never gets exec'd.
+        run_workflow.assert_not_called()
+        assert self._OPEN_FLOW_NAME in str(result.result_details), result.result_details
+
+    @pytest.mark.asyncio
+    async def test_allows_a_workflow_context_with_no_open_flow(
+        self,
+        engine: Engine,
+        context_manager: Mock,
+        run_workflow: AsyncMock,
+        get_complete_file_path: Mock,  # noqa: ARG002
+        anyio_path: Mock,  # noqa: ARG002
+    ) -> None:
+        context_manager.has_current_flow.return_value = False
+
+        await engine.workflow_manager.on_run_workflow_with_current_state_request(
+            RunWorkflowWithCurrentStateRequest(file_path=self._WORKFLOW_FILE)
+        )
+
+        # Getting past the guard is the behaviour under test; what the run then does is mocked away.
+        run_workflow.assert_called_once_with(relative_file_path=self._WORKFLOW_FILE)
 
 
 class TestWorkflowsLoadingGate:

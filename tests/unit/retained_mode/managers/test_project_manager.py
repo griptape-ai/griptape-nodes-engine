@@ -5064,7 +5064,7 @@ class TestProjectManagerProjectWorkspaces:
 
         # Activation first clears all per-activation layers, then applies the mapped value.
         mock_config.clear_project_layers.assert_called_once()
-        mock_config.set_workspace_override.assert_called_once_with(Path(str(workspace_dir)))
+        mock_config.set_workspace_override.assert_called_once_with(Path(str(workspace_dir)), supplied_by_config=False)
         mock_config.load_workspace_config.assert_called_once()
 
     @pytest.mark.asyncio
@@ -5091,7 +5091,7 @@ class TestProjectManagerProjectWorkspaces:
 
         # Activation first clears all per-activation layers, then applies the mapped value.
         mock_config.clear_project_layers.assert_called_once()
-        mock_config.set_workspace_override.assert_called_once_with(Path(str(workspace_dir)))
+        mock_config.set_workspace_override.assert_called_once_with(Path(str(workspace_dir)), supplied_by_config=False)
         mock_config.load_workspace_config.assert_called_once()
 
     @pytest.mark.asyncio
@@ -5114,7 +5114,7 @@ class TestProjectManagerProjectWorkspaces:
 
         # Activation first clears all per-activation layers, then defaults to the project dir.
         mock_config.clear_project_layers.assert_called_once()
-        mock_config.set_workspace_override.assert_called_once_with(project_file.parent)
+        mock_config.set_workspace_override.assert_called_once_with(project_file.parent, supplied_by_config=False)
         mock_config.load_workspace_config.assert_called_once()
 
     @pytest.mark.asyncio
@@ -5190,7 +5190,7 @@ class TestProjectManagerProjectWorkspaces:
         # Activate the auto-default project: clears all layers, then sets the override to its own dir.
         await pm.on_set_current_project_request(SetCurrentProjectRequest(project_id=str(auto_default_file)))
         mock_config.clear_project_layers.assert_called_once()
-        mock_config.set_workspace_override.assert_called_once_with(auto_default_file.parent)
+        mock_config.set_workspace_override.assert_called_once_with(auto_default_file.parent, supplied_by_config=False)
 
         # Now the second project supplies its own workspace_directory.
         mock_config.project_config = {"workspace_directory": str(pinned_workspace_file.parent)}
@@ -5404,7 +5404,9 @@ class TestProjectManagerProjectWorkspaces:
 
         await pm.on_set_current_project_request(SetCurrentProjectRequest(project_id="C"))
 
-        mock_config.set_workspace_override.assert_called_once_with(Path(str(_canon(parent_file.parent))))
+        mock_config.set_workspace_override.assert_called_once_with(
+            Path(str(_canon(parent_file.parent))), supplied_by_config=False
+        )
 
     @pytest.mark.asyncio
     async def test_activation_child_adjacent_workspace_beats_parent_and_is_unpinned(self, tmp_path: Path) -> None:
@@ -5443,7 +5445,10 @@ class TestProjectManagerProjectWorkspaces:
 
         # Branch 5 pins the RAW configured workspace_directory (canonicalization happens inside the
         # real set_workspace_override, which is mocked here), so assert the unmodified config value.
-        mock_config.set_workspace_override.assert_called_once_with(Path("/global/ws"))
+        # supplied_by_config marks this as the one branch whose pinned value came from a config
+        # layer, so ConfigManager keeps reporting that layer as the owner of workspace_directory
+        # instead of reporting an unreachable "runtime" layer.
+        mock_config.set_workspace_override.assert_called_once_with(Path("/global/ws"), supplied_by_config=True)
 
     @pytest.mark.asyncio
     async def test_activation_clears_libraries_root_override_when_none_in_chain(self, tmp_path: Path) -> None:
@@ -5749,7 +5754,7 @@ class TestProjectManagerProjectWorkspaces:
             mock_engine.workflow_manager = mock_workflow_manager
 
             # Simulate workspace changing after config is applied
-            def side_effect_set_workspace_override(_: object) -> None:
+            def side_effect_set_workspace_override(_: object, **_kwargs: object) -> None:
                 mock_config.workspace_path = new_ws
 
             mock_config.set_workspace_override.side_effect = side_effect_set_workspace_override

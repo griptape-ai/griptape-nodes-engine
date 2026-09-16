@@ -165,6 +165,7 @@ from griptape_nodes.retained_mode.events.node_events import (
     SerializeNodeToCommandsResultFailure,
     SerializeNodeToCommandsResultSuccess,
     SerializeSelectedNodesToCommandsRequest,
+    SerializeSelectedNodesToCommandsResultFailure,
     SerializeSelectedNodesToCommandsResultSuccess,
     SetLockNodeStateRequest,
     SetLockNodeStateResultFailure,
@@ -3449,6 +3450,8 @@ class NodeManager(EngineScoped):
         group_node: BaseNodeGroup,
         unique_uuid_to_values: dict,
         serialized_parameter_value_tracker: SerializedParameterValueTracker,
+        *,
+        serialize_all_parameter_values: bool = False,
     ) -> SerializedGroupResult:
         """Serialize a group node and its children for copy/paste operations.
 
@@ -3461,6 +3464,8 @@ class NodeManager(EngineScoped):
             group_node: The group node to serialize
             unique_uuid_to_values: Shared dictionary for tracking pickled parameter values
             serialized_parameter_value_tracker: Tracker for parameter value hashes
+            serialize_all_parameter_values: If True, capture every parameter value on the group and
+                on each child, not just the ones the ordinary save condition would record
 
         Returns:
             SerializedGroupResult containing the group command, child commands, and child UUIDs
@@ -3477,6 +3482,7 @@ class NodeManager(EngineScoped):
                 unique_parameter_uuid_to_values=unique_uuid_to_values,
                 serialized_parameter_value_tracker=serialized_parameter_value_tracker,
                 use_pickling=True,
+                serialize_all_parameter_values=serialize_all_parameter_values,
             )
         )
 
@@ -3503,6 +3509,7 @@ class NodeManager(EngineScoped):
                     unique_parameter_uuid_to_values=unique_uuid_to_values,
                     serialized_parameter_value_tracker=serialized_parameter_value_tracker,
                     use_pickling=True,
+                    serialize_all_parameter_values=serialize_all_parameter_values,
                 )
             )
 
@@ -3763,6 +3770,7 @@ class NodeManager(EngineScoped):
                     create_node_request=create_node_request,
                     workflow_manager=self.engine.workflow_manager,
                     use_pickling=request.use_pickling,
+                    serialize_all_parameter_values=request.serialize_all_parameter_values,
                 )
                 if set_param_value_requests is not None:
                     set_value_commands.extend(set_param_value_requests)
@@ -3993,7 +4001,7 @@ class NodeManager(EngineScoped):
             node = self.engine.object_manager.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 details = f"Attempted to serialize a selection of Nodes. Failed to get node '{node_name}'."
-                return SerializeNodeToCommandsResultFailure(result_details=details)
+                return SerializeSelectedNodesToCommandsResultFailure(result_details=details)
 
             if isinstance(node, BaseNodeGroup):
                 # Use special method to handle group + children
@@ -4005,7 +4013,7 @@ class NodeManager(EngineScoped):
 
                 if group_result.group_command is None:
                     details = f"Attempted to serialize a selection of Nodes. Failed to serialize group '{node_name}'."
-                    return SerializeNodeToCommandsResultFailure(result_details=details)
+                    return SerializeSelectedNodesToCommandsResultFailure(result_details=details)
 
                 # Process the group node command
                 node_commands[node_name] = group_result.group_command
@@ -4018,7 +4026,7 @@ class NodeManager(EngineScoped):
                     child_name = child_command.create_node_command.node_name
                     if not child_name:
                         details = f"Attempted to serialize group node '{node.name}'. Failed because child node command has no name."
-                        return SerializeNodeToCommandsResultFailure(result_details=details)
+                        return SerializeSelectedNodesToCommandsResultFailure(result_details=details)
                     if child_name in explicitly_selected and child_name in node_commands:
                         # We need to remove the explicitly selected name from the commands that already exist
                         node_commands.pop(child_name)
@@ -4053,7 +4061,7 @@ class NodeManager(EngineScoped):
                 )
                 if not isinstance(result, SerializeNodeToCommandsResultSuccess):
                     details = f"Attempted to serialize a selection of Nodes. Failed to serialize {node_name}."
-                    return SerializeNodeToCommandsResultFailure(result_details=details)
+                    return SerializeSelectedNodesToCommandsResultFailure(result_details=details)
                 node_commands[node_name] = result.serialized_node_commands
                 node_name_to_uuid[node_name] = result.serialized_node_commands.node_uuid
                 parameter_commands[result.serialized_node_commands.node_uuid] = result.set_parameter_value_commands
@@ -4388,7 +4396,7 @@ class NodeManager(EngineScoped):
                     try:
                         unique_parameter_uuid_to_values[unique_uuid] = copy.deepcopy(value)
                     except Exception:
-                        details = f"Attempted to serialize parameter '{parameter_name}` on node '{node_name}'. The parameter value could not be copied. It will be serialized by value. If problems arise from this, ensure the type '{type(value)}' works with copy.deepcopy()."
+                        details = f"Attempted to serialize parameter '{parameter_name}' on node '{node_name}'. The parameter value could not be copied. It will be serialized by value. If problems arise from this, ensure the type '{type(value)}' works with copy.deepcopy()."
                         logger.warning(details)
                         unique_parameter_uuid_to_values[unique_uuid] = value
                 serialized_parameter_value_tracker.add_as_serializable(value_id, unique_uuid)

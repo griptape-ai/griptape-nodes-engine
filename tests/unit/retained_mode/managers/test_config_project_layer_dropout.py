@@ -3,10 +3,12 @@
 This is the mechanism behind the stale-library report. Three facts combine:
 
 1. `libraries_to_register` lives at
-   `app_events.on_app_initialization_complete.libraries_to_register` -- a *nested* key.
-   `_load_config_from_env_vars` only ever produces flat top-level keys
-   (`config_key = key[11:].lower()`, no dot-splitting), so no `GTN_CONFIG_*` variable can
-   set or shadow it.
+   `app_events.on_app_initialization_complete.libraries_to_register` -- a *nested*,
+   *list-valued* key. `_load_config_from_env_vars` can reach a nested key via a `__`
+   path separator (e.g. `GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S`), but a list-valued
+   setting has no string representation the `Settings` model accepts, so any value
+   supplied for `libraries_to_register` is rejected and dropped. No `GTN_CONFIG_*`
+   variable can set or shadow it.
 
 2. `merge_dicts` is called with the default `merge_lists=False`, so a project layer that
    declares `libraries_to_register` *replaces* the user layer's list, hiding a polluted
@@ -31,6 +33,7 @@ config, where it persists after the project is gone.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
 from pathlib import Path
@@ -180,8 +183,9 @@ class TestProjectLayerDropoutExposesUserLayer:
     def test_env_vars_cannot_protect_the_register_list(self, isolate_user_config: Path) -> None:
         """The user's GTN_CONFIG_* pins are structurally unable to shadow the nested key.
 
-        Env vars become flat top-level keys, so `libraries_to_register` -- nested two levels
-        deep -- is untouched no matter what is exported.
+        `libraries_to_register` is list-valued, and list values have no string form the
+        `Settings` model accepts, so no `GTN_CONFIG_*` variable -- flat or `__`-nested -- can
+        set or shadow it: any attempt is rejected and dropped.
         """
         isolate_user_config.write_text(
             _register_list_config(PREVIOUS_INSTALL_LIBRARIES, workspace_directory=OLD_WORKSPACE)
@@ -204,24 +208,27 @@ class TestProjectLayerDropoutExposesUserLayer:
 
             # ...but the nested register list is still the previous install's.
             assert manager.get_config_value(LIBRARIES_TO_REGISTER_KEY) == PREVIOUS_INSTALL_LIBRARIES
-
-            # No env-derived key can reach it: the loader never splits on dots.
-            assert all("." not in key for key in manager.env_config)
             assert LIBRARIES_TO_REGISTER_KEY not in manager.env_config
 
-    def test_env_config_only_produces_flat_keys(self) -> None:
-        """Pin the loader behavior the test above depends on."""
+    def test_list_valued_setting_cannot_be_set_from_env(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Pin the loader behavior the test above depends on.
+
+        A `__`-nested path reaches `libraries_to_register`, but the value supplied is a
+        JSON-array string, and the `Settings` model has no string form for a `list[str |
+        LibraryRegistration]` field, so validation rejects it and the env layer ends up empty.
+        """
         with patch.dict(
             os.environ,
             {"GTN_CONFIG_APP_EVENTS__ON_APP_INITIALIZATION_COMPLETE__LIBRARIES_TO_REGISTER": "[]"},
             clear=True,
         ):
             manager = ConfigManager()
-            env_config = manager._load_config_from_env_vars()
+            with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+                env_config = manager._load_config_from_env_vars()
 
-        # Flattened to a single meaningless key rather than a nested path.
-        assert list(env_config) == ["app_events__on_app_initialization_complete__libraries_to_register"]
-        assert "app_events" not in env_config
+        # Rejected by the Settings model, not merged as a nested path or a flat key.
+        assert env_config == {}
+        assert any("is not a valid value for the" in record.message for record in caplog.records)
 
 
 class TestDropoutProducesTheReportedErrors:

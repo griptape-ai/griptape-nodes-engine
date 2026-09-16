@@ -33,7 +33,11 @@ STATIC_SERVER_URL = os.getenv("STATIC_SERVER_URL", "/workspace")
 STATIC_SERVER_LOG_LEVEL = os.getenv("STATIC_SERVER_LOG_LEVEL", "ERROR").lower()
 
 logger = logging.getLogger("griptape_nodes_api")
-logging.getLogger("uvicorn").addHandler(RichHandler(show_time=True, show_path=False, markup=True, rich_tracebacks=True))
+# markup=False: a log message body is data, never Rich markup. Request paths and error text
+# can contain brackets, and Rich raises MarkupError on an unmatched `[/...]`. See #5512.
+logging.getLogger("uvicorn").addHandler(
+    RichHandler(show_time=True, show_path=False, markup=False, rich_tracebacks=True)
+)
 
 
 async def _create_static_file_upload_url(request: Request) -> dict:
