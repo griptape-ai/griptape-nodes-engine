@@ -2,11 +2,13 @@ import json
 import os
 import tempfile
 from collections.abc import Generator
+from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 from unittest.mock import Mock, patch
 
 import anyio
+import numpy as np
 import pytest
 import static_ffmpeg.run
 from PIL import Image
@@ -41,6 +43,10 @@ from griptape_nodes.retained_mode.managers.artifact_manager import ArtifactManag
 from griptape_nodes.retained_mode.managers.artifact_providers import (
     BaseArtifactProvider,
     ImageArtifactProvider,
+)
+from griptape_nodes.retained_mode.managers.artifact_providers.image_decoder_mixin import (
+    DecodedImageArtifact,
+    ImageArtifactDecoderMixin,
 )
 from griptape_nodes.retained_mode.managers.artifact_providers.image_situation import ImageArtifactSituation
 from griptape_nodes.utils import ffmpeg_cache
@@ -708,6 +714,291 @@ class TestCheckArtifactReadPermissionHandler:
         # The result_details includes the denial's reason so callers logging
         # the result get useful text without inspecting the payload.
         assert "probe reads" in str(result.result_details)
+
+
+class TestGetDisplayableImageBytesHandler:
+    """The request-based decode+encode pipeline.
+
+    Decoder and encoder are resolved independently: the decoder by source
+    extension, the encoder always by friendly name "Image". This lets a
+    future non-Pillow decoder reuse the existing Pillow encoder without
+    implementing its own.
+    """
+
+    @pytest.fixture
+    def test_image_path(self, tmp_path: Path) -> Path:
+        """Create a real test image file to decode."""
+        image_path = tmp_path / "test_source.jpg"
+        img = Image.new("RGB", (100, 100), color="red")
+        img.save(str(image_path), format="JPEG")
+        return image_path
+
+    @pytest.fixture
+    def artifact_manager(self) -> ArtifactManager:
+        """Create ArtifactManager instance with ImageArtifactProvider registered."""
+        manager = ArtifactManager()
+        request = RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider)
+        manager.on_handle_register_artifact_provider_request(request)
+        return manager
+
+    @pytest.mark.asyncio
+    async def test_viewer_without_format_override_defaults_to_webp(
+        self, artifact_manager: ArtifactManager, test_image_path: Path
+    ) -> None:
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            GetDisplayableImageBytesRequest,
+            GetDisplayableImageBytesResultSuccess,
+        )
+
+        request = GetDisplayableImageBytesRequest(
+            source_path=str(test_image_path), situation=ImageArtifactSituation.VIEWER
+        )
+        result = await artifact_manager.on_get_displayable_image_bytes_request(request)
+
+        assert isinstance(result, GetDisplayableImageBytesResultSuccess)
+        assert result.format == "webp"
+        assert len(result.image_bytes) > 0
+
+    @pytest.mark.asyncio
+    async def test_explicit_format_override_is_honored(
+        self, artifact_manager: ArtifactManager, test_image_path: Path
+    ) -> None:
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            GetDisplayableImageBytesRequest,
+            GetDisplayableImageBytesResultSuccess,
+        )
+
+        request = GetDisplayableImageBytesRequest(
+            source_path=str(test_image_path), situation=ImageArtifactSituation.VIEWER, format="png"
+        )
+        result = await artifact_manager.on_get_displayable_image_bytes_request(request)
+
+        assert isinstance(result, GetDisplayableImageBytesResultSuccess)
+        assert result.format == "png"
+        with Image.open(BytesIO(result.image_bytes)) as img:
+            assert img.format == "PNG"
+
+    @pytest.mark.asyncio
+    async def test_thumbnail_situation_bounds_dimensions(
+        self, artifact_manager: ArtifactManager, test_image_path: Path
+    ) -> None:
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            GetDisplayableImageBytesRequest,
+            GetDisplayableImageBytesResultSuccess,
+        )
+        from griptape_nodes.retained_mode.managers.artifact_providers.image.image_artifact_provider import (
+            ImageArtifactProvider as _ImageArtifactProvider,
+        )
+
+        request = GetDisplayableImageBytesRequest(
+            source_path=str(test_image_path), situation=ImageArtifactSituation.THUMBNAIL
+        )
+        result = await artifact_manager.on_get_displayable_image_bytes_request(request)
+
+        assert isinstance(result, GetDisplayableImageBytesResultSuccess)
+        max_width, max_height = _ImageArtifactProvider.get_thumbnail_max_size()
+        with Image.open(BytesIO(result.image_bytes)) as img:
+            assert img.width <= max_width
+            assert img.height <= max_height
+
+    @pytest.mark.asyncio
+    async def test_original_returns_raw_source_bytes_without_decode_or_encode(self, test_image_path: Path) -> None:
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            GetDisplayableImageBytesRequest,
+            GetDisplayableImageBytesResultSuccess,
+        )
+
+        class _RaisingDecodeEncodeProvider(ImageArtifactProvider):
+            def decode(self, source_path: str, situation: ImageArtifactSituation) -> DecodedImageArtifact:  # noqa: ARG002
+                message = "decode() must not be called for ORIGINAL"
+                raise AssertionError(message)
+
+            def encode(
+                self,
+                decoded_artifact: DecodedImageArtifact,  # noqa: ARG002
+                situation: ImageArtifactSituation,  # noqa: ARG002
+                format: str | None = None,  # noqa: ARG002, A002
+            ) -> bytes:
+                message = "encode() must not be called for ORIGINAL"
+                raise AssertionError(message)
+
+        manager = ArtifactManager()
+        manager.on_handle_register_artifact_provider_request(
+            RegisterArtifactProviderRequest(provider_class=_RaisingDecodeEncodeProvider)
+        )
+
+        request = GetDisplayableImageBytesRequest(
+            source_path=str(test_image_path), situation=ImageArtifactSituation.ORIGINAL
+        )
+        result = await manager.on_get_displayable_image_bytes_request(request)
+
+        assert isinstance(result, GetDisplayableImageBytesResultSuccess)
+        assert result.image_bytes == await anyio.Path(test_image_path).read_bytes()
+        assert result.format == "jpg"
+
+    @pytest.mark.asyncio
+    async def test_missing_source_file_returns_failure(self, artifact_manager: ArtifactManager, tmp_path: Path) -> None:
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            GetDisplayableImageBytesRequest,
+            GetDisplayableImageBytesResultFailure,
+        )
+
+        request = GetDisplayableImageBytesRequest(
+            source_path=str(tmp_path / "nonexistent.jpg"), situation=ImageArtifactSituation.VIEWER
+        )
+        result = await artifact_manager.on_get_displayable_image_bytes_request(request)
+
+        assert isinstance(result, GetDisplayableImageBytesResultFailure)
+        assert "not found" in str(result.result_details).lower()
+
+    @pytest.mark.asyncio
+    async def test_decoder_without_decode_mixin_returns_failure(self, tmp_path: Path) -> None:
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            GetDisplayableImageBytesRequest,
+            GetDisplayableImageBytesResultFailure,
+        )
+        from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_provider import (
+            BaseArtifactMetadata,
+            BaseArtifactProvider,
+        )
+
+        class _NoDecodeProvider(BaseArtifactProvider):
+            @classmethod
+            def get_friendly_name(cls) -> str:
+                return "NoDecode"
+
+            @classmethod
+            def get_supported_formats(cls) -> set[str]:
+                return {"nodecode"}
+
+            @classmethod
+            def get_artifact_metadata(cls, source_path: str) -> BaseArtifactMetadata | None:  # noqa: ARG003
+                return None
+
+        manager = ArtifactManager()
+        manager.on_handle_register_artifact_provider_request(
+            RegisterArtifactProviderRequest(provider_class=_NoDecodeProvider)
+        )
+
+        source_path = tmp_path / "test_source.nodecode"
+        source_path.write_bytes(b"not really an image")
+
+        request = GetDisplayableImageBytesRequest(source_path=str(source_path), situation=ImageArtifactSituation.VIEWER)
+        result = await manager.on_get_displayable_image_bytes_request(request)
+
+        assert isinstance(result, GetDisplayableImageBytesResultFailure)
+        assert "NoDecode" in str(result.result_details)
+
+    @pytest.mark.asyncio
+    async def test_unsupported_requested_format_returns_failure(
+        self, artifact_manager: ArtifactManager, test_image_path: Path
+    ) -> None:
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            GetDisplayableImageBytesRequest,
+            GetDisplayableImageBytesResultFailure,
+        )
+
+        request = GetDisplayableImageBytesRequest(
+            source_path=str(test_image_path), situation=ImageArtifactSituation.VIEWER, format="exr"
+        )
+        result = await artifact_manager.on_get_displayable_image_bytes_request(request)
+
+        assert isinstance(result, GetDisplayableImageBytesResultFailure)
+        assert "exr" in str(result.result_details).lower()
+
+    @pytest.mark.asyncio
+    async def test_empty_source_path_returns_failure(self, artifact_manager: ArtifactManager) -> None:
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            GetDisplayableImageBytesRequest,
+            GetDisplayableImageBytesResultFailure,
+        )
+
+        request = GetDisplayableImageBytesRequest(source_path="", situation=ImageArtifactSituation.VIEWER)
+        result = await artifact_manager.on_get_displayable_image_bytes_request(request)
+
+        assert isinstance(result, GetDisplayableImageBytesResultFailure)
+        assert "no source path" in str(result.result_details).lower()
+
+    @pytest.mark.asyncio
+    async def test_unregistered_extension_returns_failure(
+        self, artifact_manager: ArtifactManager, tmp_path: Path
+    ) -> None:
+        """Assert extension mismatch is a failure, unlike CheckArtifactReadPermissionRequest.
+
+        An unregistered extension is a failure here -- there is no decoder to
+        produce bytes from, so "allow" has nothing to fall back to.
+        """
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            GetDisplayableImageBytesRequest,
+            GetDisplayableImageBytesResultFailure,
+        )
+
+        source_path = tmp_path / "test_source.unregistered"
+        source_path.write_bytes(b"not an image")
+
+        request = GetDisplayableImageBytesRequest(source_path=str(source_path), situation=ImageArtifactSituation.VIEWER)
+        result = await artifact_manager.on_get_displayable_image_bytes_request(request)
+
+        assert isinstance(result, GetDisplayableImageBytesResultFailure)
+
+    @pytest.mark.asyncio
+    async def test_decoder_and_encoder_may_be_different_provider_instances(self, tmp_path: Path) -> None:
+        """Assert encoding still happens even when the decoder isn't the encoder.
+
+        A decoder that is not itself the "Image" encoder still gets its output
+        encoded by the real ImageArtifactProvider, since DecodedImageArtifact is
+        a format-agnostic intermediate once produced.
+        """
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            GetDisplayableImageBytesRequest,
+            GetDisplayableImageBytesResultSuccess,
+        )
+        from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_provider import (
+            BaseArtifactMetadata,
+            BaseArtifactProvider,
+        )
+
+        class _OtherDecoderProvider(BaseArtifactProvider, ImageArtifactDecoderMixin):
+            @classmethod
+            def get_friendly_name(cls) -> str:
+                return "OtherDecoder"
+
+            @classmethod
+            def get_supported_formats(cls) -> set[str]:
+                return {"otherimg"}
+
+            @classmethod
+            def get_artifact_metadata(cls, source_path: str) -> BaseArtifactMetadata | None:  # noqa: ARG003
+                return None
+
+            def decode(self, source_path: str, situation: ImageArtifactSituation) -> DecodedImageArtifact:  # noqa: ARG002
+                with Image.open(source_path) as img:
+                    return DecodedImageArtifact(
+                        pixel_data=np.asarray(img.convert("RGB")),
+                        source_color_space="sRGB",
+                        bit_depth=8,
+                        channel_layout="RGB",
+                    )
+
+        manager = ArtifactManager()
+        manager.on_handle_register_artifact_provider_request(
+            RegisterArtifactProviderRequest(provider_class=_OtherDecoderProvider)
+        )
+        manager.on_handle_register_artifact_provider_request(
+            RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider)
+        )
+
+        source_path = tmp_path / "test_source.otherimg"
+        img = Image.new("RGB", (10, 10), color="blue")
+        img.save(str(source_path), format="PNG")
+
+        request = GetDisplayableImageBytesRequest(source_path=str(source_path), situation=ImageArtifactSituation.VIEWER)
+        result = await manager.on_get_displayable_image_bytes_request(request)
+
+        assert isinstance(result, GetDisplayableImageBytesResultSuccess)
+        assert result.format == "webp"
+        with Image.open(BytesIO(result.image_bytes)) as img:
+            assert img.format == "WEBP"
 
 
 class TestGeneratePreview:

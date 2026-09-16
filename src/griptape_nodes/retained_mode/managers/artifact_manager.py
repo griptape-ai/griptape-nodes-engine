@@ -30,6 +30,9 @@ from griptape_nodes.retained_mode.events.artifact_events import (
     GetArtifactSchemasRequest,
     GetArtifactSchemasResultFailure,
     GetArtifactSchemasResultSuccess,
+    GetDisplayableImageBytesRequest,
+    GetDisplayableImageBytesResultFailure,
+    GetDisplayableImageBytesResultSuccess,
     GetPreviewForArtifactRequest,
     GetPreviewForArtifactResultFailure,
     GetPreviewForArtifactResultSuccess,
@@ -102,6 +105,8 @@ from griptape_nodes.retained_mode.managers.artifact_providers.artifact_schema_mo
     PreviewGeneratorSchema,
     ProviderSchema,
 )
+from griptape_nodes.retained_mode.managers.artifact_providers.image_decoder_mixin import ImageArtifactDecoderMixin
+from griptape_nodes.retained_mode.managers.artifact_providers.image_encoder_mixin import ImageArtifactEncoderMixin
 from griptape_nodes.retained_mode.managers.artifact_providers.image_situation import (
     IMAGE_ARTIFACT_SITUATION_FALLBACKS,
     ImageArtifactSituation,
@@ -234,6 +239,9 @@ class ArtifactManager(EngineScoped):
             )
             event_manager.assign_manager_to_request_type(
                 CheckArtifactReadPermissionRequest, self.on_check_artifact_read_permission_request
+            )
+            event_manager.assign_manager_to_request_type(
+                GetDisplayableImageBytesRequest, self.on_get_displayable_image_bytes_request
             )
 
             event_manager.add_listener_to_app_event(
@@ -398,6 +406,36 @@ class ArtifactManager(EngineScoped):
             return None
         metadata = await to_thread(provider.get_artifact_metadata, source_path)
         return metadata.model_dump() if metadata else None
+
+    async def get_displayable_image_bytes(
+        self,
+        source_path: str,
+        decoder: ImageArtifactDecoderMixin,
+        encoder: ImageArtifactEncoderMixin,
+        situation: ImageArtifactSituation,
+        format: str | None,  # noqa: A002
+    ) -> bytes:
+        """Decode ``source_path`` via ``decoder``, then encode the result via ``encoder``, for ``situation``.
+
+        ``decoder`` and ``encoder`` may be different provider instances --
+        ``DecodedImageArtifact`` is a format-agnostic intermediate. ``ORIGINAL``
+        is not accepted here -- the caller (the event handler) must read and
+        return raw source bytes directly for ``ORIGINAL``, per the mixins'
+        documented contract that ``ArtifactManager``, not the provider, owns
+        skipping decode/encode for that situation.
+
+        Args:
+            source_path: Absolute path to the source file.
+            decoder: Provider implementing ``ImageArtifactDecoderMixin``.
+            encoder: Provider implementing ``ImageArtifactEncoderMixin``.
+            situation: The display context bytes are being requested for.
+            format: Desired output format, or None for the encoder's default.
+
+        Returns:
+            Encoded raster bytes.
+        """
+        decoded = await to_thread(decoder.decode, source_path, situation)
+        return await to_thread(encoder.encode, decoded, situation, format)
 
     def _provider_for_format(self, fmt: str) -> BaseArtifactProvider | None:
         """Resolve the registered provider that handles ``fmt`` (empty → None).
@@ -1079,6 +1117,119 @@ class ArtifactManager(EngineScoped):
         return CheckArtifactReadPermissionResultSuccess(
             denial=denial,
             result_details=f"Read denied for '{request.source_path}': {denial.reason()}",
+        )
+
+    async def on_get_displayable_image_bytes_request(
+        self, request: GetDisplayableImageBytesRequest
+    ) -> GetDisplayableImageBytesResultSuccess | GetDisplayableImageBytesResultFailure:
+        """Handle a request for displayable image bytes, decoding and encoding as needed.
+
+        The decoder is resolved by the source file's extension; the encoder is
+        always resolved by friendly name "Image", independently of which
+        provider decoded the source. ORIGINAL bypasses decode/encode entirely
+        and returns the source file's raw bytes.
+
+        Args:
+            request: Contains source_path, situation, and optional format override.
+
+        Returns:
+            Success with the displayable bytes, or Failure with the reason.
+        """
+        # FAILURE CASE: malformed request
+        if not request.source_path:
+            return GetDisplayableImageBytesResultFailure(
+                result_details="Attempted to get displayable image bytes. Failed because no source path was provided."
+            )
+
+        # FAILURE CASE: source file must exist
+        file_info_result = self.engine.handle_request(
+            GetFileInfoRequest(path=request.source_path, workspace_only=False)
+        )
+        if not isinstance(file_info_result, GetFileInfoResultSuccess) or file_info_result.file_entry is None:
+            return GetDisplayableImageBytesResultFailure(
+                result_details=f"Attempted to get displayable image bytes for '{request.source_path}'. "
+                f"Failed because the source file was not found."
+            )
+
+        extension = Path(request.source_path).suffix.lstrip(".").lower()
+
+        if request.situation is ImageArtifactSituation.ORIGINAL:
+            return self._get_original_image_bytes(request.source_path, extension)
+
+        return await self._get_decoded_encoded_image_bytes(request, extension)
+
+    def _get_original_image_bytes(
+        self, source_path: str, extension: str
+    ) -> GetDisplayableImageBytesResultSuccess | GetDisplayableImageBytesResultFailure:
+        """Read and return the source file's raw bytes unmodified, bypassing decode/encode."""
+        read_result = self.engine.handle_request(
+            ReadFileRequest(
+                file_path=source_path,
+                workspace_only=False,
+                should_transform_image_content_to_thumbnail=False,
+            )
+        )
+        # FAILURE CASE: source file couldn't be read as raw bytes
+        if not isinstance(read_result, ReadFileResultSuccess) or not isinstance(read_result.content, bytes):
+            return GetDisplayableImageBytesResultFailure(
+                result_details=f"Attempted to read original bytes for '{source_path}'. "
+                f"Failed due to: {read_result.result_details}"
+            )
+        return GetDisplayableImageBytesResultSuccess(
+            image_bytes=read_result.content,
+            format=extension,
+            result_details=f"Returned original bytes for '{source_path}'.",
+        )
+
+    async def _get_decoded_encoded_image_bytes(
+        self, request: GetDisplayableImageBytesRequest, extension: str
+    ) -> GetDisplayableImageBytesResultSuccess | GetDisplayableImageBytesResultFailure:
+        """Resolve a decoder/encoder pair and produce decoded+encoded displayable bytes."""
+        # FAILURE CASE: no decoder provider for this extension
+        decoder = self._provider_for_format(extension)
+        if decoder is None:
+            return GetDisplayableImageBytesResultFailure(
+                result_details=f"Attempted to get displayable image bytes for '{request.source_path}'. "
+                f"Failed because no provider is registered for extension '{extension}'."
+            )
+
+        # FAILURE CASE: decoder doesn't implement the decode mixin
+        if not isinstance(decoder, ImageArtifactDecoderMixin):
+            return GetDisplayableImageBytesResultFailure(
+                result_details=f"Attempted to get displayable image bytes for '{request.source_path}'. "
+                f"Failed because provider '{decoder.get_friendly_name()}' does not support decoding."
+            )
+
+        # FAILURE CASE: no "Image" encoder provider registered
+        encoder_class = self._registry.get_provider_class_by_friendly_name("Image")
+        encoder = self._registry.get_or_create_provider_instance(encoder_class) if encoder_class else None
+        if encoder is None:
+            return GetDisplayableImageBytesResultFailure(
+                result_details="Attempted to get displayable image bytes. "
+                "Failed because no 'Image' provider is registered to encode with."
+            )
+
+        # FAILURE CASE: encoder doesn't implement the encode mixin
+        if not isinstance(encoder, ImageArtifactEncoderMixin):
+            return GetDisplayableImageBytesResultFailure(
+                result_details=f"Attempted to get displayable image bytes for '{request.source_path}'. "
+                f"Failed because provider '{encoder.get_friendly_name()}' does not support encoding."
+            )
+
+        # FAILURE CASE: requested format isn't one the encoder supports
+        if request.format is not None and request.format not in encoder.get_preview_formats():
+            return GetDisplayableImageBytesResultFailure(
+                result_details=f"Attempted to get displayable image bytes for '{request.source_path}'. "
+                f"Failed because format '{request.format}' is not supported by provider '{encoder.get_friendly_name()}'."
+            )
+
+        image_bytes = await self.get_displayable_image_bytes(
+            request.source_path, decoder, encoder, request.situation, request.format
+        )
+        return GetDisplayableImageBytesResultSuccess(
+            image_bytes=image_bytes,
+            format=request.format or encoder.get_default_preview_format(),
+            result_details=f"Got displayable bytes for '{request.source_path}' ({request.situation.value}).",
         )
 
     def on_handle_list_artifact_providers_request(

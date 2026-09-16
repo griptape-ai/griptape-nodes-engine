@@ -253,19 +253,25 @@ class ImageArtifactProvider(BaseArtifactProvider, ImageArtifactDecoderMixin, Ima
                 channel_layout=channel_layout,
             )
 
-    def encode(self, decoded_artifact: DecodedImageArtifact, situation: ImageArtifactSituation) -> bytes:  # noqa: ARG002
+    def encode(
+        self,
+        decoded_artifact: DecodedImageArtifact,
+        situation: ImageArtifactSituation,  # noqa: ARG002
+        format: str | None = None,  # noqa: A002
+    ) -> bytes:
         """Encode a DecodedImageArtifact to raster bytes for VIEWER/THUMBNAIL.
 
         ORIGINAL is never passed in - ArtifactManager skips encode for it - so this
         method does not special-case it, mirroring decode()'s contract. situation
         does not currently change the output format; every situation encodes to
-        get_default_preview_format().
+        format, or get_default_preview_format() when format is None.
         """
+        output_format = format or self.get_default_preview_format()
         pixel_data = self._normalize_to_uint8(decoded_artifact.pixel_data)
         img = Image.fromarray(pixel_data)
 
         output_buffer = BytesIO()
-        img.save(output_buffer, format=self.get_default_preview_format().upper())
+        img.save(output_buffer, format=output_format.upper())
         return output_buffer.getvalue()
 
     @staticmethod

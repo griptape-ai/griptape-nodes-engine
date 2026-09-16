@@ -12,6 +12,7 @@ from griptape_nodes.retained_mode.events.base_events import (
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.events.project_events import MacroPath
+from griptape_nodes.retained_mode.managers.artifact_providers.image_situation import ImageArtifactSituation
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
 
 
@@ -435,3 +436,57 @@ class CheckArtifactReadPermissionResultSuccess(WorkflowNotAlteredMixin, ResultPa
 @PayloadRegistry.register
 class CheckArtifactReadPermissionResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """The read-permission request itself was malformed (e.g. empty source path)."""
+
+
+@dataclass
+@PayloadRegistry.register
+class GetDisplayableImageBytesRequest(RequestPayload):
+    """Get displayable raster bytes for an image, decoded/encoded for a given situation.
+
+    The decoder is resolved by the source file's extension (same routing as
+    ``CheckArtifactReadPermissionRequest``/``extract_artifact_metadata``). The
+    encoder is resolved independently, by friendly name "Image" -- decode and
+    encode do not have to be the same provider: ``DecodedImageArtifact`` is a
+    format-agnostic intermediate once produced, so any provider implementing
+    ``ImageArtifactEncoderMixin`` can encode output decoded by a different
+    provider's ``ImageArtifactDecoderMixin``.
+
+    ``ImageArtifactSituation.ORIGINAL`` is handled by ``ArtifactManager``
+    directly: ``decode()``/``encode()`` are never called for it, per both
+    mixins' documented contracts. The manager reads and returns the source
+    file's raw bytes unmodified instead.
+
+    Args:
+        source_path: Absolute path to the source image file.
+        situation: The display context bytes are being requested for.
+        format: Desired output format (e.g. "webp"), None for the encoder
+            provider's own default. Ignored for ORIGINAL.
+
+    Results: GetDisplayableImageBytesResultSuccess | GetDisplayableImageBytesResultFailure
+    """
+
+    source_path: str
+    situation: ImageArtifactSituation
+    format: str | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class GetDisplayableImageBytesResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Displayable image bytes were produced successfully.
+
+    Attributes:
+        image_bytes: Encoded raster bytes (webp/png for VIEWER/THUMBNAIL), or
+            the untouched source file's raw bytes for ORIGINAL.
+        format: Lowercase format of image_bytes, no leading dot. For ORIGINAL
+            this is the source file's own extension.
+    """
+
+    image_bytes: bytes
+    format: str
+
+
+@dataclass
+@PayloadRegistry.register
+class GetDisplayableImageBytesResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Failed to produce displayable image bytes."""
