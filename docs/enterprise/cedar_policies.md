@@ -6,16 +6,14 @@ Choose Raw Cedar only when the builder's capability catalog cannot express the r
 
 ## Policy inputs
 
-Cedar makes each decision from four inputs: `(principal, action, resource, context)`. The engine creates an authorization checkpoint just before a privileged operation. The Griptape Nodes app maps that checkpoint and its license data into these Cedar inputs:
+Cedar makes each decision from four inputs: `(principal, action, resource, context)`. Griptape Nodes maps each authorization checkpoint and its license data into these Cedar inputs:
 
-| Part        | What it holds                                                                | Use it for                                           |
-| ----------- | ---------------------------------------------------------------------------- | ---------------------------------------------------- |
-| `principal` | A fixed placeholder, `User::"<anonymous>"`.                                  | Nothing. Leave it unconstrained.                     |
-| `action`    | The engine checkpoint, e.g. `Action::"LoadLibrary"`.                         | Naming which operation a rule covers.                |
-| `resource`  | The checkpoint's resolved library, node type, project, model, or codec.      | Matching a specific thing, or a fact about it.       |
-| `context`   | Facts added by the app: active project, engine, libraries, and license data. | Scoping a rule to one project, or to a license type. |
-
-The app evaluates the policy and returns a verdict at each checkpoint. The engine does not parse Cedar. It enforces the app's verdict.
+| Part        | What it holds                                                           | Use it for                                           |
+| ----------- | ----------------------------------------------------------------------- | ---------------------------------------------------- |
+| `principal` | A fixed placeholder, `User::"<anonymous>"`.                             | Nothing. Leave it unconstrained.                     |
+| `action`    | The authorization checkpoint, e.g. `Action::"LoadLibrary"`.             | Naming which operation a rule covers.                |
+| `resource`  | The checkpoint's resolved library, node type, project, model, or codec. | Matching a specific thing, or a fact about it.       |
+| `context`   | Active project, engine, library, and license facts.                     | Scoping a rule to one project, or to a license type. |
 
 ## Combining decisions
 
@@ -57,12 +55,6 @@ Each action below identifies an operation that the engine gates. The result of a
 | `Action::"ReadVideoCodec"`  | Video is about to be read, and when a picker is built.    | `VideoCodec` | The read is refused, or the codec is filtered out.                                                            |
 | `Action::"WriteVideoCodec"` | Video is about to be written, and when a picker is built. | `VideoCodec` | The write is refused, or the codec is filtered out.                                                           |
 
-When restricting a model, name both `OfferModel` and `InvokeModel`. `OfferModel` removes it from pickers, but without `InvokeModel`, nodes already bound to it can still call it.
-
-!!! note "Reserved action names"
-
-    `Action::"LoadNodeType"` and `Action::"ListModel"` belong to the policy model, but the engine never requests them. Rules that name either action never match.
-
 ## Resource attributes
 
 Unless a table says otherwise, each resource attribute is optional. Use `has` before reading an optional attribute. See [Guard optional attributes](#guard-optional-attributes) for the required pattern.
@@ -76,16 +68,14 @@ Unless a table says otherwise, each resource attribute is optional. Use `has` be
 
 ### `NodeType`
 
-| Attribute                 | Type        | Present when                                                                   |
-| ------------------------- | ----------- | ------------------------------------------------------------------------------ |
-| `id`                      | string      | Always. The node type name.                                                    |
-| `executes_arbitrary_code` | bool        | Always. `true` when the node runs Python supplied at runtime.                  |
-| `lifecycle_stage`         | string      | The node declares a stage, or inherits one from its library.                   |
-| `model_ids`               | set<string> | The node declares model usage.                                                 |
-| `provider_ids`            | set<string> | The node declares model or provider usage.                                     |
-| `model_families`          | set<string> | The node's declared models resolve to families in the library's model catalog. |
-
-Those three sets carry what the node declares, so a rule can refuse the node at `InstantiateNode` rather than wait for it to call a model. Each set is a union of every model the node declares, so a node offering a dropdown of many models is refused as a whole. To filter individual entries in that dropdown, write the rule against `Model` and `OfferModel` instead.
+| Attribute                 | Type        | Present when                                                                         |
+| ------------------------- | ----------- | ------------------------------------------------------------------------------------ |
+| `id`                      | string      | Always. The node type name.                                                          |
+| `executes_arbitrary_code` | bool        | Always. `true` when the node's library declaration marks arbitrary Python execution. |
+| `lifecycle_stage`         | string      | The node declares a stage, or inherits one from its library.                         |
+| `model_ids`               | set<string> | The node declares model usage.                                                       |
+| `provider_ids`            | set<string> | The node declares model or provider usage.                                           |
+| `model_families`          | set<string> | The node's declared models resolve to families in the library's model catalog.       |
 
 ### `Project`
 
@@ -94,26 +84,16 @@ Those three sets carry what the node declares, so a rule can refuse the node at 
 | `id`      | string | Always. The project's opaque id, a GUID for projects created in the editor. |
 | `name`    | string | The template has loaded far enough to know its name.                        |
 
-Never construct a project `id` or assume it is a file path. The policy matches it verbatim, and the editor generates it. Copy the value from the project picker in the Permission Editor.
-
-!!! warning "Legacy project ids"
-
-    Projects that predate explicit ids use their file path as the id. They do not match rules written for GUIDs, just as newer projects do not match rules written for paths. Copy each project's id from the project picker before naming it in a rule.
-
 Use `name` for a human-readable rule and `id` when the match must be exact. Prefer `id` in a `permit`. The project name becomes available only after the template has loaded, and a permit that does not match results in a denial.
 
 ### `Model`
 
-| Attribute        | Type        | Present when                                                         |
-| ---------------- | ----------- | -------------------------------------------------------------------- |
-| `id`             | string      | Always. The stable catalog model key.                                |
-| `provider_id`    | string      | The key resolves in the model catalog.                               |
-| `model_families` | set<string> | The resolved model declares a family. Carries that one family.       |
-| `node_type`      | string      | An `OfferModel` check made on behalf of a node. Names the node type. |
-
-`node_type` is node attribution the engine adds for its own use. It is not declared in the entity model and is absent from catalog-wide checks, so do not write rules against it.
-
-To match a provider rather than a single model, see [Entity hierarchy](#entity-hierarchy).
+| Attribute                                                                                  | Type        | Present when                                                   |
+| ------------------------------------------------------------------------------------------ | ----------- | -------------------------------------------------------------- |
+| `id`                                                                                       | string      | Always. The stable catalog model key.                          |
+| `provider_id`                                                                              | string      | The key resolves in the model catalog.                         |
+| `model_families`                                                                           | set<string> | The resolved model declares a family. Carries that one family. |
+| To match a provider rather than a single model, see [Entity hierarchy](#entity-hierarchy). |             |                                                                |
 
 ### `VideoCodec`
 
@@ -141,7 +121,7 @@ Provider ids are the provider keys in a library's [`model_catalog`](../developme
 
 !!! warning "Guard context facts"
 
-    All context facts are optional. The app includes the facts it can resolve and omits the rest, so check each one with `has` before reading it.
+    All context facts are optional. Griptape Nodes includes the facts it can resolve and omits the rest, so check each one with `has` before reading it.
 
     Guard the record, then read through it:
 
@@ -170,7 +150,7 @@ The builder adds this condition to every statement in a Project-scoped template,
 when { context has active_project && context.active_project.id == "<project id>" }
 ```
 
-The app derives `active_project` from the engine's project chain. This has two consequences.
+Griptape Nodes evaluates the policy for each project in the active project's chain. This has two consequences.
 
 **Include ancestor projects.** When a project inherits from a parent, the policy runs for each project in the chain: first the active project, then each ancestor. Every run must allow the operation. A `forbid` scoped to a parent therefore blocks its children, and a project allow-list must include every project in the chain.
 
@@ -228,7 +208,7 @@ The value of `@capability` is free-form, and Cedar does not validate it. Conside
 
 ## Examples
 
-Each example below is a complete Raw Cedar policy. It does not depend on the builder posture or another template.
+Each example below is a complete Raw Cedar policy.
 
 ### Block arbitrary-code nodes
 
@@ -274,6 +254,8 @@ when {
 
 The `unless` clause inverts the match, blocking every provider except the two named below. The `in` operator returns false, rather than an error, when a resource has no matching ancestor, so it does not need a `has` guard.
 
+Name both model checkpoints when restricting models. `OfferModel` removes denied models from pickers. `InvokeModel` blocks nodes already bound to them.
+
 ```cedar
 permit(principal, action, resource);
 
@@ -317,7 +299,7 @@ unless {
 
 ### Restrict codec writes
 
-This statement names only the write checkpoint. It does not affect reading existing footage.
+This statement names only the write checkpoint.
 
 ```cedar
 permit(principal, action, resource);
@@ -412,15 +394,3 @@ permit(principal, action in [
   Action::"WriteVideoCodec"
 ], resource);
 ```
-
-## Trace a denial
-
-A denial starts with the rule's `@advice`, followed by the template and rule that produced it:
-
-```
-Nodes that run arbitrary code are not available on this license. (source: policy 'Show A Lockdown', rule 'nodes/no-arbitrary-code').
-```
-
-The template supplies the policy name, and the rule's `@id` supplies the rule name. Without `@id`, the rule falls back to its document id. If the document has no declared id, that fallback is a positional `license-<n>` value that changes when documents are added or reordered. Add `@id` to every rule to avoid that unstable fallback. Without `@advice`, the message starts with `Missing capability: <name>.` when the rule has `@capability`, or `Denied by the license policy.` when it has neither annotation.
-
-A message ending with `managed by Griptape` identifies a Griptape-authored rule, so you cannot edit its text. The phrase does not tell you whether you can detach the rule. An admin can detach a Griptape-managed template in the Permission Editor, but cannot detach a policy that Griptape applies platform-wide.

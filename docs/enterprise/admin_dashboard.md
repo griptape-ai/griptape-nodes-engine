@@ -181,7 +181,7 @@ The permission list is a catalog of capabilities grouped by category. Each row c
 | **Libraries** | Use libraries                     | Loading node libraries.                                                                                                          | Specific libraries |
 | **Libraries** | Use libraries by lifecycle stage  | Loading libraries at specific lifecycle stages (`STABLE`, `BETA`, `ALPHA`, `LABS`, `DEPRECATED`).                                | Lifecycle stages   |
 | **Nodes**     | Use nodes by lifecycle stage      | Using nodes at specific lifecycle stages.                                                                                        | Lifecycle stages   |
-| **Nodes**     | Use nodes that run arbitrary code | Nodes that execute Python supplied at runtime.                                                                                   | Not scopeable      |
+| **Nodes**     | Use nodes that run arbitrary code | Nodes whose library declarations mark them as executing arbitrary Python.                                                        | Not scopeable      |
 | **Projects**  | Use projects                      | Loading and activating projects.                                                                                                 | Specific projects  |
 | **Models**    | Use model providers               | Every model under a provider. Denied models are filtered out of model pickers and blocked from invocation; nodes stay creatable. | Specific providers |
 | **Models**    | Use model families                | Models in specific families (e.g. Claude 4, GPT-4). Same picker filtering and invocation blocking as providers.                  | Specific families  |
@@ -194,7 +194,7 @@ When a template conflicts with another template or access group for the same lic
 
 #### Compiled Cedar
 
-The builder compiles your choices into [Cedar](https://www.cedarpolicy.com/) policy statements. The Griptape Nodes app evaluates those statements at engine authorization checkpoints, and the engine enforces the returned verdict. The **Compiled Cedar Policy** section is collapsed by default and shows the Cedar from the last save. See [Cedar Policies](cedar_policies.md) for details.
+The builder compiles your choices into [Cedar](https://www.cedarpolicy.com/) policy statements. Griptape Nodes evaluates those statements at authorization checkpoints. The **Compiled Cedar Policy** section is collapsed by default and shows the Cedar from the last save. See [Cedar Policies](cedar_policies.md) for details.
 
 ### Raw Cedar templates
 
