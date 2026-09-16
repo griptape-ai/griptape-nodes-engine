@@ -40,10 +40,11 @@ class TestExecuteNodeStrictMode:
         mock_engine = MagicMock()
         mock_engine.object_manager = object_manager
         mock_engine.library_manager = library_manager
+        # Engine always has a WorkerManager, so a test that leaves it None describes a shape the
+        # engine cannot be in. Routing awaits it, so it needs to be awaitable.
+        worker_manager = worker_manager or MagicMock()
+        worker_manager.wait_until_executable = AsyncMock()
         mock_engine.worker_manager = worker_manager
-        # Routing awaits this before dispatching, so a bare MagicMock is not awaitable enough.
-        if worker_manager is not None:
-            worker_manager.wait_until_executable = AsyncMock()
         return NodeManager(MagicMock(), engine=mock_engine)
 
     def _make_mock_node(self, *, aprocess_reports: bool = False) -> MagicMock:
@@ -74,7 +75,6 @@ class TestExecuteNodeStrictMode:
         m.get_worker_for_library.return_value = None
         # Awaited on the orchestrator route before a node is routed, so it has to be a coroutine
         # rather than a plain MagicMock attribute.
-        m.wait_for_library_ready = AsyncMock(return_value=None)
         return m
 
     @pytest.mark.asyncio

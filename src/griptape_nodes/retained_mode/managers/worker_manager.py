@@ -769,7 +769,7 @@ class WorkerManager(EngineScoped):
         session_id = self.engine.get_session_id()
         if not session_id:
             logger.error("Session event set but no session ID available for library '%s'.", library_name)
-            self._refuse_spawn(library_name, "no session was available to start its worker process.")
+            self.note_worker_unavailable(library_name, "no session was available to start its worker process.")
             return
         # The worker is handed its library's execution environment as PYTHONPATH, so that directory
         # has to exist before the process starts. It does: the orchestrator builds it while
@@ -798,7 +798,7 @@ class WorkerManager(EngineScoped):
         if exc is None:
             return
         logger.error("Failed to spawn worker for library '%s': %s", library_name, exc)
-        self._refuse_spawn(library_name, f"the worker process that runs it could not be started ({exc}).")
+        self.note_worker_unavailable(library_name, f"the worker process that runs it could not be started ({exc}).")
 
     def expect_worker(self, library_name: str) -> None:
         """Declare that a worker is coming for `library_name`, so callers can wait for it.
@@ -827,12 +827,27 @@ class WorkerManager(EngineScoped):
         self._worker_unavailable[library_name] = reason
         self.note_library_loaded(library_name)
 
+    def forget_library(self, library_name: str) -> None:
+        """Drop everything this manager records about `library_name`.
+
+        Called when a library leaves the registry. These are keyed by a bare name, so without this
+        they outlive the record they describe: the reason from an evicted worker would still be
+        reported after the library came back declaring no execution dependencies at all, for a
+        library that now runs in this process.
+        """
+        self._execution_ready.pop(library_name, None)
+        self._worker_unavailable.pop(library_name, None)
+
     def worker_unavailable_reason(self, library_name: str) -> str | None:
         """Why no worker is available to run `library_name`, or None if that is not the problem."""
         return self._worker_unavailable.get(library_name)
 
-    def is_execution_available(self, library_name: str) -> bool:
-        """Whether `library_name` has settled -- loaded, refused, or died -- rather than pending."""
+    def has_settled(self, library_name: str) -> bool:
+        """Whether `library_name` has settled -- loaded, refused, or died -- rather than pending.
+
+        Settled is not available: a refused spawn settles, and `worker_unavailable_reason` then
+        says why. This is a wait predicate, not an answer about whether execution can proceed.
+        """
         ready = self._execution_ready.get(library_name)
         return ready is None or ready.is_set()
 
@@ -849,7 +864,7 @@ class WorkerManager(EngineScoped):
         changing and the cost of it being wrong once is a node that hangs with no diagnosis. A named
         timeout is a bug report; an unbounded wait is a mystery.
         """
-        if self.is_execution_available(library_name):
+        if self.has_settled(library_name):
             return
         logger.info("Waiting for library '%s''s worker to finish loading before executing", library_name)
         try:
@@ -868,19 +883,15 @@ class WorkerManager(EngineScoped):
         Boot uses this rather than `wait_until_executable` per library: one collective ceiling, and
         the caller decides what an unsettled library means for the rest of initialization.
         """
-        pending = [name for name in library_names if not self.is_execution_available(name)]
+        pending = [name for name in library_names if not self.has_settled(name)]
         if not pending:
             return []
         try:
             with anyio.fail_after(timeout_s):
                 await asyncio.gather(*[self._execution_ready[name].wait() for name in pending])
         except TimeoutError:
-            return [name for name in pending if not self.is_execution_available(name)]
+            return [name for name in pending if not self.has_settled(name)]
         return []
-
-    def _refuse_spawn(self, library_name: str, reason: str) -> None:
-        """Record why no worker is coming for `library_name`, and release anything waiting on one."""
-        self.note_worker_unavailable(library_name, reason)
 
     def get_topics_to_subscribe(self, *, is_worker: bool) -> list[str]:
         """Build the list of topics to subscribe to at connection start.

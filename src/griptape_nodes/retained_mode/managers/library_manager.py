@@ -878,9 +878,12 @@ class LibraryManager(EngineScoped):
             # resource the machine lacks, an execution environment that would not build -- and
             # WorkerManager knows process-level ones. Library reasons come first because they apply
             # to an in-process library too, which never reaches the worker branch below.
-            unavailable = (library_info.execution_unavailable_reason if library_info else None) or (
-                self._worker_manager.worker_unavailable_reason(library_name) if self._worker_manager else None
+            worker_reason = (
+                self._worker_manager.worker_unavailable_reason(library_name)
+                if library_info and library_info.executes_in_worker
+                else None
             )
+            unavailable = (library_info.execution_unavailable_reason if library_info else None) or worker_reason
             if unavailable:
                 msg = (
                     f"Library '{library_name}' cannot run right now: "
@@ -3483,6 +3486,9 @@ class LibraryManager(EngineScoped):
         ]
         for file_path in stale_paths:
             del self._library_file_path_to_info[file_path]
+        # Whether a worker is available is keyed by library name over there, so it has to be dropped
+        # with the record rather than outliving it.
+        self._worker_manager.forget_library(request.library_name)
         details = f"Successfully unloaded (and unregistered) library '{request.library_name}'."
         return UnloadLibraryFromRegistryResultSuccess(result_details=details)
 
