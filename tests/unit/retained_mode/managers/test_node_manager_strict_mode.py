@@ -41,6 +41,9 @@ class TestExecuteNodeStrictMode:
         mock_engine.object_manager = object_manager
         mock_engine.library_manager = library_manager
         mock_engine.worker_manager = worker_manager
+        # Routing awaits this before dispatching, so a bare MagicMock is not awaitable enough.
+        if worker_manager is not None:
+            worker_manager.wait_until_executable = AsyncMock()
         return NodeManager(MagicMock(), engine=mock_engine)
 
     def _make_mock_node(self, *, aprocess_reports: bool = False) -> MagicMock:
