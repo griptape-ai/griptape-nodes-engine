@@ -27,7 +27,12 @@ class _IncompleteEncoder(ImageArtifactEncoderMixin):
 class _CompliantEncoder(ImageArtifactEncoderMixin):
     """A minimal concrete implementation, used only to prove the contract is satisfiable."""
 
-    def encode(self, decoded_artifact: DecodedImageArtifact, situation: ImageArtifactSituation) -> bytes:  # noqa: ARG002
+    def encode(
+        self,
+        decoded_artifact: DecodedImageArtifact,  # noqa: ARG002
+        situation: ImageArtifactSituation,  # noqa: ARG002
+        format: str | None = None,  # noqa: ARG002, A002
+    ) -> bytes:
         return b""
 
 
