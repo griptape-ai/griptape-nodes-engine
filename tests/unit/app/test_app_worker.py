@@ -1513,24 +1513,6 @@ class TestWorkerExecutionPath:
         assert env["PYTHONPATH"] == f"/libs/mine/.venv-exec/sp{os.pathsep}/host/libs"
 
     @pytest.mark.asyncio
-    async def test_spawn_refuses_when_the_environment_failed_to_build(self, worker_manager: WorkerManager) -> None:
-        """A failed build leaves the venv directory behind, so existence alone says nothing.
-
-        Spawning anyway would front the worker's import path with a partial site-packages -- the
-        unpinned execution the edit/exec split exists to prevent -- and the raw ModuleNotFoundError
-        would bury the recorded uv error.
-        """
-        worker_manager.engine.library_manager.execution_env_failure_reason.return_value = (  # type: ignore[attr-defined]
-            "its execution dependencies could not be installed (no solution found)."
-        )
-        worker_manager._session_ready_event.set()
-        worker_manager.engine.get_session_id.return_value = "sess-1"  # type: ignore[attr-defined]
-
-        with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn:
-            await worker_manager._spawn_when_session_ready("My Library")
-
-        spawn.assert_not_awaited()
-
     @pytest.mark.asyncio
     async def test_no_execution_environment_means_no_pythonpath(self, worker_manager: WorkerManager) -> None:
         """A library with no execution dependencies, or one whose environment is not built yet.

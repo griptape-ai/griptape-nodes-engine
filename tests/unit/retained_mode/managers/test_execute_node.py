@@ -72,6 +72,9 @@ def _make_node_manager(
     mock_engine.object_manager = object_manager
     mock_engine.library_manager = library_manager
     mock_engine.worker_manager = worker_manager
+    # Routing awaits this before dispatching, so a bare MagicMock is not awaitable enough.
+    if worker_manager is not None:
+        worker_manager.wait_until_executable = AsyncMock()
     return NodeManager(MagicMock(), engine=mock_engine)
 
 

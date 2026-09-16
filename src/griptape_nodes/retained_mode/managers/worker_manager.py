@@ -12,6 +12,8 @@ import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import anyio
+
 from griptape_nodes.bootstrap.utils.subprocess_websocket_base import WebSocketMessage
 from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
 from griptape_nodes.retained_mode.engine import EngineScoped
@@ -141,6 +143,15 @@ class WorkerManager(EngineScoped):
 
         # Set when an active session becomes available; gates worker spawning.
         self._session_ready_event: asyncio.Event = asyncio.Event()
+
+        # Whether a library's execution is available yet, and why not, keyed by library name.
+        #
+        # Held here rather than on LibraryInfo because these answer questions about a PROCESS: is
+        # one coming, has it loaded the library, did it die. LibraryManager used to own both fields
+        # and this manager wrote them, so a record with one owner had two writers -- and the clear
+        # before a spawn raced the write on a refusal.
+        self._execution_ready: dict[str, asyncio.Event] = {}
+        self._worker_unavailable: dict[str, str] = {}
 
         config = engine.config_manager
         self.heartbeat_interval_s: float = config.get_config_value(
@@ -584,6 +595,13 @@ class WorkerManager(EngineScoped):
             worker_engine_id,
             worker_events.WorkerGoneError(f"worker '{worker_engine_id}' stopped responding and was shut down"),
         )
+        # Eviction is terminal -- nothing respawns the worker -- so anything still waiting on this
+        # library would wait forever, and the next run would report a worker that "may still be
+        # starting up" for the rest of the session.
+        if lib_name:
+            self.note_worker_unavailable(
+                lib_name, "the worker process that runs it stopped responding and was shut down."
+            )
 
         # Notify registered callbacks that this worker has been evicted.
         for cb in self._worker_evicted_callbacks:
@@ -755,22 +773,8 @@ class WorkerManager(EngineScoped):
             return
         # The worker is handed its library's execution environment as PYTHONPATH, so that directory
         # has to exist before the process starts. It does: the orchestrator builds it while
-        # registering the library, before any spawn is scheduled, so there is nothing to wait for.
-        #
-        # A failed build records why and leaves the venv directory behind, so spawning anyway would
-        # put a partial or stale site-packages at the front of the worker's import path -- the exact
-        # unpinned execution the edit/exec split exists to prevent -- and the raw ModuleNotFoundError
-        # would bury the recorded uv error. Refusing here keeps the reason as the thing the next run
-        # reports.
-        failed_env_reason = self.engine.library_manager.execution_env_failure_reason(library_name)
-        if failed_env_reason is not None:
-            logger.error(
-                "Not spawning a worker for library '%s': %s",
-                library_name,
-                failed_env_reason,
-            )
-            self._refuse_spawn(library_name, failed_env_reason)
-            return
+        # registering the library, and a library whose build failed is never asked for a worker --
+        # LibraryManager knows its own build result and does not request one.
         args = [
             sys.executable,
             "-m",
@@ -796,19 +800,87 @@ class WorkerManager(EngineScoped):
         logger.error("Failed to spawn worker for library '%s': %s", library_name, exc)
         self._refuse_spawn(library_name, f"the worker process that runs it could not be started ({exc}).")
 
-    def _refuse_spawn(self, library_name: str, reason: str) -> None:
-        """Record why no worker is coming for `library_name`, and release anything waiting on one.
+    def expect_worker(self, library_name: str) -> None:
+        """Declare that a worker is coming for `library_name`, so callers can wait for it.
 
-        `_start_workers` clears `execution_unavailable_reason` and installs a fresh `library_ready`
-        before scheduling a spawn, so a refusal that records neither leaves the next run waiting
-        out the whole startup grace and then blaming a library load that never began.
+        Called before the spawn is requested. Installs a fresh readiness gate and drops any account
+        of a previous attempt, which no longer describes the situation. Every attempt gets one: a
+        worker registers BEFORE it loads libraries, so execution routing has to wait for the load
+        rather than for the registration.
         """
-        library_info = self.engine.library_manager.get_library_info_by_library_name(library_name)
-        if library_info is None:
+        self._execution_ready[library_name] = asyncio.Event()
+        self._worker_unavailable.pop(library_name, None)
+
+    def note_library_loaded(self, library_name: str) -> None:
+        """Release anything waiting on `library_name`, now that its worker has loaded it."""
+        ready = self._execution_ready.get(library_name)
+        if ready is not None:
+            ready.set()
+
+    def note_worker_unavailable(self, library_name: str, reason: str) -> None:
+        """Record why no worker will run `library_name`, and release anything waiting on one.
+
+        Recording without releasing leaves the next run waiting out the whole startup grace before
+        blaming a library load that never began; releasing without recording leaves it blaming a
+        worker that "may still be starting up" for the rest of the session.
+        """
+        self._worker_unavailable[library_name] = reason
+        self.note_library_loaded(library_name)
+
+    def worker_unavailable_reason(self, library_name: str) -> str | None:
+        """Why no worker is available to run `library_name`, or None if that is not the problem."""
+        return self._worker_unavailable.get(library_name)
+
+    def is_execution_available(self, library_name: str) -> bool:
+        """Whether `library_name` has settled -- loaded, refused, or died -- rather than pending."""
+        ready = self._execution_ready.get(library_name)
+        return ready is None or ready.is_set()
+
+    async def wait_until_executable(self, library_name: str) -> None:
+        """Block until `library_name` can be executed, or until it is settled that it cannot.
+
+        A worker registers BEFORE it loads libraries -- registration is what carries the
+        orchestrator's project to it, and the project decides how libraries load -- so routing would
+        otherwise see somewhere to send execution whose library is not loaded yet, and forwarding
+        into that window fails node creation there.
+
+        Cannot hang: every terminal outcome releases the gate (loaded, spawn refused, spawn died,
+        worker evicted). Bounded anyway, because "every" is a claim about code that will keep
+        changing and the cost of it being wrong once is a node that hangs with no diagnosis. A named
+        timeout is a bug report; an unbounded wait is a mystery.
+        """
+        if self.is_execution_available(library_name):
             return
-        library_info.execution_unavailable_reason = reason
-        if library_info.library_ready is not None:
-            library_info.library_ready.set()
+        logger.info("Waiting for library '%s''s worker to finish loading before executing", library_name)
+        try:
+            with anyio.fail_after(self.heartbeat_startup_grace_s):
+                await self._execution_ready[library_name].wait()
+        except TimeoutError:
+            msg = (
+                f"Attempted to run a node from library '{library_name}'. Failed because its worker "
+                f"process did not finish loading the library within {self.heartbeat_startup_grace_s:.0f} seconds."
+            )
+            raise RuntimeError(msg) from None
+
+    async def wait_for_libraries(self, library_names: list[str], timeout_s: float) -> list[str]:
+        """Wait for several libraries at once. Returns the names that did not settle in time.
+
+        Boot uses this rather than `wait_until_executable` per library: one collective ceiling, and
+        the caller decides what an unsettled library means for the rest of initialization.
+        """
+        pending = [name for name in library_names if not self.is_execution_available(name)]
+        if not pending:
+            return []
+        try:
+            with anyio.fail_after(timeout_s):
+                await asyncio.gather(*[self._execution_ready[name].wait() for name in pending])
+        except TimeoutError:
+            return [name for name in pending if not self.is_execution_available(name)]
+        return []
+
+    def _refuse_spawn(self, library_name: str, reason: str) -> None:
+        """Record why no worker is coming for `library_name`, and release anything waiting on one."""
+        self.note_worker_unavailable(library_name, reason)
 
     def get_topics_to_subscribe(self, *, is_worker: bool) -> list[str]:
         """Build the list of topics to subscribe to at connection start.

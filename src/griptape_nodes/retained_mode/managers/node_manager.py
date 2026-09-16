@@ -3299,8 +3299,10 @@ class NodeManager(EngineScoped):
             # its library after registering, and forwarding into that window fails node creation
             # over there. Bounded by the startup grace, which surfaces here as a node failure.
             try:
-                if library_name:
-                    await library_manager.wait_for_library_ready(library_name)
+                # worker_manager is absent in embedders that never spawn one, and its absence is
+                # exactly the case where there is nothing to wait for.
+                if library_name and self.engine.worker_manager is not None:
+                    await self.engine.worker_manager.wait_until_executable(library_name)
                 worker = library_manager.get_worker_for_library(library_name) if library_name else None
             except RuntimeError as err:
                 return ExecuteNodeResultFailure(result_details=str(err), exception=err)
