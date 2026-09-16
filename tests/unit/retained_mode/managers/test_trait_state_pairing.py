@@ -22,6 +22,18 @@ class Twin(Trait):
         return {}
 
 
+_ALLOWED_LEVEL = 2
+
+
+class Ranged(Trait):
+    """A validator rejects out-of-range state, as a third-party trait's own field might."""
+
+    level: int = attrs.field(default=1, validator=attrs.validators.in_([1, _ALLOWED_LEVEL, 3]))
+
+    def ui_options_for_trait(self) -> dict:
+        return {}
+
+
 @pytest.fixture
 def foreign_twin() -> Generator[ModuleType, None, None]:
     """A second Trait class named Twin, importable from its own module.
@@ -141,3 +153,54 @@ class TestStateTheTraitCannotAccept:
         )
 
         assert any("Slider" in record.getMessage() for record in caplog.records)
+
+
+class TestAValidatorRejectingSavedState:
+    """A constructor argument out of range raises ValueError, not TypeError.
+
+    The two failure modes have to degrade the same way: neither is a mistake an artist can
+    fix mid-load.
+    """
+
+    def test_an_existing_trait_keeps_what_init_built(self) -> None:
+        ranged = Ranged(level=_ALLOWED_LEVEL)
+        parameter = Parameter(name="p", tooltip="t", traits={ranged})
+
+        NodeManager._apply_trait_states(
+            parameter,
+            [{"trait_name": "Ranged", "trait_module": __name__, "trait_state": {"level": 99}}],
+        )
+
+        assert ranged.level == _ALLOWED_LEVEL
+
+    def test_a_warning_names_the_trait_when_one_is_already_attached(self, caplog: pytest.LogCaptureFixture) -> None:
+        parameter = Parameter(name="p", tooltip="t", traits={Ranged(level=_ALLOWED_LEVEL)})
+        caplog.set_level("WARNING", logger="griptape_nodes")
+
+        NodeManager._apply_trait_states(
+            parameter,
+            [{"trait_name": "Ranged", "trait_module": __name__, "trait_state": {"level": 99}}],
+        )
+
+        assert any("Ranged" in record.getMessage() for record in caplog.records)
+
+    def test_no_trait_is_built_when_none_is_already_attached(self) -> None:
+        parameter = Parameter(name="p", tooltip="t", traits=set())
+
+        NodeManager._apply_trait_states(
+            parameter,
+            [{"trait_name": "Ranged", "trait_module": __name__, "trait_state": {"level": 99}}],
+        )
+
+        assert parameter.find_elements_by_type(Ranged) == []
+
+    def test_a_warning_names_the_trait_when_none_is_already_attached(self, caplog: pytest.LogCaptureFixture) -> None:
+        parameter = Parameter(name="p", tooltip="t", traits=set())
+        caplog.set_level("WARNING", logger="griptape_nodes")
+
+        NodeManager._apply_trait_states(
+            parameter,
+            [{"trait_name": "Ranged", "trait_module": __name__, "trait_state": {"level": 99}}],
+        )
+
+        assert any("Ranged" in record.getMessage() for record in caplog.records)

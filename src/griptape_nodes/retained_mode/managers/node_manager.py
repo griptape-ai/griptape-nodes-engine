@@ -4573,7 +4573,7 @@ class NodeManager(EngineScoped):
             else:
                 try:
                     existing.apply_state(entry.trait_state)
-                except TypeError:
+                except (TypeError, ValueError):
                     NodeManager._warn_unsatisfiable_trait_state(parameter, entry.trait_name)
             restored.append(RestoredTrait(entry=entry, trait=trait))
         return restored
@@ -4607,7 +4607,7 @@ class NodeManager(EngineScoped):
             return None
         try:
             trait = trait_class.from_state(entry.trait_state)
-        except TypeError:
+        except (TypeError, ValueError):
             NodeManager._warn_unsatisfiable_trait_state(parameter, entry.trait_name)
             return None
         parameter.add_trait(trait)

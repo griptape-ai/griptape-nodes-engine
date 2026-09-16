@@ -2043,7 +2043,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
             # Supply complete constructor state when the input mentions only some fields.
             try:
                 trait.apply_state({**trait.to_state(), **adopted})
-            except TypeError:
+            except (TypeError, ValueError):
                 logger.warning(
                     "Attempted to update the %s control on parameter '%s' from a UI option change, "
                     "but it would not accept those values, so the control is unchanged.",
@@ -3410,7 +3410,8 @@ class Trait(ABC, BaseNodeElement):
         absent from older files. Constructor converters and validators still apply.
 
         Raises:
-            TypeError: If ``state`` cannot satisfy the constructor.
+            TypeError: If ``state`` is missing a field the constructor requires.
+            ValueError: If ``state`` holds a value a field's validator rejects.
         """
         if not state:
             return

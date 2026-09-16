@@ -258,3 +258,47 @@ class TestStateTheTraitWillNotAccept:
         parameter.adopt_ui_options({"misdeclared": 9, "hide": True})
 
         assert parameter.authored_ui_options()["hide"] is True
+
+
+_ALLOWED_RANGE_LIMITED_LEVEL = 2
+
+
+class _RangeLimitedTrait(Trait):
+    """A validator rejects out-of-range state, as a third-party trait's own field might."""
+
+    level: int = attrs.field(default=1, validator=attrs.validators.in_([1, _ALLOWED_RANGE_LIMITED_LEVEL, 3]))
+
+    def ui_options_for_trait(self) -> dict:
+        return {"ranged": self.level}
+
+    @classmethod
+    def state_from_ui_options(cls, ui_options: dict) -> dict:
+        if "ranged" not in ui_options:
+            return {}
+        return {"level": ui_options["ranged"]}
+
+
+class TestStateAValidatorRejects:
+    """A constructor argument out of range raises ValueError, not TypeError.
+
+    Adoption has to treat the two the same: neither is a mistake an artist can fix mid-load.
+    """
+
+    def test_the_trait_keeps_the_state_it_had(self) -> None:
+        trait = _RangeLimitedTrait(level=_ALLOWED_RANGE_LIMITED_LEVEL)
+        parameter = Parameter(name="level", type="int", tooltip="t", traits={trait})
+
+        parameter.adopt_ui_options({"ranged": 99})
+
+        assert trait.level == _ALLOWED_RANGE_LIMITED_LEVEL
+
+    def test_a_warning_names_the_control_and_the_parameter(self, caplog: pytest.LogCaptureFixture) -> None:
+        parameter = Parameter(name="level", type="int", tooltip="t", traits={_RangeLimitedTrait()})
+        caplog.set_level(logging.WARNING, logger="griptape_nodes")
+
+        parameter.adopt_ui_options({"ranged": 99})
+
+        assert any(
+            "_RangeLimitedTrait" in record.getMessage() and "'level'" in record.getMessage()
+            for record in caplog.records
+        )
