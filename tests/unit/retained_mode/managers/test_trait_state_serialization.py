@@ -312,6 +312,22 @@ class TestTraitModuleStabilization:
 
         assert stabilized[0]["trait_module"] == "griptape_nodes.traits.options"
 
+    def test_a_dynamic_module_with_no_stable_name_is_reported(
+        self, engine: Engine, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Saving the session-local name would record a control no later load can find."""
+        trait_states = [{"trait_name": "Options", "trait_module": "gtn_dynamic_module_foo_py_123", "trait_state": {}}]
+        caplog.set_level(logging.WARNING, logger="griptape_nodes")
+
+        with (
+            patch.object(engine.library_manager, "is_dynamic_module", return_value=True),
+            patch.object(engine.library_manager, "get_stable_namespace_for_dynamic_module", return_value=None),
+        ):
+            stabilized = engine.node_manager._stabilize_trait_modules(trait_states)
+
+        assert stabilized[0]["trait_module"] == "gtn_dynamic_module_foo_py_123"
+        assert any("Options" in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+
     def test_serializing_a_library_trait_saves_the_stable_namespace(self, engine: Engine) -> None:
         node = _add_node(engine, "picker")
         node.discover()

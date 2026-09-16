@@ -4522,8 +4522,17 @@ class NodeManager(EngineScoped):
             if not library_manager.is_dynamic_module(trait_module):
                 continue
             stable_namespace = library_manager.get_stable_namespace_for_dynamic_module(trait_module)
-            if stable_namespace is not None:
-                entry["trait_module"] = stable_namespace
+            if stable_namespace is None:
+                # The module name only names that library inside this session, so recording it
+                # would save a control that cannot be found again.
+                logger.warning(
+                    "Attempted to save the '%s' control, but the library providing it has no stable name to "
+                    "record, so the control will be missing when this workflow is opened again. Reinstalling "
+                    "or updating that library and saving again will fix it.",
+                    entry.get("trait_name"),
+                )
+                continue
+            entry["trait_module"] = stable_namespace
         return trait_states
 
     @staticmethod
