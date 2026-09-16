@@ -548,10 +548,11 @@ class LibraryManager(EngineScoped):
         # only its process() runs in the worker, where .venv-exec is on sys.path).
         # Consumed by execution routing; never by load-time skips.
         executes_in_worker: bool = False
-        # Set when the library enters WORKER_PENDING state. The orchestrator waits on this
-        # event before returning RegisterLibraryFromFileResultSuccess so callers see the real
-        # fitness once the worker has loaded and reported back.
-        worker_ready: asyncio.Event | None = field(default=None, repr=False)
+        # Set once this library can be executed, or once it is settled that it cannot: loaded,
+        # spawn refused, spawn died, worker evicted. Named for the condition rather than the
+        # mechanism, because a caller wants to know whether it may route execution here, not how
+        # that came to be true. Whoever waits reads the failure reason afterwards.
+        library_ready: asyncio.Event | None = field(default=None, repr=False)
 
         # Set when this library's `.venv-exec` has been built (or has failed to build). The
         # orchestrator builds it as a background task so a multi-gigabyte torch install does not
@@ -811,9 +812,9 @@ class LibraryManager(EngineScoped):
         # Only legacy worker-mode libraries (requires_worker) use stub registration.
         if notification.node_schemas and not self._is_worker and library_info.requires_worker:
             self._register_nodes_from_worker_schemas(notification.library_name, notification.node_schemas)
-        # Unblock any code awaiting this library's worker_ready event.
-        if library_info.worker_ready is not None:
-            library_info.worker_ready.set()
+        # Unblock any code awaiting this library.
+        if library_info.library_ready is not None:
+            library_info.library_ready.set()
 
     @property
     def is_worker(self) -> bool:
@@ -827,19 +828,19 @@ class LibraryManager(EngineScoped):
         """
         return self._is_worker
 
-    async def wait_for_worker_ready(self, library_name: str) -> None:
-        """Block until the worker expected to serve this library has confirmed loading it.
+    async def wait_for_library_ready(self, library_name: str) -> None:
+        """Block until this library can be executed, or until it is settled that it cannot.
 
-        A worker registers BEFORE it loads libraries -- registration is what carries the
-        orchestrator's project to it, and the project decides how libraries load -- so execution
-        routing sees a registered worker whose library may not be loaded yet, and forwarding into
-        that window fails node creation on the worker. Cannot hang: the event is set on every
-        terminal outcome (library loaded, spawn refused, spawn died, worker evicted), and
-        `get_worker_for_library` reports the failure reason afterward. Returns immediately for a
-        library with no spawn scheduled.
+        Where a library runs in a separate process, that process registers BEFORE it loads
+        libraries -- registration is what carries the orchestrator's project to it, and the project
+        decides how libraries load -- so routing would otherwise see somewhere to send execution
+        whose library is not loaded yet, and forwarding into that window fails node creation there.
+        Cannot hang: the event is set on every terminal outcome (loaded, spawn refused, spawn died,
+        worker evicted), and `get_worker_for_library` reports the failure reason afterward. Returns
+        immediately for a library that runs in this process.
         """
         library_info = self.get_library_info_by_library_name(library_name)
-        if library_info is None or library_info.worker_ready is None or library_info.worker_ready.is_set():
+        if library_info is None or library_info.library_ready is None or library_info.library_ready.is_set():
             return
 
         config_mgr = self.engine.config_manager
@@ -850,7 +851,7 @@ class LibraryManager(EngineScoped):
         # with no diagnosis. A named timeout is a bug report; an unbounded wait is a mystery.
         try:
             with anyio.fail_after(wait_seconds):
-                await library_info.worker_ready.wait()
+                await library_info.library_ready.wait()
         except TimeoutError:
             msg = (
                 f"Attempted to run a node from library '{library_name}'. Failed because its worker "
@@ -1000,11 +1001,11 @@ class LibraryManager(EngineScoped):
                 # registration must not block on it.
                 if library_info.requires_worker:
                     library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.WORKER_PENDING
-                # Create (or reset) the worker_ready event for this spawn. Every spawn gets
+                # Create (or reset) the library_ready event for this spawn. Every spawn gets
                 # one: a worker registers BEFORE it loads libraries, so execution routing
                 # waits on this to keep a run from racing the worker's library load. Only
                 # WORKER_PENDING (legacy) libraries block boot on it in _await_pending_workers.
-                library_info.worker_ready = asyncio.Event()
+                library_info.library_ready = asyncio.Event()
                 # A fresh attempt, so an account of a PREVIOUS one no longer describes the
                 # situation. Not conditioned on the result: StartWorkerRequest only SCHEDULES the
                 # spawn and always reports success, so a spawn that dies records its own reason
@@ -1042,8 +1043,8 @@ class LibraryManager(EngineScoped):
         # LOADED, so that branch never fires for exactly the libraries whose execution just died.
         # Eviction is terminal -- nothing respawns the worker -- so an unreleased waiter waits
         # forever.
-        if library_info.worker_ready is not None:
-            library_info.worker_ready.set()
+        if library_info.library_ready is not None:
+            library_info.library_ready.set()
 
         if library_info.lifecycle_state == LibraryManager.LibraryLifecycleState.WORKER_PENDING:
             library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.FAILURE
@@ -4874,7 +4875,7 @@ class LibraryManager(EngineScoped):
         """Wait for all WORKER_PENDING libraries to report back via LibraryLoadedNotification.
 
         On timeout, marks remaining pending libraries as FAILURE/UNUSABLE so the rest of
-        initialization can continue. Per-library worker_ready events are set by
+        initialization can continue. Per-library library_ready events are set by
         _on_library_loaded_notification when the worker sends its LibraryLoadedNotification.
 
         When wait_seconds is None, reads the worker heartbeat startup grace from config so
@@ -4882,13 +4883,13 @@ class LibraryManager(EngineScoped):
         installs of large libraries can easily exceed the default heartbeat timeout.
         """
         # WORKER_PENDING only, matching the timeout loop below: exec-deps libraries also carry
-        # a worker_ready event (execution routing waits on it), but their nodes loaded locally
+        # a library_ready event (execution routing waits on it), but their nodes loaded locally
         # already and boot must not block on their workers.
         pending_events = [
-            info.worker_ready
+            info.library_ready
             for info in self._library_file_path_to_info.values()
-            if info.worker_ready is not None
-            and not info.worker_ready.is_set()
+            if info.library_ready is not None
+            and not info.library_ready.is_set()
             and info.lifecycle_state == LibraryManager.LibraryLifecycleState.WORKER_PENDING
         ]
         if not pending_events:
@@ -4910,8 +4911,8 @@ class LibraryManager(EngineScoped):
         if timed_out:
             for info in self._library_file_path_to_info.values():
                 if (
-                    info.worker_ready is not None
-                    and not info.worker_ready.is_set()
+                    info.library_ready is not None
+                    and not info.library_ready.is_set()
                     and info.lifecycle_state == LibraryManager.LibraryLifecycleState.WORKER_PENDING
                 ):
                     info.lifecycle_state = LibraryManager.LibraryLifecycleState.FAILURE
@@ -4921,7 +4922,7 @@ class LibraryManager(EngineScoped):
                     info.execution_unavailable_reason = (
                         f"its worker process did not report a library load within {wait_seconds} seconds."
                     )
-                    info.worker_ready.set()
+                    info.library_ready.set()
                     logger.warning(
                         "Worker for library '%s' timed out after %s seconds; marked as FAILURE.",
                         info.library_name,

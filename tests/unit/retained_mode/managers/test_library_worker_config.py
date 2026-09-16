@@ -287,9 +287,9 @@ class TestExecuteWaitsForTheWorkerLibraryLoad:
             library_name="Lib",
             executes_in_worker=True,
         )
-        info.worker_ready = asyncio.Event()
+        info.library_ready = asyncio.Event()
         if loaded:
-            info.worker_ready.set()
+            info.library_ready.set()
         return info
 
     @pytest.mark.asyncio
@@ -300,7 +300,7 @@ class TestExecuteWaitsForTheWorkerLibraryLoad:
         order: list[str] = []
 
         async def executes() -> None:
-            await mgr.wait_for_worker_ready("Lib")
+            await mgr.wait_for_library_ready("Lib")
             order.append("routed")
 
         async def worker_finishes_loading() -> None:
@@ -316,16 +316,16 @@ class TestExecuteWaitsForTheWorkerLibraryLoad:
         mgr = _make_library_manager()
         mgr._library_file_path_to_info["/some/path.json"] = self._spawned_info(loaded=True)
 
-        await mgr.wait_for_worker_ready("Lib")
+        await mgr.wait_for_library_ready("Lib")
 
     @pytest.mark.asyncio
     async def test_a_library_with_no_spawned_worker_does_not_wait(self) -> None:
         mgr = _make_library_manager()
         info = self._spawned_info(loaded=False)
-        info.worker_ready = None
+        info.library_ready = None
         mgr._library_file_path_to_info["/some/path.json"] = info
 
-        await mgr.wait_for_worker_ready("Lib")
+        await mgr.wait_for_library_ready("Lib")
 
     @pytest.mark.asyncio
     async def test_the_timeout_names_the_library_and_the_ceiling(self) -> None:
@@ -335,7 +335,7 @@ class TestExecuteWaitsForTheWorkerLibraryLoad:
         mgr._engine.config_manager.get_config_value.return_value = 0.01
 
         with pytest.raises(RuntimeError, match="Lib"):
-            await mgr.wait_for_worker_ready("Lib")
+            await mgr.wait_for_library_ready("Lib")
 
     @pytest.mark.asyncio
     async def test_an_eviction_during_the_wait_releases_it(self) -> None:
@@ -350,7 +350,7 @@ class TestExecuteWaitsForTheWorkerLibraryLoad:
         order: list[str] = []
 
         async def executes() -> None:
-            await mgr.wait_for_worker_ready("Lib")
+            await mgr.wait_for_library_ready("Lib")
             order.append("released")
 
         async def worker_dies() -> None:
@@ -464,7 +464,7 @@ class TestSpawnSkipForUnmetRequirements:
     async def test_a_library_whose_worker_is_registered_keeps_its_readiness(self) -> None:
         """_start_workers runs again per session join, and spawn_worker refuses the duplicate.
 
-        Replacing worker_ready here would leave nothing to set it, so every later run on a live,
+        Replacing library_ready here would leave nothing to set it, so every later run on a live,
         loaded worker would wait out the whole startup grace and then blame its library load.
         """
         manager = self._manager(requires_worker=False, unmet=False)
@@ -472,13 +472,13 @@ class TestSpawnSkipForUnmetRequirements:
         info = manager._library_file_path_to_info["/some/path.json"]
         already_ready = asyncio.Event()
         already_ready.set()
-        info.worker_ready = already_ready
+        info.library_ready = already_ready
 
         await manager._start_workers()
 
         cast("MagicMock", manager._engine).ahandle_request.assert_not_awaited()
-        assert info.worker_ready is already_ready
-        assert info.worker_ready.is_set()
+        assert info.library_ready is already_ready
+        assert info.library_ready.is_set()
 
     @pytest.mark.asyncio
     async def test_legacy_worker_library_still_spawns_even_when_unmet(self) -> None:
