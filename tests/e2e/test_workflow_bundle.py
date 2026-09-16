@@ -28,7 +28,7 @@ from griptape_nodes.retained_mode.events.library_events import (
 )
 from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
 from griptape_nodes.retained_mode.events.workflow_events import SaveWorkflowRequest, SaveWorkflowResultSuccess
-from griptape_nodes.retained_mode.publishing.workflow_packager import WorkflowPackager
+from griptape_nodes.retained_mode.publishing.workflow_packager import PackagedBundle, WorkflowPackager
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -46,16 +46,15 @@ LIBRARY_NAME = "Workflow Node Library"
 WORKFLOW_NAME = "bundle_e2e_workflow"
 
 
-class PackagedBundle(NamedTuple):
-    """What a packaging run left on disk, plus the values needed to run it."""
+class BundleOnDisk(NamedTuple):
+    """Where a packaging run wrote its bundle, and what the packager reported about it."""
 
     directory: Path
-    workflow_file_name: str
-    library_paths: list[str]
+    packaged: PackagedBundle
 
 
 @pytest.fixture
-def published_bundle(package_bundle: Callable[..., PackagedBundle]) -> PackagedBundle:
+def published_bundle(package_bundle: Callable[..., BundleOnDisk]) -> BundleOnDisk:
     """Package the Start -> Shout -> End workflow into a bundle folder."""
     return package_bundle(WORKFLOW_NAME, _build_shout_flow)
 
@@ -63,7 +62,7 @@ def published_bundle(package_bundle: Callable[..., PackagedBundle]) -> PackagedB
 @pytest.fixture
 def package_bundle(
     tmp_path: Path, engine: Engine, materialize_library: Callable[..., Path]
-) -> Callable[..., PackagedBundle]:
+) -> Callable[..., BundleOnDisk]:
     """Return a factory that registers the fixture library, saves a workflow, and packages it.
 
     ``build_flow`` receives the engine and the name of a freshly created top-level flow and is
@@ -71,7 +70,7 @@ def package_bundle(
     is the same for any graph.
     """
 
-    def _package(workflow_name: str, build_flow: Callable[[Engine, str], None]) -> PackagedBundle:
+    def _package(workflow_name: str, build_flow: Callable[[Engine, str], None]) -> BundleOnDisk:
         library_json = materialize_library(
             tmp_path / "library",
             template=FIXTURE_LIBRARY_JSON_TEMPLATE,
@@ -95,12 +94,8 @@ def package_bundle(
 
         workflow = WorkflowRegistry.get_workflow_by_name(save_result.workflow_name)
         bundle_dir = tmp_path / "bundle"
-        library_paths = WorkflowPackager(save_result.workflow_name).package_to_folder(bundle_dir, workflow)
-        return PackagedBundle(
-            directory=bundle_dir,
-            workflow_file_name=Path(save_result.file_path).name,
-            library_paths=library_paths,
-        )
+        packaged = WorkflowPackager(save_result.workflow_name).package_to_folder(bundle_dir, workflow)
+        return BundleOnDisk(directory=bundle_dir, packaged=packaged)
 
     return _package
 
@@ -145,11 +140,11 @@ def _build_shout_flow(engine: Engine, flow_name: str) -> None:
     _connect(shout_node, "shouted", end_node, "result")
 
 
-def test_package_to_folder_writes_a_complete_bundle(published_bundle: PackagedBundle) -> None:
+def test_package_to_folder_writes_a_complete_bundle(published_bundle: BundleOnDisk) -> None:
     """Every file a standalone bundle needs is present and internally consistent."""
     bundle = published_bundle.directory
 
-    assert (bundle / published_bundle.workflow_file_name).is_file()
+    assert (bundle / published_bundle.packaged.entrypoint_workflow_path).is_file()
     assert (bundle / "libraries").is_dir()
     config_path = bundle / "griptape_nodes_config.json"
     assert config_path.is_file()
@@ -165,7 +160,9 @@ def test_package_to_folder_writes_a_complete_bundle(published_bundle: PackagedBu
     assert config["enable_workspace_file_watching"] is False
     app_init = config["app_events"]["on_app_initialization_complete"]
     assert app_init["workflows_to_register"] == []
-    assert app_init["libraries_to_register"] == published_bundle.library_paths
+    assert app_init["libraries_to_register"] == [
+        library_path.as_posix() for library_path in published_bundle.packaged.library_paths
+    ]
 
     # Bundle-relative, so the folder stays runnable after being copied to another machine.
     for library_path in app_init["libraries_to_register"]:
@@ -187,7 +184,7 @@ def test_package_to_folder_writes_a_complete_bundle(published_bundle: PackagedBu
 
 def test_packaged_bundle_registers_libraries_on_a_clean_machine(
     tmp_path: Path,
-    published_bundle: PackagedBundle,
+    published_bundle: BundleOnDisk,
     engine_subprocess_env: Callable[..., dict[str, str]],
 ) -> None:
     """Running a bundle where nothing else is registered must still load its own libraries.
@@ -213,7 +210,7 @@ def test_packaged_bundle_registers_libraries_on_a_clean_machine(
     result = subprocess.run(  # noqa: S603 - subprocess input is constructed inside the test
         [
             sys.executable,
-            str(published_bundle.directory / published_bundle.workflow_file_name),
+            str(published_bundle.directory / published_bundle.packaged.entrypoint_workflow_path),
             "--project-file-path",
             str(published_bundle.directory / "project.yml"),
         ],
