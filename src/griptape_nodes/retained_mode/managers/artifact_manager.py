@@ -102,6 +102,10 @@ from griptape_nodes.retained_mode.managers.artifact_providers.artifact_schema_mo
     PreviewGeneratorSchema,
     ProviderSchema,
 )
+from griptape_nodes.retained_mode.managers.artifact_providers.image_situation import (
+    IMAGE_ARTIFACT_SITUATION_FALLBACKS,
+    ImageArtifactSituation,
+)
 from griptape_nodes.retained_mode.managers.artifact_providers.utils import (
     normalize_friendly_name_to_key,
 )
@@ -357,6 +361,18 @@ class ArtifactManager(EngineScoped):
         if provider is None:
             return None
         return provider.check_read_permission(source_path)
+
+    def get_image_situation_fallback(self, situation: ImageArtifactSituation) -> ImageArtifactSituation | None:
+        """Look up the declared fallback for an ``ImageArtifactSituation``.
+
+        Args:
+            situation: The situation to resolve a fallback for.
+
+        Returns:
+            The fallback situation (e.g. ``THUMBNAIL`` falls back to
+            ``VIEWER``), or ``None`` when the situation has no fallback.
+        """
+        return IMAGE_ARTIFACT_SITUATION_FALLBACKS[situation]
 
     async def extract_artifact_metadata(self, source_path: str) -> dict | None:
         """Extract source-file metadata via the format's provider, off the event loop.
