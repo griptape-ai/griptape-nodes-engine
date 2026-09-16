@@ -123,8 +123,8 @@ def _import_fresh(module_name: str) -> object:
 
 
 class TestOrchestratorHoldsEditTimeDepsOnly:
-    def test_the_orchestrator_does_not_install_execution_dependencies_at_all(self, tmp_path: Path) -> None:
-        """The orchestrator installs the edit-time environment and never imports the execution set.
+    def test_the_orchestrator_builds_the_execution_env_but_never_imports_from_it(self, tmp_path: Path) -> None:
+        """The orchestrator installs both environments and never imports the execution set.
 
         It owns both directories -- the worker receives .venv-exec as PYTHONPATH and so cannot be
         the process that creates it -- but nothing on the orchestrator's sys.path comes from there,
@@ -150,12 +150,13 @@ class TestOrchestratorHoldsEditTimeDepsOnly:
         edit_venv = library_dir / ".venv"
         exec_venv = library_dir / ".venv-exec"
         assert edit_venv.exists()
-        # Absent because the exec build is scheduled rather than awaited, and a synchronous caller
-        # runs the handler under asyncio.run -- the loop closes before the task can finish. This
-        # pins the edit-time install being the only thing registration blocks on, not ownership.
-        assert not exec_venv.exists()
+        # The heavy set really is installed, into its own environment, by the orchestrator. The
+        # worker is handed this directory as PYTHONPATH and cannot build it for itself, so if it is
+        # absent there is nothing for a worker to execute against.
+        assert exec_venv.exists(), info.execution_env_failure
+        assert (Path(_site_packages(exec_venv)) / EXEC_DEP / "__init__.py").exists(), info.execution_env_failure
 
-        # And the heavy dependency is unreachable from here either way.
+        # And the heavy dependency is still unreachable from here: on disk, absent from this sys.path.
         assert _site_packages(edit_venv) in sys.path
         assert _site_packages(exec_venv) not in sys.path
         assert _import_fresh(EDIT_DEP).__version__ == EDIT_DEP_VERSION  # type: ignore[attr-defined]
