@@ -557,12 +557,11 @@ class LibraryManager(EngineScoped):
         # orchestrator builds it as a background task so a multi-gigabyte torch install does not
         # block engine startup, and worker spawn waits on this -- the worker needs the directory to
         # exist so it can be handed over as PYTHONPATH before the worker imports anything.
-        execution_env_ready: asyncio.Event | None = field(default=None, repr=False)
 
-        # Why the last `.venv-exec` build failed; None while a build is in flight or after one
-        # succeeds. Deliberately separate from execution_unavailable_reason, which _start_workers
-        # clears before every spawn attempt -- the spawn refusal reads THIS field after waiting
-        # for the build, so a pre-session failure must survive that clearing.
+        # Why the last `.venv-exec` build failed; None when it succeeded. Deliberately separate
+        # from execution_unavailable_reason, which _start_workers clears before every spawn attempt
+        # -- the spawn refusal reads THIS field, so a failure recorded at registration must survive
+        # that clearing.
         execution_env_failure: str | None = None
 
     class RegisterLibraryPrerequisites(NamedTuple):
@@ -635,7 +634,7 @@ class LibraryManager(EngineScoped):
     # Callbacks invoked immediately before all libraries are reloaded.
     _pre_reload_callbacks: list[Callable[[], Awaitable[None]]]
 
-    def __init__(  # noqa: PLR0915
+    def __init__(
         self, event_manager: EventManager, *, worker_manager: WorkerManager, engine: Engine | None = None
     ) -> None:
         super().__init__(engine)
@@ -674,12 +673,6 @@ class LibraryManager(EngineScoped):
         self._is_worker: bool = False
         # The libraries this process is restricted to loading (set on workers).
         self._target_library_names: list[str] | None = None
-        # In-flight `.venv-exec` builds, keyed by the directory they write, because that is the unit
-        # the single-writer guarantee covers. Not on LibraryInfo: a reload replaces that record
-        # while a multi-minute build keeps installing, so the handle needed to cancel it would be
-        # unreachable. Also the strong reference that keeps the loop from collecting a live build.
-        self._execution_env_builds: dict[str, asyncio.Task] = {}
-
         event_manager.assign_manager_to_request_type(
             ListRegisteredLibrariesRequest, self.on_list_registered_libraries_request
         )
@@ -834,29 +827,6 @@ class LibraryManager(EngineScoped):
         """
         return self._is_worker
 
-    async def wait_for_execution_env(self, library_name: str) -> None:
-        """Block until this library's execution environment has finished building, if one is.
-
-        The orchestrator builds `.venv-exec` as a background task so a torch install does not hold
-        up engine startup. A worker needs that directory to exist BEFORE it starts, because it is
-        handed over as PYTHONPATH -- so spawn waits here rather than racing the install. Returns
-        immediately for a library with no execution dependencies, and after a failed build too: the
-        reason is recorded, and refusing to spawn is decided by the caller.
-        """
-        while True:
-            library_info = self.get_library_info_by_library_name(library_name)
-            if library_info is None or library_info.execution_env_ready is None:
-                return
-            ready_event = library_info.execution_env_ready
-            if not ready_event.is_set():
-                logger.info("Waiting for library '%s' execution environment before starting its worker", library_name)
-            await ready_event.wait()
-            if library_info.execution_env_ready is ready_event:
-                return
-            # A reload or project switch re-ran registration while we waited, so what released
-            # us was the superseded build (each build sets only its own event). Loop and wait
-            # on the replacement's.
-
     async def wait_for_worker_ready(self, library_name: str) -> None:
         """Block until the worker expected to serve this library has confirmed loading it.
 
@@ -891,8 +861,8 @@ class LibraryManager(EngineScoped):
     def execution_env_failure_reason(self, library_name: str) -> str | None:
         """Why this library's execution environment cannot be used, or None when it can.
 
-        Read by the spawn path after waiting for the build: a failed build records its reason and
-        leaves the venv directory behind, so directory existence alone says nothing. Spawning a
+        Read by the spawn path: a failed build records its reason and leaves the venv directory
+        behind, so directory existence alone says nothing. Spawning a
         worker whose PYTHONPATH fronts a partial or stale site-packages would trade the recorded
         uv error for a raw ModuleNotFoundError deep inside library load.
         """
@@ -902,8 +872,8 @@ class LibraryManager(EngineScoped):
         if library_info.execution_env_failure is not None:
             return library_info.execution_env_failure
         # The edit-time install failing is just as disqualifying: the exec build resolves both
-        # sets together, but registration stops before scheduling it when the edit set fails,
-        # leaving only this marker behind.
+        # sets together, but registration stops before reaching it when the edit set fails, leaving
+        # only this marker behind.
         if any(isinstance(problem, DependencyInstallationFailedProblem) for problem in library_info.problems):
             return library_info.execution_unavailable_reason or (
                 f"the execution environment build for library '{library_name}' failed; details are in the engine log."
@@ -7459,18 +7429,32 @@ class LibraryManager(EngineScoped):
         # nothing heavy produces no .venv-exec at all. A declared dependency's execution pins count
         # toward it and resolve alongside this library's own: apart, uv can choose different
         # versions of anything they share, and a worker with both on sys.path binds whichever
-        # landed first. Scheduled rather than awaited, because a torch install is gigabytes and
-        # awaiting it here would block startup; spawn waits on the event instead.
+        # landed first.
+        #
+        # Awaited, exactly like the edit-time install above. Backgrounding it to keep a torch
+        # install off the startup path bought a cancel-and-replace protocol, a task registry keyed
+        # by venv directory, and a readiness event for spawn to wait on -- coordination whose only
+        # purpose was to make an install that had not finished look like one that had. Holding
+        # startup is the honest behaviour; installing less often is the way to make it cheap.
         if not self._is_worker and execution_dependencies:
-            library_info = self.get_library_info_by_library_name(library_name)
-            if library_info is not None:
-                await self._replace_execution_env_build(
+            try:
+                await self._install_dependency_set(
                     library_name=library_name,
-                    library_info=library_info,
-                    pip_dependencies=pip_dependencies,
-                    pip_dependencies_exec=execution_dependencies,
+                    library_file_path=library_file_path,
+                    pip_dependencies=[*pip_dependencies, *execution_dependencies],
                     pip_install_flags=pip_install_flags,
+                    execution=True,
                 )
+            except DependencyInstallError as e:
+                # Costs execution and nothing else: the library keeps its real node classes on the
+                # orchestrator and stays editable, and the reason is recorded so a spawn refusal can
+                # say why. Recorded on execution_env_failure rather than
+                # execution_unavailable_reason, which _start_workers clears before every attempt.
+                library_info = self.get_library_info_by_library_name(library_name)
+                if library_info is not None:
+                    library_info.execution_env_failure = f"its execution dependencies could not be installed ({e})."
+                logger.error("Execution environment for library '%s' failed to build: %s", library_name, e)
+            else:
                 installed_exec_count = len(execution_dependencies)
 
         # Only count the edit-time set if this process actually installed it: a worker for an
@@ -7595,121 +7579,6 @@ class LibraryManager(EngineScoped):
             )
             return False
         return library_info.requires_worker
-
-    async def _replace_execution_env_build(
-        self,
-        *,
-        library_name: str,
-        library_info: LibraryInfo,
-        pip_dependencies: list[str],
-        pip_dependencies_exec: list[str],
-        pip_install_flags: list[str],
-    ) -> None:
-        """Take down any in-flight `.venv-exec` build for this library, then schedule a new one.
-
-        One writer per venv directory. A reload or project switch re-runs registration while a
-        previous multi-minute build may still be installing into the same path, and the recovery
-        path inside the build can rmtree the directory out from under the other writer. The
-        handle comes from a manager-level map keyed by the directory, because that is the level
-        the guarantee lives at: a reload recreates the LibraryInfo, and the orphaned build must
-        still be findable by the registration that replaces it.
-
-        The replacement event goes up BEFORE the cancel. A build sets only its own event, so a
-        spawn released by the superseded build's finally re-checks, finds this newer unset
-        event, and parks again -- instead of spawning into the gap while the replacement is
-        still installing.
-        """
-        venv_key = str(self._get_library_venv_path(library_name, library_info.library_path, execution=True))
-        ready_event = asyncio.Event()
-        library_info.execution_env_ready = ready_event
-        library_info.execution_env_failure = None
-        # Re-read after every await: this task suspends there, and a concurrent registration
-        # for the same library can schedule its own build meanwhile. Whoever reaches the map
-        # assignment last owns the directory; every build found on the way gets taken down
-        # first.
-        while True:
-            previous_build = self._execution_env_builds.get(venv_key)
-            if previous_build is None or previous_build.done():
-                break
-            previous_build.cancel()
-            try:
-                await previous_build
-            except asyncio.CancelledError:
-                # The superseded build's CancelledError propagates through this await; only a
-                # cancellation aimed at THIS task means registration itself is being cancelled.
-                # Then no replacement build is coming, so release anything parked on the event
-                # just installed, with the reason recorded.
-                task = asyncio.current_task()
-                if task is not None and task.cancelling() > 0:
-                    library_info.execution_env_failure = (
-                        f"registration of library '{library_name}' was cancelled before "
-                        "its execution environment could be rebuilt."
-                    )
-                    ready_event.set()
-                    raise
-        self._execution_env_builds[venv_key] = asyncio.create_task(
-            self._build_execution_env(
-                library_info=library_info,
-                pip_dependencies=pip_dependencies,
-                pip_dependencies_exec=pip_dependencies_exec,
-                pip_install_flags=pip_install_flags,
-                ready_event=ready_event,
-            )
-        )
-
-    async def _build_execution_env(
-        self,
-        *,
-        library_info: LibraryInfo,
-        pip_dependencies: list[str],
-        pip_dependencies_exec: list[str],
-        pip_install_flags: list[str],
-        ready_event: asyncio.Event,
-    ) -> None:
-        """Build a library's `.venv-exec`, then release anything waiting to spawn its worker.
-
-        The edit-time set is resolved INTO the execution environment alongside the heavy one, not
-        just listed beside it. The two environments are separate, so resolving them apart let uv
-        pick a different version of anything they share -- numpy as an edit-time dependency and
-        numpy pulled in by torch, say -- and the worker would then run against one version while
-        the orchestrator built the node against another. One resolution over both sets settles it.
-
-        A failure costs execution and nothing else: the library keeps its real node classes on the
-        orchestrator and stays editable, and the reason is recorded so the refusal can say why.
-
-        `ready_event` is THIS build's event, passed in rather than read off library_info: by the
-        time a superseded build is cancelled, library_info already points at its replacement's
-        event, and setting that one would release spawns before the replacement finished.
-        """
-        try:
-            library_name = library_info.library_name or "unknown"
-            failure: str | None = None
-            try:
-                await self._install_dependency_set(
-                    library_name=library_name,
-                    library_file_path=library_info.library_path,
-                    pip_dependencies=[*pip_dependencies, *pip_dependencies_exec],
-                    pip_install_flags=pip_install_flags,
-                    execution=True,
-                )
-            except DependencyInstallError as e:
-                failure = str(e)
-            # Broad by necessity: nothing retrieves this background task's exception, and an
-            # escaping one would open the spawn gate with no failure recorded.
-            except Exception as e:
-                failure = f"the execution environment build for library '{library_name}' stopped unexpectedly ({e})."
-            if failure is not None:
-                library_info.execution_env_failure = failure
-                library_info.execution_unavailable_reason = failure
-                logger.error(
-                    "Library '%s' cannot run: its execution environment could not be built. %s",
-                    library_name,
-                    failure,
-                )
-        finally:
-            # Released on every path, including failure: a waiter that never wakes would hold the
-            # spawn loop open for a library that is never going to be runnable.
-            ready_event.set()
 
     async def _retire_execution_env(self, library_name: str, library_file_path: str) -> None:
         """Remove an execution environment the library's manifest no longer declares.

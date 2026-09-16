@@ -1513,27 +1513,23 @@ class TestWorkerExecutionPath:
         assert env["PYTHONPATH"] == f"/libs/mine/.venv-exec/sp{os.pathsep}/host/libs"
 
     @pytest.mark.asyncio
-    async def test_spawn_waits_for_the_environment_before_starting(self, worker_manager: WorkerManager) -> None:
-        """The wait is the whole point: a worker cannot be handed a directory that is not there yet.
+    async def test_spawn_refuses_when_the_environment_failed_to_build(self, worker_manager: WorkerManager) -> None:
+        """A failed build leaves the venv directory behind, so existence alone says nothing.
 
-        On a library's first run the orchestrator is still building `.venv-exec`. Spawning before it
-        finishes would leave PYTHONPATH unset for that process, which is the pre-fix ordering and
-        exactly the bug -- so the environment must be awaited, not raced.
+        Spawning anyway would front the worker's import path with a partial site-packages -- the
+        unpinned execution the edit/exec split exists to prevent -- and the raw ModuleNotFoundError
+        would bury the recorded uv error.
         """
-        order: list[str] = []
-        worker_manager.engine.library_manager.wait_for_execution_env = AsyncMock(  # type: ignore[attr-defined]
-            side_effect=lambda _name: order.append("waited")
+        worker_manager.engine.library_manager.execution_env_failure_reason.return_value = (  # type: ignore[attr-defined]
+            "its execution dependencies could not be installed (no solution found)."
         )
         worker_manager._session_ready_event.set()
         worker_manager.engine.get_session_id.return_value = "sess-1"  # type: ignore[attr-defined]
 
-        async def record_spawn(_args: list[str], _worker_key: str) -> None:
-            order.append("spawned")
-
-        with patch.object(worker_manager, "spawn_worker", new=AsyncMock(side_effect=record_spawn)):
+        with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as spawn:
             await worker_manager._spawn_when_session_ready("My Library")
 
-        assert order == ["waited", "spawned"]
+        spawn.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_no_execution_environment_means_no_pythonpath(self, worker_manager: WorkerManager) -> None:
