@@ -494,12 +494,16 @@ def register_broadcast_handlers(
     in the manager and routing decisions stay here.
 
     Returns:
-        An event set once this worker has settled an activation from the orchestrator, whether by
-        adopting it or by finding it already stale. A worker must not load libraries before that:
-        libraries resolve against the workspace a project decides, and the orchestrator sends the
-        activation rather than answering registration with it, so nothing else orders the two.
+        An event set once this worker has settled the startup state the orchestrator sent it, and
+        may begin loading libraries. Today that state is the project, settled either by adopting an
+        activation or by finding it already stale -- libraries resolve against the workspace a
+        project decides, and the orchestrator sends the activation rather than answering
+        registration with it, so nothing else orders the two.
+
+        Deliberately named for the worker rather than the project: a second piece of startup state
+        should gate this same event rather than introduce a second one for the caller to wait on.
     """
-    project_activation_settled = asyncio.Event()
+    worker_settled = asyncio.Event()
 
     def handle_reload_config(request: ReloadConfigRequest) -> ResultPayload:  # noqa: ARG001
         try:
@@ -525,6 +529,10 @@ def register_broadcast_handlers(
     # both replies report success. One sender does not fix this -- overlap is a property of the
     # await, not of who sent it. The staleness check must not be hoisted out of the lock: it reads
     # the generation the previous holder records.
+    #
+    # TODO(https://github.com/griptape-ai/internal/issues/266): replace this and the generations
+    # with a single-consumer queue, which makes the ordering structural rather than a rule every
+    # future caller has to remember.
     adoption_lock = asyncio.Lock()
 
     async def handle_activate_project(request: ActivateProjectRequest) -> ResultPayload:
@@ -546,7 +554,7 @@ def register_broadcast_handlers(
             if project_manager.is_stale_adoption(request.project_id, request.generation):
                 # Settled, not adopted: a newer activation already landed, so whatever is waiting
                 # on this has the answer it needs.
-                project_activation_settled.set()
+                worker_settled.set()
                 return ActivateProjectResultSuccess(
                     result_details=(
                         f"Skipped adopting project '{request.project_id}' (generation "
@@ -573,10 +581,10 @@ def register_broadcast_handlers(
                 logger.error(details)
                 return ActivateProjectResultFailure(result_details=details)
             project_manager.record_adopted_generation(request.generation)
-            project_activation_settled.set()
+            worker_settled.set()
         return ActivateProjectResultSuccess(result_details=f"Adopted project from orchestrator: {request.project_id}.")
 
     event_manager.assign_manager_to_request_type(ReloadConfigRequest, handle_reload_config)
     event_manager.assign_manager_to_request_type(RefreshSecretsRequest, handle_refresh_secrets)
     event_manager.assign_manager_to_request_type(ActivateProjectRequest, handle_activate_project)
-    return project_activation_settled
+    return worker_settled
