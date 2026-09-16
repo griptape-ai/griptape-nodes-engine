@@ -29,7 +29,7 @@ class DecodedImageArtifact:
     source_color_space: The colour space the pixel data is already in (e.g. "sRGB",
         "ACEScg", "Linear"), as reported by the source file/format. Not converted -
         that's colour management's job, done centrally by ArtifactManager after decode.
-    bit_depth: Bits per channel in ``pixel_data` (e.g. 8, 16, 32).
+    bit_depth: Bits per channel in ``pixel_data`` (e.g. 8, 16, 32).
     channel_layout: The channel composition and order (e.g. "RGB", "RGBA", "Grayscale").
     """
 
