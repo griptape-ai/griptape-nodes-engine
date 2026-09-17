@@ -40,6 +40,12 @@ Add functionality via `add_trait()`:
 
 For the full list of traits, the widgets they render, and the `ui_options` keys they manage, see the [Parameter UI Reference](parameter_ui_reference.md).
 
+**Saving callbacks**: `Button` callbacks and parameter converters or validators must be bound node methods, such as `self.my_handler`. A lambda or local function cannot be resolved when loading, so its behavior is omitted with a warning.
+
+**Saving trait state**: Trait constructor arguments may contain text, numbers, booleans, and lists or dictionaries of those values. Sets and tuples load as lists. Unsupported values are omitted with a warning.
+
+**Accepting UI option writes**: Implement `state_from_ui_options` to map editor and saved-file `ui_options` to trait state. It is the inverse of `ui_options_for_trait`. The default ignores writes, which suits rendered keys with no state; a write that would have changed what the trait renders is logged, since it is neither applied nor saved.
+
 ## Parameter helper constructs (`ParameterString`, `ParameterInt`, ...)
 
 Griptape Nodes includes a set of convenience Parameter subclasses under `griptape_nodes.exe_types.param_types.*`.
@@ -591,7 +597,7 @@ def after_value_set(self, parameter: Parameter, value: Any) -> None:
 
 ### Dynamic Options Updates
 
-Update parameter choices at runtime:
+Update parameter choices at runtime. They are saved as trait state:
 
 ```python
 from griptape_nodes.traits.options import Options
