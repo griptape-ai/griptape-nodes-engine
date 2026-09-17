@@ -122,10 +122,6 @@ class MultiOptions(Trait):
             # Write choices to ui_options (this gets serialized and survives reload)
             self._parent.ui_options["multi_options"]["choices"] = value  # type: ignore[attr-defined]
 
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["multi_options"]
-
     def converters_for_trait(self) -> list[Callable]:
         def converter(value: Any) -> Any:
             # CRITICAL: This converter uses self.choices property (not _choices field)

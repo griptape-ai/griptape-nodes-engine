@@ -178,10 +178,6 @@ class Button(Trait):
 
         return handler
 
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["button", "addbutton"]
-
     def get_button_details(self, state: ButtonState | None = None) -> ButtonDetailsMessagePayload:
         """Create a ButtonDetailsMessagePayload with current or specified button state."""
         return ButtonDetailsMessagePayload(
