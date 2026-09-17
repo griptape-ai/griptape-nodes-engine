@@ -6,6 +6,7 @@ import pickle
 import tempfile
 from collections.abc import Generator
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 from PIL import Image
@@ -13,6 +14,8 @@ from PIL.PngImagePlugin import PngInfo
 
 from griptape_nodes.exe_types.connections import Connections
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
+from griptape_nodes.exe_types.flow import ControlFlow
+from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
 from griptape_nodes.exe_types.node_types import BaseNode, ControlNode, DataNode, StartNode
 from griptape_nodes.machines.dag_builder import DagNodeCategories
 from griptape_nodes.retained_mode.engine import Engine
@@ -702,6 +705,53 @@ class TestExcludeSubflowGroupChildren:
         flow_manager = engine.flow_manager
 
         assert flow_manager.exclude_subflow_group_children([]) == []
+
+
+class TestGetInvolvedNodeNames:
+    """Tests for FlowManager.get_involved_node_names.
+
+    A group's children live in the group's own ``nodes`` dict, not the flow's, so the editor --
+    which gates a node's run status on involvement -- could never light up the inside of a running
+    group. This walk expands groups to any depth so the announcement names every node a viewer can
+    see on the canvas.
+    """
+
+    def test_expands_group_children_to_any_depth(self, engine: Engine) -> None:
+        def plain_node(name: str) -> MagicMock:
+            node = MagicMock(spec=BaseNode)
+            node.name = name
+            return node
+
+        def group(name: str, *children: MagicMock) -> MagicMock:
+            node = MagicMock(spec=BaseNodeGroup)
+            node.name = name
+            node.nodes = {child.name: child for child in children}
+            return node
+
+        inner_group = group("inner_group", plain_node("deep_child"))
+        outer_group = group("outer_group", plain_node("child"), inner_group)
+        flow = MagicMock(spec=ControlFlow)
+        flow.nodes = {"loose": plain_node("loose"), "outer_group": outer_group}
+
+        involved = engine.flow_manager.get_involved_node_names(flow)
+
+        assert sorted(involved) == ["child", "deep_child", "inner_group", "loose", "outer_group"]
+
+    def test_group_cycle_terminates(self, engine: Engine) -> None:
+        """A malformed group that contains itself must not hang the walk."""
+        cyclic_group = MagicMock(spec=BaseNodeGroup)
+        cyclic_group.name = "cyclic_group"
+        cyclic_group.nodes = {"cyclic_group": cyclic_group}
+        flow = MagicMock(spec=ControlFlow)
+        flow.nodes = {"cyclic_group": cyclic_group}
+
+        assert engine.flow_manager.get_involved_node_names(flow) == ["cyclic_group"]
+
+    def test_empty_flow_returns_empty(self, engine: Engine) -> None:
+        flow = MagicMock(spec=ControlFlow)
+        flow.nodes = {}
+
+        assert engine.flow_manager.get_involved_node_names(flow) == []
 
 
 class TestClassifyNodesForDag:
