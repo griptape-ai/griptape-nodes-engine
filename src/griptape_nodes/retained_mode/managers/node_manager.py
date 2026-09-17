@@ -1488,13 +1488,10 @@ class NodeManager(EngineScoped):
                         )
                         return DeleteNodeResultFailure(result_details=details)
 
-        # Check if it's in a node group
-        if isinstance(node.parent_group, SubflowNodeGroup):
-            try:
-                node.parent_group.delete_nodes_from_group([node])
-            except ValueError as e:
-                details = f"Attempted to delete a Node '{node_name}'. Failed to remove it from the node group: {e}"
-                return DeleteNodeResultFailure(result_details=details)
+        # Every kind of group has to give up a node being deleted, not just a SubflowNodeGroup:
+        # a group that keeps naming a deleted child reports it as involved in the next run.
+        if isinstance(node.parent_group, BaseNodeGroup):
+            node.parent_group.delete_nodes_from_group([node])
 
         parent_flow.remove_node(node.name)
 
