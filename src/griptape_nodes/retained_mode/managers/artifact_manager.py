@@ -1192,13 +1192,40 @@ class ArtifactManager(EngineScoped):
         self, request: GetDisplayableImageBytesRequest, extension: str
     ) -> ImageCodecPair | GetDisplayableImageBytesResultFailure:
         """Resolve the decoder/encoder pair for ``extension``, or the failure explaining why one is missing."""
-        # FAILURE CASE: no decoder provider for this extension
-        decoder = self._provider_for_format(extension)
-        if decoder is None:
-            return GetDisplayableImageBytesResultFailure(
-                result_details=f"Attempted to get displayable image bytes for '{request.source_path}'. "
-                f"Failed because no provider is registered for extension '{extension}'."
+        decoder = self._resolve_image_decoder(request, extension)
+        if isinstance(decoder, GetDisplayableImageBytesResultFailure):
+            return decoder
+
+        encoder = self._resolve_image_encoder(request)
+        if isinstance(encoder, GetDisplayableImageBytesResultFailure):
+            return encoder
+
+        return ImageCodecPair(decoder=decoder, encoder=encoder)
+
+    def _resolve_image_decoder(
+        self, request: GetDisplayableImageBytesRequest, extension: str
+    ) -> BaseArtifactProvider | GetDisplayableImageBytesResultFailure:
+        """Resolve the decoder provider for ``extension``, honoring ``preferred_decoder_friendly_name``."""
+        if request.preferred_decoder_friendly_name is not None:
+            # FAILURE CASE: no decoder named preferred_decoder_friendly_name registered for this extension
+            decoder_class = self._family_registry.resolve_decoder(
+                ImageFamily, extension, request.preferred_decoder_friendly_name
             )
+            if decoder_class is None:
+                return GetDisplayableImageBytesResultFailure(
+                    result_details=f"Attempted to get displayable image bytes for '{request.source_path}'. "
+                    f"Failed because no decoder provider named '{request.preferred_decoder_friendly_name}' "
+                    f"is registered for extension '{extension}'."
+                )
+            decoder = self._registry.get_or_create_provider_instance(decoder_class)
+        else:
+            # FAILURE CASE: no decoder provider for this extension
+            decoder = self._provider_for_format(extension)
+            if decoder is None:
+                return GetDisplayableImageBytesResultFailure(
+                    result_details=f"Attempted to get displayable image bytes for '{request.source_path}'. "
+                    f"Failed because no provider is registered for extension '{extension}'."
+                )
 
         # FAILURE CASE: decoder doesn't implement the decode mixin
         if not isinstance(decoder, ImageArtifactDecoderMixin):
@@ -1207,10 +1234,24 @@ class ArtifactManager(EngineScoped):
                 f"Failed because provider '{decoder.get_friendly_name()}' does not support decoding."
             )
 
-        # FAILURE CASE: no "Image" encoder provider registered
-        encoder_class = self._family_registry.resolve_encoder(ImageFamily)
+        return decoder
+
+    def _resolve_image_encoder(
+        self, request: GetDisplayableImageBytesRequest
+    ) -> BaseArtifactProvider | GetDisplayableImageBytesResultFailure:
+        """Resolve the encoder provider, honoring ``preferred_encoder_friendly_name``."""
+        # FAILURE CASE: no "Image" encoder provider registered (named or otherwise)
+        encoder_class = self._family_registry.resolve_encoder(
+            ImageFamily, preferred_friendly_name=request.preferred_encoder_friendly_name
+        )
         encoder = self._registry.get_or_create_provider_instance(encoder_class) if encoder_class else None
         if encoder is None:
+            if request.preferred_encoder_friendly_name is not None:
+                return GetDisplayableImageBytesResultFailure(
+                    result_details="Attempted to get displayable image bytes. "
+                    f"Failed because no encoder provider named '{request.preferred_encoder_friendly_name}' "
+                    "is registered."
+                )
             return GetDisplayableImageBytesResultFailure(
                 result_details="Attempted to get displayable image bytes. "
                 "Failed because no 'Image' provider is registered to encode with."
@@ -1223,7 +1264,7 @@ class ArtifactManager(EngineScoped):
                 f"Failed because provider '{encoder.get_friendly_name()}' does not support encoding."
             )
 
-        return ImageCodecPair(decoder=decoder, encoder=encoder)
+        return encoder
 
     async def _get_disk_cached_displayable_image_bytes(
         self,
