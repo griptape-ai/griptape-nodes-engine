@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal, overload
 
@@ -31,6 +32,18 @@ from griptape_nodes.utils.dict_utils import normalize_secrets_to_register
 logger = logging.getLogger("griptape_nodes")
 
 ENV_VAR_PATH = xdg_config_home() / "griptape_nodes" / ".env"
+
+
+def merge_env_file_values(*, global_values: Mapping[str, str], workspace_values: Mapping[str, str]) -> dict[str, str]:
+    """Merge the two ``.env`` layers in the precedence ``get_secret`` documents.
+
+    Workspace beats global. Stated once, here, and shared with the diagnostics report,
+    which reads the same two files itself so it can say which one each key came from. Two
+    hand-written copies of this line meant a later change to the layering could be applied
+    to secret resolution and not to the report of it, leaving the report quietly wrong
+    about which file a support engineer should be looking at.
+    """
+    return {**global_values, **workspace_values}
 
 
 class SecretsManager:
@@ -82,7 +95,7 @@ class SecretsManager:
             logger.debug("No .env files to refresh from; leaving os.environ untouched.")
             return
 
-        merged = self._read_merged_env_files()
+        merged = self.read_merged_env_files()
         previously_managed = set(self._managed_env_keys)
         installed = 0
         overridden = 0
@@ -268,6 +281,23 @@ class SecretsManager:
             )
         self._install_managed(secret_name, secret_value)
 
+    def read_merged_env_files(self) -> dict[str, str]:
+        """Return the merged contents of both .env files with workspace winning.
+
+        Workspace overrides global because that is the precedence order
+        ``get_secret`` documents. Empty values (``FOO=`` in the file) are
+        kept as empty strings; missing files are skipped. ``None`` values
+        from ``dotenv_values`` are filtered out so callers can rely on
+        ``dict[str, str]`` shape.
+
+        Public because the diagnostics report needs the same values this
+        manager resolves from, in order to scrub them out of log text.
+        """
+        return merge_env_file_values(
+            global_values=self._read_env_file(ENV_VAR_PATH),
+            workspace_values=self._read_env_file(self.workspace_env_path),
+        )
+
     def _load_env_files_into_environ(self) -> None:
         """Read both .env files into ``os.environ`` and seed ``_managed_env_keys``.
 
@@ -284,28 +314,22 @@ class SecretsManager:
         delivered before.
         """
         pre_load_environ = set(os.environ.keys())
-        merged = self._read_merged_env_files()
+        merged = self.read_merged_env_files()
         for key, value in merged.items():
             if key in pre_load_environ:
                 # OS-owned. Leave alone.
                 continue
             self._install_managed(key, value)
 
-    def _read_merged_env_files(self) -> dict[str, str]:
-        """Return the merged contents of both .env files with workspace winning.
+    def _read_env_file(self, path: Path) -> dict[str, str]:
+        """Return one .env file's contents, or nothing when there is no file there.
 
-        Workspace overrides global because that is the precedence order
-        ``get_secret`` documents. Empty values (``FOO=`` in the file) are
-        kept as empty strings; missing files are skipped. ``None`` values
-        from ``dotenv_values`` are filtered out so callers can rely on
-        ``dict[str, str]`` shape.
+        ``None`` values from ``dotenv_values`` -- a bare ``FOO`` with no ``=`` -- are
+        dropped, so callers can rely on the ``dict[str, str]`` shape.
         """
-        merged: dict[str, str] = {}
-        if ENV_VAR_PATH.exists():
-            merged.update({k: v for k, v in dotenv_values(ENV_VAR_PATH).items() if v is not None})
-        if self.workspace_env_path.exists():
-            merged.update({k: v for k, v in dotenv_values(self.workspace_env_path).items() if v is not None})
-        return merged
+        if not path.exists():
+            return {}
+        return {key: value for key, value in dotenv_values(path).items() if value is not None}
 
     def _register_handlers(self, event_manager: EventManager) -> None:
         """Wire request types to their handlers."""
