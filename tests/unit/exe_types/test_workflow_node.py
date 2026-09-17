@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,7 @@ from griptape_nodes.exe_types.workflow_node import (
     WorkflowNodeDefinitionError,
     WorkflowNodeRoutingError,
     WorkflowParameterRoute,
+    _workspace_relative_workflow_path,
     build_workflow_node_class,
     build_workflow_node_surface,
     flatten_shape_section,
@@ -472,3 +474,51 @@ class TestEditorPreviewMetadata:
         # The node is still usable; only the preview is unavailable.
         assert "_workflow_file_value" not in node.metadata
         assert node.get_parameter_by_name("text") is not None
+
+
+class TestWorkspaceRelativeWorkflowPath:
+    @pytest.fixture
+    def workspace(self, tmp_path: Path) -> Path:
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        return workspace.resolve()
+
+    def test_file_inside_the_workspace_is_workspace_relative(self, workspace: Path) -> None:
+        """A file inside the workspace is named relative to it."""
+        result = _workspace_relative_workflow_path(workspace, workspace / "nested" / "flow.py")
+
+        assert result == str(Path("nested") / "flow.py")
+
+    def test_file_outside_the_workspace_keeps_its_full_path(self, workspace: Path, tmp_path: Path) -> None:
+        """A file outside the workspace keeps its full path."""
+        outside = (tmp_path / "library" / "flow.py").resolve()
+
+        result = _workspace_relative_workflow_path(workspace, outside)
+
+        assert result == str(outside)
+
+    @pytest.mark.skipif(sys.platform.startswith("win"), reason="symlink creation needs privileges on Windows")
+    def test_link_inside_the_workspace_keeps_the_link_name(self, workspace: Path, tmp_path: Path) -> None:
+        """A file reached through a link inside the workspace is named by the link."""
+        real_folder = tmp_path / "elsewhere"
+        real_folder.mkdir()
+        (real_folder / "flow.py").write_text("")
+        (workspace / "linked").symlink_to(real_folder, target_is_directory=True)
+
+        result = _workspace_relative_workflow_path(workspace, workspace / "linked" / "flow.py")
+
+        assert result == str(Path("linked") / "flow.py")
+
+    @pytest.mark.skipif(sys.platform.startswith("win"), reason="symlink creation needs privileges on Windows")
+    def test_link_outside_the_workspace_to_a_parent_folder_falls_back_to_the_real_path(
+        self, workspace: Path, tmp_path: Path
+    ) -> None:
+        """A file inside the workspace reached through an outside link is named by its real place."""
+        (workspace / "nested").mkdir()
+        (workspace / "nested" / "flow.py").write_text("")
+        outside_link = tmp_path / "outside_link"
+        outside_link.symlink_to(workspace, target_is_directory=True)
+
+        result = _workspace_relative_workflow_path(workspace, outside_link / "nested" / "flow.py")
+
+        assert result == str(Path("nested") / "flow.py")

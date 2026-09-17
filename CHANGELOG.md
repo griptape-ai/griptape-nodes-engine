@@ -33,6 +33,8 @@ the engine's request API from working without edits. Migration steps live in
   with no output has nowhere to publish, so a value set on it during a run stays in the process that
   set it.
   [#5663](https://github.com/griptape-ai/griptape-nodes-engine/issues/5663)
+- A workflow used by a workflow node no longer appears twice in the workflow list when it is inside
+  the workspace.
 
 ## [0.103.0] - 2026-09-29
 
