@@ -388,7 +388,11 @@ class ParameterButton(Parameter):
     def href(self, value: str | None) -> None:
         """Set the href URL to open when button is clicked.
 
-        A button holds one click action, so this replaces an existing on_click callback; see
-        ``Button.button_link``.
+        A button holds one click action: reading the trait always prefers a handler over a
+        link (see ``Button.on_click_callback``), so setting href would do nothing while a
+        handler from ``on_click`` is still attached. Clearing the handler here makes href
+        replace it, matching a button built with ``href`` and no ``on_click`` from the start.
         """
-        self._get_button_trait().button_link = value
+        trait = self._get_button_trait()
+        trait.on_click_handler = None
+        trait.button_link = value

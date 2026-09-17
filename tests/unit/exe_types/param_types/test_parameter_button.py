@@ -51,3 +51,17 @@ class TestHrefRoutesToTheLink:
         """Both name one click action; Button's own constructor enforces there is only one."""
         with pytest.raises(ValueError, match="Cannot specify both"):
             ParameterButton(name="bad", href="https://docs.example.test", on_click=lambda button, details: None)  # noqa: ARG005
+
+    def test_href_replaces_an_on_click_set_after_construction(self) -> None:
+        """Setting href is how a button already wired to ``on_click`` switches to a link."""
+        parameter = ParameterButton(name="docs", on_click=lambda button, details: None)  # noqa: ARG005
+
+        parameter.href = "https://docs.example.test"
+
+        assert parameter.href == "https://docs.example.test"
+        trait = parameter._get_button_trait()
+        callback = parameter.on_click_callback
+        assert callback is not None
+        result = callback(trait, trait.get_button_details())
+        assert result is not None
+        assert getattr(result.response, "href", None) == "https://docs.example.test"

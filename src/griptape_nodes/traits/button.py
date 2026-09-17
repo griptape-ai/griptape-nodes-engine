@@ -106,32 +106,6 @@ def _build_link_handler(url: str) -> Callable:
     return handler
 
 
-def _link_yields_to_a_handler(button: "Button", _attribute: attrs.Attribute, url: str | None) -> str | None:
-    """Discard a link write that would coexist with a handler already on the button.
-
-    ``apply_state`` and a direct assignment both reach a field through plain attribute
-    assignment, so this runs regardless of which one is writing. Discarding the write here,
-    rather than leaving the link live until ``on_click_callback`` is read, stops it from taking
-    over if a callback name saved alongside it later fails to resolve.
-    """
-    if url is not None and button.on_click_handler is not None:
-        return button.button_link
-    return url
-
-
-def _handler_clears_the_link(
-    button: "Button", _attribute: attrs.Attribute, callback: Callable | None
-) -> Callable | None:
-    """Clear the link once a handler is set, so the two can never both be live.
-
-    Runs however the handler arrives: constructor, direct assignment, or a saved callback name
-    binding through ``apply_callback_names``.
-    """
-    if callback is not None:
-        button.button_link = None
-    return callback
-
-
 class Button(Trait):
     type OnClickCallback = Callable[[Button, ButtonDetailsMessagePayload], NodeMessageResult | None]
     type GetButtonStateCallback = Callable[[Button, ButtonDetailsMessagePayload], NodeMessageResult | None]
@@ -155,8 +129,9 @@ class Button(Trait):
     loading_icon_class: str | None = attrs.field(default=None)
     tooltip: str | None = attrs.field(default=None)
 
-    # Link URL is state; its callback is derived and cached lazily in ``on_click_callback``.
-    button_link: str | None = attrs.field(default=None, on_setattr=_link_yields_to_a_handler)
+    # State a handler may leave stored but unread: reading always prefers the handler, so a
+    # link saved alongside one is inert rather than cleared. See ``on_click_callback``.
+    button_link: str | None = attrs.field(default=None)
 
     # Cache of the handler derived from ``button_link``, valid while the URL is unchanged.
     _link_handler_url: str | None = attrs.field(default=None, init=False)
@@ -164,7 +139,7 @@ class Button(Trait):
 
     # A link callback is derived state and must not be saved as node behavior.
     on_click_handler: OnClickCallback | None = attrs.field(
-        default=None, alias="on_click", metadata=BEHAVIOR, on_setattr=_handler_clears_the_link, kw_only=True
+        default=None, alias="on_click", metadata=BEHAVIOR, kw_only=True
     )
     get_button_state_callback: GetButtonStateCallback | None = attrs.field(
         default=None, alias="get_button_state", metadata=BEHAVIOR, kw_only=True

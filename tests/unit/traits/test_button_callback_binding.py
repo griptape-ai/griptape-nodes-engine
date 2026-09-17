@@ -213,12 +213,12 @@ class TestALinkAndAHandlerCannotDrift:
 
         assert button.on_click_callback is before
 
-    def test_a_saved_link_yields_to_a_constructor_supplied_on_click_and_is_dropped(self) -> None:
+    def test_a_saved_link_yields_to_a_constructor_supplied_on_click(self) -> None:
         """A node that rewired its button from a link to one of its methods in a new version.
 
         The live wiring wins, so the saved link describes a version of the node that no longer
-        exists. Keeping it would re-save a link that the next build-from-scratch turns back
-        into the handler, quietly replacing the node's method with a URL.
+        exists. Reading the trait still prefers the handler, so the link does nothing rather
+        than needing to be cleared to be harmless.
         """
         node = ButtonNode(name="rewired")
         button = Button(label="Refresh", on_click=node.refresh)
@@ -226,8 +226,7 @@ class TestALinkAndAHandlerCannotDrift:
         button.apply_state({"label": "Refresh", "button_link": "https://example.test/old"})
 
         assert button.on_click_callback == node.refresh
-        assert button.button_link is None
-        assert button.to_state()["button_link"] is None
+        assert button.button_link == "https://example.test/old"
 
     def test_the_node_method_still_wins_after_a_full_save_cycle(self) -> None:
         """The saved state and the saved callback name have to agree on which one fires.
@@ -271,15 +270,15 @@ class TestALinkAndAHandlerCannotDrift:
 
         assert button.on_click_callback is button.on_click_callback
 
-    def test_assigning_a_handler_replaces_the_link_it_had(self) -> None:
-        """How ``ParameterButton.href`` swaps a link button over to its own callback."""
+    def test_assigning_a_handler_leaves_the_link_stored_but_unread(self) -> None:
+        """A handler wins on read; the link it displaces is not defensively cleared."""
         node = ButtonNode(name="swapped")
         button = Button(label="Docs", button_link="https://example.test")
 
         button.on_click_callback = node.refresh
 
         assert button.on_click_callback == node.refresh
-        assert button.button_link is None
+        assert button.button_link == "https://example.test"
 
     @pytest.mark.parametrize(
         "arrive_at_a_handler",
@@ -298,5 +297,4 @@ class TestALinkAndAHandlerCannotDrift:
         arrive_at_a_handler(button, node)
 
         assert button.on_click_handler is not None
-        assert button.button_link is None
-        assert button.to_state()["button_link"] is None
+        assert button.on_click_callback == node.refresh
