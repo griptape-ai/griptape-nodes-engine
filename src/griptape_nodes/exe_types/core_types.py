@@ -2105,6 +2105,28 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
             type(trait).__name__,
         )
 
+    def remove_ui_options_key(self, key: str) -> None:
+        """Remove a stored option, or report that a trait renders it regardless.
+
+        A trait-rendered key is never stored raw, so there is no copy to remove: only the
+        trait's own state controls it.
+        """
+        for trait in self.find_elements_by_type(Trait):
+            if key in trait.ui_options_for_trait():
+                self._report_unremovable_trait_option(trait, key)
+                return
+        super().remove_ui_options_key(key)
+
+    def _report_unremovable_trait_option(self, trait: Trait, key: str) -> None:
+        logger.warning(
+            "Attempted to remove '%s' from parameter '%s', but its %s control renders that key "
+            "regardless, so removing it here has no effect. Change the control's own state "
+            "instead, or detach it.",
+            key,
+            self.name,
+            type(trait).__name__,
+        )
+
     def authored_ui_options(self) -> dict[str, Any]:
         """Remove options rendered by attached traits.
 

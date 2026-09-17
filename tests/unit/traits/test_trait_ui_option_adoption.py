@@ -225,14 +225,14 @@ class TestNodeCodeWritesAdoptToo:
 
         assert "display_name" not in parameter.authored_ui_options()
 
-    def test_removing_a_trait_rendered_key_is_silent(self, caplog: pytest.LogCaptureFixture) -> None:
-        """The key was never stored raw to begin with, so there is nothing to warn about."""
+    def test_removing_a_trait_rendered_key_is_reported(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A trait renders the key regardless, so the removal can never take effect."""
         parameter = Parameter(name="model", type="str", tooltip="t", traits={Options(choices=["a"])})
         caplog.set_level(logging.WARNING, logger="griptape_nodes")
 
         parameter.remove_ui_options_key("simple_dropdown")
 
-        assert caplog.records == []
+        assert len(caplog.records) == 1
         assert parameter.ui_options["simple_dropdown"] == ["a"]
 
 
