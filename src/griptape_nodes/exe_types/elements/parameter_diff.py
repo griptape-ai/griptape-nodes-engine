@@ -33,7 +33,8 @@ def diff_parameters(parameter: Parameter, other: Parameter) -> dict:
             if self_value != other_value:
                 differences[key] = other_value
         elif isinstance(self_value, (list, set)) and isinstance(other_value, (list, set)):
-            diff_list_values(self_value, other_value, differences, key)
+            # Through the method, not diff_list_values directly: subclasses override it.
+            parameter.check_list(self_value, other_value, differences, key)
         elif self_value != other_value:
             differences[key] = other_value
     return differences

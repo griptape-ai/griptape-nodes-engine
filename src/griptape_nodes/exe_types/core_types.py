@@ -1,8 +1,8 @@
-"""Public import surface for node elements.
+"""Import surface separately versioned callers bind to.
 
 The elements themselves live in ``griptape_nodes.exe_types.elements``, one module per
-concern. Separately versioned node libraries and saved workflow files import from this
-module name, so it stays put and re-exports them.
+concern. Node libraries and saved workflow files import this module name, so it stays put
+and re-exports them.
 """
 
 from griptape_nodes.exe_types.elements.badge import VALID_BADGE_VARIANTS, BadgeData, BadgeVariantType

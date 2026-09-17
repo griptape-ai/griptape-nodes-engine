@@ -656,6 +656,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         return param
 
     def check_list(self, self_value: Any, other_value: Any, differences: dict, key: Any) -> None:
+        """How this parameter diffs two sequences. Override to change what counts as a difference."""
         diff_list_values(self_value, other_value, differences, key)
 
     # intentionally not overwriting __eq__ because I want to return a dict not true or false
