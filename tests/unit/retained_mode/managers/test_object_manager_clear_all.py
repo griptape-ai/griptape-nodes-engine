@@ -32,6 +32,7 @@ class TestClearAllObjectStateCancelsFirst:
         engine.flow_manager.reset_global_execution_state = MagicMock(side_effect=lambda: calls.append("reset"))
         # Awaited by the handler to release objects libraries parked in workers.
         engine.worker_manager.broadcast_drop_all_local_objects = AsyncMock()
+        engine.worker_manager.broadcast_pending_local_object_releases = AsyncMock()
         engine.context_manager.has_current_workflow.return_value = False
 
         object_manager = ObjectManager(MagicMock(), engine=engine)
@@ -48,6 +49,7 @@ class TestClearAllObjectStateCancelsFirst:
         engine.flow_manager.check_for_existing_running_flow.return_value = False
         engine.flow_manager.cancel_flow_run = AsyncMock()
         engine.worker_manager.broadcast_drop_all_local_objects = AsyncMock()
+        engine.worker_manager.broadcast_pending_local_object_releases = AsyncMock()
         engine.context_manager.has_current_workflow.return_value = False
 
         object_manager = ObjectManager(MagicMock(), engine=engine)

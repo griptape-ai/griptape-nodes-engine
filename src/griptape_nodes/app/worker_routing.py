@@ -188,6 +188,34 @@ class DropAllLocalObjectsRequest(RequestPayload, SkipTheLineMixin):
 
 @dataclass
 @PayloadRegistry.register
+class DropLocalObjectsRequest(RequestPayload, SkipTheLineMixin):
+    """Sent by the orchestrator when named held objects stop being referenced.
+
+    A handle parameter's value is a key. When that value is replaced or the node carrying it is deleted,
+    the object behind the old key is unreachable, and the process holding it is usually a worker.
+
+    Carries a list because releases queue up on sync paths and drain together, and SkipTheLineMixin for
+    the same reason as its sibling: a queued execution would otherwise run first and could rebuild what
+    this is about to release.
+    """
+
+    keys: list[str]
+
+
+@dataclass
+@PayloadRegistry.register
+class DropLocalObjectsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Worker released whichever of the named objects it was holding."""
+
+
+@dataclass
+@PayloadRegistry.register
+class DropLocalObjectsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Worker failed while releasing the named objects."""
+
+
+@dataclass
+@PayloadRegistry.register
 class DropAllLocalObjectsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Worker released every object it was holding for its libraries."""
 
@@ -369,6 +397,36 @@ async def _handle_drop_all_local_objects(
     return DropAllLocalObjectsResultSuccess(result_details=f"Released {dropped} held object(s).")
 
 
+async def _handle_drop_local_objects(
+    request: DropLocalObjectsRequest,
+    *,
+    event_manager: EventManager,
+) -> ResultPayload:
+    """Release the named objects, whichever of them this process is holding.
+
+    Unlike its drop-all sibling this does not decline mid-execution: the keys named here were already
+    replaced or deleted on the orchestrator, so a node executing now cannot be using them -- it was given
+    the new value. Waiting would keep the memory for the length of a render.
+
+    Passes owner=None because the orchestrator names keys it has already released; the namespace is in the
+    key, and this process either holds it or does not.
+    """
+    resource_manager = event_manager.engine.resource_manager
+
+    def release_all() -> int:
+        return sum(1 for key in request.keys if resource_manager.drop_local_object(key))
+
+    try:
+        # Off the loop for the same reason as its sibling: a release hook is `del model` plus a CUDA cache
+        # flush, and a worker whose loop is blocked past the heartbeat timeout is evicted mid-load.
+        dropped = await to_thread(release_all)
+    except Exception as e:
+        details = f"Attempted to release {len(request.keys)} held object(s). Failed because of {type(e).__name__}: {e}."
+        logger.error(details)
+        return DropLocalObjectsResultFailure(result_details=details)
+    return DropLocalObjectsResultSuccess(result_details=f"Released {dropped} of {len(request.keys)} named object(s).")
+
+
 def register_broadcast_handlers(
     event_manager: EventManager,
     *,
@@ -447,3 +505,8 @@ def register_broadcast_handlers(
         return await _handle_drop_all_local_objects(request, event_manager=event_manager)
 
     event_manager.assign_manager_to_request_type(DropAllLocalObjectsRequest, handle_drop_all_local_objects)
+
+    async def handle_drop_local_objects(request: DropLocalObjectsRequest) -> ResultPayload:
+        return await _handle_drop_local_objects(request, event_manager=event_manager)
+
+    event_manager.assign_manager_to_request_type(DropLocalObjectsRequest, handle_drop_local_objects)

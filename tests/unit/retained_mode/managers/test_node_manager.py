@@ -111,6 +111,7 @@ class TestNodeManagerResolutionStateSerialization:
         mock_parameter = MagicMock(spec=Parameter)
         mock_parameter.name = "test_param"
         mock_parameter.serializable = True
+        mock_parameter.holds_local_object = False
 
         mock_node = MagicMock(spec=BaseNode)
         mock_node.name = "test_node"
@@ -200,6 +201,7 @@ class TestNodeManagerResolutionStateSerialization:
         mock_parameter = MagicMock(spec=Parameter)
         mock_parameter.name = "test_param"
         mock_parameter.serializable = True
+        mock_parameter.holds_local_object = False
 
         mock_node = MagicMock(spec=BaseNode)
         mock_node.name = "test_node"

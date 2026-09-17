@@ -28,8 +28,12 @@ from griptape_nodes.app.worker_routing import (
     DropAllLocalObjectsRequest,
     DropAllLocalObjectsResultFailure,
     DropAllLocalObjectsResultSuccess,
+    DropLocalObjectsRequest,
+    DropLocalObjectsResultFailure,
+    DropLocalObjectsResultSuccess,
     RemoteHandler,
     _handle_drop_all_local_objects,
+    _handle_drop_local_objects,
     register_remote_handlers,
 )
 from griptape_nodes.retained_mode.events.base_events import (
@@ -262,3 +266,80 @@ class TestDropAllLocalObjectsHandler:
             )
 
         assert isinstance(result, DropAllLocalObjectsResultFailure)
+
+
+class TestDropLocalObjectsHandler:
+    """The worker half of a handle being replaced or its node deleted."""
+
+    @pytest.mark.asyncio
+    async def test_releases_the_named_objects(self, engine: Engine) -> None:
+        released: list[str] = []
+        keys = [
+            engine.resource_manager.put_local_object(
+                object(), owner="Lib A", source="N", key=label, on_drop=lambda _v, label=label: released.append(label)
+            )
+            for label in ("one", "two")
+        ]
+
+        result = await _handle_drop_local_objects(
+            DropLocalObjectsRequest(keys=keys), event_manager=engine.event_manager
+        )
+
+        assert isinstance(result, DropLocalObjectsResultSuccess)
+        assert sorted(released) == ["one", "two"]
+
+    @pytest.mark.asyncio
+    async def test_a_key_this_worker_never_held_is_not_a_failure(self, engine: Engine) -> None:
+        """The orchestrator broadcasts to every worker, and only one of them holds any given object."""
+        result = await _handle_drop_local_objects(
+            DropLocalObjectsRequest(keys=["Lib A:not-here"]), event_manager=engine.event_manager
+        )
+
+        assert isinstance(result, DropLocalObjectsResultSuccess)
+
+    @pytest.mark.asyncio
+    async def test_releases_while_executing_a_node(self, engine: Engine) -> None:
+        """Unlike the drop-all sibling this does not decline.
+
+        These keys were replaced or deleted on the orchestrator before the message was sent, so a node
+        executing now was handed the new value and cannot be using them. Declining would hold the memory
+        for the length of a render.
+        """
+        released: list[str] = []
+        key = engine.resource_manager.put_local_object(
+            object(), owner="Lib A", source="N", key="cfg", on_drop=lambda _v: released.append("gone")
+        )
+
+        with engine.event_manager.worker_node_execution_scope():
+            result = await _handle_drop_local_objects(
+                DropLocalObjectsRequest(keys=[key]), event_manager=engine.event_manager
+            )
+
+        assert isinstance(result, DropLocalObjectsResultSuccess)
+        assert released == ["gone"]
+
+    @pytest.mark.asyncio
+    async def test_releases_off_the_event_loop(self, engine: Engine) -> None:
+        """A worker whose loop is blocked past the heartbeat timeout is evicted mid-load."""
+        release_threads: list[int] = []
+        key = engine.resource_manager.put_local_object(
+            object(),
+            owner="Lib A",
+            source="N",
+            key="cfg",
+            on_drop=lambda _v: release_threads.append(threading.get_ident()),
+        )
+
+        await _handle_drop_local_objects(DropLocalObjectsRequest(keys=[key]), event_manager=engine.event_manager)
+
+        assert release_threads
+        assert release_threads[0] != threading.get_ident()
+
+    @pytest.mark.asyncio
+    async def test_reports_failure_rather_than_raising_at_the_transport(self, engine: Engine) -> None:
+        with patch.object(engine.resource_manager, "drop_local_object", side_effect=RuntimeError("boom")):
+            result = await _handle_drop_local_objects(
+                DropLocalObjectsRequest(keys=["Lib A:cfg"]), event_manager=engine.event_manager
+            )
+
+        assert isinstance(result, DropLocalObjectsResultFailure)

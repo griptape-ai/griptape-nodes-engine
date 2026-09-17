@@ -702,6 +702,60 @@ class WorkerManager(EngineScoped):
             return
         await self.broadcast_to_workers(EventRequest(request=ReloadConfigRequest()))
 
+    def schedule_pending_local_object_releases(self) -> None:
+        """Send queued handle releases to the workers on the caller's running loop, if there is one.
+
+        Sync because the releases happen on sync paths: a parameter value being written, a node being
+        deleted. Fire-and-forget like `schedule_broadcast`, and for the same reason it is acceptable here --
+        losing the message leaves a worker holding an object until a later teardown, which is the bound the
+        mid-execution decline already has.
+
+        With no running loop the keys stay queued and the next drain sends them, so a release issued from a
+        thread or a sync test is not lost.
+        """
+        from griptape_nodes.app.worker_routing import DropLocalObjectsRequest
+
+        if self._transport is None or not self._workers:
+            # Nothing to tell. Draining keeps the queue from growing for the life of the process.
+            self.engine.resource_manager.drain_pending_worker_releases()
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        keys = self.engine.resource_manager.drain_pending_worker_releases()
+        if not keys:
+            return
+        event = EventRequest(request=DropLocalObjectsRequest(keys=keys))
+        task = loop.create_task(self.broadcast_to_workers(event))
+        self._inflight_broadcast_tasks.add(task)
+        task.add_done_callback(self._inflight_broadcast_tasks.discard)
+
+    async def broadcast_pending_local_object_releases(self) -> None:
+        """Tell every worker about keys released here that it may also be holding.
+
+        Drains the queue the sync release paths fill -- a handle parameter's value being replaced, a node
+        being deleted -- so those paths do not each need a loop of their own. Never raises, for the same
+        reason as its sibling below: a send failure must not break whatever triggered the release.
+
+        Lazy import breaks the same cycle as its siblings: `app.worker_routing` imports `EventManager` from
+        this package.
+        """
+        from griptape_nodes.app.worker_routing import DropLocalObjectsRequest
+
+        keys = self.engine.resource_manager.drain_pending_worker_releases()
+        if not keys or self._transport is None or not self._workers:
+            return
+        try:
+            await self.broadcast_to_workers(EventRequest(request=DropLocalObjectsRequest(keys=keys)))
+        except Exception as e:
+            logger.warning(
+                "Could not tell the workers to release %d held object(s): %s. A worker that did not get the "
+                "message keeps them until a later teardown.",
+                len(keys),
+                e,
+            )
+
     async def broadcast_drop_all_local_objects(self) -> None:
         """Tell every worker to release the objects its libraries parked in it.
 

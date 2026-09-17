@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from griptape_nodes.app.worker_routing import DropAllLocalObjectsRequest
+from griptape_nodes.app.worker_routing import DropAllLocalObjectsRequest, DropLocalObjectsRequest
 from griptape_nodes.exe_types.core_types import ParameterType, ParameterTypeBuiltin
 from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.retained_mode.engine import Engine
@@ -611,6 +611,97 @@ class TestConcurrentAccess:
         assert errors == []
         assert sorted(reported) == [False, True]
         assert released == ["once"]
+
+
+class TestReleaseKeyEverywhere:
+    """What the engine calls when a handle stops being referenced: release here, tell the workers."""
+
+    @pytest.fixture(autouse=True)
+    def _with_registered_workers(self, engine: Engine) -> Iterator[None]:
+        """Workers exist but no loop is running, which is how a sync release path arrives here.
+
+        The keys stay queued for the awaited drain rather than being sent, which is what these assert on.
+        With no workers registered the queue is drained on the spot instead, since there is nobody to tell
+        and it must not grow for the life of the process -- covered separately below.
+        """
+        worker_manager = engine.worker_manager
+        with (
+            patch.object(worker_manager, "_transport", object()),
+            patch.object(worker_manager, "_workers", {"w1": object()}),
+        ):
+            yield
+
+    def test_releases_locally_and_queues_the_key(self, engine: Engine) -> None:
+        manager = engine.resource_manager
+        released: list[str] = []
+        key = manager.put_local_object(
+            Held("pipeline"),
+            owner="Lib A",
+            source="N",
+            key="cfg",
+            on_drop=lambda value: released.append(value.label),
+        )
+
+        assert manager.release_key_everywhere(key, owner="Lib A") is True
+        assert released == ["pipeline"]
+        assert manager.get_local_object(key, owner="Lib A") is None
+        assert manager.drain_pending_worker_releases() == [key]
+
+    def test_a_key_this_process_never_held_is_still_queued(self, engine: Engine) -> None:
+        """The object is usually in a worker, so the local result says nothing about who holds it."""
+        manager = engine.resource_manager
+
+        assert manager.release_key_everywhere("Lib A:elsewhere", owner="Lib A") is False
+        assert manager.drain_pending_worker_releases() == ["Lib A:elsewhere"]
+
+    def test_draining_empties_the_queue(self, engine: Engine) -> None:
+        manager = engine.resource_manager
+        manager.release_key_everywhere("Lib A:one", owner="Lib A")
+
+        assert manager.drain_pending_worker_releases() == ["Lib A:one"]
+        assert manager.drain_pending_worker_releases() == []
+
+    def test_the_broadcast_carries_the_drained_keys_to_the_transport(self, engine: Engine) -> None:
+        """Mocking the broadcast method proves a call, never that a message is sent."""
+        manager = engine.resource_manager
+        worker_manager = engine.worker_manager
+        manager.release_key_everywhere("Lib A:one", owner="Lib A")
+        manager.release_key_everywhere("Lib A:two", owner="Lib A")
+
+        with (
+            patch.object(worker_manager, "broadcast_to_workers", AsyncMock()) as fan_out,
+            patch.object(worker_manager, "_transport", object()),
+            patch.object(worker_manager, "_workers", {"w1": object()}),
+        ):
+            asyncio.run(worker_manager.broadcast_pending_local_object_releases())
+
+        assert fan_out.await_count == 1
+        assert fan_out.await_args is not None
+        sent = fan_out.await_args.args[0]
+        assert isinstance(sent.request, DropLocalObjectsRequest)
+        assert sent.request.keys == ["Lib A:one", "Lib A:two"]
+
+    def test_no_workers_means_no_message_and_no_growing_queue(self, engine: Engine) -> None:
+        """A worker process has no workers of its own, and its queue must not grow for the process's life."""
+        manager = engine.resource_manager
+        worker_manager = engine.worker_manager
+
+        with patch.object(worker_manager, "_workers", {}):
+            manager.release_key_everywhere("Lib A:one", owner="Lib A")
+
+        assert manager.drain_pending_worker_releases() == []
+
+    def test_a_failing_broadcast_does_not_raise(self, engine: Engine) -> None:
+        """A send fails most readily against a dying worker, and the release already happened here."""
+        engine.resource_manager.release_key_everywhere("Lib A:one", owner="Lib A")
+        worker_manager = engine.worker_manager
+
+        with (
+            patch.object(worker_manager, "broadcast_to_workers", AsyncMock(side_effect=RuntimeError("no broker"))),
+            patch.object(worker_manager, "_transport", object()),
+            patch.object(worker_manager, "_workers", {"w1": object()}),
+        ):
+            asyncio.run(worker_manager.broadcast_pending_local_object_releases())
 
 
 @pytest.mark.parametrize("bad_key", ["", "no-namespace", "Lib A:", ":suffix"])

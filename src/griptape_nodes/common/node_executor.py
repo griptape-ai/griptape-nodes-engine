@@ -350,6 +350,7 @@ class NodeExecutor(EngineScoped):
             # reads from parameter_output_values.
             for name, value in result.parameter_output_values.items():
                 node.parameter_output_values[name] = value
+
         finally:
             current_executing_node_name.reset(token)
 

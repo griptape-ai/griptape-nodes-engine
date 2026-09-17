@@ -1289,6 +1289,11 @@ class NodeManager(EngineScoped):
             details = f"Attempted to delete a Node '{node_name}', but no such Node was found."
             return DeleteNodeResultFailure(result_details=details)
 
+        # Which of this node's held objects nothing else refers to, decided now rather than after the
+        # connections come down: deleting a connection clears an INPUT-only consumer's copy of the key, so
+        # by then every one of them would look unreferenced.
+        releasable_handle_keys = self._unreferenced_handle_keys(node)
+
         with self.engine.context_manager.node(node=node):
             parent_flow_name = self._name_to_parent_flow_name[node_name]
             try:
@@ -1363,6 +1368,9 @@ class NodeManager(EngineScoped):
                 return DeleteNodeResultFailure(result_details=details)
 
         parent_flow.remove_node(node.name)
+
+        for key in releasable_handle_keys:
+            node.release_displaced_handle(key)
 
         # Now remove the record keeping
         self.engine.object_manager.del_obj_by_name(node_name)
@@ -3004,6 +3012,27 @@ class NodeManager(EngineScoped):
             valid_parameters_by_node=valid_parameters_by_node, result_details=details
         )
 
+    def _unreferenced_handle_keys(self, node: BaseNode) -> list[str]:
+        """The keys of `node`'s held objects that no other node's parameter values carry.
+
+        A key is a value, not an edge: a consumer keeps its copy when the connection goes away, and while it
+        does the object behind that key is still reachable and still usable, so deleting the node that made
+        it must leave it alone. Unlike an overwrite there is no fresher value to take its place.
+        """
+        candidates = {
+            key
+            for parameter in node.parameters
+            if parameter.holds_local_object and isinstance(key := node.parameter_output_values.get(parameter.name), str)
+        }
+        if not candidates:
+            return []
+        for name, other in self.engine.object_manager.get_filtered_subset(type=BaseNode).items():
+            if name == node.name:
+                continue
+            candidates -= set(other.parameter_values.values())
+            candidates -= set(other.parameter_output_values.values())
+        return sorted(candidates)
+
     def get_node_by_name(self, name: str) -> BaseNode:
         obj_mgr = self.engine.object_manager
 
@@ -4373,7 +4402,9 @@ class NodeManager(EngineScoped):
                 # This value is new for us.
 
                 # Check if parameter is marked as non-serializable (e.g., ImageDrivers, PromptDrivers, file handles)
-                if not parameter.serializable:
+                # A handle is never serializable: its value is a key into one process's memory, and a
+                # reopened workflow would resolve it to nothing.
+                if not parameter.serializable or parameter.holds_local_object:
                     serialized_parameter_value_tracker.add_as_not_serializable(value_id)
                     return None
 
@@ -4551,8 +4582,9 @@ class NodeManager(EngineScoped):
         if isinstance(create_node_request, CreateNodeRequest):
             create_node_request.resolution = NodeResolutionState.UNRESOLVED.value
 
-        # Author opted out via serializable=False — silently skip; not a failure.
-        if not parameter.serializable:
+        # Author opted out via serializable=False, or the parameter holds a handle, whose key means
+        # nothing in another process — silently skip; not a failure.
+        if not parameter.serializable or parameter.holds_local_object:
             return None
         # Genuine serialization failure — warn and mark unresolved.
         details = f"Attempted to serialize {value_kind} value for parameter '{parameter.name}' on node '{node.name}'. The {value_kind} value will not be restored in anything that attempts to deserialize or save this node. The value for this parameter was not serialized because it did not match Griptape Nodes' criteria for serializability. To remedy, either update the value's type to support serializability or mark the parameter as not serializable by setting serializable=False when creating the parameter."

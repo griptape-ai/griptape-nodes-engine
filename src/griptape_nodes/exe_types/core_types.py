@@ -178,6 +178,13 @@ class ParameterType:
         return type_str[:bracket_index]
 
     @staticmethod
+    def is_handle(type_name: str | None) -> bool:
+        """Whether this type names a handle, with or without a payload: `handle`, `handle[FluxPipeline]`."""
+        if not type_name:
+            return False
+        return ParameterType._extract_base_type(type_name.lower()) == ParameterTypeBuiltin.HANDLE.value
+
+    @staticmethod
     def are_types_compatible(source_type: str | None, target_type: str | None) -> bool:  # noqa: PLR0911
         if source_type is None or target_type is None:
             return False
@@ -1494,6 +1501,10 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
             ParameterMode.PROPERTY,
         }
     )
+    # A handle parameter's release hook: what to run when the engine releases the object this parameter
+    # referred to. Underscored like the other callables so it stays out of to_dict, which a saved
+    # workflow reads -- a function there would be written out as a repr.
+    _on_local_object_drop: Callable[[Any], None] | None = None
     _converters: list[Callable[[Any], Any]]
     _validators: list[Callable[[Parameter, Any], None]]
     _on_incoming_connection_removed: list[Callable[[Parameter, str, str], None]]
@@ -1516,6 +1527,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         tooltip_as_property: str | list[dict] | None = None,
         tooltip_as_output: str | list[dict] | None = None,
         allowed_modes: set[ParameterMode] | None = None,
+        on_local_object_drop: Callable[[Any], None] | None = None,
         converters: list[Callable[[Any], Any]] | None = None,
         validators: list[Callable[[Parameter, Any], None]] | None = None,
         traits: set[Trait.__class__ | Trait] | None = None,  # We are going to make these children.
@@ -1603,6 +1615,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
                     stacklevel=2,
                 )
 
+        self._on_local_object_drop = on_local_object_drop
         if converters is None:
             self._converters = []
         else:
@@ -2116,6 +2129,27 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
                 self._output_type = value
             return
         self._output_type = None
+
+    @property
+    def holds_local_object(self) -> bool:
+        """Whether values on this parameter are keys into the process-local object store.
+
+        A `handle[...]` parameter carries a key; the object it refers to never leaves the process that
+        built it. True for the producing and the consuming side, since both see the key.
+        """
+        return any(
+            ParameterType.is_handle(candidate)
+            for candidate in (self._type, self._output_type, *(self._input_types or ()))
+        )
+
+    @property
+    def on_local_object_drop(self) -> Callable[[Any], None] | None:
+        """What to run when the engine releases the object this parameter referred to.
+
+        For anything whose memory is not freed by dropping the reference -- a pipeline holding GPU
+        memory. The engine calls it when this parameter's value is replaced, and when the node is deleted.
+        """
+        return self._on_local_object_drop
 
     def add_trait(self, trait: type[Trait] | Trait) -> None:
         if not isinstance(trait, Trait):

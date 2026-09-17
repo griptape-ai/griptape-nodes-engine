@@ -100,6 +100,11 @@ class ResourceManager(EngineScoped):
         # an object another node is still using. There is no borrow or lease.
         self._local_objects_lock = threading.Lock()
 
+        # Keys released here that a worker may also be holding. The releases happen on sync paths -- a
+        # parameter value being written, a node being deleted -- and telling a worker has to be awaited, so
+        # the async chokepoints that already exist drain this instead of each caller inventing a loop.
+        self._pending_worker_releases: list[str] = []
+
         # Register event handlers
         event_manager.assign_manager_to_request_type(
             request_type=ListRegisteredResourceTypesRequest, callback=self.on_list_registered_resource_types_request
@@ -429,6 +434,26 @@ class ResourceManager(EngineScoped):
 
         self._invoke_on_drop(key, entry)
         return True
+
+    def release_key_everywhere(self, key: str, *, owner: str) -> bool:
+        """Release `key` here and remember to tell the workers, returning whether this process held it.
+
+        The object may be in this process, in a worker, or in both when two libraries share a namespace, so
+        the local release cannot tell you whether anything is left holding it. Callers on sync paths use
+        this and let `drain_pending_worker_releases` do the rest.
+        """
+        dropped = self.drop_local_object(key, owner=owner)
+        with self._local_objects_lock:
+            self._pending_worker_releases.append(key)
+        self.engine.worker_manager.schedule_pending_local_object_releases()
+        return dropped
+
+    def drain_pending_worker_releases(self) -> list[str]:
+        """Take the keys queued for the workers, leaving the queue empty."""
+        with self._local_objects_lock:
+            pending = self._pending_worker_releases
+            self._pending_worker_releases = []
+        return pending
 
     def drop_all_local_objects(self) -> int:
         """Release everything held in this process, returning how many went.

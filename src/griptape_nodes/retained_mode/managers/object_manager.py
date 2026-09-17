@@ -154,6 +154,7 @@ class ObjectManager(EngineScoped):
             #
             # In the finally because nothing retries this request, so a worker that was never told keeps
             # its objects for the life of the process.
+            await self.engine.worker_manager.broadcast_pending_local_object_releases()
             await self.engine.worker_manager.broadcast_drop_all_local_objects()
 
         if self._name_to_objects:

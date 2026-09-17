@@ -46,6 +46,8 @@ def _make_node_with_tracked_outputs(name: str = "TestNode") -> MagicMock:
     node.parameter_values = {}
     node.parameter_output_values = TrackedParameterOutputValues(node)
     node.metadata = {}
+    # These write outputs for parameters the node never declared, which is what a real node reports.
+    node.get_parameter_by_name.return_value = None
     return node
 
 
