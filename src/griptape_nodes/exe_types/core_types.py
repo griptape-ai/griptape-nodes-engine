@@ -19,13 +19,13 @@ from griptape_nodes.exe_types.elements.control_parameters import (
     ControlParameterOutput,
 )
 from griptape_nodes.exe_types.elements.groups import ParameterButtonGroup, ParameterGroup
-from griptape_nodes.exe_types.elements.messages import DeprecationMessage, ParameterMessage
 from griptape_nodes.exe_types.elements.node_messages import (
     ElementMessageCallback,
     NodeMessagePayload,
     NodeMessageResult,
 )
 from griptape_nodes.exe_types.elements.parameter import Parameter, ParameterBase
+from griptape_nodes.exe_types.elements.parameter_messages import DeprecationMessage, ParameterMessage
 from griptape_nodes.exe_types.elements.parameter_types import (
     VALID_PARAMETER_RENDER_LOCATIONS,
     ParameterMode,
