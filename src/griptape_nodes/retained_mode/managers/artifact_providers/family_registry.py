@@ -108,31 +108,36 @@ class FamilyRegistry:
         candidates = self.get_decoders(family, extension)
         return self._resolve_from_candidates(candidates, preferred_friendly_name)
 
-    def get_encoders(self, family: type[ArtifactFamily], output_format: str) -> list[type[BaseArtifactProvider]]:
-        """Return every registered provider that can encode ``family`` to ``output_format``.
+    def get_encoders(
+        self, family: type[ArtifactFamily], output_format: str | None = None
+    ) -> list[type[BaseArtifactProvider]]:
+        """Return every registered provider that can encode ``family``, optionally filtered by format.
 
         Args:
             family: The family whose encoder mixin providers must implement.
-            output_format: Desired output format without leading dot (e.g. "webp").
+            output_format: Desired output format without leading dot (e.g. "webp"),
+                or ``None`` to return every encoder for ``family`` regardless of
+                which formats it supports.
         """
         return [
             provider_class
             for provider_class in self._registry.get_all_provider_classes()
             if issubclass(provider_class, family.encoder_mixin)
-            and output_format in provider_class.get_preview_formats()
+            and (output_format is None or output_format in provider_class.get_preview_formats())
         ]
 
     def resolve_encoder(
         self,
         family: type[ArtifactFamily],
-        output_format: str,
+        output_format: str | None = None,
         preferred_friendly_name: str | None = None,
     ) -> type[BaseArtifactProvider] | None:
         """Resolve the encoder provider to use for ``output_format`` within ``family``.
 
         Args:
             family: The family whose encoder mixin providers must implement.
-            output_format: Desired output format without leading dot (e.g. "webp").
+            output_format: Desired output format without leading dot (e.g. "webp"),
+                or ``None`` to resolve without filtering by format.
             preferred_friendly_name: If given, only a provider with this friendly
                 name is returned; a name that matches no candidate returns
                 ``None`` rather than silently falling back to another provider.
@@ -144,12 +149,15 @@ class FamilyRegistry:
         candidates = self.get_encoders(family, output_format)
         return self._resolve_from_candidates(candidates, preferred_friendly_name)
 
-    def resolve_conversion(self, family: type[ArtifactFamily], output_format: str) -> type[BaseArtifactProvider] | None:
+    def resolve_conversion(
+        self, family: type[ArtifactFamily], output_format: str | None = None
+    ) -> type[BaseArtifactProvider] | None:
         """Resolve the provider to convert ``family`` artifacts to ``output_format``.
 
         Args:
             family: The family whose encoder mixin providers must implement.
-            output_format: Desired output format without leading dot (e.g. "webp").
+            output_format: Desired output format without leading dot (e.g. "webp"),
+                or ``None`` to resolve without filtering by format.
         """
         return self.resolve_encoder(family, output_format)
 
@@ -166,10 +174,7 @@ class FamilyRegistry:
         """
         if self.resolve_decoder(family, extension) is None:
             return False
-        return any(
-            issubclass(provider_class, family.encoder_mixin)
-            for provider_class in self._registry.get_all_provider_classes()
-        )
+        return bool(self.get_encoders(family))
 
     def _family_for_provider_class(self, provider_class: type[BaseArtifactProvider]) -> type[ArtifactFamily] | None:
         for family in self._families:

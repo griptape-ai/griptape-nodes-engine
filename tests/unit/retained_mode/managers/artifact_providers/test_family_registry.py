@@ -182,6 +182,13 @@ class TestGetEncoders:
 
         assert family_registry.get_encoders(ImageFamily, "not-a-format") == []
 
+    def test_get_encoders_with_no_format_returns_every_encoder_for_family(self) -> None:
+        family_registry = FamilyRegistry(_build_registry_with_two_image_providers())
+
+        encoders = family_registry.get_encoders(ImageFamily)
+
+        assert set(encoders) == {ImageArtifactProvider, _AlternateImageProvider}
+
 
 class TestResolveEncoder:
     def test_resolve_encoder_honors_explicit_override(self) -> None:
@@ -197,6 +204,11 @@ class TestResolveEncoder:
         encoder = family_registry.resolve_encoder(ImageFamily, "webp", preferred_friendly_name="NoSuchProvider")
 
         assert encoder is None
+
+    def test_resolve_encoder_with_no_format_returns_first_registered(self) -> None:
+        family_registry = FamilyRegistry(_build_registry_with_two_image_providers())
+
+        assert family_registry.resolve_encoder(ImageFamily) is ImageArtifactProvider
 
 
 class TestResolveConversion:
