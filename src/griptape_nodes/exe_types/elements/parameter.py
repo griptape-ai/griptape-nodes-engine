@@ -9,6 +9,7 @@ from copy import deepcopy
 from dataclasses import field
 from typing import TYPE_CHECKING, Any
 
+from griptape_nodes.exe_types.elements.badge import set_initial_badge
 from griptape_nodes.exe_types.elements.base import BaseNodeElement
 from griptape_nodes.exe_types.elements.parameter_types import ParameterMode, ParameterType, ParameterTypeBuiltin
 from griptape_nodes.exe_types.elements.trait import Trait
@@ -267,15 +268,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
                 # UI options are now traits! sorry!
                 self.add_child(created)
         if badge is not None:
-            self.set_badge(
-                variant=badge.variant,
-                title=badge.title,
-                message=badge.message,
-                icon=badge.icon,
-                color=badge.color,
-                hide=badge.hide,
-                hide_clear_button=badge.hide_clear_button,
-            )
+            set_initial_badge(self, badge)
         self.type = type
         self.input_types = input_types
         self.output_type = output_type

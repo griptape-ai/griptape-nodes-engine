@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Literal
 
+from griptape_nodes.exe_types.elements.badge import set_initial_badge
 from griptape_nodes.exe_types.elements.base import BaseNodeElement
 from griptape_nodes.exe_types.elements.parameter import Parameter
 from griptape_nodes.exe_types.elements.ui_options import UIOptionsMixin
@@ -41,15 +42,7 @@ class ParameterGroup(BaseNodeElement, UIOptionsMixin):
         self.user_defined = user_defined
 
         if badge is not None:
-            self.set_badge(
-                variant=badge.variant,
-                title=badge.title,
-                message=badge.message,
-                icon=badge.icon,
-                color=badge.color,
-                hide=badge.hide,
-                hide_clear_button=badge.hide_clear_button,
-            )
+            set_initial_badge(self, badge)
 
     @property
     def ui_options(self) -> dict:

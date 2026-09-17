@@ -2,22 +2,19 @@
 
 from __future__ import annotations
 
-import logging
 import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar, Self, TypeVar
 
-from griptape_nodes.exe_types.elements.badge import VALID_BADGE_VARIANTS, BadgeData
-from griptape_nodes.exe_types.elements.node_messages import NodeMessagePayload, NodeMessageResult
+from griptape_nodes.exe_types.elements.badge import handle_badge_message, write_badge_fields
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from types import TracebackType
 
-    from griptape_nodes.exe_types.elements.badge import BadgeVariantType
+    from griptape_nodes.exe_types.elements.badge import BadgeData, BadgeVariantType
+    from griptape_nodes.exe_types.elements.node_messages import NodeMessagePayload, NodeMessageResult
     from griptape_nodes.exe_types.node_types import BaseNode
-
-logger = logging.getLogger("griptape_nodes")
 
 
 N = TypeVar("N", bound="BaseNodeElement")
@@ -103,24 +100,16 @@ class BaseNodeElement:
 
         color can be hex (e.g. "#3b82f6"), rgb (e.g. "rgb(59, 130, 246)"), etc.
         """
-        if self._badge is None:
-            self._badge = BadgeData()
-        self._badge._parent_element = self
-        if variant is not None:
-            self._badge.variant = variant
-        if title is not None:
-            self._badge.title = title
-        if message is not None:
-            self._badge.message = message
-        if icon is not None:
-            self._badge.icon = icon
-        if color is not None:
-            self._badge.color = color
-        if hide is not None:
-            self._badge.hide = hide
-        if hide_clear_button is not None:
-            self._badge.hide_clear_button = hide_clear_button
-        self.track_change("badge", self._badge.to_dict())
+        provided = {
+            "variant": variant,
+            "title": title,
+            "message": message,
+            "icon": icon,
+            "color": color,
+            "hide": hide,
+            "hide_clear_button": hide_clear_button,
+        }
+        write_badge_fields(self, {name: value for name, value in provided.items() if value is not None})
 
     def clear_badge(self) -> None:
         """Set badge to None (cleared)."""
@@ -323,79 +312,6 @@ class BaseNodeElement:
         }
         return event_data
 
-    def _apply_badge_from_message_data(self, data: dict) -> None:
-        """Apply badge fields from a message data dict and track change."""
-        if self._badge is None:
-            self._badge = BadgeData()
-        self._badge._parent_element = self
-        if "variant" in data:
-            val = data["variant"]
-            if val in VALID_BADGE_VARIANTS:
-                self._badge.variant = val
-            else:
-                msg = f"{self.__class__.__name__} received invalid badge variant {val}; using 'info'. Valid: {sorted(VALID_BADGE_VARIANTS)}"
-                logger.error(msg)
-                self._badge.variant = "info"
-        if "title" in data:
-            self._badge.title = data["title"]
-        if "message" in data:
-            self._badge.message = data["message"]
-        if "icon" in data:
-            self._badge.icon = data["icon"]
-        if "color" in data:
-            self._badge.color = data["color"]
-        if "hide" in data:
-            self._badge.hide = data["hide"]
-        if "hide_clear_button" in data:
-            self._badge.hide_clear_button = data["hide_clear_button"]
-        self.track_change("badge", self._badge.to_dict())
-
-    def _on_badge_message_received(
-        self, message_type: str, message: NodeMessagePayload | None
-    ) -> NodeMessageResult | None:
-        """Handle badge-related messages; return result if handled, None otherwise."""
-        msg_lower = message_type.lower()
-        match msg_lower:
-            case "clear_badge":
-                self.clear_badge()
-                return NodeMessageResult(
-                    success=True,
-                    details="Badge cleared",
-                    response=None,
-                    altered_workflow_state=False,
-                )
-            case "get_badge":
-                badge = self.get_badge()
-                badge_dict = badge.to_dict() if badge is not None else None
-                return NodeMessageResult(
-                    success=True,
-                    details="Badge retrieved",
-                    response=NodeMessagePayload(data=badge_dict),
-                    altered_workflow_state=False,
-                )
-            case "set_badge":
-                if message is not None and hasattr(message, "data") and isinstance(message.data, dict):
-                    self._apply_badge_from_message_data(message.data)
-                badge = self.get_badge()
-                badge_dict = badge.to_dict() if badge is not None else None
-                return NodeMessageResult(
-                    success=True,
-                    details="Badge updated",
-                    response=NodeMessagePayload(data=badge_dict),
-                    altered_workflow_state=False,
-                )
-            case "clear_badge_display":
-                self.dismiss_badge()
-                return NodeMessageResult(
-                    success=True,
-                    details="Badge dismissed",
-                    response=None,
-                    altered_workflow_state=False,
-                )
-            case _:
-                # Not a badge message; return None so caller can delegate to other handlers (e.g. on_click).
-                return None
-
     def on_message_received(self, message_type: str, message: NodeMessagePayload | None) -> NodeMessageResult | None:
         """Virtual method for handling messages sent to this element.
 
@@ -410,7 +326,7 @@ class BaseNodeElement:
         Returns:
             NodeMessageResult | None: Result if handled, None if no handler available
         """
-        badge_result = self._on_badge_message_received(message_type, message)
+        badge_result = handle_badge_message(self, message_type, message)
         if badge_result is not None:
             return badge_result
         for child in self._children:
