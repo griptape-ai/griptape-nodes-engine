@@ -719,8 +719,8 @@ class TestGetDisplayableImageBytesHandler:
     """The request-based decode+encode pipeline.
 
     Decoder and encoder are resolved independently: the decoder by source
-    extension, the encoder always by friendly name "Image". This lets a
-    future non-Pillow decoder reuse the existing Pillow encoder without
+    extension, the encoder via FamilyRegistry.resolve_encoder(ImageFamily). This
+    lets a future non-Pillow decoder reuse the existing Pillow encoder without
     implementing its own.
     """
 
@@ -998,6 +998,66 @@ class TestGetDisplayableImageBytesHandler:
         assert result.format == "webp"
         with Image.open(BytesIO(result.image_bytes)) as img:
             assert img.format == "WEBP"
+
+    @pytest.mark.asyncio
+    async def test_encoder_resolved_via_family_registry_not_hardcoded_friendly_name(
+        self, test_image_path: Path
+    ) -> None:
+        """Encoder resolution goes through FamilyRegistry, not a hardcoded "Image" lookup.
+
+        Registers a second Image-family encoder after ImageArtifactProvider and
+        asserts Pillow (registered first) still wins, proving resolution follows
+        registration order via FamilyRegistry rather than any hardcoded name.
+        """
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            GetDisplayableImageBytesRequest,
+            GetDisplayableImageBytesResultSuccess,
+        )
+        from griptape_nodes.retained_mode.managers.artifact_providers.image_encoder_mixin import (
+            ImageArtifactEncoderMixin,
+        )
+
+        class _AlternateEncoderProvider(BaseArtifactProvider, ImageArtifactEncoderMixin):
+            @classmethod
+            def get_friendly_name(cls) -> str:
+                return "AlternateEncoder"
+
+            @classmethod
+            def get_supported_formats(cls) -> set[str]:
+                return {"jpg"}
+
+            @classmethod
+            def get_preview_formats(cls) -> set[str]:
+                return {"webp"}
+
+            @classmethod
+            def get_default_preview_format(cls) -> str:
+                return "webp"
+
+            def encode(
+                self,
+                decoded_artifact: DecodedImageArtifact,  # noqa: ARG002
+                situation: ImageArtifactSituation,  # noqa: ARG002
+                format: str | None = None,  # noqa: ARG002, A002
+            ) -> bytes:
+                message = "encode() must not be called: ImageArtifactProvider should win by registration order"
+                raise AssertionError(message)
+
+        manager = ArtifactManager()
+        manager.on_handle_register_artifact_provider_request(
+            RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider)
+        )
+        manager.on_handle_register_artifact_provider_request(
+            RegisterArtifactProviderRequest(provider_class=_AlternateEncoderProvider)
+        )
+
+        request = GetDisplayableImageBytesRequest(
+            source_path=str(test_image_path), situation=ImageArtifactSituation.VIEWER
+        )
+        result = await manager.on_get_displayable_image_bytes_request(request)
+
+        assert isinstance(result, GetDisplayableImageBytesResultSuccess)
+        assert result.format == "webp"
 
 
 class TestGeneratePreview:

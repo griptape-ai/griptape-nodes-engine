@@ -95,6 +95,7 @@ from griptape_nodes.retained_mode.managers.artifact_providers import (
     VideoArtifactProvider,
     WriteVettingPolicy,
 )
+from griptape_nodes.retained_mode.managers.artifact_providers.artifact_family import ImageFamily
 from griptape_nodes.retained_mode.managers.artifact_providers.artifact_schema_models import (
     ArtifactSchemas,
     GeneratorConfigurationsSchema,
@@ -105,6 +106,7 @@ from griptape_nodes.retained_mode.managers.artifact_providers.artifact_schema_mo
     PreviewGeneratorSchema,
     ProviderSchema,
 )
+from griptape_nodes.retained_mode.managers.artifact_providers.family_registry import FamilyRegistry
 from griptape_nodes.retained_mode.managers.artifact_providers.image_decoder_mixin import ImageArtifactDecoderMixin
 from griptape_nodes.retained_mode.managers.artifact_providers.image_encoder_mixin import ImageArtifactEncoderMixin
 from griptape_nodes.retained_mode.managers.artifact_providers.image_situation import (
@@ -228,6 +230,7 @@ class ArtifactManager(EngineScoped):
         super().__init__(engine)
         # Provider registry for managing artifact providers
         self._registry = ProviderRegistry(engine=engine)
+        self._family_registry = FamilyRegistry(self._registry)
 
         if event_manager is not None:
             event_manager.assign_manager_to_request_type(
@@ -487,7 +490,7 @@ class ArtifactManager(EngineScoped):
         decoder = self._provider_for_format(extension)
         if decoder is None or not isinstance(decoder, ImageArtifactDecoderMixin):
             return False
-        encoder_class = self._registry.get_provider_class_by_friendly_name("Image")
+        encoder_class = self._family_registry.resolve_encoder(ImageFamily)
         encoder = self._registry.get_or_create_provider_instance(encoder_class) if encoder_class else None
         return isinstance(encoder, ImageArtifactEncoderMixin)
 
@@ -1113,7 +1116,7 @@ class ArtifactManager(EngineScoped):
             )
 
         # FAILURE CASE: no "Image" encoder provider registered
-        encoder_class = self._registry.get_provider_class_by_friendly_name("Image")
+        encoder_class = self._family_registry.resolve_encoder(ImageFamily)
         encoder = self._registry.get_or_create_provider_instance(encoder_class) if encoder_class else None
         if encoder is None:
             return GetDisplayableImageBytesResultFailure(
