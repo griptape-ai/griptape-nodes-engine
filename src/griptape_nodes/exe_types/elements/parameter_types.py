@@ -204,3 +204,37 @@ def accepts_incoming_type(input_types: list[str], incoming_type: str | None) -> 
         if ParameterType.are_types_compatible(source_type=incoming_type, target_type=test_type):
             return True
     return False
+
+
+def modes_from_flags(*, allow_input: bool, allow_property: bool, allow_output: bool) -> set[ParameterMode]:
+    """Return the modes the ``allow_*`` arguments ask for."""
+    modes: set[ParameterMode] = set()
+    if allow_input:
+        modes.add(ParameterMode.INPUT)
+    if allow_property:
+        modes.add(ParameterMode.PROPERTY)
+    if allow_output:
+        modes.add(ParameterMode.OUTPUT)
+    return modes
+
+
+def disallowed_mode_flags(*, allow_input: bool, allow_property: bool, allow_output: bool) -> list[str]:
+    """Name the ``allow_*`` arguments turned off, as a caller wrote them."""
+    disallowed: list[str] = []
+    if not allow_input:
+        disallowed.append("allow_input=False")
+    if not allow_property:
+        disallowed.append("allow_property=False")
+    if not allow_output:
+        disallowed.append("allow_output=False")
+    return disallowed
+
+
+def modes_with(modes: set[ParameterMode], mode: ParameterMode, *, allowed: bool) -> set[ParameterMode]:
+    """Return ``modes`` with ``mode`` added or removed, leaving the original alone."""
+    updated = modes.copy()
+    if allowed:
+        updated.add(mode)
+    else:
+        updated.discard(mode)
+    return updated

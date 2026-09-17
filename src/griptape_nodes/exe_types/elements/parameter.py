@@ -18,6 +18,9 @@ from griptape_nodes.exe_types.elements.parameter_types import (
     ParameterTypeBuiltin,
     accepts_incoming_type,
     canonical_type_name,
+    disallowed_mode_flags,
+    modes_from_flags,
+    modes_with,
 )
 from griptape_nodes.exe_types.elements.tooltips import default_parameter_tooltip
 from griptape_nodes.exe_types.elements.trait import Trait
@@ -190,24 +193,16 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
 
         # Process allowed_modes - use convenience parameters if allowed_modes not explicitly set
         if allowed_modes is None:
-            self._allowed_modes = set()
-            if allow_input:
-                self._allowed_modes.add(ParameterMode.INPUT)
-            if allow_property:
-                self._allowed_modes.add(ParameterMode.PROPERTY)
-            if allow_output:
-                self._allowed_modes.add(ParameterMode.OUTPUT)
+            self._allowed_modes = modes_from_flags(
+                allow_input=allow_input, allow_property=allow_property, allow_output=allow_output
+            )
         else:
             self._allowed_modes = allowed_modes
 
             # Warn if both allowed_modes and convenience parameters are set
-            convenience_params_used = []
-            if not allow_input:
-                convenience_params_used.append("allow_input=False")
-            if not allow_property:
-                convenience_params_used.append("allow_property=False")
-            if not allow_output:
-                convenience_params_used.append("allow_output=False")
+            convenience_params_used = disallowed_mode_flags(
+                allow_input=allow_input, allow_property=allow_property, allow_output=allow_output
+            )
 
             if convenience_params_used:
                 warnings.warn(
@@ -542,12 +537,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         Args:
             value: True to allow INPUT mode, False to disallow it
         """
-        current_modes = self.allowed_modes.copy()
-        if value:
-            current_modes.add(ParameterMode.INPUT)
-        else:
-            current_modes.discard(ParameterMode.INPUT)
-        self.allowed_modes = current_modes
+        self.allowed_modes = modes_with(self.allowed_modes, ParameterMode.INPUT, allowed=value)
 
     @property
     def allow_property(self) -> bool:
@@ -565,12 +555,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         Args:
             value: True to allow PROPERTY mode, False to disallow it
         """
-        current_modes = self.allowed_modes.copy()
-        if value:
-            current_modes.add(ParameterMode.PROPERTY)
-        else:
-            current_modes.discard(ParameterMode.PROPERTY)
-        self.allowed_modes = current_modes
+        self.allowed_modes = modes_with(self.allowed_modes, ParameterMode.PROPERTY, allowed=value)
 
     @property
     def allow_output(self) -> bool:
@@ -588,12 +573,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         Args:
             value: True to allow OUTPUT mode, False to disallow it
         """
-        current_modes = self.allowed_modes.copy()
-        if value:
-            current_modes.add(ParameterMode.OUTPUT)
-        else:
-            current_modes.discard(ParameterMode.OUTPUT)
-        self.allowed_modes = current_modes
+        self.allowed_modes = modes_with(self.allowed_modes, ParameterMode.OUTPUT, allowed=value)
 
     @property
     def input_types(self) -> list[str]:
