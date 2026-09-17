@@ -459,6 +459,7 @@ class GetDisplayableImageBytesRequest(RequestPayload):
     source_path: str
     situation: ImageArtifactSituation
     format: str | None = None
+    cache_policy: PreviewGenerationPolicy | None = None
 
 
 @dataclass
@@ -471,10 +472,16 @@ class GetDisplayableImageBytesResultSuccess(WorkflowNotAlteredMixin, ResultPaylo
             the untouched source file's raw bytes for ORIGINAL.
         format: Lowercase format of image_bytes, no leading dot. For ORIGINAL
             this is the source file's own extension.
+        path_to_preview: Absolute path to the disk-cached preview file.
+            Populated only when ``cache_policy`` was set on the request.
+        artifact_metadata: Provider-extracted metadata from the source file.
+            Populated only when ``cache_policy`` was set on the request.
     """
 
     image_bytes: bytes
     format: str
+    path_to_preview: str | None = None
+    artifact_metadata: dict[str, Any] | None = None
 
 
 @dataclass

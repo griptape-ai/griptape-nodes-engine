@@ -4,7 +4,7 @@ import json
 import logging
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, ClassVar, NamedTuple
+from typing import Any, ClassVar, NamedTuple, cast
 
 import semver
 from pydantic import BaseModel, ValidationError
@@ -162,6 +162,39 @@ class PreviewMetadata(BaseModel):
     preview_generator_name: str
     preview_generator_parameters: dict[str, Any]
     artifact_metadata: dict[str, Any] | None = None
+
+
+class ImageCodecPair(NamedTuple):
+    """A resolved decoder/encoder pair for the displayable-image pipeline.
+
+    Typed as ``BaseArtifactProvider`` rather than the narrower mixins because callers need
+    both the mixin's decode/encode method and the base provider's friendly-name/format
+    methods; the isinstance checks that establish the mixin conformance happen in
+    ``_resolve_image_codec_pair``, so callers use ``cast`` at the point they call decode/encode.
+    """
+
+    decoder: BaseArtifactProvider
+    encoder: BaseArtifactProvider
+
+
+class PreviewCacheStatus(BaseModel):
+    """Validity of a cached preview, checked against its sidecar metadata and the current source file.
+
+    Attributes:
+        metadata: Parsed sidecar metadata, or None if the sidecar could not be read or parsed.
+        is_valid: True when the cached preview can be reused as-is.
+        fatal_error: Set when the sidecar itself is unusable (malformed JSON, failed schema
+            validation, or an unparseable version). This fails regardless of
+            ``PreviewGenerationPolicy`` -- a caller can never trust bytes it can't read.
+        invalid_reason: Set when the sidecar is readable but stale (outdated schema, a missing
+            preview file, or a changed source). Whether this triggers regeneration is up to the
+            caller's policy.
+    """
+
+    metadata: PreviewMetadata | None = None
+    is_valid: bool = False
+    fatal_error: str | None = None
+    invalid_reason: str | None = None
 
 
 class PreviewSettings(BaseModel):
@@ -444,6 +477,19 @@ class ArtifactManager(EngineScoped):
         if not provider_classes:
             return None
         return self._registry.get_or_create_provider_instance(provider_classes[0])
+
+    def supports_displayable_image_pipeline(self, extension: str) -> bool:
+        """True when ``extension`` has a decoder and an "Image" encoder for the displayable-bytes pipeline.
+
+        Args:
+            extension: File extension without leading dot (e.g. "jpg").
+        """
+        decoder = self._provider_for_format(extension)
+        if decoder is None or not isinstance(decoder, ImageArtifactDecoderMixin):
+            return False
+        encoder_class = self._registry.get_provider_class_by_friendly_name("Image")
+        encoder = self._registry.get_or_create_provider_instance(encoder_class) if encoder_class else None
+        return isinstance(encoder, ImageArtifactEncoderMixin)
 
     async def on_app_initialization_complete(self, _payload: AppInitializationComplete) -> None:
         """Handle app initialization complete event.
@@ -837,80 +883,22 @@ class ArtifactManager(EngineScoped):
                         result_details=f"Attempted to get preview for '{source_path}'. Failed due to: unknown policy '{request.preview_generation_policy}'"
                     )
 
-        # Read metadata file
-        read_metadata_request = ReadFileRequest(
-            file_path=metadata_path,
-            workspace_only=False,
-            should_transform_image_content_to_thumbnail=False,
-        )
-        read_metadata_result = await self.engine.ahandle_request(read_metadata_request)
-
-        if not isinstance(read_metadata_result, ReadFileResultSuccess):
-            return GetPreviewForArtifactResultFailure(
-                result_details=f"Attempted to get preview for '{source_path}'. Failed due to: could not read metadata file at '{metadata_path}'"
-            )
-
-        # Parse and validate metadata using Pydantic
-        try:
-            metadata_dict = json.loads(read_metadata_result.content)
-            metadata = PreviewMetadata.model_validate(metadata_dict)
-        except json.JSONDecodeError as e:
-            return GetPreviewForArtifactResultFailure(
-                result_details=f"Attempted to get preview for '{source_path}'. Failed due to: malformed metadata JSON - {e}"
-            )
-        except ValidationError as e:
-            return GetPreviewForArtifactResultFailure(
-                result_details=f"Attempted to get preview for '{source_path}'. Failed due to: invalid metadata - {e}"
-            )
-
-        # Validate preview metadata version
-        try:
-            metadata_version = semver.VersionInfo.parse(metadata.version)
-            latest_version = semver.VersionInfo.parse(PreviewMetadata.LATEST_SCHEMA_VERSION)
-
-            if metadata_version < latest_version:
-                metadata_version_outdated = True
-            else:
-                metadata_version_outdated = False
-        except ValueError as e:
-            return GetPreviewForArtifactResultFailure(
-                result_details=(
-                    f"Attempted to get preview for '{source_path}'. "
-                    f"Invalid metadata version format '{metadata.version}': {e}"
-                )
-            )
-
-        # Check preview files exist on disk
-        preview_files_missing = False
-        if isinstance(metadata.preview_file_names, str):
-            # Single file case
-            preview_file_path = str(destination_dir / metadata.preview_file_names)
-            preview_info_request = GetFileInfoRequest(path=preview_file_path, workspace_only=False)
-            preview_info_result = self.engine.handle_request(preview_info_request)
-
-            if not isinstance(preview_info_result, GetFileInfoResultSuccess) or preview_info_result.file_entry is None:
-                preview_files_missing = True
-        else:
-            # Multi-file case
-            for filename in metadata.preview_file_names.values():
-                file_path = str(destination_dir / filename)
-                preview_file_check_request = GetFileInfoRequest(path=file_path, workspace_only=False)
-                preview_file_check_result = self.engine.handle_request(preview_file_check_request)
-
-                if (
-                    not isinstance(preview_file_check_result, GetFileInfoResultSuccess)
-                    or preview_file_check_result.file_entry is None
-                ):
-                    preview_files_missing = True
-                    break
-
-        # Check source staleness
+        # Load and validate the sidecar, checking it against the current source file
         source_size = file_info_result.file_entry.size
         source_mtime = file_info_result.file_entry.modified_time
-        source_is_stale = self._is_preview_source_stale(metadata, source_size, source_mtime)
+        cache_status = self._load_preview_cache_status(metadata_path, source_size, source_mtime)
+        if cache_status.fatal_error:
+            return GetPreviewForArtifactResultFailure(
+                result_details=f"Attempted to get preview for '{source_path}'. Failed due to: {cache_status.fatal_error}"
+            )
 
-        # Determine if there's any validity issue
-        has_validity_issue = metadata_version_outdated or preview_files_missing or source_is_stale
+        if cache_status.metadata is None:
+            return GetPreviewForArtifactResultFailure(
+                result_details=f"Attempted to get preview for '{source_path}'. "
+                f"Failed due to: could not read metadata file at '{metadata_path}'"
+            )
+        metadata = cache_status.metadata
+        has_validity_issue = not cache_status.is_valid
 
         # Match on policy to determine if regeneration is needed
         should_regenerate_preview = False
@@ -918,27 +906,9 @@ class ArtifactManager(EngineScoped):
         match request.preview_generation_policy:
             case PreviewGenerationPolicy.DO_NOT_GENERATE:
                 if has_validity_issue:
-                    if metadata_version_outdated:
-                        return GetPreviewForArtifactResultFailure(
-                            result_details=(
-                                f"Attempted to get preview for '{source_path}'. "
-                                f"Preview metadata version {metadata.version} is outdated. "
-                                f"Latest version is {PreviewMetadata.LATEST_SCHEMA_VERSION}. "
-                                f"Please regenerate the preview."
-                            )
-                        )
-                    if preview_files_missing:
-                        return GetPreviewForArtifactResultFailure(
-                            result_details=f"Attempted to get preview for '{source_path}'. Preview file(s) not found."
-                        )
-                    if source_is_stale:
-                        return GetPreviewForArtifactResultFailure(
-                            result_details=(
-                                f"Attempted to get preview for '{source_path}'. "
-                                f"Preview metadata exists but is stale (source file modified since preview generation). "
-                                f"Please regenerate the preview."
-                            )
-                        )
+                    return GetPreviewForArtifactResultFailure(
+                        result_details=f"Attempted to get preview for '{source_path}'. {cache_status.invalid_reason}"
+                    )
             case PreviewGenerationPolicy.ONLY_IF_STALE:
                 if has_validity_issue:
                     should_regenerate_preview = True
@@ -1093,6 +1063,40 @@ class ArtifactManager(EngineScoped):
         self, request: GetDisplayableImageBytesRequest, extension: str
     ) -> GetDisplayableImageBytesResultSuccess | GetDisplayableImageBytesResultFailure:
         """Resolve a decoder/encoder pair and produce decoded+encoded displayable bytes."""
+        codec_pair = self._resolve_image_codec_pair(request, extension)
+        if isinstance(codec_pair, GetDisplayableImageBytesResultFailure):
+            return codec_pair
+        decoder, encoder = codec_pair
+
+        # FAILURE CASE: requested format isn't one the encoder supports
+        if request.format is not None and request.format not in encoder.get_preview_formats():
+            return GetDisplayableImageBytesResultFailure(
+                result_details=f"Attempted to get displayable image bytes for '{request.source_path}'. "
+                f"Failed because format '{request.format}' is not supported by provider '{encoder.get_friendly_name()}'."
+            )
+
+        output_format = request.format or encoder.get_default_preview_format()
+
+        if request.cache_policy is None:
+            image_bytes = await self.get_displayable_image_bytes(
+                request.source_path,
+                cast("ImageArtifactDecoderMixin", decoder),
+                cast("ImageArtifactEncoderMixin", encoder),
+                request.situation,
+                request.format,
+            )
+            return GetDisplayableImageBytesResultSuccess(
+                image_bytes=image_bytes,
+                format=output_format,
+                result_details=f"Got displayable bytes for '{request.source_path}' ({request.situation.value}).",
+            )
+
+        return await self._get_disk_cached_displayable_image_bytes(request, decoder, encoder, output_format)
+
+    def _resolve_image_codec_pair(
+        self, request: GetDisplayableImageBytesRequest, extension: str
+    ) -> ImageCodecPair | GetDisplayableImageBytesResultFailure:
+        """Resolve the decoder/encoder pair for ``extension``, or the failure explaining why one is missing."""
         # FAILURE CASE: no decoder provider for this extension
         decoder = self._provider_for_format(extension)
         if decoder is None:
@@ -1124,20 +1128,123 @@ class ArtifactManager(EngineScoped):
                 f"Failed because provider '{encoder.get_friendly_name()}' does not support encoding."
             )
 
-        # FAILURE CASE: requested format isn't one the encoder supports
-        if request.format is not None and request.format not in encoder.get_preview_formats():
+        return ImageCodecPair(decoder=decoder, encoder=encoder)
+
+    async def _get_disk_cached_displayable_image_bytes(
+        self,
+        request: GetDisplayableImageBytesRequest,
+        decoder: BaseArtifactProvider,
+        encoder: BaseArtifactProvider,
+        output_format: str,
+    ) -> GetDisplayableImageBytesResultSuccess | GetDisplayableImageBytesResultFailure:
+        """Serve displayable bytes from a disk-backed cache, regenerating per ``request.cache_policy``."""
+        situation_tag = request.situation.value
+
+        try:
+            preview_resolved = self._resolve_preview_path(request.source_path, f"{situation_tag}.{output_format}")
+            metadata_resolved = self._resolve_preview_path(request.source_path, f"{situation_tag}.json")
+        except Exception as e:
             return GetDisplayableImageBytesResultFailure(
                 result_details=f"Attempted to get displayable image bytes for '{request.source_path}'. "
-                f"Failed because format '{request.format}' is not supported by provider '{encoder.get_friendly_name()}'."
+                f"Failed due to: {e}"
             )
 
-        image_bytes = await self.get_displayable_image_bytes(
-            request.source_path, decoder, encoder, request.situation, request.format
+        preview_path = preview_resolved.destination_dir / preview_resolved.file_name
+        metadata_path = metadata_resolved.destination_dir / metadata_resolved.file_name
+
+        file_info_result = self.engine.handle_request(
+            GetFileInfoRequest(path=request.source_path, workspace_only=False)
         )
+        if not isinstance(file_info_result, GetFileInfoResultSuccess) or file_info_result.file_entry is None:
+            return GetDisplayableImageBytesResultFailure(
+                result_details=f"Attempted to get displayable image bytes for '{request.source_path}'. "
+                f"Failed because the source file was not found."
+            )
+        source_size = file_info_result.file_entry.size
+        source_mtime = file_info_result.file_entry.modified_time
+
+        metadata_info_result = self.engine.handle_request(
+            GetFileInfoRequest(path=str(metadata_path), workspace_only=False)
+        )
+        metadata_exists = (
+            isinstance(metadata_info_result, GetFileInfoResultSuccess) and metadata_info_result.file_entry is not None
+        )
+
+        if metadata_exists and request.cache_policy != PreviewGenerationPolicy.ALWAYS:
+            cache_status = self._load_preview_cache_status(str(metadata_path), source_size, source_mtime)
+            if cache_status.is_valid:
+                read_result = self.engine.handle_request(
+                    ReadFileRequest(
+                        file_path=str(preview_path),
+                        workspace_only=False,
+                        should_transform_image_content_to_thumbnail=False,
+                    )
+                )
+                if isinstance(read_result, ReadFileResultSuccess) and isinstance(read_result.content, bytes):
+                    return GetDisplayableImageBytesResultSuccess(
+                        image_bytes=read_result.content,
+                        format=output_format,
+                        path_to_preview=str(preview_path),
+                        artifact_metadata=cache_status.metadata.artifact_metadata if cache_status.metadata else None,
+                        result_details=f"Returned cached displayable bytes for '{request.source_path}' ({situation_tag}).",
+                    )
+
+        image_bytes = await self.get_displayable_image_bytes(
+            request.source_path,
+            cast("ImageArtifactDecoderMixin", decoder),
+            cast("ImageArtifactEncoderMixin", encoder),
+            request.situation,
+            request.format,
+        )
+
+        write_result = self.engine.handle_request(
+            WriteFileRequest(
+                file_path=str(preview_path),
+                content=image_bytes,
+                create_parents=True,
+                existing_file_policy=ExistingFilePolicy.OVERWRITE,
+                file_metadata=preview_resolved.file_metadata,
+            )
+        )
+        if not isinstance(write_result, WriteFileResultSuccess):
+            return GetDisplayableImageBytesResultFailure(
+                result_details=f"Attempted to write displayable image preview for '{request.source_path}'. "
+                f"Failed due to: {write_result.result_details}"
+            )
+
+        artifact_metadata = await self.extract_artifact_metadata(request.source_path)
+
+        metadata = PreviewMetadata(
+            version=PreviewMetadata.LATEST_SCHEMA_VERSION,
+            source_macro_path=request.source_path,
+            source_file_size=source_size,
+            source_file_modified_time=source_mtime,
+            preview_file_names=preview_resolved.file_name,
+            preview_generator_name="displayable_image_pipeline",
+            preview_generator_parameters={},
+            artifact_metadata=artifact_metadata,
+        )
+        metadata_write_result = self.engine.handle_request(
+            WriteFileRequest(
+                file_path=str(metadata_path),
+                content=json.dumps(metadata.model_dump(), indent=2),
+                create_parents=True,
+                existing_file_policy=ExistingFilePolicy.OVERWRITE,
+                file_metadata=metadata_resolved.file_metadata,
+            )
+        )
+        if not isinstance(metadata_write_result, WriteFileResultSuccess):
+            return GetDisplayableImageBytesResultFailure(
+                result_details=f"Attempted to write displayable image preview metadata for '{request.source_path}'. "
+                f"Failed due to: {metadata_write_result.result_details}"
+            )
+
         return GetDisplayableImageBytesResultSuccess(
             image_bytes=image_bytes,
-            format=request.format or encoder.get_default_preview_format(),
-            result_details=f"Got displayable bytes for '{request.source_path}' ({request.situation.value}).",
+            format=output_format,
+            path_to_preview=str(preview_path),
+            artifact_metadata=artifact_metadata,
+            result_details=f"Generated and cached displayable bytes for '{request.source_path}' ({situation_tag}).",
         )
 
     def on_handle_list_artifact_providers_request(
@@ -1746,6 +1853,113 @@ class ArtifactManager(EngineScoped):
             True if source file has changed (stale), False otherwise
         """
         return metadata.source_file_size != source_size or metadata.source_file_modified_time != source_mtime
+
+    def _read_preview_metadata(self, metadata_path: str) -> PreviewMetadata | str:
+        """Read and parse ``metadata_path``'s sidecar JSON.
+
+        Args:
+            metadata_path: Absolute path to the sidecar metadata JSON file.
+
+        Returns:
+            The parsed metadata, or a string describing why it couldn't be read or parsed.
+        """
+        read_metadata_result = self.engine.handle_request(
+            ReadFileRequest(
+                file_path=metadata_path,
+                workspace_only=False,
+                should_transform_image_content_to_thumbnail=False,
+            )
+        )
+        if not isinstance(read_metadata_result, ReadFileResultSuccess):
+            return f"could not read metadata file at '{metadata_path}'"
+
+        try:
+            metadata_dict = json.loads(read_metadata_result.content)
+            return PreviewMetadata.model_validate(metadata_dict)
+        except json.JSONDecodeError as e:
+            return f"malformed metadata JSON - {e}"
+        except ValidationError as e:
+            return f"invalid metadata - {e}"
+
+    def _preview_files_missing(self, metadata_path: str, metadata: PreviewMetadata) -> bool:
+        """True when any preview file named in ``metadata`` is absent from disk.
+
+        Args:
+            metadata_path: Absolute path to the sidecar metadata JSON file, whose parent
+                directory holds the preview file(s).
+            metadata: Parsed sidecar metadata naming the preview file(s).
+        """
+        destination_dir = Path(metadata_path).parent
+        if isinstance(metadata.preview_file_names, str):
+            preview_paths = [str(destination_dir / metadata.preview_file_names)]
+        else:
+            preview_paths = [str(destination_dir / filename) for filename in metadata.preview_file_names.values()]
+
+        for preview_path in preview_paths:
+            preview_info_result = self.engine.handle_request(
+                GetFileInfoRequest(path=preview_path, workspace_only=False)
+            )
+            if not isinstance(preview_info_result, GetFileInfoResultSuccess) or preview_info_result.file_entry is None:
+                return True
+        return False
+
+    def _load_preview_cache_status(
+        self,
+        metadata_path: str,
+        source_size: int,
+        source_mtime: float,
+    ) -> PreviewCacheStatus:
+        """Read ``metadata_path``'s sidecar and evaluate whether its cached preview is still usable.
+
+        Assumes the metadata file exists -- callers check that first, since a missing sidecar
+        means "no preview yet" rather than "invalid cache".
+
+        Args:
+            metadata_path: Absolute path to the sidecar metadata JSON file.
+            source_size: Current size of the source file in bytes.
+            source_mtime: Current modification time of the source file.
+
+        Returns:
+            The cache's validity, or the reason it can't be trusted.
+        """
+        metadata_or_error = self._read_preview_metadata(metadata_path)
+        if isinstance(metadata_or_error, str):
+            return PreviewCacheStatus(fatal_error=metadata_or_error)
+        metadata = metadata_or_error
+
+        try:
+            metadata_version = semver.VersionInfo.parse(metadata.version)
+            latest_version = semver.VersionInfo.parse(PreviewMetadata.LATEST_SCHEMA_VERSION)
+        except ValueError as e:
+            return PreviewCacheStatus(
+                metadata=metadata,
+                fatal_error=f"Invalid metadata version format '{metadata.version}': {e}",
+            )
+
+        metadata_version_outdated = metadata_version < latest_version
+        preview_files_missing = self._preview_files_missing(metadata_path, metadata)
+        source_is_stale = self._is_preview_source_stale(metadata, source_size, source_mtime)
+
+        if metadata_version_outdated:
+            return PreviewCacheStatus(
+                metadata=metadata,
+                invalid_reason=(
+                    f"Preview metadata version {metadata.version} is outdated. "
+                    f"Latest version is {PreviewMetadata.LATEST_SCHEMA_VERSION}. Please regenerate the preview."
+                ),
+            )
+        if preview_files_missing:
+            return PreviewCacheStatus(metadata=metadata, invalid_reason="Preview file(s) not found.")
+        if source_is_stale:
+            return PreviewCacheStatus(
+                metadata=metadata,
+                invalid_reason=(
+                    "Preview metadata exists but is stale (source file modified since preview generation). "
+                    "Please regenerate the preview."
+                ),
+            )
+
+        return PreviewCacheStatus(metadata=metadata, is_valid=True)
 
     def _does_preview_match_current_settings(
         self,

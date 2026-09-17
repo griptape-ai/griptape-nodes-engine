@@ -5,7 +5,7 @@ from collections.abc import Generator
 from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import anyio
 import numpy as np
@@ -1789,6 +1789,296 @@ class TestGetPreviewForArtifact:
         # Should regenerate successfully even though preview was fresh
         assert isinstance(result, GetPreviewForArtifactResultSuccess)
         assert result.paths_to_preview is not None
+
+
+class TestGetDisplayableImageBytesDiskCache:
+    """The disk-backed cache path of GetDisplayableImageBytesRequest, gated by cache_policy."""
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        """Create temporary directory for test files."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    @pytest.fixture
+    def mock_project(self, temp_dir: Path, engine: Engine) -> None:
+        """Set up a real project in ProjectManager with temp_dir as workspace."""
+        from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
+        from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
+        from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
+
+        project_manager = engine.project_manager
+
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        situation_schemas = project_manager._parse_situation_macros(DEFAULT_PROJECT_TEMPLATE.situations, validation)
+        directory_schemas = project_manager._parse_directory_macros(DEFAULT_PROJECT_TEMPLATE.directories, validation)
+
+        project_info = ProjectInfo(
+            project_id="test_project",
+            project_file_path=temp_dir / "project.yml",
+            project_base_dir=temp_dir,
+            template=DEFAULT_PROJECT_TEMPLATE,
+            validation=validation,
+            parsed_situation_schemas=situation_schemas,
+            parsed_directory_schemas=directory_schemas,
+        )
+
+        project_manager._successfully_loaded_project_templates["test_project"] = project_info
+        project_manager._current_project_id = "test_project"
+
+    @pytest.fixture
+    def test_image_path(self, temp_dir: Path) -> Path:
+        """Create a real test image file."""
+        image_path = temp_dir / "test_source.jpg"
+        img = Image.new("RGB", (100, 100), color="red")
+        img.save(str(image_path), format="JPEG")
+        return image_path
+
+    @pytest.fixture
+    def artifact_manager(self, mock_project: None, temp_dir: Path, engine: Engine) -> ArtifactManager:  # noqa: ARG002
+        """Create ArtifactManager with ImageArtifactProvider registered."""
+        manager = ArtifactManager()
+        request = RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider)
+        manager.on_handle_register_artifact_provider_request(request)
+        engine.config_manager.workspace_path = temp_dir
+        return manager
+
+    @pytest.mark.asyncio
+    async def test_cache_policy_none_never_writes_to_disk(
+        self, artifact_manager: ArtifactManager, test_image_path: Path
+    ) -> None:
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            GetDisplayableImageBytesRequest,
+            GetDisplayableImageBytesResultSuccess,
+        )
+
+        request = GetDisplayableImageBytesRequest(
+            source_path=str(test_image_path), situation=ImageArtifactSituation.VIEWER
+        )
+        result = await artifact_manager.on_get_displayable_image_bytes_request(request)
+
+        assert isinstance(result, GetDisplayableImageBytesResultSuccess)
+        assert result.path_to_preview is None
+        assert result.artifact_metadata is None
+        assert not await anyio.Path(test_image_path.parent / ".griptape-nodes-previews").exists()
+
+    @pytest.mark.asyncio
+    async def test_only_if_stale_no_cache_generates_and_writes(
+        self, artifact_manager: ArtifactManager, test_image_path: Path
+    ) -> None:
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            GetDisplayableImageBytesRequest,
+            GetDisplayableImageBytesResultSuccess,
+        )
+
+        request = GetDisplayableImageBytesRequest(
+            source_path=str(test_image_path),
+            situation=ImageArtifactSituation.VIEWER,
+            cache_policy=PreviewGenerationPolicy.ONLY_IF_STALE,
+        )
+        result = await artifact_manager.on_get_displayable_image_bytes_request(request)
+
+        assert isinstance(result, GetDisplayableImageBytesResultSuccess)
+        assert result.path_to_preview is not None
+        preview_path = Path(result.path_to_preview)
+        assert await anyio.Path(preview_path).exists()
+        assert preview_path.name.endswith(f"viewer.{result.format}")
+        metadata_path = preview_path.parent / preview_path.name.replace(f"viewer.{result.format}", "viewer.json")
+        assert await anyio.Path(metadata_path).exists()
+        assert result.artifact_metadata is not None
+
+    @pytest.mark.asyncio
+    async def test_only_if_stale_valid_cache_skips_regeneration(
+        self, artifact_manager: ArtifactManager, test_image_path: Path
+    ) -> None:
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            GetDisplayableImageBytesRequest,
+            GetDisplayableImageBytesResultSuccess,
+        )
+
+        request = GetDisplayableImageBytesRequest(
+            source_path=str(test_image_path),
+            situation=ImageArtifactSituation.VIEWER,
+            cache_policy=PreviewGenerationPolicy.ONLY_IF_STALE,
+        )
+        first_result = await artifact_manager.on_get_displayable_image_bytes_request(request)
+        assert isinstance(first_result, GetDisplayableImageBytesResultSuccess)
+        assert first_result.path_to_preview is not None
+        first_mtime = (await anyio.Path(first_result.path_to_preview).stat()).st_mtime
+
+        provider: ImageArtifactDecoderMixin = cast(
+            "ImageArtifactDecoderMixin",
+            artifact_manager._registry.get_or_create_provider_instance(ImageArtifactProvider),
+        )
+        with patch.object(provider, "decode", wraps=provider.decode) as decode_spy:
+            second_result = await artifact_manager.on_get_displayable_image_bytes_request(request)
+
+        decode_spy.assert_not_called()
+        assert isinstance(second_result, GetDisplayableImageBytesResultSuccess)
+        assert second_result.image_bytes == first_result.image_bytes
+        assert second_result.path_to_preview is not None
+        second_mtime = (await anyio.Path(second_result.path_to_preview).stat()).st_mtime
+        assert second_mtime == first_mtime
+
+    @pytest.mark.asyncio
+    async def test_only_if_stale_regenerates_when_source_modified(
+        self, artifact_manager: ArtifactManager, test_image_path: Path
+    ) -> None:
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            GetDisplayableImageBytesRequest,
+            GetDisplayableImageBytesResultSuccess,
+        )
+
+        request = GetDisplayableImageBytesRequest(
+            source_path=str(test_image_path),
+            situation=ImageArtifactSituation.VIEWER,
+            cache_policy=PreviewGenerationPolicy.ONLY_IF_STALE,
+        )
+        first_result = await artifact_manager.on_get_displayable_image_bytes_request(request)
+        assert isinstance(first_result, GetDisplayableImageBytesResultSuccess)
+
+        img = Image.new("RGB", (100, 100), color="blue")
+        img.save(str(test_image_path), format="JPEG")
+
+        second_result = await artifact_manager.on_get_displayable_image_bytes_request(request)
+
+        assert isinstance(second_result, GetDisplayableImageBytesResultSuccess)
+        assert second_result.image_bytes != first_result.image_bytes
+
+    @pytest.mark.asyncio
+    async def test_always_regenerates_even_with_valid_cache(
+        self, artifact_manager: ArtifactManager, test_image_path: Path
+    ) -> None:
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            GetDisplayableImageBytesRequest,
+            GetDisplayableImageBytesResultSuccess,
+        )
+
+        only_if_stale_request = GetDisplayableImageBytesRequest(
+            source_path=str(test_image_path),
+            situation=ImageArtifactSituation.VIEWER,
+            cache_policy=PreviewGenerationPolicy.ONLY_IF_STALE,
+        )
+        await artifact_manager.on_get_displayable_image_bytes_request(only_if_stale_request)
+
+        provider: ImageArtifactDecoderMixin = cast(
+            "ImageArtifactDecoderMixin",
+            artifact_manager._registry.get_or_create_provider_instance(ImageArtifactProvider),
+        )
+        always_request = GetDisplayableImageBytesRequest(
+            source_path=str(test_image_path),
+            situation=ImageArtifactSituation.VIEWER,
+            cache_policy=PreviewGenerationPolicy.ALWAYS,
+        )
+        with patch.object(provider, "decode", wraps=provider.decode) as decode_spy:
+            result = await artifact_manager.on_get_displayable_image_bytes_request(always_request)
+
+        decode_spy.assert_called_once()
+        assert isinstance(result, GetDisplayableImageBytesResultSuccess)
+
+    @pytest.mark.asyncio
+    async def test_viewer_and_thumbnail_use_distinct_cache_files(
+        self, artifact_manager: ArtifactManager, test_image_path: Path
+    ) -> None:
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            GetDisplayableImageBytesRequest,
+            GetDisplayableImageBytesResultSuccess,
+        )
+
+        viewer_request = GetDisplayableImageBytesRequest(
+            source_path=str(test_image_path),
+            situation=ImageArtifactSituation.VIEWER,
+            cache_policy=PreviewGenerationPolicy.ONLY_IF_STALE,
+        )
+        thumbnail_request = GetDisplayableImageBytesRequest(
+            source_path=str(test_image_path),
+            situation=ImageArtifactSituation.THUMBNAIL,
+            cache_policy=PreviewGenerationPolicy.ONLY_IF_STALE,
+        )
+
+        viewer_result = await artifact_manager.on_get_displayable_image_bytes_request(viewer_request)
+        thumbnail_result = await artifact_manager.on_get_displayable_image_bytes_request(thumbnail_request)
+
+        assert isinstance(viewer_result, GetDisplayableImageBytesResultSuccess)
+        assert isinstance(thumbnail_result, GetDisplayableImageBytesResultSuccess)
+        assert viewer_result.path_to_preview is not None
+        assert thumbnail_result.path_to_preview is not None
+        assert viewer_result.path_to_preview != thumbnail_result.path_to_preview
+        assert Path(viewer_result.path_to_preview).name.endswith("viewer." + viewer_result.format)
+        assert Path(thumbnail_result.path_to_preview).name.endswith("thumbnail." + thumbnail_result.format)
+        assert await anyio.Path(viewer_result.path_to_preview).exists()
+        assert await anyio.Path(thumbnail_result.path_to_preview).exists()
+
+    @pytest.mark.asyncio
+    async def test_disk_write_failure_returns_failure(
+        self, artifact_manager: ArtifactManager, test_image_path: Path
+    ) -> None:
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            GetDisplayableImageBytesRequest,
+            GetDisplayableImageBytesResultFailure,
+        )
+        from griptape_nodes.retained_mode.events.os_events import (
+            FileIOFailureReason,
+            WriteFileRequest,
+            WriteFileResultFailure,
+        )
+
+        original_handle_request = Engine.handle_request
+
+        def failing_write(self: Engine, request: RequestPayload) -> ResultPayload:
+            if isinstance(request, WriteFileRequest):
+                return WriteFileResultFailure(
+                    failure_reason=FileIOFailureReason.PERMISSION_DENIED,
+                    result_details="Simulated disk write failure",
+                )
+            return original_handle_request(self, request)
+
+        request = GetDisplayableImageBytesRequest(
+            source_path=str(test_image_path),
+            situation=ImageArtifactSituation.VIEWER,
+            cache_policy=PreviewGenerationPolicy.ONLY_IF_STALE,
+        )
+        with patch.object(Engine, "handle_request", failing_write):
+            result = await artifact_manager.on_get_displayable_image_bytes_request(request)
+
+        assert isinstance(result, GetDisplayableImageBytesResultFailure)
+        assert "disk write failure" in str(result.result_details).lower()
+
+    def test_supports_displayable_image_pipeline_true_for_registered_image_extension(
+        self, artifact_manager: ArtifactManager
+    ) -> None:
+        assert artifact_manager.supports_displayable_image_pipeline("jpg") is True
+
+    def test_supports_displayable_image_pipeline_false_for_unregistered_extension(
+        self, artifact_manager: ArtifactManager
+    ) -> None:
+        assert artifact_manager.supports_displayable_image_pipeline("unregistered") is False
+
+    def test_supports_displayable_image_pipeline_false_when_decoder_lacks_mixin(self) -> None:
+        from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_provider import (
+            BaseArtifactMetadata,
+            BaseArtifactProvider,
+        )
+
+        class _NoDecodeProvider(BaseArtifactProvider):
+            @classmethod
+            def get_friendly_name(cls) -> str:
+                return "NoDecode"
+
+            @classmethod
+            def get_supported_formats(cls) -> set[str]:
+                return {"nodecode"}
+
+            @classmethod
+            def get_artifact_metadata(cls, source_path: str) -> BaseArtifactMetadata | None:  # noqa: ARG003
+                return None
+
+        manager = ArtifactManager()
+        manager.on_handle_register_artifact_provider_request(
+            RegisterArtifactProviderRequest(provider_class=_NoDecodeProvider)
+        )
+
+        assert manager.supports_displayable_image_pipeline("nodecode") is False
 
 
 class TestGeneratorValidation:
