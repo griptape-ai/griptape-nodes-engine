@@ -375,9 +375,19 @@ class AlterParameterDetailsRequest(RequestPayload):
         mode_allowed_output: Whether parameter can be used as output
         settable: Whether parameter can be set directly by the user or not
         allow_variable_substitution: Whether {VAR} tokens in this parameter's value are substituted at execution time
-        ui_options: New UI configuration options
+        ui_options: New UI configuration options, replacing every option currently set
+        ui_options_patch: UI options to merge, where a value of ``None`` removes its key and
+            every option not named is left alone
         traits: Set of parameter traits
         initial_setup: Skip setup work when loading from file
+
+    Send either ``ui_options`` on its own or ``ui_options_patch``. A writer that knows only
+    the keys it is changing cannot use a replacement without first reading back every other
+    key and sending it too, which overwrites anything that moved in the meantime.
+
+    The patch names top-level keys only: a value replaces whatever its key held, rather than
+    merging into it. Every writer sends a whole nested option, such as the complete
+    ``slider``, so there is nothing to merge into.
 
     Results: AlterParameterDetailsResultSuccess | AlterParameterDetailsResultFailure
     """
@@ -400,6 +410,7 @@ class AlterParameterDetailsRequest(RequestPayload):
     settable: bool | None = None
     allow_variable_substitution: bool | None = None
     ui_options: dict | None = None
+    ui_options_patch: dict | None = None
     traits: set[str] | None = None
     # initial_setup prevents unnecessary work when we are loading a workflow from a file.
     initial_setup: bool = False

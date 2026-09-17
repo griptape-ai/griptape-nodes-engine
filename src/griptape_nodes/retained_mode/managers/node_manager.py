@@ -40,6 +40,7 @@ from griptape_nodes.exe_types.core_types import (
     ParameterMode,
     ParameterType,
     ParameterTypeBuiltin,
+    UIOptionsMixin,
 )
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_groups import NodeGroupMembershipError, SubflowNodeGroup
@@ -2410,6 +2411,23 @@ class NodeManager(EngineScoped):
                 parameter.tooltip_as_output = request.tooltip_as_output
         if request.ui_options is not None and hasattr(parameter, "ui_options"):
             parameter.ui_options = request.ui_options  # type: ignore[attr-defined]
+        if isinstance(parameter, UIOptionsMixin):
+            NodeManager._patch_ui_options(request, parameter)
+
+    @staticmethod
+    def _patch_ui_options(request: AlterParameterDetailsRequest, element: UIOptionsMixin) -> None:
+        """Merge the named options, removing the ones named with ``None``.
+
+        A key is either written or removed, never both, so a patch cannot contradict itself.
+        """
+        if not request.ui_options_patch:
+            return
+        written = {key: value for key, value in request.ui_options_patch.items() if value is not None}
+        removed = [key for key, value in request.ui_options_patch.items() if value is None]
+        if written:
+            element.update_ui_options(written)
+        for key in removed:
+            element.remove_ui_options_key(key)
 
     def modify_key_parameter_fields(self, request: AlterParameterDetailsRequest, parameter: Parameter) -> None:  # noqa: C901, PLR0912
         if request.type is not None:
@@ -2515,6 +2533,13 @@ class NodeManager(EngineScoped):
         node_name = request.node_name
         node = None
 
+        if request.ui_options is not None and request.ui_options_patch is not None:
+            details = (
+                f"Attempted to change the display options for '{request.parameter_name}' two ways at once: a complete "
+                f"replacement and a partial change. Send one or the other."
+            )
+            return AlterParameterDetailsResultFailure(result_details=details)
+
         if node_name is None:
             if not self.engine.context_manager.has_current_node():
                 details = f"Attempted to alter details for Parameter '{request.parameter_name}' from node in the Current Context. Failed because there was no such Node."
@@ -2558,8 +2583,6 @@ class NodeManager(EngineScoped):
         if element is None:
             details = f"Attempted to alter details for Element '{request.parameter_name}' from Node '{node_name}'. Failed because it didn't have an Element with that name on it."
             return AlterParameterDetailsResultFailure(result_details=details)
-        if request.ui_options is not None:
-            element.ui_options = request.ui_options  # type: ignore[attr-defined]
 
         # Check and handle connections if type was changed
         if isinstance(element, Parameter) and (
