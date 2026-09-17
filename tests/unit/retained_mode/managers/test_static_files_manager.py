@@ -377,6 +377,9 @@ class TestStaticFilesManagerCreateDownloadUrlFromPath:
                 engine=Mock(),
             )
             manager.storage_driver = Mock()
+            # These tests cover the legacy GetPreviewForArtifactRequest path; a bare Mock would
+            # return truthy here and route every case through the displayable-bytes pipeline.
+            manager.engine.artifact_manager.supports_displayable_image_pipeline.return_value = False
             return manager
 
     @pytest.mark.asyncio
@@ -1036,6 +1039,207 @@ class TestStaticFilesManagerCreateDownloadUrlFromPath:
         preview_request = await_args.args[0]
         assert isinstance(preview_request, GetPreviewForArtifactRequest)
         assert preview_request.macro_path.parsed_macro.template == str(source_file)
+
+
+class TestStaticFilesManagerDisplayableImagePreviewDelegation:
+    """Test that preview generation routes image-family formats through the displayable-bytes pipeline."""
+
+    @pytest.fixture
+    def mock_config_manager(self) -> Mock:
+        """Mock ConfigManager for StaticFilesManager initialization."""
+        mock_config = Mock()
+        mock_config.get_config_value.side_effect = lambda key, default=None: {
+            "storage_backend": "local",
+            "workspace_directory": "/mock/workspace",
+            "static_files_directory": "staticfiles",
+            "static_server_base_url": "http://localhost:8124",
+        }.get(key, default)
+        mock_config.workspace_path = Path("/mock/workspace")
+        return mock_config
+
+    @pytest.fixture
+    def mock_secrets_manager(self) -> Mock:
+        """Mock SecretsManager for StaticFilesManager initialization."""
+        mock = Mock()
+        mock.get_secret.return_value = "test-api-key"
+        return mock
+
+    @pytest.fixture
+    def mock_static_files_manager(self, mock_config_manager: Mock, mock_secrets_manager: Mock) -> StaticFilesManager:
+        """Create StaticFilesManager instance with mocked dependencies."""
+        with patch("griptape_nodes.retained_mode.managers.static_files_manager.LocalStorageDriver"):
+            manager = StaticFilesManager(
+                config_manager=mock_config_manager,
+                secrets_manager=mock_secrets_manager,
+                event_manager=None,
+                engine=Mock(),
+            )
+            manager.storage_driver = Mock()
+            return manager
+
+    @pytest.mark.asyncio
+    async def test_image_family_extension_uses_displayable_bytes_pipeline(
+        self, mock_static_files_manager: StaticFilesManager, tmp_path: Path
+    ) -> None:
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            GetDisplayableImageBytesRequest,
+            GetDisplayableImageBytesResultSuccess,
+            GetPreviewForArtifactRequest,
+        )
+
+        source_file = tmp_path / "photo.jpg"
+        source_file.write_bytes(b"not really a jpeg")
+        preview_path = tmp_path / "photo.jpg.viewer.webp"
+        preview_path.write_bytes(b"preview bytes")
+
+        mock_static_files_manager.engine.artifact_manager._registry.get_provider_classes_by_format.return_value = [
+            Mock()
+        ]
+        mock_static_files_manager.engine.artifact_manager.supports_displayable_image_pipeline.return_value = True
+        mock_static_files_manager.engine.ahandle_request = AsyncMock(
+            return_value=GetDisplayableImageBytesResultSuccess(
+                image_bytes=b"preview bytes",
+                format="webp",
+                path_to_preview=str(preview_path),
+                artifact_metadata={"width": 100, "height": 100},
+                result_details="Generated and cached displayable bytes.",
+            )
+        )
+
+        resolution = await mock_static_files_manager._generate_preview_if_needed(source_file)
+
+        assert resolution.path_to_serve == preview_path
+        assert resolution.artifact_metadata == {"width": 100, "height": 100}
+        assert resolution.preview_failure_reason is None
+        called_request = mock_static_files_manager.engine.ahandle_request.call_args[0][0]
+        assert isinstance(called_request, GetDisplayableImageBytesRequest)
+        for call in mock_static_files_manager.engine.ahandle_request.call_args_list:
+            assert not isinstance(call.args[0], GetPreviewForArtifactRequest)
+
+    @pytest.mark.asyncio
+    async def test_non_image_family_extension_uses_legacy_preview_request(
+        self, mock_static_files_manager: StaticFilesManager, tmp_path: Path
+    ) -> None:
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            GetDisplayableImageBytesRequest,
+            GetPreviewForArtifactRequest,
+            GetPreviewForArtifactResultSuccess,
+        )
+
+        source_file = tmp_path / "clip.mov"
+        source_file.write_bytes(b"not really a video")
+        preview_path = tmp_path / "clip.mov.viewer.webp"
+
+        provider_class = Mock()
+        provider_class.get_friendly_name.return_value = "Video"
+        mock_static_files_manager.engine.artifact_manager._registry.get_provider_classes_by_format.return_value = [
+            provider_class
+        ]
+        mock_static_files_manager.engine.artifact_manager.supports_displayable_image_pipeline.return_value = False
+        mock_static_files_manager.engine.ahandle_request = AsyncMock(
+            return_value=GetPreviewForArtifactResultSuccess(
+                paths_to_preview=str(preview_path),
+                artifact_metadata={"codec": "prores"},
+                result_details="Generated preview.",
+            )
+        )
+
+        resolution = await mock_static_files_manager._generate_preview_if_needed(source_file)
+
+        assert resolution.path_to_serve == preview_path
+        assert resolution.artifact_metadata == {"codec": "prores"}
+        assert resolution.preview_failure_reason is None
+        called_request = mock_static_files_manager.engine.ahandle_request.call_args[0][0]
+        assert isinstance(called_request, GetPreviewForArtifactRequest)
+        for call in mock_static_files_manager.engine.ahandle_request.call_args_list:
+            assert not isinstance(call.args[0], GetDisplayableImageBytesRequest)
+
+    @pytest.mark.asyncio
+    async def test_displayable_pipeline_failure_raises_instead_of_falling_back(
+        self, mock_static_files_manager: StaticFilesManager, tmp_path: Path
+    ) -> None:
+        from griptape_nodes.retained_mode.events.artifact_events import GetDisplayableImageBytesResultFailure
+        from griptape_nodes.retained_mode.managers.static_files_manager import DisplayableImagePreviewError
+
+        source_file = tmp_path / "photo.jpg"
+        source_file.write_bytes(b"not really a jpeg")
+
+        mock_static_files_manager.engine.artifact_manager._registry.get_provider_classes_by_format.return_value = [
+            Mock()
+        ]
+        mock_static_files_manager.engine.artifact_manager.supports_displayable_image_pipeline.return_value = True
+        mock_static_files_manager.engine.ahandle_request = AsyncMock(
+            return_value=GetDisplayableImageBytesResultFailure(result_details="decode blew up")
+        )
+
+        with pytest.raises(DisplayableImagePreviewError, match="decode blew up"):
+            await mock_static_files_manager._generate_preview_if_needed(source_file)
+
+    @pytest.mark.asyncio
+    async def test_displayable_pipeline_failure_surfaces_as_download_url_failure(
+        self, mock_static_files_manager: StaticFilesManager, tmp_path: Path
+    ) -> None:
+        from griptape_nodes.retained_mode.events.artifact_events import GetDisplayableImageBytesResultFailure
+        from griptape_nodes.retained_mode.events.static_file_events import (
+            CreateStaticFileDownloadUrlFromPathRequest,
+            CreateStaticFileDownloadUrlResultFailure,
+        )
+
+        source_file = tmp_path / "photo.jpg"
+        source_file.write_bytes(b"not really a jpeg")
+
+        mock_static_files_manager.engine.artifact_manager._registry.get_provider_classes_by_format.return_value = [
+            Mock()
+        ]
+        mock_static_files_manager.engine.artifact_manager.supports_displayable_image_pipeline.return_value = True
+        mock_static_files_manager.engine.ahandle_request = AsyncMock(
+            return_value=GetDisplayableImageBytesResultFailure(result_details="decode blew up")
+        )
+
+        request = CreateStaticFileDownloadUrlFromPathRequest(file_path=str(source_file), preview=True)
+        result = await mock_static_files_manager.on_handle_create_static_file_download_url_from_path_request(request)
+
+        assert isinstance(result, CreateStaticFileDownloadUrlResultFailure)
+        assert "decode blew up" in result.error
+        mock_static_files_manager.storage_driver.create_signed_download_url.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_artifact_metadata_threads_through_to_success_result(
+        self, mock_static_files_manager: StaticFilesManager, tmp_path: Path
+    ) -> None:
+        from griptape_nodes.retained_mode.events.artifact_events import GetDisplayableImageBytesResultSuccess
+        from griptape_nodes.retained_mode.events.static_file_events import (
+            CreateStaticFileDownloadUrlFromPathRequest,
+            CreateStaticFileDownloadUrlFromPathResultSuccess,
+        )
+
+        source_file = tmp_path / "photo.jpg"
+        source_file.write_bytes(b"not really a jpeg")
+        preview_path = tmp_path / "photo.jpg.viewer.webp"
+        preview_path.write_bytes(b"preview bytes")
+
+        mock_static_files_manager.engine.artifact_manager._registry.get_provider_classes_by_format.return_value = [
+            Mock()
+        ]
+        mock_static_files_manager.engine.artifact_manager.supports_displayable_image_pipeline.return_value = True
+        mock_static_files_manager.engine.ahandle_request = AsyncMock(
+            return_value=GetDisplayableImageBytesResultSuccess(
+                image_bytes=b"preview bytes",
+                format="webp",
+                path_to_preview=str(preview_path),
+                artifact_metadata={"width": 100, "height": 100},
+                result_details="Generated and cached displayable bytes.",
+            )
+        )
+        mock_static_files_manager.storage_driver.create_signed_download_url.return_value = "http://signed-url.com"
+        mock_static_files_manager.storage_driver.get_asset_url.return_value = "http://asset-url.com"
+
+        request = CreateStaticFileDownloadUrlFromPathRequest(file_path=str(source_file), preview=True)
+        result = await mock_static_files_manager.on_handle_create_static_file_download_url_from_path_request(request)
+
+        assert isinstance(result, CreateStaticFileDownloadUrlFromPathResultSuccess)
+        assert result.artifact_metadata == {"width": 100, "height": 100}
+        mock_static_files_manager.storage_driver.create_signed_download_url.assert_called_once_with(preview_path)
 
 
 class TestStaticFilesManagerResolveStaticFilePath:
