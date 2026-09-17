@@ -56,18 +56,14 @@ class ResourceStatus:
 
 @dataclass
 class LocalObjectEntry:
-    """A live object held for one process, plus what is needed to release it.
+    """A live object held for this process, plus what is needed to release it.
 
-    `owner_library` scopes clearing when that library reloads, and namespaces keys so two libraries
-    cannot collide. `producing_node` is the default key suffix, and names the node in the log if a
-    release hook fails; it deliberately does NOT appear in a miss message, because a miss means the
-    entry is gone and this field went with it. `on_drop` is the library's release hook, needed because
-    deleting the entry does not free what the object was holding.
+    `on_drop` exists because deleting the entry does not free what the object was holding.
     """
 
     value: Any
-    owner_library: str
-    producing_node: str
+    owner: str
+    source: str
     on_drop: Callable[[Any], None] | None = None
 
 
@@ -96,13 +92,12 @@ class ResourceManager(EngineScoped):
         self._local_objects: dict[str, LocalObjectEntry] = {}
         # Node bodies that yield a callable run on real threads (`async_utils.to_thread`), and parallel
         # resolution runs several node tasks at once, so two nodes can be inside these methods together.
-        # Every mutation happens under this lock; release hooks run outside it, because a hook is library
+        # Every mutation happens under this lock; release hooks run outside it, since a hook is caller
         # code that may be slow or may call back in.
         #
-        # Scope of the guarantee, because it is narrower than "thread-safe": the MAP is consistent, so
-        # concurrent puts and drops cannot corrupt it or raise. The held OBJECT is not protected. A
-        # reader is not protected against a concurrent drop, which can run a release hook on an object
-        # another node is still using; there is no borrow or lease.
+        # The guarantee is narrower than "thread-safe": the MAP is consistent, the held OBJECT is not
+        # protected. A reader is not protected against a concurrent drop, which can run a release hook on
+        # an object another node is still using. There is no borrow or lease.
         self._local_objects_lock = threading.Lock()
 
         # Register event handlers
@@ -344,39 +339,33 @@ class ResourceManager(EngineScoped):
 
     # Process-Local Object Cache
     #
-    # Plain calls, not request handlers. A request carrying a live object has to be excluded from
-    # worker forwarding by hand: the derivation in `app/worker_routing.py` matches a `type[...]`
-    # annotation and cannot see an instance-typed field, so a missing entry sends the object through
-    # `json.dumps(default=str)`, which stringifies it with no error on either side. A call has nothing
-    # to forward and nothing to remember.
+    # Plain calls, not request handlers: a request carrying a live object would be forwarded to a
+    # worker and stringified by `json.dumps(default=str)` on the way.
 
     def put_local_object(
         self,
         value: Any,
         *,
-        owner_library: str,
-        producing_node: str,
+        owner: str,
+        source: str,
         key: str | None = None,
         on_drop: Callable[[Any], None] | None = None,
     ) -> str:
         """Hold `value` in this process and return the key that refers to it.
 
-        The key is namespaced by owner library, so two libraries choosing the same suffix scheme cannot
-        collide -- which matters because one worker can serve several libraries. Supplying `key` lets a
-        library reuse an entry it has already built (a config hash, say); omitting it mints a fresh one.
+        The key is namespaced by `owner`, so two owners choosing the same suffix scheme cannot collide.
+        Supplying `key` reuses a slot the caller can name again (a config hash); omitting it uses
+        `source`.
         """
-        # Default the suffix to the producing node rather than minting a random one. A random suffix has
-        # no owner that can ever release it: the producing node is discarded after each execution in a
-        # worker, so it cannot remember what it put last time, and a node re-run five times would leave
-        # five objects resident with no way to reach the first four. Keying on the node makes a re-run
-        # displace its own predecessor, which routes that memory through `on_drop`. A node needing more
-        # than one live object at a time must pass its own `key`.
-        suffix = key if key is not None else producing_node
-        full_key = self.local_object_key(suffix, owner_library=owner_library)
+        # The suffix defaults to the source rather than to something unique per put, so that putting
+        # again displaces what the same source put last time and routes it through `on_drop`. A random
+        # suffix would leave every earlier object resident and unreachable.
+        suffix = key if key is not None else source
+        full_key = self.local_object_key(suffix, owner=owner)
         entry = LocalObjectEntry(
             value=value,
-            owner_library=owner_library,
-            producing_node=producing_node,
+            owner=owner,
+            source=source,
             on_drop=on_drop,
         )
         with self._local_objects_lock:
@@ -395,51 +384,45 @@ class ResourceManager(EngineScoped):
             self._invoke_on_drop(full_key, displaced)
         return full_key
 
-    def local_object_key(self, suffix: str, *, owner_library: str) -> str:
+    def local_object_key(self, suffix: str, *, owner: str) -> str:
         """The key `put_local_object` would produce for this suffix, without putting anything.
 
-        Exists because `key` goes in as a suffix and comes back namespaced, so a caller that supplied
-        `config_hash` cannot look it up again with `config_hash`. Without this the miss is silent: the
-        library rebuilds its model every execution, which is the cost this cache exists to remove.
+        `key` goes in as a suffix and comes back namespaced, so a caller that supplied `config_hash`
+        cannot look it up again with `config_hash`, and the miss is silent.
         """
-        return f"{owner_library}:{suffix}"
+        return f"{owner}:{suffix}"
 
-    def get_local_object(self, key: str, *, owner_library: str, default: Any = None) -> Any:
-        """The held object, or `default` if this process is not holding it for `owner_library`.
+    def get_local_object(self, key: str, *, owner: str, default: Any = None) -> Any:
+        """The held object, or `default` if this process is not holding it for `owner`.
 
-        `owner_library` is required, as it is for putting: a library that could read another's key would
-        work while both happened to share a process and stop the moment either moved to a worker, which
-        is the same graph failing later with a message saying it was never possible.
-
-        `default` lets a caller pass a sentinel and so distinguish "not held" from "held, and the value
-        happens to be None", in one lookup rather than a check followed by a read that another thread
-        can invalidate in between.
+        `owner` is required, as it is for putting: reading across owners would work only while both
+        happened to share a process. Pass a sentinel as `default` to tell "not held" from a held None
+        in one lookup, which a concurrent drop cannot invalidate halfway.
         """
         with self._local_objects_lock:
             entry = self._local_objects.get(key)
         if entry is None:
             return default
-        if entry.owner_library != owner_library:
+        if entry.owner != owner:
             return default
         return entry.value
 
-    def drop_local_object(self, key: str, *, owner_library: str | None = None) -> bool:
+    def drop_local_object(self, key: str, *, owner: str | None = None) -> bool:
         """Release one held object. Returns whether it was released.
 
-        Pass `owner_library` to refuse a key belonging to someone else. Releasing another library's
-        object would run their teardown under them and leave their still-valid keys reporting the
-        object as gone, which reads as a crash that never happened.
+        Pass `owner` to refuse a key belonging to someone else: releasing it would run their teardown
+        under them and leave their still-valid keys reporting the object as gone.
         """
         with self._local_objects_lock:
             entry = self._local_objects.get(key)
             if entry is None:
                 return False
-            if owner_library is not None and entry.owner_library != owner_library:
+            if owner is not None and entry.owner != owner:
                 logger.warning(
-                    "Library '%s' attempted to release an object owned by library '%s'. Refused: a "
-                    "library may only release what it put.",
-                    owner_library,
-                    entry.owner_library,
+                    "'%s' attempted to release an object owned by '%s'. Refused: an owner may only "
+                    "release what it put.",
+                    owner,
+                    entry.owner,
                 )
                 return False
             del self._local_objects[key]
@@ -448,10 +431,10 @@ class ResourceManager(EngineScoped):
         return True
 
     def drop_all_local_objects(self) -> int:
-        """Release everything every library is holding in this process, returning how many went.
+        """Release everything held in this process, returning how many went.
 
         For clearing workflow state: every key lived in a parameter value, so deleting the nodes makes
-        all of them unreachable at once, whichever library put them.
+        all of them unreachable at once, whoever put them.
         """
         with self._local_objects_lock:
             doomed = dict(self._local_objects)
@@ -461,14 +444,14 @@ class ResourceManager(EngineScoped):
             self._invoke_on_drop(key, entry)
         return len(doomed)
 
-    def drop_local_objects_for_library(self, owner_library: str) -> int:
-        """Release everything one library is holding, returning how many entries went.
+    def drop_objects_for_owner(self, owner: str) -> int:
+        """Release everything one owner is holding, returning how many entries went.
 
-        Used by a library clearing its own cache, and by library reload: a reloaded library must not
-        keep objects its previous code built.
+        For an owner clearing its own cache, and for library reload, where code that built an object is
+        being replaced.
         """
         with self._local_objects_lock:
-            doomed = {key: entry for key, entry in self._local_objects.items() if entry.owner_library == owner_library}
+            doomed = {key: entry for key, entry in self._local_objects.items() if entry.owner == owner}
             for key in doomed:
                 del self._local_objects[key]
 
@@ -481,12 +464,9 @@ class ResourceManager(EngineScoped):
     def _invoke_on_drop(self, key: str, entry: LocalObjectEntry) -> None:
         """Run a dropped entry's release hook, if it has one.
 
-        The caller has already removed the entry from the map. That ordering is the point: a teardown
-        that raises would otherwise leave the entry present and the object resident, and no later drop
-        would retry it, so the only recovery would be restarting the engine.
-
-        Broad except by necessity: teardown is library code freeing whatever it likes, and a failure
-        there must not propagate into whatever triggered the drop, which is often a library reload
+        The caller has already removed the entry, so a teardown that raises cannot leave the entry
+        present with its object resident and no later drop to retry it. The hook is arbitrary caller
+        code, and its failure must not propagate into whatever triggered the drop -- often a reload
         clearing many entries at once.
         """
         if entry.on_drop is None:
@@ -495,10 +475,10 @@ class ResourceManager(EngineScoped):
             entry.on_drop(entry.value)
         except Exception:
             logger.exception(
-                "Attempted to release the held object '%s' produced by node '%s'. Its cleanup failed, so "
+                "Attempted to release the held object '%s' produced by '%s'. Its cleanup failed, so "
                 "whatever it was holding (GPU memory, for example) may not have been freed.",
                 key,
-                entry.producing_node,
+                entry.source,
             )
 
     def _get_resource_type_by_name(self, name: str) -> ResourceType | None:

@@ -705,15 +705,13 @@ class WorkerManager(EngineScoped):
     async def broadcast_drop_all_local_objects(self) -> None:
         """Tell every worker to release the objects its libraries parked in it.
 
-        Awaited rather than scheduled, for the reason recorded on `_on_config_changed` above: a
-        fire-and-forget task created from a transient side loop is destroyed when that loop closes, and
-        the caller here is a workflow teardown that can be dispatched synchronously. Losing the message
-        silently would leave a worker holding gigabytes with nothing logged.
+        Awaited rather than scheduled, for the reason recorded on `_on_config_changed` above: this one is
+        called from a workflow teardown that can be dispatched synchronously, and a task created on a
+        transient side loop dies with that loop.
 
-        Never raises. Its callers are teardowns that have already destroyed nodes and flows, one of them
-        with a registry delete still to come, so a send failure -- likeliest against a dying worker,
-        which is exactly when a workflow is closing -- must not abort them or displace the failure they
-        were already reporting.
+        Never raises. Its callers have already destroyed nodes and flows, one with a registry delete
+        still to come, so a send failure must not abort them or displace the failure they were already
+        reporting.
 
         Lazy import breaks the same cycle as its siblings: `app.worker_routing` imports `EventManager`
         from this package.

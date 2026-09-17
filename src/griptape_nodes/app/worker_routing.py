@@ -177,17 +177,12 @@ class ReloadConfigResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 class DropAllLocalObjectsRequest(RequestPayload, SkipTheLineMixin):
     """Sent by the orchestrator to each registered worker when workflow object state is cleared.
 
-    A library parks unserializable values (a loaded pipeline, a latent) in the process that built them,
-    referenced by a key that travels as a parameter value. Clearing workflow state deletes every node
-    and therefore every key, so those objects become unreachable while still holding what they hold --
-    gigabytes of GPU memory, in the case this exists for.
+    Clearing workflow state deletes every node and so every key referring to a held object, leaving
+    those objects unreachable while still holding what they hold. A broadcast rather than a local hook
+    because the worker, not the orchestrator, is the process holding them.
 
-    It has to be a broadcast rather than a local hook, because the orchestrator does not hold them: a
-    library declaring execution dependencies runs its nodes in a worker, so that is the process with
-    the objects, and workflow loading happens over here.
-
-    Uses SkipTheLineMixin for the same reason as its siblings: the alternative is a queued
-    ExecuteNodeRequest running against objects belonging to a workflow that is already gone.
+    SkipTheLineMixin for the same reason as its siblings: the alternative is a queued ExecuteNodeRequest
+    running against objects belonging to a workflow that is already gone.
     """
 
 
@@ -347,29 +342,23 @@ async def _handle_drop_all_local_objects(
 ) -> ResultPayload:
     """Release every object this process is holding for its libraries.
 
-    Takes the event manager because that is how it reaches this engine. The process-global engine would
+    Takes the event manager because that is how it reaches this engine; the process-global engine would
     silently no-op for an engine an embedder built directly.
     """
     resource_manager = event_manager.engine.resource_manager
 
-    # Refuse while this worker is executing a node. The release hooks free what the object holds --
-    # GPU memory, for the case this exists for -- and this request is SkipTheLine, so it lands
-    # inline rather than queued: dropping here would pull the pipeline out from under a forward pass
-    # already running on a worker thread. The orchestrator's pre-teardown cancel is best-effort and
-    # a torch inference does not cancel, so that is a reachable UI action, not library misuse.
-    # Nothing re-issues this drop when the execution ends, so what is skipped stays resident until some
-    # later teardown, not until this render finishes. That is the accepted cost of not killing a render
-    # in progress; the objects go when the next workflow is torn down.
+    # Refuse while this worker is executing a node: this request skips the line, so releasing here
+    # would free the pipeline under a forward pass already running on a worker thread. Reachable by
+    # closing a workflow mid-render, since a torch inference does not cancel. Nothing re-issues the
+    # drop afterwards, so what is skipped stays until a later teardown.
     if event_manager.in_node_execution():
         details = "Declined to release held objects: this worker is executing a node. They will be released at a later teardown."
         logger.info(details)
         return DropAllLocalObjectsResultSuccess(result_details=details)
 
     try:
-        # Off the loop: teardown is library code, documented as possibly slow, and for this feature
-        # it is `del model` plus a CUDA cache flush. Blocking the worker's loop past the heartbeat
-        # timeout gets the worker evicted mid-load. Same reason event_manager offloads sync library
-        # callbacks.
+        # Off the loop: a release hook is `del model` plus a CUDA cache flush, and blocking the
+        # worker's loop past the heartbeat timeout gets it evicted mid-load.
         dropped = await to_thread(resource_manager.drop_all_local_objects)
     except Exception as e:
         details = (

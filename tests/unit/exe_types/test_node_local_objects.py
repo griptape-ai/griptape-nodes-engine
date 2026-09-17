@@ -1,8 +1,7 @@
 """Tests for the BaseNode surface over the process-local object cache.
 
-A node is the only place a library reaches this from, and the node is what supplies ownership and the
-producing-node name. These tests pin that plumbing, and the error a consumer gets when the object is
-gone, because that message is the whole reason libraries stop improvising recovery paths.
+The node supplies ownership and the key's default suffix, so these pin that plumbing and the error a
+consumer gets when the object is gone.
 """
 
 import pytest
@@ -26,11 +25,10 @@ class Held:
 
 
 class _ArrayLike:
-    """Stands in for a tensor: truthiness raises unless it holds exactly one element, and it is unhashable.
+    """Stands in for a tensor: truthiness raises above one element, and it is unhashable.
 
-    numpy is not an engine dependency, and these are the two behaviours that matter -- an array is the
-    value a library most easily wires into a handle input by mistake, and both what asks whether a key is
-    empty and what looks one up in a map break on it.
+    numpy is not an engine dependency, and those are the two behaviours that break a key check and a map
+    lookup respectively.
     """
 
     __hash__ = None  # type: ignore[assignment]
@@ -65,11 +63,7 @@ class TestNodeRoundTrip:
         assert key.startswith("Lib A:")
 
     def test_a_node_without_a_library_still_works(self) -> None:
-        """An unregistered node still gets somewhere to put things.
-
-        A node built outside library registration, in a test or a sandbox script, must not land in a
-        real library's namespace.
-        """
+        """A node built outside library registration must not land in a real library's namespace."""
         orphan = _Holder(name="Loose", metadata={})
 
         key = orphan.put_local_object(Held("x"))
@@ -103,11 +97,7 @@ class TestRequireLocalObject:
         assert "Re-run the node that produces it." in message
 
     def test_names_the_parameter_to_look_at_when_given_one(self, node: _Holder) -> None:
-        """The message points at the input rather than at the producing node.
-
-        Naming the producer is impossible on a miss, because its record went with the entry. The
-        consumer does know which of its own inputs it was reading.
-        """
+        """The producer cannot be named on a miss, but the consumer knows which input it was reading."""
         with pytest.raises(RuntimeError) as excinfo:
             node.require_local_object("Lib A:long-gone", parameter_name="pipeline")
 
@@ -117,11 +107,7 @@ class TestRequireLocalObject:
         assert "Re-run whatever is connected to 'pipeline'." in message
 
     def test_a_key_from_another_library_says_so_instead_of_re_run(self, node: _Holder) -> None:
-        """Telling someone to re-run a cross-library handle would have them do it forever.
-
-        A key is namespaced by its creating library, and the value never leaves the process that built
-        it, so a key from elsewhere can never resolve here no matter how many times anything re-runs.
-        """
+        """A key from another library can never resolve here, so re-running would go on forever."""
         other = _Holder(name="Other", metadata={"library": "Lib B"})
         theirs = other.put_local_object(Held("theirs"))
         other.drop_local_object(theirs)
@@ -136,12 +122,7 @@ class TestRequireLocalObject:
 
     @pytest.mark.parametrize("wrong_value", [_ArrayLike(elements=4), _ArrayLike(elements=1), 42, object()])
     def test_a_value_that_is_not_a_key_reports_that(self, node: _Holder, wrong_value: object) -> None:
-        """Wiring the object itself into a handle input is the mistake this branch exists to catch.
-
-        So it must survive the object being a tensor: asking whether a multi-element array is empty
-        raises out of numpy, and a single-element one answers falsy, which would report that nothing is
-        connected when something is.
-        """
+        """The mistake this catches is wiring the object in place of its key, so it must survive a tensor."""
         with pytest.raises(RuntimeError) as caught:
             node.require_local_object(wrong_value, parameter_name="pipeline")  # type: ignore[arg-type]
 
@@ -150,11 +131,7 @@ class TestRequireLocalObject:
         assert "nothing is connected" not in message
 
     def test_an_unwired_input_is_told_that_nothing_is_connected(self, node: _Holder) -> None:
-        """`get_parameter_value` returns None for an unwired input, which is the likeliest way here.
-
-        Distinct from the wrong-value message: "you wired nothing in" and "you wired the wrong thing in"
-        are the two mistakes a library author makes most, and they call for different fixes.
-        """
+        """An unwired input reads as None, and needs a different remedy from a wrong value."""
         with pytest.raises(RuntimeError) as caught:
             node.require_local_object(None, parameter_name="pipeline")  # type: ignore[arg-type]
 
@@ -163,11 +140,7 @@ class TestRequireLocalObject:
         assert "not a reference to a held object" not in message
 
     def test_a_held_falsy_value_is_not_treated_as_missing(self, node: _Holder) -> None:
-        """A held falsy value is not mistaken for a missing one.
-
-        A plain `None` return cannot distinguish absent from falsy, which is why `require_local_object`
-        does one lookup against a sentinel instead.
-        """
+        """A plain None return cannot tell absent from falsy, hence the sentinel lookup."""
         key = node.put_local_object(None)
 
         assert node.require_local_object(key) is None
@@ -182,11 +155,7 @@ class TestNodeDrop:
 
     @pytest.mark.parametrize("wrong_value", [_ArrayLike(elements=4), ["not", "a", "key"], None])
     def test_dropping_something_that_is_not_a_key_releases_nothing(self, node: _Holder, wrong_value: object) -> None:
-        """A clear-cache node reads its key from a parameter, so it can be handed anything.
-
-        An unhashable value -- the held object itself, wired in place of its key -- would otherwise raise
-        `TypeError: unhashable type` out of the map lookup.
-        """
+        """An unhashable value would otherwise raise `TypeError` out of the map lookup."""
         assert node.drop_local_object(wrong_value) is False  # type: ignore[arg-type]
 
     def test_drop_all_is_scoped_to_this_library(self, node: _Holder) -> None:
@@ -220,11 +189,7 @@ class TestNodeDrop:
 
 class TestSurvivesNodeDiscard:
     def test_a_new_node_reads_what_another_put(self, node: _Holder) -> None:
-        """The cache outlives the node that filled it.
-
-        This is the point of the design: a worker discards the node after every execution, so a second
-        node instance standing in for the next execution must still find what the first one put.
-        """
+        """A worker discards the node each execution, so the next instance must find what the last put."""
         held = Held("pipeline")
         key = node.put_local_object(held)
 

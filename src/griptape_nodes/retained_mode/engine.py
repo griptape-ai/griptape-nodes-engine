@@ -563,18 +563,13 @@ class Engine:
             context_manager.pop_flow()
         context_manager.pop_workflow()
 
-        # Release objects libraries parked in a process, keyed by values that lived on the nodes just
-        # deleted. Every key is now unreachable, so each entry would otherwise hold what it holds -- a
-        # multi-gigabyte pipeline, for the case this exists for -- until something else clears it.
+        # Every key referring to a held object lived on a node just deleted, so each entry would hold
+        # what it holds -- a multi-gigabyte pipeline -- until something else cleared it.
         #
-        # Placed here rather than in the clear-all-object-state handler because this is the chokepoint
-        # every teardown shares: deleting the open workflow reaches this directly, without going
-        # through that handler.
-        #
-        # Both halves are needed. The local call covers libraries running in this process; the broadcast
-        # covers workers, which is where a library declaring execution dependencies actually holds them,
-        # and which never see this otherwise (forwarding runs worker to orchestrator, and only during
-        # node execution).
+        # Here rather than in the clear-all-object-state handler because this is the chokepoint every
+        # teardown shares: deleting the open workflow reaches this without going through that handler.
+        # This covers only the objects in this process; ObjectManager and WorkflowManager tell the
+        # workers about theirs.
         dropped = self._resource_manager.drop_all_local_objects()
         if dropped:
             logger.debug("Released %d held object(s) while tearing down the workflow.", dropped)

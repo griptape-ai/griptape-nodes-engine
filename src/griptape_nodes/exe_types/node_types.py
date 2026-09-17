@@ -59,6 +59,10 @@ T = TypeVar("T")
 # in a single lookup, so a concurrent drop cannot slip between a presence check and a read.
 _LOCAL_OBJECT_MISSING = object()
 
+# The owner recorded for a node that no library registered, so its keys cannot land in a real library's
+# namespace. Not a valid library name, deliberately.
+UNREGISTERED_LOCAL_OBJECT_OWNER = "<unregistered>"
+
 NODE_GROUP_FLOW = "NodeGroupFlow"
 NODE_DEFAULT_SIZE = {"width": 400, "height": 320}
 
@@ -1284,49 +1288,33 @@ class BaseNode(ABC):
     ) -> str:
         """Hold an object in THIS process and return the key that refers to it.
 
-        For a value that cannot cross a process boundary: a loaded model, a pipeline, a tensor. The key
-        is a plain string, so it can be a parameter value and travel wherever parameter values go, while
-        the object itself never moves. Give that parameter the type `handle[<what it holds>]` and set
-        `serializable=False` on it, so a reopened workflow has no stale key and simply re-runs this node.
+        For a value that cannot cross a process boundary: a loaded model, a pipeline, a tensor. Output
+        the key rather than the object, from a parameter typed `handle[<what it holds>]` with
+        `serializable=False`, and declared INPUT-only on the consumer -- a handle is not a value anyone
+        can type, and allowing PROPERTY keeps a stale key after the producer is disconnected.
 
-        **The key choice decides how many of these can be resident at once**, which is the difference
-        between a latent and an 8 GB pipeline:
+        `key` decides how many objects can be resident at once:
 
-        - Omit `key` and the slot is this node, by name. Re-running the node displaces what it put last
-          time, so residency tracks how many producing nodes the graph has rather than how many times
-          they run. This is the right default for a heavy object. Caveat: the slot follows the node's
-          *name*, and renaming a node orphans what it was holding until the next workflow teardown
-          releases everything.
-        - Pass a fixed key (`key="pipeline"`) and the slot is the whole library: one, no matter how many
-          nodes load one. Only safe when at most one such node runs at a time. Two resolving
-          concurrently derive the same key, and the second displaces the first: `on_drop` then runs on
-          an object the first node is still holding a reference to and still using, so its next call
-          into that object reaches memory this cache just freed.
-        - Pass a content key (`key=config_hash`) and there is one per distinct content, so several can
-          be resident. Use `local_object_key` to look one up before rebuilding it. Nothing bounds the
-          total, so this trades memory for reuse.
+        - Omit it and the slot is this node, by name. Putting again displaces what this node put last
+          time. Right for a heavy object. The slot follows the node's *name*, so renaming orphans it.
+        - Pass a fixed key and the slot is the whole library, which is only safe while at most one such
+          node runs at a time. Two running concurrently means `on_drop` runs on an object the other one
+          is still using.
+        - Pass a content key (a config hash) for one slot per distinct content. Look it up with
+          `local_object_key` before rebuilding. Nothing bounds the total.
 
-        Pass `on_drop` when releasing the object takes more than dropping the reference, which is true
-        of anything holding GPU memory.
+        One object, one key: a node that changes an object in place and outputs it again returns the key
+        it was given. Two entries for one object means two release hooks, either of which frees it under
+        the other.
 
-        One object, one key. A node that takes a handle, changes the object in place and outputs it again
-        returns the key it was given; putting the same object a second time gives it two entries and two
-        release hooks, and dropping either leaves the other describing freed memory.
-
-        Nodes are discarded after every execution in a worker, so this outlives the node; the process
-        holds it. That also means it does not outlive the process, and a consumer must cope with a miss
-        (see `require_local_object`).
-
-        **For libraries whose nodes execute in a worker**, meaning those declaring execution
-        dependencies. A library running in the orchestrator does not need this, because its node output
-        values already hold live references, and it does not get the protection a worker has: a worker
-        declines to release while it is executing a node, and the orchestrator cannot tell, so a
-        workflow teardown mid-execution would run a release hook under a running node.
+        Pass `on_drop` when releasing takes more than dropping the reference, as it does for anything
+        holding GPU memory. The object outlives the node, which a worker discards after every execution,
+        but not the process, so a consumer must cope with a miss (see `require_local_object`).
         """
         return self._resource_manager_for_local_objects().put_local_object(
             value,
-            owner_library=self._local_object_owner(),
-            producing_node=self.name,
+            owner=self._local_object_owner(),
+            source=self.name,
             key=key,
             on_drop=on_drop,
         )
@@ -1334,9 +1322,8 @@ class BaseNode(ABC):
     def local_object_key(self, suffix: str) -> str:
         """The full key for a suffix this library chose, without putting anything.
 
-        `put_local_object` namespaces `key` by library and returns the full key, so a suffix alone will
-        not find anything. This is how a library checks whether it already holds something before
-        paying to rebuild it:
+        A suffix alone will not find anything, because `put_local_object` returns it namespaced. This is
+        how a library checks what it already holds before paying to rebuild:
 
             key = self.local_object_key(config_hash)
             pipe = self.get_local_object(key)
@@ -1344,47 +1331,37 @@ class BaseNode(ABC):
                 pipe = build()
                 self.put_local_object(pipe, key=config_hash, on_drop=release)
         """
-        return self._resource_manager_for_local_objects().local_object_key(
-            suffix, owner_library=self._local_object_owner()
-        )
+        return self._resource_manager_for_local_objects().local_object_key(suffix, owner=self._local_object_owner())
 
     def get_local_object(self, key: str) -> Any | None:
         """The object behind `key`, or None if this library is not holding it in this process.
 
-        Scoped to this node's library, like the drops. Without that, a handle wired in from another
-        library would resolve for as long as both happened to share a process and then stop working the
-        moment either moved to a worker or the workflow was reloaded -- the same graph failing later,
-        with a message saying it was never possible.
+        Scoped to this node's library, like the drops: a handle from another library would otherwise
+        resolve only while both happened to share a process.
         """
         owner = self._local_object_owner()
         if not isinstance(key, str) or not key.startswith(f"{owner}:"):
             return None
-        return self._resource_manager_for_local_objects().get_local_object(key, owner_library=owner)
+        return self._resource_manager_for_local_objects().get_local_object(key, owner=owner)
 
     def require_local_object(self, key: str, *, parameter_name: str | None = None) -> Any:
         """The object behind `key`, raising if this process is not holding it.
 
-        Use this rather than checking `get_local_object` and improvising a recovery path. Reaching back
-        through the graph to rebuild from the producing node's internals only works while everything
-        shares one process, and fails in a worker, where the graph lives somewhere else.
+        Use this rather than improvising a recovery path around `get_local_object`: rebuilding from the
+        producing node's internals only works while everything shares one process.
 
-        Pass `parameter_name` when the key came from a parameter, so the failure can point at the input
-        to look at. The producing node is deliberately not named: on a miss the entry is gone, and its
-        record of the producer went with it, so any name here would be a guess.
+        Pass `parameter_name` when the key came from a parameter, so the failure points at the input to
+        look at. The producing node cannot be named, because on a miss its record went with the entry.
 
         Raises:
             RuntimeError: if the object is not held.
         """
-        # An unwired input is the most likely way this is reached: `get_parameter_value` returns None,
-        # and that must produce the same readable failure as a stale key rather than an AttributeError
-        # from inside the engine. A key that carries no library prefix cannot have come from here
-        # either, so it gets the same treatment.
+        # A key arrives as a parameter value, so it can be any type or missing entirely, and each way of
+        # being wrong calls for a different fix by whoever built the graph.
         owner = self._local_object_owner()
         if not isinstance(key, str) or not key.startswith(f"{owner}:"):
-            # `is None` before the type check, and emptiness after it: "you wired nothing in" and "you
-            # wired the wrong thing in" are the two failures a library author hits most, so each needs
-            # its own message, and asking whether a tensor is empty raises out of numpy rather than
-            # reporting anything.
+            # `is None` first, then the type, then emptiness: asking whether a tensor is empty raises
+            # out of numpy, and a one-element tensor answers falsy.
             if key is None:
                 cause = "nothing is connected to it"
                 remedy = "Connect a node that produces one."
@@ -1409,7 +1386,7 @@ class BaseNode(ABC):
         # concurrent drop between those two calls would make this return None from a method contracted
         # to raise, and the caller would fail somewhere deeper with no useful message.
         value = self._resource_manager_for_local_objects().get_local_object(
-            key, owner_library=owner, default=_LOCAL_OBJECT_MISSING
+            key, owner=owner, default=_LOCAL_OBJECT_MISSING
         )
         if value is _LOCAL_OBJECT_MISSING:
             if parameter_name is not None:
@@ -1430,35 +1407,29 @@ class BaseNode(ABC):
     def drop_local_object(self, key: str) -> bool:
         """Release one object this library is holding. Returns whether it was released.
 
-        Scoped to this node's library, matching `drop_all_local_objects`. A key belonging to another
-        library is refused rather than honoured: running their teardown under them would leave their
-        own still-valid keys reporting the object as gone.
+        Scoped to this node's library, matching `drop_all_local_objects`: honouring another library's
+        key would leave their own still-valid keys reporting the object as gone.
         """
-        # A key arrives from a parameter value, so it can be anything, and an unhashable one -- the held
-        # object itself, wired in place of its key -- would raise out of the map lookup. Nothing was
-        # released either way, which is what False already means here.
+        # An unhashable key -- the held object itself, passed in place of its key -- would raise out of
+        # the map lookup. Nothing was released either way, which is what False already means.
         if not isinstance(key, str):
             return False
-        return self._resource_manager_for_local_objects().drop_local_object(
-            key, owner_library=self._local_object_owner()
-        )
+        return self._resource_manager_for_local_objects().drop_local_object(key, owner=self._local_object_owner())
 
     def drop_all_local_objects(self) -> int:
         """Release everything THIS library is holding in this process, returning how many went.
 
-        Scoped to this node's library, so it cannot clear another library's objects. This is what a
-        "clear cache" node calls.
+        What a "clear cache" node calls. Scoped to this node's library.
         """
-        return self._resource_manager_for_local_objects().drop_local_objects_for_library(self._local_object_owner())
+        return self._resource_manager_for_local_objects().drop_objects_for_owner(self._local_object_owner())
 
     def _local_object_owner(self) -> str:
         """The library that owns objects this node holds, used to scope keys and clearing."""
         library_name = self.metadata.get("library")
         if not library_name:
             # A node built outside library registration (a test, a sandbox script) still needs somewhere
-            # to put things. One namespace for all of them, so they behave like nodes of one library and
-            # can pass handles to each other; the prefix is what keeps them out of a real library's.
-            return "<unregistered>"
+            # to put things, and one namespace for all of them lets them pass handles to each other.
+            return UNREGISTERED_LOCAL_OBJECT_OWNER
         return str(library_name)
 
     def _resource_manager_for_local_objects(self) -> ResourceManager:

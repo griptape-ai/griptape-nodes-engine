@@ -219,16 +219,15 @@ class TestInstallRemoteHandlersSwap:
 class TestDropAllLocalObjectsHandler:
     """The worker half of workflow teardown: release what this process is holding.
 
-    Objects held here are the reason the cache exists (a pipeline the orchestrator has no torch to
-    hold), so the branch that declines to release them is the one that decides whether gigabytes stay
-    resident.
+    This is the process with the pipeline the orchestrator has no torch to hold, so the branch that
+    declines to release decides whether gigabytes stay resident.
     """
 
     @pytest.mark.asyncio
     async def test_declines_while_executing_a_node(self, engine: Engine) -> None:
         """Releasing mid-execution would free the pipeline under a forward pass already running."""
         held = object()
-        key = engine.resource_manager.put_local_object(held, owner_library="Lib A", producing_node="N")
+        key = engine.resource_manager.put_local_object(held, owner="Lib A", source="N")
 
         with engine.event_manager.worker_node_execution_scope():
             result = await _handle_drop_all_local_objects(
@@ -236,20 +235,16 @@ class TestDropAllLocalObjectsHandler:
             )
 
         assert isinstance(result, DropAllLocalObjectsResultSuccess)
-        assert engine.resource_manager.get_local_object(key, owner_library="Lib A") is held
+        assert engine.resource_manager.get_local_object(key, owner="Lib A") is held
 
     @pytest.mark.asyncio
     async def test_releases_off_the_event_loop(self, engine: Engine) -> None:
-        """A release hook is `del model` plus a CUDA cache flush.
-
-        Running that on the worker's loop blocks its heartbeat, and a worker that misses heartbeats is
-        evicted mid-load, so the hook must run on a worker thread.
-        """
+        """A worker whose loop is blocked past the heartbeat timeout is evicted mid-load."""
         release_threads: list[int] = []
         engine.resource_manager.put_local_object(
             object(),
-            owner_library="Lib A",
-            producing_node="N",
+            owner="Lib A",
+            source="N",
             on_drop=lambda _value: release_threads.append(threading.get_ident()),
         )
 
