@@ -356,11 +356,7 @@ Use this process to release bug fixes for a specific version without including n
 
     This creates and pushes the version tag (e.g., `v0.65.3`) and updates the `stable` tag.
 
-1. **Automatic synchronization** - After you push to the release branch, GitHub Actions automatically:
-
-    - Detects the version bump commit
-    - Cherry-picks it back to `main`
-    - Creates a PR to keep `main` in sync with the latest version number
+1. **No synchronization back to `main`** - A patch release does not touch `main`, and does not need to: `main` already carries the next minor version. The `Bump Main to Next Version` workflow skips any released tag that does not end in `.0`.
 
 ### Important Notes
 
@@ -369,6 +365,6 @@ Use this process to release bug fixes for a specific version without including n
 - Release branches follow the pattern `release/v{major.minor}` (e.g., `release/v0.65`)
 - Version tags follow the format `v{major}.{minor}.{patch}` (e.g., `v0.65.3`)
 - The `stable` tag always points to the latest stable release across all versions
-- The `version-bump-on-release.yml` GitHub Actions workflow handles automatic version synchronization back to `main`
+- The `version-bump-next-on-release.yml` GitHub Actions workflow opens a PR advancing `main` to the next minor version, and only for minor and major releases
 
 Thank you for contributing!
