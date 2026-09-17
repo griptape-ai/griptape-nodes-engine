@@ -634,7 +634,7 @@ class TestEveryMultiLibraryLoadIsBracketed:
     """Boot is not the only loop that loads more than one library, so it is not the only bracket.
 
     A library that registers its workflows mid-batch resolves their `node_libraries_referenced`
-    against the libraries loaded so far, so one naming a sibling still to come lands UNUSABLE and
+    against the libraries loaded so far, so one naming a sibling still to come lands FLAWED and
     stays that way: the workspace rescan skips registered-library roots, so nothing recomputes it.
     """
 

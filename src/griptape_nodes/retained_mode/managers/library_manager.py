@@ -2144,7 +2144,7 @@ class LibraryManager(EngineScoped):
         Skipped while the library loading gate is closed, which is how a load of more than one
         library defers this. Registering a workflow resolves its `node_libraries_referenced`
         against `LibraryRegistry` as it stands right then, so a library registering mid-batch
-        would mark a workflow UNUSABLE for referencing a sibling that has not loaded yet, and
+        would report a workflow as FLAWED for referencing a sibling that has not loaded yet, and
         nothing recomputes that verdict afterwards. It also reaches
         `WorkflowManager.on_load_workflow_metadata_request`, which waits on that same gate.
         `_loading_multiple_libraries` closes the gate and registers the whole set once it
@@ -3741,10 +3741,11 @@ class LibraryManager(EngineScoped):
         A library registering its own workflows resolves each one's `node_libraries_referenced`
         against `LibraryRegistry` as it stands at that moment. Do that partway through a batch
         and a workflow naming a sibling that has not loaded yet collects a
-        `LibraryNotRegisteredProblem` and lands UNUSABLE, which nothing recomputes: the workspace
-        rescan skips registered-library roots, so the verdict sticks for the life of the process.
-        Any loop that loads more than one library therefore has to defer registration until the
-        whole set is in, and this is how it says so.
+        `LibraryNotRegisteredProblem` and lands FLAWED, reported as depending on a library that
+        is not installed when it is merely not installed *yet*. Nothing recomputes that: the
+        workspace rescan skips registered-library roots, so the verdict sticks for the life of
+        the process. Any loop that loads more than one library therefore has to defer
+        registration until the whole set is in, and this is how it says so.
 
         Closing the gate is what defers it -- `_finish_successful_library_registration` skips the
         hook while it is closed -- and the gate has to be closed for that anyway, because
