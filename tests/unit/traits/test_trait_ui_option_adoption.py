@@ -182,6 +182,60 @@ class TestATraitWithNothingToAdopt:
         assert parameter.authored_ui_options() == {"simple_dropdown": ["a", "b"], "hide": True}
 
 
+class TestNodeCodeWritesAdoptToo:
+    """``update_ui_options`` and its siblings route through the same adoption as the editor.
+
+    A node keeping a slider's bound in step with a loaded image (as an image crop node does)
+    used to write straight into stored options: never read back, since the trait's own
+    rendered bound always won, and never saved, since a trait-owned key is stripped from what
+    gets stored.
+    """
+
+    def test_update_ui_options_moves_a_slider_bound(self) -> None:
+        trait = Slider(min_val=0, max_val=100)
+        parameter = Parameter(name="top", type="int", tooltip="t", traits={trait})
+
+        parameter.update_ui_options({"slider": {"max_val": 512}})
+
+        assert (trait.min, trait.max) == (0, 512)
+        assert parameter.ui_options["slider"] == {"min_val": 0, "max_val": 512}
+
+    def test_update_ui_options_key_moves_a_dropdown_choice_list(self) -> None:
+        trait = Options(choices=["a"])
+        parameter = Parameter(name="model", type="str", tooltip="t", traits={trait})
+
+        parameter.update_ui_options_key("simple_dropdown", ["a", "b"])
+
+        assert trait.choices == ["a", "b"]
+
+    def test_a_non_trait_write_is_still_silent(self, caplog: pytest.LogCaptureFixture) -> None:
+        parameter = Parameter(name="go", type="str", tooltip="t", traits={Button(label="Go")})
+        caplog.set_level(logging.WARNING, logger="griptape_nodes")
+
+        parameter.update_ui_options_key("hide", True)
+
+        assert caplog.records == []
+        assert parameter.authored_ui_options()["hide"] is True
+
+    def test_remove_ui_options_key_still_removes_a_stored_key(self) -> None:
+        parameter = Parameter(name="go", type="str", tooltip="t")
+        parameter.update_ui_options_key("display_name", "Go")
+
+        parameter.remove_ui_options_key("display_name")
+
+        assert "display_name" not in parameter.authored_ui_options()
+
+    def test_removing_a_trait_rendered_key_is_silent(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The key was never stored raw to begin with, so there is nothing to warn about."""
+        parameter = Parameter(name="model", type="str", tooltip="t", traits={Options(choices=["a"])})
+        caplog.set_level(logging.WARNING, logger="griptape_nodes")
+
+        parameter.remove_ui_options_key("simple_dropdown")
+
+        assert caplog.records == []
+        assert parameter.ui_options["simple_dropdown"] == ["a"]
+
+
 _ADOPTED_RANK = 3
 
 

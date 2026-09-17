@@ -829,17 +829,26 @@ class UIOptionsMixin:
         """Update stored options without copying derived options into them."""
         authored = self.authored_ui_options()
         authored.update(updates)
-        self.ui_options = authored  # type: ignore[attr-defined]
+        self._store_ui_options(authored)
 
     def remove_ui_options_key(self, key: str) -> None:
         """Remove a stored option without copying derived options into storage."""
         authored = self.authored_ui_options()
         authored.pop(key, None)
-        self.ui_options = authored  # type: ignore[attr-defined]
+        self._store_ui_options(authored)
 
     def report_ui_options_change(self) -> None:
         """Report derived UI options without storing them."""
         self.track_change("ui_options", self.ui_options)  # type: ignore[attr-defined]
+
+    def _store_ui_options(self, value: dict[str, Any]) -> None:
+        """Write updated options, whatever the caller: node code, the editor, or a saved file.
+
+        Plain storage here. ``Parameter`` overrides this to route a trait-owned key to the
+        trait that renders it, so a runtime write through this mixin and an inbound write
+        through ``adopt_ui_options`` resolve the same way.
+        """
+        self.ui_options = value  # type: ignore[attr-defined]
 
 
 class ParameterMessage(BaseNodeElement, UIOptionsMixin):
@@ -2047,10 +2056,17 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
     def ui_options(self, value: dict) -> None:
         self._ui_options = value
 
+    def _store_ui_options(self, value: dict[str, Any]) -> None:
+        """Route a runtime write through the same adoption a saved file or the editor gets."""
+        self.adopt_ui_options(value)
+
     def adopt_ui_options(self, value: dict) -> None:
         """Route inbound trait-owned options to their traits.
 
-        Keep the flat input stored so detaching a trait reveals the written value.
+        Keep the flat input stored so detaching a trait reveals the written value. Every write
+        reaches this: the editor and a saved file call it directly, and ``_store_ui_options``
+        routes ``update_ui_options`` and the convenience setters through it too, so a runtime
+        write to a trait-owned key is applied and saved rather than silently kept as dead state.
         """
         for trait in self.find_elements_by_type(Trait):
             adopted = trait.state_from_ui_options(value)
