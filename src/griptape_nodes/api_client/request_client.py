@@ -378,9 +378,6 @@ class RequestClient:
     def discard_request(self, request_id: str) -> None:
         """Stop tracking a request and cancel its future.
 
-        Synchronous so a caller cancelled mid-await can call it from its own except block without
-        introducing a suspension point while the cancellation is being delivered.
-
         Args:
             request_id: Request identifier
         """
@@ -509,9 +506,6 @@ class RequestClient:
         Returns:
             List of request_id strings
         """
-        # Building the list iterates the map, so an insert or pop from another loop raises
-        # "dictionary changed size during iteration". A diagnostic that can raise is worse than
-        # one that answers a moment out of date.
         with self._lock:
             return list(self._pending_requests.keys())
 

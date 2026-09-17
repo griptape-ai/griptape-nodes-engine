@@ -498,6 +498,9 @@ class WorkerManager(EngineScoped):
                 except Exception as e:
                     logger.debug("Failed to unsubscribe from '%s' during reset: %s", response_topic, e)
         self._managed_worker_processes.clear()
+        # Cleared with the registry, not left behind: a spawn still inside its awaits holds this
+        # library's claim, and a claim surviving the reset refuses the reload's own spawn for it.
+        self._spawns_in_flight.clear()
         self._workers.clear()
         self._worker_last_seen.clear()
 
