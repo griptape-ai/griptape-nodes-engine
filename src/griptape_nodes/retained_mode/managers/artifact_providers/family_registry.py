@@ -177,6 +177,11 @@ class FamilyRegistry:
         return bool(self.get_encoders(family))
 
     def _family_for_provider_class(self, provider_class: type[BaseArtifactProvider]) -> type[ArtifactFamily] | None:
+        # TODO(DH): First-match-wins if provider_class implements mixins from more than one
+        # family (e.g. decodes Image and encodes some other family) - resolves silently to
+        # whichever family is listed first in self._families rather than detecting the
+        # ambiguity. Not reachable today since ImageFamily is the only family and nothing
+        # multiply-inherits across families; revisit if/when a second family is added.
         for family in self._families:
             if issubclass(provider_class, family.decoder_mixin) or issubclass(provider_class, family.encoder_mixin):
                 return family
