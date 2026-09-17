@@ -2824,9 +2824,14 @@ class ParameterList(ParameterContainer):
         """Add back the layout options this class holds outside ``_ui_options``.
 
         ``collapsed``, ``child_prefix``, and the grid keys are authored, not derived: they
-        come from constructor arguments and the properties above. Leaving them out would
-        drop a list's layout from the save, and would make any other UI option write erase
-        it, since the setter below reads grid mode back out of the dict it is handed.
+        come from constructor arguments and the properties above. Leaving them out would drop
+        a list's layout from the save.
+
+        This also keeps every writer that reads ``authored_ui_options()`` before writing (the
+        mixin's ``update_ui_options`` and its siblings) from handing the setter below a partial
+        dict: the setter treats a missing ``display`` key as authoritative, same as every other
+        ``Parameter.ui_options`` setter treats a missing key as absent, so a caller has to see
+        the layout to keep it.
 
         Trait-owned keys are still subtracted, by ``Parameter``'s override above.
         """
