@@ -19,6 +19,8 @@ from griptape_nodes.files.path_utils import FilenameParts, resolve_workspace_pat
 from griptape_nodes.retained_mode.engine import Engine, EngineScoped
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.artifact_events import (
+    GetDisplayableImageBytesRequest,
+    GetDisplayableImageBytesResultSuccess,
     GetPreviewForArtifactRequest,
     GetPreviewForArtifactResultFailure,
     GetPreviewForArtifactResultSuccess,
@@ -50,6 +52,7 @@ from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import (
     SituationMetadata,
     SituationPolicy,
 )
+from griptape_nodes.retained_mode.managers.artifact_providers.image_situation import ImageArtifactSituation
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
@@ -66,6 +69,15 @@ from griptape_nodes.utils.url_utils import uri_to_path
 logger = logging.getLogger("griptape_nodes")
 
 USER_CONFIG_PATH = xdg_config_home() / "griptape_nodes" / "griptape_nodes_config.json"
+
+
+class DisplayableImagePreviewError(Exception):
+    """Raised when the displayable-image pipeline fails after its family gate already passed.
+
+    Distinguished from a generic preview-generation failure (which falls back to serving the
+    original file) because the caller already confirmed this format should support the
+    pipeline -- a failure here is a real problem, not a "provider doesn't support this format" case.
+    """
 
 
 class ResolvedStaticFilePath(NamedTuple):
@@ -269,6 +281,9 @@ class StaticFilesManager(EngineScoped):
             logger.debug("Skipping preview for unsupported file format: %s", file_path)
             return PreviewResolution(path_to_serve=file_path)
 
+        if self.engine.artifact_manager.supports_displayable_image_pipeline(extension):
+            return await self._generate_displayable_image_preview(file_path)
+
         provider_name = provider_classes[0].get_friendly_name()
 
         if source_macro_path is not None:
@@ -306,6 +321,32 @@ class StaticFilesManager(EngineScoped):
         preview_path = Path(result.paths_to_preview)
         logger.debug("Serving preview for %s -> %s", file_path, preview_path)
         return PreviewResolution(path_to_serve=preview_path, artifact_metadata=result.artifact_metadata)
+
+    async def _generate_displayable_image_preview(self, file_path: Path) -> PreviewResolution:
+        """Serve an image preview through the displayable-bytes pipeline, family-gated by the caller.
+
+        Args:
+            file_path: Path to the original file.
+
+        Raises:
+            DisplayableImagePreviewError: If the pipeline fails to produce a cached preview.
+        """
+        logger.info("Routing preview for %s through the displayable-bytes pipeline", file_path)
+        result = await self.engine.ahandle_request(
+            GetDisplayableImageBytesRequest(
+                source_path=str(file_path),
+                situation=ImageArtifactSituation.VIEWER,
+                cache_policy=PreviewGenerationPolicy.ONLY_IF_STALE,
+            )
+        )
+        if not isinstance(result, GetDisplayableImageBytesResultSuccess) or result.path_to_preview is None:
+            msg = (
+                f"Attempted to generate a displayable image preview for '{file_path}'. "
+                f"Failed due to: {result.result_details}"
+            )
+            raise DisplayableImagePreviewError(msg)
+        logger.debug("Serving displayable image preview for %s -> %s", file_path, result.path_to_preview)
+        return PreviewResolution(path_to_serve=Path(result.path_to_preview), artifact_metadata=result.artifact_metadata)
 
     def on_handle_create_static_file_request(
         self,
@@ -475,6 +516,8 @@ class StaticFilesManager(EngineScoped):
             return PreviewResolution(path_to_serve=file_path)
         try:
             resolution = await self._generate_preview_if_needed(file_path, source_macro_path=source_macro_path)
+        except DisplayableImagePreviewError:
+            raise
         except Exception as e:
             logger.warning("Preview generation failed for %s, using original: %s", file_path, e)
             return PreviewResolution(path_to_serve=file_path, preview_failure_reason=str(e))
@@ -542,12 +585,16 @@ class StaticFilesManager(EngineScoped):
 
         # If preview requested, generate preview and get preview path + artifact metadata.
         # If metadata_only requested, extract metadata without generating a preview.
-        resolution = await self._resolve_preview_path(
-            file_path_for_driver,
-            preview=request.preview,
-            metadata_only=request.metadata_only,
-            source_macro_path=source_macro_path,
-        )
+        try:
+            resolution = await self._resolve_preview_path(
+                file_path_for_driver,
+                preview=request.preview,
+                metadata_only=request.metadata_only,
+                source_macro_path=source_macro_path,
+            )
+        except DisplayableImagePreviewError as e:
+            msg = f"Attempted to create download URL for '{file_path}'. Failed due to: {e}"
+            return CreateStaticFileDownloadUrlResultFailure(error=msg, result_details=msg)
 
         try:
             url = driver.create_signed_download_url(resolution.path_to_serve)
