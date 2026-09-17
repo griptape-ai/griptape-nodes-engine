@@ -853,10 +853,21 @@ class TestOrchestratorStaticServerBaseUrl:
         static_files_manager = cast("MagicMock", worker_manager.engine.static_files_manager)
         static_files_manager.static_server_base_url_settled = False
         static_files_manager.wait_for_static_server_base_url.return_value = "http://orchestrator:4242"
+        waiting_thread: list[str] = []
+
+        def _record_thread(timeout_s: float) -> str:  # noqa: ARG001
+            waiting_thread.append(threading.current_thread().name)
+            return "http://orchestrator:4242"
+
+        static_files_manager.wait_for_static_server_base_url.side_effect = _record_thread
 
         result = await worker_manager._orchestrator_static_server_base_url()
 
         assert result == "http://orchestrator:4242"
+        # The wait blocks whichever thread runs it, so running it here would stall every other
+        # spawn and every request this loop is serving for the whole settle timeout.
+        assert len(waiting_thread) == 1
+        assert waiting_thread[0] != threading.current_thread().name
         static_files_manager.wait_for_static_server_base_url.assert_called_once_with(_STATIC_URL_SETTLE_TIMEOUT_S)
 
     @pytest.mark.asyncio
@@ -916,6 +927,23 @@ class TestOrchestratorStaticServerBaseUrl:
 
 
 class TestResetWorkers:
+    @pytest.mark.asyncio
+    async def test_a_claim_does_not_outlive_the_reset(self, worker_manager: WorkerManager) -> None:
+        """A reload resets and then spawns again, so a surviving claim would refuse its own spawn.
+
+        The refusal records nothing -- a worker is normally on its way when a key is claimed -- so
+        the next run would wait out the whole startup grace and then blame the library load.
+        """
+        worker_manager.engine.library_manager.execution_site_packages.return_value = None  # type: ignore[union-attr]
+        worker_manager._spawns_in_flight.add("My Library")
+
+        await worker_manager.reset_workers()
+
+        with patch("asyncio.create_subprocess_exec", return_value=_managed_proc_mock()) as mock_exec:
+            await worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "My Library")
+
+        mock_exec.assert_called_once()
+
     @pytest.mark.asyncio
     async def test_terminates_all_processes(self, worker_manager: WorkerManager) -> None:
         proc_a, proc_b = _managed_proc_mock(), _managed_proc_mock()
@@ -1186,7 +1214,7 @@ class TestLogSpawnError:
         task = asyncio.create_task(_raise())
         await asyncio.gather(task, return_exceptions=True)
 
-        with patch.object(worker_manager, "_refuse_spawn") as mock_refuse:
+        with patch.object(worker_manager, "note_worker_unavailable") as mock_refuse:
             worker_manager._log_spawn_error(task, "My Library")
 
         mock_refuse.assert_called_once()
