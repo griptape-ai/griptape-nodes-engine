@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 from griptape_nodes.exe_types.elements.badge import set_initial_badge
 from griptape_nodes.exe_types.elements.base import BaseNodeElement
 from griptape_nodes.exe_types.elements.parameter_types import ParameterMode, ParameterType, ParameterTypeBuiltin
+from griptape_nodes.exe_types.elements.tooltips import default_parameter_tooltip
 from griptape_nodes.exe_types.elements.trait import Trait
 from griptape_nodes.exe_types.elements.ui_options import UIOptionsMixin
 
@@ -71,9 +72,6 @@ class ParameterBase(BaseNodeElement, ABC):
 
 
 class Parameter(BaseNodeElement, UIOptionsMixin):
-    # Maximum number of input types to show in tooltip before truncating
-    _MAX_TOOLTIP_INPUT_TYPES = 3
-
     # This is the list of types that the Parameter can accept, either externally or when internally treated as a property.
     # Today, we can accept multiple types for input, but only a single output type.
     tooltip: str | list[dict]  # Default tooltip, can be string or list of dicts
@@ -169,7 +167,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
 
         # Generate default tooltip if none provided
         if not tooltip:
-            tooltip = self._generate_default_tooltip(name, type, input_types, output_type)
+            tooltip = default_parameter_tooltip(name, type, input_types, output_type)
 
         self.tooltip = tooltip
         self.default_value = default_value
@@ -272,61 +270,6 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         self.type = type
         self.input_types = input_types
         self.output_type = output_type
-
-    def _generate_default_tooltip(
-        self,
-        name: str,
-        type: str | None,  # noqa: A002
-        input_types: list[str] | None,
-        output_type: str | None,
-    ) -> str:
-        """Generate a default tooltip describing the parameter type and usage.
-
-        Args:
-            name: The parameter name
-            type: The parameter type
-            input_types: List of accepted input types
-            output_type: The output type
-
-        Returns:
-            A descriptive tooltip string
-        """
-        # Determine the primary type to describe
-        primary_type = type
-        if not primary_type and input_types:
-            primary_type = input_types[0]
-        if not primary_type and output_type:
-            primary_type = output_type
-        if not primary_type:
-            primary_type = "any"
-
-        # Create a human-readable description
-        type_descriptions = {
-            "str": "text/string",
-            "bool": "boolean (true/false)",
-            "int": "integer number",
-            "float": "decimal number",
-            "any": "any type of data",
-            "list": "list/array",
-            "dict": "dictionary/object",
-            "parametercontroltype": "control flow",
-        }
-
-        type_desc = type_descriptions.get(primary_type.lower(), primary_type)
-
-        # Build the tooltip
-        tooltip_parts = [f"Enter {type_desc} for {name}"]
-
-        # Add input type info if different from primary type
-        if input_types and len(input_types) > 1:
-            input_desc = ", ".join(
-                type_descriptions.get(t.lower(), t) for t in input_types[: self._MAX_TOOLTIP_INPUT_TYPES]
-            )
-            if len(input_types) > self._MAX_TOOLTIP_INPUT_TYPES:
-                input_desc += f" or {len(input_types) - self._MAX_TOOLTIP_INPUT_TYPES} other types"
-            tooltip_parts.append(f"Accepts: {input_desc}")
-
-        return ". ".join(tooltip_parts) + "."
 
     def to_dict(self) -> dict[str, Any]:
         """Returns a nested dictionary representation of this node and its children."""
