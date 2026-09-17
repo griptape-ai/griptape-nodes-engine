@@ -24,7 +24,7 @@ from griptape_nodes.exe_types.elements.parameter_types import (
 )
 from griptape_nodes.exe_types.elements.tooltips import default_parameter_tooltip
 from griptape_nodes.exe_types.elements.trait import Trait
-from griptape_nodes.exe_types.elements.ui_options import UIOptionsMixin
+from griptape_nodes.exe_types.elements.ui_options import UIOptionsMixin, seed_ui_options
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -232,32 +232,18 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         else:
             self._ui_options = ui_options.copy()
 
-        # Validate that explicit parameters don't conflict with ui_options (only if not None)
-        if hide is not None:
-            self._validate_ui_option_conflict(ui_options_dict=self._ui_options, param_name="hide", param_value=hide)
-        if hide_label is not None:
-            self._validate_ui_option_conflict(
-                ui_options_dict=self._ui_options, param_name="hide_label", param_value=hide_label
-            )
-        if hide_property is not None:
-            self._validate_ui_option_conflict(
-                ui_options_dict=self._ui_options, param_name="hide_property", param_value=hide_property
-            )
-        if display_name is not None:
-            self._validate_ui_option_conflict(
-                ui_options_dict=self._ui_options, param_name="display_name", param_value=display_name
-            )
-
-        # Add common UI options if explicitly provided (not None) and NOT already in ui_options
-        # (ui_options always wins in case of conflict)
-        if hide is not None and "hide" not in self._ui_options:
-            self._ui_options["hide"] = hide
-        if hide_label is not None and "hide_label" not in self._ui_options:
-            self._ui_options["hide_label"] = hide_label
-        if hide_property is not None and "hide_property" not in self._ui_options:
-            self._ui_options["hide_property"] = hide_property
-        if display_name is not None and "display_name" not in self._ui_options:
-            self._ui_options["display_name"] = display_name
+        # Validate that explicit parameters don't conflict with ui_options, then add the ones
+        # ui_options did not already name.
+        seed_ui_options(
+            self,
+            self._ui_options,
+            {
+                "hide": hide,
+                "hide_label": hide_label,
+                "hide_property": hide_property,
+                "display_name": display_name,
+            },
+        )
         if traits:
             for trait in traits:
                 if not isinstance(trait, Trait):

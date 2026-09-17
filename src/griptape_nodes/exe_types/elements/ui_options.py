@@ -60,3 +60,17 @@ class UIOptionsMixin:
         ui_options = self.ui_options
         ui_options.update(updates)
         self.ui_options = ui_options
+
+
+def seed_ui_options(element: UIOptionsMixin, ui_options: dict, values: dict[str, Any]) -> None:
+    """Write the display arguments a constructor took into ``ui_options``.
+
+    A value left as ``None`` was not asked for. ``ui_options`` wins a conflict, and the
+    element reports one.
+    """
+    for key, value in values.items():
+        if value is None:
+            continue
+        element._validate_ui_option_conflict(ui_options_dict=ui_options, param_name=key, param_value=value)
+        if key not in ui_options:
+            ui_options[key] = value

@@ -6,7 +6,7 @@ from dataclasses import field
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 from griptape_nodes.exe_types.elements.base import BaseNodeElement
-from griptape_nodes.exe_types.elements.ui_options import UIOptionsMixin
+from griptape_nodes.exe_types.elements.ui_options import UIOptionsMixin, seed_ui_options
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -103,20 +103,9 @@ class ParameterMessage(BaseNodeElement, UIOptionsMixin):
         self._full_width = full_width
         self._ui_options = ui_options or {}
 
-        # Validate that explicit parameters don't conflict with ui_options (only if not None)
-        if markdown is not None:
-            self._validate_ui_option_conflict(
-                ui_options_dict=self._ui_options, param_name="markdown", param_value=markdown
-            )
-        if hide is not None:
-            self._validate_ui_option_conflict(ui_options_dict=self._ui_options, param_name="hide", param_value=hide)
-
-        # Add common UI options if explicitly provided (not None) and NOT already in ui_options
-        # (ui_options always wins in case of conflict)
-        if markdown is not None and "markdown" not in self._ui_options:
-            self._ui_options["markdown"] = markdown
-        if hide is not None and "hide" not in self._ui_options:
-            self._ui_options["hide"] = hide
+        # Validate that explicit parameters don't conflict with ui_options, then add the ones
+        # ui_options did not already name.
+        seed_ui_options(self, self._ui_options, {"markdown": markdown, "hide": hide})
 
         # Handle traits if provided
         if traits:

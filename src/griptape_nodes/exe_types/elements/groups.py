@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from griptape_nodes.exe_types.elements.badge import set_initial_badge
 from griptape_nodes.exe_types.elements.base import BaseNodeElement
 from griptape_nodes.exe_types.elements.parameter import Parameter
-from griptape_nodes.exe_types.elements.ui_options import UIOptionsMixin
+from griptape_nodes.exe_types.elements.ui_options import UIOptionsMixin, seed_ui_options
 
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.elements.badge import BadgeData
@@ -186,23 +186,11 @@ class ParameterButtonGroup(BaseNodeElement, UIOptionsMixin):
         else:
             ui_options = ui_options.copy()
 
-        if hide_label is not None:
-            self._validate_ui_option_conflict(
-                ui_options_dict=ui_options, param_name="hide_label", param_value=hide_label
-            )
-        if display_name is not None:
-            self._validate_ui_option_conflict(
-                ui_options_dict=ui_options, param_name="display_name", param_value=display_name
-            )
+        seed_ui_options(self, ui_options, {"hide_label": hide_label, "display_name": display_name})
 
+        # A button group labels itself with its buttons, so the label is hidden unless asked for.
         if "hide_label" not in ui_options:
-            if hide_label is not None:
-                ui_options["hide_label"] = hide_label
-            else:
-                ui_options["hide_label"] = True
-
-        if display_name is not None and "display_name" not in ui_options:
-            ui_options["display_name"] = display_name
+            ui_options["hide_label"] = True
 
         ui_options["button_group"] = True
         ui_options["orientation"] = orientation
