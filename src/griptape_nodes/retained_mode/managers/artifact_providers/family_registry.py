@@ -65,8 +65,119 @@ class FamilyRegistry:
                     return family
         return self.get_family_for_extension(extension)
 
+    def get_decoders(self, family: type[ArtifactFamily], extension: str) -> list[type[BaseArtifactProvider]]:
+        """Return every registered provider for ``extension`` that can decode ``family``.
+
+        Args:
+            family: The family whose decoder mixin providers must implement.
+            extension: File extension without leading dot (e.g. "png").
+        """
+        return [
+            provider_class
+            for provider_class in self._registry.get_provider_classes_by_format(extension)
+            if issubclass(provider_class, family.decoder_mixin)
+        ]
+
+    def resolve_decoder(
+        self,
+        family: type[ArtifactFamily],
+        extension: str,
+        preferred_friendly_name: str | None = None,
+    ) -> type[BaseArtifactProvider] | None:
+        """Resolve the decoder provider to use for ``extension`` within ``family``.
+
+        Args:
+            family: The family whose decoder mixin providers must implement.
+            extension: File extension without leading dot (e.g. "png").
+            preferred_friendly_name: If given, only a provider with this friendly
+                name is returned; a name that matches no candidate returns
+                ``None`` rather than silently falling back to another provider.
+
+        Returns:
+            The named provider, the first registered candidate, or ``None`` if
+            there are no candidates or the named provider isn't among them.
+        """
+        candidates = self.get_decoders(family, extension)
+        return self._resolve_from_candidates(candidates, preferred_friendly_name)
+
+    def get_encoders(self, family: type[ArtifactFamily], output_format: str) -> list[type[BaseArtifactProvider]]:
+        """Return every registered provider that can encode ``family`` to ``output_format``.
+
+        Args:
+            family: The family whose encoder mixin providers must implement.
+            output_format: Desired output format without leading dot (e.g. "webp").
+        """
+        return [
+            provider_class
+            for provider_class in self._registry.get_all_provider_classes()
+            if issubclass(provider_class, family.encoder_mixin)
+            and output_format in provider_class.get_preview_formats()
+        ]
+
+    def resolve_encoder(
+        self,
+        family: type[ArtifactFamily],
+        output_format: str,
+        preferred_friendly_name: str | None = None,
+    ) -> type[BaseArtifactProvider] | None:
+        """Resolve the encoder provider to use for ``output_format`` within ``family``.
+
+        Args:
+            family: The family whose encoder mixin providers must implement.
+            output_format: Desired output format without leading dot (e.g. "webp").
+            preferred_friendly_name: If given, only a provider with this friendly
+                name is returned; a name that matches no candidate returns
+                ``None`` rather than silently falling back to another provider.
+
+        Returns:
+            The named provider, the first registered candidate, or ``None`` if
+            there are no candidates or the named provider isn't among them.
+        """
+        candidates = self.get_encoders(family, output_format)
+        return self._resolve_from_candidates(candidates, preferred_friendly_name)
+
+    def resolve_conversion(self, family: type[ArtifactFamily], output_format: str) -> type[BaseArtifactProvider] | None:
+        """Resolve the provider to convert ``family`` artifacts to ``output_format``.
+
+        Args:
+            family: The family whose encoder mixin providers must implement.
+            output_format: Desired output format without leading dot (e.g. "webp").
+        """
+        return self.resolve_encoder(family, output_format)
+
+    def supports_pipeline(self, family: type[ArtifactFamily], extension: str) -> bool:
+        """True when ``extension`` has a decoder and at least one encoder exists for ``family``.
+
+        Mirrors ``ArtifactManager.supports_displayable_image_pipeline``'s current
+        shape: a decoder for this specific extension, plus any registered
+        encoder for the family regardless of output format.
+
+        Args:
+            family: The family to check the decode/encode pipeline for.
+            extension: File extension without leading dot (e.g. "png").
+        """
+        if self.resolve_decoder(family, extension) is None:
+            return False
+        return any(
+            issubclass(provider_class, family.encoder_mixin)
+            for provider_class in self._registry.get_all_provider_classes()
+        )
+
     def _family_for_provider_class(self, provider_class: type[BaseArtifactProvider]) -> type[ArtifactFamily] | None:
         for family in self._families:
             if issubclass(provider_class, family.decoder_mixin) or issubclass(provider_class, family.encoder_mixin):
                 return family
         return None
+
+    @staticmethod
+    def _resolve_from_candidates(
+        candidates: list[type[BaseArtifactProvider]], preferred_friendly_name: str | None
+    ) -> type[BaseArtifactProvider] | None:
+        if preferred_friendly_name is not None:
+            for candidate in candidates:
+                if candidate.get_friendly_name().lower() == preferred_friendly_name.lower():
+                    return candidate
+            return None
+        if not candidates:
+            return None
+        return candidates[0]

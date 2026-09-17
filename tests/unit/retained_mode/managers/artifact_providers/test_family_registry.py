@@ -4,11 +4,20 @@ Constructs FamilyRegistry directly with a real ProviderRegistry that has
 ImageArtifactProvider registered - no ArtifactManager wiring involved yet.
 """
 
+import numpy as np
+
 from griptape_nodes.retained_mode.managers.artifact_providers.artifact_family import ImageFamily
+from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_provider import BaseArtifactProvider
 from griptape_nodes.retained_mode.managers.artifact_providers.family_registry import FamilyRegistry
 from griptape_nodes.retained_mode.managers.artifact_providers.image.image_artifact_provider import (
     ImageArtifactProvider,
 )
+from griptape_nodes.retained_mode.managers.artifact_providers.image_decoder_mixin import (
+    DecodedImageArtifact,
+    ImageArtifactDecoderMixin,
+)
+from griptape_nodes.retained_mode.managers.artifact_providers.image_encoder_mixin import ImageArtifactEncoderMixin
+from griptape_nodes.retained_mode.managers.artifact_providers.image_situation import ImageArtifactSituation
 from griptape_nodes.retained_mode.managers.artifact_providers.provider_registry import ProviderRegistry
 
 _PNG_MAGIC_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 8
@@ -60,3 +69,177 @@ class TestResolveFamily:
         result = family_registry.resolve_family("mp4", data=b"not a recognizable header")
 
         assert result is None
+
+
+class _AlternateImageProvider(BaseArtifactProvider, ImageArtifactDecoderMixin, ImageArtifactEncoderMixin):
+    """A second Image-family provider, so registration order/override behavior can be tested."""
+
+    @classmethod
+    def get_friendly_name(cls) -> str:
+        return "AlternateImage"
+
+    @classmethod
+    def get_supported_formats(cls) -> set[str]:
+        return {"png", "jpg"}
+
+    @classmethod
+    def get_preview_formats(cls) -> set[str]:
+        return {"webp"}
+
+    @classmethod
+    def get_default_preview_generator(cls) -> str:
+        return "Default"
+
+    @classmethod
+    def get_default_preview_format(cls) -> str:
+        return "webp"
+
+    @classmethod
+    def get_default_preview_generators(cls) -> list:
+        return []
+
+    @classmethod
+    def get_artifact_metadata(cls, _source_path: str) -> None:
+        return None
+
+    def decode(self, source_path: str, situation: ImageArtifactSituation) -> DecodedImageArtifact:  # noqa: ARG002
+        return DecodedImageArtifact(
+            pixel_data=np.zeros((1, 1, 3)), source_color_space="sRGB", bit_depth=8, channel_layout="RGB"
+        )
+
+    def encode(
+        self,
+        decoded_artifact: DecodedImageArtifact,  # noqa: ARG002
+        situation: ImageArtifactSituation,  # noqa: ARG002
+        format: str | None = None,  # noqa: A002, ARG002
+    ) -> bytes:
+        return b""
+
+
+def _build_registry_with_two_image_providers() -> ProviderRegistry:
+    registry = ProviderRegistry()
+    registry.register_provider(ImageArtifactProvider)
+    registry.register_provider(_AlternateImageProvider)
+    return registry
+
+
+class TestGetDecoders:
+    def test_get_decoders_returns_decoder_providers_for_extension(self) -> None:
+        family_registry = FamilyRegistry(_build_registry_with_two_image_providers())
+
+        decoders = family_registry.get_decoders(ImageFamily, "png")
+
+        assert set(decoders) == {ImageArtifactProvider, _AlternateImageProvider}
+
+    def test_get_decoders_returns_empty_list_for_unregistered_extension(self) -> None:
+        family_registry = FamilyRegistry(_build_registry_with_image_provider())
+
+        assert family_registry.get_decoders(ImageFamily, "mp4") == []
+
+
+class TestResolveDecoder:
+    def test_resolve_decoder_returns_first_registered_when_no_override_given(self) -> None:
+        family_registry = FamilyRegistry(_build_registry_with_two_image_providers())
+
+        decoder = family_registry.resolve_decoder(ImageFamily, "png")
+
+        assert decoder is ImageArtifactProvider
+
+    def test_resolve_decoder_honors_explicit_override(self) -> None:
+        family_registry = FamilyRegistry(_build_registry_with_two_image_providers())
+
+        decoder = family_registry.resolve_decoder(ImageFamily, "png", preferred_friendly_name="AlternateImage")
+
+        assert decoder is _AlternateImageProvider
+
+    def test_resolve_decoder_returns_none_when_override_names_unregistered_provider(self) -> None:
+        family_registry = FamilyRegistry(_build_registry_with_two_image_providers())
+
+        decoder = family_registry.resolve_decoder(ImageFamily, "png", preferred_friendly_name="NoSuchProvider")
+
+        assert decoder is None
+
+    def test_resolve_decoder_returns_none_when_no_decoders_registered(self) -> None:
+        family_registry = FamilyRegistry(_build_registry_with_image_provider())
+
+        assert family_registry.resolve_decoder(ImageFamily, "mp4") is None
+
+
+class TestGetEncoders:
+    def test_get_encoders_returns_multiple_providers_for_same_output_format(self) -> None:
+        family_registry = FamilyRegistry(_build_registry_with_two_image_providers())
+
+        encoders = family_registry.get_encoders(ImageFamily, "webp")
+
+        assert set(encoders) == {ImageArtifactProvider, _AlternateImageProvider}
+
+    def test_get_encoders_returns_empty_list_for_unsupported_format(self) -> None:
+        family_registry = FamilyRegistry(_build_registry_with_two_image_providers())
+
+        assert family_registry.get_encoders(ImageFamily, "not-a-format") == []
+
+
+class TestResolveEncoder:
+    def test_resolve_encoder_honors_explicit_override(self) -> None:
+        family_registry = FamilyRegistry(_build_registry_with_two_image_providers())
+
+        encoder = family_registry.resolve_encoder(ImageFamily, "webp", preferred_friendly_name="AlternateImage")
+
+        assert encoder is _AlternateImageProvider
+
+    def test_resolve_encoder_returns_none_when_override_names_unregistered_provider(self) -> None:
+        family_registry = FamilyRegistry(_build_registry_with_two_image_providers())
+
+        encoder = family_registry.resolve_encoder(ImageFamily, "webp", preferred_friendly_name="NoSuchProvider")
+
+        assert encoder is None
+
+
+class TestResolveConversion:
+    def test_resolve_conversion_delegates_to_resolve_encoder(self) -> None:
+        family_registry = FamilyRegistry(_build_registry_with_two_image_providers())
+
+        assert family_registry.resolve_conversion(ImageFamily, "webp") == family_registry.resolve_encoder(
+            ImageFamily, "webp"
+        )
+
+
+class TestSupportsPipeline:
+    def test_supports_pipeline_true_when_decoder_and_encoder_exist(self) -> None:
+        family_registry = FamilyRegistry(_build_registry_with_two_image_providers())
+
+        assert family_registry.supports_pipeline(ImageFamily, "png") is True
+
+    def test_supports_pipeline_false_when_only_decoder_exists(self) -> None:
+        registry = ProviderRegistry()
+
+        class _DecodeOnlyProvider(BaseArtifactProvider, ImageArtifactDecoderMixin):
+            @classmethod
+            def get_friendly_name(cls) -> str:
+                return "DecodeOnly"
+
+            @classmethod
+            def get_supported_formats(cls) -> set[str]:
+                return {"png"}
+
+            @classmethod
+            def get_preview_formats(cls) -> set[str]:
+                return set()
+
+            @classmethod
+            def get_default_preview_generators(cls) -> list:
+                return []
+
+            @classmethod
+            def get_artifact_metadata(cls, _source_path: str) -> None:
+                return None
+
+            def decode(self, source_path: str, situation: ImageArtifactSituation) -> DecodedImageArtifact:  # noqa: ARG002
+                return DecodedImageArtifact(
+                    pixel_data=np.zeros((1, 1, 3)), source_color_space="sRGB", bit_depth=8, channel_layout="RGB"
+                )
+
+        registry.register_provider(_DecodeOnlyProvider)
+        family_registry = FamilyRegistry(registry)
+
+        assert family_registry.supports_pipeline(ImageFamily, "png") is False
