@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from importlib.resources import files
+from itertools import groupby
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Generic, NamedTuple, TypeVar, cast
 
@@ -39,7 +40,11 @@ from griptape_nodes.common.strict_mode import (
 from griptape_nodes.common.strict_mode_checks import RULES
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import BaseNode
-from griptape_nodes.exe_types.workflow_node import WorkflowNodeDefinitionError, build_workflow_node_class
+from griptape_nodes.exe_types.workflow_node import (
+    WorkflowNode,
+    WorkflowNodeDefinitionError,
+    build_workflow_node_class,
+)
 from griptape_nodes.files.path_utils import (
     canonicalize_for_identity,
     canonicalize_for_identity_preserving_symlinks,
@@ -72,7 +77,12 @@ from griptape_nodes.node_library.library_validation import (
     detect_retired_node_declarations,
     validate_library_declarations,
 )
-from griptape_nodes.node_library.workflow_registry import WorkflowMetadataError, read_workflow_metadata
+from griptape_nodes.node_library.workflow_registry import (
+    WorkflowMetadata,
+    WorkflowMetadataError,
+    WorkflowMetadataSectionCountError,
+    read_workflow_metadata,
+)
 from griptape_nodes.retained_mode.beta_features import (
     LIBRARY_BETA_FEATURES_KEY,
     find_library_config_slug_collision,
@@ -229,6 +239,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     CreateConfigCategoryProblem,
     DependencyInstallationFailedProblem,
     DuplicateLibraryProblem,
+    DuplicateNodeRegistrationProblem,
     EngineVersionErrorProblem,
     IncompatibleRequirementsProblem,
     InvalidVersionStringProblem,
@@ -320,6 +331,9 @@ logger = logging.getLogger("griptape_nodes")
 
 # Directories to exclude when scanning for Python source files (in addition to any directory starting with '.')
 EXCLUDED_SCAN_DIRECTORIES = frozenset({"venv", "__pycache__"})
+
+# Prepended when a workflow's name cannot start a node type on its own (e.g. "3d_scan").
+SUBFLOW_NODE_TYPE_FALLBACK_PREFIX = "Subflow"
 
 TRegisteredEventData = TypeVar("TRegisteredEventData")
 
@@ -473,6 +487,44 @@ class LibraryVenvInitResult(NamedTuple):
     reused: bool
 
 
+@dataclass
+class SandboxCandidates:
+    """The sandbox's scanned files.
+
+    Split into node source to import and saved workflows to build as nodes.
+    """
+
+    node_source_definitions: list[NodeDefinition] = field(default_factory=list)
+    workflow_node_definitions: list[WorkflowNodeDefinition] = field(default_factory=list)
+    problems: list[WorkflowNodeLoadProblem] = field(default_factory=list)
+
+
+def node_type_for_subflow_workflow_name(workflow_name: str) -> str:
+    """Derive a valid node type name from a saved workflow's name.
+
+    Runs of letters and digits (any language) are capitalized and joined: ``shout_workflow``
+    becomes ``ShoutWorkflow``. A name that cannot start a type gains a prefix rather than being
+    rejected: ``3d_scan`` becomes ``Subflow3dScan``.
+    """
+    words = [
+        "".join(characters)
+        for is_word_character, characters in groupby(workflow_name, key=_can_appear_in_node_type)
+        if is_word_character
+    ]
+    node_type = "".join(f"{word[0].upper()}{word[1:]}" for word in words)
+    if not node_type or not node_type[0].isidentifier():
+        return f"{SUBFLOW_NODE_TYPE_FALLBACK_PREFIX}{node_type}"
+    return node_type
+
+
+def _can_appear_in_node_type(character: str) -> bool:
+    """Whether a character from a workflow's name can be carried into its node type name.
+
+    Letters and digits in any language are kept; "½" counts as a number but is not valid in a class name.
+    """
+    return character.isalnum() and f"a{character}".isidentifier()
+
+
 class LibraryManager(EngineScoped):
     SANDBOX_LIBRARY_NAME = "Sandbox Library"
     # Prefix for the stable, deterministic module namespaces that library node files are
@@ -485,6 +537,9 @@ class LibraryManager(EngineScoped):
     # Sandbox library constants
     UNRESOLVED_SANDBOX_CLASS_NAME = "<NOT YET RESOLVED>"
     SANDBOX_CATEGORY_NAME = "Griptape Nodes Sandbox"
+
+    # Icon for the workflow-backed nodes that saved workflows in the sandbox become
+    SUBFLOW_NODE_ICON = "Layers"
 
     _library_file_path_to_info: dict[str, LibraryInfo]
 
@@ -2189,9 +2244,11 @@ class LibraryManager(EngineScoped):
     def register_sandbox_node_from_source_request(  # noqa: C901, PLR0911
         self, request: RegisterSandboxNodeFromSourceRequest
     ) -> ResultPayload:
-        """Import a Python source file from the sandbox dir and register its BaseNode subclasses.
+        """Register node types from a `.py` file in the sandbox dir.
 
-        Leverages existing engine primitives end to end:
+        A file with a workflow header is a saved workflow. It is never imported, and becomes one
+        workflow-backed node built the same way the sandbox load builds it. Any other file is
+        Python node source and is handled with existing engine primitives end to end:
           * `_get_sandbox_directory` resolves the configured path.
           * `_load_module_from_file` imports the source (with the existing hot-reload
             semantics when replacing an iterating draft).
@@ -2260,6 +2317,14 @@ class LibraryManager(EngineScoped):
                 "the source file into the sandbox directory before calling this request."
             )
             return RegisterSandboxNodeFromSourceResultFailure(result_details=details)
+
+        # Saved workflows are never imported (see `_partition_sandbox_candidates`). The link is
+        # kept in the path so the workflow is keyed as the workspace scan keys it.
+        workflow_header = self._read_sandbox_workflow_header(file_identity)
+        if workflow_header is not None:
+            return self._register_sandbox_workflow_node_from_source(
+                workflow_header, file_identity, sandbox_dir, replace_if_exists=request.replace_if_exists
+            )
 
         # Import the module. `_load_module_from_file` handles both first-load and hot-reload
         # (re-importing an existing module with fresh source), which is exactly what an agent
@@ -2336,6 +2401,115 @@ class LibraryManager(EngineScoped):
             registered_class_names=registered_class_names,
             replaced_class_names=replaced_class_names,
             result_details=summary,
+        )
+
+    def _register_sandbox_workflow_node_from_source(
+        self,
+        workflow_header: WorkflowMetadata | WorkflowNodeLoadProblem,
+        workflow_path: Path,
+        sandbox_dir: Path,
+        *,
+        replace_if_exists: bool,
+    ) -> RegisterSandboxNodeFromSourceResultSuccess | RegisterSandboxNodeFromSourceResultFailure:
+        """Register a saved sandbox workflow as a workflow-backed node, without importing it.
+
+        Built as the sandbox load builds it, and before any same-named node is removed, so a workflow
+        that cannot become a node leaves the existing one in place.
+        """
+        if isinstance(workflow_header, WorkflowNodeLoadProblem):
+            details = (
+                f"Attempted to register the saved workflow at '{workflow_path}' as a sandbox node. "
+                f"Failed because its workflow header could not be read: {workflow_header.error_message}"
+            )
+            return RegisterSandboxNodeFromSourceResultFailure(result_details=details)
+
+        try:
+            sandbox_library = LibraryRegistry.get_library(LibraryManager.SANDBOX_LIBRARY_NAME)
+        except KeyError:
+            details = (
+                "Attempted to register a sandbox node, but the Sandbox Library is not "
+                "registered in the engine. Ensure the sandbox directory has been initialized "
+                "(it is scanned once at engine startup) before calling this request."
+            )
+            return RegisterSandboxNodeFromSourceResultFailure(result_details=details)
+
+        workflow_node_definition = self._create_sandbox_workflow_node_definition(workflow_header, str(workflow_path))
+        node_type = workflow_node_definition.node_type
+        node_class = self._build_workflow_node_class(workflow_node_definition, sandbox_dir)
+        if isinstance(node_class, WorkflowNodeLoadProblem):
+            details = (
+                f"Attempted to register the saved workflow at '{workflow_path}' as node type '{node_type}'. "
+                f"Failed because the workflow cannot become a node: {node_class.error_message}"
+            )
+            return RegisterSandboxNodeFromSourceResultFailure(result_details=details)
+
+        already_registered = sandbox_library.has_node_type(node_type)
+        if already_registered and not replace_if_exists:
+            details = (
+                f"Attempted to register the saved workflow at '{workflow_path}' as node type '{node_type}'. "
+                "Failed because a node type with that name is already registered in the Sandbox Library "
+                "and replace_if_exists=False."
+            )
+            return RegisterSandboxNodeFromSourceResultFailure(result_details=details)
+
+        replaced_class_names: list[str] = []
+        if already_registered:
+            sandbox_library.unregister_node_type(node_type)
+            replaced_class_names.append(node_type)
+        library_problem = sandbox_library.register_new_node_type(node_class, workflow_node_definition.metadata)
+
+        problem_details = ""
+        if library_problem is not None:
+            # A duplicate is removed or refused above, so none is expected. If one appears, the new
+            # type replaced it: record it (as the load path does) and succeed with a warning. Any
+            # other problem type is a guard for future kinds: the node type may or may not have
+            # been stored, so fail and say so.
+            problem_details = type(library_problem).collate_problems_for_display([library_problem])
+            sandbox_library_info = self.get_library_info_by_library_name(LibraryManager.SANDBOX_LIBRARY_NAME)
+            if sandbox_library_info is None:
+                logger.warning(
+                    "Attempted to record a problem registering the saved workflow at '%s' as node type '%s'. "
+                    "Failed because the %s has no load entry to record it in. The problem: %s",
+                    workflow_path,
+                    node_type,
+                    LibraryManager.SANDBOX_LIBRARY_NAME,
+                    problem_details,
+                )
+            else:
+                sandbox_library_info.problems.append(library_problem)
+
+        if library_problem is not None and not isinstance(library_problem, DuplicateNodeRegistrationProblem):
+            details = (
+                f"Attempted to register the saved workflow at '{workflow_path}' as node type '{node_type}'. "
+                f"Failed because the {LibraryManager.SANDBOX_LIBRARY_NAME} reported a problem: "
+                f"{problem_details} The node type may have been registered anyway. "
+                f"Check whether node type '{node_type}' is listed in the {LibraryManager.SANDBOX_LIBRARY_NAME} "
+                "before using it, or retry with replace_if_exists=True."
+            )
+            return RegisterSandboxNodeFromSourceResultFailure(result_details=details)
+
+        summary = (
+            f"Registered the saved workflow at '{workflow_path}' as node type '{node_type}' "
+            f"in the {LibraryManager.SANDBOX_LIBRARY_NAME} (replaced: {len(replaced_class_names)})."
+        )
+        result_details: ResultDetails | str = summary
+        if library_problem is not None:
+            warning = (
+                f"Attempted to register the saved workflow at '{workflow_path}' as node type '{node_type}'. "
+                f"The node type may have been registered, but the {LibraryManager.SANDBOX_LIBRARY_NAME} "
+                f"reported a problem: {problem_details}"
+            )
+            result_details = ResultDetails(
+                ResultDetail(level=logging.INFO, message=summary),
+                ResultDetail(level=logging.WARNING, message=warning),
+            )
+
+        return RegisterSandboxNodeFromSourceResultSuccess(
+            file_path=str(workflow_path),
+            library_name=LibraryManager.SANDBOX_LIBRARY_NAME,
+            registered_class_names=[node_type],
+            replaced_class_names=replaced_class_names,
+            result_details=result_details,
         )
 
     def describe_node_type_request(self, request: DescribeNodeTypeRequest) -> ResultPayload:
@@ -5315,6 +5489,20 @@ class LibraryManager(EngineScoped):
         parameters. Returns False (recording a library problem) when the header cannot be read or
         carries no shape.
         """
+        node_class = self._build_workflow_node_class(workflow_node_definition, base_dir)
+        if isinstance(node_class, WorkflowNodeLoadProblem):
+            library_info.problems.append(node_class)
+            return False
+
+        library_problem = library.register_new_node_type(node_class, metadata=workflow_node_definition.metadata)
+        if library_problem is not None:
+            library_info.problems.append(library_problem)
+        return True
+
+    def _build_workflow_node_class(
+        self, workflow_node_definition: WorkflowNodeDefinition, base_dir: Path
+    ) -> type[WorkflowNode] | WorkflowNodeLoadProblem:
+        """Generate the node type a saved workflow file describes, or the problem that prevents it."""
         # Deliberately not `canonicalize_for_identity`: the workspace scan registers a linked
         # workflow under the link's path, and resolving it would key it by a full machine-specific
         # path instead.
@@ -5324,14 +5512,11 @@ class LibraryManager(EngineScoped):
         try:
             workflow_metadata = read_workflow_metadata(workflow_file_path)
         except WorkflowMetadataError as err:
-            library_info.problems.append(
-                WorkflowNodeLoadProblem(
-                    node_type=workflow_node_definition.node_type,
-                    workflow_path=str(workflow_file_path),
-                    error_message=str(err),
-                )
+            return WorkflowNodeLoadProblem(
+                node_type=workflow_node_definition.node_type,
+                workflow_path=str(workflow_file_path),
+                error_message=str(err),
             )
-            return False
 
         try:
             node_class = build_workflow_node_class(
@@ -5340,19 +5525,13 @@ class LibraryManager(EngineScoped):
                 workflow_metadata=workflow_metadata,
             )
         except WorkflowNodeDefinitionError as err:
-            library_info.problems.append(
-                WorkflowNodeLoadProblem(
-                    node_type=workflow_node_definition.node_type,
-                    workflow_path=str(workflow_file_path),
-                    error_message=str(err),
-                )
+            return WorkflowNodeLoadProblem(
+                node_type=workflow_node_definition.node_type,
+                workflow_path=str(workflow_file_path),
+                error_message=str(err),
             )
-            return False
 
-        library_problem = library.register_new_node_type(node_class, metadata=workflow_node_definition.metadata)
-        if library_problem is not None:
-            library_info.problems.append(library_problem)
-        return True
+        return node_class
 
     def _attempt_load_nodes_from_library(  # noqa: PLR0912, PLR0915, C901
         self,
@@ -5799,9 +5978,13 @@ class LibraryManager(EngineScoped):
 
         problems = []
 
+        # Saved workflows are set aside before anything is imported.
+        candidates = self._partition_sandbox_candidates(library_schema, sandbox_library_dir)
+        problems.extend(candidates.problems)
+
         # Get the file paths from the schema's node definitions to load actual classes
         actual_node_definitions = []
-        for node_def in library_schema.nodes:
+        for node_def in candidates.node_source_definitions:
             # Resolve relative path from schema against sandbox directory
             # Resolved, unlike the sandbox paths around it: one file is one module.
             candidate_path = resolve_workspace_path(Path(node_def.file_path), sandbox_library_dir)
@@ -5862,7 +6045,7 @@ class LibraryManager(EngineScoped):
                     )
                     actual_node_definitions.append(node_definition)
 
-        if not actual_node_definitions:
+        if not actual_node_definitions and not candidates.workflow_node_definitions:
             # The sandbox directory exists but currently holds no files that declare a
             # BaseNode subclass. Previously the loader bailed here and left the Sandbox
             # Library unregistered, which made it impossible to add the first node via
@@ -5874,6 +6057,10 @@ class LibraryManager(EngineScoped):
                 sandbox_library_dir,
             )
 
+        workflow_nodes = None
+        if candidates.workflow_node_definitions:
+            workflow_nodes = candidates.workflow_node_definitions
+
         # Use the existing schema but replace nodes with actual discovered ones
         library_data = LibrarySchema(
             name=library_schema.name,
@@ -5881,6 +6068,7 @@ class LibraryManager(EngineScoped):
             metadata=library_schema.metadata,
             categories=library_schema.categories,
             nodes=actual_node_definitions,
+            workflow_nodes=workflow_nodes,
             widgets=library_schema.widgets,
         )
 
@@ -5927,6 +6115,63 @@ class LibraryManager(EngineScoped):
             base_dir=sandbox_library_dir,
             library_info=library_info,
             lazy_loading=False,
+        )
+
+    def _partition_sandbox_candidates(
+        self, library_schema: LibrarySchema, sandbox_directory: Path
+    ) -> SandboxCandidates:
+        """Split the sandbox's scanned files into node source and saved workflows, without importing any.
+
+        Saved workflows are never imported, since that would run their graph-construction code. Their
+        entries are rebuilt from the header on every load, so a rename is never frozen at first scan.
+        """
+        candidates = SandboxCandidates()
+        for node_def in library_schema.nodes:
+            workflow_header = self._read_sandbox_workflow_header(sandbox_directory / node_def.file_path)
+            if isinstance(workflow_header, WorkflowNodeLoadProblem):
+                candidates.problems.append(workflow_header)
+            elif workflow_header is None:
+                candidates.node_source_definitions.append(node_def)
+            else:
+                candidates.workflow_node_definitions.append(
+                    self._create_sandbox_workflow_node_definition(workflow_header, node_def.file_path)
+                )
+        return candidates
+
+    def _read_sandbox_workflow_header(self, candidate_path: Path) -> WorkflowMetadata | WorkflowNodeLoadProblem | None:
+        """Read a sandbox file's workflow header, telling Python node source apart from saved workflows.
+
+        Returns None for a file with no workflow header (Python node source), the header for a saved
+        workflow, or a problem for a file whose header is present but cannot be read.
+        """
+        try:
+            workflow_metadata = read_workflow_metadata(candidate_path)
+        except WorkflowMetadataError as err:
+            if isinstance(err, WorkflowMetadataSectionCountError) and err.count == 0:
+                return None
+            return WorkflowNodeLoadProblem(
+                node_type=candidate_path.stem, workflow_path=str(candidate_path), error_message=str(err)
+            )
+
+        return workflow_metadata
+
+    def _create_sandbox_workflow_node_definition(
+        self, workflow_metadata: WorkflowMetadata, workflow_path: str
+    ) -> WorkflowNodeDefinition:
+        """Describe a saved sandbox workflow as a node, named and described by the workflow itself."""
+        description = workflow_metadata.description
+        if not description:
+            description = f"Runs the '{workflow_metadata.name}' workflow."
+
+        return WorkflowNodeDefinition(
+            node_type=node_type_for_subflow_workflow_name(workflow_metadata.name),
+            workflow_path=workflow_path,
+            metadata=NodeMetadata(
+                category=LibraryManager.SANDBOX_CATEGORY_NAME,
+                description=description,
+                display_name=workflow_metadata.name,
+                icon=LibraryManager.SUBFLOW_NODE_ICON,
+            ),
         )
 
     def _find_files_in_dir(self, directory: Path, extension: str) -> list[Path]:
