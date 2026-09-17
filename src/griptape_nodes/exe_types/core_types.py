@@ -1727,8 +1727,16 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         # Add in our deltas.
         our_dict["name"] = self.name
         our_dict["type"] = self.type
-        our_dict["input_types"] = self.input_types
-        our_dict["output_type"] = self.output_type
+        # The public type accessors fill in the opposite side for compatibility with
+        # property-mode checks. Save/load needs the declared sides instead, otherwise a
+        # ControlParameterInput is serialized with an output type too and is rebuilt as a
+        # generic bidirectional ControlParameter.
+        if isinstance(self, ControlParameter):
+            our_dict["input_types"] = self._input_types
+            our_dict["output_type"] = self._output_type
+        else:
+            our_dict["input_types"] = self.input_types
+            our_dict["output_type"] = self.output_type
         our_dict["default_value"] = self.default_value
         our_dict["tooltip"] = self.tooltip
         our_dict["tooltip_as_input"] = self.tooltip_as_input

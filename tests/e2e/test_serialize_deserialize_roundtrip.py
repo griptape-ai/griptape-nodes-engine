@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from griptape_nodes.exe_types.core_types import ControlParameterInput, ControlParameterOutput
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
 from griptape_nodes.retained_mode.events.connection_events import CreateConnectionRequest, CreateConnectionResultSuccess
 from griptape_nodes.retained_mode.events.flow_events import (
@@ -164,6 +165,63 @@ class TestPlainSubflowRoundTrip:
 
 
 class TestNodeGroupRoundTrip:
+    def test_restores_control_boundary_ports_and_wall_edges(self, engine: Engine, library_name: str) -> None:
+        """Control proxies keep their wall side, port shape, and edges after reload."""
+        flow = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="ControlGroupRoundTrip", set_as_new_context=False)
+        )
+        assert isinstance(flow, CreateFlowResultSuccess), flow
+
+        with engine.context_manager.flow(flow.flow_name):
+            group = _create_node(engine, "SubflowGroupNode", "Group", library_name)
+            leaf = _create_node(engine, "EchoNode", "Leaf", library_name, parent_group_name=group)
+            source = _create_node(engine, "EchoNode", "Source", library_name)
+            sink = _create_node(engine, "EchoNode", "Sink", library_name)
+
+            for source_name, target_name in ((source, leaf), (leaf, sink)):
+                parameter_pair = ("exec_out", "exec_in")
+                result = engine.handle_request(
+                    CreateConnectionRequest(
+                        source_node_name=source_name,
+                        source_parameter_name=parameter_pair[0],
+                        target_node_name=target_name,
+                        target_parameter_name=parameter_pair[1],
+                    )
+                )
+                assert isinstance(result, CreateConnectionResultSuccess), result
+
+        original_group = _get_group(engine, group)
+        assert original_group.metadata["left_parameters"] == ["group_exec_in", "exec_in"]
+        assert original_group.metadata["right_parameters"] == ["group_exec_out", "exec_out"]
+
+        commands = _serialize(engine, flow.flow_name)
+
+        engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        result = _deserialize_into_fresh_context(engine, commands)
+
+        restored_group = _get_group(engine, result.node_name_mappings["Group"])
+        restored_source = result.node_name_mappings["Source"]
+        restored_leaf = result.node_name_mappings["Leaf"]
+        restored_sink = result.node_name_mappings["Sink"]
+
+        assert restored_group.metadata["left_parameters"] == ["group_exec_in", "exec_in"]
+        assert restored_group.metadata["right_parameters"] == ["group_exec_out", "exec_out"]
+        assert isinstance(restored_group.get_parameter_by_name("exec_in"), ControlParameterInput)
+        assert isinstance(restored_group.get_parameter_by_name("exec_out"), ControlParameterOutput)
+
+        connections = engine.flow_manager.get_connections()
+        edges = {
+            f"{connection.source_node.name}.{connection.source_parameter.name}"
+            f"->{connection.target_node.name}.{connection.target_parameter.name}"
+            for connection in connections.connections.values()
+        }
+        assert {
+            f"{restored_source}.exec_out->{restored_group.name}.exec_in",
+            f"{restored_group.name}.exec_in->{restored_leaf}.exec_in",
+            f"{restored_leaf}.exec_out->{restored_group.name}.exec_out",
+            f"{restored_group.name}.exec_out->{restored_sink}.exec_in",
+        } <= edges
+
     def test_restores_a_single_level_group(self, engine: Engine, library_name: str) -> None:
         """A group's wall connections cross its boundary, so this failed for every group."""
         flow = engine.handle_request(

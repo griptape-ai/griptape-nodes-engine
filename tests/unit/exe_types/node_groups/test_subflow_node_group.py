@@ -53,6 +53,15 @@ class TestSubflowNodeGroupCreateSubflow:
         # ...but the group must record the flow it ACTUALLY got back, not the requested name.
         assert group.metadata["subflow_name"] == "G_subflow_1"
 
+    def test_preserves_saved_proxy_side_metadata(self, engine: Engine) -> None:  # noqa: ARG002
+        group = _MiniSubflowGroup(
+            name="G",
+            metadata={"left_parameters": ["exec_in"], "right_parameters": ["exec_out"]},
+        )
+
+        assert group.metadata["left_parameters"] == ["group_exec_in", "exec_in"]
+        assert group.metadata["right_parameters"] == ["group_exec_out", "exec_out"]
+
 
 class TestGetAllNodes:
     """get_all_nodes has to reach the whole body, not just the first level down.
@@ -108,6 +117,18 @@ class TestSubflowNodeGroupProxyParameters:
         assert outgoing_proxy.allowed_modes == {ParameterMode.INPUT, ParameterMode.OUTPUT}
         assert ParameterMode.PROPERTY not in incoming_proxy.allowed_modes
         assert ParameterMode.PROPERTY not in outgoing_proxy.allowed_modes
+
+    def test_control_port_serialization_preserves_directional_shape(self) -> None:
+        incoming = ControlParameterInput(name="exec_in")
+        outgoing = ControlParameterOutput(name="exec_out")
+
+        incoming_dict = incoming.to_dict()
+        outgoing_dict = outgoing.to_dict()
+
+        assert incoming_dict["input_types"] == ["parametercontroltype"]
+        assert incoming_dict["output_type"] is None
+        assert outgoing_dict["input_types"] is None
+        assert outgoing_dict["output_type"] == "parametercontroltype"
 
 
 class _MiniSubflowGroup(SubflowNodeGroup):
