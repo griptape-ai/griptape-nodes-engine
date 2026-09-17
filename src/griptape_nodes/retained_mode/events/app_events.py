@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
+from griptape_nodes.node_library.workflow_registry import WorkflowSource
 from griptape_nodes.retained_mode.events.base_events import (
     AppPayload,
     RequestPayload,
@@ -266,6 +267,36 @@ class LibraryLoadedNotification(AppPayload):
     fitness: str
     problem_details: str | None = None
     node_schemas: list[WorkerNodeSchema] | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class WorkflowsChanged(AppPayload):
+    """Notification that workflows from one source were added to or removed from the registry.
+
+    Today the only source that emits this is a library: a library that declares `workflows` in
+    its `griptape_nodes_library.json` announces them once it has registered them (engine start,
+    library install, library reload), and announces their removal when it unloads. Carrying the
+    source rather than the library name means the same payload covers whatever population gains
+    a lifecycle next, instead of a second event type per source.
+
+    Intended for clients that show the workflow list, so they have something to refetch on
+    rather than only learning about the change the next time they happen to ask. No client
+    subscribes yet; the companion editor change is what wires it up.
+
+    Enqueued with `put_event`, like `EngineReadyEvent`, so it reaches the application layer
+    and the GUI. In-process Python subscribers registered via `add_listener_to_app_event` do
+    not see it -- those only fire for events passed to `broadcast_app_event`.
+
+    Args:
+        source: Where the workflows came from. See `WorkflowSource`.
+        workflow_names: Registry keys of the workflows that were added or removed.
+        registered: True when the workflows were added, False when they were removed.
+    """
+
+    source: WorkflowSource
+    workflow_names: list[str]
+    registered: bool
 
 
 @dataclass
