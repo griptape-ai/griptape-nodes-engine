@@ -178,3 +178,29 @@ class ParameterType:
             raise ValueError(err_str)
 
         return ParameterType.KeyValueTypePair(key_type=key_type, value_type=value_type)
+
+
+def canonical_type_name(type_name: str) -> str:
+    """Return the builtin name a type alias resolves to, or the name as it was written."""
+    builtin = ParameterType.attempt_get_builtin(type_name)
+    if builtin is None:
+        return type_name
+    return builtin.value
+
+
+def accepts_incoming_type(input_types: list[str], incoming_type: str | None) -> bool:
+    """Whether something declaring ``input_types`` may receive a value of ``incoming_type``."""
+    if incoming_type is None:
+        return False
+
+    if incoming_type.lower() == ParameterTypeBuiltin.ALL.value:
+        return True
+
+    if not input_types:
+        # Customer feedback was to treat as a string by default.
+        return ParameterType.are_types_compatible(source_type=incoming_type, target_type=ParameterTypeBuiltin.STR.value)
+
+    for test_type in input_types:
+        if ParameterType.are_types_compatible(source_type=incoming_type, target_type=test_type):
+            return True
+    return False

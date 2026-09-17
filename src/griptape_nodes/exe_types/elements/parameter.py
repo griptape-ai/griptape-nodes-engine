@@ -12,7 +12,13 @@ from typing import TYPE_CHECKING, Any
 from griptape_nodes.exe_types.elements.badge import set_initial_badge
 from griptape_nodes.exe_types.elements.base import BaseNodeElement
 from griptape_nodes.exe_types.elements.parameter_diff import diff_list_values, diff_parameters
-from griptape_nodes.exe_types.elements.parameter_types import ParameterMode, ParameterType, ParameterTypeBuiltin
+from griptape_nodes.exe_types.elements.parameter_types import (
+    ParameterMode,
+    ParameterType,
+    ParameterTypeBuiltin,
+    accepts_incoming_type,
+    canonical_type_name,
+)
 from griptape_nodes.exe_types.elements.tooltips import default_parameter_tooltip
 from griptape_nodes.exe_types.elements.trait import Trait
 from griptape_nodes.exe_types.elements.ui_options import UIOptionsMixin
@@ -341,15 +347,10 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
 
     def _custom_setter_for_property_type(self, value: str | None) -> None:
         """Derived classes may override this. Overriding property getter/setters is fraught with peril."""
-        if value is not None:
-            # See if it's an alias to a builtin first.
-            builtin = ParameterType.attempt_get_builtin(value)
-            if builtin is not None:
-                self._type = builtin.value
-            else:
-                self._type = value
+        if value is None:
+            self._type = None
             return
-        self._type = None
+        self._type = canonical_type_name(value)
 
     @property
     def converters(self) -> list[Callable[[Any], Any]]:
@@ -618,14 +619,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         if value is None:
             self._input_types = None
         else:
-            self._input_types = []
-            for new_type in value:
-                # See if it's an alias to a builtin first.
-                builtin = ParameterType.attempt_get_builtin(new_type)
-                if builtin is not None:
-                    self._input_types.append(builtin.value)
-                else:
-                    self._input_types.append(new_type)
+            self._input_types = [canonical_type_name(new_type) for new_type in value]
 
     @property
     def output_type(self) -> str:
@@ -653,15 +647,10 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
 
     def _custom_setter_for_property_output_type(self, value: str | None) -> None:
         """Derived classes may override this. Overriding property getter/setters is fraught with peril."""
-        if value is not None:
-            # See if it's an alias to a builtin first.
-            builtin = ParameterType.attempt_get_builtin(value)
-            if builtin is not None:
-                self._output_type = builtin.value
-            else:
-                self._output_type = value
+        if value is None:
+            self._output_type = None
             return
-        self._output_type = None
+        self._output_type = canonical_type_name(value)
 
     def add_trait(self, trait: type[Trait] | Trait) -> None:
         if not isinstance(trait, Trait):
@@ -684,26 +673,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         self._converters.append(converter)
 
     def is_incoming_type_allowed(self, incoming_type: str | None) -> bool:
-        if incoming_type is None:
-            return False
-
-        if incoming_type.lower() == ParameterTypeBuiltin.ALL.value:
-            return True
-
-        ret_val = False
-
-        if self.input_types:
-            for test_type in self.input_types:
-                if ParameterType.are_types_compatible(source_type=incoming_type, target_type=test_type):
-                    ret_val = True
-                    break
-        else:
-            # Customer feedback was to treat as a string by default.
-            ret_val = ParameterType.are_types_compatible(
-                source_type=incoming_type, target_type=ParameterTypeBuiltin.STR.value
-            )
-
-        return ret_val
+        return accepts_incoming_type(self.input_types, incoming_type)
 
     def is_outgoing_type_allowed(self, target_type: str | None) -> bool:
         return ParameterType.are_types_compatible(source_type=self.output_type, target_type=target_type)
