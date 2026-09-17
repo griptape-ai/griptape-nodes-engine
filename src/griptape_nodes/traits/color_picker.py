@@ -1,24 +1,13 @@
 from collections.abc import Callable
-from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from griptape_nodes.exe_types.core_types import Parameter, ParameterMode, Trait
+import attrs
+
+from griptape_nodes.exe_types.core_types import Parameter, Trait
 
 
-@dataclass(eq=False)
 class ColorPicker(Trait):
-    format: Literal["hex", "hexa", "rgb", "rgba", "hsl", "hsla", "hsv", "hsva"] = "hex"
-    element_id: str = field(default_factory=lambda: "ColorPicker")
-
-    _allowed_modes: set = field(default_factory=lambda: {ParameterMode.PROPERTY})
-
-    def __init__(self, format: Literal["hex", "hexa", "rgb", "rgba", "hsl", "hsla", "hsv", "hsva"] = "hex") -> None:  # noqa: A002
-        super().__init__()
-        self.format = format
-
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["color_picker"]
+    format: Literal["hex", "hexa", "rgb", "rgba", "hsl", "hsla", "hsv", "hsva"] = attrs.field(default="hex")
 
     def ui_options_for_trait(self) -> dict:
         return {"color_picker": {"format": self.format}}

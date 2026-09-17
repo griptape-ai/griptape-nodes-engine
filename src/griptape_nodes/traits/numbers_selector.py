@@ -1,36 +1,16 @@
 from collections.abc import Callable
-from dataclasses import dataclass, field
 from typing import Any
 
-from griptape_nodes.exe_types.core_types import Parameter, ParameterMode, Trait
+import attrs
+
+from griptape_nodes.exe_types.core_types import Parameter, Trait
 
 
-@dataclass(eq=False)
 class NumbersSelector(Trait):
-    defaults: dict[str, float] = field(kw_only=True)
-    step: float = 1.0
-    overall_min: float | None = None
-    overall_max: float | None = None
-    element_id: str = field(default_factory=lambda: "NumbersSelector")
-
-    _allowed_modes: set = field(default_factory=lambda: {ParameterMode.PROPERTY})
-
-    def __init__(
-        self,
-        defaults: dict[str, float],
-        step: float = 1.0,
-        overall_min: float | None = None,
-        overall_max: float | None = None,
-    ) -> None:
-        super().__init__()
-        self.defaults = defaults
-        self.step = step
-        self.overall_min = overall_min
-        self.overall_max = overall_max
-
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["numbers_selector"]
+    defaults: dict[str, float] = attrs.field()
+    step: float = attrs.field(default=1.0)
+    overall_min: float | None = attrs.field(default=None)
+    overall_max: float | None = attrs.field(default=None)
 
     def ui_options_for_trait(self) -> dict:
         return {
