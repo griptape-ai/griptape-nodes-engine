@@ -435,8 +435,9 @@ class GetDisplayableImageBytesRequest(RequestPayload):
     """Get displayable raster bytes for an image, decoded/encoded for a given situation.
 
     The decoder is resolved by the source file's extension (same routing as
-    ``CheckArtifactReadPermissionRequest``/``extract_artifact_metadata``). The
-    encoder is resolved independently, by friendly name "Image" -- decode and
+    ``CheckArtifactReadPermissionRequest``/``extract_artifact_metadata``),
+    unless ``preferred_decoder_friendly_name`` names one explicitly. The
+    encoder is resolved independently via ``FamilyRegistry`` -- decode and
     encode do not have to be the same provider: ``DecodedImageArtifact`` is a
     format-agnostic intermediate once produced, so any provider implementing
     ``ImageArtifactEncoderMixin`` can encode output decoded by a different
@@ -452,6 +453,14 @@ class GetDisplayableImageBytesRequest(RequestPayload):
         situation: The display context bytes are being requested for.
         format: Desired output format (e.g. "webp"), None for the encoder
             provider's own default. Ignored for ORIGINAL.
+        preferred_decoder_friendly_name: If given, only a decoder with this
+            friendly name is used; a name that matches no registered decoder
+            for this source's extension fails the request. None preserves the
+            default first-registered-candidate behavior.
+        preferred_encoder_friendly_name: If given, only an encoder with this
+            friendly name is used; a name that matches no registered encoder
+            fails the request. None preserves the default
+            first-registered-candidate behavior.
 
     Results: GetDisplayableImageBytesResultSuccess | GetDisplayableImageBytesResultFailure
     """
@@ -460,6 +469,8 @@ class GetDisplayableImageBytesRequest(RequestPayload):
     situation: ImageArtifactSituation
     format: str | None = None
     cache_policy: PreviewGenerationPolicy | None = None
+    preferred_decoder_friendly_name: str | None = None
+    preferred_encoder_friendly_name: str | None = None
 
 
 @dataclass

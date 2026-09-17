@@ -836,6 +836,162 @@ class TestGetDisplayableImageBytesHandler:
         assert result.format == "jpg"
 
     @pytest.mark.asyncio
+    async def test_preferred_decoder_override_is_honored_when_multiple_decoders_registered(
+        self, test_image_path: Path
+    ) -> None:
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            GetDisplayableImageBytesRequest,
+            GetDisplayableImageBytesResultSuccess,
+        )
+
+        decode_calls: list[str] = []
+
+        class _DecoderA(ImageArtifactProvider):
+            @classmethod
+            def get_friendly_name(cls) -> str:
+                return "DecoderA"
+
+            def decode(self, source_path: str, situation: ImageArtifactSituation) -> DecodedImageArtifact:  # noqa: ARG002
+                message = "DecoderA must not be called when DecoderB is preferred"
+                raise AssertionError(message)
+
+        class _DecoderB(ImageArtifactProvider):
+            @classmethod
+            def get_friendly_name(cls) -> str:
+                return "DecoderB"
+
+            def decode(self, source_path: str, situation: ImageArtifactSituation) -> DecodedImageArtifact:
+                decode_calls.append("DecoderB")
+                return super().decode(source_path, situation)
+
+        manager = ArtifactManager()
+        # _DecoderA is registered first, so the default (unpreferred) resolution would pick it.
+        manager.on_handle_register_artifact_provider_request(RegisterArtifactProviderRequest(provider_class=_DecoderA))
+        manager.on_handle_register_artifact_provider_request(RegisterArtifactProviderRequest(provider_class=_DecoderB))
+
+        request = GetDisplayableImageBytesRequest(
+            source_path=str(test_image_path),
+            situation=ImageArtifactSituation.VIEWER,
+            preferred_decoder_friendly_name="DecoderB",
+        )
+        result = await manager.on_get_displayable_image_bytes_request(request)
+
+        assert isinstance(result, GetDisplayableImageBytesResultSuccess)
+        assert decode_calls == ["DecoderB"]
+
+    @pytest.mark.asyncio
+    async def test_preferred_encoder_override_is_honored(self, test_image_path: Path) -> None:
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            GetDisplayableImageBytesRequest,
+            GetDisplayableImageBytesResultSuccess,
+        )
+
+        encode_calls: list[str] = []
+
+        class _EncoderA(ImageArtifactProvider):
+            @classmethod
+            def get_friendly_name(cls) -> str:
+                return "EncoderA"
+
+            def encode(
+                self,
+                decoded_artifact: DecodedImageArtifact,  # noqa: ARG002
+                situation: ImageArtifactSituation,  # noqa: ARG002
+                format: str | None = None,  # noqa: ARG002, A002
+            ) -> bytes:
+                message = "EncoderA must not be called when EncoderB is preferred"
+                raise AssertionError(message)
+
+        class _EncoderB(ImageArtifactProvider):
+            @classmethod
+            def get_friendly_name(cls) -> str:
+                return "EncoderB"
+
+            def encode(
+                self,
+                decoded_artifact: DecodedImageArtifact,
+                situation: ImageArtifactSituation,
+                format: str | None = None,  # noqa: A002
+            ) -> bytes:
+                encode_calls.append("EncoderB")
+                return super().encode(decoded_artifact, situation, format)
+
+        manager = ArtifactManager()
+        # _EncoderA is registered first, so the default (unpreferred) resolution would pick it.
+        manager.on_handle_register_artifact_provider_request(RegisterArtifactProviderRequest(provider_class=_EncoderA))
+        manager.on_handle_register_artifact_provider_request(RegisterArtifactProviderRequest(provider_class=_EncoderB))
+
+        request = GetDisplayableImageBytesRequest(
+            source_path=str(test_image_path),
+            situation=ImageArtifactSituation.VIEWER,
+            preferred_encoder_friendly_name="EncoderB",
+        )
+        result = await manager.on_get_displayable_image_bytes_request(request)
+
+        assert isinstance(result, GetDisplayableImageBytesResultSuccess)
+        assert encode_calls == ["EncoderB"]
+
+    @pytest.mark.asyncio
+    async def test_unknown_preferred_decoder_name_returns_failure_result(
+        self, artifact_manager: ArtifactManager, test_image_path: Path
+    ) -> None:
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            GetDisplayableImageBytesRequest,
+            GetDisplayableImageBytesResultFailure,
+        )
+
+        request = GetDisplayableImageBytesRequest(
+            source_path=str(test_image_path),
+            situation=ImageArtifactSituation.VIEWER,
+            preferred_decoder_friendly_name="NoSuchDecoder",
+        )
+        result = await artifact_manager.on_get_displayable_image_bytes_request(request)
+
+        assert isinstance(result, GetDisplayableImageBytesResultFailure)
+        assert "NoSuchDecoder" in str(result.result_details)
+
+    @pytest.mark.asyncio
+    async def test_unknown_preferred_encoder_name_returns_failure_result(
+        self, artifact_manager: ArtifactManager, test_image_path: Path
+    ) -> None:
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            GetDisplayableImageBytesRequest,
+            GetDisplayableImageBytesResultFailure,
+        )
+
+        request = GetDisplayableImageBytesRequest(
+            source_path=str(test_image_path),
+            situation=ImageArtifactSituation.VIEWER,
+            preferred_encoder_friendly_name="NoSuchEncoder",
+        )
+        result = await artifact_manager.on_get_displayable_image_bytes_request(request)
+
+        assert isinstance(result, GetDisplayableImageBytesResultFailure)
+        assert "NoSuchEncoder" in str(result.result_details)
+
+    @pytest.mark.asyncio
+    async def test_omitted_preferred_names_preserve_existing_default_behavior(
+        self, artifact_manager: ArtifactManager, test_image_path: Path
+    ) -> None:
+        """Explicit regression check: default resolution is unaffected by the new override fields."""
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            GetDisplayableImageBytesRequest,
+            GetDisplayableImageBytesResultSuccess,
+        )
+
+        request = GetDisplayableImageBytesRequest(
+            source_path=str(test_image_path),
+            situation=ImageArtifactSituation.VIEWER,
+            preferred_decoder_friendly_name=None,
+            preferred_encoder_friendly_name=None,
+        )
+        result = await artifact_manager.on_get_displayable_image_bytes_request(request)
+
+        assert isinstance(result, GetDisplayableImageBytesResultSuccess)
+        assert result.format == "webp"
+        assert len(result.image_bytes) > 0
+
+    @pytest.mark.asyncio
     async def test_missing_source_file_returns_failure(self, artifact_manager: ArtifactManager, tmp_path: Path) -> None:
         from griptape_nodes.retained_mode.events.artifact_events import (
             GetDisplayableImageBytesRequest,
