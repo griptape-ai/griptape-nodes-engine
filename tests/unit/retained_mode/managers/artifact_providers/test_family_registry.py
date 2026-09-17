@@ -4,6 +4,10 @@ Constructs FamilyRegistry directly with a real ProviderRegistry that has
 ImageArtifactProvider registered - no ArtifactManager wiring involved yet.
 """
 
+from abc import ABC, abstractmethod
+from enum import StrEnum
+from typing import ClassVar
+
 import numpy as np
 
 from griptape_nodes.retained_mode.managers.artifact_providers.artifact_family import ImageFamily
@@ -243,3 +247,199 @@ class TestSupportsPipeline:
         family_registry = FamilyRegistry(registry)
 
         assert family_registry.supports_pipeline(ImageFamily, "png") is False
+
+
+# Step 4: a second, unrelated family - proves FamilyRegistry has no Image-specific
+# assumptions baked in (hardcoded "Image" string, hardcoded situation type, etc.).
+# Test-only: FixtureFamily/FixtureProvider never appear outside this file.
+
+
+class _FixtureSituation(StrEnum):
+    RAW = "raw"
+    COOKED = "cooked"
+
+
+class _FixtureDecoderMixin(ABC):
+    @abstractmethod
+    def fixture_decode(self, source_path: str, situation: _FixtureSituation) -> str: ...
+
+
+class _FixtureEncoderMixin(ABC):
+    @abstractmethod
+    def fixture_encode(self, decoded: str, situation: _FixtureSituation) -> bytes: ...
+
+
+class FixtureFamily:
+    family_id: ClassVar[str] = "fixturefamily"
+    situation_type: ClassVar[type[StrEnum]] = _FixtureSituation
+    situation_fallbacks: ClassVar[dict] = {
+        _FixtureSituation.RAW: None,
+        _FixtureSituation.COOKED: _FixtureSituation.RAW,
+    }
+    decoder_mixin: ClassVar[type[ABC]] = _FixtureDecoderMixin
+    encoder_mixin: ClassVar[type[ABC]] = _FixtureEncoderMixin
+
+
+class FixtureProvider(BaseArtifactProvider, _FixtureDecoderMixin, _FixtureEncoderMixin):
+    """Registered for a fake extension that cannot collide with any real format."""
+
+    @classmethod
+    def get_friendly_name(cls) -> str:
+        return "Fixture"
+
+    @classmethod
+    def get_supported_formats(cls) -> set[str]:
+        return {"fixturefmt"}
+
+    @classmethod
+    def get_preview_formats(cls) -> set[str]:
+        return {"fixturepreview"}
+
+    @classmethod
+    def get_default_preview_generator(cls) -> str:
+        return "Default"
+
+    @classmethod
+    def get_default_preview_format(cls) -> str:
+        return "fixturepreview"
+
+    @classmethod
+    def get_default_preview_generators(cls) -> list:
+        return []
+
+    @classmethod
+    def get_artifact_metadata(cls, _source_path: str) -> None:
+        return None
+
+    @classmethod
+    def detect_format(cls, data: bytes) -> str | None:
+        if data.startswith(b"FIXTURE_MAGIC"):
+            return "fixturefmt"
+        return None
+
+    def fixture_decode(self, source_path: str, situation: _FixtureSituation) -> str:  # noqa: ARG002
+        return "decoded"
+
+    def fixture_encode(self, decoded: str, situation: _FixtureSituation) -> bytes:  # noqa: ARG002
+        return b"encoded"
+
+
+class _AlternateFixtureProvider(BaseArtifactProvider, _FixtureDecoderMixin, _FixtureEncoderMixin):
+    """A second Fixture-family provider, mirroring _AlternateImageProvider's role."""
+
+    @classmethod
+    def get_friendly_name(cls) -> str:
+        return "AlternateFixture"
+
+    @classmethod
+    def get_supported_formats(cls) -> set[str]:
+        return {"fixturefmt"}
+
+    @classmethod
+    def get_preview_formats(cls) -> set[str]:
+        return {"fixturepreview"}
+
+    @classmethod
+    def get_default_preview_generator(cls) -> str:
+        return "Default"
+
+    @classmethod
+    def get_default_preview_format(cls) -> str:
+        return "fixturepreview"
+
+    @classmethod
+    def get_default_preview_generators(cls) -> list:
+        return []
+
+    @classmethod
+    def get_artifact_metadata(cls, _source_path: str) -> None:
+        return None
+
+    def fixture_decode(self, source_path: str, situation: _FixtureSituation) -> str:  # noqa: ARG002
+        return "decoded"
+
+    def fixture_encode(self, decoded: str, situation: _FixtureSituation) -> bytes:  # noqa: ARG002
+        return b"encoded"
+
+
+def _build_fixture_family_registry() -> FamilyRegistry:
+    registry = ProviderRegistry()
+    registry.register_provider(FixtureProvider)
+    registry.register_provider(_AlternateFixtureProvider)
+    return FamilyRegistry(registry, families=[ImageFamily, FixtureFamily])
+
+
+class TestFamilyRegistryIsFamilyAgnostic:
+    """Re-runs the Step 2/3 matrix against FixtureFamily instead of ImageFamily."""
+
+    def test_get_family_for_extension_returns_fixture_family(self) -> None:
+        family_registry = _build_fixture_family_registry()
+
+        assert family_registry.get_family_for_extension("fixturefmt") is FixtureFamily
+
+    def test_resolve_family_prefers_content_sniff_over_extension(self) -> None:
+        family_registry = _build_fixture_family_registry()
+
+        result = family_registry.resolve_family("txt", data=b"FIXTURE_MAGIC_HEADER")
+
+        assert result is FixtureFamily
+
+    def test_resolve_family_falls_back_to_extension(self) -> None:
+        family_registry = _build_fixture_family_registry()
+
+        assert family_registry.resolve_family("fixturefmt", data=None) is FixtureFamily
+
+    def test_get_decoders_returns_both_fixture_providers(self) -> None:
+        family_registry = _build_fixture_family_registry()
+
+        decoders = family_registry.get_decoders(FixtureFamily, "fixturefmt")
+
+        assert set(decoders) == {FixtureProvider, _AlternateFixtureProvider}
+
+    def test_resolve_decoder_returns_first_registered_when_no_override_given(self) -> None:
+        family_registry = _build_fixture_family_registry()
+
+        assert family_registry.resolve_decoder(FixtureFamily, "fixturefmt") is FixtureProvider
+
+    def test_resolve_decoder_honors_explicit_override(self) -> None:
+        family_registry = _build_fixture_family_registry()
+
+        decoder = family_registry.resolve_decoder(
+            FixtureFamily, "fixturefmt", preferred_friendly_name="AlternateFixture"
+        )
+
+        assert decoder is _AlternateFixtureProvider
+
+    def test_get_encoders_returns_both_fixture_providers(self) -> None:
+        family_registry = _build_fixture_family_registry()
+
+        encoders = family_registry.get_encoders(FixtureFamily, "fixturepreview")
+
+        assert set(encoders) == {FixtureProvider, _AlternateFixtureProvider}
+
+    def test_resolve_encoder_honors_explicit_override(self) -> None:
+        family_registry = _build_fixture_family_registry()
+
+        encoder = family_registry.resolve_encoder(
+            FixtureFamily, "fixturepreview", preferred_friendly_name="AlternateFixture"
+        )
+
+        assert encoder is _AlternateFixtureProvider
+
+    def test_resolve_conversion_delegates_to_resolve_encoder(self) -> None:
+        family_registry = _build_fixture_family_registry()
+
+        assert family_registry.resolve_conversion(FixtureFamily, "fixturepreview") == family_registry.resolve_encoder(
+            FixtureFamily, "fixturepreview"
+        )
+
+    def test_supports_pipeline_true_when_decoder_and_encoder_exist(self) -> None:
+        family_registry = _build_fixture_family_registry()
+
+        assert family_registry.supports_pipeline(FixtureFamily, "fixturefmt") is True
+
+    def test_image_and_fixture_families_do_not_cross_resolve(self) -> None:
+        family_registry = _build_fixture_family_registry()
+
+        assert family_registry.get_decoders(ImageFamily, "fixturefmt") == []
+        assert family_registry.get_decoders(FixtureFamily, "png") == []
