@@ -18,9 +18,6 @@ class MinMax(Trait):
         self.min = min_val
         self.max = max_val
 
-    def ui_options_for_trait(self) -> dict:
-        return {"multiline": True}
-
     def display_options_for_trait(self) -> dict:
         return {}
 
