@@ -188,7 +188,7 @@ class ParameterButtonGroup(BaseNodeElement, UIOptionsMixin):
 
         seed_ui_options(self, ui_options, {"hide_label": hide_label, "display_name": display_name})
 
-        # A button group labels itself with its buttons, so the label is hidden unless asked for.
+        # A button group hides its label unless a caller says otherwise.
         if "hide_label" not in ui_options:
             ui_options["hide_label"] = True
 

@@ -23,7 +23,7 @@ from griptape_nodes.exe_types.elements.parameter_types import (
     modes_with,
 )
 from griptape_nodes.exe_types.elements.tooltips import default_parameter_tooltip
-from griptape_nodes.exe_types.elements.trait import Trait
+from griptape_nodes.exe_types.elements.trait import Trait, instantiate_trait
 from griptape_nodes.exe_types.elements.ui_options import UIOptionsMixin, seed_ui_options
 
 if TYPE_CHECKING:
@@ -122,7 +122,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
     parent_container_name: str | None = None
     parent_element_name: str | None = None
 
-    def __init__(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917
+    def __init__(  # noqa: C901, PLR0912, PLR0913, PLR0917
         self,
         name: str,
         tooltip: str | list[dict] | None = None,
@@ -246,13 +246,9 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         )
         if traits:
             for trait in traits:
-                if not isinstance(trait, Trait):
-                    created = trait()
-                else:
-                    created = trait
                 # Add a trait as a child
                 # UI options are now traits! sorry!
-                self.add_child(created)
+                self.add_child(instantiate_trait(trait))
         if badge is not None:
             set_initial_badge(self, badge)
         self.type = type
@@ -619,11 +615,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         self._output_type = canonical_type_name(value)
 
     def add_trait(self, trait: type[Trait] | Trait) -> None:
-        if not isinstance(trait, Trait):
-            created = trait()
-        else:
-            created = trait
-        self.add_child(created)
+        self.add_child(instantiate_trait(trait))
 
     def remove_trait(self, trait_type: BaseNodeElement) -> None:
         # You are NOT ALLOWED TO ADD DUPLICATE TRAITS (kate)

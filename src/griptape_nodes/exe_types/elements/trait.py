@@ -55,3 +55,10 @@ class Trait(ABC, BaseNodeElement):
     def validators_for_trait(self) -> list[Callable[[Parameter, Any]]]:
         """Returns a list of methods to be applied as a validator."""
         return []
+
+
+def instantiate_trait(trait: type[Trait] | Trait) -> Trait:
+    """Return the trait a caller passed, building one if the caller passed the class."""
+    if isinstance(trait, Trait):
+        return trait
+    return trait()
