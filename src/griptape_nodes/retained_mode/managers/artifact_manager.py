@@ -30,6 +30,9 @@ from griptape_nodes.retained_mode.events.artifact_events import (
     GetArtifactSchemasRequest,
     GetArtifactSchemasResultFailure,
     GetArtifactSchemasResultSuccess,
+    GetColorManagementProviderRequest,
+    GetColorManagementProviderResultFailure,
+    GetColorManagementProviderResultSuccess,
     GetDisplayableImageBytesRequest,
     GetDisplayableImageBytesResultFailure,
     GetDisplayableImageBytesResultSuccess,
@@ -49,6 +52,9 @@ from griptape_nodes.retained_mode.events.artifact_events import (
     RegisterArtifactProviderRequest,
     RegisterArtifactProviderResultFailure,
     RegisterArtifactProviderResultSuccess,
+    RegisterColorManagementProviderRequest,
+    RegisterColorManagementProviderResultFailure,
+    RegisterColorManagementProviderResultSuccess,
     RegisterPreviewGeneratorRequest,
     RegisterPreviewGeneratorResultFailure,
     RegisterPreviewGeneratorResultSuccess,
@@ -105,6 +111,9 @@ from griptape_nodes.retained_mode.managers.artifact_providers.artifact_schema_mo
     PreviewGenerationSchema,
     PreviewGeneratorSchema,
     ProviderSchema,
+)
+from griptape_nodes.retained_mode.managers.artifact_providers.color_management_registry import (
+    ColorManagementRegistry,
 )
 from griptape_nodes.retained_mode.managers.artifact_providers.family_registry import FamilyRegistry
 from griptape_nodes.retained_mode.managers.artifact_providers.image_decoder_mixin import ImageArtifactDecoderMixin
@@ -233,6 +242,7 @@ class ArtifactManager(EngineScoped):
         # Provider registry for managing artifact providers
         self._registry = ProviderRegistry(engine=engine)
         self._family_registry = FamilyRegistry(self._registry)
+        self._color_management_registry = ColorManagementRegistry(engine=engine)
 
         # Per-source single-flight lock for preview lookup/regeneration, keyed on the
         # canonicalized source path. Must be a KeyedMutex, not asyncio.Locks: request
@@ -278,6 +288,12 @@ class ArtifactManager(EngineScoped):
             )
             event_manager.assign_manager_to_request_type(
                 GetDisplayableImageBytesRequest, self.on_get_displayable_image_bytes_request
+            )
+            event_manager.assign_manager_to_request_type(
+                RegisterColorManagementProviderRequest, self.on_handle_register_color_management_provider_request
+            )
+            event_manager.assign_manager_to_request_type(
+                GetColorManagementProviderRequest, self.on_handle_get_color_management_provider_request
             )
 
             event_manager.add_listener_to_app_event(
@@ -1443,6 +1459,47 @@ class ArtifactManager(EngineScoped):
         # SUCCESS PATH: Provider registered
         # NOTE: Provider is NOT instantiated here - lazy instantiation happens on first use
         return RegisterArtifactProviderResultSuccess(result_details="Artifact provider registered successfully")
+
+    def on_handle_register_color_management_provider_request(
+        self, request: RegisterColorManagementProviderRequest
+    ) -> RegisterColorManagementProviderResultSuccess | RegisterColorManagementProviderResultFailure:
+        """Handle colour-management provider registration request.
+
+        Args:
+            request: The registration request containing the provider class
+
+        Returns:
+            Success or failure result
+        """
+        provider_class = request.provider_class
+
+        # FAILURE CASE: Try to access class methods
+        try:
+            provider_class.get_friendly_name()
+        except Exception as e:
+            return RegisterColorManagementProviderResultFailure(
+                result_details=f"Attempted to register colour-management provider {provider_class.__name__}. "
+                f"Failed due to: {e}"
+            )
+
+        # SUCCESS PATH: Provider registered (or ignored as a first-wins collision, which still succeeds)
+        self._color_management_registry.register_provider(provider_class)
+        return RegisterColorManagementProviderResultSuccess(
+            result_details="Colour-management provider registered successfully"
+        )
+
+    def on_handle_get_color_management_provider_request(
+        self, _request: GetColorManagementProviderRequest
+    ) -> GetColorManagementProviderResultSuccess | GetColorManagementProviderResultFailure:
+        """Handle get colour-management provider request."""
+        provider_class = self._color_management_registry.get_registered_provider()
+        friendly_name = None if provider_class is None else provider_class.get_friendly_name()
+
+        return GetColorManagementProviderResultSuccess(
+            result_details="Successfully retrieved colour-management provider",
+            provider_class=provider_class,
+            friendly_name=friendly_name,
+        )
 
     def on_handle_register_preview_generator_request(
         self, request: RegisterPreviewGeneratorRequest

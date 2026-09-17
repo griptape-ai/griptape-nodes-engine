@@ -302,6 +302,7 @@ _ENUM_UNION_MISSING_STRUCTURE_HOOK_REASON = (
 
 _KNOWN_WIRE_ROUND_TRIP_BUGS: dict[str, str] = {
     "RegisterArtifactProviderRequest": _TYPE_FIELD_MISSING_STRUCTURE_HOOK_REASON,
+    "RegisterColorManagementProviderRequest": _TYPE_FIELD_MISSING_STRUCTURE_HOOK_REASON,
     "RegisterPreviewGeneratorRequest": _TYPE_FIELD_MISSING_STRUCTURE_HOOK_REASON,
     "UpdateAgentProviderRequest": _UPDATE_PROVIDER_PAYLOAD_ROUND_TRIP_REASON,
     "DeduceSequencesFromFileListResultFailure": _ENUM_UNION_MISSING_STRUCTURE_HOOK_REASON,
