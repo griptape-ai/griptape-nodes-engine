@@ -208,6 +208,63 @@ class RegisterArtifactProviderResultFailure(WorkflowNotAlteredMixin, ResultPaylo
 
 @dataclass
 @PayloadRegistry.register
+class RegisterColorManagementProviderRequest(RequestPayload):
+    """Register a colour-management provider.
+
+    First-registered-wins: registering a second provider after one is already
+    registered is not a failure, it is ignored (with a warning logged).
+
+    Args:
+        provider_class: The colour-management provider class to register
+
+    Results: RegisterColorManagementProviderResultSuccess | RegisterColorManagementProviderResultFailure
+    """
+
+    provider_class: type
+
+
+@dataclass
+@PayloadRegistry.register
+class RegisterColorManagementProviderResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Colour-management provider registered successfully."""
+
+
+@dataclass
+@PayloadRegistry.register
+class RegisterColorManagementProviderResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Failed to register colour-management provider."""
+
+
+@dataclass
+@PayloadRegistry.register
+class GetColorManagementProviderRequest(RequestPayload):
+    """Get the registered colour-management provider, if any.
+
+    Results: GetColorManagementProviderResultSuccess | GetColorManagementProviderResultFailure
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class GetColorManagementProviderResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Successfully retrieved the registered colour-management provider.
+
+    ``provider_class``/``friendly_name`` being None is a success -- no provider
+    registered is a valid state, not an error.
+    """
+
+    provider_class: type | None
+    friendly_name: str | None
+
+
+@dataclass
+@PayloadRegistry.register
+class GetColorManagementProviderResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Failed to get the registered colour-management provider."""
+
+
+@dataclass
+@PayloadRegistry.register
 class ListArtifactProvidersRequest(RequestPayload):
     """List all registered artifact providers.
 

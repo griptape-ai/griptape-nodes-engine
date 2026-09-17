@@ -25,6 +25,8 @@ from griptape_nodes.retained_mode.events.artifact_events import (
     GetArtifactProviderDetailsRequest,
     GetArtifactProviderDetailsResultFailure,
     GetArtifactProviderDetailsResultSuccess,
+    GetColorManagementProviderRequest,
+    GetColorManagementProviderResultSuccess,
     GetPreviewForArtifactRequest,
     GetPreviewForArtifactResultFailure,
     GetPreviewForArtifactResultSuccess,
@@ -34,6 +36,9 @@ from griptape_nodes.retained_mode.events.artifact_events import (
     RegisterArtifactProviderRequest,
     RegisterArtifactProviderResultFailure,
     RegisterArtifactProviderResultSuccess,
+    RegisterColorManagementProviderRequest,
+    RegisterColorManagementProviderResultFailure,
+    RegisterColorManagementProviderResultSuccess,
 )
 from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload
 from griptape_nodes.retained_mode.events.config_events import SetConfigValueResultSuccess
@@ -42,6 +47,9 @@ from griptape_nodes.retained_mode.managers.artifact_manager import ArtifactManag
 from griptape_nodes.retained_mode.managers.artifact_providers import (
     BaseArtifactProvider,
     ImageArtifactProvider,
+)
+from griptape_nodes.retained_mode.managers.artifact_providers.base_color_management_provider import (
+    BaseColorManagementProvider,
 )
 from griptape_nodes.retained_mode.managers.artifact_providers.image_decoder_mixin import (
     DecodedImageArtifact,
@@ -417,6 +425,138 @@ class TestArtifactManager:
         assert isinstance(result, GetArtifactProviderDetailsResultFailure)
         assert "provider not found" in str(result.result_details)
         assert "Video" in str(result.result_details)
+
+
+class TestColorManagementProviderRegistration:
+    """RegisterColorManagementProviderRequest / GetColorManagementProviderRequest."""
+
+    def test_register_color_management_provider_success(self) -> None:
+        manager = ArtifactManager()
+
+        class TestColorManagementProvider(BaseColorManagementProvider):
+            @classmethod
+            def get_friendly_name(cls) -> str:
+                return "TestOCIO"
+
+            @classmethod
+            def build_colorspace_transform_request(
+                cls,
+                _pixels: np.ndarray,
+                _source_colorspace: str,
+                *,
+                _display: str = "",
+                _view: str = "",
+                _config_path: str | None = None,
+            ) -> RequestPayload:
+                raise NotImplementedError
+
+            @classmethod
+            def list_colorspaces(cls, _config_path: str | None) -> list[str]:
+                return []
+
+            @classmethod
+            def list_displays(cls, _config_path: str | None) -> list[str]:
+                return []
+
+            @classmethod
+            def list_views(cls, _config_path: str | None, _display: str) -> list[str]:
+                return []
+
+        request = RegisterColorManagementProviderRequest(provider_class=TestColorManagementProvider)
+        result = manager.on_handle_register_color_management_provider_request(request)
+
+        assert isinstance(result, RegisterColorManagementProviderResultSuccess)
+        assert manager._color_management_registry.get_registered_provider() is TestColorManagementProvider
+
+    def test_register_color_management_provider_failure_bad_provider_class(self) -> None:
+        manager = ArtifactManager()
+
+        class BrokenColorManagementProvider(BaseColorManagementProvider):
+            @classmethod
+            def get_friendly_name(cls) -> str:
+                msg = "boom"
+                raise RuntimeError(msg)
+
+            @classmethod
+            def build_colorspace_transform_request(
+                cls,
+                _pixels: np.ndarray,
+                _source_colorspace: str,
+                *,
+                _display: str = "",
+                _view: str = "",
+                _config_path: str | None = None,
+            ) -> RequestPayload:
+                raise NotImplementedError
+
+            @classmethod
+            def list_colorspaces(cls, _config_path: str | None) -> list[str]:
+                return []
+
+            @classmethod
+            def list_displays(cls, _config_path: str | None) -> list[str]:
+                return []
+
+            @classmethod
+            def list_views(cls, _config_path: str | None, _display: str) -> list[str]:
+                return []
+
+        request = RegisterColorManagementProviderRequest(provider_class=BrokenColorManagementProvider)
+        result = manager.on_handle_register_color_management_provider_request(request)
+
+        assert isinstance(result, RegisterColorManagementProviderResultFailure)
+        assert manager._color_management_registry.get_registered_provider() is None
+
+    def test_get_color_management_provider_success_when_none_registered(self) -> None:
+        manager = ArtifactManager()
+
+        result = manager.on_handle_get_color_management_provider_request(GetColorManagementProviderRequest())
+
+        assert isinstance(result, GetColorManagementProviderResultSuccess)
+        assert result.provider_class is None
+        assert result.friendly_name is None
+
+    def test_get_color_management_provider_success_when_registered(self) -> None:
+        manager = ArtifactManager()
+
+        class TestColorManagementProvider(BaseColorManagementProvider):
+            @classmethod
+            def get_friendly_name(cls) -> str:
+                return "TestOCIO"
+
+            @classmethod
+            def build_colorspace_transform_request(
+                cls,
+                _pixels: np.ndarray,
+                _source_colorspace: str,
+                *,
+                _display: str = "",
+                _view: str = "",
+                _config_path: str | None = None,
+            ) -> RequestPayload:
+                raise NotImplementedError
+
+            @classmethod
+            def list_colorspaces(cls, _config_path: str | None) -> list[str]:
+                return []
+
+            @classmethod
+            def list_displays(cls, _config_path: str | None) -> list[str]:
+                return []
+
+            @classmethod
+            def list_views(cls, _config_path: str | None, _display: str) -> list[str]:
+                return []
+
+        manager.on_handle_register_color_management_provider_request(
+            RegisterColorManagementProviderRequest(provider_class=TestColorManagementProvider)
+        )
+
+        result = manager.on_handle_get_color_management_provider_request(GetColorManagementProviderRequest())
+
+        assert isinstance(result, GetColorManagementProviderResultSuccess)
+        assert result.provider_class is TestColorManagementProvider
+        assert result.friendly_name == "TestOCIO"
 
 
 class TestPermissionDispatch:
