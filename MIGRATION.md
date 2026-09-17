@@ -101,17 +101,22 @@ and the trait wins:
 | saved                          | merged, copy included | authored options only  |
 | runtime `trait.choices` update | lost unless mirrored  | saved as trait state   |
 
-Setting a trait-rendered key on the parameter in node code no longer has any effect: set it on
-the trait.
+**A write to a trait-rendered key is routed to the trait that renders it**, whoever writes it:
+node code through `update_ui_options`, the editor, or a saved file. The flat shape keeps working
+for writers that do not know about traits.
+
+Assigning `ui_options` outright is the exception. It is the raw store the routing itself writes
+through, so it cannot route without recursing. A trait-owned key put there is dropped at save and
+shadowed at read, because the trait still owns it.
 
 ```python
+parameter.update_ui_options({"slider": {"max_val": height}})  # routed to the Slider
+trait.max = height  # same result, said directly
 parameter.ui_options = {"simple_dropdown": choices}  # dropped at save, shadowed at read
-trait.choices = choices  # saved, and reported to the editor
 ```
 
-**A write arriving from the editor or a saved file is routed to the trait**, so the flat shape
-keeps working for the writers that do not know about traits. A trait declares what it will adopt
-by implementing `state_from_ui_options`, the inverse of `ui_options_for_trait`:
+A trait declares what it will adopt by implementing `state_from_ui_options`, the inverse of
+`ui_options_for_trait`:
 
 ```python
 class Threshold(Trait):
