@@ -23,10 +23,18 @@ class FamilyRegistry:
     yet" decision.
     """
 
-    def __init__(self, registry: ProviderRegistry) -> None:
-        """Initialize with the ``ProviderRegistry`` whose providers this resolves families for."""
+    def __init__(self, registry: ProviderRegistry, families: list[type[ArtifactFamily]] | None = None) -> None:
+        """Initialize with the ``ProviderRegistry`` whose providers this resolves families for.
+
+        Args:
+            registry: The provider registry to resolve families/providers against.
+            families: Known families to resolve against. Defaults to the production
+                set (``[ImageFamily]``); tests pass a custom list to prove
+                ``FamilyRegistry`` isn't hardcoded to Image specifically, without
+                permanently registering a test-only family in production code.
+        """
         self._registry = registry
-        self._families: list[type[ArtifactFamily]] = [ImageFamily]
+        self._families: list[type[ArtifactFamily]] = families if families is not None else [ImageFamily]
 
     def get_family_for_extension(self, extension: str) -> type[ArtifactFamily] | None:
         """Return the family a registered provider for ``extension`` belongs to, if any.
