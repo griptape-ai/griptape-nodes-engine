@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from griptape_nodes.node_library.library_declarations import LibraryDependencyDeclaration
 from griptape_nodes.node_library.library_registry import Dependencies, LibraryMetadata
 from griptape_nodes.retained_mode.events.app_events import LibraryLoadedNotification
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
@@ -486,3 +487,363 @@ class TestSpawnSkipForUnmetRequirements:
         cast("MagicMock", manager._engine).ahandle_request.assert_awaited_once()
         # Nothing standing in the way, so a stale account of a previous attempt is cleared.
         assert manager._library_file_path_to_info["/some/path.json"].execution_unavailable_reason is None
+
+
+class TestLibraryDependencyResolution:
+    """A dependency declaration names a REPO; the registry is keyed by library NAME.
+
+    `griptape-nodes-library-openexr` publishes itself as `OpenEXR Library`, so matching the repo
+    name against library names missed it -- and a miss only warns and skips, so the whole
+    library-dependency mechanism was a silent no-op for any library not named after its repo.
+    Provisioning installs each download under a repo-name directory, which is where the repo name
+    actually appears.
+    """
+
+    def _register(self, manager: LibraryManager, *, path: str, library_name: str) -> None:
+        manager._library_file_path_to_info[path] = LibraryManager.LibraryInfo(
+            lifecycle_state=LibraryManager.LibraryLifecycleState.LOADED,
+            fitness=LibraryManager.LibraryFitness.GOOD,
+            library_path=path,
+            is_sandbox=False,
+            library_name=library_name,
+        )
+
+    def test_repo_name_resolves_via_the_install_directory(self) -> None:
+        manager = _make_library_manager()
+        self._register(
+            manager,
+            path="/libs/griptape-nodes-library-openexr/griptape-nodes-library.json",
+            library_name="OpenEXR Library",
+        )
+
+        info = manager._library_info_for_repo_name("griptape-nodes-library-openexr")
+
+        assert info is not None
+        assert info.library_name == "OpenEXR Library"
+
+    def test_library_name_still_resolves_when_it_matches_the_repo(self) -> None:
+        manager = _make_library_manager()
+        self._register(manager, path="/libs/whatever/griptape-nodes-library.json", library_name="some-repo-name")
+
+        info = manager._library_info_for_repo_name("some-repo-name")
+
+        assert info is not None
+
+    def test_unknown_repo_name_resolves_to_none(self) -> None:
+        manager = _make_library_manager()
+        self._register(manager, path="/libs/other/griptape-nodes-library.json", library_name="Other Library")
+
+        assert manager._library_info_for_repo_name("griptape-nodes-library-openexr") is None
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "griptape-ai/griptape-nodes-library-openexr",
+            "griptape-ai/griptape-nodes-library-openexr@v1.2.0",
+            "https://github.com/griptape-ai/griptape-nodes-library-openexr.git",
+            "https://github.com/griptape-ai/griptape-nodes-library-openexr.git@v1.2.0",
+        ],
+    )
+    def test_every_spelling_of_a_declaration_url_yields_one_repo_name(self, url: str) -> None:
+        """Every caller reads this field, so it must be derived one way.
+
+        A `@ref` suffix and a `.git` extension both change the final path segment. One call site
+        normalized and the other did not, so a pinned declaration resolved for the transitive
+        resolver and missed for the worker's target expansion -- and a miss only logs.
+        """
+        assert LibraryManager._parse_dependency_url(url).repo_name == "griptape-nodes-library-openexr"
+
+    @pytest.mark.parametrize(
+        ("url", "expected_ref"),
+        [
+            ("griptape-ai/griptape-nodes-library-openexr", None),
+            ("griptape-ai/griptape-nodes-library-openexr@v1.2.0", "v1.2.0"),
+            ("https://github.com/griptape-ai/griptape-nodes-library-openexr.git@v1.2.0", "v1.2.0"),
+        ],
+    )
+    def test_the_parsed_url_carries_what_the_download_needs(self, url: str, expected_ref: str | None) -> None:
+        """Registration downloads a missing dependency from these two fields, not from the repo name.
+
+        The ref is what pins a declaration to a version, so losing it installs the default branch
+        instead of the declared one -- and the install still reports success.
+        """
+        parsed = LibraryManager._parse_dependency_url(url)
+
+        assert parsed.ref == expected_ref
+        assert parsed.normalized_url == "https://github.com/griptape-ai/griptape-nodes-library-openexr.git"
+
+    def test_a_failed_duplicate_does_not_mask_the_copy_that_loaded(self) -> None:
+        """One path can hold a FAILURE record beside the copy that loaded.
+
+        Both callers need library_name, so answering with the failed entry reports "not installed
+        here" for a library that is.
+        """
+        manager = _make_library_manager()
+        path = "/libs/griptape-nodes-library-openexr/griptape-nodes-library.json"
+        manager._library_file_path_to_info[path + "#failed"] = LibraryManager.LibraryInfo(
+            lifecycle_state=LibraryManager.LibraryLifecycleState.FAILURE,
+            fitness=LibraryManager.LibraryFitness.UNUSABLE,
+            library_path=path,
+            is_sandbox=False,
+            library_name=None,
+        )
+        self._register(manager, path=path, library_name="OpenEXR Library")
+
+        info = manager._library_info_for_repo_name("griptape-nodes-library-openexr")
+
+        assert info is not None
+        assert info.library_name == "OpenEXR Library"
+
+
+class TestExpandTargetsWithLibraryDependencies:
+    """A worker must load the libraries its library declares, or a feature works only while editing.
+
+    CorridorKey's OCIO path reaches into the OpenEXR library. The orchestrator loaded it, the
+    worker did not, so selecting an OCIO colour space succeeded on the canvas and failed on run.
+    The declaration names a REPO (`griptape-nodes-library-openexr`) while the registry is keyed by
+    library NAME (`OpenEXR Library`), which is why resolution has to go through the install path.
+    """
+
+    def _manager_with(self, monkeypatch: pytest.MonkeyPatch, libraries: dict[str, Any]) -> LibraryManager:
+        """A manager whose discovery found `libraries`: {library_name: (path, declarations)}."""
+        manager = _make_library_manager()
+        by_path: dict[str, Any] = {}
+        for name, (path, declarations) in libraries.items():
+            manager._library_file_path_to_info[path] = LibraryManager.LibraryInfo(
+                lifecycle_state=LibraryManager.LibraryLifecycleState.DISCOVERED,
+                fitness=LibraryManager.LibraryFitness.NOT_EVALUATED,
+                library_path=path,
+                is_sandbox=False,
+                library_name=name,
+            )
+            by_path[path] = declarations
+
+        def fake_load(request: Any) -> Any:
+            schema = MagicMock()
+            schema.metadata = _make_metadata(declarations=by_path[request.file_path])
+            result = MagicMock()
+            result.library_schema = schema
+            return result
+
+        monkeypatch.setattr(manager, "load_library_metadata_from_file_request", fake_load)
+        return manager
+
+    def test_declared_dependency_reaches_the_worker(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        manager = self._manager_with(
+            monkeypatch,
+            {
+                "Consumer Library": (
+                    "/libs/consumer/griptape-nodes-library.json",
+                    [LibraryDependencyDeclaration(url="https://github.com/o/griptape-nodes-library-openexr.git")],
+                ),
+                "OpenEXR Library": ("/libs/griptape-nodes-library-openexr/griptape-nodes-library.json", []),
+            },
+        )
+
+        expanded = manager._expand_targets_with_library_dependencies(["Consumer Library"])
+
+        assert expanded == ["Consumer Library", "OpenEXR Library"]
+
+    def test_dependencies_are_followed_transitively(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        manager = self._manager_with(
+            monkeypatch,
+            {
+                "A": (
+                    "/libs/a/griptape-nodes-library.json",
+                    [LibraryDependencyDeclaration(url="https://github.com/o/griptape-nodes-library-b.git")],
+                ),
+                "B Library": (
+                    "/libs/griptape-nodes-library-b/griptape-nodes-library.json",
+                    [LibraryDependencyDeclaration(url="https://github.com/o/griptape-nodes-library-c.git")],
+                ),
+                "C Library": ("/libs/griptape-nodes-library-c/griptape-nodes-library.json", []),
+            },
+        )
+
+        assert manager._expand_targets_with_library_dependencies(["A"]) == ["A", "B Library", "C Library"]
+
+    def test_a_library_with_no_declarations_gains_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Over-broad expansion would put every library in every worker, undoing the isolation."""
+        manager = self._manager_with(
+            monkeypatch,
+            {
+                "Solo Library": ("/libs/solo/griptape-nodes-library.json", []),
+                "Unrelated Library": ("/libs/griptape-nodes-library-unrelated/griptape-nodes-library.json", []),
+            },
+        )
+
+        assert manager._expand_targets_with_library_dependencies(["Solo Library"]) == ["Solo Library"]
+
+    def test_an_uninstalled_dependency_is_skipped_not_fatal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Declarations are optional in practice; refusing to start would be the worse failure."""
+        manager = self._manager_with(
+            monkeypatch,
+            {
+                "Consumer Library": (
+                    "/libs/consumer/griptape-nodes-library.json",
+                    [LibraryDependencyDeclaration(url="https://github.com/o/griptape-nodes-library-absent.git")],
+                ),
+            },
+        )
+
+        assert manager._expand_targets_with_library_dependencies(["Consumer Library"]) == ["Consumer Library"]
+
+
+class TestExecutionDependenciesOfDeclaredLibraries:
+    """A dependency's execution set is installed into the DEPENDING library's environment.
+
+    A worker loads its library's declared dependencies, so their execution pins have to be on its
+    sys.path too. Building each dependency its own `.venv-exec` and splicing them all back would
+    reproduce between libraries the disagreement the combined edit/exec resolution already avoids
+    within one: two environments resolved apart can choose different versions of anything they
+    share, and whichever landed first would win. It would also have one worker writing a venv
+    another library owns.
+    """
+
+    def _manager_with(self, monkeypatch: pytest.MonkeyPatch, libraries: dict[str, Any]) -> LibraryManager:
+        """A manager whose discovery found `libraries`: {name: (path, declarations, exec_deps)}."""
+        manager = _make_library_manager()
+        by_path: dict[str, Any] = {}
+        for name, (path, declarations, exec_deps) in libraries.items():
+            manager._library_file_path_to_info[path] = LibraryManager.LibraryInfo(
+                lifecycle_state=LibraryManager.LibraryLifecycleState.DISCOVERED,
+                fitness=LibraryManager.LibraryFitness.NOT_EVALUATED,
+                library_path=path,
+                is_sandbox=False,
+                library_name=name,
+            )
+            by_path[path] = (declarations, exec_deps)
+
+        def fake_load(request: Any) -> Any:
+            declarations, exec_deps = by_path[request.file_path]
+            schema = MagicMock()
+            schema.metadata = _make_metadata(
+                declarations=declarations,
+                dependencies=Dependencies(pip_dependencies_exec=exec_deps),
+            )
+            result = MagicMock()
+            result.library_schema = schema
+            return result
+
+        monkeypatch.setattr(manager, "load_library_metadata_from_file_request", fake_load)
+        return manager
+
+    def _collect(self, manager: LibraryManager, library_name: str) -> list[str]:
+        """What `library_name`'s dependencies contribute, given the caller already holds its manifest."""
+        schema = manager._library_schema_for_name(library_name)
+        assert schema is not None
+        return manager._execution_dependencies_of_declared_libraries(schema)
+
+    def test_a_dependency_execution_set_is_collected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        manager = self._manager_with(
+            monkeypatch,
+            {
+                "Consumer Library": (
+                    "/libs/consumer/griptape-nodes-library.json",
+                    [LibraryDependencyDeclaration(url="https://github.com/o/griptape-nodes-library-openexr.git")],
+                    ["consumer-only==1.0"],
+                ),
+                "OpenEXR Library": (
+                    "/libs/griptape-nodes-library-openexr/griptape-nodes-library.json",
+                    [],
+                    ["openexr==3.2"],
+                ),
+            },
+        )
+
+        collected = self._collect(manager, "Consumer Library")
+
+        # Its own set is added by the caller, so only the dependency's appears here.
+        assert collected == ["openexr==3.2"]
+
+    def test_execution_sets_are_collected_transitively(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        manager = self._manager_with(
+            monkeypatch,
+            {
+                "A": (
+                    "/libs/a/griptape-nodes-library.json",
+                    [LibraryDependencyDeclaration(url="https://github.com/o/griptape-nodes-library-b.git")],
+                    [],
+                ),
+                "B Library": (
+                    "/libs/griptape-nodes-library-b/griptape-nodes-library.json",
+                    [LibraryDependencyDeclaration(url="https://github.com/o/griptape-nodes-library-c.git")],
+                    ["b-pin==1.0"],
+                ),
+                "C Library": (
+                    "/libs/griptape-nodes-library-c/griptape-nodes-library.json",
+                    [],
+                    ["c-pin==2.0"],
+                ),
+            },
+        )
+
+        assert self._collect(manager, "A") == ["b-pin==1.0", "c-pin==2.0"]
+
+    def test_a_library_with_no_declarations_collects_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        manager = self._manager_with(
+            monkeypatch,
+            {
+                "Solo Library": ("/libs/solo/griptape-nodes-library.json", [], ["solo==1.0"]),
+            },
+        )
+
+        assert self._collect(manager, "Solo Library") == []
+
+    def test_a_pin_declared_by_two_dependencies_appears_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """It becomes one resolution, so a repeat is noise the install does not need."""
+        manager = self._manager_with(
+            monkeypatch,
+            {
+                "Consumer Library": (
+                    "/libs/consumer/griptape-nodes-library.json",
+                    [
+                        LibraryDependencyDeclaration(url="https://github.com/o/griptape-nodes-library-b.git"),
+                        LibraryDependencyDeclaration(url="https://github.com/o/griptape-nodes-library-c.git"),
+                    ],
+                    [],
+                ),
+                "B Library": (
+                    "/libs/griptape-nodes-library-b/griptape-nodes-library.json",
+                    [],
+                    ["shared==1.0"],
+                ),
+                "C Library": (
+                    "/libs/griptape-nodes-library-c/griptape-nodes-library.json",
+                    [],
+                    ["shared==1.0"],
+                ),
+            },
+        )
+
+        assert self._collect(manager, "Consumer Library") == ["shared==1.0"]
+
+    @pytest.mark.asyncio
+    async def test_the_worker_load_path_applies_the_expansion(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Guards the call site, not just the method.
+
+        The expansion is only useful if the worker's load path runs it. Testing the method alone
+        left removing the call invisible, so this pins that load_all_libraries_from_config feeds
+        its target list through it -- and that an orchestrator (no target list) is left alone.
+        """
+        manager = _make_library_manager()
+        seen: list[list[str] | None] = []
+
+        def fake_expand(targets: list[str]) -> list[str]:
+            seen.append(targets)
+            return [*targets, "Pulled In Library"]
+
+        monkeypatch.setattr(manager, "_expand_targets_with_library_dependencies", fake_expand)
+        monkeypatch.setattr(manager, "_reconcile_libraries_from_config", AsyncMock(return_value=[]))
+        # Discovery returning nothing ends the load early, which is all this test needs: the
+        # expansion runs before any library is touched.
+        monkeypatch.setattr(
+            manager, "discover_libraries_request", AsyncMock(return_value=MagicMock(libraries_discovered=[]))
+        )
+
+        await manager.load_all_libraries_from_config(target_library_names=["Worker Library"])
+        assert seen == [["Worker Library"]], "the worker load path did not expand its target list"
+
+        seen.clear()
+        await manager.load_all_libraries_from_config(target_library_names=None)
+        assert seen == [], "the orchestrator has no target list and must not be expanded"
