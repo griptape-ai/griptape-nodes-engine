@@ -6,6 +6,7 @@ import uuid
 from abc import ABCMeta
 from contextlib import contextmanager
 from dataclasses import field
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, ClassVar, Self, TypeVar, dataclass_transform
 
 import attrs
@@ -13,7 +14,7 @@ import attrs
 from griptape_nodes.exe_types.elements.badge import handle_badge_message, write_badge_fields
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterator, Mapping
     from types import TracebackType
 
     from griptape_nodes.exe_types.elements.badge import BadgeData, BadgeVariantType
@@ -24,10 +25,12 @@ if TYPE_CHECKING:
 N = TypeVar("N", bound="BaseNodeElement")
 
 # Excludes element wiring from trait state.
-WIRING: dict[str, bool] = {"wiring": True}
+WIRING_KEY = "wiring"
+WIRING: Mapping[str, bool] = MappingProxyType({WIRING_KEY: True})
 
 # Saves callbacks by owning-node method name rather than as data.
-BEHAVIOR: dict[str, bool] = {"behavior": True}
+BEHAVIOR_KEY = "behavior"
+BEHAVIOR: Mapping[str, bool] = MappingProxyType({BEHAVIOR_KEY: True})
 
 
 def default_element_id(element_id: str | None) -> str:

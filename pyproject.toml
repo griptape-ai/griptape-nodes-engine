@@ -38,6 +38,9 @@ dependencies = [
   "send2trash>=2.1.0",
   "tenacity>=9.0.0",
   "truststore>=0.10.1",
+  # Elements are attrs classes: a trait declares fields and the metaclass generates its
+  # constructor, so node libraries import attrs directly too.
+  "attrs>=25.3.0",
   "cattrs>=26.1.0",
   "fileseq>=3.2.0",
   # Floor at 2.29.0: that release ("Support FastMCP 4 and MCP SDK v2 in `MCPToolset` alongside

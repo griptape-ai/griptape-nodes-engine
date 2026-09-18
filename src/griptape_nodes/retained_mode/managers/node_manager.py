@@ -3855,7 +3855,7 @@ class NodeManager(EngineScoped):
                 # Create the parameter, or alter it on the existing node
                 if parameter.user_defined:
                     # Always serialize user-defined parameters regardless of node type
-                    add_param_request = AddParameterToNodeRequest.create(**self._parameter_save_dict(parameter))
+                    add_param_request = AddParameterToNodeRequest.create(**parameter.save_dict(), initial_setup=True)
                     element_modification_commands.append(add_param_request)
                 elif isinstance(node, ErrorProxyNode):
                     # For ErrorProxyNode, replay all recorded initialization requests for this parameter
@@ -3871,7 +3871,7 @@ class NodeManager(EngineScoped):
                     element_modification_commands.extend(matching_requests)
                 elif reference_node is None:
                     # Normal node with no reference - treat all parameters as needing serialization
-                    add_param_request = AddParameterToNodeRequest.create(**self._parameter_save_dict(parameter))
+                    add_param_request = AddParameterToNodeRequest.create(**parameter.save_dict(), initial_setup=True)
                     element_modification_commands.append(add_param_request)
                 else:
                     # Normal node - compare against reference node
@@ -4464,12 +4464,6 @@ class NodeManager(EngineScoped):
             result_details=f"Successfully duplicated {len(serialize_result.node_names_serialized)} nodes.",
         )
 
-    def _parameter_save_dict(self, parameter: Parameter) -> dict[str, Any]:
-        """Build the fields that recreate a parameter."""
-        param_dict = parameter.save_dict()
-        param_dict["initial_setup"] = True
-        return param_dict
-
     @staticmethod
     def _apply_trait_states(parameter: Parameter, trait_states: list[dict[str, Any]]) -> None:
         """Hand saved state to the trait the node's own code built.
@@ -4477,20 +4471,7 @@ class NodeManager(EngineScoped):
         Updating the attached instance rather than replacing it is what keeps a callback the
         node's ``__init__`` supplied, along with everything else the constructor wired.
         """
-        entries = NodeManager._parse_trait_entries(parameter, trait_states)
-        paired = NodeManager._pair_saved_traits(parameter, entries)
-        for entry, existing in zip(entries, paired, strict=True):
-            if existing is None:
-                NodeManager._warn_no_trait_to_carry_state(parameter, entry.trait_name)
-                continue
-            try:
-                existing.apply_state(entry.trait_state)
-            except (TypeError, ValueError):
-                NodeManager._warn_unsatisfiable_trait_state(parameter, entry.trait_name)
-
-    @staticmethod
-    def _parse_trait_entries(parameter: Parameter, trait_states: list[dict[str, Any]]) -> list[TraitStateEntry]:
-        entries: list[TraitStateEntry] = []
+        unmatched = parameter.find_elements_by_type(Trait)
         for state in trait_states:
             entry = TraitStateEntry.from_dict(state)
             if entry is None:
@@ -4500,46 +4481,37 @@ class NodeManager(EngineScoped):
                     parameter.name,
                 )
                 continue
-            entries.append(entry)
-        return entries
+            trait = NodeManager._take_trait_named(unmatched, entry.trait_name)
+            if trait is None:
+                logger.warning(
+                    "Parameter '%s' was saved with a '%s' control, but nothing on this node builds one, "
+                    "so the parameter loads without it. This usually means the node's library changed.",
+                    parameter.name,
+                    entry.trait_name,
+                )
+                continue
+            try:
+                trait.apply_state(entry.trait_state)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Parameter '%s' was saved with the '%s' trait, but its saved state is missing "
+                    "something the trait requires. The parameter will load without it. Check that the "
+                    "library providing it is up to date.",
+                    parameter.name,
+                    entry.trait_name,
+                )
 
     @staticmethod
-    def _pair_saved_traits(parameter: Parameter, entries: list[TraitStateEntry]) -> list[Trait | None]:
-        """Match by class name, consuming each attached trait at most once.
+    def _take_trait_named(unmatched: list[Trait], trait_name: str) -> Trait | None:
+        """Take an attached trait by class name, consuming it so two entries cannot share one.
 
         A name is enough because the candidates are the traits already on this one parameter.
         """
-        unmatched = parameter.find_elements_by_type(Trait)
-        paired: list[Trait | None] = []
-        for entry in entries:
-            match = None
-            for candidate in unmatched:
-                if type(candidate).__name__ == entry.trait_name:
-                    match = candidate
-                    break
-            if match is not None:
-                unmatched.remove(match)
-            paired.append(match)
-        return paired
-
-    @staticmethod
-    def _warn_no_trait_to_carry_state(parameter: Parameter, trait_name: str) -> None:
-        logger.warning(
-            "Parameter '%s' was saved with a '%s' control, but nothing on this node builds one, "
-            "so the parameter loads without it. This usually means the node's library changed.",
-            parameter.name,
-            trait_name,
-        )
-
-    @staticmethod
-    def _warn_unsatisfiable_trait_state(parameter: Parameter, trait_name: str) -> None:
-        logger.warning(
-            "Parameter '%s' was saved with the '%s' trait, but its saved state is missing "
-            "something the trait requires. The parameter will load without it. Check that the "
-            "library providing it is up to date.",
-            parameter.name,
-            trait_name,
-        )
+        for candidate in unmatched:
+            if type(candidate).__name__ == trait_name:
+                unmatched.remove(candidate)
+                return candidate
+        return None
 
     @staticmethod
     def _manage_alter_details(parameter: Parameter, base_node_obj: BaseNode) -> dict:

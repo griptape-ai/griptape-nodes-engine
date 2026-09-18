@@ -55,14 +55,6 @@ def test_a_trait_is_an_attrs_class_without_declaring_it(trait_class: type[Trait]
 
 
 @pytest.mark.parametrize("trait_class", IN_TREE_TRAITS, ids=lambda cls: cls.__name__)
-def test_a_trait_module_does_not_stringify_its_annotations(trait_class: type[Trait]) -> None:
-    """``from __future__ import annotations`` hides a ClassVar behind a string the checks cannot read."""
-    module = importlib.import_module(trait_class.__module__)
-
-    assert "annotations" not in vars(module)
-
-
-@pytest.mark.parametrize("trait_class", IN_TREE_TRAITS, ids=lambda cls: cls.__name__)
 def test_a_trait_constructs_with_its_element_attributes_set(trait_class: type[Trait]) -> None:
     """Default-constructible traits must come out as usable elements."""
     try:
@@ -133,6 +125,25 @@ class TestTheContractIsCheckedWhenTheClassIsBuilt:
 
         assert Fine.state_keys() == ["label", "counts"]
 
+    def test_a_set_with_no_converter_is_refused(self) -> None:
+        """A save writes a list, so without a converter the field is a list after one load."""
+        with pytest.raises(TypeError, match="converter=set"):
+
+            class Extensions(Trait):
+                extensions: set[str] = attrs.field(factory=set)
+
+    def test_an_optional_tuple_with_no_converter_is_refused(self) -> None:
+        with pytest.raises(TypeError, match="converter=tuple"):
+
+            class Bounds(Trait):
+                bounds: tuple[int, ...] | None = attrs.field(default=None)
+
+    def test_a_set_that_converts_itself_back_is_accepted(self) -> None:
+        class Extensions(Trait):
+            extensions: set[str] = attrs.field(converter=set, factory=set)
+
+        assert Extensions(extensions=["a", "a"]).extensions == {"a"}
+
     def test_a_derived_field_is_neither_state_nor_a_constructor_argument(self) -> None:
         class Derived(Trait):
             label: str = attrs.field(default="")
@@ -175,38 +186,37 @@ class TestAnAnnotationThatIsNotAFieldIsRefused:
 
         assert BareConstant.state_keys() == []
 
-    def test_a_manually_stringified_class_constant_is_still_bare(self) -> None:
-        """Quoting one annotation does not make it a field.
+    def test_a_manually_stringified_class_constant_is_allowed(self) -> None:
+        """A quoted annotation is what a module with postponed annotations hands over."""
 
-        Only the module's own future import, checked separately below, changes what the error
-        says.
-        """
-        with pytest.raises(TypeError, match="annotates 'DEFAULTS' but never declares it"):
+        class Stringified(Trait):
+            DEFAULTS: "ClassVar[list[str]]" = ["a"]  # noqa: RUF012
 
-            class Stringified(Trait):
-                DEFAULTS: "ClassVar[list[str]]" = ["a"]  # noqa: RUF012
+        assert Stringified.state_keys() == []
 
-    def test_a_trait_modules_future_import_is_named_as_the_cause(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_a_trait_module_may_postpone_its_annotations(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The class body above cannot reproduce a real future import.
 
         ``from __future__ import annotations`` stringifies every annotation in the module, so
         this has to run in a module that actually wrote the import, not one field quoted by
-        hand.
+        hand. A bare annotation there is still refused; a ClassVar there is still read.
         """
         module_name = "griptape_nodes_test_trait_with_postponed_annotations"
         module = types.ModuleType(module_name)
         monkeypatch.setitem(sys.modules, module_name, module)
         source = (
             "from __future__ import annotations\n"
+            "from typing import ClassVar\n"
             "import attrs\n"
             "from griptape_nodes.exe_types.core_types import Trait\n"
             "class Postponed(Trait):\n"
+            "    DEFAULTS: ClassVar[list[str]] = ['a']\n"
             "    threshold: int = attrs.field(default=5)\n"
             "    extra: int\n"
         )
         code = compile(source, module_name, "exec")
 
-        with pytest.raises(TypeError, match="from __future__ import annotations"):
+        with pytest.raises(TypeError, match="annotates 'extra' but never declares it"):
             exec(code, module.__dict__)  # noqa: S102
 
     def test_a_declared_field_is_allowed(self) -> None:

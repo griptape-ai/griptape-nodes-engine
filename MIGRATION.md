@@ -50,11 +50,12 @@ class creation:
 class Broken(Trait):
     root: Path | None = attrs.field(default=None)  # no saved form
     on_ping: Callable | None = attrs.field(default=None)  # a callback: mark it metadata=BEHAVIOR
+    extensions: set[str] = attrs.field(factory=set)  # a save writes a list: add converter=set
     derived: str = attrs.field(default="x", init=False)  # fine: init=False is not state
 ```
 
-A set or a tuple is saved as a list, which is what the constructor is handed on load, so convert
-in the field if the trait wants a set:
+A set or a tuple is saved as a list, which is what the constructor is handed on load, so a field
+declaring one has to convert it back:
 
 ```python
 class Extensions(Trait):
@@ -100,14 +101,19 @@ parameter.ui_options = {"simple_dropdown": choices}  # dropped at save, shadowed
 ```
 
 A trait declares what it will adopt by implementing `state_from_ui_options`, the inverse of
-`ui_options_for_trait`:
+`ui_options_for_trait`. A trait rendering its options under one nested key just names it:
 
 ```python
+class Slider(Trait):
+    NESTED_UI_OPTIONS_KEY: ClassVar[str] = "slider"  # adopts what it renders under "slider"
+
+
 class Threshold(Trait):
     def ui_options_for_trait(self) -> dict:
         return {"threshold": self.threshold}
 
-    def state_from_ui_options(self, ui_options: dict) -> dict:
+    @classmethod
+    def state_from_ui_options(cls, ui_options: dict) -> dict:
         if "threshold" not in ui_options:
             return {}
         return {"threshold": ui_options["threshold"]}

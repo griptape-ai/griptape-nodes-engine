@@ -16,6 +16,8 @@ def _known_icon_size(icon_size: str) -> str:
 class MultiOptions(Trait):
     DEFAULT_CHOICES: ClassVar[list[str]] = ["choice 1", "choice 2", "choice 3"]
 
+    NESTED_UI_OPTIONS_KEY: ClassVar[str | None] = "multi_options"
+
     # Preserve ``choices`` as the constructor and saved-state key behind the property.
     _choices: list = attrs.field(factory=lambda: list(MultiOptions.DEFAULT_CHOICES), alias="choices")
     placeholder: str = attrs.field(default="Select options...")
@@ -32,14 +34,6 @@ class MultiOptions(Trait):
     @choices.setter
     def choices(self, value: list) -> None:
         self._choices = value
-
-    @classmethod
-    def state_from_ui_options(cls, ui_options: dict) -> dict[str, Any]:
-        """Map flat multi-select options to trait state."""
-        written = ui_options.get("multi_options")
-        if not isinstance(written, dict):
-            return {}
-        return {key: written[key] for key in cls.state_keys() if key in written}
 
     def converters_for_trait(self) -> list[Callable]:
         def converter(value: Any) -> Any:

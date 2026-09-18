@@ -72,7 +72,7 @@ class _UnsaveableItemTrait(Trait):
 class _ExtensionsTrait(Trait):
     """Stands in for a trait taking a set, as a file picker's extensions are."""
 
-    extensions: set[str] | list[str] | None = attrs.field(default=None)
+    extensions: set[str] = attrs.field(converter=set, factory=set)
 
 
 class TestAValueNoSavedFileCanHoldIsOmittedAndWarnedAbout:
@@ -99,13 +99,13 @@ class TestStateIsWhatADataFormatCanHold:
 
         assert trait.to_state() == {"extensions": [".avi", ".mp4"]}
 
-    def test_the_constructor_is_handed_that_list_on_load(self) -> None:
-        """A trait wanting a set converts in the field, which is where coercion belongs."""
+    def test_the_converter_makes_it_a_set_again_on_load(self) -> None:
+        """The field's converter is what class creation demands of a set, so the load is lossless."""
         source = _ExtensionsTrait(extensions={".mp4", ".avi"})
 
         rebuilt = _ExtensionsTrait.from_state(json.loads(json.dumps(source.to_state())))
 
-        assert rebuilt.extensions == [".avi", ".mp4"]
+        assert rebuilt.extensions == {".avi", ".mp4"}
         assert rebuilt.to_state() == source.to_state()
 
 

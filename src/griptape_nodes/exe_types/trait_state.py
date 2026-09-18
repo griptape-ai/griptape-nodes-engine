@@ -11,7 +11,49 @@ SAVEABLE_SCALARS = (type(None), bool, int, float, str)
 
 SAVEABLE_CONTAINERS = (list, dict, set, frozenset, tuple)
 
-CALLBACK_TYPE = "callback"
+# Containers a save writes as a list, so a field declaring one needs a converter to get it back.
+LIST_SHAPED_CONTAINERS = (set, frozenset, tuple)
+
+_CALLBACK_NAME = "callback"
+
+
+def is_callback_annotation(annotation: Any) -> bool:
+    """True when an annotation is a callback, or an optional one.
+
+    Only the annotation itself: a container of callbacks is unsaveable for the ordinary reason,
+    and naming it a callback would suggest the wrong fix.
+    """
+    origin = get_origin(annotation)
+    if origin in (Union, UnionType):
+        return any(is_callback_annotation(member) for member in get_args(annotation))
+    if origin is CallableABC:
+        return True
+    return isinstance(annotation, type) and issubclass(annotation, CallableABC)
+
+
+def list_shaped_container(annotation: Any) -> str | None:
+    """Name a container a save flattens to a list, or ``None``.
+
+    Only the annotation itself, because a converter can restore the field's own type and not
+    the type of something nested inside it.
+    """
+    origin = get_origin(annotation)
+    if origin in (Union, UnionType):
+        return _first_list_shaped(get_args(annotation))
+    candidate = annotation
+    if origin is not None:
+        candidate = origin
+    if isinstance(candidate, type) and issubclass(candidate, LIST_SHAPED_CONTAINERS):
+        return candidate.__name__
+    return None
+
+
+def _first_list_shaped(members: tuple[Any, ...]) -> str | None:
+    for member in members:
+        found = list_shaped_container(member)
+        if found is not None:
+            return found
+    return None
 
 
 def unsaveable_type(annotation: Any) -> str | None:
@@ -36,7 +78,7 @@ def _unsaveable_parameterized(annotation: Any, origin: Any) -> str | None:
     if origin in (Union, UnionType):
         return _first_unsaveable(get_args(annotation))
     if origin is CallableABC:
-        return CALLBACK_TYPE
+        return _CALLBACK_NAME
     outer = unsaveable_type(origin)
     if outer is not None:
         return outer
@@ -47,7 +89,7 @@ def _unsaveable_plain(annotation: Any) -> str | None:
     if not isinstance(annotation, type):
         return None
     if issubclass(annotation, CallableABC):
-        return CALLBACK_TYPE
+        return _CALLBACK_NAME
     if not issubclass(annotation, (*SAVEABLE_SCALARS, *SAVEABLE_CONTAINERS)):
         return annotation.__name__
     return None

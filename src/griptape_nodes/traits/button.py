@@ -133,10 +133,6 @@ class Button(Trait):
     # link saved alongside one is inert rather than cleared. See ``on_click_callback``.
     button_link: str | None = attrs.field(default=None)
 
-    # Cache of the handler derived from ``button_link``, valid while the URL is unchanged.
-    _link_handler_url: str | None = attrs.field(default=None, init=False)
-    _link_handler: Callable | None = attrs.field(default=None, init=False)
-
     # A link callback is derived state and must not be saved as node behavior.
     on_click_handler: OnClickCallback | None = attrs.field(
         default=None, alias="on_click", metadata=BEHAVIOR, kw_only=True
@@ -162,10 +158,7 @@ class Button(Trait):
             return self.on_click_handler
         if self.button_link is None:
             return None
-        if self._link_handler_url != self.button_link:
-            self._link_handler = _build_link_handler(self.button_link)
-            self._link_handler_url = self.button_link
-        return self._link_handler
+        return _build_link_handler(self.button_link)
 
     @on_click_callback.setter
     def on_click_callback(self, callback: OnClickCallback | None) -> None:

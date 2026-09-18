@@ -1,5 +1,5 @@
 from collections.abc import Callable
-from typing import Any
+from typing import Any, ClassVar
 
 import attrs
 
@@ -7,19 +7,13 @@ from griptape_nodes.exe_types.core_types import Parameter, Trait
 
 
 class Slider(Trait):
+    NESTED_UI_OPTIONS_KEY: ClassVar[str | None] = "slider"
+
     min: float = attrs.field(alias="min_val")
     max: float = attrs.field(alias="max_val")
 
     def ui_options_for_trait(self) -> dict:
         return {"slider": {"min_val": self.min, "max_val": self.max}}
-
-    @classmethod
-    def state_from_ui_options(cls, ui_options: dict) -> dict[str, Any]:
-        """Map flat slider options to trait state."""
-        written = ui_options.get("slider")
-        if not isinstance(written, dict):
-            return {}
-        return {key: written[key] for key in cls.state_keys() if key in written}
 
     def validators_for_trait(self) -> list[Callable[..., Any]]:
         def validate(param: Parameter, value: Any) -> None:  # noqa: ARG001

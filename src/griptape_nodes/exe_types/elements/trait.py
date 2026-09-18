@@ -1,19 +1,22 @@
 """The trait base class: a control attached to a parameter."""
 
 from __future__ import annotations
-import __future__
 
 import contextlib
 import inspect
 import logging
-import sys
 from abc import ABC
 from typing import TYPE_CHECKING, Any, ClassVar, Self, get_origin
 
 import attrs
 
-from griptape_nodes.exe_types.elements.base import BaseNodeElement
-from griptape_nodes.exe_types.trait_state import CALLBACK_TYPE, as_saved_state_value, unsaveable_type
+from griptape_nodes.exe_types.elements.base import BEHAVIOR_KEY, WIRING_KEY, BaseNodeElement
+from griptape_nodes.exe_types.trait_state import (
+    as_saved_state_value,
+    is_callback_annotation,
+    list_shaped_container,
+    unsaveable_type,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -21,6 +24,19 @@ if TYPE_CHECKING:
     from griptape_nodes.exe_types.elements.parameter import Parameter
 
 logger = logging.getLogger("griptape_nodes")
+
+
+def _is_class_var(annotation: Any) -> bool:
+    """Recognize a ``ClassVar`` written either as a type or as text.
+
+    A module with ``from __future__ import annotations`` hands every annotation over as a
+    string, so the textual form has to be read too. Matches the trailing name, covering
+    ``ClassVar``, ``ClassVar[x]``, and ``typing.ClassVar[x]``.
+    """
+    if isinstance(annotation, str):
+        head = annotation.partition("[")[0].strip()
+        return head.rpartition(".")[2] == "ClassVar"
+    return annotation is ClassVar or get_origin(annotation) is ClassVar
 
 
 # TODO: https://github.com/griptape-ai/griptape-nodes/issues/858
@@ -34,6 +50,10 @@ class Trait(ABC, BaseNodeElement):
     saved either.
     """
 
+    # Set by a trait rendering its options under one nested key, which ``state_from_ui_options``
+    # then reads back without the trait writing that inverse itself.
+    NESTED_UI_OPTIONS_KEY: ClassVar[str | None] = None
+
     @classmethod
     def __attrs_init_subclass__(cls) -> None:
         """Reject state that cannot round-trip through a saved workflow."""
@@ -42,20 +62,32 @@ class Trait(ABC, BaseNodeElement):
         with contextlib.suppress(NameError):
             attrs.resolve_types(cls)
         for attribute in cls._state_fields():
-            unsaveable = unsaveable_type(attribute.type)
-            if unsaveable == CALLBACK_TYPE:
-                msg = (
-                    f"Trait '{cls.__name__}' declares '{attribute.name}' as state, but its type is a callback. "
-                    f"Declare it with metadata=BEHAVIOR, which marks a callback the owning node supplies."
-                )
-                raise TypeError(msg)
-            if unsaveable is not None:
-                msg = (
-                    f"Trait '{cls.__name__}' declares '{attribute.name}' as state, but a {unsaveable} cannot be "
-                    f"written to a saved workflow. Trait state holds text, numbers, true/false, and lists or "
-                    f"dictionaries of those. Convert it in the field, or declare it init=False if it is derived."
-                )
-                raise TypeError(msg)
+            cls._reject_unsaveable_field(attribute)
+
+    @classmethod
+    def _reject_unsaveable_field(cls, attribute: attrs.Attribute) -> None:
+        if is_callback_annotation(attribute.type):
+            msg = (
+                f"Trait '{cls.__name__}' declares '{attribute.name}' as state, but its type is a callback. "
+                f"Declare it with metadata=BEHAVIOR, which marks a callback the owning node supplies."
+            )
+            raise TypeError(msg)
+        unsaveable = unsaveable_type(attribute.type)
+        if unsaveable is not None:
+            msg = (
+                f"Trait '{cls.__name__}' declares '{attribute.name}' as state, but a {unsaveable} cannot be "
+                f"written to a saved workflow. Trait state holds text, numbers, true/false, and lists or "
+                f"dictionaries of those. Convert it in the field, or declare it init=False if it is derived."
+            )
+            raise TypeError(msg)
+        flattened = list_shaped_container(attribute.type)
+        if flattened is not None and attribute.converter is None:
+            msg = (
+                f"Trait '{cls.__name__}' declares '{attribute.name}' as a {flattened}, which a saved workflow "
+                f"holds as a list, so the constructor is handed a list on load. Give the field "
+                f"converter={flattened} to convert it back, or declare it as a list."
+            )
+            raise TypeError(msg)
 
     def to_dict(self) -> dict[str, Any]:
         updated = super().to_dict()
@@ -101,14 +133,20 @@ class Trait(ABC, BaseNodeElement):
                 setattr(self, attribute.name, getattr(interpreted, attribute.name))
 
     @classmethod
-    def state_from_ui_options(cls, ui_options: dict[str, Any]) -> dict[str, Any]:  # noqa: ARG003
-        """Map flat UI options to the mentioned state fields.
+    def state_from_ui_options(cls, ui_options: dict[str, Any]) -> dict[str, Any]:
+        """Map flat UI options to the state fields they mention.
 
-        The default ignores writes for traits with no state behind their rendered keys, which
-        is why class creation does not require this to invert ``ui_options_for_trait``. A write
-        to a rendered key no trait accepts is logged rather than dropped in silence.
+        Reads the nested key a trait renders under, when it names one. A trait rendering keys
+        with no state behind them adopts nothing, which is why class creation does not require
+        this to invert ``ui_options_for_trait``. A write to a rendered key no trait accepts is
+        logged rather than dropped in silence.
         """
-        return {}
+        if cls.NESTED_UI_OPTIONS_KEY is None:
+            return {}
+        written = ui_options.get(cls.NESTED_UI_OPTIONS_KEY)
+        if not isinstance(written, dict):
+            return {}
+        return {key: written[key] for key in cls.state_keys() if key in written}
 
     @classmethod
     def from_state(cls, state: dict[str, Any]) -> Self:
@@ -124,41 +162,17 @@ class Trait(ABC, BaseNodeElement):
 
     @classmethod
     def _reject_annotations_that_are_not_fields(cls) -> None:
-        """Reject bare annotations that type check as nonexistent constructor fields.
-
-        Trait modules cannot postpone annotations because stringified ``ClassVar`` values
-        cannot be distinguished from fields without evaluating possibly unbound names.
-        """
+        """Reject bare annotations that type check as nonexistent constructor fields."""
         declared = {attribute.name for attribute in attrs.fields(cls)}
         for name, annotation in inspect.get_annotations(cls).items():
-            # Bare ``ClassVar`` has no origin to read.
-            if name in declared or annotation is ClassVar or get_origin(annotation) is ClassVar:
+            if name in declared or _is_class_var(annotation):
                 continue
-            if cls._uses_postponed_annotations():
-                msg = (
-                    f"Trait '{cls.__name__}' annotates '{name}' in a module with 'from __future__ import "
-                    f"annotations', which turns every annotation into a string and hides whether it is a "
-                    f"field. Remove that import from the trait's module."
-                )
-                raise TypeError(msg)
             msg = (
                 f"Trait '{cls.__name__}' annotates '{name}' but never declares it. A trait's fields are its "
                 f"saved state, so declare it with attrs.field(), mark it ClassVar if it is a constant, or "
                 f"annotate it where it is assigned if it is neither."
             )
             raise TypeError(msg)
-
-    @classmethod
-    def _uses_postponed_annotations(cls) -> bool:
-        """True when the trait's defining module wrote ``from __future__ import annotations``.
-
-        That statement is a real import: it binds the name ``annotations`` in the module's
-        namespace to this singleton, which nothing else binds.
-        """
-        module = sys.modules.get(cls.__module__)
-        if module is None:
-            return False
-        return getattr(module, "annotations", None) is __future__.annotations
 
     @classmethod
     def state_keys(cls) -> list[str]:
@@ -169,12 +183,8 @@ class Trait(ABC, BaseNodeElement):
         return [
             attribute
             for attribute in attrs.fields(cls)
-            if attribute.init and not attribute.metadata.get("wiring") and not attribute.metadata.get("behavior")
+            if attribute.init and not attribute.metadata.get(WIRING_KEY) and not attribute.metadata.get(BEHAVIOR_KEY)
         ]
-
-    @classmethod
-    def _behavior_fields(cls) -> list[attrs.Attribute]:
-        return [attribute for attribute in attrs.fields(cls) if attribute.metadata.get("behavior")]
 
     def ui_options_for_trait(self) -> dict:
         """Returns a list of UI options for the parameter as a list of strings or dictionaries."""
