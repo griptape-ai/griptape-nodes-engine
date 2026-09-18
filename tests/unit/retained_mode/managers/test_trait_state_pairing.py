@@ -58,10 +58,12 @@ class TestPairingByClass:
             [
                 {
                     "trait_name": "Slider",
+                    "trait_module": "griptape_nodes.traits.slider",
                     "trait_state": {"min_val": 2, "max_val": 8},
                 },
                 {
                     "trait_name": "Options",
+                    "trait_module": "griptape_nodes.traits.options",
                     "trait_state": {"choices": ["b"]},
                 },
             ],
@@ -70,6 +72,22 @@ class TestPairingByClass:
         slider = parameter.find_elements_by_type(Slider)[0]
         assert (slider.min, slider.max) == (2, 8)
         assert parameter.find_elements_by_type(Options)[0].choices == ["b"]
+
+    def test_a_same_named_trait_from_another_library_is_not_mistaken_for_it(self, foreign_twin: ModuleType) -> None:
+        local = Twin(tag="local")
+        parameter = Parameter(name="p", tooltip="t", traits={local})
+
+        # The saved entry names the other library's Twin, so it describes a trait this
+        # parameter does not carry. Matching on the name alone would overwrite the local one.
+        NodeManager._apply_trait_states(
+            parameter,
+            [{"trait_name": "Twin", "trait_module": foreign_twin.__name__, "trait_state": {"tag": "foreign"}}],
+        )
+
+        assert local.tag == "local"
+        attached = parameter.find_elements_by_type(Twin)
+        assert len(attached) == 2  # noqa: PLR2004
+        assert {type(trait).__module__ for trait in attached} == {Twin.__module__, foreign_twin.__name__}
 
 
 class TestPairingIsOneToOne:
@@ -86,10 +104,12 @@ class TestPairingIsOneToOne:
             [
                 {
                     "trait_name": "Options",
+                    "trait_module": "griptape_nodes.traits.options",
                     "trait_state": {"choices": ["first"]},
                 },
                 {
                     "trait_name": "Options",
+                    "trait_module": "griptape_nodes.traits.options",
                     "trait_state": {"choices": ["second"]},
                 },
             ],
@@ -103,8 +123,8 @@ class TestPairingIsOneToOne:
         NodeManager._apply_trait_states(
             parameter,
             [
-                {"trait_name": "Options", "trait_state": {}},
-                {"trait_name": "Options", "trait_state": {}},
+                {"trait_name": "Options", "trait_module": "griptape_nodes.traits.options", "trait_state": {}},
+                {"trait_name": "Options", "trait_module": "griptape_nodes.traits.options", "trait_state": {}},
             ],
         )
 
@@ -118,7 +138,7 @@ class TestStateTheTraitCannotAccept:
 
         NodeManager._apply_trait_states(
             parameter,
-            [{"trait_name": "Slider", "trait_state": {"min_val": 2}}],
+            [{"trait_name": "Slider", "trait_module": "griptape_nodes.traits.slider", "trait_state": {"min_val": 2}}],
         )
 
         assert (slider.min, slider.max) == (0, 1)
@@ -129,7 +149,7 @@ class TestStateTheTraitCannotAccept:
 
         NodeManager._apply_trait_states(
             parameter,
-            [{"trait_name": "Slider", "trait_state": {"min_val": 2}}],
+            [{"trait_name": "Slider", "trait_module": "griptape_nodes.traits.slider", "trait_state": {"min_val": 2}}],
         )
 
         assert any("Slider" in record.getMessage() for record in caplog.records)
@@ -148,7 +168,7 @@ class TestAValidatorRejectingSavedState:
 
         NodeManager._apply_trait_states(
             parameter,
-            [{"trait_name": "Ranged", "trait_state": {"level": 99}}],
+            [{"trait_name": "Ranged", "trait_module": __name__, "trait_state": {"level": 99}}],
         )
 
         assert ranged.level == _ALLOWED_LEVEL
@@ -159,7 +179,7 @@ class TestAValidatorRejectingSavedState:
 
         NodeManager._apply_trait_states(
             parameter,
-            [{"trait_name": "Ranged", "trait_state": {"level": 99}}],
+            [{"trait_name": "Ranged", "trait_module": __name__, "trait_state": {"level": 99}}],
         )
 
         assert any("Ranged" in record.getMessage() for record in caplog.records)
@@ -169,7 +189,7 @@ class TestAValidatorRejectingSavedState:
 
         NodeManager._apply_trait_states(
             parameter,
-            [{"trait_name": "Ranged", "trait_state": {"level": 99}}],
+            [{"trait_name": "Ranged", "trait_module": __name__, "trait_state": {"level": 99}}],
         )
 
         assert parameter.find_elements_by_type(Ranged) == []
@@ -180,7 +200,7 @@ class TestAValidatorRejectingSavedState:
 
         NodeManager._apply_trait_states(
             parameter,
-            [{"trait_name": "Ranged", "trait_state": {"level": 99}}],
+            [{"trait_name": "Ranged", "trait_module": __name__, "trait_state": {"level": 99}}],
         )
 
         assert any("Ranged" in record.getMessage() for record in caplog.records)
