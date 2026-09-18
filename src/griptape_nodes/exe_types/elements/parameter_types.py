@@ -209,6 +209,14 @@ def accepts_incoming_type(input_types: list[str], incoming_type: str | None) -> 
     if incoming_type is None:
         return False
 
+    # Ahead of the `all` short-circuit: `all` claims to satisfy any target, and a handle target is not
+    # any target. Only a handle key can arrive on a handle parameter -- an ErrorProxyNode placeholder
+    # output is `all`, and what it carries is not a key.
+    if any(ParameterType.is_handle(test_type) for test_type in input_types) and not ParameterType.is_handle(
+        incoming_type
+    ):
+        return False
+
     if incoming_type.lower() == ParameterTypeBuiltin.ALL.value:
         return True
 

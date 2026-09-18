@@ -349,6 +349,8 @@ class BaseNode(ABC):
         # displace and free a dead node's object while a consumer still holds its key. Minted once here
         # and carried in metadata, it survives the trip to a worker's transient node (ExecuteNodeRequest
         # copies metadata) and survives rename, so a renamed node keeps displacing its own prior objects.
+        # Any path that writes node metadata must preserve this key; losing it only orphans entries until
+        # workflow teardown, but serialization must keep stripping it (on_serialize_node_to_commands).
         self.metadata.setdefault("local_object_source", f"{name}@{uuid.uuid4().hex[:8]}")
         self.parameter_values = {}
         self.parameter_output_values = TrackedParameterOutputValues(self)

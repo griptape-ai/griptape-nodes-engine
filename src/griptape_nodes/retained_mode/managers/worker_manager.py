@@ -734,6 +734,11 @@ class WorkerManager(EngineScoped):
         They were drained before this ran, so without the re-queue a task that dies with a transient side
         loop -- the case `broadcast_drop_all_local_objects` documents below -- would take them with it and
         nothing would ever retry.
+
+        The awaited sibling `broadcast_pending_local_object_releases` deliberately does NOT re-queue: it
+        runs on the teardown path, where the drop-all that follows covers its keys, and re-queuing there
+        would leave keys from a deleted workflow cycling forever with nothing left to drain them. Do not
+        unify the two policies.
         """
         from griptape_nodes.app.worker_routing import DropLocalObjectsRequest
 
@@ -754,6 +759,10 @@ class WorkerManager(EngineScoped):
         Drains the queue the sync release paths fill -- a handle parameter's value being replaced, a node
         being deleted -- so those paths do not each need a loop of their own. Never raises, for the same
         reason as its sibling below: a send failure must not break whatever triggered the release.
+
+        On failure the keys are discarded, not re-queued: this runs on the teardown path, the drop-all
+        that follows covers them, and a re-queue would cycle keys from a deleted workflow forever. The
+        scheduled sibling `_send_local_object_releases` re-queues, because nothing follows it.
 
         Lazy import breaks the same cycle as its siblings: `app.worker_routing` imports `EventManager` from
         this package.

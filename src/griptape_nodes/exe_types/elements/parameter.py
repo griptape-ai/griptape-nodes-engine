@@ -98,7 +98,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
 
     # "serializable" controls whether parameter values should be serialized during save/load operations.
     # Set to False for parameters containing non-serializable types (ImageDrivers, PromptDrivers, file handles, etc.)
-    serializable: bool = True
+    _serializable: bool = True
 
     user_defined: bool = False
     private: bool = False
@@ -189,7 +189,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         self.tooltip_as_property = tooltip_as_property
         self.tooltip_as_output = tooltip_as_output
         self._settable = settable
-        self.serializable = serializable
+        self._serializable = serializable
         self.user_defined = user_defined
         self.private = private
         self.exclude_from_metadata = exclude_from_metadata
@@ -259,12 +259,6 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         self.type = type
         self.input_types = input_types
         self.output_type = output_type
-
-        # A handle's value is a key into one process's memory, so it can never be saved: the engine
-        # already owns one mechanism for "skip this value, re-run the node on load", and this is it.
-        # Forced rather than documented, so to_dict and the GUI agree with the serializer.
-        if self.holds_local_object:
-            self.serializable = False
 
     def to_dict(self) -> dict[str, Any]:
         """Returns a nested dictionary representation of this node and its children."""
@@ -624,6 +618,21 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
             self._output_type = None
             return
         self._output_type = canonical_type_name(value)
+
+    @property
+    def serializable(self) -> bool:
+        """Whether this parameter's values may be written into a saved workflow.
+
+        A handle can never be: its value is a key into one process's memory. Derived rather than stamped
+        at construction, so re-typing a live parameter to `handle[...]` (AlterParameterDetailsRequest)
+        cannot leave it serializable behind the flag's back -- to_dict, the GUI, and the serializer all
+        read this one property.
+        """
+        return self._serializable and not self.holds_local_object
+
+    @serializable.setter
+    def serializable(self, value: bool) -> None:
+        self._serializable = value
 
     @property
     def holds_local_object(self) -> bool:

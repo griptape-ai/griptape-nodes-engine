@@ -7,6 +7,7 @@ key, and `node.local_objects`, where a library names its own key for a resource 
 import pytest
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode, ParameterType
+from griptape_nodes.exe_types.elements.parameter_types import accepts_incoming_type
 from griptape_nodes.exe_types.node_types import BaseNode
 
 
@@ -306,8 +307,46 @@ class TestAHandleOnlyConnectsToAHandle:
     def test_compatibility(self, source: str, target: str, expected: bool) -> None:  # noqa: FBT001
         assert ParameterType.are_types_compatible(source, target) is expected
 
+    @pytest.mark.parametrize(
+        ("input_types", "incoming", "expected"),
+        [
+            # `all` claims to satisfy any target; a handle target is not any target. An ErrorProxyNode
+            # placeholder output is `all`, and what it carries is not a key.
+            (["handle[Pipeline]"], "all", False),
+            (["handle[Pipeline]"], "handle[Pipeline]", True),
+            (["all"], "handle[Pipeline]", False),
+            (["str"], "all", True),
+        ],
+    )
+    def test_the_all_short_circuit_does_not_bypass_the_rule(
+        self,
+        input_types: list[str],
+        incoming: str,
+        expected: bool,  # noqa: FBT001
+    ) -> None:
+        assert accepts_incoming_type(input_types, incoming) is expected
+
 
 class TestAHandleParameterIsNeverSerializable:
+    def test_retyping_a_live_parameter_to_a_handle_turns_it_off(self) -> None:
+        """AlterParameterDetailsRequest writes types onto a live parameter.
+
+        Stamping the flag at construction would leave a re-typed parameter serializable, and the key it
+        holds would save on a node marked RESOLVED -- a key into a process that no longer exists, with
+        nothing re-running to replace it. Derived, the flag follows the type wherever it changes.
+        """
+        parameter = Parameter(name="pipe", output_type="str", tooltip="")
+        assert parameter.serializable is True
+
+        parameter.output_type = "handle[FluxPipeline]"
+
+        assert parameter.serializable is False
+
+    def test_an_authors_opt_out_is_kept_on_ordinary_parameters(self) -> None:
+        parameter = Parameter(name="driver", output_type="str", tooltip="", serializable=False)
+
+        assert parameter.serializable is False
+
     def test_declaring_the_type_is_what_forces_it_off(self) -> None:
         """One mechanism, owned by the parameter.
 
