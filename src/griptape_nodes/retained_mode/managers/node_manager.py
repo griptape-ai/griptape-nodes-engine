@@ -232,6 +232,7 @@ from griptape_nodes.retained_mode.events.validation_events import (
     ValidateNodeDependenciesResultFailure,
     ValidateNodeDependenciesResultSuccess,
 )
+from griptape_nodes.retained_mode.events.worker_events import WorkerGoneError
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     AuthorizationCheckpoint,
     CheckpointAction,
@@ -3467,6 +3468,17 @@ class NodeManager(EngineScoped):
                 worker_engine_id,
                 worker_request_topic,
             )
+        except WorkerGoneError as err:
+            # A failure, not a cancellation: the resolution machine reaps cancellations as CANCELED,
+            # emitting no NodeErrorEvent and logging one unnamed line, so the node would come back
+            # UNRESOLVED with nothing anywhere saying why. The reason comes from whoever retired the
+            # worker, and rides on `exception` so it reaches the node-failure formatting.
+            details = (
+                f"Attempted to run node '{request.node_name}' in a separate process. Failed because "
+                f"{err} Editing the node still works and your workflow keeps it."
+            )
+            logger.error(details)
+            return ExecuteNodeResultFailure(result_details=details, exception=err)
         finally:
             # Drop the tracking entry regardless of success, failure, or cancellation
             # so a subsequent execute on the same node doesn't see a stale record.
