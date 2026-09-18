@@ -166,6 +166,30 @@ def dict_diff(current: dict, base: dict) -> dict:
     return result
 
 
+def drop_blank_values(d: dict) -> dict:
+    """Return a copy of a config layer without the keys whose value is a blank string.
+
+    A layer holding ``""`` for a setting states nothing about it, so the key is dropped and the
+    next layer down (or the built-in default) supplies the value. Recurses into nested dicts;
+    entries inside lists are left alone.
+
+    Args:
+        d: A single config layer.
+
+    Returns:
+        A new dict with the blank-string entries removed.
+    """
+    result = {}
+    for key, value in d.items():
+        if isinstance(value, str) and not value.strip():
+            continue
+        if isinstance(value, dict):
+            result[key] = drop_blank_values(value)
+        else:
+            result[key] = value
+    return result
+
+
 def merge_dicts(dct: dict | None, merge_dct: dict | None, *, add_keys: bool = True, merge_lists: bool = False) -> dict:
     """Recursive dict merge.
 
