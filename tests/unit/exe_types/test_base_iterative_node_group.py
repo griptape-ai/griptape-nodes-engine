@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -97,3 +98,43 @@ class TestBaseIterativeNodeGroupControlPorts:
         """get_next_control_output() must return the exec_out parameter instance."""
         result = iterative_group.get_next_control_output()
         assert result is iterative_group.exec_out
+
+
+class TestBaseIterativeNodeGroupRails:
+    """The rail metadata drives what the editor draws down each side of the group."""
+
+    def test_fresh_group_names_each_rail_parameter_once(self, iterative_group: MockIterativeGroup) -> None:
+        """Pins rail ORDER rather than mere membership, because at_front is what places the control ports."""
+        assert iterative_group.metadata[LEFT_PARAMETERS_KEY] == ["exec_in", "group_exec_in", "on_each", "index"]
+        assert iterative_group.metadata[RIGHT_PARAMETERS_KEY] == [
+            "exec_out",
+            "group_exec_out",
+            "loop_complete",
+            "new_item_to_add",
+            "skip_iteration",
+            "break_loop",
+            "results",
+        ]
+
+
+class TestBaseIterativeNodeGroupRestoreRoundTrip:
+    """Rebuilding a group from its saved metadata must reproduce its rails, not grow them.
+
+    Load hands the saved metadata straight to the constructor, and the group holds on to that very
+    list, so any port the constructor re-records is a port the artist sees twice.
+    """
+
+    def test_restored_group_has_the_same_rail_parameters(self, iterative_group: MockIterativeGroup) -> None:
+        """A group rebuilt from what it was saved with names the same ports, in the same order."""
+        restored = MockIterativeGroup(name="restored", metadata=copy.deepcopy(iterative_group.metadata))
+
+        assert restored.metadata[LEFT_PARAMETERS_KEY] == iterative_group.metadata[LEFT_PARAMETERS_KEY]
+        assert restored.metadata[RIGHT_PARAMETERS_KEY] == iterative_group.metadata[RIGHT_PARAMETERS_KEY]
+
+    def test_a_third_generation_still_has_the_same_rail_parameters(self, iterative_group: MockIterativeGroup) -> None:
+        """Duplicates compound across save/load cycles, so a second rebuild has to stay stable too."""
+        restored = MockIterativeGroup(name="restored", metadata=copy.deepcopy(iterative_group.metadata))
+        restored_again = MockIterativeGroup(name="restored_again", metadata=copy.deepcopy(restored.metadata))
+
+        assert restored_again.metadata[LEFT_PARAMETERS_KEY] == iterative_group.metadata[LEFT_PARAMETERS_KEY]
+        assert restored_again.metadata[RIGHT_PARAMETERS_KEY] == iterative_group.metadata[RIGHT_PARAMETERS_KEY]

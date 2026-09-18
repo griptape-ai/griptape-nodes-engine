@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
+import copy
 from typing import TYPE_CHECKING, Any
-from unittest.mock import create_autospec
+from unittest.mock import Mock, create_autospec
 
-from griptape_nodes.exe_types.node_groups.subflow_node_group import SubflowNodeGroup
+import pytest
+
+from griptape_nodes.exe_types.core_types import Parameter, ParameterTypeBuiltin
+from griptape_nodes.exe_types.node_groups.subflow_node_group import (
+    LEFT_PARAMETERS_KEY,
+    RIGHT_PARAMETERS_KEY,
+    SubflowNodeGroup,
+)
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
+from griptape_nodes.retained_mode.events.parameter_events import AddParameterToNodeResultSuccess
 
 if TYPE_CHECKING:
-    import pytest
-
     from griptape_nodes.retained_mode.engine import Engine
 
 
@@ -85,6 +92,131 @@ class TestGetAllNodes:
         group.nodes = {"only": _MiniSubflowGroup(name="only")}
 
         assert set(group.get_all_nodes()) == {"only"}
+
+
+class TestRegisterSideParameter:
+    """Recording a rail parameter must add what is missing without disturbing what is already there."""
+
+    def test_fresh_group_records_each_control_port_once(
+        self,
+        engine: Engine,  # noqa: ARG002 - initialises the engine singleton for construction
+    ) -> None:
+        """A group built from nothing names its own control ports, once each."""
+        group = _MiniSubflowGroup(name="fresh")
+
+        assert group.metadata[LEFT_PARAMETERS_KEY] == ["group_exec_in"]
+        assert group.metadata[RIGHT_PARAMETERS_KEY] == ["group_exec_out"]
+
+    def test_restored_group_keeps_saved_proxy_ports_in_saved_order(
+        self,
+        engine: Engine,  # noqa: ARG002 - initialises the engine singleton for construction
+    ) -> None:
+        """Data proxies saved with the workflow survive the rebuild, in the order they were saved."""
+        saved_metadata = {
+            LEFT_PARAMETERS_KEY: ["group_exec_in", "prompt", "seed"],
+            RIGHT_PARAMETERS_KEY: ["group_exec_out", "image"],
+        }
+
+        group = _MiniSubflowGroup(name="restored", metadata=saved_metadata)
+
+        assert group.metadata[LEFT_PARAMETERS_KEY] == ["group_exec_in", "prompt", "seed"]
+        assert group.metadata[RIGHT_PARAMETERS_KEY] == ["group_exec_out", "image"]
+
+    def test_repeated_restores_do_not_grow_the_rail_lists(
+        self,
+        engine: Engine,  # noqa: ARG002 - initialises the engine singleton for construction
+    ) -> None:
+        """Save/load cycles are stable: the third generation names the same ports as the first."""
+        first = _MiniSubflowGroup(name="first")
+        second = _MiniSubflowGroup(name="second", metadata=copy.deepcopy(first.metadata))
+        third = _MiniSubflowGroup(name="third", metadata=copy.deepcopy(second.metadata))
+
+        assert third.metadata[LEFT_PARAMETERS_KEY] == first.metadata[LEFT_PARAMETERS_KEY]
+        assert third.metadata[RIGHT_PARAMETERS_KEY] == first.metadata[RIGHT_PARAMETERS_KEY]
+
+    def test_at_front_pins_a_new_parameter_to_the_top_of_the_rail(
+        self,
+        engine: Engine,  # noqa: ARG002 - initialises the engine singleton for construction
+    ) -> None:
+        """Control ports sit above data ports, so a front-inserted name lands at index 0."""
+        group = _MiniSubflowGroup(name="pinned", metadata={LEFT_PARAMETERS_KEY: ["prompt"]})
+
+        group._register_side_parameter(LEFT_PARAMETERS_KEY, "exec_in", at_front=True)
+
+        assert group.metadata[LEFT_PARAMETERS_KEY] == ["exec_in", "prompt", "group_exec_in"]
+
+    def test_at_front_leaves_an_already_recorded_parameter_where_it_is(
+        self,
+        engine: Engine,  # noqa: ARG002 - initialises the engine singleton for construction
+    ) -> None:
+        """A restored rail already names the control port, so re-recording must not move or repeat it."""
+        group = _MiniSubflowGroup(name="pinned", metadata={LEFT_PARAMETERS_KEY: ["prompt", "exec_in"]})
+
+        group._register_side_parameter(LEFT_PARAMETERS_KEY, "exec_in", at_front=True)
+
+        assert group.metadata[LEFT_PARAMETERS_KEY] == ["prompt", "exec_in", "group_exec_in"]
+
+
+class TestCreateProxyParameterForConnection:
+    """A proxy parameter has to land on the rail matching the direction of the connection it stands in for."""
+
+    PROXY_NAME = "prompt"
+
+    @pytest.fixture
+    def group(
+        self,
+        engine: Engine,  # noqa: ARG002 - initialises the engine singleton for construction
+    ) -> _MiniSubflowGroup:
+        """A group already carrying the parameter the engine is stubbed to report it added."""
+        group = _MiniSubflowGroup(name="G")
+        group.add_parameter(Parameter(name=self.PROXY_NAME, tooltip=""))
+        return group
+
+    @pytest.fixture
+    def mock_handle_request(
+        self,
+        engine: Engine,
+        group: _MiniSubflowGroup,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> Mock:
+        """Stand in for the engine handling AddParameterToNodeRequest, which is not under test here."""
+        added_result = AddParameterToNodeResultSuccess(
+            parameter_name=self.PROXY_NAME,
+            type=ParameterTypeBuiltin.ANY.value,
+            node_name=group.name,
+            result_details="added",
+        )
+        mock_handle = create_autospec(engine.handle_request, return_value=added_result)
+        monkeypatch.setattr(engine, "handle_request", mock_handle)
+        return mock_handle
+
+    def test_incoming_connection_records_the_proxy_on_the_left_rail(
+        self,
+        group: _MiniSubflowGroup,
+        mock_handle_request: Mock,  # noqa: ARG002 - stubs the engine the call under test goes through
+    ) -> None:
+        """A connection coming into the group enters through a left-rail port."""
+        proxy = group._create_proxy_parameter_for_connection(
+            Parameter(name=self.PROXY_NAME, tooltip=""), is_incoming=True
+        )
+
+        assert proxy.name == self.PROXY_NAME
+        assert group.metadata[LEFT_PARAMETERS_KEY] == ["group_exec_in", self.PROXY_NAME]
+        assert group.metadata[RIGHT_PARAMETERS_KEY] == ["group_exec_out"]
+
+    def test_outgoing_connection_records_the_proxy_on_the_right_rail(
+        self,
+        group: _MiniSubflowGroup,
+        mock_handle_request: Mock,  # noqa: ARG002 - stubs the engine the call under test goes through
+    ) -> None:
+        """A connection leaving the group exits through a right-rail port."""
+        proxy = group._create_proxy_parameter_for_connection(
+            Parameter(name=self.PROXY_NAME, tooltip=""), is_incoming=False
+        )
+
+        assert proxy.name == self.PROXY_NAME
+        assert group.metadata[RIGHT_PARAMETERS_KEY] == ["group_exec_out", self.PROXY_NAME]
+        assert group.metadata[LEFT_PARAMETERS_KEY] == ["group_exec_in"]
 
 
 class _MiniSubflowGroup(SubflowNodeGroup):

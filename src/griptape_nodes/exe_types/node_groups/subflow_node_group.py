@@ -89,10 +89,10 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         super().__init__(name, metadata)
         self.control_in = ControlParameterInput(name="group_exec_in")
         self.add_parameter(self.control_in)
-        self.metadata[LEFT_PARAMETERS_KEY] = [self.control_in.name]
+        self._register_side_parameter(LEFT_PARAMETERS_KEY, self.control_in.name)
         self.control_out = ControlParameterOutput(name="group_exec_out")
         self.add_parameter(self.control_out)
-        self.metadata[RIGHT_PARAMETERS_KEY] = [self.control_out.name]
+        self._register_side_parameter(RIGHT_PARAMETERS_KEY, self.control_out.name)
         self.execution_environment = Parameter(
             name="execution_environment",
             tooltip="Environment that the group should execute in",
@@ -287,6 +287,23 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             "parameter_names": parameter_names,
         }
 
+    def _register_side_parameter(self, metadata_key: str, parameter_name: str, *, at_front: bool = False) -> None:
+        """Record a parameter on the group's left or right port list.
+
+        Args:
+            metadata_key: LEFT_PARAMETERS_KEY or RIGHT_PARAMETERS_KEY
+            parameter_name: The parameter to record on that side
+            at_front: Pin the parameter to the top of the rail rather than the bottom.
+                Only applies when the parameter is not already recorded.
+        """
+        side_parameters = self.metadata.setdefault(metadata_key, [])
+        if parameter_name in side_parameters:
+            return
+        if at_front:
+            side_parameters.insert(0, parameter_name)
+            return
+        side_parameters.append(parameter_name)
+
     def _clone_and_add_parameter(self, param: Parameter, new_name: str) -> None:
         """Clone a parameter with a new name and add it to this node.
 
@@ -356,14 +373,10 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             msg = f"{self.name} failed to create proxy parameter '{result.parameter_name}'"
             raise RuntimeError(msg)
         if is_incoming:
-            if LEFT_PARAMETERS_KEY in self.metadata:
-                self.metadata[LEFT_PARAMETERS_KEY].append(proxy_param.name)
-            else:
-                self.metadata[LEFT_PARAMETERS_KEY] = [proxy_param.name]
-        elif RIGHT_PARAMETERS_KEY in self.metadata:
-            self.metadata[RIGHT_PARAMETERS_KEY].append(proxy_param.name)
+            side_key = LEFT_PARAMETERS_KEY
         else:
-            self.metadata[RIGHT_PARAMETERS_KEY] = [proxy_param.name]
+            side_key = RIGHT_PARAMETERS_KEY
+        self._register_side_parameter(side_key, proxy_param.name)
 
         return proxy_param
 
