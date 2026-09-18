@@ -2492,6 +2492,16 @@ class ParameterContainer(Parameter, ABC):
             element_type=element_type,
         )
 
+        # A container of handles is not supported, and failing quietly would be worse than failing here:
+        # the write hook would park the whole list as one object, so a downstream ParameterList would
+        # receive a single opaque key instead of N items, and a container cannot carry a release hook.
+        if self.holds_local_object:
+            msg = (
+                f"Attempted to create container parameter '{name}' of type '{self.output_type}'. Failed "
+                f"because a container cannot hold handles. Give each element its own handle parameter."
+            )
+            raise ValueError(msg)
+
     def __bool__(self) -> bool:
         """Parameter containers are always truthy, even when empty.
 

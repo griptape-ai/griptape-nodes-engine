@@ -408,13 +408,15 @@ async def _handle_drop_local_objects(
     replaced or deleted on the orchestrator, so a node executing now cannot be using them -- it was given
     the new value. Waiting would keep the memory for the length of a render.
 
-    Passes owner=None because the orchestrator names keys it has already released; the namespace is in the
-    key, and this process either holds it or does not.
+    Drops parked entries only. The orchestrator broadcasts keys it cannot check locally -- the entry lives
+    here -- so the never-release-a-library-named-key rule is enforced on this side.
     """
     resource_manager = event_manager.engine.resource_manager
 
     def release_all() -> int:
-        return sum(1 for key in request.keys if resource_manager.drop_local_object(key))
+        # Parked entries only: the orchestrator broadcasts keys it holds no entry for, so provenance is
+        # checked here, in the process with the entry. A key a library named itself is never dropped.
+        return sum(1 for key in request.keys if resource_manager.drop_parked_local_object(key))
 
     try:
         # Off the loop for the same reason as its sibling: a release hook is `del model` plus a CUDA cache

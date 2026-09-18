@@ -22,6 +22,7 @@ from griptape_nodes.retained_mode.events.library_events import (
     UnloadLibraryFromRegistryResultSuccess,
 )
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
+from griptape_nodes.retained_mode.events.workflow_events import DeleteWorkflowRequest
 from griptape_nodes.retained_mode.managers.resource_manager import LocalObjectEntry
 
 _SECOND_READ_TIMEOUT_SECONDS = 0.25
@@ -482,6 +483,19 @@ class TestWorkflowStateClearReleasesObjects:
             result = engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
 
         assert result.succeeded()
+
+    def test_deleting_the_open_workflow_tells_the_workers(self, engine: Engine) -> None:
+        """A chokepoint of its own, separate from the clear-all handler.
+
+        Deleting the open workflow reaches teardown without going through that handler, and without this
+        every worker keeps its objects.
+        """
+        engine.context_manager.push_workflow("wf")
+
+        with patch.object(engine.worker_manager, "broadcast_drop_all_local_objects", AsyncMock()) as broadcast:
+            engine.handle_request(DeleteWorkflowRequest(name="wf"))
+
+        assert broadcast.await_count == 1
 
     def test_the_broadcast_actually_reaches_the_transport(self, engine: Engine) -> None:
         """One layer deeper than mocking the broadcast, so losing the message without raising cannot pass."""

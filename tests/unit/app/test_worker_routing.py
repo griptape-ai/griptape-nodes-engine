@@ -276,7 +276,12 @@ class TestDropLocalObjectsHandler:
         released: list[str] = []
         keys = [
             engine.resource_manager.put_local_object(
-                object(), owner="Lib A", source="N", key=label, on_drop=lambda _v, label=label: released.append(label)
+                object(),
+                owner="Lib A",
+                source="N",
+                key=label,
+                slot=label,
+                on_drop=lambda _v, label=label: released.append(label),
             )
             for label in ("one", "two")
         ]
@@ -307,7 +312,7 @@ class TestDropLocalObjectsHandler:
         """
         released: list[str] = []
         key = engine.resource_manager.put_local_object(
-            object(), owner="Lib A", source="N", key="cfg", on_drop=lambda _v: released.append("gone")
+            object(), owner="Lib A", source="N", key="cfg", slot="out", on_drop=lambda _v: released.append("gone")
         )
 
         with engine.event_manager.worker_node_execution_scope():
@@ -327,6 +332,7 @@ class TestDropLocalObjectsHandler:
             owner="Lib A",
             source="N",
             key="cfg",
+            slot="out",
             on_drop=lambda _v: release_threads.append(threading.get_ident()),
         )
 
@@ -337,9 +343,25 @@ class TestDropLocalObjectsHandler:
 
     @pytest.mark.asyncio
     async def test_reports_failure_rather_than_raising_at_the_transport(self, engine: Engine) -> None:
-        with patch.object(engine.resource_manager, "drop_local_object", side_effect=RuntimeError("boom")):
+        with patch.object(engine.resource_manager, "drop_parked_local_object", side_effect=RuntimeError("boom")):
             result = await _handle_drop_local_objects(
                 DropLocalObjectsRequest(keys=["Lib A:cfg"]), event_manager=engine.event_manager
             )
 
         assert isinstance(result, DropLocalObjectsResultFailure)
+
+    @pytest.mark.asyncio
+    async def test_a_library_named_entry_is_refused(self, engine: Engine) -> None:
+        """The orchestrator broadcasts keys it cannot check, so the provenance rule is enforced here."""
+        released: list[str] = []
+        key = engine.resource_manager.put_local_object(
+            object(), owner="Lib A", source="N", key="sd-xl-1.0#a1b2c3d4", on_drop=lambda _v: released.append("gone")
+        )
+
+        result = await _handle_drop_local_objects(
+            DropLocalObjectsRequest(keys=[key]), event_manager=engine.event_manager
+        )
+
+        assert isinstance(result, DropLocalObjectsResultSuccess)
+        assert released == []
+        assert engine.resource_manager.get_local_object(key, owner="Lib A") is not None

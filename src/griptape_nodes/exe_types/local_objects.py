@@ -11,6 +11,7 @@ which node produced it.
 
 from __future__ import annotations
 
+import uuid
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -58,6 +59,45 @@ class LocalObjectScope:
         takes more than dropping the reference, which is true of anything holding GPU memory.
         """
         return self._manager().put_local_object(value, owner=self._owner, source=self._source, key=key, on_drop=on_drop)
+
+    def park(self, value: Any, *, parameter_name: str, on_drop: Callable[[Any], None] | None = None) -> str:
+        """Hold a value on behalf of a parameter, under a key minted for this assignment.
+
+        For the engine's own use from the write path. The key is unique per call, so a parameter's value
+        changes every time its node runs and the editor hears about it. The slot carries the identity: one
+        object per (owner, source, parameter), and parking into it again releases the previous occupant in
+        the process holding it -- which is what frees the last run's object, however the parameter values
+        themselves were cleared in between.
+        """
+        # Straight to the manager: `slot` is what makes an entry the engine's to release and to displace,
+        # and it stays off the library-facing `put` on purpose.
+        return self._manager().put_local_object(
+            value,
+            owner=self._owner,
+            source=self._source,
+            key=f"{self._source}.{parameter_name}#{uuid.uuid4().hex[:8]}",
+            slot=parameter_name,
+            on_drop=on_drop,
+        )
+
+    def is_parked_by_engine(self, key: Any) -> bool:
+        """Whether `key` names an entry the engine parked, rather than one a library keyed through `put`.
+
+        Recorded on the entry, not inferred from the key's shape: a library key can look like anything,
+        including exactly like a minted one (`sd-xl-1.0#a1b2c3d4`).
+        """
+        return self._manager().is_parked_key(key)
+
+    def release_parked(self, key: Any) -> bool:
+        """Release `key` in every process, but only if the engine parked it for this library.
+
+        What node deletion calls once nothing refers to a key. A library-named key is refused: it is the
+        library's to release, and stable by construction, so releasing it would drop that resource in
+        every process holding it.
+        """
+        if not isinstance(key, str):
+            return False
+        return self._manager().release_parked_key(key, owner=self._owner)
 
     def key_for(self, suffix: str) -> str:
         """The full key for a suffix this library chose, without putting anything.
@@ -111,15 +151,14 @@ class LocalObjectScope:
             return False
         return self._manager().drop_local_object(key, owner=self._owner)
 
-    def release_everywhere(self, key: str) -> bool:
-        """Release `key` here and queue it for the workers. Returns whether this process held it.
+    def vacate_slot(self, parameter_name: str, *, keeping: str | None = None) -> None:
+        """Release whatever this node parked for `parameter_name`, except the entry behind `keeping`.
 
-        For the engine's own releases, where the object may be in this process or in a worker. A library
-        clearing its own cache wants `drop` or `drop_all` instead.
+        For the engine's write path, when a run ends with the parameter carrying something other than a
+        fresh park: an upstream's key passed through, or None. The upstream's own entry cannot be caught
+        here, because it sits under the upstream's source.
         """
-        if not isinstance(key, str):
-            return False
-        return self._manager().release_key_everywhere(key, owner=self._owner)
+        self._manager().vacate_slot(owner=self._owner, source=self._source, slot=parameter_name, keeping=keeping)
 
     def drop_all(self) -> int:
         """Release everything THIS library is holding in this process, returning how many went.

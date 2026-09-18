@@ -307,6 +307,37 @@ class _NodeInstantiationDeniedError(Exception):
     """
 
 
+def _keys_referenced_by(node: BaseNode, candidates: set[str]) -> set[str]:
+    """Which of `candidates` appear anywhere in this node's parameter values.
+
+    Walks into lists, dicts and tuples: a ParameterList consumer holds `[key]`, not `key`, and a value of
+    that shape is unhashable, so comparing sets of values raises instead of missing the reference quietly.
+    """
+    found: set[str] = set()
+    seen: set[int] = set()
+    # Snapshot with list(): node bodies write outputs from worker threads, and a dict that changes size
+    # mid-iteration raises, which would abort the delete.
+    for source in (node.parameter_values, node.parameter_output_values):
+        for value in list(source.values()):
+            _collect_keys(value, candidates, found, seen)
+    return found
+
+
+def _collect_keys(value: Any, candidates: set[str], found: set[str], seen: set[int]) -> None:
+    """Add any candidate key reachable inside `value` to `found`. `seen` breaks reference cycles."""
+    if isinstance(value, str):
+        if value in candidates:
+            found.add(value)
+        return
+    if isinstance(value, (dict, list, tuple, set)):
+        if id(value) in seen:
+            return
+        seen.add(id(value))
+        items = value.values() if isinstance(value, dict) else value
+        for item in list(items):
+            _collect_keys(item, candidates, found, seen)
+
+
 class NodeManager(EngineScoped):
     _name_to_parent_flow_name: dict[str, str]
 
@@ -1370,7 +1401,7 @@ class NodeManager(EngineScoped):
         parent_flow.remove_node(node.name)
 
         for key in releasable_handle_keys:
-            node.release_displaced_handle(key)
+            node.local_objects.release_parked(key)
 
         # Now remove the record keeping
         self.engine.object_manager.del_obj_by_name(node_name)
@@ -3019,18 +3050,31 @@ class NodeManager(EngineScoped):
         does the object behind that key is still reachable and still usable, so deleting the node that made
         it must leave it alone. Unlike an overwrite there is no fresher value to take its place.
         """
-        candidates = {
-            key
-            for parameter in node.parameters
-            if parameter.holds_local_object and isinstance(key := node.parameter_output_values.get(parameter.name), str)
-        }
+        candidates: set[str] = set()
+        for parameter in node.parameters:
+            if not parameter.holds_local_object:
+                continue
+            # Both maps: this node may be the producer holding it as an output, or the last consumer
+            # holding the only remaining copy of someone else's key.
+            for source in (node.parameter_output_values, node.parameter_values):
+                if isinstance(key := source.get(parameter.name), str):
+                    candidates.add(key)
+        # The store's own record too, not just live parameter names: a parameter renamed or removed after
+        # parking, or a run cancelled between the clear and the park, leaves an entry no current name can
+        # reach, and this is the last chance to run its release hook.
+        candidates.update(
+            self.engine.resource_manager.parked_keys_for(
+                owner=node.local_objects.owner, source=node.metadata["local_object_source"]
+            )
+        )
         if not candidates:
             return []
         for name, other in self.engine.object_manager.get_filtered_subset(type=BaseNode).items():
             if name == node.name:
                 continue
-            candidates -= set(other.parameter_values.values())
-            candidates -= set(other.parameter_output_values.values())
+            candidates -= _keys_referenced_by(other, candidates)
+            if not candidates:
+                return []
         return sorted(candidates)
 
     def get_node_by_name(self, name: str) -> BaseNode:
@@ -3645,6 +3689,11 @@ class NodeManager(EngineScoped):
                 # Remove node_names_in_group from metadata - it's redundant and will be regenerated
                 metadata_copy = copy.deepcopy(node.metadata)
                 metadata_copy.pop("node_names_in_group", None)
+                # The identity held objects are parked under is per live node, never per serialized form:
+                # duplicate/paste and saved files all rebuild from these commands, and a second node with
+                # the same identity displaces and frees the original's still-referenced objects. The
+                # deserialized node mints a fresh one in BaseNode.__init__.
+                metadata_copy.pop("local_object_source", None)
 
                 # Remove subflow_name for copy/paste operations (so pasted groups create fresh subflows)
                 # Keep it for workflow file generation (so it can be extracted and used as a variable reference)
@@ -3676,11 +3725,14 @@ class NodeManager(EngineScoped):
                     serialized_library_name = library_details.library_name
 
                 # Get the creation details for regular nodes
+                metadata_copy = copy.deepcopy(node.metadata)
+                # Per live node, never per serialized form -- see the group branch above.
+                metadata_copy.pop("local_object_source", None)
                 create_node_request = CreateNodeRequest(
                     node_type=serialized_node_type,
                     node_name=node_name,
                     specific_library_name=serialized_library_name,
-                    metadata=copy.deepcopy(node.metadata),
+                    metadata=metadata_copy,
                     # If it is actively resolving, mark as unresolved.
                     resolution=node.state.value,
                     initial_setup=True,
@@ -4402,9 +4454,7 @@ class NodeManager(EngineScoped):
                 # This value is new for us.
 
                 # Check if parameter is marked as non-serializable (e.g., ImageDrivers, PromptDrivers, file handles)
-                # A handle is never serializable: its value is a key into one process's memory, and a
-                # reopened workflow would resolve it to nothing.
-                if not parameter.serializable or parameter.holds_local_object:
+                if not parameter.serializable:
                     serialized_parameter_value_tracker.add_as_not_serializable(value_id)
                     return None
 
@@ -4564,6 +4614,14 @@ class NodeManager(EngineScoped):
         # No value of this kind was set on the node.
         if value is None:
             return None
+        # Ahead of the hashing: a handle key is a picklable string, so it would hash and serialize like
+        # any other value, and the reloaded workflow would hold a key into a process that no longer
+        # exists -- marked RESOLVED, so nothing would re-run to replace it. Skipping stamps the node
+        # UNRESOLVED instead, and the producer re-runs on load.
+        if parameter.holds_local_object:
+            if isinstance(create_node_request, CreateNodeRequest):
+                create_node_request.resolution = NodeResolutionState.UNRESOLVED.value
+            return None
         command = NodeManager._handle_value_hashing(
             value=value,
             serialized_parameter_value_tracker=serialized_parameter_value_tracker,
@@ -4582,9 +4640,8 @@ class NodeManager(EngineScoped):
         if isinstance(create_node_request, CreateNodeRequest):
             create_node_request.resolution = NodeResolutionState.UNRESOLVED.value
 
-        # Author opted out via serializable=False, or the parameter holds a handle, whose key means
-        # nothing in another process — silently skip; not a failure.
-        if not parameter.serializable or parameter.holds_local_object:
+        # Author opted out via serializable=False — silently skip; not a failure.
+        if not parameter.serializable:
             return None
         # Genuine serialization failure — warn and mark unresolved.
         details = f"Attempted to serialize {value_kind} value for parameter '{parameter.name}' on node '{node.name}'. The {value_kind} value will not be restored in anything that attempts to deserialize or save this node. The value for this parameter was not serialized because it did not match Griptape Nodes' criteria for serializability. To remedy, either update the value's type to support serializability or mark the parameter as not serializable by setting serializable=False when creating the parameter."

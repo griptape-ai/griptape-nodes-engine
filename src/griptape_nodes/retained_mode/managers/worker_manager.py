@@ -713,8 +713,6 @@ class WorkerManager(EngineScoped):
         With no running loop the keys stay queued and the next drain sends them, so a release issued from a
         thread or a sync test is not lost.
         """
-        from griptape_nodes.app.worker_routing import DropLocalObjectsRequest
-
         if self._transport is None or not self._workers:
             # Nothing to tell. Draining keeps the queue from growing for the life of the process.
             self.engine.resource_manager.drain_pending_worker_releases()
@@ -726,10 +724,29 @@ class WorkerManager(EngineScoped):
         keys = self.engine.resource_manager.drain_pending_worker_releases()
         if not keys:
             return
-        event = EventRequest(request=DropLocalObjectsRequest(keys=keys))
-        task = loop.create_task(self.broadcast_to_workers(event))
+        task = loop.create_task(self._send_local_object_releases(keys))
         self._inflight_broadcast_tasks.add(task)
         task.add_done_callback(self._inflight_broadcast_tasks.discard)
+
+    async def _send_local_object_releases(self, keys: list[str]) -> None:
+        """Fan the keys out, putting them back on the queue if the send fails.
+
+        They were drained before this ran, so without the re-queue a task that dies with a transient side
+        loop -- the case `broadcast_drop_all_local_objects` documents below -- would take them with it and
+        nothing would ever retry.
+        """
+        from griptape_nodes.app.worker_routing import DropLocalObjectsRequest
+
+        try:
+            await self.broadcast_to_workers(EventRequest(request=DropLocalObjectsRequest(keys=keys)))
+        except Exception as e:
+            self.engine.resource_manager.requeue_pending_worker_releases(keys)
+            logger.warning(
+                "Could not tell the workers to release %d held object(s): %s. Queued to go with the next "
+                "release or at teardown.",
+                len(keys),
+                e,
+            )
 
     async def broadcast_pending_local_object_releases(self) -> None:
         """Tell every worker about keys released here that it may also be holding.

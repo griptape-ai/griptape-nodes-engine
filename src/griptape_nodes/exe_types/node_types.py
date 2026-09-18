@@ -342,6 +342,12 @@ class BaseNode(ABC):
             self.metadata = {}
         else:
             self.metadata = metadata
+        # The identity held objects are parked under. Display names are recycled -- delete Producer_1 and
+        # the next node created gets Producer_1 back -- so parking under the name would let a new node
+        # displace and free a dead node's object while a consumer still holds its key. Minted once here
+        # and carried in metadata, it survives the trip to a worker's transient node (ExecuteNodeRequest
+        # copies metadata) and survives rename, so a renamed node keeps displacing its own prior objects.
+        self.metadata.setdefault("local_object_source", f"{name}@{uuid.uuid4().hex[:8]}")
         self.parameter_values = {}
         self.parameter_output_values = TrackedParameterOutputValues(self)
         self._local_objects = None
@@ -1284,19 +1290,10 @@ class BaseNode(ABC):
         """
         if self._local_objects is None:
             self._local_objects = LocalObjectScope(
-                owner=owner_for_library(self.metadata.get("library")), source=self.name
+                owner=owner_for_library(self.metadata.get("library")),
+                source=str(self.metadata["local_object_source"]),
             )
         return self._local_objects
-
-    def release_displaced_handle(self, key: Any) -> None:
-        """Release the object a handle parameter referred to before its value changed.
-
-        Called by the engine, not by libraries. The key may name an object held in this process or in a
-        worker, so the worker half queues here and is sent from the async path that drains it.
-        """
-        if not isinstance(key, str) or not key.startswith(f"{self.local_objects.owner}:"):
-            return
-        self.local_objects.release_everywhere(key)
 
     def resolve_handle(self, param_name: str) -> Any:
         """The object behind a `handle[...]` parameter's value, raising if this process is not holding it.
@@ -1986,14 +1983,9 @@ class TrackedParameterOutputValues(dict[str, Any]):
         # would keep showing the stale prior value.
         if not had_key or old_value != value:
             self._emit_parameter_change_event(key, value)
-            if parameter is not None and parameter.holds_local_object:
-                # The value that just went is the only reference anything had to that object. Consumers
-                # hold copies of the old key, but re-running this node unresolved them, so each is
-                # refreshed before it runs again.
-                self._node.release_displaced_handle(old_value)
 
-    def _park_local_object(self, parameter: Parameter, value: Any) -> str:
-        """Hold `value` in this process and return the key to put in the parameter instead.
+    def _park_local_object(self, parameter: Parameter, value: Any) -> Any:
+        """Hold `value` in this process and return the key to store in the parameter instead of it.
 
         Runs wherever the value was produced, so an object built in a worker stays in that worker and only
         its key crosses the wire. A value that is already this library's key is passed through, which is
@@ -2001,14 +1993,17 @@ class TrackedParameterOutputValues(dict[str, Any]):
         same object twice.
         """
         scope = self._node.local_objects
-        if isinstance(value, str) and value.startswith(f"{scope.owner}:"):
+        if value is None or (isinstance(value, str) and value.startswith(f"{scope.owner}:")):
+            # A key already belonging to this library is passed through rather than parked again, so a node
+            # that changes an object in place and outputs it keeps one entry for it. None is passed through
+            # too, so a consumer is told nothing is connected rather than resolving to None.
+            #
+            # Either way the node re-ran without parking, so whatever it parked here last run is displaced
+            # now, exactly as a fresh park would displace it. Without this, a node that alternates between
+            # producing an object and passing its upstream's through strands its own prior entry.
+            scope.vacate_slot(parameter.name, keeping=value if isinstance(value, str) else None)
             return value
-        # Unique per assignment. Stable keys were tried first and are worse: writing the same string back
-        # means `old_value != value` is False above, so nothing is emitted and the editor never learns the
-        # value changed. uuid rather than a counter because a key minted here may be released from another
-        # process, and two processes counting from one would collide.
-        suffix = f"{self._node.name}.{parameter.name}#{uuid.uuid4().hex[:8]}"
-        return scope.put(value, key=suffix, on_drop=parameter.on_local_object_drop)
+        return scope.park(value, parameter_name=parameter.name, on_drop=parameter.on_local_object_drop)
 
     def __delitem__(self, key: str) -> None:
         if key in self:
