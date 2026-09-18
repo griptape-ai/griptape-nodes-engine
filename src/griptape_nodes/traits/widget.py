@@ -1,9 +1,8 @@
-from dataclasses import dataclass, field
+import attrs
 
 from griptape_nodes.exe_types.core_types import Trait
 
 
-@dataclass(eq=False, kw_only=True)
 class Widget(Trait):
     """Associates a parameter with a UI widget from a library.
 
@@ -11,16 +10,12 @@ class Widget(Trait):
     The widget must be registered in the library's widgets list.
     """
 
-    library: str  # Library that provides the widget (e.g., "example_nodes_template")
-    element_id: str = field(default_factory=lambda: "Widget")
-
-    def __init__(self, name: str, library: str) -> None:
-        super().__init__()
-        self.name = name
-        self.library = library
+    # Avoid collision with the element wiring field named ``name``.
+    widget_name: str = attrs.field()
+    library: str = attrs.field()
 
     def ui_options_for_trait(self) -> dict:
         return {
-            "widget": self.name,
+            "widget": self.widget_name,
             "library": self.library,
         }
