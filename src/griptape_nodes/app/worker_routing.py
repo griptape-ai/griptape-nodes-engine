@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from dataclasses import fields as dc_fields
 from typing import TYPE_CHECKING, Any, TypeGuard, cast
 
 from griptape_nodes.common.strict_mode import STRICT_MODE
@@ -181,66 +180,33 @@ class ActivateProjectResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure
     """Worker failed to adopt the orchestrator's current project."""
 
 
-def _registers_a_python_class(payload: type) -> bool:
-    """Whether a field is declared as a bare ``type``.
-
-    Two reasons such a request must stay local, and either alone is sufficient. cattrs has no
-    structure hook for ``type``, so the orchestrator's ingress raises and the worker blocks until
-    the forward times out. And the point of the request is to put a *class* into a process-local
-    registry: forwarding it would register something in the wrong process while the worker -- the
-    one that needs the provider while running a node -- registers nothing.
-    """
-    return any(
-        _annotation_text(field.type).strip().startswith(("type[", "type "))
-        or _annotation_text(field.type).strip() == "type"
-        for field in dc_fields(payload)
-    )
-
-
-def _annotation_text(annotation: object) -> str:
-    """The annotation as text, whichever form the module stored it in.
-
-    `str(annotation)` rather than `__name__`, because composite shapes have no useful name:
-    `MacroPath | None` is a UnionType whose `__name__` does not exist, and `list[MacroPath]`
-    is named just `list` -- both would silently defeat a matcher that only reads names, and
-    a missed MacroPath means a forwarded request that dies on the wire instead of answering
-    locally.
-    """
-    if isinstance(annotation, str):
-        return annotation
-    if isinstance(annotation, type):
-        # str() of a plain class is "<class 'x.Y'>", which matches nothing a matcher looks
-        # for -- and `provider_class: type` (a bare builtin) is exactly the shape the
-        # type-registration predicate exists to catch.
-        return annotation.__name__
-    return str(annotation)
+# The artifact_events requests a worker answers itself, named rather than detected. The reason is
+# never serialization -- these all cross the wire fine -- so a rule that reads field annotations
+# would state the wrong cause and would silently re-route them the moment serialization changed.
+_LOCAL_ONLY_ARTIFACT_REQUESTS: frozenset[type[RequestPayload]] = frozenset(
+    {
+        # Registration puts a *class* into this process's provider registry. Forwarding would
+        # register it in the orchestrator while the worker, the process that needs the provider to
+        # run a node, registers nothing.
+        artifact_events.RegisterArtifactProviderRequest,
+        artifact_events.RegisterPreviewGeneratorRequest,
+        # Preview generation resolves a provider out of that same process-local registry and writes
+        # into the project's previews directory, so it belongs with the registrations above.
+        artifact_events.GeneratePreviewRequest,
+        artifact_events.GeneratePreviewFromDefaultsRequest,
+        artifact_events.GetPreviewForArtifactRequest,
+    }
+)
 
 
-def _carries_a_macro_path(payload: type) -> bool:
-    """Whether any field of ``payload`` is declared as a ``MacroPath``.
-
-    A MacroPath wraps a ParsedMacro, which will not serialize, so a request carrying one cannot be
-    forwarded at all: the send raises and the worker blocks until the forward times out. Matched on
-    the declared annotation text rather than a resolved type, because these modules annotate under
-    `from __future__ import annotations` and several cannot be resolved at runtime.
-
-    Applied to the two modules swept below, which are the only ones defining a MacroPath carrier
-    today. The invariant is wider than that scope, so a test sweeps the whole payload registry
-    and fails if a carrier appears elsewhere -- rather than this widening to the registry, where
-    a false positive would silently answer a request in the wrong process.
-    """
-    return any("MacroPath" in _annotation_text(field.type) for field in dc_fields(payload))
-
-
-# Requests a worker must answer itself, derived from the CAUSE rather than listed, so a request
-# added later is covered without anyone remembering this file. Two independent reasons: filesystem
-# work, where the shared-on-disk workspace makes the worker's own answer the authoritative one and
-# forwarding a write corrupts it (`content` is `str | bytes` and the wire form resolves back to
-# `str`); and carrying a MacroPath, which cannot serialize at all.
+# os_events is swept wholesale rather than listed, so a filesystem request added later is local
+# without anyone remembering this file. The reason is the shared-on-disk workspace: the worker's own
+# answer is the authoritative one, and forwarding a write corrupts it (`content` is `str | bytes`
+# and the wire form resolves back to `str`).
 #
 # OpenAssociatedFileRequest is the one filesystem request deliberately NOT local: it hands a path to
 # the OS to open in the user's default application, and that side effect belongs where the user is,
-# not in a headless subprocess. It carries no MacroPath, so nothing else claims it.
+# not in a headless subprocess.
 _FORWARDING_FILESYSTEM_REQUESTS: frozenset[type[RequestPayload]] = frozenset({os_events.OpenAssociatedFileRequest})
 
 
@@ -252,33 +218,21 @@ _FORWARDING_FILESYSTEM_REQUESTS: frozenset[type[RequestPayload]] = frozenset({os
 # than a guarantee, which is why the pinning test makes each member a reviewed decision.
 _WHOLESALE_LOCAL_MODULES = (os_events,)
 
-# These modules hold requests that are NOT all filesystem work, so membership is earned rather than
-# assumed: only the ones carrying something the wire cannot deliver qualify. Everything else in them
-# forwards like any other request.
-_SELECTIVE_LOCAL_MODULES = (artifact_events,)
-
 
 def _local_only_by_derivation() -> frozenset[type[RequestPayload]]:
-    """The request types routed local by rule rather than by name.
+    """The request types routed local by rule rather than one at a time.
 
-    Two policies, because the two module groups differ. A wholesale module is local in full. A
-    selective module contributes only its undeliverable carriers -- a MacroPath field, or a
-    bare `type` field whose class has to land in the process that will instantiate it.
+    Only os_events is swept. A request added to it later is local without anyone remembering this
+    file, and the cost is that it is also ROUTED without anyone deciding, so
+    `tests/unit/app/test_worker_routing_filesystem.py` pins the exact membership: a new one fails
+    that test and forces the call.
 
-    Deriving rather than listing means a request added to one of these modules later is covered
-    without anyone remembering this file. The cost is that it also ROUTES that request without
-    anyone deciding, so `tests/unit/app/test_worker_routing_filesystem.py` pins the exact
-    membership: a new one fails that test and forces the call.
+    artifact_events is not swept. Its local members are named in _LOCAL_ONLY_ARTIFACT_REQUESTS,
+    because what binds them is what each request DOES, which no rule over field types can see.
     """
-    derived: set[type[RequestPayload]] = set()
+    derived: set[type[RequestPayload]] = set(_LOCAL_ONLY_ARTIFACT_REQUESTS)
     for module in _WHOLESALE_LOCAL_MODULES:
         derived.update(_candidate_request_types(module))
-    for module in _SELECTIVE_LOCAL_MODULES:
-        derived.update(
-            payload
-            for payload in _candidate_request_types(module)
-            if _carries_a_macro_path(payload) or _registers_a_python_class(payload)
-        )
     return frozenset(derived)
 
 
@@ -349,11 +303,10 @@ LOCAL_ONLY_REQUEST_TYPES: frozenset[type[RequestPayload]] = frozenset(
         #
         # --- 2. The worker's own answer is the correct one ---------------------------------------
         #
-        # Derived, not enumerated, so a request added to a swept module is covered by construction;
         # `test_worker_routing_filesystem.py` pins the membership and comments it by group. All of
         # os_events, because the workspace is shared on disk (OpenAssociatedFileRequest excepted --
-        # opening a file in the user's app belongs where the user is), plus the artifact_events
-        # requests that carry a MacroPath or a bare `type` for a process-local registry.
+        # opening a file in the user's app belongs where the user is), plus the named
+        # artifact_events requests that answer out of this process's provider registry.
         *_LOCAL_ONLY_FILESYSTEM_REQUESTS,
         # The payload IS the file body, so forwarding would base64 a whole generated asset across
         # the boundary on every save. The worker writes it through its own storage driver instead and
