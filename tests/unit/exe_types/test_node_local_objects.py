@@ -6,7 +6,7 @@ key, and `node.local_objects`, where a library names its own key for a resource 
 
 import pytest
 
-from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
+from griptape_nodes.exe_types.core_types import Parameter, ParameterMode, ParameterType
 from griptape_nodes.exe_types.node_types import BaseNode
 
 
@@ -281,3 +281,40 @@ class TestSurvivesNodeDiscard:
         next_execution.set_parameter_value("pipeline", key)
 
         assert next_execution.resolve_handle("pipeline") is held
+
+
+class TestAHandleOnlyConnectsToAHandle:
+    """`any` accepts everything else, but a handle's value is a key into one process's memory.
+
+    An `any` consumer (Reroute, Display) would show an opaque string, serialize it, and, if it allows
+    PROPERTY, keep it past disconnection -- pinning the object against release with nothing able to
+    resolve it.
+    """
+
+    @pytest.mark.parametrize(
+        ("source", "target", "expected"),
+        [
+            ("handle[Pipeline]", "any", False),
+            ("handle", "any", False),
+            ("any", "handle[Pipeline]", False),
+            ("str", "handle[Pipeline]", False),
+            ("handle[Pipeline]", "handle[Pipeline]", True),
+            ("handle[Pipeline]", "handle", True),
+            ("str", "any", True),
+        ],
+    )
+    def test_compatibility(self, source: str, target: str, expected: bool) -> None:  # noqa: FBT001
+        assert ParameterType.are_types_compatible(source, target) is expected
+
+
+class TestAHandleParameterIsNeverSerializable:
+    def test_declaring_the_type_is_what_forces_it_off(self) -> None:
+        """One mechanism, owned by the parameter.
+
+        to_dict, the GUI, and the serializer all read the same flag, so they cannot disagree about the
+        same parameter.
+        """
+        parameter = Parameter(name="pipe", output_type="handle[Pipeline]", tooltip="")
+
+        assert parameter.serializable is False
+        assert parameter.to_dict()["serializable"] is False

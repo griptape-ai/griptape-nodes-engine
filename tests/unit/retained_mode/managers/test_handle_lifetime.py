@@ -349,7 +349,9 @@ class TestSaving:
         producer.parameter_output_values["latent"] = Held("latent")
         parameter = producer.get_parameter_by_name("latent")
         assert parameter is not None
-        assert parameter.serializable is True
+        # The author never set it: declaring the type handle[...] is what forced it off, which is why
+        # to_dict and the serializer cannot disagree about this parameter.
+        assert parameter.serializable is False
 
         tracker = SerializedParameterValueTracker()
         uuid_to_values: dict = {}

@@ -65,7 +65,7 @@ class TestPutAndGet:
         manager = engine.resource_manager
         held = Held("pipeline")
 
-        key = manager.put_local_object(held, owner="Lib A", source="Builder")
+        key = manager.put_local_object(held, owner="Lib A", source="Builder", key="Builder-slot")
 
         assert manager.get_local_object(key, owner="Lib A") is held
 
@@ -88,7 +88,7 @@ class TestPutAndGet:
     def test_reading_another_library_s_key_misses(self, engine: Engine) -> None:
         """An unscoped read here would work only while both libraries happened to share a process."""
         manager = engine.resource_manager
-        key = manager.put_local_object(Held("theirs"), owner="Lib A", source="N")
+        key = manager.put_local_object(Held("theirs"), owner="Lib A", source="N", key="N-slot")
 
         assert manager.get_local_object(key, owner="Lib B") is None
         assert manager.get_local_object(key, owner="Lib A") is not None
@@ -163,8 +163,8 @@ class TestPutAndGet:
         """Residency scales with producing nodes, not with runs: two nodes coexist, one node twice does not."""
         manager = engine.resource_manager
 
-        first = manager.put_local_object(Held("a"), owner="Lib A", source="Node A")
-        second = manager.put_local_object(Held("b"), owner="Lib A", source="Node B")
+        first = manager.put_local_object(Held("a"), owner="Lib A", source="Node A", key="Node A-slot")
+        second = manager.put_local_object(Held("b"), owner="Lib A", source="Node B", key="Node B-slot")
 
         assert first != second
         assert manager.get_local_object(first, owner="Lib A") is not None
@@ -174,7 +174,7 @@ class TestPutAndGet:
 class TestDrop:
     def test_drop_removes_and_reports(self, engine: Engine) -> None:
         manager = engine.resource_manager
-        key = manager.put_local_object(Held("x"), owner="Lib A", source="N")
+        key = manager.put_local_object(Held("x"), owner="Lib A", source="N", key="N-slot")
 
         assert manager.drop_local_object(key) is True
         assert manager.get_local_object(key, owner="Lib A") is None
@@ -190,6 +190,7 @@ class TestDrop:
             held,
             owner="Lib A",
             source="N",
+            key="N-slot",
             on_drop=lambda value: released.append(value.label),
         )
         manager.drop_local_object(key)
@@ -204,6 +205,7 @@ class TestDrop:
             Held("theirs"),
             owner="Lib A",
             source="N",
+            key="N-slot",
             on_drop=lambda value: released.append(value.label),
         )
 
@@ -213,7 +215,7 @@ class TestDrop:
 
     def test_owner_may_drop_its_own(self, engine: Engine) -> None:
         manager = engine.resource_manager
-        key = manager.put_local_object(Held("mine"), owner="Lib A", source="N")
+        key = manager.put_local_object(Held("mine"), owner="Lib A", source="N", key="N-slot")
 
         assert manager.drop_local_object(key, owner="Lib A") is True
 
@@ -229,7 +231,7 @@ class TestDrop:
             error = "teardown failed"
             raise RuntimeError(error)
 
-        key = manager.put_local_object(Held("x"), owner="Lib A", source="N", on_drop=explode)
+        key = manager.put_local_object(Held("x"), owner="Lib A", source="N", key="N-slot", on_drop=explode)
 
         assert manager.drop_local_object(key) is True
         assert manager.get_local_object(key, owner="Lib A") is None
@@ -238,8 +240,8 @@ class TestDrop:
 class TestDropForLibrary:
     def test_drops_only_that_library(self, engine: Engine) -> None:
         manager = engine.resource_manager
-        mine = manager.put_local_object(Held("mine"), owner="Lib A", source="N")
-        theirs = manager.put_local_object(Held("theirs"), owner="Lib B", source="N")
+        mine = manager.put_local_object(Held("mine"), owner="Lib A", source="N", key="N-slot")
+        theirs = manager.put_local_object(Held("theirs"), owner="Lib B", source="N", key="N-slot")
 
         dropped = manager.drop_objects_for_owner("Lib A")
 
@@ -255,6 +257,7 @@ class TestDropForLibrary:
                 Held(label),
                 owner="Lib A",
                 source="N",
+                key="N-slot",
                 on_drop=lambda value: released.append(value.label),
             )
 
@@ -271,11 +274,12 @@ class TestDropForLibrary:
             error = "teardown failed"
             raise RuntimeError(error)
 
-        manager.put_local_object(Held("bad"), owner="Lib A", source="Node A", on_drop=explode)
+        manager.put_local_object(Held("bad"), owner="Lib A", source="Node A", key="Node A-slot", on_drop=explode)
         manager.put_local_object(
             Held("good"),
             owner="Lib A",
             source="Node B",
+            key="Node B-slot",
             on_drop=lambda value: released.append(value.label),
         )
         entries_put = 2
@@ -291,7 +295,7 @@ class TestPresence:
         """One sentinel lookup leaves no window for a drop between a presence check and a read."""
         manager = engine.resource_manager
         missing = object()
-        key = manager.put_local_object(None, owner="Lib A", source="N")
+        key = manager.put_local_object(None, owner="Lib A", source="N", key="N-slot")
 
         assert manager.get_local_object(key, owner="Lib A", default=missing) is None
         assert manager.get_local_object("Lib A:gone", owner="Lib A", default=missing) is missing
@@ -312,15 +316,6 @@ class TestKeyDerivation:
 
         assert manager.local_object_key("cfg", owner="Lib A") == put_key
 
-    def test_default_key_is_the_source(self, engine: Engine) -> None:
-        """A random default would have no owner able to release it, so a re-run would strand the old one."""
-        manager = engine.resource_manager
-        first = manager.put_local_object(Held("a"), owner="Lib A", source="Loader")
-        second = manager.put_local_object(Held("b"), owner="Lib A", source="Loader")
-
-        assert first == second
-        assert first == manager.local_object_key("Loader", owner="Lib A")
-
     def test_a_re_run_releases_what_it_replaced(self, engine: Engine) -> None:
         """The point of keying on the node: residency is bounded by producing nodes, not executions."""
         manager = engine.resource_manager
@@ -331,6 +326,7 @@ class TestKeyDerivation:
                 Held(label),
                 owner="Lib A",
                 source="Loader",
+                key="Loader-slot",
                 on_drop=lambda value: released.append(value.label),
             )
 
@@ -387,7 +383,7 @@ class TestCapabilityMapIsSeparate:
         manager = engine.resource_manager
         before = len(manager._capability_instances)
 
-        manager.put_local_object(Held("x"), owner="Lib A", source="N")
+        manager.put_local_object(Held("x"), owner="Lib A", source="N", key="N-slot")
 
         assert len(manager._capability_instances) == before
 
@@ -405,9 +401,10 @@ class TestLibraryUnloadClears:
             Held("mine"),
             owner="MyLib",
             source="N",
+            key="N-slot",
             on_drop=lambda value: released.append(value.label),
         )
-        theirs = manager.put_local_object(Held("theirs"), owner="OtherLib", source="N")
+        theirs = manager.put_local_object(Held("theirs"), owner="OtherLib", source="N", key="N-slot")
 
         with (
             patch.object(LibraryRegistry, "unregister_library"),
@@ -434,6 +431,7 @@ class TestWorkflowStateClearReleasesObjects:
                 Held(label),
                 owner=library,
                 source="N",
+                key="N-slot",
                 on_drop=lambda value: released.append(value.label),
             )
 
@@ -447,7 +445,7 @@ class TestWorkflowStateClearReleasesObjects:
         """Teardown runs on the orchestrator, so without the broadcast the worker keeps its objects."""
         engine.context_manager.push_workflow("wf")
 
-        with patch.object(engine.worker_manager, "broadcast_drop_all_local_objects", AsyncMock()) as broadcast:
+        with patch.object(engine.worker_manager, "broadcast_local_object_teardown", AsyncMock()) as broadcast:
             engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
 
         assert broadcast.await_count == 1
@@ -458,7 +456,7 @@ class TestWorkflowStateClearReleasesObjects:
 
         with (
             patch.object(engine, "clear_current_workflow_data", side_effect=RuntimeError("teardown blew up")),
-            patch.object(engine.worker_manager, "broadcast_drop_all_local_objects", AsyncMock()) as broadcast,
+            patch.object(engine.worker_manager, "broadcast_local_object_teardown", AsyncMock()) as broadcast,
         ):
             result = engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
 
@@ -492,7 +490,7 @@ class TestWorkflowStateClearReleasesObjects:
         """
         engine.context_manager.push_workflow("wf")
 
-        with patch.object(engine.worker_manager, "broadcast_drop_all_local_objects", AsyncMock()) as broadcast:
+        with patch.object(engine.worker_manager, "broadcast_local_object_teardown", AsyncMock()) as broadcast:
             engine.handle_request(DeleteWorkflowRequest(name="wf"))
 
         assert broadcast.await_count == 1
@@ -520,6 +518,7 @@ class TestWorkflowStateClearReleasesObjects:
             Held("x"),
             owner="Lib A",
             source="N",
+            key="N-slot",
             on_drop=lambda value: released.append(value.label),
         )
         engine.context_manager.push_workflow("wf")
@@ -531,7 +530,7 @@ class TestWorkflowStateClearReleasesObjects:
     def test_a_refused_clear_releases_nothing(self, engine: Engine) -> None:
         """The guard rejects the request before any teardown, so objects must survive it."""
         manager = engine.resource_manager
-        key = manager.put_local_object(Held("x"), owner="Lib A", source="N")
+        key = manager.put_local_object(Held("x"), owner="Lib A", source="N", key="N-slot")
 
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=False))
 
@@ -565,7 +564,9 @@ class TestConcurrentAccess:
             try:
                 index = 0
                 while not stop.is_set():
-                    manager.put_local_object(Held(str(index)), owner="Lib A", source=f"N{index % 20}")
+                    manager.put_local_object(
+                        Held(str(index)), owner="Lib A", source=f"N{index % 20}", key=f"N{index % 20}"
+                    )
                     index += 1
             except Exception as exc:
                 errors.append(exc)
@@ -597,7 +598,7 @@ class TestConcurrentAccess:
             with release_lock:
                 released.append(value.label)
 
-        key = manager.put_local_object(Held("once"), owner="Lib A", source="N", on_drop=record)
+        key = manager.put_local_object(Held("once"), owner="Lib A", source="N", key="N-slot", on_drop=record)
         # The lookup and the delete are adjacent bytecodes, so no switch interval preempts between them
         # and an unsynchronized drop passes. Ordering the delete after a second read is what forces the
         # interleaving this test is about.
@@ -723,3 +724,29 @@ def test_malformed_keys_miss_rather_than_raise(engine: Engine, bad_key: str) -> 
     """A key arrives from a parameter value, so it can be anything. A lookup must not raise."""
     assert engine.resource_manager.get_local_object(bad_key, owner="Lib A") is None
     assert engine.resource_manager.drop_local_object(bad_key) is False
+
+
+class TestTeardownBroadcastPairing:
+    def test_the_combined_method_sends_named_keys_before_the_drop_all(self, engine: Engine) -> None:
+        """The ordering is an invariant, not a convenience.
+
+        Drop-all declines while a worker is mid-node-execution and the named-key path deliberately does
+        not, so pending keys going first is the only thing that releases displaced objects during a render.
+        """
+        worker_manager = engine.worker_manager
+        order: list[str] = []
+        with (
+            patch.object(
+                worker_manager,
+                "broadcast_pending_local_object_releases",
+                AsyncMock(side_effect=lambda: order.append("pending")),
+            ),
+            patch.object(
+                worker_manager,
+                "broadcast_drop_all_local_objects",
+                AsyncMock(side_effect=lambda: order.append("drop_all")),
+            ),
+        ):
+            asyncio.run(worker_manager.broadcast_local_object_teardown())
+
+        assert order == ["pending", "drop_all"]

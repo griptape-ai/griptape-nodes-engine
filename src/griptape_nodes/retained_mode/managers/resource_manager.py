@@ -360,15 +360,13 @@ class ResourceManager(EngineScoped):
         *,
         owner: str,
         source: str,
-        key: str | None = None,
+        key: str,
         slot: str | None = None,
         on_drop: Callable[[Any], None] | None = None,
     ) -> str:
         """Hold `value` in this process and return the key that refers to it.
 
         The key is namespaced by `owner`, so two owners choosing the same suffix scheme cannot collide.
-        Supplying `key` reuses a slot the caller can name again (a config hash); omitting it uses
-        `source`.
 
         `slot` marks an entry the engine parked for one of `source`'s parameters. A slot holds one object:
         parking into it again releases the previous occupant, in this process, which is the process that
@@ -376,11 +374,7 @@ class ResourceManager(EngineScoped):
         clears parameter values through several paths and none of them can be trusted to still hold the
         old key by the time the new one is written.
         """
-        # The suffix defaults to the source rather than to something unique per put, so that putting
-        # again displaces what the same source put last time and routes it through `on_drop`. A random
-        # suffix would leave every earlier object resident and unreachable.
-        suffix = key if key is not None else source
-        full_key = self.local_object_key(suffix, owner=owner)
+        full_key = self.local_object_key(key, owner=owner)
         entry = LocalObjectEntry(
             value=value,
             owner=owner,

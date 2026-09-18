@@ -154,8 +154,7 @@ class ObjectManager(EngineScoped):
             #
             # In the finally because nothing retries this request, so a worker that was never told keeps
             # its objects for the life of the process.
-            await self.engine.worker_manager.broadcast_pending_local_object_releases()
-            await self.engine.worker_manager.broadcast_drop_all_local_objects()
+            await self.engine.worker_manager.broadcast_local_object_teardown()
 
         if self._name_to_objects:
             details = f"Attempted to clear all object state, but {len(self._name_to_objects)} object(s) remained after workflow teardown."

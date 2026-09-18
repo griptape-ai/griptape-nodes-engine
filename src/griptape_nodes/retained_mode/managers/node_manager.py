@@ -4755,14 +4755,6 @@ class NodeManager(EngineScoped):
         # No value of this kind was set on the node.
         if value is None:
             return None
-        # Ahead of the hashing: a handle key is a picklable string, so it would hash and serialize like
-        # any other value, and the reloaded workflow would hold a key into a process that no longer
-        # exists -- marked RESOLVED, so nothing would re-run to replace it. Skipping stamps the node
-        # UNRESOLVED instead, and the producer re-runs on load.
-        if parameter.holds_local_object:
-            if isinstance(create_node_request, CreateNodeRequest):
-                create_node_request.resolution = NodeResolutionState.UNRESOLVED.value
-            return None
         command = NodeManager._handle_value_hashing(
             value=value,
             serialized_parameter_value_tracker=serialized_parameter_value_tracker,

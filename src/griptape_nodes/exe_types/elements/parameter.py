@@ -260,6 +260,12 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         self.input_types = input_types
         self.output_type = output_type
 
+        # A handle's value is a key into one process's memory, so it can never be saved: the engine
+        # already owns one mechanism for "skip this value, re-run the node on load", and this is it.
+        # Forced rather than documented, so to_dict and the GUI agree with the serializer.
+        if self.holds_local_object:
+            self.serializable = False
+
     def to_dict(self) -> dict[str, Any]:
         """Returns a nested dictionary representation of this node and its children."""
         # Get the parent's version first.

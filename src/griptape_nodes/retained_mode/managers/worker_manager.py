@@ -773,6 +773,17 @@ class WorkerManager(EngineScoped):
                 e,
             )
 
+    async def broadcast_local_object_teardown(self) -> None:
+        """Tell every worker to release named pending keys, then everything its libraries hold.
+
+        One method because the ordering is an invariant, not a convenience: the drop-all declines while a
+        worker is mid-node-execution, and the named-key path deliberately does not, so sending the pending
+        keys first is the only thing that gets displaced objects released during a render. Two teardown
+        sites call this; neither may take half of it.
+        """
+        await self.broadcast_pending_local_object_releases()
+        await self.broadcast_drop_all_local_objects()
+
     async def broadcast_drop_all_local_objects(self) -> None:
         """Tell every worker to release the objects its libraries parked in it.
 

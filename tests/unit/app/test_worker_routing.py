@@ -231,7 +231,7 @@ class TestDropAllLocalObjectsHandler:
     async def test_declines_while_executing_a_node(self, engine: Engine) -> None:
         """Releasing mid-execution would free the pipeline under a forward pass already running."""
         held = object()
-        key = engine.resource_manager.put_local_object(held, owner="Lib A", source="N")
+        key = engine.resource_manager.put_local_object(held, owner="Lib A", source="N", key="N-slot")
 
         with engine.event_manager.worker_node_execution_scope():
             result = await _handle_drop_all_local_objects(
@@ -249,6 +249,7 @@ class TestDropAllLocalObjectsHandler:
             object(),
             owner="Lib A",
             source="N",
+            key="cfg",
             on_drop=lambda _value: release_threads.append(threading.get_ident()),
         )
 

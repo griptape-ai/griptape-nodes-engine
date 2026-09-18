@@ -95,6 +95,11 @@ class ParameterType:
         # If either are None, bail.
         if ParameterTypeBuiltin.NONE.value in (source_type_lower, target_type_lower):
             return False
+        # A handle only connects to a handle, before `any` gets its say. The value is a key into one
+        # process's memory: an `any` consumer would display an opaque string, serialize it, and -- if it
+        # allows PROPERTY -- keep it past disconnection, pinning the object against release forever.
+        if ParameterType.is_handle(source_type_lower) != ParameterType.is_handle(target_type_lower):
+            return False
         if target_type_lower == ParameterTypeBuiltin.ANY.value:
             # If the TARGET accepts Any, we're good. Not always true the other way 'round.
             return True
