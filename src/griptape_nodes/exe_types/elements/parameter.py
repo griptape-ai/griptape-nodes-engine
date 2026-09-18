@@ -288,10 +288,17 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         return our_dict
 
     def trait_states(self) -> list[dict[str, Any]]:
-        """Return save-only trait identity and constructor state."""
+        """Return save-only trait identity and constructor state.
+
+        ``NodeManager`` stabilizes dynamic library module names before saving.
+        """
         states: list[dict[str, Any]] = []
         for trait in self.find_elements_by_type(Trait):
-            entry = TraitStateEntry(trait_name=type(trait).__name__, trait_state=trait.to_state())
+            entry = TraitStateEntry(
+                trait_name=type(trait).__name__,
+                trait_module=type(trait).__module__,
+                trait_state=trait.to_state(),
+            )
             states.append(entry.to_dict())
         return states
 

@@ -171,6 +171,7 @@ class TestSerializeThenReplay:
         assert model_command.traits == [
             {
                 "trait_name": "Options",
+                "trait_module": "griptape_nodes.traits.options",
                 "trait_state": {
                     "choices": ["sdxl", "sd3", "flux"],
                     "show_search": True,
@@ -184,6 +185,7 @@ class TestSerializeThenReplay:
         assert reload_command.traits == [
             {
                 "trait_name": "Button",
+                "trait_module": "griptape_nodes.traits.button",
                 "trait_state": {
                     "label": "Reload",
                     "variant": "secondary",
@@ -201,6 +203,41 @@ class TestSerializeThenReplay:
                 },
             }
         ]
+
+    def test_replaying_the_commands_restores_state(self, engine: Engine) -> None:
+        node = _add_node(engine, "picker")
+        node.discover()
+        node.set_parameter_value("model", "flux")
+
+        result = engine.node_manager.on_serialize_node_to_commands(SerializeNodeToCommandsRequest(node_name=node.name))
+        assert isinstance(result, SerializeNodeToCommandsResultSuccess)
+        commands = _added_parameter_commands(result.serialized_node_commands.element_modification_commands)
+
+        target = _add_node(engine, "reloaded")
+        for command in commands.values():
+            command.node_name = target.name
+            command.initial_setup = True
+            replay_result = engine.handle_request(command)
+            assert isinstance(replay_result, AddParameterToNodeResultSuccess)
+
+        model = target.get_parameter_by_name("model")
+        assert model is not None
+        assert model.ui_options["simple_dropdown"] == ["sdxl", "sd3", "flux"]
+        converted = "not-a-model"
+        for converter in model.converters:
+            converted = converter(converted)
+        assert converted == "sdxl"  # Options snaps an invalid value to its first choice.
+
+        # A replayed command carries state, not behavior. Behavior comes from the node's own
+        # code, which is why a declared parameter's button still fires: its trait is built by
+        # __init__ and only updated from the save. A bare replay onto a node whose code never
+        # built this button has nothing to supply the handler.
+        reload_button = next(
+            trait
+            for trait in target.get_parameter_by_name("reload").find_elements_by_type(Button)  # type: ignore[union-attr]
+        )
+        assert reload_button.label == "Reload"
+        assert reload_button.on_click_callback is None
 
 
 class _UnsaveableValueTrait(Trait):
@@ -269,6 +306,7 @@ class TestAnUnsaveableTraitValueDegradesTheSaveInsteadOfFailingIt:
         assert broken_command.traits == [
             {
                 "trait_name": "_UnsaveableValueTrait",
+                "trait_module": _UnsaveableValueTrait.__module__,
                 "trait_state": {},
             }
         ]
