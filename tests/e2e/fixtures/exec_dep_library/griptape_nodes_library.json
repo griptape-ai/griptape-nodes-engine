@@ -1,0 +1,36 @@
+{
+  "name": "Exec Dep Library",
+  "library_schema_version": "0.12.0",
+  "metadata": {
+    "author": "Test Fixture",
+    "description": "Library that declares edit-time and execution dependencies separately",
+    "library_version": "0.1.0",
+    "engine_version": "0.0.0",
+    "tags": ["test"],
+    "dependencies": {
+      "pip_dependencies": [],
+      "pip_dependencies_exec": []
+    }
+  },
+  "categories": [
+    {
+      "test": {
+        "title": "test",
+        "description": "Test nodes",
+        "color": "border-gray-500",
+        "icon": "Folder"
+      }
+    }
+  ],
+  "nodes": [
+    {
+      "class_name": "ExecDepNode",
+      "file_path": "exec_dep_node.py",
+      "metadata": {
+        "category": "test",
+        "description": "Node whose module needs an edit-time dep and whose process needs an execution dep",
+        "display_name": "Exec Dep Node"
+      }
+    }
+  ]
+}

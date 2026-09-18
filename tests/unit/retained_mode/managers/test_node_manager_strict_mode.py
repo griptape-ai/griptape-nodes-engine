@@ -69,6 +69,9 @@ class TestExecuteNodeStrictMode:
         m.is_worker = is_worker
         m._is_worker = is_worker
         m.get_worker_for_library.return_value = None
+        # Awaited on the orchestrator route before a node is routed, so it has to be a coroutine
+        # rather than a plain MagicMock attribute.
+        m.wait_for_worker_library_load = AsyncMock(return_value=None)
         return m
 
     @pytest.mark.asyncio

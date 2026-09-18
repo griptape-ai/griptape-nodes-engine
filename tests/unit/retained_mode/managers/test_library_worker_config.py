@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
 
-from griptape_nodes.node_library.library_registry import LibraryMetadata
+from griptape_nodes.node_library.library_registry import Dependencies, LibraryMetadata
 from griptape_nodes.retained_mode.events.app_events import LibraryLoadedNotification
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 
@@ -69,6 +70,7 @@ class TestGetWorkerForLibrary:
             is_sandbox=False,
             library_name="my_lib",
             requires_worker=True,
+            executes_in_worker=True,
         )
 
         cast("MagicMock", mgr._worker_manager).get_worker_for_key.return_value = (
@@ -106,6 +108,7 @@ class TestGetWorkerForLibrary:
             is_sandbox=False,
             library_name="my_lib",
             requires_worker=True,
+            executes_in_worker=True,
         )
 
         cast("MagicMock", mgr._worker_manager).get_worker_for_key.return_value = None
@@ -174,3 +177,137 @@ class TestRegisterPreReloadCallback:
         mgr.register_pre_reload_callback(second)
 
         assert mgr._pre_reload_callbacks == [*baseline, first, second]
+
+
+class TestResolveExecutesInWorker:
+    """Execution placement is a fact about dependencies, derived not declared."""
+
+    def _metadata(self, *, exec_deps: list[str] | None) -> LibraryMetadata:
+        dependencies = None
+        if exec_deps is not None:
+            dependencies = Dependencies(pip_dependencies=["pillow"], pip_dependencies_exec=exec_deps)
+        return LibraryMetadata(
+            author="t",
+            description="d",
+            library_version="1.0.0",
+            engine_version="0.0.0",
+            tags=[],
+            dependencies=dependencies,
+        )
+
+    def test_exec_dependencies_require_a_worker(self) -> None:
+        result = LibraryManager._resolve_executes_in_worker(
+            requires_worker=False, metadata=self._metadata(exec_deps=["torch"])
+        )
+        assert result is True
+
+    def test_no_dependencies_section_means_no_worker(self) -> None:
+        result = LibraryManager._resolve_executes_in_worker(
+            requires_worker=False, metadata=self._metadata(exec_deps=None)
+        )
+        assert result is False
+
+    def test_empty_exec_dependencies_mean_no_worker(self) -> None:
+        result = LibraryManager._resolve_executes_in_worker(
+            requires_worker=False, metadata=self._metadata(exec_deps=[])
+        )
+        assert result is False
+
+    def test_legacy_worker_mode_still_executes_in_a_worker(self) -> None:
+        """The two reasons are independent: declaring worker mode is sufficient alone."""
+        result = LibraryManager._resolve_executes_in_worker(
+            requires_worker=True, metadata=self._metadata(exec_deps=None)
+        )
+        assert result is True
+
+
+class TestExecuteWaitsForTheWorkerLibraryLoad:
+    """Routing must gate on the worker's LibraryLoadedNotification, not on registration.
+
+    A worker registers at process start, BEFORE it has loaded its library -- with eager
+    execution-module imports, seconds before. A node routed in that window failed in the
+    worker with "Library 'X' not found". The old worker system never had this window:
+    stub nodes did not exist until the worker confirmed the load, so nothing could execute.
+    """
+
+    def _spawned_info(self, *, loaded: bool) -> LibraryManager.LibraryInfo:
+        info = LibraryManager.LibraryInfo(
+            lifecycle_state=LibraryManager.LibraryLifecycleState.LOADED,
+            fitness=LibraryManager.LibraryFitness.GOOD,
+            library_path="/some/path.json",
+            is_sandbox=False,
+            library_name="Lib",
+            executes_in_worker=True,
+        )
+        info.worker_ready = asyncio.Event()
+        if loaded:
+            info.worker_ready.set()
+        return info
+
+    @pytest.mark.asyncio
+    async def test_the_wait_releases_when_the_notification_arrives(self) -> None:
+        mgr = _make_library_manager()
+        info = self._spawned_info(loaded=False)
+        mgr._library_file_path_to_info["/some/path.json"] = info
+        order: list[str] = []
+
+        async def executes() -> None:
+            await mgr.wait_for_worker_library_load("Lib")
+            order.append("routed")
+
+        async def worker_finishes_loading() -> None:
+            order.append("loaded")
+            await mgr._on_library_loaded_notification(LibraryLoadedNotification(library_name="Lib", fitness="GOOD"))
+
+        await asyncio.gather(executes(), worker_finishes_loading())
+
+        assert order == ["loaded", "routed"], "execution routed before the worker reported the library loaded"
+
+    @pytest.mark.asyncio
+    async def test_an_already_loaded_library_does_not_wait(self) -> None:
+        mgr = _make_library_manager()
+        mgr._library_file_path_to_info["/some/path.json"] = self._spawned_info(loaded=True)
+
+        await mgr.wait_for_worker_library_load("Lib")
+
+    @pytest.mark.asyncio
+    async def test_a_library_with_no_spawned_worker_does_not_wait(self) -> None:
+        mgr = _make_library_manager()
+        info = self._spawned_info(loaded=False)
+        info.worker_ready = None
+        mgr._library_file_path_to_info["/some/path.json"] = info
+
+        await mgr.wait_for_worker_library_load("Lib")
+
+    @pytest.mark.asyncio
+    async def test_the_timeout_names_the_library_and_the_ceiling(self) -> None:
+        mgr = _make_library_manager()
+        mgr._library_file_path_to_info["/some/path.json"] = self._spawned_info(loaded=False)
+        mgr._engine = MagicMock()  # type: ignore[assignment]
+        mgr._engine.config_manager.get_config_value.return_value = 0.01
+
+        with pytest.raises(RuntimeError, match="Lib"):
+            await mgr.wait_for_worker_library_load("Lib")
+
+    @pytest.mark.asyncio
+    async def test_an_eviction_during_the_wait_releases_it(self) -> None:
+        """The waiter must not hold on for the full grace for a worker that is already gone."""
+        mgr = _make_library_manager()
+        info = self._spawned_info(loaded=False)
+        mgr._library_file_path_to_info["/some/path.json"] = info
+        order: list[str] = []
+
+        async def executes() -> None:
+            await mgr.wait_for_worker_library_load("Lib")
+            order.append("released")
+
+        async def worker_dies() -> None:
+            order.append("evicted")
+            mgr.on_worker_evicted("worker-1", "Lib")
+
+        await asyncio.gather(executes(), worker_dies())
+
+        assert order == ["evicted", "released"]
+        assert info.lifecycle_state is LibraryManager.LibraryLifecycleState.LOADED, (
+            "an exec-deps library must stay editable through an eviction"
+        )
