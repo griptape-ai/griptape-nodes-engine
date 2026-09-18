@@ -1,20 +1,14 @@
 from collections.abc import Callable
-from dataclasses import dataclass, field
 from typing import Any
+
+import attrs
 
 from griptape_nodes.exe_types.core_types import Trait
 
 
-@dataclass(eq=False)
 class Clamp(Trait):
-    min: Any = 0
-    max: Any = 10
-    element_id: str = field(default_factory=lambda: "ClampTrait")
-
-    def __init__(self, min_val: float | None = None, max_val: float | None = None) -> None:
-        super().__init__()
-        self.min = min_val
-        self.max = max_val
+    min: float | None = attrs.field(default=None, alias="min_val")
+    max: float | None = attrs.field(default=None, alias="max_val")
 
     def _clamp_number(self, value: float) -> float:
         # Keep this as a tiny helper so the converter stays readable and so we can
@@ -32,7 +26,8 @@ class Clamp(Trait):
             return value
         if len(value) <= self.max:
             return value
-        return value[: self.max]
+        # int() because a length cannot be fractional, and slicing by a float raises.
+        return value[: int(self.max)]
 
     def _try_parse_numeric_string(self, value: str) -> float | None:
         # Trait converters run BEFORE parameter-level converters (e.g. ParameterInt/Float
@@ -65,7 +60,7 @@ class Clamp(Trait):
                 # historical string behavior: max length clamping only.
                 if self.max is None or len(value) <= self.max:
                     return value
-                return value[: self.max]
+                return value[: int(self.max)]
 
             if isinstance(value, (int, float)):
                 return self._clamp_number(float(value))

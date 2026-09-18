@@ -1,5 +1,134 @@
 # Unreleased
 
+## A `Trait` declares fields, not a constructor
+
+`BaseNodeElement` is an [attrs](https://www.attrs.org) class, and its metaclass makes every
+element one. A trait declares `attrs.field()` attributes and the constructor is generated,
+element wiring included. There is no decorator to remember and no `super().__init__()` to call:
+
+```python
+import attrs
+
+from griptape_nodes.exe_types.core_types import BEHAVIOR, Trait
+
+
+class Threshold(Trait):
+    level: int = attrs.field(default=5, alias="threshold")
+    on_cross: Callable | None = attrs.field(default=None, metadata=BEHAVIOR)
+```
+
+`Threshold(threshold=8)` sets `self.level`, and a save records `{"threshold": 8}`. Every element
+field is keyword-only, so a trait that took positional arguments (`Slider(0, 100)`) now takes
+`Slider(min_val=0, max_val=100)`.
+
+The fields *are* the saved contract, so there is nothing else to declare and nothing to keep in
+step. Three kinds:
+
+- **state**, the default. Saved as data and handed back to the constructor on load.
+- **behavior**, `metadata=BEHAVIOR`. A callback. Not saved, because the node's own `__init__`
+    supplies it on every load; a save only updates the trait that code already built.
+- **neither**, `init=False`. Not saved, not a constructor argument. For a value the trait
+    derives.
+
+`alias` covers a keyword that differs from the attribute it lands on, which is also how a field
+sits behind a property: a field named `_choices` takes the keyword `choices`, leaving `choices`
+free to be a property.
+
+A subclass inherits its base's fields and declares only its own. To fix an inherited field
+instead of taking an argument for it, re-declare it `init=False`.
+
+**An annotation is not a declaration.** `threshold: int = 5` is a field to a type checker and
+nothing at all to the engine, so it raises at class creation. Declare it with `attrs.field()`,
+mark it `ClassVar` if it is a constant, or annotate it where it is assigned if it is neither.
+
+**The declaration is checked when the class is built**, so a mistake costs a library its import
+rather than an artist's saved work. A state field's type has to be something a saved workflow can
+hold: text, numbers, true/false, and lists or dictionaries of those. These raise `TypeError` at
+class creation:
+
+```python
+class Broken(Trait):
+    root: Path | None = attrs.field(default=None)  # no saved form
+    on_ping: Callable | None = attrs.field(default=None)  # a callback: mark it metadata=BEHAVIOR
+    extensions: set[str] = attrs.field(factory=set)  # a save writes a list: add converter=set
+    derived: str = attrs.field(default="x", init=False)  # fine: init=False is not state
+```
+
+A set or a tuple is saved as a list, which is what the constructor is handed on load, so a field
+declaring one has to convert it back:
+
+```python
+class Extensions(Trait):
+    extensions: set[str] = attrs.field(converter=set, factory=set)
+```
+
+A value whose type passed the check but whose contents cannot be written, a `list[Any]` holding
+an object, is dropped from the state with a warning, and the parameter loads without it.
+
+Two smaller consequences:
+
+- **Elements compare by identity.** `Button(label="Go") == Button(label="Go")` is now False, and
+    a `set` holds both. `Button` and `AddParameterButton` fixed their `element_id`, which used to
+    give them value equality and quietly collapse a pair of identical buttons into one.
+- **`Widget` takes `widget_name`.** It used to overload the element's own `name`, which a
+    generated constructor cannot do: the element base already takes that keyword.
+
+## A trait owns the `ui_options` keys it renders
+
+A trait's options used to be merged into `Parameter.ui_options` and saved as part of it, where
+any stored copy won. The copy could predate the trait's current state, so narrowing a `Slider`
+moved its validator but not the slider an artist sees. Trait state is now saved in its own right,
+and the trait wins:
+
+|                                | before                | after                  |
+| ------------------------------ | --------------------- | ---------------------- |
+| reported to the editor         | stored copy           | what the trait renders |
+| saved                          | merged, copy included | authored options only  |
+| runtime `trait.choices` update | lost unless mirrored  | saved as trait state   |
+
+**A write to a trait-rendered key is routed to the trait that renders it**, whoever writes it:
+node code through `update_ui_options`, the editor, or a saved file. The flat shape keeps working
+for writers that do not know about traits.
+
+Assigning `ui_options` outright is the exception. It is the raw store the routing itself writes
+through, so it cannot route without recursing. A trait-owned key put there is dropped at save and
+shadowed at read, because the trait still owns it.
+
+```python
+parameter.update_ui_options({"slider": {"max_val": height}})  # routed to the Slider
+trait.max = height  # same result, said directly
+parameter.ui_options = {"simple_dropdown": choices}  # dropped at save, shadowed at read
+```
+
+A trait declares what it will adopt by implementing `state_from_ui_options`, the inverse of
+`ui_options_for_trait`. A trait rendering its options under one nested key just names it:
+
+```python
+class Slider(Trait):
+    NESTED_UI_OPTIONS_KEY: ClassVar[str] = "slider"  # adopts what it renders under "slider"
+
+
+class Threshold(Trait):
+    def ui_options_for_trait(self) -> dict:
+        return {"threshold": self.threshold}
+
+    @classmethod
+    def state_from_ui_options(cls, ui_options: dict) -> dict:
+        if "threshold" not in ui_options:
+            return {}
+        return {"threshold": ui_options["threshold"]}
+```
+
+Without it a trait ignores such a write, which is the right answer for a key with no state behind
+it, such as a widget-type marker. A write that would have changed what the trait renders is
+logged, since it is neither applied nor saved. `Options`, `MultiOptions`, and `Slider` adopt
+theirs.
+
+**Workflows already on disk.** A parameter a node's code declares gets its trait back from that
+code, so an older file loses only a change made at run time before the save: a dropdown a node
+filled in reloads with the choices its code declares until the node fills it in again. The next
+save records trait state properly.
+
 ## Branched workflows show a title instead of a file path
 
 Branching a workflow used to set the new workflow's `metadata.name` — the human-readable display
