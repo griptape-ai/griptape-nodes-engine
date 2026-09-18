@@ -868,3 +868,37 @@ class TestAnUnhookedEntryDoesNotSuppressAHookedOne:
         manager.drop_all_local_objects()
 
         assert released == ["shared"]
+
+
+class TestStreamingIntoAHandleIsRefused:
+    def test_append_raises_and_the_object_survives(self, engine: Engine, graph: tuple) -> None:
+        """Concatenating a chunk onto a key makes a string that still looks like this library's key.
+
+        The write path would pass it through and vacate the slot, releasing the object under everyone
+        holding the real key -- on the first chunk, silently. Same rule as containers: fail loudly.
+        """
+        producer, _consumer = graph
+        producer.parameter_output_values["latent"] = Held("streamed")
+        key = producer.parameter_output_values["latent"]
+
+        with pytest.raises(RuntimeError, match="cannot be streamed into"):
+            producer.append_value_to_parameter("latent", "chunk")
+
+        assert producer.released == []
+        assert _is_held(engine, key)
+
+
+class TestBatchTeardownIsOncePerObject:
+    def test_an_owner_sweep_with_one_object_in_two_entries_runs_one_hook(self, engine: Engine) -> None:
+        """The bulk paths' only exactly-once guard is the batch dedupe; drive one directly to pin it."""
+        manager = engine.resource_manager
+        released: list[str] = []
+        shared = Held("shared")
+        for key in ("a", "b"):
+            manager.put_local_object(
+                shared, owner=OWNER, source="S", key=key, on_drop=lambda value: released.append(value.label)
+            )
+
+        manager.drop_objects_for_owner(OWNER)
+
+        assert released == ["shared"]

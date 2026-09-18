@@ -1443,6 +1443,18 @@ class BaseNode(ABC):
     def append_value_to_parameter(self, parameter_name: str, value: Any) -> None:
         from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
+        # A handle's value is a key, and concatenating a chunk onto it makes a string that still looks
+        # like this library's key -- so the write below would pass it through and vacate the slot,
+        # releasing the object under everyone holding the real key. Same rule as containers: failing
+        # loudly beats failing quietly.
+        parameter = self.get_parameter_by_name(parameter_name)
+        if parameter is not None and parameter.holds_local_object:
+            msg = (
+                f"Attempted to append to parameter '{parameter_name}' on node '{self.name}'. Failed "
+                f"because a handle cannot be streamed into: assign the finished object once."
+            )
+            raise RuntimeError(msg)
+
         # Add the value to the node
         if parameter_name in self.parameter_output_values:
             try:
