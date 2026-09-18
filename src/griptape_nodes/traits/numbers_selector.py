@@ -28,10 +28,6 @@ class NumbersSelector(Trait):
         self.overall_min = overall_min
         self.overall_max = overall_max
 
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["numbers_selector"]
-
     def ui_options_for_trait(self) -> dict:
         return {
             "numbers_selector": {
