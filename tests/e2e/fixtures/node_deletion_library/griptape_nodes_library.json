@@ -1,0 +1,41 @@
+{
+  "name": "Node Deletion Library",
+  "library_schema_version": "0.7.0",
+  "metadata": {
+    "author": "Test Fixture",
+    "description": "Gated, streaming nodes for the delete-a-node-during-a-run tests",
+    "library_version": "0.1.0",
+    "engine_version": "0.0.0",
+    "tags": ["test"],
+    "dependencies": {
+      "pip_dependencies": []
+    }
+  },
+  "categories": [
+    {
+      "test": {
+        "title": "test",
+        "description": "Test nodes",
+        "color": "border-gray-500",
+        "icon": "Folder"
+      }
+    }
+  ],
+  "nodes": [
+    {
+      "class_name": "GatedStreamNode",
+      "file_path": "gated_stream_nodes.py",
+      "metadata": {"category": "test", "description": "gated streaming echo", "display_name": "Gated Stream"}
+    },
+    {
+      "class_name": "GatedStreamStartNode",
+      "file_path": "gated_stream_nodes.py",
+      "metadata": {"category": "test", "description": "gated stream start", "display_name": "Gated Stream Start"}
+    },
+    {
+      "class_name": "GatedStreamEndNode",
+      "file_path": "gated_stream_nodes.py",
+      "metadata": {"category": "test", "description": "gated stream end", "display_name": "Gated Stream End"}
+    }
+  ]
+}
