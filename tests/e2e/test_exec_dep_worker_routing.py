@@ -503,20 +503,22 @@ class TestUnshippableOutputGuardrail:
             ExecuteNodeResultSuccess,
         )
 
-        # Set BEFORE registering: the execution venv is spliced onto sys.path during load, and only
-        # for a worker, so flipping the flag afterwards leaves the heavy import unavailable.
-        current_engine().library_manager._is_worker = True
         _register(
             tmp_path,
             fixture_dir=EXEC_FIXTURE,
             node_file="exec_dep_node.py",
             name="Guardrail Serializable",
-            edit_dependencies=["fakeedit"],
-            # Installed so process() actually completes. Without it the node raised on the missing
-            # import every time, so the branch this test is named for never ran and the assertion
-            # below could not distinguish success from any unrelated failure.
+            # Both sets are declared edit-time so this one process can import both. A real worker
+            # receives the execution set as PYTHONPATH from the spawn, which no single-process test
+            # has; the two environments being separate on disk is pinned in
+            # test_library_execution_dependency_split.py and is not what this test is about.
+            edit_dependencies=["fakeedit", "fakeexec"],
+            # Still declared, so the library is worker-routed and the guardrail applies at all.
             exec_dependencies=["fakeexec"],
         )
+        # Flipped after registering, as the sibling guardrail test does: loading a library is the
+        # orchestrator's job, and the flag only selects the execution path under test.
+        current_engine().library_manager._is_worker = True
         node = LibraryRegistry.create_node(
             node_type="ExecDepNode", name="Fine", specific_library_name="Guardrail Serializable"
         )

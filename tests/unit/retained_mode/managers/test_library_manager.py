@@ -860,6 +860,49 @@ class TestLibraryManagerInstallLibraryDependencies:
         assert result.dependencies_installed == 0
 
     @pytest.mark.asyncio
+    async def test_an_unremovable_execution_environment_still_loads_the_library(self, engine: Engine) -> None:
+        """A directory that will not delete costs execution, never editing.
+
+        This runs on the registration path, so raising here takes the library's node types with
+        it -- every workflow using it opens with "Library not found" over a leftover directory.
+        """
+        mgr = engine.library_manager
+        schema = MagicMock()
+        schema.name = "test_lib"
+        schema.metadata.library_version = "1.0.0"
+        schema.metadata.dependencies.pip_dependencies = []
+        schema.metadata.dependencies.pip_install_flags = []
+        schema.metadata.dependencies.pip_dependencies_exec = None
+
+        with (
+            patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
+            # Reports as present so the removal is attempted, unlike _ABSENT_VENV_PATH.
+            patch.object(mgr, "_get_library_venv_path", return_value=MagicMock(exists=MagicMock(return_value=True))),
+            patch.object(
+                mgr,
+                "_init_library_venv",
+                new_callable=AsyncMock,
+                return_value=LibraryVenvInitResult(python_path=MagicMock(), reused=False),
+            ),
+            patch.object(mgr, "_can_write_to_venv_location", return_value=True),
+            patch(
+                "griptape_nodes.retained_mode.managers.library_manager.OSManager.check_available_disk_space",
+                return_value=True,
+            ),
+            patch.object(engine.config_manager, "get_config_value", return_value=5.0),
+            patch(
+                "griptape_nodes.retained_mode.managers.library_manager.shutil.rmtree",
+                side_effect=OSError("in use by another process"),
+            ) as mock_rmtree,
+        ):
+            result = await mgr.install_library_dependencies_request(
+                InstallLibraryDependenciesRequest(library_file_path="/mock.json")
+            )
+
+        mock_rmtree.assert_called_once()
+        assert isinstance(result, InstallLibraryDependenciesResultSuccess)
+
+    @pytest.mark.asyncio
     async def test_returns_failure_when_venv_creation_fails_with_no_deps(self, engine: Engine) -> None:
         """Test that venv creation failure returns failure even when pip_dependencies is empty."""
         mgr = engine.library_manager
@@ -1124,16 +1167,28 @@ class TestLibraryManagerInstallLibraryDependencies:
         mock_reset.assert_called_once()
         assert mock_subprocess.await_count == expected_attempts
 
-    def _worker_schema_without_its_own_execution_set(self, mgr: _LibraryManager) -> MagicMock:
-        """A worker serving `test_lib`, whose manifest declares no execution dependencies."""
+    def _schema_without_its_own_execution_set(self, mgr: _LibraryManager) -> MagicMock:
+        """An orchestrator registering `test_lib`, whose manifest declares no execution deps.
+
+        The orchestrator is the builder: the worker receives `.venv-exec` as PYTHONPATH and so
+        cannot be the process that creates it.
+        """
         schema = MagicMock()
         schema.name = "test_lib"
         schema.metadata.library_version = "1.0.0"
         schema.metadata.dependencies.pip_dependencies = []
         schema.metadata.dependencies.pip_install_flags = []
         schema.metadata.dependencies.pip_dependencies_exec = None
-        mgr._is_worker = True
-        mgr._target_library_names = ["test_lib"]
+        mgr._is_worker = False
+        # The build is scheduled against the library's record, so without one there is nothing to
+        # schedule and the assertions below would pass for the wrong reason.
+        mgr._library_file_path_to_info["/mock.json"] = _LibraryManager.LibraryInfo(
+            lifecycle_state=_LibraryManager.LibraryLifecycleState.DISCOVERED,
+            fitness=_LibraryManager.LibraryFitness.NOT_EVALUATED,
+            library_path="/mock.json",
+            is_sandbox=False,
+            library_name="test_lib",
+        )
         return schema
 
     @pytest.mark.asyncio
@@ -1144,13 +1199,13 @@ class TestLibraryManagerInstallLibraryDependencies:
         environment the dependency's pins were about to be installed into.
         """
         mgr = engine.library_manager
-        schema = self._worker_schema_without_its_own_execution_set(mgr)
+        schema = self._schema_without_its_own_execution_set(mgr)
 
         with (
             patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
             patch.object(mgr, "_execution_dependencies_of_declared_libraries", return_value=["openexr==3.2"]),
             patch.object(mgr, "_retire_execution_env", new_callable=AsyncMock) as mock_retire,
-            patch.object(mgr, "_install_dependency_set", new_callable=AsyncMock) as mock_install,
+            patch.object(mgr, "_install_dependency_set", new_callable=AsyncMock) as mock_build,
             patch.object(mgr, "_this_process_owns_the_edit_venv", return_value=False),
         ):
             result = await mgr.install_library_dependencies_request(
@@ -1159,16 +1214,16 @@ class TestLibraryManagerInstallLibraryDependencies:
 
         mock_retire.assert_not_called()
         assert isinstance(result, InstallLibraryDependenciesResultSuccess)
-        # One resolution, so the dependency's pins go in beside this library's own edit-time set.
-        assert mock_install.await_args is not None
-        assert mock_install.await_args.kwargs["execution"] is True
-        assert "openexr==3.2" in mock_install.await_args.kwargs["pip_dependencies"]
+        # One resolution, so the dependency's pins are scheduled alongside this library's own.
+        assert mock_build.await_args is not None
+        assert mock_build.await_args.kwargs["execution"] is True
+        assert "openexr==3.2" in mock_build.await_args.kwargs["pip_dependencies"]
 
     @pytest.mark.asyncio
     async def test_no_execution_set_anywhere_still_retires(self, engine: Engine) -> None:
         """The combined set must not keep an environment alive for a library that needs none."""
         mgr = engine.library_manager
-        schema = self._worker_schema_without_its_own_execution_set(mgr)
+        schema = self._schema_without_its_own_execution_set(mgr)
 
         with (
             patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
@@ -1195,8 +1250,7 @@ class TestLibraryManagerInstallLibraryDependencies:
         manifests, and nothing patched between the request and the installer.
         """
         mgr = engine.library_manager
-        mgr._is_worker = True
-        mgr._target_library_names = ["Consumer Library"]
+        mgr._is_worker = False
 
         consumer_path = "/libs/consumer/griptape-nodes-library.json"
         # The declaration names a REPO while the registry is keyed by library NAME, so the repo
@@ -1242,7 +1296,7 @@ class TestLibraryManagerInstallLibraryDependencies:
                 "load_library_metadata_from_file_request",
                 side_effect=lambda request: self._metadata_result(schemas[request.file_path]),
             ),
-            patch.object(mgr, "_install_dependency_set", new_callable=AsyncMock) as mock_install,
+            patch.object(mgr, "_install_dependency_set", new_callable=AsyncMock) as mock_build,
             patch.object(mgr, "_this_process_owns_the_edit_venv", return_value=False),
             patch.object(mgr, "_get_library_venv_path", return_value=_ABSENT_VENV_PATH),
         ):
@@ -1251,9 +1305,9 @@ class TestLibraryManagerInstallLibraryDependencies:
             )
 
         assert isinstance(result, InstallLibraryDependenciesResultSuccess)
-        assert mock_install.await_args is not None
-        assert mock_install.await_args.kwargs["execution"] is True
-        assert "openexr==3.2" in mock_install.await_args.kwargs["pip_dependencies"]
+        assert mock_build.await_args is not None
+        assert mock_build.await_args.kwargs["execution"] is True
+        assert "openexr==3.2" in mock_build.await_args.kwargs["pip_dependencies"]
 
 
 def _fake_config_value(key: str, **_: object) -> object:

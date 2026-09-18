@@ -10,20 +10,25 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import json
+import os
 import sys
 import threading
 import time
+from pathlib import Path
+from typing import cast
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
 from griptape_nodes.api_client.request_client import _PendingRequest
 from griptape_nodes.retained_mode.events import worker_events
+from griptape_nodes.retained_mode.events.app_events import CurrentProjectChanged
 from griptape_nodes.retained_mode.events.base_events import EventRequest
 from griptape_nodes.retained_mode.events.execution_events import (
     ExecuteNodeRequest,
     ExecuteNodeResultSuccess,
 )
+from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
 from griptape_nodes.retained_mode.managers.worker_manager import WorkerManager, WorkerRegistration
 from griptape_nodes.utils.version_utils import engine_version
 
@@ -72,6 +77,13 @@ def worker_manager() -> WorkerManager:
     # spawn_worker builds the child env from the orchestrator's pre-project environ;
     # hand back a real dict so {**base_environ, ...} doesn't choke on a MagicMock.
     gtn.project_manager.get_pre_project_environ.return_value = {}
+    # Registration answers from the committed pair; a bare MagicMock cannot be unpacked.
+    gtn.project_manager.committed_project.return_value = ("<system-defaults>", 0)
+    # A MagicMock reads as a truthy failure reason and would refuse every spawn.
+    gtn.library_manager.execution_env_failure_reason.return_value = None
+    # Spawn awaits the library's execution environment before starting the process; a bare
+    # MagicMock is not awaitable.
+    gtn.library_manager.wait_for_execution_env = AsyncMock()
     wm = WorkerManager(engine=gtn, event_manager=MagicMock())
     wm.attach_transport(
         ws_outgoing_queue=asyncio.Queue(),
@@ -129,6 +141,205 @@ class TestHandleRegisterWorkerRequest:
 
         assert isinstance(result, worker_events.RegisterWorkerResultSuccess)
         assert result.worker_engine_id == _ENGINE
+
+
+class TestRegistrationActivatesTheProject:
+    @pytest.mark.asyncio
+    async def test_registering_sends_the_worker_its_first_activation(self, worker_manager: WorkerManager) -> None:
+        """One sender and one adoption path, rather than a reply that has to be ordered against a fan-out.
+
+        The reply carries no project, so a switch landing mid-registration is a second message on
+        the same channel instead of a second source the worker has to reconcile.
+        """
+        committed_generation = 7
+        worker_manager.engine.project_manager.committed_project.return_value = ("proj-42", committed_generation)  # type: ignore[union-attr]
+        request = worker_events.RegisterWorkerRequest(worker_engine_id=_ENGINE, engine_version=engine_version)
+
+        result = await worker_manager.handle_register_worker_request(request)
+
+        assert isinstance(result, worker_events.RegisterWorkerResultSuccess)
+        sent = cast("MagicMock", worker_manager._tx.send_message).await_args_list
+        activations = [call for call in sent if "ActivateProjectRequest" in str(call)]
+        assert len(activations) == 1, "registration must send exactly one activation"
+        assert "proj-42" in str(activations[0])
+        assert f'"generation": {committed_generation}' in str(activations[0])
+
+    @pytest.mark.asyncio
+    async def test_the_activation_is_sent_for_system_defaults_too(self, worker_manager: WorkerManager) -> None:
+        """A worker has to be told what it is on even when that is the rest state.
+
+        Skipping it there would leave nothing distinguishing "told" from "not yet told", and the
+        worker's wait before library load would never lift.
+        """
+        worker_manager.engine.project_manager.committed_project.return_value = (SYSTEM_DEFAULTS_KEY, 0)  # type: ignore[union-attr]
+        request = worker_events.RegisterWorkerRequest(worker_engine_id=_ENGINE, engine_version=engine_version)
+
+        await worker_manager.handle_register_worker_request(request)
+
+        sent = cast("MagicMock", worker_manager._tx.send_message).await_args_list
+        assert any("ActivateProjectRequest" in str(call) for call in sent)
+
+
+class TestProjectSwitchWaitsForWorkers:
+    @pytest.mark.asyncio
+    async def test_switch_awaits_each_worker_and_reports_failures(self, worker_manager: WorkerManager) -> None:
+        """A switch must not report success while a worker is still on the old workspace.
+
+        The fire-and-forget fan-out returns once messages are sent, so execution dispatched right
+        after a switch could reach a worker that had not adopted yet -- which writes files where
+        this engine does not read, silently.
+        """
+        worker_manager._workers = {
+            "worker-a": WorkerRegistration(request_topic="t/a", worker_key=None),
+            "worker-b": WorkerRegistration(request_topic="t/b", worker_key=None),
+        }
+        replies = {
+            "worker-a": {"result_type": "ActivateProjectResultSuccess", "result": {}},
+            "worker-b": {"result_type": "ActivateProjectResultFailure", "result": {"result_details": "unknown id"}},
+        }
+        awaited: list[str] = []
+
+        async def fake_route(_event: object, worker_engine_id: str, _topic: str) -> dict:
+            awaited.append(worker_engine_id)
+            return replies[worker_engine_id]
+
+        worker_manager.route_to_worker = fake_route  # type: ignore[method-assign]
+
+        failures = await worker_manager.broadcast_to_workers_awaiting_replies(
+            EventRequest(request=worker_events.UnregisterWorkerRequest(worker_engine_id="x"))
+        )
+
+        # Every worker was awaited, and the one that refused is named rather than swallowed.
+        assert sorted(awaited) == ["worker-a", "worker-b"]
+        assert len(failures) == 1
+        assert "worker-b" in failures[0]
+        assert "unknown id" in failures[0]
+
+    @pytest.mark.asyncio
+    async def test_one_unreachable_worker_does_not_strand_the_others(self, worker_manager: WorkerManager) -> None:
+        worker_manager._workers = {
+            "dead": WorkerRegistration(request_topic="t/dead", worker_key=None),
+            "alive": WorkerRegistration(request_topic="t/alive", worker_key=None),
+        }
+
+        async def fake_route(_event: object, worker_engine_id: str, _topic: str) -> dict:
+            if worker_engine_id == "dead":
+                msg = "worker is gone"
+                raise RuntimeError(msg)
+            return {"result_type": "ActivateProjectResultSuccess", "result": {}}
+
+        worker_manager.route_to_worker = fake_route  # type: ignore[method-assign]
+
+        failures = await worker_manager.broadcast_to_workers_awaiting_replies(
+            EventRequest(request=worker_events.UnregisterWorkerRequest(worker_engine_id="x"))
+        )
+
+        assert len(failures) == 1
+        assert "dead" in failures[0]
+
+    @pytest.mark.asyncio
+    async def test_a_slow_worker_does_not_delay_the_others(self, worker_manager: WorkerManager) -> None:
+        """Serially, the caller waited out the SUM of every worker's adoption, not the slowest.
+
+        Adoption runs a full library reload, so slow is the normal case rather than the exception,
+        and this is on SetCurrentProjectRequest -- a GUI action someone is sitting in front of.
+        """
+        worker_count = 4
+        worker_manager._workers = {
+            f"w{i}": WorkerRegistration(request_topic=f"t/w{i}", worker_key=None) for i in range(worker_count)
+        }
+        peak = 0
+        in_flight = 0
+
+        async def fake_route(_event: object, _worker_engine_id: str, _topic: str) -> dict:
+            nonlocal peak, in_flight
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0.05)
+            in_flight -= 1
+            return {"result_type": "ActivateProjectResultSuccess", "result": {}}
+
+        worker_manager.route_to_worker = fake_route  # type: ignore[method-assign]
+
+        failures = await worker_manager.broadcast_to_workers_awaiting_replies(
+            EventRequest(request=worker_events.UnregisterWorkerRequest(worker_engine_id="x"))
+        )
+
+        assert failures == []
+        assert peak == worker_count, f"workers were asked one at a time (peak concurrency {peak})"
+
+    @pytest.mark.asyncio
+    async def test_a_worker_that_never_answers_is_reported_rather_than_waited_on(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        """A worker that never answers is named, not waited on.
+
+        route_to_worker has no ceiling: it argues liveness from the heartbeat, which evicts a SILENT
+        worker and says nothing about one busy adopting. Unbounded, the switch never returns.
+        """
+        worker_manager.heartbeat_startup_grace_s = 0.05
+        worker_manager._workers = {"stuck": WorkerRegistration(request_topic="t/stuck", worker_key=None)}
+
+        async def never_answers(_event: object, _worker_engine_id: str, _topic: str) -> dict:
+            await asyncio.sleep(30)
+            msg = "unreachable"
+            raise AssertionError(msg)
+
+        worker_manager.route_to_worker = never_answers  # type: ignore[method-assign]
+
+        failures = await worker_manager.broadcast_to_workers_awaiting_replies(
+            EventRequest(request=worker_events.UnregisterWorkerRequest(worker_engine_id="x"))
+        )
+
+        assert len(failures) == 1
+        assert "no reply within" in failures[0]
+
+    @pytest.mark.asyncio
+    async def test_a_result_type_merely_containing_success_is_not_treated_as_one(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        """The suffix is the discriminator, not the substring.
+
+        A substring test read any type merely containing "Success" as one. Result payloads all end
+        in ResultSuccess or ResultFailure.
+        """
+        worker_manager._workers = {"w": WorkerRegistration(request_topic="t/w", worker_key=None)}
+
+        async def odd_reply(_event: object, _worker_engine_id: str, _topic: str) -> dict:
+            return {"result_type": "SuccessorLookupResultFailure", "result": {"result_details": "nope"}}
+
+        worker_manager.route_to_worker = odd_reply  # type: ignore[method-assign]
+
+        failures = await worker_manager.broadcast_to_workers_awaiting_replies(
+            EventRequest(request=worker_events.UnregisterWorkerRequest(worker_engine_id="x"))
+        )
+
+        assert len(failures) == 1
+        assert "nope" in failures[0]
+
+    @pytest.mark.asyncio
+    async def test_fan_out_reads_the_committed_pair_rather_than_the_event(self, worker_manager: WorkerManager) -> None:
+        """The id and the generation describing it must come from one read.
+
+        A worker adopts only strictly newer generations, so a fan-out stamped with the default 0
+        makes every switch after the first look stale -- and the worker answers Success, which
+        costs the caller the failure log too. Taking the id from the event and the generation from
+        state separately can pair an older id with a newer switch's generation.
+        """
+        worker_manager._workers = {"worker-a": WorkerRegistration(request_topic="t/a", worker_key=None)}
+        worker_manager.engine.project_manager.committed_project.return_value = ("proj-9", 4)  # type: ignore[union-attr]
+        sent: list[tuple[str, int]] = []
+
+        async def carrying_route(event: EventRequest, _worker_engine_id: str, _topic: str) -> dict:
+            sent.append((event.request.project_id, event.request.generation))  # type: ignore[attr-defined]
+            return {"result_type": "ActivateProjectResultSuccess", "result": {}}
+
+        worker_manager.route_to_worker = carrying_route  # type: ignore[method-assign]
+
+        # The event's id is deliberately stale here: the fan-out must ignore it.
+        await worker_manager._on_current_project_changed(CurrentProjectChanged(project_id="proj-stale"))
+
+        assert sent == [("proj-9", 4)]
 
 
 class TestHandleRegisterWorkerRequestEngineVersion:
@@ -323,6 +534,33 @@ class TestRelayWorkerResult:
 
 class TestEvictWorker:
     @pytest.mark.asyncio
+    async def test_records_why_its_library_can_no_longer_execute(self, worker_manager: WorkerManager) -> None:
+        """A recorded reason is what stops the next run blaming a worker that is already gone.
+
+        Nothing respawns an evicted worker, so without it the next run reports that the worker "may
+        still be starting up" for the rest of the session, and anything already waiting on it waits
+        out the whole startup grace first.
+        """
+        worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key="Lib")
+        worker_manager.expect_worker("Lib")
+
+        await worker_manager.evict_worker(_ENGINE)
+
+        reason = worker_manager.worker_unavailable_reason("Lib")
+        assert reason is not None
+        assert "stopped responding" in reason
+        assert worker_manager.has_settled("Lib"), "a waiter must not hold on for a worker already gone"
+
+    @pytest.mark.asyncio
+    async def test_forget_library_drops_the_recorded_reason(self, worker_manager: WorkerManager) -> None:
+        """Keyed by a bare name, so it has to be dropped with the library rather than outlive it."""
+        worker_manager.note_worker_unavailable("Lib", "the worker stopped responding.")
+
+        worker_manager.forget_library("Lib")
+
+        assert worker_manager.worker_unavailable_reason("Lib") is None
+
+    @pytest.mark.asyncio
     async def test_removes_worker_from_state(self, worker_manager: WorkerManager) -> None:
         worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
         worker_manager._worker_last_seen[_ENGINE] = 100.0
@@ -478,6 +716,22 @@ class TestSpawnWorker:
         # Worker stdout is a pipe under a GUI-hosted orchestrator; unbuffered output keeps
         # log lines from stalling in Python's block buffer.
         assert mock_exec.call_args.kwargs["env"]["PYTHONUNBUFFERED"] == "1"
+
+    @pytest.mark.asyncio
+    async def test_spawn_does_not_pin_the_workspace_into_the_env(self, worker_manager: WorkerManager) -> None:
+        """The spawn env must not carry GTN_CONFIG_WORKSPACE_DIRECTORY.
+
+        Workers spawn before any project resolves, so the value at spawn time is the CWD-relative
+        placeholder -- and GTN_CONFIG_ outranks the runtime project override, so a worker handed it
+        could never follow its orchestrator onto a project's workspace again. The workspace comes
+        from the project adopted out of the registration reply instead.
+        """
+        worker_manager.engine.config_manager.workspace_path = Path("/somewhere/else/GriptapeNodes")  # type: ignore[union-attr]
+
+        with patch("asyncio.create_subprocess_exec", return_value=MagicMock()) as mock_exec:
+            await worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "my-key")
+
+        assert "GTN_CONFIG_WORKSPACE_DIRECTORY" not in mock_exec.call_args.kwargs["env"]
 
     @pytest.mark.asyncio
     async def test_spawn_env_stamps_orchestrator_engine_id(self, worker_manager: WorkerManager) -> None:
@@ -1244,3 +1498,57 @@ class TestWorkerManagerDomainEventListeners:
         assert len(send_calls) == 1
         sent_payload = json.loads(send_calls[0][1])
         assert sent_payload["request_type"] == "ReloadConfigRequest"
+
+
+class TestWorkerExecutionPath:
+    """A worker gets its library's execution dependencies as PYTHONPATH, not as a later splice.
+
+    Splicing them onto a running interpreter cannot give the library its own versions. A module
+    already in sys.modules is never reconsidered, and a package that probed for an optional
+    dependency at import time has cached the answer -- which is how a library that ships
+    `safetensors` still hit `NameError: name 'safetensors' is not defined` inside huggingface_hub.
+    PYTHONPATH is on sys.path before the process imports anything, which is the whole point.
+    """
+
+    @pytest.mark.asyncio
+    async def test_spawn_hands_the_worker_its_execution_path(self, worker_manager: WorkerManager) -> None:
+        worker_manager.engine.library_manager.execution_site_packages.return_value = "/libs/mine/.venv-exec/sp"  # type: ignore[attr-defined]
+
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=_managed_proc_mock())) as spawn:
+            await worker_manager.spawn_worker([sys.executable, "-c", ""], "My Library")
+
+        env = spawn.call_args.kwargs["env"]
+        assert env["PYTHONPATH"] == "/libs/mine/.venv-exec/sp"
+
+    @pytest.mark.asyncio
+    async def test_an_inherited_pythonpath_survives_the_handover(self, worker_manager: WorkerManager) -> None:
+        """Prepended, not assigned.
+
+        A launcher-set PYTHONPATH -- embedding hosts, source checkouts -- is part of the environment
+        the engine itself booted with. Assigning over it would lose those modules in exactly one
+        process kind, so an import that resolves in the orchestrator would fail in its worker.
+        """
+        worker_manager.engine.library_manager.execution_site_packages.return_value = "/libs/mine/.venv-exec/sp"  # type: ignore[attr-defined]
+        worker_manager.engine.project_manager.get_pre_project_environ.return_value = {"PYTHONPATH": "/host/libs"}  # type: ignore[attr-defined]
+
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=_managed_proc_mock())) as spawn:
+            await worker_manager.spawn_worker([sys.executable, "-c", ""], "My Library")
+
+        env = spawn.call_args.kwargs["env"]
+        # Library first, so a package the library pins wins; the engine's own environment still
+        # resolves anything the library does not carry.
+        assert env["PYTHONPATH"] == f"/libs/mine/.venv-exec/sp{os.pathsep}/host/libs"
+
+    @pytest.mark.asyncio
+    async def test_no_execution_environment_means_no_pythonpath(self, worker_manager: WorkerManager) -> None:
+        """A library with no execution dependencies, or one whose environment is not built yet.
+
+        Pointing PYTHONPATH at a directory that does not exist would be silently ignored by Python,
+        so an absent entry and a wrong one look identical from inside the worker. Leave it unset.
+        """
+        worker_manager.engine.library_manager.execution_site_packages.return_value = None  # type: ignore[attr-defined]
+
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=_managed_proc_mock())) as spawn:
+            await worker_manager.spawn_worker([sys.executable, "-c", ""], "Light Library")
+
+        assert "PYTHONPATH" not in spawn.call_args.kwargs["env"]

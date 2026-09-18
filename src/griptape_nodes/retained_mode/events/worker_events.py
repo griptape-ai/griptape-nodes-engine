@@ -53,6 +53,10 @@ class RegisterWorkerRequest(RequestPayload):
 class RegisterWorkerResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Worker registration succeeded.
 
+    Carries no project: the orchestrator sends the worker's first activation down the same path a
+    mid-session switch uses, so there is one sender and one adoption path rather than two that have
+    to be ordered against each other.
+
     Args:
         worker_engine_id: The engine_id of the worker that was registered.
     """
