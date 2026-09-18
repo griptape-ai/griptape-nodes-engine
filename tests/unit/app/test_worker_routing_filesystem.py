@@ -26,11 +26,12 @@ import pytest
 
 from griptape_nodes.app.worker_routing import (
     _FORWARDING_FILESYSTEM_REQUESTS,
+    _LOCAL_ONLY_ARTIFACT_REQUESTS,
     _LOCAL_ONLY_FILESYSTEM_REQUESTS,
     LOCAL_ONLY_REQUEST_TYPES,
 )
 from griptape_nodes.common.macro_parser import ParsedMacro
-from griptape_nodes.retained_mode.events import os_events
+from griptape_nodes.retained_mode.events import artifact_events, os_events
 from griptape_nodes.retained_mode.events.base_events import RequestPayload
 from griptape_nodes.retained_mode.events.event_converter import converter
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
@@ -164,24 +165,38 @@ class TestEveryMacroPathCarrierSurvivesTheWire:
         assert [type(s) for s in restored.parsed_macro.segments] == [type(s) for s in macro_path.parsed_macro.segments]
 
 
-class TestTypeRegisteringRequestsAnswerLocally:
-    """The two provider-registration payloads carry a bare `type` field.
+class TestTheArtifactRequestsAnswerLocally:
+    """Named rather than detected, because what binds them is what they DO.
 
-    cattrs has no structure hook for `type`, and the point of the request is a
-    process-local registry -- so these must answer locally. They fell out of the
-    derivation once already: the bare builtin `type` annotation is an evaluated class,
-    and a matcher reading `str(annotation)` sees "<class 'type'>" and misses it.
+    The registrations put a class into this process's provider registry, and preview generation
+    resolves a provider back out of it. Neither is a serialization limit, so no rule over field
+    types can see either one -- an earlier version of this file tried, keyed on the annotations,
+    and the reason it recorded went stale the moment the wire could carry a MacroPath.
     """
 
-    def test_register_artifact_provider_is_local(self) -> None:
-        from griptape_nodes.retained_mode.events.artifact_events import RegisterArtifactProviderRequest
+    def test_every_named_request_is_local(self) -> None:
+        assert _LOCAL_ONLY_ARTIFACT_REQUESTS <= LOCAL_ONLY_REQUEST_TYPES
 
-        assert RegisterArtifactProviderRequest in LOCAL_ONLY_REQUEST_TYPES
+    def test_the_named_set_is_exactly_what_was_reviewed(self) -> None:
+        """Dropping one would forward it silently: nothing else would fail."""
+        assert {payload.__name__ for payload in _LOCAL_ONLY_ARTIFACT_REQUESTS} == {
+            "RegisterArtifactProviderRequest",
+            "RegisterPreviewGeneratorRequest",
+            "GeneratePreviewRequest",
+            "GeneratePreviewFromDefaultsRequest",
+            "GetPreviewForArtifactRequest",
+        }
 
-    def test_register_preview_generator_is_local(self) -> None:
-        from griptape_nodes.retained_mode.events.artifact_events import RegisterPreviewGeneratorRequest
-
-        assert RegisterPreviewGeneratorRequest in LOCAL_ONLY_REQUEST_TYPES
+    def test_nothing_else_in_artifact_events_is_local(self) -> None:
+        """The module is no longer swept, so anything unnamed must forward."""
+        for payload in vars(artifact_events).values():
+            if not (isinstance(payload, type) and issubclass(payload, RequestPayload)):
+                continue
+            if payload.__module__ != artifact_events.__name__ or payload is RequestPayload:
+                continue
+            if payload in _LOCAL_ONLY_ARTIFACT_REQUESTS:
+                continue
+            assert payload not in LOCAL_ONLY_REQUEST_TYPES
 
 
 class TestTheWireCannotCarryThese:
@@ -261,8 +276,8 @@ class TestTheDerivedMembershipIsReviewed:
             # No filesystem I/O at all -- it groups a caller-supplied path list. Local only because
             # its failure union cannot be structured; see category 3 in worker_routing.
             "DeduceSequencesFromFileListRequest",
-            # artifact_events: carry a MacroPath, and resolve providers from a process-local
-            # registry while writing into the project's previews directory.
+            # artifact_events: resolve a provider from a process-local registry while writing into
+            # the project's previews directory.
             "GeneratePreviewFromDefaultsRequest",
             "GeneratePreviewRequest",
             "GetPreviewForArtifactRequest",
