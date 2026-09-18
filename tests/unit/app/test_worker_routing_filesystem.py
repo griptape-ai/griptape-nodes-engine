@@ -60,6 +60,30 @@ def _requests_defined_in(module: ModuleType) -> list[type[RequestPayload]]:
     ]
 
 
+def _minimal_instance(request_type: type, macro_field: str, macro_path: MacroPath) -> RequestPayload:
+    """Build ``request_type`` with ``macro_field`` set and every other required field filled.
+
+    The carriers do not share a constructor signature, so the round-trip sweep cannot hard-code
+    one. Only fields without a default are filled, by annotation, which keeps a new carrier working
+    here without anyone editing this helper.
+    """
+    fillers: dict[str, object] = {"str": "x", "bool": False, "int": 0, "float": 0.0, "dict": {}, "list": []}
+    kwargs: dict[str, object] = {}
+    for field in dataclasses.fields(request_type):
+        if field.name == macro_field:
+            kwargs[field.name] = macro_path
+            continue
+        has_default = field.default is not dataclasses.MISSING or field.default_factory is not dataclasses.MISSING
+        if has_default:
+            continue
+        annotation = field.type if isinstance(field.type, str) else str(field.type)
+        kwargs[field.name] = next(
+            (value for name, value in fillers.items() if annotation.startswith(name)),
+            None,
+        )
+    return request_type(**kwargs)
+
+
 def _filesystem_requests() -> list[type[RequestPayload]]:
     return _requests_defined_in(os_events)
 
@@ -109,13 +133,12 @@ class TestEveryFilesystemRequestHasARoutingDecision:
         assert {os_events.OpenAssociatedFileRequest} == _FORWARDING_FILESYSTEM_REQUESTS
 
 
-class TestNothingCarryingAMacroPathIsForwarded:
-    """A MacroPath cannot be serialized, so forwarding one hangs the worker until it times out.
+class TestEveryMacroPathCarrierSurvivesTheWire:
+    """Carrying a MacroPath no longer decides routing, so every carrier has to serialize.
 
     Checked across the whole payload registry rather than one module: MacroPath is defined in
-    project_events and used by both os_events and artifact_events, and the artifact preview
-    requests are reachable from a handler a worker runs locally -- so a module-scoped rule let them
-    through while looking complete.
+    project_events and used by both os_events and artifact_events. A carrier added later that does
+    NOT round trip would be forwarded and die on the wire, which is what this catches.
     """
 
     def test_the_sweep_finds_the_ones_we_know_about(self) -> None:
@@ -124,8 +147,21 @@ class TestNothingCarryingAMacroPathIsForwarded:
         assert {"GetPreviewForArtifactRequest", "GetNextVersionIndexRequest"} <= names
 
     @pytest.mark.parametrize("request_type", _macro_path_requests(), ids=lambda cls: cls.__name__)
-    def test_it_is_local_only(self, request_type: type[RequestPayload]) -> None:
-        assert request_type in LOCAL_ONLY_REQUEST_TYPES
+    def test_its_macro_path_round_trips(self, request_type: type[RequestPayload]) -> None:
+        field_name = next(
+            f.name
+            for f in dataclasses.fields(request_type)
+            if "MacroPath" in (f.type if isinstance(f.type, str) else str(f.type))
+        )
+        macro_path = MacroPath(parsed_macro=ParsedMacro("{outputs}/o_{###}.png"), variables={"v": 1})
+
+        wire = json.loads(json.dumps(converter.unstructure(_minimal_instance(request_type, field_name, macro_path))))
+        restored = getattr(converter.structure(wire, request_type), field_name)
+
+        assert restored.parsed_macro.template == macro_path.parsed_macro.template
+        assert restored.variables == macro_path.variables
+        # Rebuilt by __post_init__ rather than sent, which is why the template alone is enough.
+        assert [type(s) for s in restored.parsed_macro.segments] == [type(s) for s in macro_path.parsed_macro.segments]
 
 
 class TestTypeRegisteringRequestsAnswerLocally:
@@ -161,26 +197,6 @@ class TestTheWireCannotCarryThese:
 
         assert round_tripped != original, "if bytes now survive, revisit whether writes may forward"
         assert isinstance(round_tripped, str)
-
-    @pytest.mark.parametrize(
-        "payload",
-        [
-            os_events.GetNextVersionIndexRequest(
-                macro_path=MacroPath(parsed_macro=ParsedMacro("{outputs}/o.png"), variables={})
-            ),
-            os_events.ResolveMacroPathRequest(
-                macro_path=MacroPath(parsed_macro=ParsedMacro("{outputs}/o.png"), variables={})
-            ),
-            os_events.GetNextUnusedFilenameRequest(
-                file_path=MacroPath(parsed_macro=ParsedMacro("{outputs}/o.png"), variables={})
-            ),
-        ],
-        ids=lambda p: type(p).__name__,
-    )
-    def test_a_macro_path_will_not_serialize(self, payload: RequestPayload) -> None:
-        """`Directory("{outputs}/renders").with_versioning()` is the ordinary caller of these."""
-        with pytest.raises(Exception):  # noqa: B017, PT011 - any failure to serialize is the point
-            json.dumps(converter.unstructure(payload))
 
     def test_the_sequence_failure_union_cannot_be_structured(self) -> None:
         """So a worker could not even receive the error, let alone the result."""
