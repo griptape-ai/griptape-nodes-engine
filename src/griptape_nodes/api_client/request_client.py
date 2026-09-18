@@ -74,7 +74,7 @@ class RequestClient:
         # Map of request_id -> pending request where tag identifies the originating worker/caller
         self._pending_requests: dict[str, _PendingRequest] = {}
         # threading.Lock, not asyncio.Lock: this guards state reached from more than one loop --
-        # _try_match runs on the transport loop while _track_request and _cancel_request run on the
+        # _try_match runs on the transport loop while _track_request and discard_request run on the
         # loop that issued the request. An asyncio.Lock binds to the loop that first awaits it and
         # only checks on the CONTENDED path, so a cross-loop acquire raises intermittently while the
         # uncontended fast path excludes nothing at all. Every section it guards is synchronous
@@ -167,12 +167,12 @@ class RequestClient:
 
         except TimeoutError:
             logger.error("Request %s timed out", request_id)
-            await self._cancel_request(request_id)
+            self.discard_request(request_id)
             raise
 
         except Exception as e:
             logger.error("Request %s failed: %s", request_id, e)
-            await self._cancel_request(request_id)
+            self.discard_request(request_id)
             raise
         else:
             logger.debug("Request %s completed successfully", request_id)
@@ -230,12 +230,12 @@ class RequestClient:
 
         except TimeoutError:
             logger.error("Forwarded request %s timed out", request_id)
-            await self._cancel_request(request_id)
+            self.discard_request(request_id)
             raise
 
         except Exception as e:
             logger.error("Forwarded request %s failed: %s", request_id, e)
-            await self._cancel_request(request_id)
+            self.discard_request(request_id)
             raise
         else:
             logger.debug("Forwarded request %s completed", request_id)
@@ -321,7 +321,7 @@ class RequestClient:
         except (TimeoutError, Exception) as e:
             logger.error("Batch request failed: %s", e)
             for request_id in request_ids:
-                await self._cancel_request(request_id)
+                self.discard_request(request_id)
             raise
         else:
             logger.debug("Batch of %d requests completed", len(inner_events))
@@ -374,6 +374,22 @@ class RequestClient:
                 entry = self._pending_requests.pop(rid)
                 RequestClient._settle(lambda entry=entry: entry.future.set_exception(error))
                 logger.debug("Failed request %s (tag=%s): %s", rid, tag, error)
+
+    def discard_request(self, request_id: str) -> None:
+        """Stop tracking a request and cancel its future.
+
+        Args:
+            request_id: Request identifier
+        """
+        with self._lock:
+            entry = self._pending_requests.pop(request_id, None)
+
+            if entry is None:
+                logger.debug("Request already completed or unknown: %s", request_id)
+                return
+
+            RequestClient._settle(entry.future.cancel)
+            logger.debug("Cancelled request: %s", request_id)
 
     async def _track_request(
         self,
@@ -473,22 +489,6 @@ class RequestClient:
         with self._lock:
             self._reject_request_unlocked(request_id, error)
 
-    async def _cancel_request(self, request_id: str) -> None:
-        """Cancel a pending request and clean up its tracking.
-
-        Args:
-            request_id: Request identifier
-        """
-        with self._lock:
-            entry = self._pending_requests.pop(request_id, None)
-
-            if entry is None:
-                logger.debug("Request already completed or unknown: %s", request_id)
-                return
-
-            RequestClient._settle(entry.future.cancel)
-            logger.debug("Cancelled request: %s", request_id)
-
     @property
     def pending_count(self) -> int:
         """Get number of currently pending requests.
@@ -496,7 +496,8 @@ class RequestClient:
         Returns:
             Count of pending requests
         """
-        return len(self._pending_requests)
+        with self._lock:
+            return len(self._pending_requests)
 
     @property
     def pending_request_ids(self) -> list[str]:
@@ -505,7 +506,8 @@ class RequestClient:
         Returns:
             List of request_id strings
         """
-        return list(self._pending_requests.keys())
+        with self._lock:
+            return list(self._pending_requests.keys())
 
     async def _try_match(self, message: dict[str, Any]) -> bool:
         """Attempt to match an incoming message to a pending request.

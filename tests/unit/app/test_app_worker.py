@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import json
+import logging
 import os
 import sys
 import threading
@@ -21,6 +22,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 import pytest
 
 from griptape_nodes.api_client.request_client import _PendingRequest
+from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
 from griptape_nodes.retained_mode.events import worker_events
 from griptape_nodes.retained_mode.events.app_events import CurrentProjectChanged
 from griptape_nodes.retained_mode.events.base_events import EventRequest
@@ -29,7 +31,11 @@ from griptape_nodes.retained_mode.events.execution_events import (
     ExecuteNodeResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
-from griptape_nodes.retained_mode.managers.worker_manager import WorkerManager, WorkerRegistration
+from griptape_nodes.retained_mode.managers.worker_manager import (
+    _STATIC_URL_SETTLE_TIMEOUT_S,
+    WorkerManager,
+    WorkerRegistration,
+)
 from griptape_nodes.utils.version_utils import engine_version
 
 _SESSION = "sess-abc"
@@ -63,6 +69,11 @@ class _FakeRequestClient:
             entry = self._pending_requests.pop(rid)
             if not entry.future.done():
                 entry.future.set_exception(error)
+
+    def discard_request(self, request_id: str) -> None:
+        entry = self._pending_requests.pop(request_id, None)
+        if entry is not None and not entry.future.done():
+            entry.future.cancel()
 
 
 @pytest.fixture
@@ -691,6 +702,97 @@ class TestSpawnWorker:
         mock_exec.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_concurrent_spawns_for_one_key_fork_once(self, worker_manager: WorkerManager) -> None:
+        """Two spawns racing for one library must produce one subprocess.
+
+        The registry entry is written only once the process exists, and the work in between
+        suspends, so checking the registry alone lets the second caller through. The loser's
+        process would then be untracked, holding its library's dependencies until its own
+        heartbeat lapsed.
+        """
+        worker_manager.engine.library_manager.execution_site_packages.return_value = None  # type: ignore[union-attr]
+
+        async def _suspend_then_answer() -> None:
+            # Yields inside the window between the duplicate check and the registry write.
+            await asyncio.sleep(0)
+
+        with (
+            patch.object(worker_manager, "_orchestrator_static_server_base_url", _suspend_then_answer),
+            patch("asyncio.create_subprocess_exec", return_value=_managed_proc_mock()) as mock_exec,
+        ):
+            await asyncio.gather(
+                worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "My Library"),
+                worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "My Library"),
+            )
+
+        mock_exec.assert_called_once()
+        assert list(worker_manager._managed_worker_processes) == ["My Library"]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_fork_does_not_keep_the_key_claimed(self, worker_manager: WorkerManager) -> None:
+        """A spawn that raises must leave the key spawnable.
+
+        The claim outliving a failed fork would silently refuse every later attempt for that
+        library, which reads as a worker that never starts and never says why.
+        """
+        worker_manager.engine.library_manager.execution_site_packages.return_value = None  # type: ignore[union-attr]
+
+        with (
+            patch("asyncio.create_subprocess_exec", side_effect=OSError("no interpreter")),
+            pytest.raises(OSError, match="no interpreter"),
+        ):
+            await worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "My Library")
+
+        assert "My Library" not in worker_manager._spawns_in_flight
+
+        with patch("asyncio.create_subprocess_exec", return_value=_managed_proc_mock()) as mock_exec:
+            await worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "My Library")
+
+        mock_exec.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_a_spawn_outlived_by_a_reset_does_not_free_the_next_claim(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        """A spawn only releases a claim it still holds.
+
+        A reset drops the claims so a reload can spawn again, which leaves a spawn suspended across
+        it resuming to find the key claimed by the reload's spawn. Releasing by name alone frees
+        that one, and the library is admitted for a third fork while a spawn is genuinely in flight.
+        """
+        worker_manager.engine.library_manager.execution_site_packages.return_value = None  # type: ignore[union-attr]
+        released = asyncio.Event()
+
+        async def _park_until_released() -> None:
+            await released.wait()
+
+        # The stale spawn, parked mid-flight between its claim and the registry write. Its fork
+        # fails, so no registry entry is left behind to shadow a wrongly-freed claim.
+        with (
+            patch.object(worker_manager, "_orchestrator_static_server_base_url", _park_until_released),
+            patch("asyncio.create_subprocess_exec", side_effect=OSError("stale spawn died")),
+        ):
+            stale = asyncio.create_task(worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "My Library"))
+            await asyncio.sleep(0.01)
+            assert "My Library" in worker_manager._spawns_in_flight
+
+            await worker_manager.reset_workers()
+            reload_claim = object()
+            worker_manager._spawns_in_flight["My Library"] = reload_claim
+
+            released.set()
+            with pytest.raises(OSError, match="stale spawn died"):
+                await stale
+
+        # The stale spawn has finished and must have left the reload's claim standing.
+        assert worker_manager._spawns_in_flight.get("My Library") is reload_claim
+
+        with patch("asyncio.create_subprocess_exec") as mock_exec:
+            await worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "My Library")
+
+        mock_exec.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_spawns_subprocess_with_provided_args(self, worker_manager: WorkerManager) -> None:
         mock_proc = MagicMock()
         mock_proc.pid = 12345
@@ -760,7 +862,130 @@ class TestSpawnWorker:
         assert "GTN_ORCHESTRATOR_ENGINE_ID" not in env
 
 
+class TestOrchestratorStaticServerBaseUrl:
+    """The spawn side of the static-URL handover.
+
+    Resolution and spawn are both listeners on AppInitializationComplete and fan out as unordered
+    concurrent tasks, so the URL is awaited rather than sampled. Which wait runs, and which of the
+    two warnings a missing URL earns, are what an operator reads when a worker's asset URLs come
+    back dead, so both choices are pinned here.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_settled_url_is_read_without_a_thread_hop(self, worker_manager: WorkerManager) -> None:
+        """The decision is normally already in, and the hop is the path with a cost.
+
+        A blocking wait handed to a thread cannot be cancelled, so taking it when nothing needs it
+        parks a default-executor thread that teardown then joins.
+        """
+        static_files_manager = cast("MagicMock", worker_manager.engine.static_files_manager)
+        static_files_manager.static_server_base_url_settled = True
+        static_files_manager.wait_for_static_server_base_url.return_value = "http://orchestrator:4242"
+
+        with patch("asyncio.to_thread", new=AsyncMock()) as mock_to_thread:
+            result = await worker_manager._orchestrator_static_server_base_url()
+
+        assert result == "http://orchestrator:4242"
+        mock_to_thread.assert_not_called()
+        static_files_manager.wait_for_static_server_base_url.assert_called_once_with(0)
+
+    @pytest.mark.asyncio
+    async def test_an_undecided_url_is_waited_for_off_the_loop(self, worker_manager: WorkerManager) -> None:
+        """The blocking wait must not run on the event loop, which is serving everything else."""
+        static_files_manager = cast("MagicMock", worker_manager.engine.static_files_manager)
+        static_files_manager.static_server_base_url_settled = False
+        static_files_manager.wait_for_static_server_base_url.return_value = "http://orchestrator:4242"
+        waiting_thread: list[str] = []
+
+        def _record_thread(timeout_s: float) -> str:  # noqa: ARG001
+            waiting_thread.append(threading.current_thread().name)
+            return "http://orchestrator:4242"
+
+        static_files_manager.wait_for_static_server_base_url.side_effect = _record_thread
+
+        result = await worker_manager._orchestrator_static_server_base_url()
+
+        assert result == "http://orchestrator:4242"
+        # The wait blocks whichever thread runs it, so running it here would stall every other
+        # spawn and every request this loop is serving for the whole settle timeout.
+        assert len(waiting_thread) == 1
+        assert waiting_thread[0] != threading.current_thread().name
+        static_files_manager.wait_for_static_server_base_url.assert_called_once_with(_STATIC_URL_SETTLE_TIMEOUT_S)
+
+    @pytest.mark.asyncio
+    async def test_a_settled_absence_blames_resolution_rather_than_the_wait(
+        self, worker_manager: WorkerManager, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Initialization deciding there is no server settles in microseconds.
+
+        Blaming the settle timeout for it points an operator at slow startup when the real lead is
+        an earlier resolution failure, which under local storage is the only way to reach here.
+        """
+        static_files_manager = cast("MagicMock", worker_manager.engine.static_files_manager)
+        static_files_manager.static_server_base_url_settled = True
+        static_files_manager.wait_for_static_server_base_url.return_value = None
+        static_files_manager.storage_driver = MagicMock(spec=LocalStorageDriver)
+
+        with caplog.at_level(logging.WARNING):
+            result = await worker_manager._orchestrator_static_server_base_url()
+
+        assert result is None
+        assert "Check for an earlier failure resolving the static server" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_a_url_that_never_arrives_blames_the_wait(
+        self, worker_manager: WorkerManager, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        static_files_manager = cast("MagicMock", worker_manager.engine.static_files_manager)
+        static_files_manager.static_server_base_url_settled = False
+        static_files_manager.wait_for_static_server_base_url.return_value = None
+        static_files_manager.storage_driver = MagicMock(spec=LocalStorageDriver)
+
+        with caplog.at_level(logging.WARNING):
+            result = await worker_manager._orchestrator_static_server_base_url()
+
+        assert result is None
+        assert "never decided" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_a_cloud_backend_without_a_url_says_nothing(
+        self, worker_manager: WorkerManager, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """On a cloud backend a worker's URLs come from the same bucket and outlive it.
+
+        There is nothing to warn about, and warning anyway trains people to ignore the case where
+        the URLs really do die with the worker.
+        """
+        static_files_manager = cast("MagicMock", worker_manager.engine.static_files_manager)
+        static_files_manager.static_server_base_url_settled = True
+        static_files_manager.wait_for_static_server_base_url.return_value = None
+        static_files_manager.storage_driver = MagicMock()
+
+        with caplog.at_level(logging.WARNING):
+            result = await worker_manager._orchestrator_static_server_base_url()
+
+        assert result is None
+        assert caplog.records == []
+
+
 class TestResetWorkers:
+    @pytest.mark.asyncio
+    async def test_a_claim_does_not_outlive_the_reset(self, worker_manager: WorkerManager) -> None:
+        """A reload resets and then spawns again, so a surviving claim would refuse its own spawn.
+
+        The refusal records nothing -- a worker is normally on its way when a key is claimed -- so
+        the next run would wait out the whole startup grace and then blame the library load.
+        """
+        worker_manager.engine.library_manager.execution_site_packages.return_value = None  # type: ignore[union-attr]
+        worker_manager._spawns_in_flight["My Library"] = object()
+
+        await worker_manager.reset_workers()
+
+        with patch("asyncio.create_subprocess_exec", return_value=_managed_proc_mock()) as mock_exec:
+            await worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "My Library")
+
+        mock_exec.assert_called_once()
+
     @pytest.mark.asyncio
     async def test_terminates_all_processes(self, worker_manager: WorkerManager) -> None:
         proc_a, proc_b = _managed_proc_mock(), _managed_proc_mock()
@@ -1003,6 +1228,40 @@ class TestHandleStartWorkerRequest:
         assert isinstance(result, worker_events.StartWorkerResultSuccess)
 
 
+class TestLogSpawnError:
+    @pytest.mark.asyncio
+    async def test_a_cancelled_spawn_does_not_raise_from_the_callback(self, worker_manager: WorkerManager) -> None:
+        """A cancelled spawn task must not make its own done-callback raise.
+
+        `task.exception()` raises on a cancelled task, and a done-callback that raises becomes
+        loop-level "Exception in callback" noise with the refusal below it skipped.
+        """
+
+        async def _never() -> None:
+            await asyncio.sleep(3600)
+
+        task = asyncio.create_task(_never())
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        assert task.cancelled()
+
+        worker_manager._log_spawn_error(task, "My Library")
+
+    @pytest.mark.asyncio
+    async def test_a_failed_spawn_still_records_a_refusal(self, worker_manager: WorkerManager) -> None:
+        async def _raise() -> None:
+            msg = "no interpreter"
+            raise OSError(msg)
+
+        task = asyncio.create_task(_raise())
+        await asyncio.gather(task, return_exceptions=True)
+
+        with patch.object(worker_manager, "note_worker_unavailable") as mock_refuse:
+            worker_manager._log_spawn_error(task, "My Library")
+
+        mock_refuse.assert_called_once()
+
+
 class TestSpawnWhenSessionReady:
     @pytest.mark.asyncio
     async def test_skips_wait_when_session_already_active(self, worker_manager: WorkerManager) -> None:
@@ -1152,6 +1411,30 @@ class TestRouteToWorker:
 
         with pytest.raises(asyncio.CancelledError):
             await task
+
+    @pytest.mark.asyncio
+    async def test_flow_cancellation_stops_tracking_the_request(self, worker_manager: WorkerManager) -> None:
+        """A cancelled run must not leave its request behind in the pending map.
+
+        Nothing else pops it on this path, so the entry would outlive the run -- one per cancelled
+        node execution for the life of the process -- and each keeps its worker's tag, so a later
+        cancel_requests_by_tag walks and re-settles long-dead requests.
+        """
+        assert isinstance(worker_manager._tx.request_client, _FakeRequestClient)
+        fake_rc = worker_manager._tx.request_client
+        event_request = EventRequest(request=ExecuteNodeRequest(node_name="MyNode", parameter_values={}))
+
+        task = asyncio.create_task(worker_manager.route_to_worker(event_request, _ENGINE, _WORKER_REQUEST_TOPIC))
+        # Long enough to be parked on the response, which is the await the cancellation has to
+        # unwind from for the entry to be the caller's to remove.
+        await asyncio.sleep(0.01)
+        assert len(fake_rc._pending_requests) == 1
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert fake_rc._pending_requests == {}
 
 
 class TestGetTopicsToSubscribe:
