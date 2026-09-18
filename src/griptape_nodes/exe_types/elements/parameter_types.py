@@ -27,9 +27,6 @@ class ParameterTypeBuiltin(StrEnum):
     NONE = "none"
     CONTROL_TYPE = "parametercontroltype"
     ALL = "all"
-    # A key into the process-local object store. The value never leaves the process that built it; the
-    # key travels as the parameter value instead.
-    HANDLE = "handle"
 
 
 class ParameterType:
@@ -55,15 +52,7 @@ class ParameterType:
         "none": ParameterTypeBuiltin.NONE,
         "parametercontroltype": ParameterTypeBuiltin.CONTROL_TYPE,
         "all": ParameterTypeBuiltin.ALL,
-        "handle": ParameterTypeBuiltin.HANDLE,
     }
-
-    @staticmethod
-    def is_handle(type_name: str | None) -> bool:
-        """Whether this type names a handle, with or without a payload: `handle`, `handle[FluxPipeline]`."""
-        if not type_name:
-            return False
-        return ParameterType._extract_base_type(type_name.lower()) == ParameterTypeBuiltin.HANDLE.value
 
     @staticmethod
     def attempt_get_builtin(type_name: str) -> ParameterTypeBuiltin | None:
@@ -94,11 +83,6 @@ class ParameterType:
 
         # If either are None, bail.
         if ParameterTypeBuiltin.NONE.value in (source_type_lower, target_type_lower):
-            return False
-        # A handle only connects to a handle, before `any` gets its say. The value is a key into one
-        # process's memory: an `any` consumer would display an opaque string, serialize it, and -- if it
-        # allows PROPERTY -- keep it past disconnection, pinning the object against release forever.
-        if ParameterType.is_handle(source_type_lower) != ParameterType.is_handle(target_type_lower):
             return False
         if target_type_lower == ParameterTypeBuiltin.ANY.value:
             # If the TARGET accepts Any, we're good. Not always true the other way 'round.
@@ -207,14 +191,6 @@ def canonical_type_name(type_name: str) -> str:
 def accepts_incoming_type(input_types: list[str], incoming_type: str | None) -> bool:
     """Whether something declaring ``input_types`` may receive a value of ``incoming_type``."""
     if incoming_type is None:
-        return False
-
-    # Ahead of the `all` short-circuit: `all` claims to satisfy any target, and a handle target is not
-    # any target. Only a handle key can arrive on a handle parameter -- an ErrorProxyNode placeholder
-    # output is `all`, and what it carries is not a key.
-    if any(ParameterType.is_handle(test_type) for test_type in input_types) and not ParameterType.is_handle(
-        incoming_type
-    ):
         return False
 
     if incoming_type.lower() == ParameterTypeBuiltin.ALL.value:

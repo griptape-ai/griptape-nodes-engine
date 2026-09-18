@@ -143,6 +143,26 @@ class LocalObjectScope:
             raise RuntimeError(self._gone_message(parameter_name=parameter_name, node_name=where_node))
         return value
 
+    def resolve_if_held(self, value: Any, *, parameter_name: str, node_name: str) -> Any:
+        """`value` itself, or the object behind it when it is one of this library's keys.
+
+        What a node's parameter read goes through, so a library reads its parameter normally and gets the
+        object. A value that is not one of our keys is returned untouched: a non-serializable parameter
+        may perfectly well hold something the engine never parked.
+
+        Raises:
+            RuntimeError: if the value is one of our keys and this process is no longer holding it.
+        """
+        if not self._is_own_key(value):
+            # A key another library parked is refused rather than handed over as a string: it can never
+            # resolve here, and saying so beats the node failing on a str it expected an object to be.
+            if self._manager().is_parked_key(value):
+                raise RuntimeError(
+                    self._unusable_key_message(value, parameter_name=parameter_name, node_name=node_name)
+                )
+            return value
+        return self.require(value, parameter_name=parameter_name, node_name=node_name)
+
     def drop(self, key: str) -> bool:
         """Release one object this library is holding. Returns whether it was released."""
         # An unhashable key -- the held object itself, passed in place of its key -- would raise out of the

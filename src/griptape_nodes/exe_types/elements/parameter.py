@@ -96,9 +96,11 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
     # During save/load, this value IS still serialized to save its proper state.
     _settable: bool = True
 
-    # "serializable" controls whether parameter values should be serialized during save/load operations.
-    # Set to False for parameters containing non-serializable types (ImageDrivers, PromptDrivers, file handles, etc.)
-    _serializable: bool = True
+    # "serializable" controls whether values are written into a saved workflow, AND whether the engine
+    # holds them in the process that produced them rather than sending them across a worker boundary.
+    # One flag: a value that cannot be written to a file is a value that cannot cross a process, and both
+    # follow from the same fact about the object.
+    serializable: bool = True
 
     user_defined: bool = False
     private: bool = False
@@ -189,7 +191,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         self.tooltip_as_property = tooltip_as_property
         self.tooltip_as_output = tooltip_as_output
         self._settable = settable
-        self._serializable = serializable
+        self.serializable = serializable
         self.user_defined = user_defined
         self.private = private
         self.exclude_from_metadata = exclude_from_metadata
@@ -305,7 +307,9 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         event_dict["parameter_name"] = name
         # Update with value
         if node is not None:
-            event_dict["value"] = node.get_parameter_value(self.name)
+            # Raw: this dict goes to the editor and is json-serialized. A process-local value is a key
+            # there, never the object it stands for.
+            event_dict["value"] = node.get_raw_parameter_value(self.name)
         return event_dict
 
     @property
@@ -620,31 +624,13 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         self._output_type = canonical_type_name(value)
 
     @property
-    def serializable(self) -> bool:
-        """Whether this parameter's values may be written into a saved workflow.
+    def is_process_local(self) -> bool:
+        """Whether the engine holds this parameter's values in the process that produced them.
 
-        A handle can never be: its value is a key into one process's memory. Derived rather than stamped
-        at construction, so re-typing a live parameter to `handle[...]` (AlterParameterDetailsRequest)
-        cannot leave it serializable behind the flag's back -- to_dict, the GUI, and the serializer all
-        read this one property.
+        `serializable=False` is the declaration: a value that cannot be written into a saved workflow
+        cannot cross a process boundary either. Containers answer False -- see ParameterContainer.
         """
-        return self._serializable and not self.holds_local_object
-
-    @serializable.setter
-    def serializable(self, value: bool) -> None:
-        self._serializable = value
-
-    @property
-    def holds_local_object(self) -> bool:
-        """Whether values on this parameter are keys into the process-local object store.
-
-        A `handle[...]` parameter carries a key; the object it refers to never leaves the process that
-        built it. True for the producing and the consuming side, since both see the key.
-        """
-        return any(
-            ParameterType.is_handle(candidate)
-            for candidate in (self._type, self._output_type, *(self._input_types or ()))
-        )
+        return not self.serializable
 
     @property
     def on_local_object_drop(self) -> Callable[[Any], None] | None:
@@ -652,6 +638,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
 
         For anything whose memory is not freed by dropping the reference -- a pipeline holding GPU
         memory. The engine calls it when this parameter's value is replaced, and when the node is deleted.
+        Only meaningful on a `serializable=False` parameter, whose values the engine holds.
         """
         return self._on_local_object_drop
 

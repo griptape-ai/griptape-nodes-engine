@@ -141,7 +141,7 @@ def _collect_parameter_values(node_name: str, engine: Engine) -> _ParameterColle
             omitted.append(param.name)
             continue
 
-        value = node.get_parameter_value(param.name)
+        value = node.get_raw_parameter_value(param.name)
         if value is None:
             continue
 

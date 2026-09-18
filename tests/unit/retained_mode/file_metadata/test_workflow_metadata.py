@@ -124,7 +124,7 @@ class TestCollectParameterValues:
         values = {"prompt": "hello", "model": "gpt-4"}
         node = Mock()
         node.parameters = [p1, p2]
-        node.get_parameter_value.side_effect = values.get
+        node.get_raw_parameter_value.side_effect = values.get
 
         engine = Mock()
         engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
@@ -142,7 +142,7 @@ class TestCollectParameterValues:
         values = {"prompt": "hello", "password": "secret"}
         node = Mock()
         node.parameters = [pub, priv]
-        node.get_parameter_value.side_effect = values.get
+        node.get_raw_parameter_value.side_effect = values.get
 
         engine = Mock()
         engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
@@ -159,7 +159,7 @@ class TestCollectParameterValues:
 
         node = Mock()
         node.parameters = [p]
-        node.get_parameter_value.return_value = None
+        node.get_raw_parameter_value.return_value = None
 
         engine = Mock()
         engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
@@ -175,7 +175,7 @@ class TestCollectParameterValues:
 
         node = Mock()
         node.parameters = [p]
-        node.get_parameter_value.return_value = "some_value"
+        node.get_raw_parameter_value.return_value = "some_value"
 
         engine = Mock()
         engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
@@ -193,7 +193,7 @@ class TestCollectParameterValues:
         values = {"api_password": "s3cr3t", "db_password": "hunter2", "prompt": "hello"}
         node = Mock()
         node.parameters = [p1, p2, p3]
-        node.get_parameter_value.side_effect = values.get
+        node.get_raw_parameter_value.side_effect = values.get
 
         engine = Mock()
         engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
@@ -245,7 +245,7 @@ class TestCollectRawProvenance:
         param_values = {"password": "secret", "prompt": "hi"}
         node = Mock()
         node.parameters = [priv, pub]
-        node.get_parameter_value.side_effect = param_values.get
+        node.get_raw_parameter_value.side_effect = param_values.get
 
         engine = _make_engine(resolving_nodes=["MyNode"])
         engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
@@ -300,7 +300,7 @@ class TestCollectSidecarProvenance:
         param_values = {"password": "s3cr3t", "prompt": "hi"}
         node = Mock()
         node.parameters = [priv, pub]
-        node.get_parameter_value.side_effect = param_values.get
+        node.get_raw_parameter_value.side_effect = param_values.get
 
         engine = _make_engine(resolving_nodes=["MyNode"])
         engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
@@ -319,7 +319,7 @@ class TestCollectSidecarProvenance:
 
         node = Mock()
         node.parameters = [pub]
-        node.get_parameter_value.return_value = "hello"
+        node.get_raw_parameter_value.return_value = "hello"
 
         engine = _make_engine(resolving_nodes=["MyNode"])
         engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
@@ -362,7 +362,7 @@ class TestCollectWorkflowMetadata:
         param_values = {"password": "s3cr3t", "prompt": "hello"}
         node = Mock()
         node.parameters = [priv, pub]
-        node.get_parameter_value.side_effect = param_values.get
+        node.get_raw_parameter_value.side_effect = param_values.get
 
         engine = _make_engine(resolving_nodes=["MyNode"])
         engine.object_manager.attempt_get_object_by_name_as_type.return_value = node

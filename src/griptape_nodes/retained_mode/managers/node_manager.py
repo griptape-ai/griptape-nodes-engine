@@ -2413,7 +2413,7 @@ class NodeManager(EngineScoped):
                 value = node.get_display_value_for_output(parameter.name, raw_value)
             else:
                 # Otherwise grab the set value or default value
-                value = node.get_parameter_value(parameter.name)
+                value = node.get_raw_parameter_value(parameter.name)
             if value is not None:
                 element_id = parameter.element_id
                 # Check if the value is in builtins. If it isn't we need to handle it specially.
@@ -2978,12 +2978,12 @@ class NodeManager(EngineScoped):
             return NodeManager.ModifiedReturnValue(object_created, modified)
         # Otherwise use set_parameter_value. This calls our converters and validators.
         # Skip before_value_set since we already called it earlier in the flow
-        old_value = node.get_parameter_value(request.parameter_name)
+        old_value = node.get_raw_parameter_value(request.parameter_name)
         node.set_parameter_value(
             request.parameter_name, object_created, initial_setup=request.initial_setup, skip_before_value_set=True
         )
         # Get the "converted" value here.
-        finalized_value = node.get_parameter_value(request.parameter_name)
+        finalized_value = node.get_raw_parameter_value(request.parameter_name)
         if old_value != finalized_value:
             modified = True
         # If any parameters were dependent on that value, we're calling this details request to emit the result to the editor.
@@ -3193,7 +3193,9 @@ class NodeManager(EngineScoped):
         """
         candidates: set[str] = set()
         for parameter in node.parameters:
-            if not parameter.holds_local_object:
+            # The same predicate the write path uses, not `serializable` directly: a container declaring
+            # serializable=False is never held, so it never has a key to collect.
+            if not parameter.is_process_local:
                 continue
             # Both maps: this node may be the producer holding it as an output, or the last consumer
             # holding the only remaining copy of someone else's key.
@@ -4683,7 +4685,7 @@ class NodeManager(EngineScoped):
             # Output values are more important.
             output_value = node.parameter_output_values[parameter.name]
         # Get the effective value to check if it matches the default
-        effective_value = node.get_parameter_value(parameter.name)
+        effective_value = node.get_raw_parameter_value(parameter.name)
         # Save the value if it was explicitly set OR if it equals the default value.
         # The latter ensures the default is preserved when loading workflows,
         # even if the code's default value changes later.
@@ -4755,6 +4757,18 @@ class NodeManager(EngineScoped):
         # No value of this kind was set on the node.
         if value is None:
             return None
+        # A key into this process's memory means nothing in another, and a workflow that saved one would
+        # reload holding a dead reference on a node marked RESOLVED, with nothing re-running to replace it.
+        # Asked of the store rather than inferred from the parameter's flag, so a key that reached a
+        # serializable parameter is still skipped.
+        #
+        # Publishing (serialize_all_parameter_values) does not change this: a held value is already skipped
+        # by its parameter's own flag today, so nothing regresses, and a key would be useless in the
+        # published copy either way. The node comes back UNRESOLVED and its producer re-runs.
+        if node.local_objects.is_parked_by_engine(value):
+            if isinstance(create_node_request, CreateNodeRequest):
+                create_node_request.resolution = NodeResolutionState.UNRESOLVED.value
+            return None
         command = NodeManager._handle_value_hashing(
             value=value,
             serialized_parameter_value_tracker=serialized_parameter_value_tracker,
@@ -4820,7 +4834,7 @@ class NodeManager(EngineScoped):
             if param.name in node.parameter_output_values:
                 param_values[param.name] = node.parameter_output_values[param.name]
             else:
-                param_values[param.name] = node.get_parameter_value(param.name)
+                param_values[param.name] = node.get_raw_parameter_value(param.name)
         simple_values = safe_unstructure(param_values)
         return SerializedParameterValues(simple_values, None)
 
@@ -4873,7 +4887,7 @@ class NodeManager(EngineScoped):
         """
         if param_name in node.parameter_output_values:
             return node.parameter_output_values[param_name]
-        return node.get_parameter_value(param_name)
+        return node.get_raw_parameter_value(param_name)
 
     @staticmethod
     def _process_parameter_for_pickling(  # noqa: PLR0913

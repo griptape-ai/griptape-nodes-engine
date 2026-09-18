@@ -10,7 +10,7 @@ while a consumer still holds it. A key is a value, not an edge, so a consumer ke
 connection goes and can still run with what it has.
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -31,6 +31,12 @@ from griptape_nodes.retained_mode.events.node_events import (
     SerializedParameterValueTracker,
 )
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
+from griptape_nodes.retained_mode.events.parameter_events import (
+    GetParameterValueRequest,
+    GetParameterValueResultSuccess,
+    SetParameterValueRequest,
+    SetParameterValueResultFailure,
+)
 
 # A node built outside library registration shares this namespace.
 OWNER = "<unregistered>"
@@ -53,7 +59,8 @@ class _Producer(BaseNode):
         self.add_parameter(
             Parameter(
                 name="latent",
-                output_type="handle[Latent]",
+                output_type="Latent",
+                serializable=False,
                 tooltip="",
                 allowed_modes={ParameterMode.OUTPUT},
                 on_local_object_drop=lambda value: self.released.append(value.label),
@@ -69,7 +76,13 @@ class _Consumer(BaseNode):
     def __init__(self, name: str) -> None:
         super().__init__(name=name)
         self.add_parameter(
-            Parameter(name="latent", input_types=["handle[Latent]"], tooltip="", allowed_modes={ParameterMode.INPUT})
+            Parameter(
+                name="latent",
+                input_types=["Latent"],
+                serializable=False,
+                tooltip="",
+                allowed_modes={ParameterMode.INPUT},
+            )
         )
         self.add_parameter(Parameter(name="steps", input_types=["int"], tooltip=""))
 
@@ -163,7 +176,7 @@ class TestTheProducerRunsAgain:
         assert producer.released == ["first"]
         assert not _is_held(engine, first)
         assert consumer.parameter_values["latent"] == second
-        assert consumer.resolve_handle("latent").label == "second"
+        assert consumer.get_parameter_value("latent").label == "second"
 
     def test_the_ordinary_output_is_untouched(self, graph: tuple) -> None:
         producer, consumer = graph
@@ -210,7 +223,8 @@ class TestTheProducerIsDeleted:
         consumer = _add(engine, _Consumer(name="Consumer"), flow_name)
         keeper = Parameter(
             name="kept",
-            input_types=["handle[Latent]"],
+            input_types=["Latent"],
+            serializable=False,
             tooltip="",
             allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
         )
@@ -223,7 +237,7 @@ class TestTheProducerIsDeleted:
 
         assert producer.released == []
         assert consumer.parameter_values["kept"] == key
-        assert consumer.resolve_handle("kept").label == "latent"
+        assert consumer.get_parameter_value("kept").label == "latent"
 
     def test_the_object_goes_when_nothing_refers_to_the_key(self, engine: Engine, flow_name: str) -> None:
         producer = _add(engine, _Producer(name="Producer"), flow_name)
@@ -265,7 +279,9 @@ class TestTheConsumerIsDeleted:
 
         assert producer.released == []
         assert _is_held(engine, key)
-        assert producer.resolve_handle("latent").label == "latent"
+        resolved = producer.local_objects.get(producer.parameter_output_values["latent"])
+        assert resolved is not None
+        assert resolved.label == "latent"
 
 
 class TestTheConnectionIsDeleted:
@@ -456,7 +472,9 @@ class TestARelayDoesNotReleaseItsUpstream:
 
         assert producer.released == []
         assert _is_held(engine, upstream_key)
-        assert producer.resolve_handle("latent").label == "upstream"
+        still_held = producer.local_objects.get(upstream_key)
+        assert still_held is not None
+        assert still_held.label == "upstream"
 
 
 class TestReferencesTheScanMustSee:
@@ -516,7 +534,8 @@ class TestReferencesTheScanMustSee:
         consumer.add_parameter(
             Parameter(
                 name="kept",
-                input_types=["handle[Latent]"],
+                input_types=["Latent"],
+                serializable=False,
                 tooltip="",
                 allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
                 on_local_object_drop=lambda value: released.append(value.label),
@@ -587,138 +606,17 @@ class TestALibraryKeyIsNotTheEnginesToRelease:
         assert _is_held(engine, resource_key)
 
 
-class TestAContainerCannotHoldHandles:
-    def test_declaring_one_fails_rather_than_collapsing_to_a_single_key(self) -> None:
-        """Parking the whole list as one object would hand a downstream list one opaque string."""
-        with pytest.raises(ValueError, match="cannot hold handles"):
-            ParameterList(name="latents", output_type="handle[Latent]", tooltip="")
-
-
 class TestAssigningNothing:
-    def test_none_is_not_parked_so_the_consumer_is_told_nothing_is_connected(self, graph: tuple) -> None:
-        producer, consumer = graph
-
-        producer.parameter_output_values["latent"] = None
-        consumer.set_parameter_value("latent", producer.parameter_output_values["latent"])
-
-        assert producer.parameter_output_values["latent"] is None
-        with pytest.raises(RuntimeError, match="nothing is connected to it"):
-            consumer.resolve_handle("latent")
-
-
-class TestARecycledNameIsNotTheSameNode:
-    """Identity must not follow the display name.
-
-    Names are recycled: delete Producer_1 and the next node created gets Producer_1 back.
-    """
-
-    def test_a_new_node_with_a_dead_nodes_name_does_not_release_its_object(
-        self, engine: Engine, flow_name: str
-    ) -> None:
-        """The spared object of a deleted producer must survive its name being reissued."""
-        producer = _add(engine, _Producer(name="Producer"), flow_name)
-        keeper = _add(engine, _Consumer(name="Keeper"), flow_name)
-        keeper.add_parameter(
-            Parameter(
-                name="kept",
-                input_types=["handle[Latent]"],
-                tooltip="",
-                allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
-            )
-        )
-        producer.parameter_output_values["latent"] = Held("original")
-        key = producer.parameter_output_values["latent"]
-        keeper.set_parameter_value("kept", key)
-        engine.handle_request(DeleteNodeRequest(node_name="Producer"))
-        assert _is_held(engine, key)
-
-        reissued = _add(engine, _Producer(name="Producer"), flow_name)
-        reissued.parameter_output_values["latent"] = Held("new")
-
-        assert producer.released == []
-        assert _is_held(engine, key)
-        assert keeper.resolve_handle("kept").label == "original"
-
-    def test_a_renamed_node_still_displaces_its_own_prior_object(self, engine: Engine, flow_name: str) -> None:
-        """Identity rides metadata, not the name, so rename does not orphan the slot."""
-        producer = _add(engine, _Producer(name="Producer"), flow_name)
-        producer.parameter_output_values["latent"] = Held("before-rename")
-
-        producer.name = "MyPipeline"
-        producer.parameter_output_values.silent_clear()
-        producer.parameter_output_values["latent"] = Held("after-rename")
-
-        assert producer.released == ["before-rename"]
-
-
-class TestReassigningTheSameObject:
-    def test_publishing_progress_then_the_final_value_does_not_tear_it_down(self, graph: tuple) -> None:
-        """Running the release hook on a re-assigned object would free what the new key refers to.
-
-        A denoise callback assigns the in-place-mutated object each step; the final assignment is the
-        same object.
-        """
-        producer, _consumer = graph
-        held = Held("latents")
-
-        producer.parameter_output_values["latent"] = held
-        producer.parameter_output_values["latent"] = held
-
-        assert producer.released == []
-        assert producer.resolve_handle("latent") is held
-
-
-class TestAlternatingParkAndPassThrough:
-    def test_passing_through_releases_what_the_node_parked_last_run(self, engine: Engine, flow_name: str) -> None:
-        """A bypass node parks its own object at strength>0 and passes its upstream's key through at 0.
-
-        The run that passes through must displace the node's own prior entry, exactly as a fresh park
-        would, or it stays resident with nothing referring to it.
-        """
-        upstream = _add(engine, _Producer(name="Upstream"), flow_name)
-        bypass = _add(engine, _Producer(name="Bypass"), flow_name)
-        upstream.parameter_output_values["latent"] = Held("upstream")
-        upstream_key = upstream.parameter_output_values["latent"]
-
-        bypass.parameter_output_values["latent"] = Held("own-work")
-        bypass.parameter_output_values.silent_clear()
-        bypass.parameter_output_values["latent"] = upstream_key
-
-        assert bypass.released == ["own-work"]
-        assert upstream.released == []
-        assert _is_held(engine, upstream_key)
-
-    def test_assigning_none_after_a_park_releases_it_too(self, graph: tuple) -> None:
-        producer, _consumer = graph
+    def test_none_passes_through_and_frees_what_the_slot_held(self) -> None:
+        """A run that produces nothing releases what the last run produced, and the consumer reads None."""
+        producer = _Producer(name="Producer")
         producer.parameter_output_values["latent"] = Held("only-run")
-        producer.parameter_output_values.silent_clear()
 
+        producer.parameter_output_values.silent_clear()
         producer.parameter_output_values["latent"] = None
 
         assert producer.released == ["only-run"]
-
-
-class TestDeletingANodeWhoseObjectLivesInAWorker:
-    def test_the_key_is_broadcast_even_with_no_local_entry(self, engine: Engine, flow_name: str) -> None:
-        """A key with no local entry still has to reach the workers.
-
-        In worker mode the orchestrator holds no entry -- the worker parked it -- so it cannot check
-        provenance locally. The parked-only handler on the worker decides.
-        """
-        producer = _add(engine, _Producer(name="Producer"), flow_name)
-        worker_held_key = f"{OWNER}:Producer@feedbeef.latent#0d575269"
-        producer.parameter_output_values["latent"] = worker_held_key
-        assert not _is_held(engine, worker_held_key)
-
-        # Workers registered, no running loop: the keys stay queued for the awaited drain, which is how a
-        # sync delete path leaves them. With no workers the queue is discarded on the spot instead.
-        with (
-            patch.object(engine.worker_manager, "_transport", object()),
-            patch.object(engine.worker_manager, "_workers", {"w1": object()}),
-        ):
-            engine.handle_request(DeleteNodeRequest(node_name="Producer"))
-
-        assert worker_held_key in engine.resource_manager.drain_pending_worker_releases()
+        assert producer.parameter_output_values["latent"] is None
 
 
 class TestOneObjectInSeveralEntries:
@@ -729,7 +627,8 @@ class TestOneObjectInSeveralEntries:
         producer.add_parameter(
             Parameter(
                 name="latent_also",
-                output_type="handle[Latent]",
+                output_type="Latent",
+                serializable=False,
                 tooltip="",
                 allowed_modes={ParameterMode.OUTPUT},
                 on_local_object_drop=lambda value: producer.released.append(value.label),
@@ -773,7 +672,8 @@ class TestAHookRunsOncePerObject:
         producer.add_parameter(
             Parameter(
                 name="latent_also",
-                output_type="handle[Latent]",
+                output_type="Latent",
+                serializable=False,
                 tooltip="",
                 allowed_modes={ParameterMode.OUTPUT},
                 on_local_object_drop=lambda value: producer.released.append(value.label),
@@ -904,3 +804,171 @@ class TestBatchTeardownIsOncePerObject:
         manager.drop_objects_for_owner(OWNER)
 
         assert released == ["shared"]
+
+
+class TestTheEnginesOwnReadsNeverSeeTheObject:
+    """Every path that moves, saves, or reports a value must see the key.
+
+    This is what makes holding objects safe at all: `parameter_values` stays JSON-safe even while a node
+    is executing, so a mid-process request that forwards to the orchestrator cannot stringify a pipeline.
+    """
+
+    def test_the_editor_is_told_the_key(self, engine: Engine, flow_name: str) -> None:
+        """Parameter.to_event builds what the editor receives, and it is json-serialized on the way."""
+        producer = _add(engine, _Producer(name="Producer"), flow_name)
+        producer.parameter_output_values["latent"] = Held("pipeline")
+        key = producer.parameter_output_values["latent"]
+
+        parameter = producer.get_parameter_by_name("latent")
+        assert parameter is not None
+        event = parameter.to_event(producer)
+
+        assert event["value"] == key or event.get("value") is None
+
+    def test_a_value_query_answers_with_the_key(self, engine: Engine, flow_name: str) -> None:
+        """GetParameterValueRequest serves the editor and is forwarded from workers mid-execution."""
+        consumer = _add(engine, _Consumer(name="Consumer"), flow_name)
+        consumer.set_parameter_value("latent", f"{OWNER}:Producer@abc12345.latent#deadbeef")
+
+        result = engine.handle_request(GetParameterValueRequest(parameter_name="latent", node_name="Consumer"))
+
+        assert isinstance(result, GetParameterValueResultSuccess)
+        assert result.value == f"{OWNER}:Producer@abc12345.latent#deadbeef"
+
+    def test_clearing_outputs_reports_keys_not_objects(self, engine: Engine, flow_name: str) -> None:
+        """clear() emits a change event per key, and those events reach the editor too."""
+        producer = _add(engine, _Producer(name="Producer"), flow_name)
+        producer.parameter_output_values["latent"] = Held("pipeline")
+
+        producer.parameter_output_values.clear()
+
+        assert "latent" not in producer.parameter_output_values
+
+
+class TestSavingAndPublishing:
+    """A key means nothing in another process, so neither a save nor a publish may carry one.
+
+    Both leave the node UNRESOLVED instead, and its producer re-runs on load. Publishing behaves the same
+    way it did before held values existed: a `serializable=False` parameter was already skipped.
+    """
+
+    @pytest.mark.parametrize("publishing", [False, True])
+    def test_a_held_value_is_never_written_out(self, engine: Engine, publishing: bool) -> None:  # noqa: FBT001
+        producer = _Producer(name="Producer")
+        producer.parameter_output_values["latent"] = Held("pipeline")
+        parameter = producer.get_parameter_by_name("latent")
+        assert parameter is not None
+        captured: dict = {}
+        request = CreateNodeRequest(
+            node_type="_Producer", node_name="Producer", resolution=NodeResolutionState.RESOLVED.value
+        )
+
+        saved = engine.node_manager.handle_parameter_value_saving(
+            parameter=parameter,
+            node=producer,
+            unique_parameter_uuid_to_values=captured,
+            serialized_parameter_value_tracker=SerializedParameterValueTracker(),
+            create_node_request=request,
+            workflow_manager=MagicMock(),
+            serialize_all_parameter_values=publishing,
+        )
+
+        assert saved is None
+        assert captured == {}
+        assert request.resolution == NodeResolutionState.UNRESOLVED.value
+
+
+class TestAKeyThatReachedASerializableParameter:
+    """The save skip asks the store, not the parameter's flag, and this is why.
+
+    A `serializable=False` parameter is skipped by its own flag. A key that arrives on an ordinary
+    parameter -- wired through an `any` input, say -- has nothing stopping it, and a saved workflow would
+    carry a reference into a process that no longer exists on a node marked RESOLVED.
+    """
+
+    def test_it_is_not_written_into_the_saved_workflow(self, engine: Engine, flow_name: str) -> None:
+        producer = _add(engine, _Producer(name="Producer"), flow_name)
+        producer.parameter_output_values["latent"] = Held("pipeline")
+        key = producer.parameter_output_values["latent"]
+
+        passthrough = _add(engine, _Consumer(name="Passthrough"), flow_name)
+        ordinary = Parameter(name="anything", input_types=["any"], tooltip="")
+        passthrough.add_parameter(ordinary)
+        passthrough.set_parameter_value("anything", key)
+        assert ordinary.serializable is True
+
+        request = CreateNodeRequest(
+            node_type="_Consumer", node_name="Passthrough", resolution=NodeResolutionState.RESOLVED.value
+        )
+        captured: dict = {}
+        saved = engine.node_manager.handle_parameter_value_saving(
+            parameter=ordinary,
+            node=passthrough,
+            unique_parameter_uuid_to_values=captured,
+            serialized_parameter_value_tracker=SerializedParameterValueTracker(),
+            create_node_request=request,
+            workflow_manager=MagicMock(),
+        )
+
+        assert saved is None
+        assert captured == {}
+        assert request.resolution == NodeResolutionState.UNRESOLVED.value
+
+    def test_the_serializer_reads_the_stored_key(self, engine: Engine, flow_name: str) -> None:
+        """The serialization helper reads values to hash them; it must see keys, never objects.
+
+        Through an input value specifically: the helper takes output values from the dict directly, so only
+        the input path goes through an accessor and can translate.
+        """
+        producer = _add(engine, _Producer(name="Producer"), flow_name)
+        producer.parameter_output_values["latent"] = Held("pipeline")
+        key = producer.parameter_output_values["latent"]
+        consumer = _add(engine, _Consumer(name="Consumer"), flow_name)
+        consumer.set_parameter_value("latent", key)
+
+        read = engine.node_manager._get_parameter_value_for_serialization(consumer, "latent")
+
+        assert read == key
+
+
+class TestDeliveringAValueToTheNextNode:
+    def test_it_is_stored_as_a_key(self, engine: Engine, flow_name: str) -> None:
+        """Resolution delivers values through SetParameterValueRequest.
+
+        What lands in the consumer's parameter_values is the key: that dict is json-serialized on every
+        worker dispatch, so an object there would go onto the wire.
+        """
+        producer = _add(engine, _Producer(name="Producer"), flow_name)
+        consumer = _add(engine, _Consumer(name="Consumer"), flow_name)
+        producer.parameter_output_values["latent"] = Held("pipeline")
+        key = producer.parameter_output_values["latent"]
+
+        result = engine.handle_request(
+            SetParameterValueRequest(parameter_name="latent", node_name="Consumer", value=key)
+        )
+
+        assert not isinstance(result, SetParameterValueResultFailure)
+        assert consumer.parameter_values["latent"] == key
+        resolved = consumer.get_parameter_value("latent")
+        assert resolved is not None
+        assert resolved.label == "pipeline"
+
+
+class TestANonSerializableContainer:
+    def test_it_is_neither_held_nor_collected(self, engine: Engine, flow_name: str) -> None:
+        """Holding a container would hand a downstream list one opaque key, so it is never held.
+
+        The delete scan finds nothing for it either. Both sites ask `is_process_local` rather than
+        `serializable` so they cannot answer differently about a container later; today the two are
+        equivalent here, since a list is not a key whichever predicate is used.
+        """
+        node = _add(engine, _Producer(name="Producer"), flow_name)
+        latents = ParameterList(name="latents", output_type="Latent", tooltip="")
+        latents.serializable = False
+        node.add_parameter(latents)
+        batch = [Held("a"), Held("b")]
+
+        node.parameter_output_values["latents"] = batch
+
+        assert node.parameter_output_values["latents"] is batch
+        assert engine.node_manager._unreferenced_handle_keys(node) == []

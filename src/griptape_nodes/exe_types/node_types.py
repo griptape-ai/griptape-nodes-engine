@@ -1088,6 +1088,33 @@ class BaseNode(ABC):
             GriptapeNodes.handle_request(RemoveParameterFromNodeRequest(parameter_name=child.name, node_name=self.name))
 
     def get_parameter_value(self, param_name: str) -> Any:
+        """The value a node reads, with a held object substituted for the key standing in for it.
+
+        A `serializable=False` parameter's value is held in the process that produced it and travels as a
+        key, so this is where the key becomes the object again -- the node reads its parameter normally.
+        Engine code that moves values between nodes, saves them, or sends them to the editor wants the key
+        and calls `get_raw_parameter_value`, which is also the one to override for a computed value.
+
+        Raises:
+            RuntimeError: if the value is a key this process is no longer holding, naming the parameter.
+        """
+        value = self.get_raw_parameter_value(param_name)
+        parameter = self.get_parameter_by_name(param_name)
+        if parameter is None or not parameter.is_process_local:
+            return value
+        return self.local_objects.resolve_if_held(value, parameter_name=param_name, node_name=self.name)
+
+    def get_raw_parameter_value(self, param_name: str) -> Any:
+        """The value as stored, with no held-object substitution.
+
+        For engine code: what is in a parameter is a key when the object is held, and a key is what has to
+        travel to a worker, into a saved workflow, or to the editor. Node bodies want
+        `get_parameter_value`.
+
+        **Override this one, not `get_parameter_value`**, to compute a value rather than store it. Saving,
+        dispatch, events and metadata all read through here, so an override on the wrapper would be
+        bypassed by every one of them and the engine would persist something the node never reports.
+        """
         param = self.get_parameter_by_name(param_name)
         if param is None:
             return None
@@ -1337,25 +1364,6 @@ class BaseNode(ABC):
             )
         return self._local_objects
 
-    def resolve_handle(self, param_name: str) -> Any:
-        """The object behind a `handle[...]` parameter's value, raising if this process is not holding it.
-
-        Reading is explicit where writing is not: when the object was built in another process there is
-        nothing to hand over, and a library that never called anything would meet that failure inside a
-        getter with no idea why.
-
-        Raises:
-            RuntimeError: if the object is not held, naming this parameter as the place to look.
-        """
-        # Output values first, then inputs, matching how the engine reads an upstream value in
-        # parallel_resolution.collect_values_from_upstream_nodes: a producing parameter's key is in
-        # parameter_output_values, a consuming one's in parameter_values.
-        if param_name in self.parameter_output_values:
-            key = self.parameter_output_values[param_name]
-        else:
-            key = self.get_parameter_value(param_name)
-        return self.local_objects.require(key, parameter_name=param_name, node_name=self.name)
-
     def clear_node(self) -> None:
         # set state to unresolved
         self.state = NodeResolutionState.UNRESOLVED
@@ -1445,15 +1453,14 @@ class BaseNode(ABC):
     def append_value_to_parameter(self, parameter_name: str, value: Any) -> None:
         from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
-        # A handle's value is a key, and concatenating a chunk onto it makes a string that still looks
+        # A held value travels as a key, and concatenating a chunk onto it makes a string that still looks
         # like this library's key -- so the write below would pass it through and vacate the slot,
-        # releasing the object under everyone holding the real key. Same rule as containers: failing
-        # loudly beats failing quietly.
+        # releasing the object under everyone holding the real key. Failing loudly beats failing quietly.
         parameter = self.get_parameter_by_name(parameter_name)
-        if parameter is not None and parameter.holds_local_object:
+        if parameter is not None and parameter.is_process_local:
             msg = (
                 f"Attempted to append to parameter '{parameter_name}' on node '{self.name}'. Failed "
-                f"because a handle cannot be streamed into: assign the finished object once."
+                f"because a held value cannot be streamed into: assign the finished object once."
             )
             raise RuntimeError(msg)
 
@@ -2026,7 +2033,7 @@ class TrackedParameterOutputValues(dict[str, Any]):
         # handles structured types (JSON Input dicts, list outputs, etc.).
         if _in_aprocess.get() and (parameter is None or parameter.allow_variable_substitution):
             value = self._node._resolve_variables_in_value(value)
-        if parameter is not None and parameter.holds_local_object:
+        if parameter is not None and parameter.is_process_local:
             value = self._park_local_object(parameter, value)
         super().__setitem__(key, value)
 
@@ -2071,7 +2078,9 @@ class TrackedParameterOutputValues(dict[str, Any]):
             for key in keys_to_clear:
                 # Some nodes still have values set, even if their output values are cleared
                 # Here, we are emitting an event with those set values, to not misrepresent the values of the parameters in the UI.
-                value = self._node.get_parameter_value(key)
+                # Raw: this goes to the editor, which shows the stored value. Translating here would put
+                # a held object into an event payload and json-serialize it on the way out.
+                value = self._node.get_raw_parameter_value(key)
                 self._emit_parameter_change_event(key, value, deleted=True)
 
     def silent_clear(self) -> None:

@@ -93,10 +93,12 @@ class _ComputedValueNode(DataNode):
             )
         )
 
-    def get_parameter_value(self, param_name: str) -> Any:
+    def get_raw_parameter_value(self, param_name: str) -> Any:
+        # The raw accessor is where "stored or computed" lives: it is what the engine reads for saving,
+        # dispatch and events, and what the translating `get_parameter_value` is built on.
         if param_name == "computed":
             return "computed-value"
-        return super().get_parameter_value(param_name)
+        return super().get_raw_parameter_value(param_name)
 
     def process(self) -> None:
         pass
@@ -645,7 +647,13 @@ class TestLocalObjectIdentityIsNeverCopied:
         released: list[str] = []
         for node in (original, clone):
             node.add_parameter(
-                Parameter(name="pipe", output_type="handle[Pipe]", tooltip="", on_local_object_drop=released.append)
+                Parameter(
+                    name="pipe",
+                    output_type="Pipe",
+                    serializable=False,
+                    tooltip="",
+                    on_local_object_drop=released.append,
+                )
             )
         original.parameter_output_values["pipe"] = object()
         key = original.parameter_output_values["pipe"]

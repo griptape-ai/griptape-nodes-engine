@@ -1,27 +1,23 @@
-"""Tests for the node-facing side of the process-local object store.
+"""What a library author sees when a value cannot cross a process boundary.
 
-Two surfaces: a `handle[...]` parameter, where assigning an object parks it and the engine owns the
-key, and `node.local_objects`, where a library names its own key for a resource it reuses across runs.
+The contract is one declaration: mark the parameter `serializable=False`. A value that cannot be written
+into a saved workflow cannot be sent to another process either, so the engine holds it where it was built
+and passes a key in its place. Reads and writes stay ordinary -- assign the object, read the object -- and
+these tests are written from that author's point of view.
+
+Engine-side lifetime (who frees what, and when) lives in
+tests/unit/retained_mode/managers/test_handle_lifetime.py.
 """
 
 import pytest
 
-from griptape_nodes.exe_types.core_types import Parameter, ParameterMode, ParameterType
-from griptape_nodes.exe_types.elements.parameter_types import accepts_incoming_type
+from griptape_nodes.exe_types.core_types import Parameter, ParameterList, ParameterMode
 from griptape_nodes.exe_types.node_types import BaseNode
 
 
-class _Holder(BaseNode):
-    """Concrete BaseNode used to exercise the local-object surfaces."""
+class Pipeline:
+    """Stands in for something that cannot cross a process boundary: a loaded model, a latent."""
 
-    def __init__(self, name: str, metadata=None) -> None:  # noqa: ANN001
-        super().__init__(name=name, metadata=metadata)
-
-    def process(self) -> None:
-        return None
-
-
-class Held:
     def __init__(self, label: str) -> None:
         self.label = label
 
@@ -29,8 +25,8 @@ class Held:
 class _ArrayLike:
     """Stands in for a tensor: truthiness raises above one element, and it is unhashable.
 
-    numpy is not an engine dependency, and those are the two behaviours that break a key check and a map
-    lookup respectively.
+    numpy is not an engine dependency, and those are the two behaviours that break a value check and a
+    map lookup respectively.
     """
 
     __hash__ = None  # type: ignore[assignment]
@@ -45,315 +41,242 @@ class _ArrayLike:
         return False
 
 
-@pytest.fixture
-def node() -> _Holder:
-    """A node belonging to a library, which is what supplies key scoping."""
-    return _Holder(name="Builder", metadata={"library": "Lib A"})
+class _LibraryNode(BaseNode):
+    def __init__(self, name: str, metadata=None) -> None:  # noqa: ANN001
+        super().__init__(name=name, metadata=metadata or {"library": "Diffusers"})
+
+    def process(self) -> None:
+        return None
 
 
-def _with_handle_output(node: _Holder, name: str = "pipeline", **kwargs) -> Parameter:
-    parameter = Parameter(name=name, output_type="handle[Pipeline]", tooltip="", **kwargs)
-    node.add_parameter(parameter)
-    return parameter
+def _producer(name: str = "LoadPipeline", *, on_drop=None) -> _LibraryNode:  # noqa: ANN001
+    """A node whose output holds a pipeline: the whole declaration is serializable=False."""
+    node = _LibraryNode(name=name)
+    node.add_parameter(
+        Parameter(
+            name="pipeline",
+            output_type="Pipeline",
+            tooltip="",
+            serializable=False,
+            allowed_modes={ParameterMode.OUTPUT},
+            on_local_object_drop=on_drop,
+        )
+    )
+    return node
 
 
-class TestHandleParameter:
-    def test_assigning_an_object_stores_a_key_and_holds_the_object(self, node: _Holder) -> None:
-        """The library assigns the object; only the key travels onward."""
-        _with_handle_output(node)
-        held = Held("pipeline")
+def _consumer(name: str = "Generate") -> _LibraryNode:
+    node = _LibraryNode(name=name)
+    node.add_parameter(
+        Parameter(
+            name="pipeline",
+            input_types=["Pipeline"],
+            tooltip="",
+            serializable=False,
+            allowed_modes={ParameterMode.INPUT},
+        )
+    )
+    return node
 
-        node.parameter_output_values["pipeline"] = held
 
-        key = node.parameter_output_values["pipeline"]
-        assert isinstance(key, str)
-        assert key.startswith("Lib A:")
-        assert node.resolve_handle("pipeline") is held
+def _hand_over(producer: _LibraryNode, consumer: _LibraryNode, param: str = "pipeline") -> None:
+    """Deliver the producer's output to the consumer, the way resolution does.
 
-    def test_a_second_run_gets_a_different_key(self, node: _Holder) -> None:
-        """A stable key would leave the value unchanged, and the editor is told only about changes."""
-        _with_handle_output(node)
+    Reads the output dict directly, as parallel_resolution does: what is there is the key.
+    """
+    consumer.set_parameter_value(param, producer.parameter_output_values[param])
 
-        node.parameter_output_values["pipeline"] = Held("first")
-        first_key = node.parameter_output_values["pipeline"]
-        node.parameter_output_values["pipeline"] = Held("second")
-        second_key = node.parameter_output_values["pipeline"]
 
-        assert first_key != second_key
+class TestHandingAnObjectToTheNextNode:
+    """The story the feature exists for: a pipeline reaches the next node without crossing the wire."""
 
-    def test_the_displaced_object_is_released(self, node: _Holder) -> None:
-        """Replacing the value is what makes the old object unreachable, so it is freed then."""
+    def test_the_consumer_reads_the_object_its_producer_assigned(self) -> None:
+        producer, consumer = _producer(), _consumer()
+        pipeline = Pipeline("flux")
+
+        producer.parameter_output_values["pipeline"] = pipeline
+        _hand_over(producer, consumer)
+
+        assert consumer.get_parameter_value("pipeline") is pipeline
+
+    def test_the_library_never_touches_a_key(self) -> None:
+        """Assign an object, read an object. The key exists, but not in anything the author writes."""
+        producer, consumer = _producer(), _consumer()
+
+        producer.parameter_output_values["pipeline"] = Pipeline("flux")
+        _hand_over(producer, consumer)
+
+        assert isinstance(producer.parameter_output_values["pipeline"], str)
+        assert isinstance(consumer.get_parameter_value("pipeline"), Pipeline)
+
+    def test_the_engine_sees_the_key_where_the_node_sees_the_object(self) -> None:
+        """What travels to a worker, into a saved file, or to the editor is the key.
+
+        A value only becomes an object at the point a node reads its own parameter.
+        """
+        producer, consumer = _producer(), _consumer()
+        producer.parameter_output_values["pipeline"] = Pipeline("flux")
+        _hand_over(producer, consumer)
+
+        raw = consumer.get_raw_parameter_value("pipeline")
+
+        assert isinstance(raw, str)
+        assert raw.startswith("Diffusers:")
+        assert consumer.get_parameter_value("pipeline") is not raw
+
+
+class TestTheProducerRunsAgain:
+    def test_the_consumer_sees_the_new_object(self) -> None:
+        producer, consumer = _producer(), _consumer()
+
+        producer.parameter_output_values["pipeline"] = Pipeline("first")
+        _hand_over(producer, consumer)
+        assert consumer.get_parameter_value("pipeline").label == "first"
+
+        producer.parameter_output_values.silent_clear()
+        producer.parameter_output_values["pipeline"] = Pipeline("second")
+        _hand_over(producer, consumer)
+
+        assert consumer.get_parameter_value("pipeline").label == "second"
+
+    def test_the_object_it_replaced_is_freed(self) -> None:
+        """The release hook is where a library frees VRAM; dropping the reference would not."""
         released: list[str] = []
-        _with_handle_output(node, on_local_object_drop=lambda value: released.append(value.label))
+        producer = _producer(on_drop=lambda value: released.append(value.label))
 
-        node.parameter_output_values["pipeline"] = Held("first")
-        node.parameter_output_values["pipeline"] = Held("second")
+        producer.parameter_output_values["pipeline"] = Pipeline("first")
+        producer.parameter_output_values.silent_clear()
+        producer.parameter_output_values["pipeline"] = Pipeline("second")
 
         assert released == ["first"]
-        assert node.resolve_handle("pipeline").label == "second"
-
-    def test_a_key_assigned_back_is_passed_through(self, node: _Holder) -> None:
-        """A node that changes an object in place and outputs it again must not park it twice.
-
-        Two entries for one object means two release hooks, either of which frees it under the other.
-        """
-        released: list[str] = []
-        _with_handle_output(node, on_local_object_drop=lambda value: released.append(value.label))
-        held = Held("pipeline")
-
-        node.parameter_output_values["pipeline"] = held
-        key = node.parameter_output_values["pipeline"]
-        node.parameter_output_values["pipeline"] = key
-
-        assert node.parameter_output_values["pipeline"] == key
-        assert released == []
-        assert node.resolve_handle("pipeline") is held
-
-    def test_an_ordinary_parameter_is_untouched(self, node: _Holder) -> None:
-        node.add_parameter(Parameter(name="count", output_type="int", tooltip=""))
-        steps = 42
-
-        node.parameter_output_values["count"] = steps
-
-        assert node.parameter_output_values["count"] == steps
-
-    def test_a_handle_parameter_reports_that_it_holds_one(self, node: _Holder) -> None:
-        parameter = _with_handle_output(node)
-
-        assert parameter.holds_local_object is True
-        assert Parameter(name="plain", output_type="str", tooltip="").holds_local_object is False
-
-    def test_a_handle_can_declare_property_without_breaking(self, node: _Holder) -> None:
-        """No construction guard: the engine clears a handle on disconnect whatever it declares."""
-        parameter = _with_handle_output(node, allowed_modes={ParameterMode.PROPERTY, ParameterMode.OUTPUT})
-
-        node.parameter_output_values["pipeline"] = Held("x")
-
-        assert parameter.holds_local_object is True
-        assert node.resolve_handle("pipeline").label == "x"
 
 
-class TestResolveHandle:
-    def test_another_node_reads_what_this_one_produced(self, node: _Holder) -> None:
-        """The normal case: a producer assigns, a consumer resolves, both in one process."""
-        _with_handle_output(node)
-        held = Held("pipeline")
-        node.parameter_output_values["pipeline"] = held
+class TestWhatTheAuthorSeesWhenSomethingIsWrong:
+    """Each way of being wrong needs a different fix, so each gets its own answer."""
 
-        consumer = _Holder(name="Runtime", metadata={"library": "Lib A"})
-        consumer.add_parameter(Parameter(name="pipeline", input_types=["handle[Pipeline]"], tooltip=""))
-        consumer.set_parameter_value("pipeline", node.parameter_output_values["pipeline"])
-
-        assert consumer.resolve_handle("pipeline") is held
-
-    def test_says_what_to_do_when_the_object_is_gone(self, node: _Holder) -> None:
-        node.add_parameter(Parameter(name="pipeline", input_types=["handle[Pipeline]"], tooltip=""))
-        node.set_parameter_value("pipeline", "Lib A:long-gone")
+    def test_the_object_is_gone(self) -> None:
+        """A reopened workflow holds keys into a process that no longer exists."""
+        consumer = _consumer()
+        consumer.set_parameter_value("pipeline", "Diffusers:LoadPipeline@abc12345.pipeline#deadbeef")
 
         with pytest.raises(RuntimeError) as caught:
-            node.resolve_handle("pipeline")
+            consumer.get_parameter_value("pipeline")
 
         message = str(caught.value)
         assert "no longer available" in message
         assert "parameter 'pipeline'" in message
         assert "Re-run whatever is connected to 'pipeline'." in message
 
-    def test_an_unwired_input_is_told_that_nothing_is_connected(self, node: _Holder) -> None:
-        """An unwired input reads as None, and needs a different remedy from a wrong value."""
-        node.add_parameter(Parameter(name="pipeline", input_types=["handle[Pipeline]"], tooltip=""))
+    def test_nothing_is_connected(self) -> None:
+        consumer = _consumer()
+
+        assert consumer.get_parameter_value("pipeline") is None
+
+    @pytest.mark.parametrize("wrong_value", [_ArrayLike(elements=4), _ArrayLike(elements=1), 42])
+    def test_a_value_the_engine_never_held_is_returned_untouched(self, wrong_value: object) -> None:
+        """A non-serializable parameter may hold something the engine never parked.
+
+        Wiring the object in rather than its key is the likeliest mistake, so this must survive a tensor:
+        asking whether a multi-element array is empty raises, and a one-element one answers falsy.
+        """
+        consumer = _consumer()
+        consumer.parameter_values["pipeline"] = wrong_value
+
+        assert consumer.get_parameter_value("pipeline") is wrong_value
+
+    def test_a_key_from_another_library_says_so(self) -> None:
+        """A key never resolves outside the library that made it, whatever process they share."""
+        other_library = _LibraryNode(name="TheirLoader", metadata={"library": "SomeoneElse"})
+        other_library.add_parameter(Parameter(name="pipeline", output_type="Pipeline", tooltip="", serializable=False))
+        other_library.parameter_output_values["pipeline"] = Pipeline("theirs")
+
+        consumer = _consumer()
+        consumer.set_parameter_value("pipeline", other_library.parameter_output_values["pipeline"])
 
         with pytest.raises(RuntimeError) as caught:
-            node.resolve_handle("pipeline")
-
-        message = str(caught.value)
-        assert "nothing is connected to it" in message
-        assert "not a reference to a held object" not in message
-
-    @pytest.mark.parametrize("wrong_value", [_ArrayLike(elements=4), _ArrayLike(elements=1), 42, object()])
-    def test_a_value_that_is_not_a_key_reports_that(self, node: _Holder, wrong_value: object) -> None:
-        """The mistake this catches is wiring the object in place of its key, so it must survive a tensor."""
-        node.add_parameter(Parameter(name="pipeline", input_types=["handle[Pipeline]"], tooltip=""))
-        node.parameter_values["pipeline"] = wrong_value
-
-        with pytest.raises(RuntimeError) as caught:
-            node.resolve_handle("pipeline")
-
-        message = str(caught.value)
-        assert "not a reference to a held object" in message
-        assert "nothing is connected" not in message
-
-    def test_a_key_from_another_library_says_so_instead_of_re_run(self, node: _Holder) -> None:
-        """A key from another library can never resolve here, so re-running would go on forever."""
-        other = _Holder(name="Other", metadata={"library": "Lib B"})
-        _with_handle_output(other)
-        other.parameter_output_values["pipeline"] = Held("theirs")
-
-        node.add_parameter(Parameter(name="pipeline", input_types=["handle[Pipeline]"], tooltip=""))
-        node.set_parameter_value("pipeline", other.parameter_output_values["pipeline"])
-
-        with pytest.raises(RuntimeError) as caught:
-            node.resolve_handle("pipeline")
+            consumer.get_parameter_value("pipeline")
 
         message = str(caught.value)
         assert "different node library" in message
         assert "Re-run" not in message
 
+    def test_streaming_into_a_held_parameter_is_refused(self) -> None:
+        """Appending a chunk to a key would make a string that still looks like a key.
 
-class TestResourceScope:
-    """`local_objects` is for a resource the library reuses across runs, keyed by something it can derive."""
+        The write would pass it through and free the object under everyone holding the real key, on the
+        first chunk, silently.
+        """
+        producer = _producer()
+        producer.parameter_output_values["pipeline"] = Pipeline("streamed")
 
-    def test_put_then_get_under_a_derived_key(self, node: _Holder) -> None:
-        held = Held("pipeline")
-        key = node.local_objects.put(held, key="cfg-hash")
-
-        assert node.local_objects.get(key) is held
-        assert node.local_objects.key_for("cfg-hash") == key
-
-    def test_key_is_scoped_to_the_nodes_library(self, node: _Holder) -> None:
-        assert node.local_objects.put(Held("x"), key="cfg").startswith("Lib A:")
-
-    def test_a_node_without_a_library_still_works(self) -> None:
-        """A node built outside library registration must not land in a real library's namespace."""
-        orphan = _Holder(name="Loose", metadata={})
-
-        key = orphan.local_objects.put(Held("x"), key="cfg")
-
-        assert orphan.local_objects.get(key) is not None
-        assert not key.startswith("Lib A:")
-
-    def test_drop_one(self, node: _Holder) -> None:
-        key = node.local_objects.put(Held("x"), key="cfg")
-
-        assert node.local_objects.drop(key) is True
-        assert node.local_objects.get(key) is None
-
-    @pytest.mark.parametrize("wrong_value", [_ArrayLike(elements=4), ["not", "a", "key"], None])
-    def test_dropping_something_that_is_not_a_key_releases_nothing(self, node: _Holder, wrong_value: object) -> None:
-        """An unhashable value would otherwise raise `TypeError` out of the map lookup."""
-        assert node.local_objects.drop(wrong_value) is False  # type: ignore[arg-type]
-
-    def test_drop_all_is_scoped_to_this_library(self, node: _Holder) -> None:
-        """This is what a clear-cache node calls, and it must not reach another library's objects."""
-        other = _Holder(name="Other", metadata={"library": "Lib B"})
-        mine = node.local_objects.put(Held("mine"), key="cfg")
-        theirs = other.local_objects.put(Held("theirs"), key="cfg")
-
-        dropped = node.local_objects.drop_all()
-
-        assert dropped == 1
-        assert node.local_objects.get(mine) is None
-        assert other.local_objects.get(theirs) is not None
-
-    def test_cannot_drop_an_object_owned_by_another_library(self, node: _Holder) -> None:
-        """A handle can arrive from another library as a parameter value; dropping it must be refused."""
-        other = _Holder(name="Other", metadata={"library": "Lib B"})
-        theirs = other.local_objects.put(Held("theirs"), key="cfg")
-
-        assert node.local_objects.drop(theirs) is False
-        assert other.local_objects.get(theirs) is not None
-
-    def test_drop_all_runs_release_hooks(self, node: _Holder) -> None:
-        released: list[str] = []
-        node.local_objects.put(Held("gpu"), key="cfg", on_drop=lambda value: released.append(value.label))
-
-        node.local_objects.drop_all()
-
-        assert released == ["gpu"]
-
-    def test_reusing_a_key_releases_what_it_displaced(self, node: _Holder) -> None:
-        """Rebuilding under an unchanged hash must not strand the old object."""
-        released: list[str] = []
-        node.local_objects.put(Held("first"), key="cfg", on_drop=lambda value: released.append(value.label))
-        node.local_objects.put(Held("second"), key="cfg")
-
-        assert released == ["first"]
+        with pytest.raises(RuntimeError, match="cannot be streamed into"):
+            producer.append_value_to_parameter("pipeline", "chunk")
 
 
-class TestSurvivesNodeDiscard:
-    def test_a_new_node_reads_what_another_produced(self, node: _Holder) -> None:
-        """A worker discards the node each execution, so the next instance must find what the last put."""
-        _with_handle_output(node)
-        held = Held("pipeline")
-        node.parameter_output_values["pipeline"] = held
-        key = node.parameter_output_values["pipeline"]
+class TestOrdinaryParametersAreUntouched:
+    def test_a_serializable_parameter_keeps_its_value(self) -> None:
+        node = _LibraryNode(name="Settings")
+        node.add_parameter(Parameter(name="steps", output_type="int", tooltip=""))
+        steps = 20
 
-        next_execution = _Holder(name="Runtime", metadata={"library": "Lib A"})
-        next_execution.add_parameter(Parameter(name="pipeline", input_types=["handle[Pipeline]"], tooltip=""))
-        next_execution.set_parameter_value("pipeline", key)
+        node.parameter_output_values["steps"] = steps
 
-        assert next_execution.resolve_handle("pipeline") is held
+        assert node.parameter_output_values["steps"] == steps
+
+    def test_a_container_is_not_parked(self) -> None:
+        """Holding a whole list as one object would hand a downstream list one opaque key.
+
+        A container has nowhere to put a release hook either; its elements are ordinary parameters.
+        """
+        node = _LibraryNode(name="Batch")
+        latents = ParameterList(name="latents", output_type="Latent", tooltip="")
+        # ParameterList does not accept `serializable` through __init__; setting it directly is the only
+        # way to reach the case, and is_process_local must still answer False for a container.
+        latents.serializable = False
+        node.add_parameter(latents)
+        assert latents.is_process_local is False
+        batch = [Pipeline("a"), Pipeline("b")]
+
+        node.parameter_output_values["latents"] = batch
+
+        assert node.parameter_output_values["latents"] is batch
 
 
-class TestAHandleOnlyConnectsToAHandle:
-    """`any` accepts everything else, but a handle's value is a key into one process's memory.
+class TestCachingAnExpensiveResourceAcrossRuns:
+    """`local_objects` is the one explicit API: a key the library can derive again.
 
-    An `any` consumer (Reroute, Display) would show an opaque string, serialize it, and, if it allows
-    PROPERTY, keep it past disconnection -- pinning the object against release with nothing able to
-    resolve it.
+    A worker rebuilds the node for every execution, so without this a 30-second pipeline load repeats on
+    every run. The engine never releases these -- the library owns them.
     """
 
-    @pytest.mark.parametrize(
-        ("source", "target", "expected"),
-        [
-            ("handle[Pipeline]", "any", False),
-            ("handle", "any", False),
-            ("any", "handle[Pipeline]", False),
-            ("str", "handle[Pipeline]", False),
-            ("handle[Pipeline]", "handle[Pipeline]", True),
-            ("handle[Pipeline]", "handle", True),
-            ("str", "any", True),
-        ],
-    )
-    def test_compatibility(self, source: str, target: str, expected: bool) -> None:  # noqa: FBT001
-        assert ParameterType.are_types_compatible(source, target) is expected
+    def test_the_second_run_finds_what_the_first_built(self) -> None:
+        node = _producer()
+        key = node.local_objects.key_for("flux-config-hash")
+        assert node.local_objects.get(key) is None
 
-    @pytest.mark.parametrize(
-        ("input_types", "incoming", "expected"),
-        [
-            # `all` claims to satisfy any target; a handle target is not any target. An ErrorProxyNode
-            # placeholder output is `all`, and what it carries is not a key.
-            (["handle[Pipeline]"], "all", False),
-            (["handle[Pipeline]"], "handle[Pipeline]", True),
-            (["all"], "handle[Pipeline]", False),
-            (["str"], "all", True),
-        ],
-    )
-    def test_the_all_short_circuit_does_not_bypass_the_rule(
-        self,
-        input_types: list[str],
-        incoming: str,
-        expected: bool,  # noqa: FBT001
-    ) -> None:
-        assert accepts_incoming_type(input_types, incoming) is expected
+        built = Pipeline("flux")
+        node.local_objects.put(built, key="flux-config-hash")
 
+        next_run = _producer()
+        assert next_run.local_objects.get(key) is built
 
-class TestAHandleParameterIsNeverSerializable:
-    def test_retyping_a_live_parameter_to_a_handle_turns_it_off(self) -> None:
-        """AlterParameterDetailsRequest writes types onto a live parameter.
+    def test_rebuilding_under_the_same_key_frees_the_old_one(self) -> None:
+        released: list[str] = []
+        node = _producer()
 
-        Stamping the flag at construction would leave a re-typed parameter serializable, and the key it
-        holds would save on a node marked RESOLVED -- a key into a process that no longer exists, with
-        nothing re-running to replace it. Derived, the flag follows the type wherever it changes.
-        """
-        parameter = Parameter(name="pipe", output_type="str", tooltip="")
-        assert parameter.serializable is True
+        node.local_objects.put(Pipeline("v1"), key="cfg", on_drop=lambda value: released.append(value.label))
+        node.local_objects.put(Pipeline("v2"), key="cfg")
 
-        parameter.output_type = "handle[FluxPipeline]"
+        assert released == ["v1"]
 
-        assert parameter.serializable is False
+    def test_a_clear_cache_node_frees_only_its_own_libraries_objects(self) -> None:
+        mine = _producer()
+        theirs = _producer(name="OtherLibLoader")
+        theirs.metadata["library"] = "SomeoneElse"
+        my_key = mine.local_objects.put(Pipeline("mine"), key="cfg")
+        their_key = theirs.local_objects.put(Pipeline("theirs"), key="cfg")
 
-    def test_an_authors_opt_out_is_kept_on_ordinary_parameters(self) -> None:
-        parameter = Parameter(name="driver", output_type="str", tooltip="", serializable=False)
+        assert mine.local_objects.drop_all() == 1
 
-        assert parameter.serializable is False
-
-    def test_declaring_the_type_is_what_forces_it_off(self) -> None:
-        """One mechanism, owned by the parameter.
-
-        to_dict, the GUI, and the serializer all read the same flag, so they cannot disagree about the
-        same parameter.
-        """
-        parameter = Parameter(name="pipe", output_type="handle[Pipeline]", tooltip="")
-
-        assert parameter.serializable is False
-        assert parameter.to_dict()["serializable"] is False
+        assert mine.local_objects.get(my_key) is None
+        assert theirs.local_objects.get(their_key) is not None

@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from griptape_nodes.app.worker_routing import DropAllLocalObjectsRequest, DropLocalObjectsRequest
-from griptape_nodes.exe_types.core_types import ParameterType, ParameterTypeBuiltin
+from griptape_nodes.exe_types.core_types import ParameterType
 from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.library_events import (
@@ -331,47 +331,6 @@ class TestKeyDerivation:
             )
 
         assert released == ["first", "second"]
-
-
-class TestHandleParameterType:
-    """`handle` is used parameterised, so the existing generic rules do the validation."""
-
-    def test_same_kind_connects(self) -> None:
-        assert ParameterType.are_types_compatible("handle[DiffusionPipeline]", "handle[DiffusionPipeline]")
-
-    def test_different_kinds_are_refused(self) -> None:
-        """The reason to parameterise: a latent must not be wirable into a pipeline input."""
-        assert not ParameterType.are_types_compatible("handle[Latent]", "handle[DiffusionPipeline]")
-
-    def test_bare_handle_accepts_any_kind(self) -> None:
-        assert ParameterType.are_types_compatible("handle[DiffusionPipeline]", "handle")
-
-    def test_handle_any_accepts_any_kind(self) -> None:
-        assert ParameterType.are_types_compatible("handle[Latent]", "handle[any]")
-
-    def test_a_handle_is_not_a_string(self) -> None:
-        """The key is carried as a string, but the parameter must not accept arbitrary strings."""
-        assert not ParameterType.are_types_compatible("str", "handle[Latent]")
-
-    def test_handle_resolves_as_a_builtin(self) -> None:
-        """Two structures must stay in sync, and nothing enforces it.
-
-        `ParameterTypeBuiltin` lists the type and `ParameterType._builtin_aliases` is what
-        `attempt_get_builtin` reads. A member missing from the aliases is the one builtin that gets no
-        name normalisation, so `Handle[X]` would reach serialisation with the author's casing and any
-        code treating `attempt_get_builtin(t) is None` as "library-defined" would misclassify it.
-        """
-        assert ParameterType.attempt_get_builtin("handle") is ParameterTypeBuiltin.HANDLE
-        assert ParameterType.attempt_get_builtin("Handle") is ParameterTypeBuiltin.HANDLE
-
-    def test_every_builtin_has_an_alias(self) -> None:
-        """The invariant behind the test above, so a future addition cannot repeat the omission."""
-        unaliased = [
-            member.name
-            for member in ParameterTypeBuiltin
-            if ParameterType.attempt_get_builtin(member.value) is not member
-        ]
-        assert unaliased == []
 
 
 class TestCapabilityMapIsSeparate:
@@ -750,3 +709,21 @@ class TestTeardownBroadcastPairing:
             asyncio.run(worker_manager.broadcast_local_object_teardown())
 
         assert order == ["pending", "drop_all"]
+
+
+class TestAHeldValueKeepsItsRealType:
+    """With `serializable=False` as the declaration, a held value's type is the type it actually is.
+
+    Mismatch protection comes from the ordinary rules -- no parallel type vocabulary to keep in step.
+    """
+
+    def test_the_same_kind_connects(self) -> None:
+        assert ParameterType.are_types_compatible("DiffusionPipeline", "DiffusionPipeline")
+
+    def test_different_kinds_are_refused(self) -> None:
+        """A latent must not be wirable into a pipeline input."""
+        assert not ParameterType.are_types_compatible("Latent", "DiffusionPipeline")
+
+    def test_a_held_value_is_not_a_string(self) -> None:
+        """The key travels as a string, but the parameter still declares what it holds."""
+        assert not ParameterType.are_types_compatible("str", "DiffusionPipeline")
