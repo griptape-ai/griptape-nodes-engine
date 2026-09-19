@@ -350,6 +350,7 @@ class NodeExecutor(EngineScoped):
             # reads from parameter_output_values.
             for name, value in result.parameter_output_values.items():
                 node.parameter_output_values[name] = value
+
         finally:
             current_executing_node_name.reset(token)
             # A connection torn down while this node was running left its input value in place so the
@@ -2801,7 +2802,7 @@ class NodeExecutor(EngineScoped):
         if upstream_param.name in upstream_node.parameter_output_values:
             return upstream_node.parameter_output_values[upstream_param.name]
 
-        return upstream_node.get_parameter_value(upstream_param.name)
+        return upstream_node.get_raw_parameter_value(upstream_param.name)
 
     def _get_value_through_subflow_group_proxy(
         self,
@@ -2860,7 +2861,7 @@ class NodeExecutor(EngineScoped):
             if source_param.name in source_node.parameter_output_values:
                 value = source_node.parameter_output_values[source_param.name]
             else:
-                value = source_node.get_parameter_value(source_param.name)
+                value = source_node.get_raw_parameter_value(source_param.name)
 
             logger.debug(
                 "Traced through proxy: %s.%s -> %s.%s (value type: %s)",

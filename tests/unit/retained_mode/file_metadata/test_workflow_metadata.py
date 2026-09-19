@@ -123,8 +123,10 @@ class TestCollectParameterValues:
 
         values = {"prompt": "hello", "model": "gpt-4"}
         node = Mock()
+        # A Mock answers truthy to everything; these values are not parked keys.
+        node.local_objects.names_a_parked_object.return_value = False
         node.parameters = [p1, p2]
-        node.get_parameter_value.side_effect = values.get
+        node.get_raw_parameter_value.side_effect = values.get
 
         engine = Mock()
         engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
@@ -141,8 +143,10 @@ class TestCollectParameterValues:
 
         values = {"prompt": "hello", "password": "secret"}
         node = Mock()
+        # A Mock answers truthy to everything; these values are not parked keys.
+        node.local_objects.names_a_parked_object.return_value = False
         node.parameters = [pub, priv]
-        node.get_parameter_value.side_effect = values.get
+        node.get_raw_parameter_value.side_effect = values.get
 
         engine = Mock()
         engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
@@ -158,8 +162,10 @@ class TestCollectParameterValues:
         p, _ = _make_param("optional_param", value=None)
 
         node = Mock()
+        # A Mock answers truthy to everything; these values are not parked keys.
+        node.local_objects.names_a_parked_object.return_value = False
         node.parameters = [p]
-        node.get_parameter_value.return_value = None
+        node.get_raw_parameter_value.return_value = None
 
         engine = Mock()
         engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
@@ -174,8 +180,10 @@ class TestCollectParameterValues:
         p, _ = _make_param("output_image", value=None, modes={ParameterMode.OUTPUT})
 
         node = Mock()
+        # A Mock answers truthy to everything; these values are not parked keys.
+        node.local_objects.names_a_parked_object.return_value = False
         node.parameters = [p]
-        node.get_parameter_value.return_value = "some_value"
+        node.get_raw_parameter_value.return_value = "some_value"
 
         engine = Mock()
         engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
@@ -192,8 +200,10 @@ class TestCollectParameterValues:
 
         values = {"api_password": "s3cr3t", "db_password": "hunter2", "prompt": "hello"}
         node = Mock()
+        # A Mock answers truthy to everything; these values are not parked keys.
+        node.local_objects.names_a_parked_object.return_value = False
         node.parameters = [p1, p2, p3]
-        node.get_parameter_value.side_effect = values.get
+        node.get_raw_parameter_value.side_effect = values.get
 
         engine = Mock()
         engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
@@ -244,8 +254,10 @@ class TestCollectRawProvenance:
 
         param_values = {"password": "secret", "prompt": "hi"}
         node = Mock()
+        # A Mock answers truthy to everything; these values are not parked keys.
+        node.local_objects.names_a_parked_object.return_value = False
         node.parameters = [priv, pub]
-        node.get_parameter_value.side_effect = param_values.get
+        node.get_raw_parameter_value.side_effect = param_values.get
 
         engine = _make_engine(resolving_nodes=["MyNode"])
         engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
@@ -299,8 +311,10 @@ class TestCollectSidecarProvenance:
 
         param_values = {"password": "s3cr3t", "prompt": "hi"}
         node = Mock()
+        # A Mock answers truthy to everything; these values are not parked keys.
+        node.local_objects.names_a_parked_object.return_value = False
         node.parameters = [priv, pub]
-        node.get_parameter_value.side_effect = param_values.get
+        node.get_raw_parameter_value.side_effect = param_values.get
 
         engine = _make_engine(resolving_nodes=["MyNode"])
         engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
@@ -318,8 +332,10 @@ class TestCollectSidecarProvenance:
         pub, _ = _make_param("prompt", value=None)
 
         node = Mock()
+        # A Mock answers truthy to everything; these values are not parked keys.
+        node.local_objects.names_a_parked_object.return_value = False
         node.parameters = [pub]
-        node.get_parameter_value.return_value = "hello"
+        node.get_raw_parameter_value.return_value = "hello"
 
         engine = _make_engine(resolving_nodes=["MyNode"])
         engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
@@ -361,8 +377,10 @@ class TestCollectWorkflowMetadata:
 
         param_values = {"password": "s3cr3t", "prompt": "hello"}
         node = Mock()
+        # A Mock answers truthy to everything; these values are not parked keys.
+        node.local_objects.names_a_parked_object.return_value = False
         node.parameters = [priv, pub]
-        node.get_parameter_value.side_effect = param_values.get
+        node.get_raw_parameter_value.side_effect = param_values.get
 
         engine = _make_engine(resolving_nodes=["MyNode"])
         engine.object_manager.attempt_get_object_by_name_as_type.return_value = node

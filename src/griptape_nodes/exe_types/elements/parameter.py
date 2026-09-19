@@ -96,8 +96,10 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
     # During save/load, this value IS still serialized to save its proper state.
     _settable: bool = True
 
-    # "serializable" controls whether parameter values should be serialized during save/load operations.
-    # Set to False for parameters containing non-serializable types (ImageDrivers, PromptDrivers, file handles, etc.)
+    # "serializable" controls whether values are written into a saved workflow, AND whether the engine
+    # holds them in the process that produced them rather than sending them across a worker boundary.
+    # One flag: a value that cannot be written to a file is a value that cannot cross a process, and both
+    # follow from the same fact about the object.
     serializable: bool = True
 
     user_defined: bool = False
@@ -111,6 +113,10 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
             ParameterMode.PROPERTY,
         }
     )
+    # A handle parameter's release hook: what to run when the engine releases the object this parameter
+    # referred to. Underscored like the other callables so it stays out of to_dict, which a saved
+    # workflow reads -- a function there would be written out as a repr.
+    _on_local_object_drop: Callable[[Any], None] | None = None
     _converters: list[Callable[[Any], Any]]
     _validators: list[Callable[[Parameter, Any], None]]
     _on_incoming_connection_removed: list[Callable[[Parameter, str, str], None]]
@@ -121,7 +127,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
     parent_container_name: str | None = None
     parent_element_name: str | None = None
 
-    def __init__(  # noqa: C901, PLR0912, PLR0913, PLR0917
+    def __init__(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917
         self,
         name: str,
         tooltip: str | list[dict] | None = None,
@@ -133,6 +139,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         tooltip_as_property: str | list[dict] | None = None,
         tooltip_as_output: str | list[dict] | None = None,
         allowed_modes: set[ParameterMode] | None = None,
+        on_local_object_drop: Callable[[Any], None] | None = None,
         converters: list[Callable[[Any], Any]] | None = None,
         validators: list[Callable[[Parameter, Any], None]] | None = None,
         traits: set[Trait.__class__ | Trait] | None = None,  # We are going to make these children.
@@ -212,6 +219,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
                     stacklevel=2,
                 )
 
+        self._on_local_object_drop = on_local_object_drop
         if converters is None:
             self._converters = []
         else:
@@ -299,7 +307,9 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         event_dict["parameter_name"] = name
         # Update with value
         if node is not None:
-            event_dict["value"] = node.get_parameter_value(self.name)
+            # Raw: this dict goes to the editor and is json-serialized. A process-local value is a key
+            # there, never the object it stands for.
+            event_dict["value"] = node.get_raw_parameter_value(self.name)
         return event_dict
 
     @property
@@ -612,6 +622,25 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
             self._output_type = None
             return
         self._output_type = canonical_type_name(value)
+
+    @property
+    def is_process_local(self) -> bool:
+        """Whether the engine holds this parameter's values in the process that produced them.
+
+        `serializable=False` is the declaration: a value that cannot be written into a saved workflow
+        cannot cross a process boundary either. Containers answer False -- see ParameterContainer.
+        """
+        return not self.serializable
+
+    @property
+    def on_local_object_drop(self) -> Callable[[Any], None] | None:
+        """What to run when the engine releases the object this parameter referred to.
+
+        For anything whose memory is not freed by dropping the reference -- a pipeline holding GPU
+        memory. The engine calls it when this parameter's value is replaced, and when the node is deleted.
+        Only meaningful on a `serializable=False` parameter, whose values the engine holds.
+        """
+        return self._on_local_object_drop
 
     def add_trait(self, trait: type[Trait] | Trait) -> None:
         self.add_child(instantiate_trait(trait))

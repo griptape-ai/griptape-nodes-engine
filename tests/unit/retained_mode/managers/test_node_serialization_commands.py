@@ -93,10 +93,12 @@ class _ComputedValueNode(DataNode):
             )
         )
 
-    def get_parameter_value(self, param_name: str) -> Any:
+    def get_raw_parameter_value(self, param_name: str) -> Any:
+        # The raw accessor is where "stored or computed" lives: it is what the engine reads for saving,
+        # dispatch and events, and what the translating `get_parameter_value` is built on.
         if param_name == "computed":
             return "computed-value"
-        return super().get_parameter_value(param_name)
+        return super().get_raw_parameter_value(param_name)
 
     def process(self) -> None:
         pass
@@ -595,3 +597,68 @@ class TestSerializeGroupWithChildren:
 
         assert isinstance(result, SerializeNodeToCommandsResultSuccess)
         assert result.serialized_node_commands.is_node_group is True
+
+
+class TestLocalObjectIdentityIsNeverCopied:
+    """Duplicate, paste, and saved files all rebuild nodes from serialized commands.
+
+    A clone carrying the original's `local_object_source` would displace and free the original's
+    still-referenced held objects on its first park, so the identity is stripped at serialization and the
+    deserialized node mints its own.
+    """
+
+    def test_a_pasted_node_gets_its_own_identity(self, engine: Engine, library_name: str) -> None:
+        node_name = _create_text_node(engine, library_name, "Original")
+        original = engine.node_manager.get_node_by_name(node_name)
+
+        serialize_result = engine.node_manager.on_serialize_node_to_commands(
+            SerializeNodeToCommandsRequest(node_name=node_name)
+        )
+        assert isinstance(serialize_result, SerializeNodeToCommandsResultSuccess)
+        create_command = serialize_result.serialized_node_commands.create_node_command
+        assert create_command.metadata is not None
+        assert "local_object_source" not in create_command.metadata
+
+        paste_result = engine.node_manager.on_deserialize_node_from_commands(
+            DeserializeNodeFromCommandsRequest(serialized_node_commands=serialize_result.serialized_node_commands)
+        )
+        assert isinstance(paste_result, DeserializeNodeFromCommandsResultSuccess)
+        clone = engine.node_manager.get_node_by_name(paste_result.node_name)
+
+        assert clone.metadata["local_object_source"] != original.metadata["local_object_source"]
+
+    def test_a_pasted_nodes_first_park_leaves_the_originals_object_alone(
+        self, engine: Engine, library_name: str
+    ) -> None:
+        node_name = _create_text_node(engine, library_name, "Original")
+        original = engine.node_manager.get_node_by_name(node_name)
+
+        serialize_result = engine.node_manager.on_serialize_node_to_commands(
+            SerializeNodeToCommandsRequest(node_name=node_name)
+        )
+        assert isinstance(serialize_result, SerializeNodeToCommandsResultSuccess)
+        paste_result = engine.node_manager.on_deserialize_node_from_commands(
+            DeserializeNodeFromCommandsRequest(serialized_node_commands=serialize_result.serialized_node_commands)
+        )
+        assert isinstance(paste_result, DeserializeNodeFromCommandsResultSuccess)
+        clone = engine.node_manager.get_node_by_name(paste_result.node_name)
+
+        # The identity was fixed at construction, so the parks can come after the round trip.
+        released: list[str] = []
+        for node in (original, clone):
+            node.add_parameter(
+                Parameter(
+                    name="pipe",
+                    output_type="Pipe",
+                    serializable=False,
+                    tooltip="",
+                    on_local_object_drop=released.append,
+                )
+            )
+        original.parameter_output_values["pipe"] = object()
+        key = original.parameter_output_values["pipe"]
+
+        clone.parameter_output_values["pipe"] = object()
+
+        assert released == []
+        assert engine.resource_manager.get_local_object(key, owner=original.local_objects.owner) is not None

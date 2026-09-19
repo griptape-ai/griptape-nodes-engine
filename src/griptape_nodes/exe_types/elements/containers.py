@@ -74,6 +74,15 @@ class ParameterContainer(Parameter, ABC):
             element_type=element_type,
         )
 
+    @property
+    def is_process_local(self) -> bool:
+        """Never: holding a container as one object would hand a downstream list one opaque key.
+
+        A container also has nowhere to put a release hook. Its elements are ordinary parameters and are
+        held individually when they declare it.
+        """
+        return False
+
     def __bool__(self) -> bool:
         """Parameter containers are always truthy, even when empty.
 

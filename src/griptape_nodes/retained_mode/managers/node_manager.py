@@ -330,6 +330,37 @@ class _NodeInstantiationDeniedError(Exception):
     """
 
 
+def _keys_referenced_by(node: BaseNode, candidates: set[str]) -> set[str]:
+    """Which of `candidates` appear anywhere in this node's parameter values.
+
+    Walks into lists, dicts and tuples: a ParameterList consumer holds `[key]`, not `key`, and a value of
+    that shape is unhashable, so comparing sets of values raises instead of missing the reference quietly.
+    """
+    found: set[str] = set()
+    seen: set[int] = set()
+    # Snapshot with list(): node bodies write outputs from worker threads, and a dict that changes size
+    # mid-iteration raises, which would abort the delete.
+    for source in (node.parameter_values, node.parameter_output_values):
+        for value in list(source.values()):
+            _collect_keys(value, candidates, found, seen)
+    return found
+
+
+def _collect_keys(value: Any, candidates: set[str], found: set[str], seen: set[int]) -> None:
+    """Add any candidate key reachable inside `value` to `found`. `seen` breaks reference cycles."""
+    if isinstance(value, str):
+        if value in candidates:
+            found.add(value)
+        return
+    if isinstance(value, (dict, list, tuple, set)):
+        if id(value) in seen:
+            return
+        seen.add(id(value))
+        items = value.values() if isinstance(value, dict) else value
+        for item in list(items):
+            _collect_keys(item, candidates, found, seen)
+
+
 class NodeManager(EngineScoped):
     _name_to_parent_flow_name: dict[str, str]
 
@@ -1416,6 +1447,11 @@ class NodeManager(EngineScoped):
             details = f"Attempted to delete a Node '{node_name}', but no such Node was found."
             return DeleteNodeResultFailure(result_details=details)
 
+        # Which of this node's held objects nothing else refers to, decided now rather than after the
+        # connections come down: deleting a connection clears an INPUT-only consumer's copy of the key, so
+        # by then every one of them would look unreferenced.
+        releasable_handle_keys = self._unreferenced_handle_keys(node)
+
         with self.engine.context_manager.node(node=node):
             parent_flow_name = self._name_to_parent_flow_name[node_name]
             try:
@@ -1495,6 +1531,9 @@ class NodeManager(EngineScoped):
                 return DeleteNodeResultFailure(result_details=details)
 
         parent_flow.remove_node(node.name)
+
+        for key in releasable_handle_keys:
+            node.local_objects.release_parked(key)
 
         # Now remove the record keeping
         self.engine.object_manager.del_obj_by_name(node_name)
@@ -2374,7 +2413,7 @@ class NodeManager(EngineScoped):
                 value = node.get_display_value_for_output(parameter.name, raw_value)
             else:
                 # Otherwise grab the set value or default value
-                value = node.get_parameter_value(parameter.name)
+                value = node.get_raw_parameter_value(parameter.name)
             if value is not None:
                 element_id = parameter.element_id
                 # Check if the value is in builtins. If it isn't we need to handle it specially.
@@ -2939,12 +2978,12 @@ class NodeManager(EngineScoped):
             return NodeManager.ModifiedReturnValue(object_created, modified)
         # Otherwise use set_parameter_value. This calls our converters and validators.
         # Skip before_value_set since we already called it earlier in the flow
-        old_value = node.get_parameter_value(request.parameter_name)
+        old_value = node.get_raw_parameter_value(request.parameter_name)
         node.set_parameter_value(
             request.parameter_name, object_created, initial_setup=request.initial_setup, skip_before_value_set=True
         )
         # Get the "converted" value here.
-        finalized_value = node.get_parameter_value(request.parameter_name)
+        finalized_value = node.get_raw_parameter_value(request.parameter_name)
         if old_value != finalized_value:
             modified = True
         # If any parameters were dependent on that value, we're calling this details request to emit the result to the editor.
@@ -3144,6 +3183,42 @@ class NodeManager(EngineScoped):
         return GetCompatibleParametersResultSuccess(
             valid_parameters_by_node=valid_parameters_by_node, result_details=details
         )
+
+    def _unreferenced_handle_keys(self, node: BaseNode) -> list[str]:
+        """The keys of `node`'s held objects that no other node's parameter values carry.
+
+        A key is a value, not an edge: a consumer keeps its copy when the connection goes away, and while it
+        does the object behind that key is still reachable and still usable, so deleting the node that made
+        it must leave it alone. Unlike an overwrite there is no fresher value to take its place.
+        """
+        candidates: set[str] = set()
+        for parameter in node.parameters:
+            # The same predicate the write path uses, not `serializable` directly: a container declaring
+            # serializable=False is never held, so it never has a key to collect.
+            if not parameter.is_process_local:
+                continue
+            # Both maps: this node may be the producer holding it as an output, or the last consumer
+            # holding the only remaining copy of someone else's key.
+            for source in (node.parameter_output_values, node.parameter_values):
+                if isinstance(key := source.get(parameter.name), str):
+                    candidates.add(key)
+        # The store's own record too, not just live parameter names: a parameter renamed or removed after
+        # parking, or a run cancelled between the clear and the park, leaves an entry no current name can
+        # reach, and this is the last chance to run its release hook.
+        candidates.update(
+            self.engine.resource_manager.parked_keys_for(
+                owner=node.local_objects.owner, source=node.metadata["local_object_source"]
+            )
+        )
+        if not candidates:
+            return []
+        for name, other in self.engine.object_manager.get_filtered_subset(type=BaseNode).items():
+            if name == node.name:
+                continue
+            candidates -= _keys_referenced_by(other, candidates)
+            if not candidates:
+                return []
+        return sorted(candidates)
 
     def get_node_by_name(self, name: str) -> BaseNode:
         obj_mgr = self.engine.object_manager
@@ -3757,6 +3832,11 @@ class NodeManager(EngineScoped):
                 # Remove node_names_in_group from metadata - it's redundant and will be regenerated
                 metadata_copy = copy.deepcopy(node.metadata)
                 metadata_copy.pop("node_names_in_group", None)
+                # The identity held objects are parked under is per live node, never per serialized form:
+                # duplicate/paste and saved files all rebuild from these commands, and a second node with
+                # the same identity displaces and frees the original's still-referenced objects. The
+                # deserialized node mints a fresh one in BaseNode.__init__.
+                metadata_copy.pop("local_object_source", None)
 
                 # Remove subflow_name for copy/paste operations (so pasted groups create fresh subflows)
                 # Keep it for workflow file generation (so it can be extracted and used as a variable reference)
@@ -3788,11 +3868,14 @@ class NodeManager(EngineScoped):
                     serialized_library_name = library_details.library_name
 
                 # Get the creation details for regular nodes
+                metadata_copy = copy.deepcopy(node.metadata)
+                # Per live node, never per serialized form -- see the group branch above.
+                metadata_copy.pop("local_object_source", None)
                 create_node_request = CreateNodeRequest(
                     node_type=serialized_node_type,
                     node_name=node_name,
                     specific_library_name=serialized_library_name,
-                    metadata=copy.deepcopy(node.metadata),
+                    metadata=metadata_copy,
                     # If it is actively resolving, mark as unresolved.
                     resolution=node.state.value,
                     initial_setup=True,
@@ -4602,7 +4685,7 @@ class NodeManager(EngineScoped):
             # Output values are more important.
             output_value = node.parameter_output_values[parameter.name]
         # Get the effective value to check if it matches the default
-        effective_value = node.get_parameter_value(parameter.name)
+        effective_value = node.get_raw_parameter_value(parameter.name)
         # Save the value if it was explicitly set OR if it equals the default value.
         # The latter ensures the default is preserved when loading workflows,
         # even if the code's default value changes later.
@@ -4674,6 +4757,18 @@ class NodeManager(EngineScoped):
         # No value of this kind was set on the node.
         if value is None:
             return None
+        # A key into this process's memory means nothing in another, and a workflow that saved one would
+        # reload holding a dead reference on a node marked RESOLVED, with nothing re-running to replace it.
+        # Asked of the store rather than inferred from the parameter's flag, so a key that reached a
+        # serializable parameter is still skipped.
+        #
+        # Publishing (serialize_all_parameter_values) does not change this: a held value is already skipped
+        # by its parameter's own flag today, so nothing regresses, and a key would be useless in the
+        # published copy either way. The node comes back UNRESOLVED and its producer re-runs.
+        if node.local_objects.names_a_parked_object(value):
+            if isinstance(create_node_request, CreateNodeRequest):
+                create_node_request.resolution = NodeResolutionState.UNRESOLVED.value
+            return None
         command = NodeManager._handle_value_hashing(
             value=value,
             serialized_parameter_value_tracker=serialized_parameter_value_tracker,
@@ -4739,7 +4834,7 @@ class NodeManager(EngineScoped):
             if param.name in node.parameter_output_values:
                 param_values[param.name] = node.parameter_output_values[param.name]
             else:
-                param_values[param.name] = node.get_parameter_value(param.name)
+                param_values[param.name] = node.get_raw_parameter_value(param.name)
         simple_values = safe_unstructure(param_values)
         return SerializedParameterValues(simple_values, None)
 
@@ -4792,7 +4887,7 @@ class NodeManager(EngineScoped):
         """
         if param_name in node.parameter_output_values:
             return node.parameter_output_values[param_name]
-        return node.get_parameter_value(param_name)
+        return node.get_raw_parameter_value(param_name)
 
     @staticmethod
     def _process_parameter_for_pickling(  # noqa: PLR0913

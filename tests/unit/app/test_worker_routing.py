@@ -16,14 +16,24 @@ These tests pin down the two invariants that replaced the old
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+from unittest.mock import patch
 
 import pytest
 
 from griptape_nodes.app.worker_routing import (
     FORWARDED_REQUEST_TYPES,
+    DropAllLocalObjectsRequest,
+    DropAllLocalObjectsResultFailure,
+    DropAllLocalObjectsResultSuccess,
+    DropLocalObjectsRequest,
+    DropLocalObjectsResultFailure,
+    DropLocalObjectsResultSuccess,
     RemoteHandler,
+    _handle_drop_all_local_objects,
+    _handle_drop_local_objects,
     register_remote_handlers,
 )
 from griptape_nodes.retained_mode.events.base_events import (
@@ -36,6 +46,7 @@ from griptape_nodes.retained_mode.events.parameter_events import AddParameterToN
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 
 if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 
 
@@ -207,3 +218,151 @@ class TestInstallRemoteHandlersSwap:
 
         assert result_event.result.succeeded()
         assert len(local_calls) == 1
+
+
+class TestDropAllLocalObjectsHandler:
+    """The worker half of workflow teardown: release what this process is holding.
+
+    This is the process with the pipeline the orchestrator has no torch to hold, so the branch that
+    declines to release decides whether gigabytes stay resident.
+    """
+
+    @pytest.mark.asyncio
+    async def test_declines_while_executing_a_node(self, engine: Engine) -> None:
+        """Releasing mid-execution would free the pipeline under a forward pass already running."""
+        held = object()
+        key = engine.resource_manager.put_local_object(held, owner="Lib A", source="N", key="N-slot")
+
+        with engine.event_manager.worker_node_execution_scope():
+            result = await _handle_drop_all_local_objects(
+                DropAllLocalObjectsRequest(), event_manager=engine.event_manager
+            )
+
+        assert isinstance(result, DropAllLocalObjectsResultSuccess)
+        assert engine.resource_manager.get_local_object(key, owner="Lib A") is held
+
+    @pytest.mark.asyncio
+    async def test_releases_off_the_event_loop(self, engine: Engine) -> None:
+        """A worker whose loop is blocked past the heartbeat timeout is evicted mid-load."""
+        release_threads: list[int] = []
+        engine.resource_manager.put_local_object(
+            object(),
+            owner="Lib A",
+            source="N",
+            key="cfg",
+            on_drop=lambda _value: release_threads.append(threading.get_ident()),
+        )
+
+        result = await _handle_drop_all_local_objects(DropAllLocalObjectsRequest(), event_manager=engine.event_manager)
+
+        assert isinstance(result, DropAllLocalObjectsResultSuccess)
+        assert release_threads
+        assert release_threads[0] != threading.get_ident()
+
+    @pytest.mark.asyncio
+    async def test_reports_failure_rather_than_raising_at_the_transport(self, engine: Engine) -> None:
+        with patch.object(engine.resource_manager, "drop_all_local_objects", side_effect=RuntimeError("boom")):
+            result = await _handle_drop_all_local_objects(
+                DropAllLocalObjectsRequest(), event_manager=engine.event_manager
+            )
+
+        assert isinstance(result, DropAllLocalObjectsResultFailure)
+
+
+class TestDropLocalObjectsHandler:
+    """The worker half of a handle being replaced or its node deleted."""
+
+    @pytest.mark.asyncio
+    async def test_releases_the_named_objects(self, engine: Engine) -> None:
+        released: list[str] = []
+        keys = [
+            engine.resource_manager.put_local_object(
+                object(),
+                owner="Lib A",
+                source="N",
+                key=label,
+                slot=label,
+                on_drop=lambda _v, label=label: released.append(label),
+            )
+            for label in ("one", "two")
+        ]
+
+        result = await _handle_drop_local_objects(
+            DropLocalObjectsRequest(keys=keys), event_manager=engine.event_manager
+        )
+
+        assert isinstance(result, DropLocalObjectsResultSuccess)
+        assert sorted(released) == ["one", "two"]
+
+    @pytest.mark.asyncio
+    async def test_a_key_this_worker_never_held_is_not_a_failure(self, engine: Engine) -> None:
+        """The orchestrator broadcasts to every worker, and only one of them holds any given object."""
+        result = await _handle_drop_local_objects(
+            DropLocalObjectsRequest(keys=["Lib A:not-here"]), event_manager=engine.event_manager
+        )
+
+        assert isinstance(result, DropLocalObjectsResultSuccess)
+
+    @pytest.mark.asyncio
+    async def test_releases_while_executing_a_node(self, engine: Engine) -> None:
+        """Unlike the drop-all sibling this does not decline.
+
+        These keys were replaced or deleted on the orchestrator before the message was sent, so a node
+        executing now was handed the new value and cannot be using them. Declining would hold the memory
+        for the length of a render.
+        """
+        released: list[str] = []
+        key = engine.resource_manager.put_local_object(
+            object(), owner="Lib A", source="N", key="cfg", slot="out", on_drop=lambda _v: released.append("gone")
+        )
+
+        with engine.event_manager.worker_node_execution_scope():
+            result = await _handle_drop_local_objects(
+                DropLocalObjectsRequest(keys=[key]), event_manager=engine.event_manager
+            )
+
+        assert isinstance(result, DropLocalObjectsResultSuccess)
+        assert released == ["gone"]
+
+    @pytest.mark.asyncio
+    async def test_releases_off_the_event_loop(self, engine: Engine) -> None:
+        """A worker whose loop is blocked past the heartbeat timeout is evicted mid-load."""
+        release_threads: list[int] = []
+        key = engine.resource_manager.put_local_object(
+            object(),
+            owner="Lib A",
+            source="N",
+            key="cfg",
+            slot="out",
+            on_drop=lambda _v: release_threads.append(threading.get_ident()),
+        )
+
+        await _handle_drop_local_objects(DropLocalObjectsRequest(keys=[key]), event_manager=engine.event_manager)
+
+        assert release_threads
+        assert release_threads[0] != threading.get_ident()
+
+    @pytest.mark.asyncio
+    async def test_reports_failure_rather_than_raising_at_the_transport(self, engine: Engine) -> None:
+        with patch.object(engine.resource_manager, "drop_parked_local_object", side_effect=RuntimeError("boom")):
+            result = await _handle_drop_local_objects(
+                DropLocalObjectsRequest(keys=["Lib A:cfg"]), event_manager=engine.event_manager
+            )
+
+        assert isinstance(result, DropLocalObjectsResultFailure)
+
+    @pytest.mark.asyncio
+    async def test_a_library_named_entry_is_refused(self, engine: Engine) -> None:
+        """The orchestrator broadcasts keys it cannot check, so the provenance rule is enforced here."""
+        released: list[str] = []
+        key = engine.resource_manager.put_local_object(
+            object(), owner="Lib A", source="N", key="sd-xl-1.0#a1b2c3d4", on_drop=lambda _v: released.append("gone")
+        )
+
+        result = await _handle_drop_local_objects(
+            DropLocalObjectsRequest(keys=[key]), event_manager=engine.event_manager
+        )
+
+        assert isinstance(result, DropLocalObjectsResultSuccess)
+        assert released == []
+        assert engine.resource_manager.get_local_object(key, owner="Lib A") is not None

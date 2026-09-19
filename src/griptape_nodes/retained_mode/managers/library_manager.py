@@ -3042,6 +3042,19 @@ class LibraryManager(EngineScoped):
             details = f"Attempted to unload library '{request.library_name}'. Failed due to {e}"
             return UnloadLibraryFromRegistryResultFailure(result_details=details)
 
+        # Release anything this library was holding in THIS process, so it cannot come back holding
+        # objects its previous code built.
+        #
+        # This process only. Reloading every library restarts the workers, which takes their copies with
+        # them, but updating or switching the ref of a single library does not.
+        dropped = self.engine.resource_manager.drop_objects_for_owner(request.library_name)
+        if dropped:
+            logger.debug(
+                "Released %d held object(s) belonging to library '%s' as it unloaded.",
+                dropped,
+                request.library_name,
+            )
+
         # Clean up all stable module aliases for this library. Note first whether any of its node
         # modules had actually been imported: if so, this process is stuck with that code and the
         # library's next load cannot replace it.

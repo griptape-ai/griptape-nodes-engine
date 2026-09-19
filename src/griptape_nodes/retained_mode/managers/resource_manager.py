@@ -1,7 +1,11 @@
 import logging
+import re
+import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from griptape_nodes.retained_mode.engine import Engine, EngineScoped
 from griptape_nodes.retained_mode.events.base_events import ResultPayload
 from griptape_nodes.retained_mode.events.resource_events import (
     AcquireResourceInstanceLockRequest,
@@ -51,13 +55,69 @@ class ResourceStatus:
         return self.owner_of_lock is not None
 
 
-class ResourceManager:
-    """Manager for resource allocation, locking, and lifecycle management."""
+@dataclass
+class LocalObjectEntry:
+    """A live object held for this process, plus what is needed to release it.
 
-    def __init__(self, event_manager: EventManager) -> None:
+    `on_drop` exists because deleting the entry does not free what the object was holding.
+    """
+
+    value: Any
+    owner: str
+    source: str
+    # Which slot of `source` the engine parked this for, or None when the owner named the key itself.
+    # Provenance lives here rather than in the key's shape, because the engine may only ever release
+    # what it parked, and an owner-chosen key can look like anything.
+    slot: str | None = None
+    on_drop: Callable[[Any], None] | None = None
+
+
+_SAME_VALUE_UNSET = object()
+
+# What `LocalObjectScope.park` mints: owner, then the producing node's identity, its parameter, and a
+# random tail. Only for recognising a key whose entry lives in another process.
+# The owner must not be followed by a slash, or a URL is a match ("https://host/a@deadbeef.png#a1b2c3d4"),
+# and the parameter segment is greedy because a parameter may be named with a dot or a hash.
+_MINTED_KEY = re.compile(r"^[^:/]+:[^/].*@[0-9a-f]{8}\..+#[0-9a-f]{8}$")
+
+
+class ResourceManager(EngineScoped):
+    """What this machine has, and what this process is holding.
+
+    Two separate maps, deliberately:
+
+    - `_capability_instances` describes the machine. `OSManager` populates it at boot with one record
+      each for OS, CPU and compute backends, and `ListCompatibleResourceInstances` matches a library's
+      declared `resources.required` against it to decide whether that library can execute here.
+    - `_local_objects` holds live Python objects a library parked in this process, keyed by an opaque
+      string that travels as a parameter value. Nothing else in the engine reads them.
+
+    Keeping them apart is load-bearing. The capability query walks every entry it can see and its
+    answer gates library executability, so a library's cached pipeline must never appear in it. A
+    third unrelated map does not belong here either; it belongs in its own manager.
+    """
+
+    def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
+        super().__init__(engine)
         self._resource_types: set[ResourceType] = set()
-        # Maps instance_id to ResourceInstance objects
-        self._instances: dict[str, ResourceInstance] = {}
+        # Maps instance_id to ResourceInstance objects describing this machine's capabilities.
+        self._capability_instances: dict[str, ResourceInstance] = {}
+        # Maps an engine-minted key to a live object a library parked in THIS process.
+        self._local_objects: dict[str, LocalObjectEntry] = {}
+        # Node bodies that yield a callable run on real threads (`async_utils.to_thread`), and parallel
+        # resolution runs several node tasks at once, so two nodes can be inside these methods together.
+        # Every mutation happens under this lock; release hooks run outside it, since a hook is caller
+        # code that may be slow or may call back in.
+        #
+        # The guarantee is narrower than "thread-safe": the MAP is consistent, the held OBJECT is not
+        # protected. A reader is not protected against a concurrent drop, which can run a release hook on
+        # an object another node is still using. There is no borrow or lease.
+        self._local_objects_lock = threading.Lock()
+
+        # Keys released here that a worker may also be holding. The releases happen on sync paths -- a
+        # parameter value being written, a node being deleted -- and telling a worker has to be awaited, so
+        # the async chokepoints that already exist drain this instead of each caller inventing a loop.
+        self._pending_worker_releases: list[str] = []
 
         # Register event handlers
         event_manager.assign_manager_to_request_type(
@@ -124,7 +184,7 @@ class ResourceManager:
             )
 
         instance_id = new_instance.get_instance_id()
-        self._instances[instance_id] = new_instance
+        self._capability_instances[instance_id] = new_instance
 
         return CreateResourceInstanceResultSuccess(
             instance_id=instance_id, result_details=f"Successfully created resource instance {instance_id}"
@@ -132,7 +192,7 @@ class ResourceManager:
 
     def on_free_resource_instance_request(self, request: FreeResourceInstanceRequest) -> ResultPayload:
         """Handle request to free a resource instance."""
-        instance = self._instances.get(request.instance_id)
+        instance = self._capability_instances.get(request.instance_id)
         if instance is None:
             return FreeResourceInstanceResultFailure(
                 result_details=f"Attempted to free resource instance {request.instance_id} with force_unlock={request.force_unlock}. Failed due to resource instance does not exist."
@@ -161,7 +221,7 @@ class ResourceManager:
                 result_details=f"Attempted to free resource instance {request.instance_id} with force_unlock={request.force_unlock}. Failed to free: {e}."
             )
 
-        del self._instances[request.instance_id]
+        del self._capability_instances[request.instance_id]
 
         return FreeResourceInstanceResultSuccess(
             result_details=f"Successfully freed resource instance {request.instance_id}"
@@ -177,7 +237,7 @@ class ResourceManager:
 
         # Get compatible unlocked instances
         compatible_instances = []
-        for instance in self._instances.values():
+        for instance in self._capability_instances.values():
             if instance.is_locked():
                 continue
             if instance.get_resource_type() != resource_type:
@@ -210,7 +270,7 @@ class ResourceManager:
 
     def on_release_resource_instance_lock_request(self, request: ReleaseResourceInstanceLockRequest) -> ResultPayload:
         """Handle request to release a resource instance lock."""
-        instance = self._instances.get(request.instance_id)
+        instance = self._capability_instances.get(request.instance_id)
         if instance is None:
             return ReleaseResourceInstanceLockResultFailure(
                 result_details=f"Attempted to release resource instance lock on {request.instance_id} for owner {request.owner_id}. Failed due to resource instance does not exist."
@@ -239,7 +299,7 @@ class ResourceManager:
 
         # Get compatible instances (with optional locked instances)
         instance_ids = []
-        for instance in self._instances.values():
+        for instance in self._capability_instances.values():
             if instance.is_locked() and not request.include_locked:
                 continue
             if instance.get_resource_type() != resource_type:
@@ -257,7 +317,7 @@ class ResourceManager:
 
     def on_get_resource_instance_status_request(self, request: GetResourceInstanceStatusRequest) -> ResultPayload:
         """Handle request to get resource instance status."""
-        instance = self._instances.get(request.instance_id)
+        instance = self._capability_instances.get(request.instance_id)
         if instance is None:
             return GetResourceInstanceStatusResultFailure(
                 result_details=f"Attempted to get resource instance status for {request.instance_id}. Failed due to resource instance not found."
@@ -284,7 +344,7 @@ class ResourceManager:
             )
 
         matching_instances = []
-        for instance in self._instances.values():
+        for instance in self._capability_instances.values():
             if instance.get_resource_type() != resource_type:
                 continue
             if not request.include_locked and instance.is_locked():
@@ -296,7 +356,348 @@ class ResourceManager:
             result_details=f"Successfully found {len(matching_instances)} resource instances of specified type",
         )
 
+    # Process-Local Object Cache
+    #
+    # Plain calls, not request handlers: a request carrying a live object would be forwarded to a
+    # worker and stringified by `json.dumps(default=str)` on the way.
+
+    def put_local_object(  # noqa: PLR0913 (each is a distinct fact about the entry; a params object would be one caller's convenience)
+        self,
+        value: Any,
+        *,
+        owner: str,
+        source: str,
+        key: str,
+        slot: str | None = None,
+        on_drop: Callable[[Any], None] | None = None,
+    ) -> str:
+        """Hold `value` in this process and return the key that refers to it.
+
+        The key is namespaced by `owner`, so two owners choosing the same suffix scheme cannot collide.
+
+        `slot` marks an entry the engine parked for one of `source`'s parameters. A slot holds one object:
+        parking into it again releases the previous occupant, in this process, which is the process that
+        holds it. That displacement lives here rather than on the parameter write, because the engine
+        clears parameter values through several paths and none of them can be trusted to still hold the
+        old key by the time the new one is written.
+        """
+        full_key = self.local_object_key(key, owner=owner)
+        entry = LocalObjectEntry(
+            value=value,
+            owner=owner,
+            source=source,
+            slot=slot,
+            on_drop=on_drop,
+        )
+        with self._local_objects_lock:
+            displaced = self._local_objects.get(full_key)
+            displaced_slot_entries = {}
+            if slot is not None:
+                displaced_slot_entries = self._take_slot_entries_locked(
+                    owner=owner, source=source, slot=slot, keep_key=full_key, keep_value=value
+                )
+            self._local_objects[full_key] = entry
+            displaced_value_survives = displaced is not None and self._value_still_held_locked(displaced.value)
+            if displaced_slot_entries:
+                self._pending_worker_releases.extend(displaced_slot_entries)
+
+        # Reusing a key replaces what was there, and that entry's release hook still has to run:
+        # dropping the last reference does not free what the object was holding, which is the whole
+        # reason on_drop exists. Rebuilding a pipeline under the same config hash would otherwise
+        # strand its GPU memory on every rebuild.
+        #
+        # Identity check, not just presence: re-registering the SAME object under its own key is the
+        # obvious way to write the reuse this API recommends, and tearing down the value that is now
+        # live in the map would hand the next reader a released object.
+        if displaced is not None and displaced.value is not value and not displaced_value_survives:
+            self._invoke_on_drop(full_key, displaced)
+        self._invoke_hooks_once_per_object(displaced_slot_entries)
+        if displaced_slot_entries:
+            # Releasing an entry here is what queues its key; this drains the queue. A worker's own slot is
+            # not reachable from this process -- keys are minted where the object is parked, so a slot
+            # occupied in a worker leaves no entry here to displace -- and it is the worker's own next park
+            # that displaces it.
+            self.engine.worker_manager.schedule_pending_local_object_releases()
+        return full_key
+
+    def parked_keys_for(self, *, owner: str, source: str) -> list[str]:
+        """The keys of every entry the engine parked for one source.
+
+        The store is the authority on what a node is holding, not the node's current parameter names: a
+        parameter renamed or removed after parking leaves an entry behind that no live name can derive,
+        and its release hook still has to run when the node goes.
+        """
+        with self._local_objects_lock:
+            return [
+                key
+                for key, entry in self._local_objects.items()
+                if entry.owner == owner and entry.source == source and entry.slot is not None
+            ]
+
+    def names_a_parked_object(self, value: Any) -> bool:
+        """Whether `value` is a key the engine minted, whether or not THIS process holds the entry.
+
+        The entry is the authority when it is here, and shape is the fallback when it is not: a worker
+        parked the object, so the orchestrator has no entry to consult, and deciding "may this be written
+        into a saved workflow" still has to come out right.
+
+        A false positive costs a value: the save drops it and stamps the node UNRESOLVED, and metadata
+        collection reports it omitted. A false negative writes a dead key into the file. So the pattern is
+        deliberately narrow on both sides -- do not widen it casually. Release decisions use the exact
+        `is_parked_key`, where a false positive would free someone else's object.
+        """
+        return self.is_parked_key(value) or (isinstance(value, str) and bool(_MINTED_KEY.match(value)))
+
+    def holds_any_key(self, value: Any) -> bool:
+        """Whether the store currently holds anything under `value`, for any owner and either kind."""
+        if not isinstance(value, str):
+            return False
+        with self._local_objects_lock:
+            return value in self._local_objects
+
+    def is_parked_key(self, key: Any) -> bool:
+        """Whether `key` names an entry the engine parked for a parameter, rather than one its owner named."""
+        if not isinstance(key, str):
+            return False
+        with self._local_objects_lock:
+            entry = self._local_objects.get(key)
+        return entry is not None and entry.slot is not None
+
+    def local_object_key(self, suffix: str, *, owner: str) -> str:
+        """The key `put_local_object` would produce for this suffix, without putting anything.
+
+        `key` goes in as a suffix and comes back namespaced, so a caller that supplied `config_hash`
+        cannot look it up again with `config_hash`, and the miss is silent.
+        """
+        return f"{owner}:{suffix}"
+
+    def get_local_object(self, key: str, *, owner: str, default: Any = None) -> Any:
+        """The held object, or `default` if this process is not holding it for `owner`.
+
+        `owner` is required, as it is for putting: reading across owners would work only while both
+        happened to share a process. Pass a sentinel as `default` to tell "not held" from a held None
+        in one lookup, which a concurrent drop cannot invalidate halfway.
+        """
+        with self._local_objects_lock:
+            entry = self._local_objects.get(key)
+        if entry is None:
+            return default
+        if entry.owner != owner:
+            return default
+        return entry.value
+
+    def drop_local_object(self, key: str, *, owner: str | None = None) -> bool:
+        """Release one held object. Returns whether it was released.
+
+        Pass `owner` to refuse a key belonging to someone else: releasing it would run their teardown
+        under them and leave their still-valid keys reporting the object as gone.
+        """
+        with self._local_objects_lock:
+            entry = self._local_objects.get(key)
+            if entry is None:
+                return False
+            if owner is not None and entry.owner != owner:
+                logger.warning(
+                    "'%s' attempted to release an object owned by '%s'. Refused: an owner may only "
+                    "release what it put.",
+                    owner,
+                    entry.owner,
+                )
+                return False
+            del self._local_objects[key]
+            survives = self._value_still_held_locked(entry.value)
+
+        if not survives:
+            self._invoke_on_drop(key, entry)
+        return True
+
+    def release_parked_key(self, key: str, *, owner: str) -> bool:
+        """Release `key` everywhere, but only if the engine parked it. Returns whether it was released here.
+
+        An entry whose key the owner named itself (`slot` is None) is the owner's to release, several
+        sources may name it, and it is stable by construction -- releasing it here would drop that
+        resource in every process holding it.
+
+        A key with no entry here still goes to the workers: the object this feature exists for lives in a
+        worker, and this process cannot check provenance for an entry it does not hold. The worker-side
+        handler drops parked entries only, so the refusal above still holds over there.
+        """
+        with self._local_objects_lock:
+            entry = self._local_objects.get(key)
+            if entry is not None and (entry.owner != owner or entry.slot is None):
+                return False
+            if entry is None:
+                self._pending_worker_releases.append(key)
+        if entry is None:
+            self.engine.worker_manager.schedule_pending_local_object_releases()
+            return False
+        return self.release_key_everywhere(key, owner=owner)
+
+    def drop_parked_local_object(self, key: str) -> bool:
+        """Release one entry, only if the engine parked it. Returns whether it was released.
+
+        The worker half of `release_parked_key`: the orchestrator broadcasts keys it holds no entry for,
+        so the provenance check happens here, in the process that has the entry.
+        """
+        with self._local_objects_lock:
+            entry = self._local_objects.get(key)
+            if entry is None or entry.slot is None:
+                return False
+            del self._local_objects[key]
+            survives = self._value_still_held_locked(entry.value)
+        if not survives:
+            self._invoke_on_drop(key, entry)
+        return True
+
+    def vacate_slot(self, *, owner: str, source: str, slot: str, keeping: str | None = None) -> None:
+        """Release everything parked in a slot, except the entry behind `keeping`.
+
+        For a run that ends without a fresh park -- the parameter carries an upstream's key, or None --
+        where a plain displacement never fires because nothing was put.
+        """
+        with self._local_objects_lock:
+            vacated = self._take_slot_entries_locked(owner=owner, source=source, slot=slot, keep_key=keeping)
+            if vacated:
+                self._pending_worker_releases.extend(vacated)
+        self._invoke_hooks_once_per_object(vacated)
+        if vacated:
+            self.engine.worker_manager.schedule_pending_local_object_releases()
+
+    def _take_slot_entries_locked(
+        self, *, owner: str, source: str, slot: str, keep_key: str | None, keep_value: Any = _SAME_VALUE_UNSET
+    ) -> dict[str, LocalObjectEntry]:
+        """Remove and return a slot's displaced entries. Caller holds the lock and runs the hooks.
+
+        An entry holding the very object being re-parked is removed but NOT returned: its object is the
+        live value, so running its hook or broadcasting its key would tear down what the new key now
+        refers to. Re-assigning the same object to an output mid-run is how progress publishing works.
+        """
+        taken: dict[str, LocalObjectEntry] = {}
+        for existing_key, existing in list(self._local_objects.items()):
+            if (
+                existing_key == keep_key
+                or existing.slot != slot
+                or existing.owner != owner
+                or existing.source != source
+            ):
+                continue
+            del self._local_objects[existing_key]
+            if keep_value is not _SAME_VALUE_UNSET and existing.value is keep_value:
+                continue
+            # One object can sit in several entries -- parked on two outputs, or parked and also cached
+            # under a library key. Displacing one entry must not tear the object down while another still
+            # hands it out, so an entry whose object survives elsewhere is removed silently: no hook, no
+            # broadcast.
+            if any(remaining.value is existing.value for remaining in self._local_objects.values()):
+                continue
+            taken[existing_key] = existing
+        return taken
+
+    def release_key_everywhere(self, key: str, *, owner: str) -> bool:
+        """Release `key` here and remember to tell the workers, returning whether this process held it.
+
+        The object may be in this process, in a worker, or in both when two libraries share a namespace, so
+        the local release cannot tell you whether anything is left holding it. Callers on sync paths use
+        this and let `drain_pending_worker_releases` do the rest.
+        """
+        dropped = self.drop_local_object(key, owner=owner)
+        with self._local_objects_lock:
+            self._pending_worker_releases.append(key)
+        self.engine.worker_manager.schedule_pending_local_object_releases()
+        return dropped
+
+    def requeue_pending_worker_releases(self, keys: list[str]) -> None:
+        """Put drained keys back, for a send that failed after taking them."""
+        with self._local_objects_lock:
+            self._pending_worker_releases[:0] = keys
+
+    def drain_pending_worker_releases(self) -> list[str]:
+        """Take the keys queued for the workers, leaving the queue empty."""
+        with self._local_objects_lock:
+            pending = self._pending_worker_releases
+            self._pending_worker_releases = []
+        return pending
+
+    def drop_all_local_objects(self) -> int:
+        """Release everything held in this process, returning how many went.
+
+        For clearing workflow state: every key lived in a parameter value, so deleting the nodes makes
+        all of them unreachable at once, whoever put them.
+        """
+        with self._local_objects_lock:
+            doomed = dict(self._local_objects)
+            self._local_objects.clear()
+
+        self._invoke_hooks_once_per_object(doomed)
+        return len(doomed)
+
+    def drop_objects_for_owner(self, owner: str) -> int:
+        """Release everything one owner is holding, returning how many entries went.
+
+        For an owner clearing its own cache, and for library reload, where code that built an object is
+        being replaced.
+        """
+        with self._local_objects_lock:
+            doomed = {key: entry for key, entry in self._local_objects.items() if entry.owner == owner}
+            for key in doomed:
+                del self._local_objects[key]
+            # Another owner's entry may hold the same object -- two libraries sharing a namespace-adjacent
+            # cache -- and this sweep must not tear down what it left behind.
+            to_release = {key: entry for key, entry in doomed.items() if not self._value_still_held_locked(entry.value)}
+
+        self._invoke_hooks_once_per_object(to_release)
+        return len(doomed)
+
     # Private Implementation Methods
+
+    def _value_still_held(self, value: Any) -> bool:
+        """Whether any current entry holds this very object."""
+        with self._local_objects_lock:
+            return self._value_still_held_locked(value)
+
+    def _value_still_held_locked(self, value: Any) -> bool:
+        """`_value_still_held` for callers already holding the lock.
+
+        Deciding whether to run a hook has to happen under the same lock hold as the entry's removal:
+        two concurrent drops of two entries holding one object would otherwise each see the other's
+        entry already gone and both run the hook.
+        """
+        return any(entry.value is value for entry in self._local_objects.values())
+
+    def _invoke_hooks_once_per_object(self, removed: dict[str, LocalObjectEntry]) -> None:
+        """Run release hooks for a batch of removed entries, once per distinct object.
+
+        One object can sit in several entries -- parked on two outputs, or parked and also cached under
+        a library key -- and a batch removal takes them all at once. Freeing is per object, not per
+        entry, so the hook runs once: the first entry carrying one, since an entry may have none.
+        """
+        seen: set[int] = set()
+        for key, entry in removed.items():
+            if id(entry.value) in seen:
+                continue
+            if entry.on_drop is not None:
+                seen.add(id(entry.value))
+                self._invoke_on_drop(key, entry)
+
+    def _invoke_on_drop(self, key: str, entry: LocalObjectEntry) -> None:
+        """Run a dropped entry's release hook, if it has one.
+
+        The caller has already removed the entry, so a teardown that raises cannot leave the entry
+        present with its object resident and no later drop to retry it. The hook is arbitrary caller
+        code, and its failure must not propagate into whatever triggered the drop -- often a reload
+        clearing many entries at once.
+        """
+        if entry.on_drop is None:
+            return
+        try:
+            entry.on_drop(entry.value)
+        except Exception:
+            logger.exception(
+                "Attempted to release the held object '%s' produced by '%s'. Its cleanup failed, so "
+                "whatever it was holding (GPU memory, for example) may not have been freed.",
+                key,
+                entry.source,
+            )
 
     def _get_resource_type_by_name(self, name: str) -> ResourceType | None:
         """Get a registered resource type by its class name."""
