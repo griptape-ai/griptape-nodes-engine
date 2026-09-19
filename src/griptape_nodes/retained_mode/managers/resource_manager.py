@@ -1,4 +1,5 @@
 import logging
+import re
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -72,6 +73,12 @@ class LocalObjectEntry:
 
 
 _SAME_VALUE_UNSET = object()
+
+# What `LocalObjectScope.park` mints: owner, then the producing node's identity, its parameter, and a
+# random tail. Only for recognising a key whose entry lives in another process.
+# The owner must not be followed by a slash, or a URL is a match ("https://host/a@deadbeef.png#a1b2c3d4"),
+# and the parameter segment is greedy because a parameter may be named with a dot or a hash.
+_MINTED_KEY = re.compile(r"^[^:/]+:[^/].*@[0-9a-f]{8}\..+#[0-9a-f]{8}$")
 
 
 class ResourceManager(EngineScoped):
@@ -406,8 +413,10 @@ class ResourceManager(EngineScoped):
             self._invoke_on_drop(full_key, displaced)
         self._invoke_hooks_once_per_object(displaced_slot_entries)
         if displaced_slot_entries:
-            # The same slot may have parked in another process too -- the node ran in a worker last time
-            # and in this process now -- so the key goes out as well. A worker not holding it no-ops.
+            # Releasing an entry here is what queues its key; this drains the queue. A worker's own slot is
+            # not reachable from this process -- keys are minted where the object is parked, so a slot
+            # occupied in a worker leaves no entry here to displace -- and it is the worker's own next park
+            # that displaces it.
             self.engine.worker_manager.schedule_pending_local_object_releases()
         return full_key
 
@@ -424,6 +433,27 @@ class ResourceManager(EngineScoped):
                 for key, entry in self._local_objects.items()
                 if entry.owner == owner and entry.source == source and entry.slot is not None
             ]
+
+    def names_a_parked_object(self, value: Any) -> bool:
+        """Whether `value` is a key the engine minted, whether or not THIS process holds the entry.
+
+        The entry is the authority when it is here, and shape is the fallback when it is not: a worker
+        parked the object, so the orchestrator has no entry to consult, and deciding "may this be written
+        into a saved workflow" still has to come out right.
+
+        A false positive costs a value: the save drops it and stamps the node UNRESOLVED, and metadata
+        collection reports it omitted. A false negative writes a dead key into the file. So the pattern is
+        deliberately narrow on both sides -- do not widen it casually. Release decisions use the exact
+        `is_parked_key`, where a false positive would free someone else's object.
+        """
+        return self.is_parked_key(value) or (isinstance(value, str) and bool(_MINTED_KEY.match(value)))
+
+    def holds_any_key(self, value: Any) -> bool:
+        """Whether the store currently holds anything under `value`, for any owner and either kind."""
+        if not isinstance(value, str):
+            return False
+        with self._local_objects_lock:
+            return value in self._local_objects
 
     def is_parked_key(self, key: Any) -> bool:
         """Whether `key` names an entry the engine parked for a parameter, rather than one its owner named."""

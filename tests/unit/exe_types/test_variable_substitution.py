@@ -70,6 +70,10 @@ def _mock_gn(
     mock_gn.handle_request.side_effect = lambda req: (
         _list_variables_result(variables) if isinstance(req, ListVariablesRequest) else MagicMock()
     )
+    # No object is held in these tests, so the store must say so. A bare MagicMock answers truthy to
+    # every predicate, which would make an ordinary string read look like a key from another library.
+    mock_gn.ResourceManager.return_value.holds_any_key.return_value = False
+    mock_gn.ResourceManager.return_value.names_a_parked_object.return_value = False
 
     incoming_index = {"mock_node": dict.fromkeys(connected_params, True)} if connected_params else {}
     mock_connections = MagicMock()
@@ -124,6 +128,10 @@ def _capturing_gn_mock(captured: list, variables: dict, *, connected_params: set
     mock_gn.handle_request.side_effect = lambda req: (
         _list_variables_result(variables) if isinstance(req, ListVariablesRequest) else MagicMock()
     )
+    # No object is held in these tests, so the store must say so. A bare MagicMock answers truthy to
+    # every predicate, which would make an ordinary string read look like a key from another library.
+    mock_gn.ResourceManager.return_value.holds_any_key.return_value = False
+    mock_gn.ResourceManager.return_value.names_a_parked_object.return_value = False
     incoming_index = {"mock_node": dict.fromkeys(connected_params, True)} if connected_params else {}
     mock_gn.FlowManager.return_value.get_connections.return_value = MagicMock(incoming_index=incoming_index)
     mock_gn.WorkflowManager.return_value.is_variable_substitution_enabled.return_value = True
@@ -352,6 +360,8 @@ class TestVariableSubstitutionFallbacks:
         node.parameter_values["text"] = "{SHOT}"
 
         mock_gn = MagicMock()
+        mock_gn.ResourceManager.return_value.holds_any_key.return_value = False
+        mock_gn.ResourceManager.return_value.names_a_parked_object.return_value = False
         mock_gn.NodeManager.return_value.get_node_parent_flow_by_name.side_effect = KeyError("mock_node")
         mock_connections = MagicMock()
         mock_connections.incoming_index = {}

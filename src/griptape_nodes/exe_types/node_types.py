@@ -1043,7 +1043,7 @@ class BaseNode(ABC):
             else:
                 final_value = self.before_value_set(parameter=parameter, value=candidate_value)
             # ACTUALLY SET THE NEW VALUE
-            self.parameter_values[param_name] = final_value
+            self.parameter_values[param_name] = self._value_to_store(parameter, final_value)
 
             # If a parameter value has been set at the top level of a container, wipe all children.
             # Allow custom node logic to respond after it's been set. Record any modified parameters for cascading.
@@ -1051,7 +1051,7 @@ class BaseNode(ABC):
             if emit_change:
                 self._emit_parameter_lifecycle_event(parameter)
         else:
-            self.parameter_values[param_name] = candidate_value
+            self.parameter_values[param_name] = self._value_to_store(parameter, candidate_value)
         # handle with container parameters
         if parameter.parent_container_name is not None:
             # Does it have a parent container
@@ -1095,13 +1095,14 @@ class BaseNode(ABC):
         Engine code that moves values between nodes, saves them, or sends them to the editor wants the key
         and calls `get_raw_parameter_value`, which is also the one to override for a computed value.
 
+        The reading parameter's own declaration is not consulted. Only the producer declares the flag, and
+        its key travels down connections to consumers that declare nothing -- gating translation on the
+        reader would hand those consumers the key string instead of the object.
+
         Raises:
             RuntimeError: if the value is a key this process is no longer holding, naming the parameter.
         """
         value = self.get_raw_parameter_value(param_name)
-        parameter = self.get_parameter_by_name(param_name)
-        if parameter is None or not parameter.is_process_local:
-            return value
         return self.local_objects.resolve_if_held(value, parameter_name=param_name, node_name=self.name)
 
     def get_raw_parameter_value(self, param_name: str) -> Any:
@@ -1353,9 +1354,9 @@ class BaseNode(ABC):
     def local_objects(self) -> LocalObjectScope:
         """This node's view of the process-local object store, for a resource it reuses across runs.
 
-        A value passed between nodes does not need this: give the output parameter the type
-        `handle[<what it holds>]` and assign the object to it. The engine parks it, sends the key on, and
-        releases it when the value is replaced or this node goes away.
+        A value passed between nodes does not need this: mark the output parameter `serializable=False` and
+        assign the object to it. The engine holds it, sends the key on, and releases it when the value is
+        replaced or this node goes away.
         """
         if self._local_objects is None:
             self._local_objects = LocalObjectScope(
@@ -1363,6 +1364,39 @@ class BaseNode(ABC):
                 source=str(self.metadata["local_object_source"]),
             )
         return self._local_objects
+
+    def _value_to_store(self, parameter: Parameter, value: Any) -> Any:
+        """What actually goes into `parameter_values`: the value, or a key standing in for it."""
+        if not parameter.is_process_local:
+            return value
+        return self.park_process_local_value(parameter, value, is_output=False)
+
+    def park_process_local_value(self, parameter: Parameter, value: Any, *, is_output: bool) -> Any:
+        """Hold `value` in this process and return the key to store in the parameter instead of it.
+
+        Called from both write paths -- the output dict and `set_parameter_value` -- because a value that
+        reached `parameter_values` unparked would be a live object in a dict that is json-serialized on
+        every worker dispatch and every editor read.
+
+        Runs wherever the value was produced, so an object built in a worker stays in that worker and only
+        its key crosses the wire. A value that is already one of this library's keys is passed through, so
+        a node that changes an object in place and outputs it again keeps one entry for it; None passes
+        through too, so a consumer is told nothing is connected rather than resolving to None. Either way
+        the node produced no fresh object, so whatever it parked in that slot last run is released now.
+        """
+        scope = self.local_objects
+        # A parameter's input value and its output value are two independent values -- the save path says
+        # so -- and each gets its own slot. Sharing one would make an input write release the object the
+        # node is publishing from the same parameter.
+        slot = f"{parameter.name}#output" if is_output else f"{parameter.name}#input"
+        # Never park a key, whoever owns it: parking one wraps the string as though it were the object, so
+        # the consumer reads a `str` and a release hook runs against a key. Another library's key must
+        # survive unchanged so the read can refuse it by name, and `names_a_parked_object` also catches one
+        # whose entry lives in a worker, where this process has nothing to look up.
+        if value is None or scope.names_any_stored_key(value) or scope.names_a_parked_object(value):
+            scope.vacate_slot(slot, keeping=value if isinstance(value, str) else None)
+            return value
+        return scope.park(value, parameter_name=parameter.name, slot=slot, on_drop=parameter.on_local_object_drop)
 
     def clear_node(self) -> None:
         # set state to unresolved
@@ -1871,9 +1905,9 @@ class BaseNode(ABC):
             event_data = parameter.to_event(self)
             # Display-preservation guard. Gated on _in_aprocess here, unlike
             # TrackedParameterOutputValues._emit_parameter_change_event, because this
-            # value comes from Parameter.to_event -> node.get_parameter_value(), which
-            # only substitutes inside aprocess. Outside it the value is already the
-            # template, so the guard would be a no-op.
+            # value comes from Parameter.to_event -> node.get_raw_parameter_value(),
+            # and substitution only happens inside aprocess. Outside it the value is
+            # already the template, so the guard would be a no-op.
             if _in_aprocess.get() and "value" in event_data:
                 event_data["value"] = self.get_display_value_for_output(parameter.name, event_data["value"])
             # Publish the event
@@ -2046,25 +2080,7 @@ class TrackedParameterOutputValues(dict[str, Any]):
             self._emit_parameter_change_event(key, value)
 
     def _park_local_object(self, parameter: Parameter, value: Any) -> Any:
-        """Hold `value` in this process and return the key to store in the parameter instead of it.
-
-        Runs wherever the value was produced, so an object built in a worker stays in that worker and only
-        its key crosses the wire. A value that is already this library's key is passed through, which is
-        how a node that takes a handle, changes the object in place and outputs it again avoids parking the
-        same object twice.
-        """
-        scope = self._node.local_objects
-        if value is None or (isinstance(value, str) and value.startswith(f"{scope.owner}:")):
-            # A key already belonging to this library is passed through rather than parked again, so a node
-            # that changes an object in place and outputs it keeps one entry for it. None is passed through
-            # too, so a consumer is told nothing is connected rather than resolving to None.
-            #
-            # Either way the node re-ran without parking, so whatever it parked here last run is displaced
-            # now, exactly as a fresh park would displace it. Without this, a node that alternates between
-            # producing an object and passing its upstream's through strands its own prior entry.
-            scope.vacate_slot(parameter.name, keeping=value if isinstance(value, str) else None)
-            return value
-        return scope.park(value, parameter_name=parameter.name, on_drop=parameter.on_local_object_drop)
+        return self._node.park_process_local_value(parameter, value, is_output=True)
 
     def __delitem__(self, key: str) -> None:
         if key in self:
@@ -2398,7 +2414,9 @@ class EndNode(BaseNode):
         # Update all values to use the output value
         for param in self.parameters:
             if param.type != ParameterTypeBuiltin.CONTROL_TYPE:
-                value = self.get_parameter_value(param.name)
+                # Raw: this copies a value along rather than reading it for use, so a held value
+                # stays the key it already is instead of being resolved and parked a second time.
+                value = self.get_raw_parameter_value(param.name)
                 self.parameter_output_values[param.name] = value
         entry_parameter = self._entry_control_parameter
         # Update which control parameter to flag as the output value.
@@ -2697,7 +2715,11 @@ def handle_container_parameter(current_node: BaseNode, parameter: Parameter) -> 
             build_parameter_value = {}
         build_parameter_value = []
         for child in children:
-            value = current_node.get_parameter_value(child.name)
+            # Raw, because what this builds is cached into the container's own entry in
+            # `parameter_values`, and that dict is the payload of an ExecuteNodeRequest. Translating here
+            # would put a live object in it and send it to a worker as JSON. The node still sees objects:
+            # its read resolves the whole list on the way out.
+            value = current_node.get_raw_parameter_value(child.name)
             if value is not None:
                 build_parameter_value.append(value)
         return build_parameter_value

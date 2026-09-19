@@ -280,3 +280,159 @@ class TestCachingAnExpensiveResourceAcrossRuns:
 
         assert mine.local_objects.get(my_key) is None
         assert theirs.local_objects.get(their_key) is not None
+
+
+class TestBothWritePathsHold:
+    """A value must not reach `parameter_values` as a live object.
+
+    That dict is json-serialized on every worker dispatch and read by the editor, so an object there goes
+    onto the wire. `set_parameter_value` is a documented public setter and libraries use it alongside the
+    output dict, so it has to hold values too.
+    """
+
+    def test_set_parameter_value_stores_a_key(self) -> None:
+        node = _producer()
+        node.add_parameter(Parameter(name="incoming", input_types=["Pipeline"], tooltip="", serializable=False))
+        pipeline = Pipeline("flux")
+
+        node.set_parameter_value("incoming", pipeline)
+
+        assert isinstance(node.get_raw_parameter_value("incoming"), str)
+        assert node.get_parameter_value("incoming") is pipeline
+
+    def test_the_editor_payload_carries_the_key(self) -> None:
+        """Parameter.to_event reads raw for this reason; an unparked write would defeat that."""
+        node = _producer()
+        node.add_parameter(Parameter(name="incoming", input_types=["Pipeline"], tooltip="", serializable=False))
+        node.set_parameter_value("incoming", Pipeline("flux"))
+
+        parameter = node.get_parameter_by_name("incoming")
+        assert parameter is not None
+        event = parameter.to_event(node)
+
+        assert isinstance(event["value"], str)
+
+    def test_a_key_arriving_on_an_input_is_not_parked_again(self) -> None:
+        """A consumer receives keys, and re-parking one would wrap the string as though it were an object."""
+        producer, consumer = _producer(), _consumer()
+        producer.parameter_output_values["pipeline"] = Pipeline("flux")
+        key = producer.parameter_output_values["pipeline"]
+
+        consumer.set_parameter_value("pipeline", key)
+
+        assert consumer.get_raw_parameter_value("pipeline") == key
+
+
+class TestOutputtingACachedResourceKey:
+    """The sanctioned way to hand a cached pipeline downstream is to output its key.
+
+    The write path must recognise that key as one this library already holds and leave it alone. Wrapping
+    it would park the string as though it were the object: the consumer reads a str where it wants a
+    Pipeline, and the release hook runs against the key.
+    """
+
+    def test_the_consumer_resolves_the_cached_object(self) -> None:
+        producer, consumer = _producer(), _consumer()
+        pipeline = Pipeline("flux")
+        cache_key = producer.local_objects.put(pipeline, key="flux-config-hash")
+
+        producer.parameter_output_values["pipeline"] = cache_key
+        _hand_over(producer, consumer)
+
+        assert producer.parameter_output_values["pipeline"] == cache_key
+        assert consumer.get_parameter_value("pipeline") is pipeline
+
+    def test_the_release_hook_is_not_handed_the_key(self) -> None:
+        """A real hook does `del value.unet`; against a str it raises into a swallowed log."""
+        released: list[object] = []
+        producer = _producer(on_drop=released.append)
+        pipeline = Pipeline("flux")
+        cache_key = producer.local_objects.put(pipeline, key="cfg")
+
+        producer.parameter_output_values["pipeline"] = cache_key
+        producer.parameter_output_values.silent_clear()
+        producer.parameter_output_values["pipeline"] = Pipeline("second")
+
+        assert all(not isinstance(value, str) for value in released)
+
+
+class TestAParameterWithAnInputAndAnOutputValue:
+    """A parameter's input value and its output value are two independent values.
+
+    The save path treats them separately, so the store must too. Sharing one slot makes an input write
+    release the object the node is publishing from the same parameter -- and the engine resets input values
+    after a run when a connection was torn down mid-execution.
+    """
+
+    def test_clearing_the_input_leaves_the_output_object_alone(self) -> None:
+        released: list[str] = []
+        node = _producer(on_drop=lambda value: released.append(value.label))
+        node.add_parameter(
+            Parameter(
+                name="pipeline_in",
+                input_types=["Pipeline"],
+                tooltip="",
+                serializable=False,
+                allowed_modes={ParameterMode.INPUT},
+            )
+        )
+        published = Pipeline("with lora")
+        node.parameter_output_values["pipeline"] = published
+        key = node.parameter_output_values["pipeline"]
+
+        # What reset_deferred_input_values does after a run whose connection was cut mid-execution.
+        node.set_parameter_value("pipeline", None)
+
+        assert released == []
+        assert node.local_objects.get(key) is published
+
+    def test_each_side_holds_its_own_object(self) -> None:
+        node = _producer()
+        incoming, outgoing = Pipeline("incoming"), Pipeline("outgoing")
+
+        node.set_parameter_value("pipeline", incoming)
+        node.parameter_output_values["pipeline"] = outgoing
+
+        assert node.get_parameter_value("pipeline") is incoming
+        assert node.local_objects.get(node.parameter_output_values["pipeline"]) is outgoing
+
+
+class TestAConsumerThatDeclaresNothing:
+    """The shipped shape: only the producer declares the flag.
+
+    `base_driver.py` in the standard library marks its `driver` output serializable=False, while the
+    Agent node's `model` input declares nothing and simply expects the driver object. Translation is
+    therefore a question about the value, not about the parameter reading it.
+    """
+
+    def _plain_consumer(self) -> _LibraryNode:
+        node = _LibraryNode(name="Agent")
+        node.add_parameter(
+            Parameter(name="model", input_types=["str", "Pipeline"], tooltip="", allowed_modes={ParameterMode.INPUT})
+        )
+        return node
+
+    def test_an_undeclared_input_still_reads_the_object(self) -> None:
+        producer, consumer = _producer(), self._plain_consumer()
+        pipeline = Pipeline("flux")
+
+        producer.parameter_output_values["pipeline"] = pipeline
+        consumer.set_parameter_value("model", producer.parameter_output_values["pipeline"])
+
+        assert consumer.get_parameter_value("model") is pipeline
+
+    def test_the_undeclared_input_still_carries_the_key(self) -> None:
+        """It has to stay JSON-safe: this dict is the payload of an ExecuteNodeRequest."""
+        producer, consumer = _producer(), self._plain_consumer()
+
+        producer.parameter_output_values["pipeline"] = Pipeline("flux")
+        consumer.set_parameter_value("model", producer.parameter_output_values["pipeline"])
+
+        assert isinstance(consumer.parameter_values["model"], str)
+        assert isinstance(consumer.get_raw_parameter_value("model"), str)
+
+    def test_an_ordinary_string_on_an_undeclared_input_is_untouched(self) -> None:
+        consumer = self._plain_consumer()
+        consumer.set_parameter_value("model", "gpt-4o")
+
+        assert consumer.get_parameter_value("model") == "gpt-4o"

@@ -4765,7 +4765,7 @@ class NodeManager(EngineScoped):
         # Publishing (serialize_all_parameter_values) does not change this: a held value is already skipped
         # by its parameter's own flag today, so nothing regresses, and a key would be useless in the
         # published copy either way. The node comes back UNRESOLVED and its producer re-runs.
-        if node.local_objects.is_parked_by_engine(value):
+        if node.local_objects.names_a_parked_object(value):
             if isinstance(create_node_request, CreateNodeRequest):
                 create_node_request.resolution = NodeResolutionState.UNRESOLVED.value
             return None

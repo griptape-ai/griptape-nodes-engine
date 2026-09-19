@@ -1,9 +1,9 @@
 """A node's view of the process-local object store.
 
 Values a library passes between nodes are held by their parameter: assigning an object to a
-`handle[...]` output parks it and stores a key, and the engine releases that key when it is replaced or
-the node goes away. This module is for the other case -- a *resource* the library reuses across runs,
-like a pipeline whose load takes 30 seconds -- which needs a key the library can name again.
+`serializable=False` output holds it and stores a key, and the engine releases that key when it is
+replaced or the node goes away. This module is for the other case -- a *resource* the library reuses
+across runs, like a pipeline whose load takes 30 seconds -- which needs a key the library can name again.
 
 The scope binds the two things a node knows and the store does not: which library owns the object, and
 which node produced it.
@@ -49,10 +49,10 @@ class LocalObjectScope:
     def put(self, value: Any, *, key: str, on_drop: Callable[[Any], None] | None = None) -> str:
         """Hold `value` for this library under `key`, returning the full key to look it up with.
 
-        `key` is required: for a value flowing between nodes, give the producing parameter the type
-        `handle[<what it holds>]` and assign the object to it, which parks it under a key of its own and
-        has the engine release it when replaced. This is for a resource the library reuses across runs,
-        where the key is something the library can derive again -- a hash of the model and settings.
+        `key` is required: for a value flowing between nodes, mark the producing parameter
+        `serializable=False` and assign the object to it, which holds it under a key of its own and has the
+        engine release it when replaced. This is for a resource the library reuses across runs, where the
+        key is something the library can derive again -- a hash of the model and settings.
 
         Putting again under the same key releases what was there, unless it is the same object, so
         rebuilding under an unchanged hash does not strand the old one. Pass `on_drop` when releasing
@@ -60,14 +60,23 @@ class LocalObjectScope:
         """
         return self._manager().put_local_object(value, owner=self._owner, source=self._source, key=key, on_drop=on_drop)
 
-    def park(self, value: Any, *, parameter_name: str, on_drop: Callable[[Any], None] | None = None) -> str:
+    def park(
+        self, value: Any, *, parameter_name: str, slot: str | None = None, on_drop: Callable[[Any], None] | None = None
+    ) -> str:
         """Hold a value on behalf of a parameter, under a key minted for this assignment.
 
-        For the engine's own use from the write path. The key is unique per call, so a parameter's value
-        changes every time its node runs and the editor hears about it. The slot carries the identity: one
-        object per (owner, source, parameter), and parking into it again releases the previous occupant in
-        the process holding it -- which is what frees the last run's object, however the parameter values
-        themselves were cleared in between.
+        For the engine's own use from the write path.
+
+        The key is unique per call so that a stale one is detectably stale. A consumer holding a key from
+        the previous run finds it dangling and is told to re-run the producer, which is the honest answer:
+        the object it wanted is gone. A key stable across runs would resolve to whatever the producer put
+        most recently, and that consumer would read the new object believing it had the old one. Do not
+        make the key stable to save the uuid -- the editor has no use for the difference either way, since
+        all it can display is the key.
+
+        The slot carries the identity: one object per (owner, source, parameter), and parking into it again
+        releases the previous occupant in the process holding it -- which is what frees the last run's
+        object, however the parameter values themselves were cleared in between.
         """
         # Straight to the manager: `slot` is what makes an entry the engine's to release and to displace,
         # and it stays off the library-facing `put` on purpose.
@@ -76,7 +85,7 @@ class LocalObjectScope:
             owner=self._owner,
             source=self._source,
             key=f"{self._source}.{parameter_name}#{uuid.uuid4().hex[:8]}",
-            slot=parameter_name,
+            slot=slot if slot is not None else parameter_name,
             on_drop=on_drop,
         )
 
@@ -87,6 +96,34 @@ class LocalObjectScope:
         including exactly like a minted one (`sd-xl-1.0#a1b2c3d4`).
         """
         return self._manager().is_parked_key(key)
+
+    def holds(self, value: Any) -> bool:
+        """Whether `value` is a key this library is holding something under, right now.
+
+        Exact, and covers both kinds of entry: one the engine parked for a parameter and one the library
+        named itself through `put`. Shape tests cannot do this -- a library key looks like whatever the
+        library chose -- and getting it wrong on the write path parks the key string as though it were the
+        object.
+        """
+        if not self._is_own_key(value):
+            return False
+        return self._manager().get_local_object(value, owner=self._owner, default=_MISSING) is not _MISSING
+
+    def names_any_stored_key(self, value: Any) -> bool:
+        """Whether `value` is a key the store currently holds anything under, for any owner.
+
+        The write path asks this because parking a key wraps the string as though it were the object: the
+        consumer reads a `str`, and a release hook runs against the key. Ownership is irrelevant to that
+        question -- another library's key must survive unchanged so the read can refuse it by name.
+        """
+        return self._manager().holds_any_key(value)
+
+    def names_a_parked_object(self, value: Any) -> bool:
+        """Whether `value` is an engine-minted key, including one whose object lives in another process.
+
+        For "may this be written out" questions. `is_parked_by_engine` is the exact, local-entry answer.
+        """
+        return self._manager().names_a_parked_object(value)
 
     def release_parked(self, key: Any) -> bool:
         """Release `key` in every process, but only if the engine parked it for this library.
@@ -144,23 +181,24 @@ class LocalObjectScope:
         return value
 
     def resolve_if_held(self, value: Any, *, parameter_name: str, node_name: str) -> Any:
-        """`value` itself, or the object behind it when it is one of this library's keys.
+        """`value`, with anything in it that names a held object replaced by the object.
 
         What a node's parameter read goes through, so a library reads its parameter normally and gets the
-        object. A value that is not one of our keys is returned untouched: a non-serializable parameter
-        may perfectly well hold something the engine never parked.
+        object. Whether to translate is a question about the value, not about the parameter doing the
+        reading: the producer's `serializable=False` is what parked the object, and the key then travels
+        down a connection to consumers that declare nothing. Gating on the reader's own declaration hands
+        a key string to every consumer that did not also declare the flag. A value naming nothing held is
+        returned untouched.
 
         Raises:
-            RuntimeError: if the value is one of our keys and this process is no longer holding it.
+            RuntimeError: if a key names an object this process cannot hand over.
         """
+        if not self._names_a_held_object(value):
+            return value
         if not self._is_own_key(value):
             # A key another library parked is refused rather than handed over as a string: it can never
             # resolve here, and saying so beats the node failing on a str it expected an object to be.
-            if self._manager().is_parked_key(value):
-                raise RuntimeError(
-                    self._unusable_key_message(value, parameter_name=parameter_name, node_name=node_name)
-                )
-            return value
+            raise RuntimeError(self._unusable_key_message(value, parameter_name=parameter_name, node_name=node_name))
         return self.require(value, parameter_name=parameter_name, node_name=node_name)
 
     def drop(self, key: str) -> bool:
@@ -171,14 +209,17 @@ class LocalObjectScope:
             return False
         return self._manager().drop_local_object(key, owner=self._owner)
 
-    def vacate_slot(self, parameter_name: str, *, keeping: str | None = None) -> None:
-        """Release whatever this node parked for `parameter_name`, except the entry behind `keeping`.
+    def vacate_slot(self, slot: str, *, keeping: str | None = None) -> None:
+        """Release whatever this node parked in `slot`, except the entry behind `keeping`.
 
         For the engine's write path, when a run ends with the parameter carrying something other than a
         fresh park: an upstream's key passed through, or None. The upstream's own entry cannot be caught
         here, because it sits under the upstream's source.
+
+        A slot is not a parameter name -- a parameter's input value and its output value are separate
+        values and hold separate slots, so the caller composes it.
         """
-        self._manager().vacate_slot(owner=self._owner, source=self._source, slot=parameter_name, keeping=keeping)
+        self._manager().vacate_slot(owner=self._owner, source=self._source, slot=slot, keeping=keeping)
 
     def drop_all(self) -> int:
         """Release everything THIS library is holding in this process, returning how many went.
@@ -186,6 +227,16 @@ class LocalObjectScope:
         What a "clear cache" node calls.
         """
         return self._manager().drop_objects_for_owner(self._owner)
+
+    def _names_a_held_object(self, value: Any) -> bool:
+        """Whether `value` names an object held here or in another process.
+
+        The entry is the authority when it is here, and either kind counts: a key its owner named through
+        `put` has no shape to match. The minted shape is the fallback for an object sitting in a worker,
+        where there is no entry to consult and handing the node a string is the wrong answer.
+        """
+        manager = self._manager()
+        return manager.holds_any_key(value) or manager.names_a_parked_object(value)
 
     def _is_own_key(self, key: Any) -> bool:
         return isinstance(key, str) and key.startswith(f"{self._owner}:")
