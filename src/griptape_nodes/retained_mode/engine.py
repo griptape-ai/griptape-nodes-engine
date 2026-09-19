@@ -58,6 +58,7 @@ if TYPE_CHECKING:
         ArbitraryCodeExecManager,
     )
     from griptape_nodes.retained_mode.managers.artifact_manager import ArtifactManager
+    from griptape_nodes.retained_mode.managers.budget_manager import BudgetManager
     from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
     from griptape_nodes.retained_mode.managers.context_manager import ContextManager
     from griptape_nodes.retained_mode.managers.engine_identity_manager import EngineIdentityManager
@@ -169,6 +170,7 @@ class Engine:
     _project_manager: ProjectManager
     _artifact_manager: ArtifactManager
     _manifest_manager: ManifestManager
+    _budget_manager: BudgetManager
     _worker_manager: WorkerManager
 
     def __init__(self) -> None:  # noqa: PLR0915
@@ -178,6 +180,7 @@ class Engine:
             ArbitraryCodeExecManager,
         )
         from griptape_nodes.retained_mode.managers.artifact_manager import ArtifactManager
+        from griptape_nodes.retained_mode.managers.budget_manager import BudgetManager
         from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
         from griptape_nodes.retained_mode.managers.context_manager import ContextManager
         from griptape_nodes.retained_mode.managers.engine_identity_manager import EngineIdentityManager
@@ -245,6 +248,9 @@ class Engine:
         )
         self._artifact_manager = ArtifactManager(self._event_manager, engine=self)
         self._manifest_manager = ManifestManager(self._event_manager, engine=self)
+        # Constructed unconditionally, including on workers: register_remote_handlers raises if a
+        # forwarded request type (GetAttributionContextRequest) has no registered owner.
+        self._budget_manager = BudgetManager(self._event_manager, engine=self)
 
         # Assign handlers now that these are created.
         self._event_manager.assign_manager_to_request_type(GetEngineVersionRequest, self.handle_engine_version_request)
@@ -359,6 +365,10 @@ class Engine:
         return self._manifest_manager
 
     @property
+    def budget_manager(self) -> BudgetManager:
+        return self._budget_manager
+
+    @property
     def worker_manager(self) -> WorkerManager:
         return self._worker_manager
 
@@ -447,6 +457,9 @@ class Engine:
 
     def ManifestManager(self) -> ManifestManager:
         return self._manifest_manager
+
+    def BudgetManager(self) -> BudgetManager:
+        return self._budget_manager
 
     def WorkerManager(self) -> WorkerManager:
         return self._worker_manager

@@ -38,12 +38,18 @@ def _library_metadata() -> LibraryMetadata:
     )
 
 
-def _project_info() -> ProjectTemplateInfo:
+def _project_info(
+    project_id: str = "/workspace/projectA/griptape-nodes-project.yml",
+    *,
+    name: str = "Project A",
+    parent_project_id: str | None = None,
+    project_file_path: str | None = "/workspace/projectA/griptape-nodes-project.yml",
+) -> ProjectTemplateInfo:
     info = MagicMock(spec=ProjectTemplateInfo)
-    info.project_id = "/workspace/projectA/griptape-nodes-project.yml"
-    info.name = "Project A"
-    info.project_file_path = "/workspace/projectA/griptape-nodes-project.yml"
-    info.parent_project_id = None
+    info.project_id = project_id
+    info.name = name
+    info.project_file_path = project_file_path
+    info.parent_project_id = parent_project_id
     return info
 
 
@@ -111,6 +117,45 @@ class TestManifestManager:
         assert project.name == "Project A"
         assert project.parent_project_id is None
         assert project.path == "/workspace/projectA/griptape-nodes-project.yml"
+
+    @pytest.mark.asyncio
+    async def test_manifest_exposes_id_keyed_parent_for_a_nested_template(
+        self, manifest_manager: ManifestManager
+    ) -> None:
+        """A child's `parent_project_id` joins to a parent entry's `project_id` within the manifest.
+
+        `parent_project_id` is carried so a consumer can rebuild the project hierarchy from the
+        manifest alone -- the engine is the only party that knows it. The existing tests only
+        assert the None case, so this pins the populated one.
+        """
+        parent = _project_info("p-1", name="Parent", project_file_path="/workspace/parent/project.yml")
+        child = _project_info(
+            "c-1", name="Child", parent_project_id="p-1", project_file_path="/workspace/parent/child/project.yml"
+        )
+
+        mock_engine = cast("MagicMock", manifest_manager.engine)
+        mock_engine.engine_identity_manager.engine_id = "engine-uuid-1"
+        mock_engine.ahandle_request = AsyncMock(
+            side_effect=[
+                ListProjectTemplatesResultSuccess(
+                    successfully_loaded=[parent, child],
+                    failed_to_load=[],
+                    result_details="ok",
+                ),
+                GetEngineVersionResultSuccess(major=1, minor=2, patch=3, result_details="ok"),
+            ]
+        )
+
+        result = await manifest_manager.on_generate_manifest_request(
+            GenerateManifestRequest(include_libraries=False, include_model_catalog=False)
+        )
+
+        assert isinstance(result, GenerateManifestResultSuccess)
+        entries = {entry.project_id: entry for entry in result.manifest.project_templates}
+        assert entries["p-1"].parent_project_id is None
+        assert entries["c-1"].parent_project_id == "p-1"
+        # The join has to resolve inside the manifest, which is the whole point of the field.
+        assert entries["c-1"].parent_project_id in entries
 
     @pytest.mark.asyncio
     async def test_generate_manifest_fails_when_library_listing_fails(self, manifest_manager: ManifestManager) -> None:
