@@ -34,6 +34,24 @@ class Connections:
         self.outgoing_index = {}
         self.incoming_index = {}
 
+    def has_connection(
+        self,
+        source_node_name: str,
+        source_parameter_name: str,
+        target_node_name: str,
+        target_parameter_name: str,
+    ) -> bool:
+        """Return whether an exact connection between the named endpoints exists."""
+        return (
+            self._get_connection_by_endpoints(
+                source_node_name,
+                source_parameter_name,
+                target_node_name,
+                target_parameter_name,
+            )
+            is not None
+        )
+
     def add_connection(
         self,
         source_node: BaseNode,
@@ -49,6 +67,16 @@ class Connections:
         if ParameterMode.INPUT not in target_parameter.get_mode():
             errormsg = f"Input Connection not allowed on Parameter '{target_parameter.name}'."
             raise ValueError(errormsg)
+
+        existing_connection = self._get_connection_by_endpoints(
+            source_node.name,
+            source_parameter.name,
+            target_node.name,
+            target_parameter.name,
+        )
+        if existing_connection is not None:
+            return existing_connection
+
         # Handle multiple inputs on parameters and multiple outputs on controls
         if self.connection_allowed(source_node, source_parameter, is_source=True) and self.connection_allowed(
             target_node, target_parameter, is_source=False
@@ -75,6 +103,25 @@ class Connections:
             return connection
         msg = "Connection not allowed because of multiple connections on the same parameter input or control output parameter"
         raise ValueError(msg)
+
+    def _get_connection_by_endpoints(
+        self,
+        source_node_name: str,
+        source_parameter_name: str,
+        target_node_name: str,
+        target_parameter_name: str,
+    ) -> Connection | None:
+        connection_ids = self.outgoing_index.get(source_node_name, {}).get(source_parameter_name, [])
+        for connection_id in connection_ids:
+            connection = self.connections.get(connection_id)
+            if connection is None:
+                continue
+            if (
+                connection.target_node.name == target_node_name
+                and connection.target_parameter.name == target_parameter_name
+            ):
+                return connection
+        return None
 
     def get_existing_connection_for_restricted_scenario(
         self, node: BaseNode, parameter: Parameter, *, is_source: bool

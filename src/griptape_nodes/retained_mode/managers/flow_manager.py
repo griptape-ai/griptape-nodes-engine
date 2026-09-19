@@ -986,6 +986,18 @@ class FlowManager(EngineScoped):
 
         # Cross-flow connections are now supported via global connection storage
 
+        if self._connections.has_connection(
+            source_node_name=source_node_name,
+            source_parameter_name=request.source_parameter_name,
+            target_node_name=target_node_name,
+            target_parameter_name=request.target_parameter_name,
+        ):
+            details = (
+                f'Connection "{source_node_name}.{request.source_parameter_name}" to '
+                f'"{target_node_name}.{request.target_parameter_name}" already exists.'
+            )
+            return CreateConnectionResultSuccess(result_details=details)
+
         # Call before_connection callbacks to allow nodes to prepare parameters
         source_node.before_outgoing_connection(
             source_parameter_name=request.source_parameter_name,
