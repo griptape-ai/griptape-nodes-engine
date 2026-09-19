@@ -59,10 +59,9 @@ class GetAttributionContextResultSuccess(WorkflowNotAlteredMixin, ResultPayloadS
     project is open and `{"v": 1, "tags": {"project": [...]}}` otherwise. `project` is the only
     key the Cloud matches budgets against, and `tags` the only namespace its parser reads.
 
-    A missing `tags` reads at the far end exactly as no header at all -- both satisfy
-    `project_chain_absent` and neither emits a metric -- so the bare envelope is sent for
-    forward-compatibility, not because it currently says anything. `<system-defaults>` never
-    travels, in any padding: the Cloud reserves that string and strips before testing it.
+    A missing `tags` reads at the far end exactly as no header at all, so the bare envelope is
+    sent for forward-compatibility rather than as a signal. `<system-defaults>` never travels, in
+    any padding: the Cloud reserves that string.
 
     Args:
         header_value: The encoded header value to send
@@ -70,10 +69,9 @@ class GetAttributionContextResultSuccess(WorkflowNotAlteredMixin, ResultPayloadS
             vendored client copy.
         schema_version: The payload schema version encoded in `header_value`
         project_chain: The project ids the call is attributed to, leaf-first, each exactly as
-            stored -- unstripped, uncut, never repaired, because a repaired value arrives looking
-            intact and the Cloud reports what it had to repair itself. Populated from the same
-            pass that built `header_value`, so the two cannot disagree. Empty only when no
-            project is open; a chain that could not be read yields a Failure instead.
+            stored -- unstripped, uncut, never repaired. Populated from the same pass that built
+            `header_value`, so the two cannot disagree. Empty only when no project is open; a
+            chain that could not be read yields a Failure instead.
     """
 
     header_value: str
@@ -93,7 +91,6 @@ class GetAttributionContextResultFailure(WorkflowNotAlteredMixin, ResultPayloadF
     lone surrogates that the wire cannot carry.
 
     Sending nothing rather than `{"v": 1}` is about the engine not asserting a fact it does not
-    have; the far end reads the two identically today, so it changes nothing there. Either way
-    the spend lands in the default budget, and the loss is visible only in the engine's log --
-    see the `reduced` follow-up on the Cloud side.
+    have; the far end reads the two identically, so it changes nothing there. Either way the
+    spend lands in the default budget, and the loss is visible only in the engine's log.
     """

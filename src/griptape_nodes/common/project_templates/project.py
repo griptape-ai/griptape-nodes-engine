@@ -56,10 +56,9 @@ class ProjectTemplate(BaseModel):
             "project name plus a random suffix (e.g. `season-02-a3f9c1`), but a user may set any unique "
             "string. It is the identifier used by project events and referenced by external consumers "
             "such as policies; consumers must not parse or construct it. Absent whenever nothing "
-            "supplied one -- a hand-written file, a project predating the field, or an editor talking "
-            "to an engine older than 0.87.0, which drops it in validation -- in which case the engine "
-            "derives the id from the canonicalized project file path. Set once at creation and "
-            "immutable thereafter."
+            "supplied one -- a hand-written file, a project predating the field, or an editor whose "
+            "engine dropped it in validation -- in which case the engine derives the id from the "
+            "canonicalized project file path. Set once at creation and immutable thereafter."
         ),
     )
     description: str | None = Field(default=None, description="Description of the project")
