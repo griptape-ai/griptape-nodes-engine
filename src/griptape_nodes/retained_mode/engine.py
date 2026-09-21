@@ -248,8 +248,6 @@ class Engine:
         )
         self._artifact_manager = ArtifactManager(self._event_manager, engine=self)
         self._manifest_manager = ManifestManager(self._event_manager, engine=self)
-        # Constructed unconditionally, including on workers: register_remote_handlers raises if a
-        # forwarded request type (GetAttributionContextRequest) has no registered owner.
         self._budget_manager = BudgetManager(self._event_manager, engine=self)
 
         # Assign handlers now that these are created.
