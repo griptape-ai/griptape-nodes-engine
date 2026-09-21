@@ -130,21 +130,35 @@ class ProjectFileDestination(FileDestination):
                 f"Add the file name you want, for example 'file:///renders/output.png'."
             )
             raise ValueError(msg)
-        if local_path_from_uri is None and is_url(filename):
+        if local_path_from_uri is not None and not Path(local_path_from_uri).is_absolute():
+            # Only honored when the path the URI names is absolute on THIS host.
+            # `file:///C:/renders/out.png` yields `C:/renders/out.png`, which POSIX reads as
+            # relative, so the bypass below would hand a relative string to File.resolve()
+            # and land at `{workspace}/C:/renders/out.png` -- a directory named `C:` inside
+            # the workspace. Refuse instead of anchoring it somewhere nobody asked for.
             msg = (
-                f"Attempted to save to '{filename}'. Failed because that is a web address rather than a "
-                f"place on this computer. Enter a file name, a folder path, or a 'file://' address that "
-                f"points at a file on this machine."
+                f"Attempted to save to '{filename}'. Failed because that address does not name a location "
+                f"on this computer. A path from another operating system, such as a 'C:' drive on macOS or "
+                f"Linux, has no equivalent here."
+            )
+            raise ValueError(msg)
+        if local_path_from_uri is None and is_url(filename):
+            # Covers a remote web address, a `file://` URI on another host, and any other
+            # scheme. `parse_static_server_url` maps the engine's own
+            # `http://localhost:8124/workspace/staticfiles/...` form back to a real file on
+            # the read side, and is deliberately NOT adopted here: that URL names an asset
+            # the engine already wrote, so treating it as a save destination would
+            # overwrite one node's output from another node.
+            msg = (
+                f"Attempted to save to '{filename}'. Failed because that address points somewhere this "
+                f"computer cannot save to. Enter a file name, a folder path, or a 'file://' address "
+                f"naming a file on this machine."
             )
             raise ValueError(msg)
         if local_path_from_uri is not None:
-            # A file:// URI names an explicit on-disk location, so swap in the local path
-            # it names and take the same verbatim route an absolute filename takes at the
-            # bottom of this method. Tracked as its own flag rather than re-deriving it
-            # from `Path(...).is_absolute()`: parse_file_uri returns the Windows form of
-            # `file:///C:/renders/out.png` as `C:/renders/out.png`, which a POSIX host does
-            # not consider absolute, and falling through would put the drive letter back
-            # into sub_dirs -- the same class of mangling this branch exists to stop.
+            # A file:// URI names an explicit on-disk location, so swap in the local path it
+            # names. It is absolute by the check above, so it reaches the same verbatim
+            # bypass an absolute filename takes below.
             filename = local_path_from_uri
 
         result = GriptapeNodes.handle_request(GetSituationRequest(situation_name=situation))
@@ -166,12 +180,12 @@ class ProjectFileDestination(FileDestination):
 
         # An explicit on-disk location bypasses the situation macro: the caller is
         # declaring where the file goes, so honor it verbatim rather than treating the
-        # leading-slash directory as sub_dirs within {outputs}/etc. Two shapes qualify --
-        # an absolute filename, and a file:// URI, whose local path we substituted above.
+        # leading-slash directory as sub_dirs within {outputs}/etc. A file:// URI arrives
+        # here as the absolute path it named, so this one condition covers both shapes.
         # No sidecar metadata: the situation macro + variables won't re-resolve to the
         # actual on-disk location, so recording them would produce a dishonest
         # provenance trail.
-        if local_path_from_uri is not None or parts.directory.is_absolute():
+        if parts.directory.is_absolute():
             return cls(
                 filename,
                 existing_file_policy=existing_file_policy,

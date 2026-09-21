@@ -177,7 +177,7 @@ Typing a plain name like `render.png` lets the situation decide the destination,
 
 A web address is not a destination. A node cannot save to `https://example.com/render.png`, and typing one gives you an error rather than a file in an unexpected place.
 
-Because an absolute path skips the project system, it also skips what the project system gives you: the path is specific to your machine, so a workflow carrying one will not find that location on someone else's computer. When you want *every* node to write somewhere new, edit the situation in your project file instead.
+Because an absolute path skips the project system, it also skips what the project system gives you: the path is specific to your machine, so a workflow carrying one will not find that location on someone else's computer. A path naming a drive the machine doesn't have — a `C:` path opened on macOS or Linux — gives you an error rather than a folder called `C:` somewhere unexpected. When you want *every* node to write somewhere new, edit the situation in your project file instead.
 
 ### Finding out which situation a node uses
 
