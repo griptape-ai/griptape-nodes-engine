@@ -30,7 +30,11 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     DependencyInstallationFailedProblem,
     LibraryDependencyProblem,
 )
-from griptape_nodes.retained_mode.managers.library_manager import DependencyInstallError, LibraryManager
+from griptape_nodes.retained_mode.managers.library_manager import (
+    DependencyInstallCounts,
+    DependencyInstallError,
+    LibraryManager,
+)
 from griptape_nodes.retained_mode.managers.settings import LibraryDependencyInstallBehavior
 
 
@@ -1047,3 +1051,110 @@ class TestExecutionEnvironmentResolvesBothSets:
         reason = mgr.execution_env_failure_reason("test_lib")
         assert reason is not None
         assert "no solution found" in reason
+
+
+def _metadata_for_mock(schema: MagicMock) -> LoadLibraryMetadataFromFileResultSuccess:
+    return LoadLibraryMetadataFromFileResultSuccess(
+        library_schema=schema,
+        file_path="/mock.json",
+        git_remote=None,
+        git_ref=None,
+        enabled=True,
+        is_registered=False,
+        result_details=ResultDetails(message="OK", level=20),
+    )
+
+
+class TestWorkerModeLibraryStillGetsAnExecutionEnvironment:
+    """A manifest can declare worker mode AND execution dependencies; nothing rejects the pair.
+
+    The orchestrator skips LOADING such a library, which is not the same as skipping its execution
+    environment: the worker receives `.venv-exec` as PYTHONPATH and so cannot be the process that
+    creates it. When the orchestrator skipped the install outright, neither process built it, the
+    spawn was not refused (no failure was recorded), and the worker started with no PYTHONPATH --
+    reaching the raw ModuleNotFoundError that the refusal exists to prevent.
+    """
+
+    def _worker_mode_info(self) -> LibraryManager.LibraryInfo:
+        info = _make_lib_info()
+        info.requires_worker = True
+        return info
+
+    def _schema(self, mgr: LibraryManager) -> MagicMock:
+        schema = MagicMock()
+        schema.name = "test_lib"
+        schema.metadata.library_version = "1.0.0"
+        schema.metadata.dependencies.pip_dependencies = ["fakeedit"]
+        schema.metadata.dependencies.pip_install_flags = []
+        schema.metadata.dependencies.pip_dependencies_exec = ["faketorch"]
+        schema.metadata.declarations = []
+        mgr._is_worker = False
+        mgr._library_file_path_to_info["/mock.json"] = self._worker_mode_info()
+        return schema
+
+    def test_the_orchestrator_does_not_own_the_edit_venv_for_it(self, engine: Engine) -> None:
+        """The worker builds `<library>/.venv`, because only the worker loads the library."""
+        mgr = engine.library_manager
+        mgr._is_worker = False
+        mgr._library_file_path_to_info["/mock.json"] = self._worker_mode_info()
+
+        assert mgr._this_process_owns_the_edit_venv("/mock.json") is False
+
+    def test_the_orchestrator_still_owns_the_edit_venv_for_an_exec_deps_library(self, engine: Engine) -> None:
+        """Guards the guard: the change above must not stop the ordinary case building."""
+        mgr = engine.library_manager
+        mgr._is_worker = False
+        mgr._library_file_path_to_info["/mock.json"] = _make_lib_info()
+
+        assert mgr._this_process_owns_the_edit_venv("/mock.json") is True
+
+    @pytest.mark.asyncio
+    async def test_the_orchestrator_builds_its_execution_environment(self, engine: Engine) -> None:
+        mgr = engine.library_manager
+        schema = self._schema(mgr)
+
+        with (
+            patch.object(mgr, "load_library_metadata_from_file_request", return_value=_metadata_for_mock(schema)),
+            patch.object(mgr, "_install_dependency_set", new=AsyncMock(return_value=None)) as install,
+        ):
+            await mgr.install_library_dependencies_request(
+                InstallLibraryDependenciesRequest(library_file_path="/mock.json")
+            )
+
+        targets = [call.kwargs["execution"] for call in install.await_args_list]
+        # Exactly one install, and it is the execution one: the edit-time venv is the worker's.
+        assert targets == [True]
+
+
+class TestTheInstallMessageDescribesWhatHappened:
+    """The execution build is awaited, so the message can report an outcome rather than a plan."""
+
+    def test_a_finished_build_is_reported_as_installed(self) -> None:
+        details = LibraryManager._describe_dependency_install(
+            "test_lib",
+            DependencyInstallCounts(declared_edit=1, declared_exec=2, installed_edit=1, installed_exec=2),
+            None,
+        )
+
+        assert "Installed 1 edit-time and 2 execution dependencies" in details
+        assert "background" not in details
+
+    def test_a_failed_build_reports_the_failure(self) -> None:
+        """Without this the message fell through and promised the heavy set was still coming."""
+        details = LibraryManager._describe_dependency_install(
+            "test_lib",
+            DependencyInstallCounts(declared_edit=1, declared_exec=2, installed_edit=1, installed_exec=0),
+            "its execution dependencies could not be installed (no solution found).",
+        )
+
+        assert "could not be installed" in details
+        assert "belong to the execution environment" not in details
+
+    def test_an_environment_someone_else_builds_says_so(self) -> None:
+        details = LibraryManager._describe_dependency_install(
+            "test_lib",
+            DependencyInstallCounts(declared_edit=1, declared_exec=2, installed_edit=1, installed_exec=0),
+            None,
+        )
+
+        assert "belong to the execution environment the orchestrator builds" in details
