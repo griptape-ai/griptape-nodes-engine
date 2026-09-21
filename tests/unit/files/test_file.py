@@ -1,8 +1,11 @@
 """Unit tests for File and FileDestination."""
 
+from __future__ import annotations
+
 import base64
 from io import BytesIO
 from pathlib import Path
+from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
@@ -31,6 +34,9 @@ from griptape_nodes.retained_mode.events.project_events import (
     MacroPath,
     PathResolutionFailureReason,
 )
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.engine import Engine
 
 HANDLE_REQUEST_PATH = "griptape_nodes.files.file.GriptapeNodes.handle_request"
 AHANDLE_REQUEST_PATH = "griptape_nodes.files.file.GriptapeNodes.ahandle_request"
@@ -1286,7 +1292,7 @@ def _jpeg_bytes() -> bytes:
 
 
 @pytest.fixture
-def _registered_providers() -> None:
+def _registered_providers(engine: Engine) -> None:
     """Ensure default artifact providers are registered with the ArtifactManager.
 
     Validation goes through ``ArtifactManager.sniff_extension``, which dispatches
@@ -1295,14 +1301,13 @@ def _registered_providers() -> None:
     so we register the default providers manually here.
     """
     from griptape_nodes.retained_mode.events.artifact_events import RegisterArtifactProviderRequest
-    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
     from griptape_nodes.retained_mode.managers.artifact_providers import (
         AudioArtifactProvider,
         ImageArtifactProvider,
         VideoArtifactProvider,
     )
 
-    artifact_manager = GriptapeNodes.ArtifactManager()
+    artifact_manager = engine.artifact_manager
     for provider_class in (ImageArtifactProvider, VideoArtifactProvider, AudioArtifactProvider):
         artifact_manager.on_handle_register_artifact_provider_request(
             RegisterArtifactProviderRequest(provider_class=provider_class)

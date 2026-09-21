@@ -57,6 +57,11 @@ MODEL_CHOICES_ARGS = [
     {"name": "gemini-2.5-flash", "icon": "logos/google.svg", "args": _GEMINI_ARGS, "vision": True},
     {"name": "gemini-2.5-flash-lite", "icon": "logos/google.svg", "args": _GEMINI_ARGS, "vision": True},
     # OpenAI
+    {"name": "gpt-5.6-sol", "icon": "logos/openai.svg", "args": _OPENAI_ARGS, "vision": True},
+    {"name": "gpt-5.6-terra", "icon": "logos/openai.svg", "args": _OPENAI_ARGS, "vision": True},
+    {"name": "gpt-5.6-luna", "icon": "logos/openai.svg", "args": _OPENAI_ARGS, "vision": True},
+    {"name": "gpt-5.5", "icon": "logos/openai.svg", "args": _OPENAI_ARGS, "vision": True},
+    {"name": "gpt-5.4", "icon": "logos/openai.svg", "args": _OPENAI_ARGS, "vision": True},
     {"name": "gpt-5.2", "icon": "logos/openai.svg", "args": _OPENAI_ARGS, "vision": True},
     {"name": "gpt-5.2-chat", "icon": "logos/openai.svg", "args": _OPENAI_ARGS, "vision": False},
     {"name": "gpt-5.1", "icon": "logos/openai.svg", "args": _OPENAI_ARGS, "vision": True},

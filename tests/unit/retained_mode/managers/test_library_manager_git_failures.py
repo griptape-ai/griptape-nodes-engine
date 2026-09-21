@@ -26,7 +26,7 @@ from griptape_nodes.retained_mode.managers.library_manager import (
 from griptape_nodes.utils.git_utils import GitError, GitNotFoundError
 
 if TYPE_CHECKING:
-    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+    from griptape_nodes.retained_mode.engine import Engine
 
 LIBRARY_MANAGER_MODULE = "griptape_nodes.retained_mode.managers.library_manager"
 LIBRARY_DIR = Path("/var/lib/test_lib")
@@ -60,9 +60,9 @@ class TestCheckLibraryUpdateRequestGitFailures:
     """Test check_library_update_request when a git call fails."""
 
     @pytest.mark.asyncio
-    async def test_monorepo_check_failure_returns_failure(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_monorepo_check_failure_returns_failure(self, engine: Engine) -> None:
         """A git failure while reading the repository layout fails the check instead of escaping."""
-        library_manager = griptape_nodes.LibraryManager()
+        library_manager = engine.library_manager
 
         with (
             patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.get_library", return_value=_library()),
@@ -77,9 +77,9 @@ class TestCheckLibraryUpdateRequestGitFailures:
         assert "test_lib" in str(result.result_details)
 
     @pytest.mark.asyncio
-    async def test_local_commit_failure_returns_failure(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_local_commit_failure_returns_failure(self, engine: Engine) -> None:
         """A git failure while reading the local commit fails the check instead of escaping."""
-        library_manager = griptape_nodes.LibraryManager()
+        library_manager = engine.library_manager
 
         with (
             patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.get_library", return_value=_library()),
@@ -97,13 +97,13 @@ class TestCheckLibraryUpdateRequestGitFailures:
         assert "test_lib" in str(result.result_details)
 
     @pytest.mark.asyncio
-    async def test_monorepo_reports_no_update_without_git_details(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_monorepo_reports_no_update_without_git_details(self, engine: Engine) -> None:
         """A monorepo library still reports "no update, manage manually" when git details are unavailable.
 
         The remote and ref in that response are informational, so their absence must not turn a
         successful answer into a failure.
         """
-        library_manager = griptape_nodes.LibraryManager()
+        library_manager = engine.library_manager
 
         with (
             patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.get_library", return_value=_library()),
@@ -125,9 +125,9 @@ class TestUpdateLibraryRequestGitFailures:
     """Test update_library_request when a git call fails."""
 
     @pytest.mark.asyncio
-    async def test_monorepo_check_failure_returns_failure(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_monorepo_check_failure_returns_failure(self, engine: Engine) -> None:
         """A git failure while reading the repository layout fails the update before the working tree is touched."""
-        library_manager = griptape_nodes.LibraryManager()
+        library_manager = engine.library_manager
 
         with (
             patch.object(

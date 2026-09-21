@@ -54,6 +54,7 @@ from griptape_nodes.files.path_utils import (
 from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete, CurrentProjectChanged
+from griptape_nodes.retained_mode.events.base_events import AppEvent
 from griptape_nodes.retained_mode.events.library_events import (
     ReloadAllLibrariesRequest,
     ReloadAllLibrariesResultFailure,
@@ -478,11 +479,18 @@ class WorkspaceDecision(NamedTuple):
     activation must refuse rather than apply it, or a child would adopt a workspace its chain never
     named. Environmental chain breaks (moved/unreadable ancestor files, cycles) do NOT set this;
     those keep the long-standing warn-and-fall-back behavior.
+
+    `pin_supplied_by_config` distinguishes the two kinds of pin, for `set_workspace_override`.
+    Branch 5 reads `workspace_directory` out of the user (or default) config layer and pins that
+    value back, so the config layer is still the owner and a settings write to it decides what the
+    next activation pins. Branches 0, 1 and 4 pin a value no config layer supplies (a project
+    template's field, a `project_workspaces` mapping, an ancestor's workspace).
     """
 
     workspace_dir: Path
     apply_override: bool
     blocked_reason: str | None = None
+    pin_supplied_by_config: bool = False
 
 
 class LibrariesRootDecision(NamedTuple):
@@ -1979,6 +1987,7 @@ class ProjectManager(EngineScoped):
                 workspace_dir=decision.workspace_dir,
                 apply_override=decision.apply_override,
                 blocked_reason=lookup.incomplete_reason,
+                pin_supplied_by_config=decision.pin_supplied_by_config,
             )
         return decision
 
@@ -2047,7 +2056,9 @@ class ProjectManager(EngineScoped):
         # Canonicalize directory-discovered files the same way _load_projects_from_directory does, so
         # their paths collide with registry paths under the path-identity comparisons used downstream.
         for directory in directory_paths:
-            discovered = await find_files_recursive(directory, WORKSPACE_PROJECT_FILE)
+            discovered = await find_files_recursive(
+                directory, WORKSPACE_PROJECT_FILE, max_depth=self.engine.config_manager.discovery_max_depth
+            )
             file_paths.extend(canonicalize_for_identity(path) for path in discovered)
 
         for canonical_path in file_paths:
@@ -2640,9 +2651,10 @@ class ProjectManager(EngineScoped):
         none. A non-None value is pinned. Otherwise falls to the global configured workspace_directory
         (user config, then default config), and finally the project's own directory (branch 5b, a
         defensive path reached only when workspace_directory is unset in both layers). All of these
-        pin via apply_override=True. Shared verbatim by decide_workspace and
-        resolve_workspace_dir_for_project_id; only the source of `inherited` (registry vs. disk walk)
-        differs between the two callers.
+        pin via apply_override=True, but only branch 5's pin sets `pin_supplied_by_config`, since it
+        alone re-applies a value a config layer already supplies. Shared verbatim by decide_workspace
+        and resolve_workspace_dir_for_project_id; only the source of `inherited` (registry vs. disk
+        walk) differs between the two callers.
         """
         if inherited is not None:
             return WorkspaceDecision(Path(inherited), apply_override=True)
@@ -2659,7 +2671,8 @@ class ProjectManager(EngineScoped):
                 default=None,
             )
         if configured_root is not None:
-            return WorkspaceDecision(Path(configured_root), apply_override=True)
+            # Branch 5: the pin is the config layer's own value, read back and re-applied.
+            return WorkspaceDecision(Path(configured_root), apply_override=True, pin_supplied_by_config=True)
 
         return WorkspaceDecision(project_file_path.parent, apply_override=True)
 
@@ -3065,7 +3078,7 @@ class ProjectManager(EngineScoped):
         # project actually changed. A worker that boots like the orchestrator has the
         # same registry, so the id resolves there too.
         if self._initialization_complete and previous_project_id != resolved_project_id:
-            self._event_manager.broadcast_app_event(CurrentProjectChanged(project_id=resolved_project_id))
+            self._event_manager.put_event(AppEvent(payload=CurrentProjectChanged(project_id=resolved_project_id)))
         return result
 
     def _refuse_unresolvable_declared_paths(
@@ -3100,6 +3113,30 @@ class ProjectManager(EngineScoped):
             ),
         )
 
+    def _refuse_unactivatable_project(
+        self, resolved_project_id: ProjectID, project_info: ProjectInfo | None
+    ) -> SetCurrentProjectResultFailure | None:
+        """Refuse an activation that cannot establish a coherent project config layer.
+
+        Returns the failure to surface, or None when activation may proceed. Callers must
+        invoke this before touching any config layer so a refusal is side-effect free.
+        """
+        # An id with no loaded template has no project config layer to establish. Refuse
+        # rather than letting activation fall through to its system-defaults branch: that
+        # remerges with no project layer, and because merge_dicts replaces lists rather than
+        # merging them, whatever `libraries_to_register` the user layer holds becomes the
+        # engine's library set. The worker adoption path refuses unknown ids for the same
+        # reason.
+        if project_info is None:
+            details = (
+                f"Attempted to activate project '{resolved_project_id}'. Failed because no loaded "
+                f"project template has that id, so its configuration could not be established."
+            )
+            logger.error(details)
+            return SetCurrentProjectResultFailure(result_details=details)
+
+        return self._refuse_unresolvable_declared_paths(project_info)
+
     async def _activate_project(self, resolved_project_id: ProjectID) -> _ProjectActivationOutcome:
         """Establish a project's config/workspace/env layers and reload libraries.
 
@@ -3121,7 +3158,10 @@ class ProjectManager(EngineScoped):
 
         project_info = self._successfully_loaded_project_templates.get(resolved_project_id)
 
-        gate_failure = self._refuse_unresolvable_declared_paths(project_info)
+        # Both refusals run before clear_project_layers() below, so a refused activation
+        # leaves every config layer untouched: config is never left in the cleared, unmerged
+        # state, and the caller's rollback has nothing to repair.
+        gate_failure = self._refuse_unactivatable_project(resolved_project_id, project_info)
         if gate_failure is not None:
             return _ProjectActivationOutcome(failure=gate_failure, workspace_changed=False)
 
@@ -3140,6 +3180,8 @@ class ProjectManager(EngineScoped):
         # below remerge via load_project_config()/load_workspace_config()/load_configs().
         self._config_manager.clear_project_layers()
 
+        # `project_info is not None` is already guaranteed by the refusal above; it is
+        # restated here so the type checker can narrow the accesses that follow.
         if project_info is not None and project_info.project_file_path is not None:
             project_file_path = project_info.project_file_path
             project_dir = project_file_path.parent
@@ -3155,11 +3197,12 @@ class ProjectManager(EngineScoped):
             # Load workspace config layer from the resolved workspace directory.
             self._config_manager.load_workspace_config(self._config_manager.workspace_path)
         else:
-            # Switching to system defaults (a loaded template with no backing file) or an
-            # unknown project id (no loaded template): clear_project_layers() above already
-            # dropped the prior project's override and config-file paths, so reloading
-            # configs now resolves workspace_path and all config layers from defaults only,
-            # rather than leaving config in the cleared, unmerged state.
+            # Switching to system defaults: a loaded template with no backing file, so there
+            # is no project-adjacent config to layer on. clear_project_layers() above already
+            # dropped the prior project's override and config-file paths, so reloading configs
+            # now resolves workspace_path and all config layers from defaults and the user
+            # config, rather than leaving config in the cleared, unmerged state. Ids with no
+            # loaded template were refused before any layer was touched.
             self._config_manager.load_configs()
 
         # Apply the new project's environment variables to os.environ. Happens after
@@ -3284,7 +3327,9 @@ class ProjectManager(EngineScoped):
             libraries_root = self.decide_libraries_root(project_file_path, template_libraries_dir)
 
         if decision.apply_override:
-            self._config_manager.set_workspace_override(decision.workspace_dir)
+            self._config_manager.set_workspace_override(
+                decision.workspace_dir, supplied_by_config=decision.pin_supplied_by_config
+            )
         self._config_manager.set_libraries_root_override(libraries_root)
         return None
 
@@ -4139,7 +4184,9 @@ class ProjectManager(EngineScoped):
         required_secret_keys = self._collect_required_secret_keys()
 
         try:
-            result = package_project_to_zip(project_info, adjacent_config, destination_path, required_secret_keys)
+            result = package_project_to_zip(
+                self.engine, project_info, adjacent_config, destination_path, required_secret_keys
+            )
         except (RuntimeError, OSError) as err:
             return ExportProjectResultFailure(
                 result_details=(
@@ -4669,7 +4716,7 @@ class ProjectManager(EngineScoped):
                 conflicts.add(var_name)
         return _BuiltinResolutionResult(conflicts=conflicts, unavailable=unavailable)
 
-    def _get_builtin_variable_value(self, var_name: str, project_info: ProjectInfo) -> str:  # noqa: C901
+    def _get_builtin_variable_value(self, var_name: str, project_info: ProjectInfo) -> str:
         """Get the value of a single builtin variable.
 
         Args:
@@ -4702,37 +4749,7 @@ class ProjectManager(EngineScoped):
                 return context_manager.get_current_workflow_name()
 
             case "workflow_dir":
-                context_manager = self.engine.context_manager
-                if not context_manager.has_current_workflow():
-                    msg = "No current workflow"
-                    raise RuntimeError(msg)
-                # Prefer the path the context was entered WITH. The registry key below is
-                # derived against the workspace that was active at push time, so a project
-                # switch -- which re-registers every workflow under the new workspace -- leaves
-                # the name pointing at a key that no longer exists. The lookup then raises,
-                # `{workflow_dir?:/}` swallows it as an optional reference, and `{outputs}`
-                # silently degrades from the workflow's own folder to a workspace-relative
-                # path, so saved media resolves somewhere it was never written.
-                context_file_path = context_manager.get_current_workflow_file_path()
-                if context_file_path is not None:
-                    return str(Path(context_file_path).parent)
-                workflow_name = context_manager.get_current_workflow_name()
-                try:
-                    workflow = WorkflowRegistry.get_workflow_by_name(workflow_name)
-                except KeyError as e:
-                    # NOT the same as unsaved: the file may be on disk and saved, but keyed
-                    # under a different workspace. Say so, rather than reporting a state the
-                    # user cannot act on.
-                    msg = (
-                        f"Workflow '{workflow_name}' is not registered on this engine "
-                        f"(it may be registered under a different workspace)"
-                    )
-                    raise RuntimeError(msg) from e
-                if workflow.file_path is None:
-                    msg = f"Workflow '{workflow_name}' has not been saved yet"
-                    raise RuntimeError(msg)
-                workflow_file_path = Path(WorkflowRegistry.get_complete_file_path(workflow.file_path))
-                return str(workflow_file_path.parent)
+                return self._resolve_workflow_dir()
 
             case "static_files_dir":
                 return self._config_manager.get_config_value("static_files_directory", default="staticfiles")
@@ -4740,6 +4757,66 @@ class ProjectManager(EngineScoped):
             case _:
                 msg = f"Unknown builtin variable: {var_name}"
                 raise ValueError(msg)
+
+        # Unreachable at runtime — `case _:` above catches everything. Present so
+        # static analyzers (CodeQL) can prove the function never implicitly returns None.
+        msg = f"Unknown builtin variable: {var_name}"
+        raise ValueError(msg)
+
+    def _resolve_workflow_dir(self) -> str:
+        """Resolve the `workflow_dir` builtin: the folder the current workflow belongs to.
+
+        Three sources, in descending order of authority:
+
+        1. The file path retained on the context. The registry key is derived against the
+           workspace that was active at push time, so a project switch -- which re-registers
+           every workflow under the new workspace -- leaves the name pointing at a key that no
+           longer exists. The lookup then raises, `{workflow_dir?:/}` swallows it as an
+           optional reference, and `{outputs}` silently degrades from the workflow's own folder
+           to a workspace-relative path, so saved media resolves somewhere it was never written.
+        2. The registry entry for the context's name.
+        3. The folder the workflow was created in, for a workflow that has never been saved and
+           so has no file to answer from. Last because a saved workflow's own location always
+           beats the folder it was created in -- the two differ as soon as the user saves
+           somewhere else.
+
+        Raises:
+            RuntimeError: If no workflow is in context, or the workflow has neither a file nor
+                a folder to answer with.
+        """
+        context_manager = self.engine.context_manager
+        if not context_manager.has_current_workflow():
+            msg = "No current workflow"
+            raise RuntimeError(msg)
+
+        context_file_path = context_manager.get_current_workflow_file_path()
+        if context_file_path is not None:
+            return str(Path(context_file_path).parent)
+
+        workflow_name = context_manager.get_current_workflow_name()
+        working_directory = context_manager.get_current_workflow_working_directory()
+        try:
+            workflow = WorkflowRegistry.get_workflow_by_name(workflow_name)
+        except KeyError as e:
+            if working_directory is not None:
+                return working_directory
+            # NOT the same as unsaved: the file may be on disk and saved, but keyed
+            # under a different workspace. Say so, rather than reporting a state the
+            # user cannot act on.
+            msg = (
+                f"Workflow '{workflow_name}' is not registered on this engine "
+                f"(it may be registered under a different workspace)"
+            )
+            raise RuntimeError(msg) from e
+
+        if workflow.file_path is None:
+            if working_directory is not None:
+                return working_directory
+            msg = f"Workflow '{workflow_name}' has not been saved yet"
+            raise RuntimeError(msg)
+
+        workflow_file_path = Path(WorkflowRegistry.get_complete_file_path(workflow.file_path))
+        return str(workflow_file_path.parent)
 
     def _absolute_path_to_macro_path(self, absolute_path: Path, project_info: ProjectInfo) -> str | None:
         """Convert an absolute path to macro form using longest prefix matching.
@@ -5131,7 +5208,9 @@ class ProjectManager(EngineScoped):
         `discovery_max_depth` setting and hidden directories (e.g. .venv, .git)
         are skipped by find_files_recursive.
         """
-        discovered = await find_files_recursive(directory, WORKSPACE_PROJECT_FILE)
+        discovered = await find_files_recursive(
+            directory, WORKSPACE_PROJECT_FILE, max_depth=self.engine.config_manager.discovery_max_depth
+        )
         if not discovered:
             logger.warning(
                 "projects_to_register directory '%s' contains no '%s' files; skipping",

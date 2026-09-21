@@ -196,7 +196,9 @@ Because `workspace_dir` is the highest-priority source, this wins over any `proj
 
 ## How paths resolve
 
-All relative paths in the project system resolve against the **workspace directory**. If your workspace is `/Users/you/workspace/` and a situation macro resolves to `outputs/render_001.png`, the final absolute path is `/Users/you/workspace/outputs/render_001.png`.
+Relative file paths in your workflows resolve against the **workspace directory**. If your workspace is `/Users/you/workspace/` and a situation macro resolves to `outputs/render_001.png`, the final absolute path is `/Users/you/workspace/outputs/render_001.png`.
+
+Relative paths written in the project file resolve against the folder that holds the project YAML, which is how the `workspace_dir: ./workspace` example above finds its workspace.
 
 Libraries are the exception: they install and resolve under the workspace-relative `libraries` directory by default, but a project can relocate them (and share them across a project tree) with the [`libraries_dir`](projects.md#libraries-directory) field, independent of the workspace.
 

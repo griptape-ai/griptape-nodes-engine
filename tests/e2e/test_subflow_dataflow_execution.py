@@ -30,10 +30,11 @@ from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileResultSuccess,
 )
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from griptape_nodes.retained_mode.engine import Engine
 
 # Timeout with thread dump.
 pytestmark = pytest.mark.timeout(300, method="thread")
@@ -52,6 +53,7 @@ _EXPECTED = "value-through-data-only-subflow"
 @pytest.mark.asyncio
 async def test_isolated_subflow_runs_data_only_graph(
     tmp_path: Path,
+    engine: Engine,
     materialize_library: Callable[..., Path],
     create_node: Callable[..., str],
     connect: Callable[..., None],
@@ -60,19 +62,19 @@ async def test_isolated_subflow_runs_data_only_graph(
     library_json = materialize_library(
         tmp_path / "library", template=FIXTURE_LIBRARY_JSON_TEMPLATE, node_file=FIXTURE_NODE_FILE
     )
-    register_result = GriptapeNodes.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
+    register_result = engine.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(register_result, RegisterLibraryFromFileResultSuccess), register_result
 
-    GriptapeNodes.ContextManager().push_workflow(workflow_name="subflow_dataflow_wf")
+    engine.context_manager.push_workflow(workflow_name="subflow_dataflow_wf")
 
     # Parent flow holds the driver; the subflow is a child flow, like an imported referenced workflow.
-    parent_result = GriptapeNodes.handle_request(
+    parent_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="ParentFlow", set_as_new_context=False)
     )
     assert isinstance(parent_result, CreateFlowResultSuccess), parent_result
     parent_flow = parent_result.flow_name
 
-    subflow_result = GriptapeNodes.handle_request(
+    subflow_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=parent_flow, flow_name="SubFlow", set_as_new_context=False)
     )
     assert isinstance(subflow_result, CreateFlowResultSuccess), subflow_result
@@ -85,15 +87,15 @@ async def test_isolated_subflow_runs_data_only_graph(
     connect("Start", "value", "Pass", "value")
     connect("Pass", "value", "End", "value")
 
-    GriptapeNodes.handle_request(SetParameterValueRequest(parameter_name="value", node_name="Start", value=_EXPECTED))
+    engine.handle_request(SetParameterValueRequest(parameter_name="value", node_name="Start", value=_EXPECTED))
 
     # Driver runs the subflow the way SubflowWorkflowNode does.
     create_node("RunSubflowNode", "Driver", parent_flow, library_name=LIBRARY_NAME)
-    driver = GriptapeNodes.NodeManager().get_node_by_name("Driver")
+    driver = engine.node_manager.get_node_by_name("Driver")
     driver.metadata["subflow_name"] = subflow
     driver.metadata["end_node_name"] = "End"
 
-    run_result = await GriptapeNodes.ahandle_request(
+    run_result = await engine.ahandle_request(
         StartFlowRequest(
             flow_name=parent_flow,
             flow_node_name="Driver",
@@ -103,7 +105,7 @@ async def test_isolated_subflow_runs_data_only_graph(
     )
     assert isinstance(run_result, StartFlowResultSuccess), run_result
 
-    node_manager = GriptapeNodes.NodeManager()
+    node_manager = engine.node_manager
     end_node = node_manager.get_node_by_name("End")
     pass_node = node_manager.get_node_by_name("Pass")
     driver = node_manager.get_node_by_name("Driver")

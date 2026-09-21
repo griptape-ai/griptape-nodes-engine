@@ -39,10 +39,11 @@ from griptape_nodes.retained_mode.events.node_events import (
 )
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from griptape_nodes.retained_mode.engine import Engine
 
 # Timeout with thread dump.
 pytestmark = pytest.mark.timeout(300, method="thread")
@@ -54,26 +55,26 @@ FIXTURE_NODE_FILE = FIXTURE_LIBRARY_DIR / "subflow_echo_node.py"
 _EXPECTED_TEXT = "hello from a nested subflow"
 
 
-def _build_nested_graph(library_name: str) -> str:
+def _build_nested_graph(engine: Engine, library_name: str) -> str:
     """Build Source -> Outer[ Inner[ Leaf ] ] and return the top-level flow name."""
-    flow_result = GriptapeNodes.handle_request(
+    flow_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="NestedParentFlow", set_as_new_context=False)
     )
     assert isinstance(flow_result, CreateFlowResultSuccess), flow_result
     flow_name = flow_result.flow_name
 
-    with GriptapeNodes.ContextManager().flow(flow_name):
-        outer = GriptapeNodes.handle_request(
+    with engine.context_manager.flow(flow_name):
+        outer = engine.handle_request(
             CreateNodeRequest(node_type="SubflowGroupNode", specific_library_name=library_name, node_name="OuterGroup")
         )
         assert isinstance(outer, CreateNodeResultSuccess), outer
 
-        inner = GriptapeNodes.handle_request(
+        inner = engine.handle_request(
             CreateNodeRequest(node_type="SubflowGroupNode", specific_library_name=library_name, node_name="InnerGroup")
         )
         assert isinstance(inner, CreateNodeResultSuccess), inner
 
-        leaf = GriptapeNodes.handle_request(
+        leaf = engine.handle_request(
             CreateNodeRequest(
                 node_type="EchoNode",
                 specific_library_name=library_name,
@@ -83,24 +84,24 @@ def _build_nested_graph(library_name: str) -> str:
         )
         assert isinstance(leaf, CreateNodeResultSuccess), leaf
 
-        source = GriptapeNodes.handle_request(
+        source = engine.handle_request(
             CreateNodeRequest(node_type="EchoNode", specific_library_name=library_name, node_name="Source")
         )
         assert isinstance(source, CreateNodeResultSuccess), source
 
         # Nest the inner group (which already holds Leaf) inside the outer group.
-        nest_result = GriptapeNodes.handle_request(
+        nest_result = engine.handle_request(
             AddNodesToNodeGroupRequest(node_names=[inner.node_name], node_group_name=outer.node_name)
         )
         assert isinstance(nest_result, AddNodesToNodeGroupResultSuccess), nest_result
 
-        GriptapeNodes.handle_request(
+        engine.handle_request(
             SetParameterValueRequest(parameter_name="text", node_name=source.node_name, value=_EXPECTED_TEXT)
         )
 
         # Crossing two boundaries at once is the case that has to keep working: the engine routes
         # this through a proxy parameter on each group it passes through.
-        connect_result = GriptapeNodes.handle_request(
+        connect_result = engine.handle_request(
             CreateConnectionRequest(
                 source_node_name=source.node_name,
                 source_parameter_name="text",
@@ -113,18 +114,18 @@ def _build_nested_graph(library_name: str) -> str:
     return flow_name
 
 
-def _generate_nested_workflow_source(library_json: Path) -> str:
+def _generate_nested_workflow_source(engine: Engine, library_json: Path) -> str:
     """Build the nested graph and serialize it to standalone workflow source."""
-    GriptapeNodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+    engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
 
-    register_result = GriptapeNodes.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
+    register_result = engine.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(register_result, RegisterLibraryFromFileResultSuccess), register_result
     library_name = register_result.library_name
 
-    GriptapeNodes.ContextManager().push_workflow(workflow_name="nested_group_e2e_workflow")
-    flow_name = _build_nested_graph(library_name)
+    engine.context_manager.push_workflow(workflow_name="nested_group_e2e_workflow")
+    flow_name = _build_nested_graph(engine, library_name)
 
-    serialize_result = GriptapeNodes.handle_request(SerializeFlowToCommandsRequest(flow_name=flow_name))
+    serialize_result = engine.handle_request(SerializeFlowToCommandsRequest(flow_name=flow_name))
     assert isinstance(serialize_result, SerializeFlowToCommandsResultSuccess), serialize_result
 
     metadata = WorkflowMetadata(
@@ -134,7 +135,7 @@ def _generate_nested_workflow_source(library_json: Path) -> str:
         node_libraries_referenced=list(serialize_result.serialized_flow_commands.node_dependencies.libraries),
         workflow_shape=None,
     )
-    return GriptapeNodes.WorkflowManager()._generate_workflow_file_content(
+    return engine.workflow_manager._generate_workflow_file_content(
         serialized_flow_commands=serialize_result.serialized_flow_commands,
         workflow_metadata=metadata,
     )
@@ -232,20 +233,23 @@ if __name__ == "__main__":
 )
 def test_nested_node_groups_survive_save_and_execute(
     tmp_path: Path,
+    engine: Engine,
     engine_subprocess_env: Callable[..., dict[str, str]],
     materialize_library: Callable[..., Path],
     write_isolated_config: Callable[..., None],
 ) -> None:
     """A group nested in another group must save, reload, and pass data to its deepest node."""
     workspace = tmp_path / "workspace"
-    workspace.mkdir()
+    # The engine's ConfigManager creates the configured workspace on init, so this only has to
+    # cover the case where it has not.
+    workspace.mkdir(exist_ok=True)
     config_root = tmp_path / "xdg_config"
     library_json = materialize_library(
         tmp_path / "library", template=FIXTURE_LIBRARY_JSON_TEMPLATE, node_file=FIXTURE_NODE_FILE
     )
     write_isolated_config(config_root, workspace=workspace, library_path=library_json)
 
-    workflow_source = _generate_nested_workflow_source(library_json)
+    workflow_source = _generate_nested_workflow_source(engine, library_json)
     runnable_source = _wrap_with_runtime_assertions(workflow_source)
 
     workflow_path = tmp_path / "nested_group_workflow.py"

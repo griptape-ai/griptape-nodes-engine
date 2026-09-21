@@ -2,9 +2,9 @@
 
 The intended entry point is the bus request, not the underlying
 `scan_sequences` function. Each test dispatches via
-`GriptapeNodes.ahandle_request(...)` and asserts on the typed result payload.
+`engine.ahandle_request(...)` and asserts on the typed result payload.
 
-Filesystem listings are stubbed by patching `GriptapeNodes.handle_request` so the
+Filesystem listings are stubbed by patching `engine.handle_request` so the
 inner `ListDirectoryRequest` returns canned filenames; this leaves the real
 `OSManager.on_scan_sequences_request` handler in place to exercise the full
 async dispatch path.
@@ -37,7 +37,6 @@ from griptape_nodes.retained_mode.events.project_events import (
     GetPathForMacroRequest,
     GetPathForMacroResultSuccess,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 
 def _stub_listing(directory: str, filenames: list[str]) -> Any:
@@ -121,6 +120,7 @@ def _stub_listing_with_macro(
 
 
 async def _scan(  # noqa: PLR0913
+    engine: Engine,
     directory: str,
     pattern: str,
     *,
@@ -136,7 +136,7 @@ async def _scan(  # noqa: PLR0913
     takes.
     """
     path = f"{directory}/{pattern}" if directory else pattern
-    result = await GriptapeNodes.ahandle_request(
+    result = await engine.ahandle_request(
         ScanSequencesRequest(
             path=path,
             policy=policy,
@@ -156,12 +156,12 @@ async def _scan(  # noqa: PLR0913
 
 class TestBasicScanning:
     @pytest.mark.asyncio
-    async def test_contiguous_sequence_split(self) -> None:
+    async def test_contiguous_sequence_split(self, engine: Engine) -> None:
         """SPLIT on a contiguous sequence yields one sub-sequence."""
         directory = "/work/in"
         filenames = [f"render.{n:04d}.png" for n in [1, 2, 3, 4, 5]]
-        with patch.object(GriptapeNodes, "handle_request", side_effect=_stub_listing(directory, filenames)):
-            result = await _scan(directory, "render.####.png", policy=MissingItemPolicy.SPLIT)
+        with patch.object(engine, "handle_request", side_effect=_stub_listing(directory, filenames)):
+            result = await _scan(engine, directory, "render.####.png", policy=MissingItemPolicy.SPLIT)
         assert isinstance(result, ScanSequencesResultSuccess)
         assert result.has_entries is True
         assert result.directory_had_matching_files is True
@@ -175,14 +175,14 @@ class TestBasicScanning:
         assert [e.padded_number for e in seqs[0].entries] == ["0001", "0002", "0003", "0004", "0005"]
 
     @pytest.mark.asyncio
-    async def test_no_files_returns_empty_success(self) -> None:
+    async def test_no_files_returns_empty_success(self, engine: Engine) -> None:
         """An empty directory yields a success with no sequences and `has_entries=False`.
 
         The `directory_had_matching_files` flag is False because nothing in
         the listing matched the basename/extension shape.
         """
-        with patch.object(GriptapeNodes, "handle_request", side_effect=_stub_listing("/work/in", [])):
-            result = await _scan("/work/in", "render.####.png")
+        with patch.object(engine, "handle_request", side_effect=_stub_listing("/work/in", [])):
+            result = await _scan(engine, "/work/in", "render.####.png")
         assert isinstance(result, ScanSequencesResultSuccess)
         assert result.sequences == []
         assert result.has_entries is False
@@ -191,7 +191,7 @@ class TestBasicScanning:
         assert result.discovered_last is None
 
     @pytest.mark.asyncio
-    async def test_directory_listing_failure_surfaces_file_io_failure(self) -> None:
+    async def test_directory_listing_failure_surfaces_file_io_failure(self, engine: Engine) -> None:
         """A failed listing propagates the OS-level `FileIOFailureReason` to the caller.
 
         `scan_sequences` raises `DirectoryListingError` when the inner
@@ -201,13 +201,13 @@ class TestBasicScanning:
         folded into empty success.
         """
         # Stub always returns failure for /work/in (only /other is recognized)
-        with patch.object(GriptapeNodes, "handle_request", side_effect=_stub_listing("/other", [])):
-            result = await _scan("/work/in", "render.####.png")
+        with patch.object(engine, "handle_request", side_effect=_stub_listing("/other", [])):
+            result = await _scan(engine, "/work/in", "render.####.png")
         assert isinstance(result, ScanSequencesResultFailure)
         assert result.failure_reason is FileIOFailureReason.FILE_NOT_FOUND
 
     @pytest.mark.asyncio
-    async def test_unrelated_files_filtered_out(self) -> None:
+    async def test_unrelated_files_filtered_out(self, engine: Engine) -> None:
         """Files not matching basename/extension are ignored."""
         directory = "/work/in"
         filenames = [
@@ -217,8 +217,8 @@ class TestBasicScanning:
             "render.0001.exr",  # different extension
             "notes.txt",  # totally unrelated
         ]
-        with patch.object(GriptapeNodes, "handle_request", side_effect=_stub_listing(directory, filenames)):
-            result = await _scan(directory, "render.####.png", policy=MissingItemPolicy.SPLIT)
+        with patch.object(engine, "handle_request", side_effect=_stub_listing(directory, filenames)):
+            result = await _scan(engine, directory, "render.####.png", policy=MissingItemPolicy.SPLIT)
         assert isinstance(result, ScanSequencesResultSuccess)
         seqs = result.sequences
         assert len(seqs) == 1
@@ -230,12 +230,12 @@ class TestBasicScanning:
 
 class TestSplitPolicy:
     @pytest.mark.asyncio
-    async def test_three_runs(self) -> None:
+    async def test_three_runs(self, engine: Engine) -> None:
         """Numbers 1-2, 4, 6-7 split into three sub-sequences."""
         directory = "/work/in"
         filenames = [f"render.{n:04d}.png" for n in [1, 2, 4, 6, 7]]
-        with patch.object(GriptapeNodes, "handle_request", side_effect=_stub_listing(directory, filenames)):
-            result = await _scan(directory, "render.####.png", policy=MissingItemPolicy.SPLIT)
+        with patch.object(engine, "handle_request", side_effect=_stub_listing(directory, filenames)):
+            result = await _scan(engine, directory, "render.####.png", policy=MissingItemPolicy.SPLIT)
         assert isinstance(result, ScanSequencesResultSuccess)
         seqs = result.sequences
         assert len(seqs) == 3
@@ -244,12 +244,12 @@ class TestSplitPolicy:
         assert (seqs[2].first, seqs[2].last) == (6, 7)
 
     @pytest.mark.asyncio
-    async def test_split_records_discovered_range_on_each(self) -> None:
+    async def test_split_records_discovered_range_on_each(self, engine: Engine) -> None:
         """All sub-sequences carry the same discovered_first/discovered_last."""
         directory = "/work/in"
         filenames = [f"render.{n:04d}.png" for n in [1, 2, 4, 6, 7]]
-        with patch.object(GriptapeNodes, "handle_request", side_effect=_stub_listing(directory, filenames)):
-            result = await _scan(directory, "render.####.png", policy=MissingItemPolicy.SPLIT)
+        with patch.object(engine, "handle_request", side_effect=_stub_listing(directory, filenames)):
+            result = await _scan(engine, directory, "render.####.png", policy=MissingItemPolicy.SPLIT)
         assert isinstance(result, ScanSequencesResultSuccess)
         for s in result.sequences:
             assert s.discovered_first == 1
@@ -258,12 +258,12 @@ class TestSplitPolicy:
 
 class TestSkipPolicy:
     @pytest.mark.asyncio
-    async def test_skip_omits_gaps(self) -> None:
+    async def test_skip_omits_gaps(self, engine: Engine) -> None:
         """SKIP yields one sequence with only present numbers; gaps absent from entries."""
         directory = "/work/in"
         filenames = [f"render.{n:04d}.png" for n in [1, 2, 4, 6, 7]]
-        with patch.object(GriptapeNodes, "handle_request", side_effect=_stub_listing(directory, filenames)):
-            result = await _scan(directory, "render.####.png", policy=MissingItemPolicy.SKIP)
+        with patch.object(engine, "handle_request", side_effect=_stub_listing(directory, filenames)):
+            result = await _scan(engine, directory, "render.####.png", policy=MissingItemPolicy.SKIP)
         assert isinstance(result, ScanSequencesResultSuccess)
         seqs = result.sequences
         assert len(seqs) == 1
@@ -273,12 +273,12 @@ class TestSkipPolicy:
 
 class TestFillNearestPolicy:
     @pytest.mark.asyncio
-    async def test_fill_nearest_backward_first(self) -> None:
+    async def test_fill_nearest_backward_first(self, engine: Engine) -> None:
         """FILL_NEAREST fills gaps with the backward-first present number."""
         directory = "/work/in"
         filenames = [f"render.{n:04d}.png" for n in [1, 2, 4, 6, 7]]
-        with patch.object(GriptapeNodes, "handle_request", side_effect=_stub_listing(directory, filenames)):
-            result = await _scan(directory, "render.####.png", policy=MissingItemPolicy.FILL_NEAREST)
+        with patch.object(engine, "handle_request", side_effect=_stub_listing(directory, filenames)):
+            result = await _scan(engine, directory, "render.####.png", policy=MissingItemPolicy.FILL_NEAREST)
         assert isinstance(result, ScanSequencesResultSuccess)
         s = result.sequences[0]
         # Gap at 3 -> backward to 2
@@ -297,7 +297,7 @@ class TestFillNearestPolicy:
 
 class TestAbortPolicy:
     @pytest.mark.asyncio
-    async def test_abort_surfaces_all_gaps(self) -> None:
+    async def test_abort_surfaces_all_gaps(self, engine: Engine) -> None:
         """ABORT surfaces a ScanSequencesResultFailure listing every gap.
 
         With items 1, 2, 4, 5 on disk, the active range 1..5 has exactly one
@@ -306,14 +306,14 @@ class TestAbortPolicy:
         """
         directory = "/work/in"
         filenames = [f"render.{n:04d}.png" for n in [1, 2, 4, 5]]
-        with patch.object(GriptapeNodes, "handle_request", side_effect=_stub_listing(directory, filenames)):
-            result = await _scan(directory, "render.####.png", policy=MissingItemPolicy.ABORT)
+        with patch.object(engine, "handle_request", side_effect=_stub_listing(directory, filenames)):
+            result = await _scan(engine, directory, "render.####.png", policy=MissingItemPolicy.ABORT)
         assert isinstance(result, ScanSequencesResultFailure)
         assert result.failure_reason is SequenceScanFailureReason.ABORTED_AT_GAP
         assert result.missing_item_numbers == [3]
 
     @pytest.mark.asyncio
-    async def test_abort_surfaces_multiple_gaps(self) -> None:
+    async def test_abort_surfaces_multiple_gaps(self, engine: Engine) -> None:
         """ABORT collects every gap in one pass, sorted ascending.
 
         Items 1, 2, 5, 7 on disk; active range 1..7. The expected gaps are 3,
@@ -323,8 +323,8 @@ class TestAbortPolicy:
         """
         directory = "/work/in"
         filenames = [f"render.{n:04d}.png" for n in [1, 2, 5, 7]]
-        with patch.object(GriptapeNodes, "handle_request", side_effect=_stub_listing(directory, filenames)):
-            result = await _scan(directory, "render.####.png", policy=MissingItemPolicy.ABORT)
+        with patch.object(engine, "handle_request", side_effect=_stub_listing(directory, filenames)):
+            result = await _scan(engine, directory, "render.####.png", policy=MissingItemPolicy.ABORT)
         assert isinstance(result, ScanSequencesResultFailure)
         assert result.failure_reason is SequenceScanFailureReason.ABORTED_AT_GAP
         assert result.missing_item_numbers == [3, 4, 6]
@@ -334,7 +334,7 @@ class TestAbortPolicy:
         assert "3, 4, 6" in details
 
     @pytest.mark.asyncio
-    async def test_abort_succeeds_when_dense(self) -> None:
+    async def test_abort_succeeds_when_dense(self, engine: Engine) -> None:
         """ABORT returns one Sequence with all entries when there are no gaps.
 
         The all-gaps pre-pass runs but finds nothing, so the scanner falls
@@ -343,8 +343,8 @@ class TestAbortPolicy:
         """
         directory = "/work/in"
         filenames = [f"render.{n:04d}.png" for n in [1, 2, 3]]
-        with patch.object(GriptapeNodes, "handle_request", side_effect=_stub_listing(directory, filenames)):
-            result = await _scan(directory, "render.####.png", policy=MissingItemPolicy.ABORT)
+        with patch.object(engine, "handle_request", side_effect=_stub_listing(directory, filenames)):
+            result = await _scan(engine, directory, "render.####.png", policy=MissingItemPolicy.ABORT)
         assert isinstance(result, ScanSequencesResultSuccess)
         seqs = result.sequences
         assert len(seqs) == 1
@@ -356,7 +356,7 @@ class TestAbortPolicy:
 
 class TestNegativeNumbers:
     @pytest.mark.asyncio
-    async def test_negatives_with_different_padding_filter_out_silently(self) -> None:
+    async def test_negatives_with_different_padding_filter_out_silently(self, engine: Engine) -> None:
         """Negative numbers at a different padding width are filtered by the padding match.
 
         When `-0005.png` has 5 total chars (sign + 4 digits), fileseq groups
@@ -365,8 +365,8 @@ class TestNegativeNumbers:
         """
         directory = "/work/in"
         filenames = ["render.-0005.png", "render.0001.png", "render.0002.png"]
-        with patch.object(GriptapeNodes, "handle_request", side_effect=_stub_listing(directory, filenames)):
-            result = await _scan(directory, "render.####.png", policy=MissingItemPolicy.SPLIT)
+        with patch.object(engine, "handle_request", side_effect=_stub_listing(directory, filenames)):
+            result = await _scan(engine, directory, "render.####.png", policy=MissingItemPolicy.SPLIT)
         assert isinstance(result, ScanSequencesResultSuccess)
         seqs = result.sequences
         assert len(seqs) == 1
@@ -375,13 +375,13 @@ class TestNegativeNumbers:
         assert seqs[0].dropped_negative_number_count == 0
 
     @pytest.mark.asyncio
-    async def test_negatives_with_matching_padding_dropped_with_counter(self) -> None:
+    async def test_negatives_with_matching_padding_dropped_with_counter(self, engine: Engine) -> None:
         """When padding matches, negatives DO enter the loop and get filtered out."""
         directory = "/work/in"
         # Width-5 pattern: `-0005` and `00005` both have 5 digits in their slot.
         filenames = ["render.-0005.png", "render.00005.png", "render.00010.png"]
-        with patch.object(GriptapeNodes, "handle_request", side_effect=_stub_listing(directory, filenames)):
-            result = await _scan(directory, "render.#####.png", policy=MissingItemPolicy.SPLIT)
+        with patch.object(engine, "handle_request", side_effect=_stub_listing(directory, filenames)):
+            result = await _scan(engine, directory, "render.#####.png", policy=MissingItemPolicy.SPLIT)
         assert isinstance(result, ScanSequencesResultSuccess)
         seqs = result.sequences
         # The negative is dropped; positives 5 and 10 are in the same sequence
@@ -397,11 +397,11 @@ class TestNegativeNumbers:
 
 class TestSubsetClipping:
     @pytest.mark.asyncio
-    async def test_start_only(self) -> None:
+    async def test_start_only(self, engine: Engine) -> None:
         directory = "/work/in"
         filenames = [f"render.{n:04d}.png" for n in [1, 2, 3, 4, 5]]
-        with patch.object(GriptapeNodes, "handle_request", side_effect=_stub_listing(directory, filenames)):
-            result = await _scan(directory, "render.####.png", policy=MissingItemPolicy.SPLIT, start_number=3)
+        with patch.object(engine, "handle_request", side_effect=_stub_listing(directory, filenames)):
+            result = await _scan(engine, directory, "render.####.png", policy=MissingItemPolicy.SPLIT, start_number=3)
         assert isinstance(result, ScanSequencesResultSuccess)
         seqs = result.sequences
         assert len(seqs) == 1
@@ -410,11 +410,11 @@ class TestSubsetClipping:
         assert seqs[0].first == 3
 
     @pytest.mark.asyncio
-    async def test_end_only(self) -> None:
+    async def test_end_only(self, engine: Engine) -> None:
         directory = "/work/in"
         filenames = [f"render.{n:04d}.png" for n in [1, 2, 3, 4, 5]]
-        with patch.object(GriptapeNodes, "handle_request", side_effect=_stub_listing(directory, filenames)):
-            result = await _scan(directory, "render.####.png", policy=MissingItemPolicy.SPLIT, end_number=3)
+        with patch.object(engine, "handle_request", side_effect=_stub_listing(directory, filenames)):
+            result = await _scan(engine, directory, "render.####.png", policy=MissingItemPolicy.SPLIT, end_number=3)
         assert isinstance(result, ScanSequencesResultSuccess)
         seqs = result.sequences
         assert len(seqs) == 1
@@ -423,12 +423,12 @@ class TestSubsetClipping:
         assert seqs[0].last == 3
 
     @pytest.mark.asyncio
-    async def test_start_and_end(self) -> None:
+    async def test_start_and_end(self, engine: Engine) -> None:
         directory = "/work/in"
         filenames = [f"render.{n:04d}.png" for n in [1, 2, 3, 4, 5]]
-        with patch.object(GriptapeNodes, "handle_request", side_effect=_stub_listing(directory, filenames)):
+        with patch.object(engine, "handle_request", side_effect=_stub_listing(directory, filenames)):
             result = await _scan(
-                directory, "render.####.png", policy=MissingItemPolicy.SPLIT, start_number=2, end_number=4
+                engine, directory, "render.####.png", policy=MissingItemPolicy.SPLIT, start_number=2, end_number=4
             )
         assert isinstance(result, ScanSequencesResultSuccess)
         seqs = result.sequences
@@ -436,7 +436,7 @@ class TestSubsetClipping:
         assert [e.number for e in seqs[0].entries] == [2, 3, 4]
 
     @pytest.mark.asyncio
-    async def test_subset_outside_discovered_range_reports_discovered_range(self) -> None:
+    async def test_subset_outside_discovered_range_reports_discovered_range(self, engine: Engine) -> None:
         """Subset clip drops every present item — diagnostic flags expose the on-disk range.
 
         The directory has 1..3 on disk but the caller asked for 10..20.
@@ -446,9 +446,9 @@ class TestSubsetClipping:
         """
         directory = "/work/in"
         filenames = [f"render.{n:04d}.png" for n in [1, 2, 3]]
-        with patch.object(GriptapeNodes, "handle_request", side_effect=_stub_listing(directory, filenames)):
+        with patch.object(engine, "handle_request", side_effect=_stub_listing(directory, filenames)):
             result = await _scan(
-                directory, "render.####.png", policy=MissingItemPolicy.SPLIT, start_number=10, end_number=20
+                engine, directory, "render.####.png", policy=MissingItemPolicy.SPLIT, start_number=10, end_number=20
             )
         assert isinstance(result, ScanSequencesResultSuccess)
         assert result.sequences == []
@@ -458,14 +458,14 @@ class TestSubsetClipping:
         assert result.discovered_last == 3
 
     @pytest.mark.asyncio
-    async def test_negative_start_rejected(self) -> None:
-        result = await _scan("/work/in", "render.####.png", start_number=-1)
+    async def test_negative_start_rejected(self, engine: Engine) -> None:
+        result = await _scan(engine, "/work/in", "render.####.png", start_number=-1)
         assert isinstance(result, ScanSequencesResultFailure)
         assert result.failure_reason is SequenceScanFailureReason.INVALID_BOUNDS
 
     @pytest.mark.asyncio
-    async def test_inverted_bounds_rejected(self) -> None:
-        result = await _scan("/work/in", "render.####.png", start_number=10, end_number=5)
+    async def test_inverted_bounds_rejected(self, engine: Engine) -> None:
+        result = await _scan(engine, "/work/in", "render.####.png", start_number=10, end_number=5)
         assert isinstance(result, ScanSequencesResultFailure)
         assert result.failure_reason is SequenceScanFailureReason.INVALID_BOUNDS
 
@@ -475,19 +475,19 @@ class TestSubsetClipping:
 
 class TestPatternVariants:
     @pytest.mark.asyncio
-    async def test_printf_pattern(self) -> None:
+    async def test_printf_pattern(self, engine: Engine) -> None:
         """%04d works the same as ####."""
         directory = "/work/in"
         filenames = [f"render.{n:04d}.png" for n in [1, 2, 3]]
-        with patch.object(GriptapeNodes, "handle_request", side_effect=_stub_listing(directory, filenames)):
-            result = await _scan(directory, "render.%04d.png", policy=MissingItemPolicy.SPLIT)
+        with patch.object(engine, "handle_request", side_effect=_stub_listing(directory, filenames)):
+            result = await _scan(engine, directory, "render.%04d.png", policy=MissingItemPolicy.SPLIT)
         assert isinstance(result, ScanSequencesResultSuccess)
         seqs = result.sequences
         assert len(seqs) == 1
         assert [e.number for e in seqs[0].entries] == [1, 2, 3]
 
     @pytest.mark.asyncio
-    async def test_mismatched_padding_reports_files_present(self) -> None:
+    async def test_mismatched_padding_reports_files_present(self, engine: Engine) -> None:
         """Disk has 3-digit numbers; user declared #### (4 digits). No match — empty success.
 
         The basename/extension prefilter accepts these files (so
@@ -498,8 +498,8 @@ class TestPatternVariants:
         """
         directory = "/work/in"
         filenames = [f"render.{n:03d}.png" for n in [1, 2, 3]]
-        with patch.object(GriptapeNodes, "handle_request", side_effect=_stub_listing(directory, filenames)):
-            result = await _scan(directory, "render.####.png", policy=MissingItemPolicy.SPLIT)
+        with patch.object(engine, "handle_request", side_effect=_stub_listing(directory, filenames)):
+            result = await _scan(engine, directory, "render.####.png", policy=MissingItemPolicy.SPLIT)
         assert isinstance(result, ScanSequencesResultSuccess)
         assert result.sequences == []
         assert result.has_entries is False
@@ -508,7 +508,7 @@ class TestPatternVariants:
         assert result.discovered_last is None
 
     @pytest.mark.asyncio
-    async def test_unpadded_printf_round_trip(self) -> None:
+    async def test_unpadded_printf_round_trip(self, engine: Engine) -> None:
         """`%d` matches an unpadded directory and yields bare integer padded_numbers.
 
         fileseq treats `%d` as zfill=1 (same as a single `#`). The Sequence's
@@ -516,8 +516,8 @@ class TestPatternVariants:
         """
         directory = "/work/in"
         filenames = ["render.5.png", "render.42.png", "render.123.png"]
-        with patch.object(GriptapeNodes, "handle_request", side_effect=_stub_listing(directory, filenames)):
-            result = await _scan(directory, "render.%d.png", policy=MissingItemPolicy.SPLIT)
+        with patch.object(engine, "handle_request", side_effect=_stub_listing(directory, filenames)):
+            result = await _scan(engine, directory, "render.%d.png", policy=MissingItemPolicy.SPLIT)
         assert isinstance(result, ScanSequencesResultSuccess)
         seqs = result.sequences
         # 5, 42, 123 aren't contiguous, so SPLIT yields three sequences.
@@ -537,31 +537,31 @@ class TestPatternValidation:
     """Multi-token templates surface as INVALID_TEMPLATE failures."""
 
     @pytest.mark.asyncio
-    async def test_multi_token_dot_separator(self) -> None:
+    async def test_multi_token_dot_separator(self, engine: Engine) -> None:
         """`render.##.##.exr` — fileseq accepts this and silently misparses."""
-        result = await _scan("/work/in", "render.##.##.exr")
+        result = await _scan(engine, "/work/in", "render.##.##.exr")
         assert isinstance(result, ScanSequencesResultFailure)
         assert result.failure_reason is SequenceScanFailureReason.INVALID_TEMPLATE
         assert "2 sequence tokens" in str(result.result_details or "")
 
     @pytest.mark.asyncio
-    async def test_multi_token_underscore_separator(self) -> None:
+    async def test_multi_token_underscore_separator(self, engine: Engine) -> None:
         """`render.####_v####.exr` — two distinct hash tokens."""
-        result = await _scan("/work/in", "render.####_v####.exr")
+        result = await _scan(engine, "/work/in", "render.####_v####.exr")
         assert isinstance(result, ScanSequencesResultFailure)
         assert result.failure_reason is SequenceScanFailureReason.INVALID_TEMPLATE
         assert "2 sequence tokens" in str(result.result_details or "")
 
     @pytest.mark.asyncio
-    async def test_multi_token_mixed_syntax(self) -> None:
+    async def test_multi_token_mixed_syntax(self, engine: Engine) -> None:
         """A printf token AND a hash token in the same template."""
-        result = await _scan("/work/in", "foo_%04d_bar_####.exr")
+        result = await _scan(engine, "/work/in", "foo_%04d_bar_####.exr")
         assert isinstance(result, ScanSequencesResultFailure)
         assert result.failure_reason is SequenceScanFailureReason.INVALID_TEMPLATE
         assert "2 sequence tokens" in str(result.result_details or "")
 
     @pytest.mark.asyncio
-    async def test_zero_token_path_one_item_when_present(self) -> None:
+    async def test_zero_token_path_one_item_when_present(self, engine: Engine) -> None:
         """A token-less path becomes a one-item sequence when the file exists.
 
         The artist pasted in `photo.png` and the file is on disk → produce a
@@ -570,8 +570,8 @@ class TestPatternValidation:
         single-file path.
         """
         directory = "/work/in"
-        with patch.object(GriptapeNodes, "handle_request", side_effect=_stub_listing(directory, ["photo.png"])):
-            result = await _scan(directory, "photo.png")
+        with patch.object(engine, "handle_request", side_effect=_stub_listing(directory, ["photo.png"])):
+            result = await _scan(engine, directory, "photo.png")
         assert isinstance(result, ScanSequencesResultSuccess)
         assert result.has_entries is True
         seqs = result.sequences
@@ -585,7 +585,7 @@ class TestPatternValidation:
         assert seqs[0].entries[0].path == "/work/in/photo.png"
 
     @pytest.mark.asyncio
-    async def test_zero_token_path_empty_when_absent(self) -> None:
+    async def test_zero_token_path_empty_when_absent(self, engine: Engine) -> None:
         """A token-less path returns empty success when the file isn't on disk.
 
         The literal filename is the only way a zero-token target can match;
@@ -593,8 +593,8 @@ class TestPatternValidation:
         other miss produces.
         """
         directory = "/work/in"
-        with patch.object(GriptapeNodes, "handle_request", side_effect=_stub_listing(directory, ["other.png"])):
-            result = await _scan(directory, "photo.png")
+        with patch.object(engine, "handle_request", side_effect=_stub_listing(directory, ["other.png"])):
+            result = await _scan(engine, directory, "photo.png")
         assert isinstance(result, ScanSequencesResultSuccess)
         assert result.sequences == []
         assert result.has_entries is False
@@ -604,12 +604,12 @@ class TestPatternValidation:
         assert result.directory_had_matching_files is False
 
     @pytest.mark.asyncio
-    async def test_single_token_passes(self) -> None:
+    async def test_single_token_passes(self, engine: Engine) -> None:
         """Sanity: a normal single-token pattern survives the validator."""
         directory = "/work/in"
         filenames = [f"render.{n:04d}.png" for n in [1, 2, 3]]
-        with patch.object(GriptapeNodes, "handle_request", side_effect=_stub_listing(directory, filenames)):
-            result = await _scan(directory, "render.####.png")
+        with patch.object(engine, "handle_request", side_effect=_stub_listing(directory, filenames)):
+            result = await _scan(engine, directory, "render.####.png")
         assert isinstance(result, ScanSequencesResultSuccess)
         assert len(result.sequences) == 1
 
@@ -626,7 +626,7 @@ class TestPathRoundTrip:
     """
 
     @pytest.mark.asyncio
-    async def test_macro_path_preserves_macro_head(self) -> None:
+    async def test_macro_path_preserves_macro_head(self, engine: Engine) -> None:
         """A macro-form input round-trips with the `{inputs}` head intact.
 
         The handler resolves the macro internally for I/O but rebuilds each
@@ -646,9 +646,7 @@ class TestPathRoundTrip:
                 filenames=filenames,
             ),
         ):
-            result = await GriptapeNodes.ahandle_request(
-                ScanSequencesRequest(path=path, policy=MissingItemPolicy.SPLIT)
-            )
+            result = await engine.ahandle_request(ScanSequencesRequest(path=path, policy=MissingItemPolicy.SPLIT))
         assert isinstance(result, ScanSequencesResultSuccess)
         assert len(result.sequences) == 1
         seq = result.sequences[0]
@@ -661,7 +659,7 @@ class TestPathRoundTrip:
         ]
 
     @pytest.mark.asyncio
-    async def test_absolute_path_round_trips_unchanged(self) -> None:
+    async def test_absolute_path_round_trips_unchanged(self, engine: Engine) -> None:
         """A plain absolute path (no macros) round-trips identically.
 
         The macro-resolver dispatch is skipped entirely — `_build_scan_path_mapping`
@@ -671,8 +669,8 @@ class TestPathRoundTrip:
         """
         directory = "/work/in"
         filenames = [f"render.{n:04d}.png" for n in [1, 2]]
-        with patch.object(GriptapeNodes, "handle_request", side_effect=_stub_listing(directory, filenames)):
-            result = await _scan(directory, "render.####.png")
+        with patch.object(engine, "handle_request", side_effect=_stub_listing(directory, filenames)):
+            result = await _scan(engine, directory, "render.####.png")
         assert isinstance(result, ScanSequencesResultSuccess)
         seq = result.sequences[0]
         assert seq.directory == directory
@@ -695,7 +693,7 @@ class TestNoTokenBehavior:
     """
 
     @pytest.mark.asyncio
-    async def test_single_file_default_ignores_siblings(self) -> None:
+    async def test_single_file_default_ignores_siblings(self, engine: Engine) -> None:
         """SINGLE_FILE: `render.0002.png` returns just that one file.
 
         This is the regression pin for the bug where fileseq's parse of
@@ -706,8 +704,8 @@ class TestNoTokenBehavior:
         directory = "/work/in"
         # Five renders on disk; only the named one should come back.
         filenames = [f"render.{n:04d}.png" for n in [1, 2, 3, 4, 5]]
-        with patch.object(GriptapeNodes, "handle_request", side_effect=_stub_listing(directory, filenames)):
-            result = await _scan(directory, "render.0002.png")
+        with patch.object(engine, "handle_request", side_effect=_stub_listing(directory, filenames)):
+            result = await _scan(engine, directory, "render.0002.png")
         assert isinstance(result, ScanSequencesResultSuccess)
         assert result.has_entries is True
         seqs = result.sequences
@@ -722,7 +720,7 @@ class TestNoTokenBehavior:
         assert seqs[0].discovered_last == 1
 
     @pytest.mark.asyncio
-    async def test_explore_sequence_recovers_implicit_grouping(self) -> None:
+    async def test_explore_sequence_recovers_implicit_grouping(self, engine: Engine) -> None:
         """EXPLORE_SEQUENCE: `render.0002.png` walks the full sibling sequence.
 
         Useful when a downstream tool gave the artist one filename but they
@@ -731,8 +729,9 @@ class TestNoTokenBehavior:
         """
         directory = "/work/in"
         filenames = [f"render.{n:04d}.png" for n in [1, 2, 3, 4, 5]]
-        with patch.object(GriptapeNodes, "handle_request", side_effect=_stub_listing(directory, filenames)):
+        with patch.object(engine, "handle_request", side_effect=_stub_listing(directory, filenames)):
             result = await _scan(
+                engine,
                 directory,
                 "render.0002.png",
                 policy=MissingItemPolicy.SPLIT,
@@ -748,13 +747,14 @@ class TestNoTokenBehavior:
         assert seqs[0].discovered_last == 5
 
     @pytest.mark.asyncio
-    async def test_reject_fails_with_invalid_template(self) -> None:
+    async def test_reject_fails_with_invalid_template(self, engine: Engine) -> None:
         """REJECT: a token-less path fails fast with INVALID_TEMPLATE.
 
         For workflows that should never silently widen the artist's intent
         (e.g. an automated pipeline that requires an explicit token).
         """
         result = await _scan(
+            engine,
             "/work/in",
             "render.0002.png",
             no_token_behavior=NoTokenBehavior.REJECT,
@@ -765,11 +765,11 @@ class TestNoTokenBehavior:
         assert "no sequence token" in str(result.result_details or "")
 
     @pytest.mark.asyncio
-    async def test_single_file_with_no_digits_still_works(self) -> None:
+    async def test_single_file_with_no_digits_still_works(self, engine: Engine) -> None:
         """SINGLE_FILE on `photo.png` (no digits at all) — sanity check."""
         directory = "/work/in"
-        with patch.object(GriptapeNodes, "handle_request", side_effect=_stub_listing(directory, ["photo.png"])):
-            result = await _scan(directory, "photo.png")
+        with patch.object(engine, "handle_request", side_effect=_stub_listing(directory, ["photo.png"])):
+            result = await _scan(engine, directory, "photo.png")
         assert isinstance(result, ScanSequencesResultSuccess)
         assert result.has_entries is True
         seqs = result.sequences
@@ -777,7 +777,7 @@ class TestNoTokenBehavior:
         assert seqs[0].entries[0].path == "/work/in/photo.png"
 
     @pytest.mark.asyncio
-    async def test_single_file_macro_path_round_trip(self) -> None:
+    async def test_single_file_macro_path_round_trip(self, engine: Engine) -> None:
         """SINGLE_FILE keeps macro paths macro-shaped on the way back out.
 
         Mirrors `test_macro_path_preserves_macro_head` for the literal-file
@@ -798,9 +798,7 @@ class TestNoTokenBehavior:
                 filenames=filenames,
             ),
         ):
-            result = await GriptapeNodes.ahandle_request(
-                ScanSequencesRequest(path=path, policy=MissingItemPolicy.SPLIT)
-            )
+            result = await engine.ahandle_request(ScanSequencesRequest(path=path, policy=MissingItemPolicy.SPLIT))
         assert isinstance(result, ScanSequencesResultSuccess)
         assert len(result.sequences) == 1
         seq = result.sequences[0]

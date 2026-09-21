@@ -16,10 +16,23 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from griptape_nodes.common.node_executor import NodeExecutor
+from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import TrackedParameterOutputValues
 from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeResultSuccess
+from griptape_nodes.retained_mode.events.flow_events import (
+    OriginalNodeParameter,
+    PackagedNodeParameterMapping,
+    PackageNodesAsSerializedFlowResultSuccess,
+)
+from griptape_nodes.retained_mode.events.variable_events import ListVariablesRequest, ListVariablesResultSuccess
+from griptape_nodes.retained_mode.variable_types import FlowVariable, VariableLayerKind
+from tests.unit.exe_types.mocks import MockNode
 
 _EXPECTED_FRESH_OUTPUT_EMITS = 2
+
+# GriptapeNodes is lazy-imported inside the event emitters; patch it at the
+# source module so those imports pick up the mock at call time.
+_GN_PATCH = "griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes"
 
 
 def _make_executor() -> NodeExecutor:
@@ -101,3 +114,251 @@ class TestLocalExecuteCopyBack:
         # Two fresh keys; each __setitem__ sees old_value None != new_value.
         assert mock_emit.call_count == _EXPECTED_FRESH_OUTPUT_EMITS
         assert node.parameter_output_values == {"a": 1, "b": 2}
+
+
+def _make_template_node(name: str = "PromptNode", template: str = "{SHOT}") -> MockNode:
+    """Real node whose PROPERTY|OUTPUT parameter holds a variable template."""
+    node = MockNode(name=name)
+    node.add_parameter(
+        Parameter(
+            name="prompt",
+            default_value=template,
+            input_types=["str"],
+            output_type="str",
+            type="str",
+            allowed_modes={ParameterMode.OUTPUT, ParameterMode.PROPERTY},
+            tooltip="test",
+        )
+    )
+    node.parameter_values["prompt"] = template
+    return node
+
+
+def _make_end_mapping(
+    sanitized_name: str, node_name: str, param_name: str
+) -> PackageNodesAsSerializedFlowResultSuccess:
+    """A package result whose End-node mappings point `sanitized_name` at `node_name.param_name`.
+
+    The mappings are the real NamedTuples rather than mocks: the code under test
+    compares `original.node_name` / `.parameter_name` against live values, and a
+    MagicMock attribute would satisfy a lookup it should not.
+    """
+    end_mapping = PackagedNodeParameterMapping(
+        node_name="End_Package_MultiNode",
+        parameter_mappings={sanitized_name: OriginalNodeParameter(node_name=node_name, parameter_name=param_name)},
+    )
+    start_mapping = PackagedNodeParameterMapping(node_name="Start_Package_MultiNode", parameter_mappings={})
+    return PackageNodesAsSerializedFlowResultSuccess(
+        result_details="ok",
+        serialized_flow_commands=cast("Any", None),
+        workflow_shape=cast("Any", {}),
+        packaged_node_names=[node_name],
+        parameter_name_mappings=[start_mapping, end_mapping],
+    )
+
+
+def _gn_mock_with_variable(name: str = "SHOT") -> Any:
+    """A GN patch where `name` is a real, defined flow variable.
+
+    `should_preserve_stored_template` confirms substitution would actually rewrite
+    the stored text before declining a write, so these tests have to define a
+    variable for the template to name (or use an optional token). A bare
+    MagicMock would also let the assertions pass -- the variable lookup would
+    return a non-ListVariablesResultSuccess and fall back to trusting the regex
+    heuristic -- but then they would no longer be testing the intended path.
+    """
+    mock_gn = MagicMock()
+    mock_gn.WorkflowManager.return_value.is_variable_substitution_enabled.return_value = True
+    mock_gn.NodeManager.return_value.get_node_parent_flow_by_name.return_value = "test_flow"
+    mock_gn.FlowManager.return_value.get_connections.return_value = MagicMock(incoming_index={})
+    mock_gn.handle_request.side_effect = lambda req: (
+        ListVariablesResultSuccess(
+            variables=[FlowVariable(name=name, owning_flow_name="test_flow", type="str", value="hyperreal")],
+            layers=[VariableLayerKind.FLOW],
+            result_details="ok",
+        )
+        if isinstance(req, ListVariablesRequest)
+        else MagicMock()
+    )
+    return patch(_GN_PATCH, mock_gn)
+
+
+class TestGroupCopyBackPreservesTemplate:
+    """Group/loop copy-back must never write a resolved value into parameter_values.
+
+    parameter_values is where get_display_value_for_output reads the template
+    from, so overwriting it destroys the user's `{VAR}` text permanently -- a
+    browser refresh cannot bring it back and a save persists the substituted
+    string.
+    """
+
+    def test_last_iteration_does_not_overwrite_stored_template(self) -> None:
+        node = _make_template_node()
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        mock_engine.node_manager.get_node_by_name.return_value = node
+        package_result = _make_end_mapping("PromptNode_prompt", "PromptNode", "prompt")
+
+        with _gn_mock_with_variable():
+            executor._apply_last_iteration_to_packaged_nodes({"PromptNode_prompt": "hyperreal"}, package_result)
+
+        assert node.parameter_values["prompt"] == "{SHOT}"
+
+    def test_last_iteration_still_applies_the_output_value(self) -> None:
+        """The resolved value must still land in parameter_output_values."""
+        node = _make_template_node()
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        mock_engine.node_manager.get_node_by_name.return_value = node
+        package_result = _make_end_mapping("PromptNode_prompt", "PromptNode", "prompt")
+
+        with _gn_mock_with_variable():
+            executor._apply_last_iteration_to_packaged_nodes({"PromptNode_prompt": "hyperreal"}, package_result)
+
+        assert node.parameter_output_values["prompt"] == "hyperreal"
+
+    def test_last_iteration_still_writes_non_template_values(self) -> None:
+        """Parameters without a macro keep the existing write-through behaviour."""
+        node = _make_template_node(template="plain text")
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        mock_engine.node_manager.get_node_by_name.return_value = node
+        package_result = _make_end_mapping("PromptNode_prompt", "PromptNode", "prompt")
+
+        with _gn_mock_with_variable():
+            executor._apply_last_iteration_to_packaged_nodes({"PromptNode_prompt": "hyperreal"}, package_result)
+
+        assert node.parameter_values["prompt"] == "hyperreal"
+
+    def test_last_iteration_writes_text_that_only_looks_templated(self) -> None:
+        """`{color: red}` matches the macro regex but names no variable -- write it.
+
+        Declining here would freeze the stored value permanently: no later group
+        run would ever update it.
+        """
+        node = _make_template_node(template="body {color: red}")
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        mock_engine.node_manager.get_node_by_name.return_value = node
+        package_result = _make_end_mapping("PromptNode_prompt", "PromptNode", "prompt")
+
+        with _gn_mock_with_variable():
+            executor._apply_last_iteration_to_packaged_nodes({"PromptNode_prompt": "hyperreal"}, package_result)
+
+        assert node.parameter_values["prompt"] == "hyperreal"
+
+    def test_last_iteration_writes_when_a_format_spec_cannot_apply(self) -> None:
+        """`{SHOT:03}` with SHOT="hyperreal" is left verbatim by the resolver -- so write it.
+
+        `NumericPaddingFormat.apply` raises on a non-numeric value and
+        `resolve_macro_token` returns the token unchanged. Naming a live variable is
+        therefore not enough to call something a template: the write guard has to ask
+        the resolver, not just look the name up, or this parameter's stored value would
+        be frozen for good.
+        """
+        node = _make_template_node(template="{SHOT:03}")
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        mock_engine.node_manager.get_node_by_name.return_value = node
+        package_result = _make_end_mapping("PromptNode_prompt", "PromptNode", "prompt")
+
+        with _gn_mock_with_variable():
+            executor._apply_last_iteration_to_packaged_nodes({"PromptNode_prompt": "hyperreal"}, package_result)
+
+        assert node.parameter_values["prompt"] == "hyperreal"
+
+    def test_last_iteration_preserves_an_optional_template(self) -> None:
+        """`{SHOT?}` resolves to "" when SHOT is undefined -- still the user's template.
+
+        The write guard must not require the name to be *defined*: an optional token
+        substitutes either way, so declining to notice it would store the resolved
+        text and take the template with it.
+        """
+        node = _make_template_node(template="{SHOT?}")
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        mock_engine.node_manager.get_node_by_name.return_value = node
+        package_result = _make_end_mapping("PromptNode_prompt", "PromptNode", "prompt")
+
+        with _gn_mock_with_variable(name="SOMETHING_ELSE"):
+            executor._apply_last_iteration_to_packaged_nodes({"PromptNode_prompt": "hyperreal"}, package_result)
+
+        assert node.parameter_values["prompt"] == "{SHOT?}"
+        assert node.parameter_output_values["prompt"] == "hyperreal"
+
+    def test_apply_parameter_values_skips_the_request_for_a_template(self) -> None:
+        """The sequential-group copy-back has the same hazard via a set-value request.
+
+        The request is skipped entirely rather than sent with is_output=True: the
+        handler gates unresolve_future_nodes on the value having changed, and for an
+        output write that is only true when the key already held something different,
+        so an is_output request would drop downstream invalidation instead of keeping
+        it. The output value still reaches downstream nodes via the direct write.
+        """
+        node = _make_template_node()
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        package_result = _make_end_mapping("PromptNode_prompt", "PromptNode", "prompt")
+
+        with _gn_mock_with_variable():
+            executor._apply_parameter_values_to_node(node, {"PromptNode_prompt": "hyperreal"}, package_result)
+
+        mock_engine.node_manager.on_set_parameter_value_request.assert_not_called()
+        assert node.parameter_values["prompt"] == "{SHOT}"
+        assert node.parameter_output_values["prompt"] == "hyperreal"
+
+    def test_apply_parameter_values_still_invalidates_downstream_nodes(self) -> None:
+        """Skipping the request must not skip the invalidation the request would have done.
+
+        Without this, a group run leaves downstream nodes resolved against the
+        previous value and they never recompute.
+        """
+        node = _make_template_node()
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        package_result = _make_end_mapping("PromptNode_prompt", "PromptNode", "prompt")
+
+        with _gn_mock_with_variable():
+            executor._apply_parameter_values_to_node(node, {"PromptNode_prompt": "hyperreal"}, package_result)
+
+        unresolve = mock_engine.flow_manager.get_connections.return_value.unresolve_future_nodes
+        unresolve.assert_called_once_with(node)
+
+    def test_apply_parameter_values_invalidates_even_when_output_unchanged(self) -> None:
+        """Invalidation is unconditional, matching the request this path stands in for.
+
+        The handler gates on the *stored* value changing, and here that is the template
+        against the resolved text, so it always unresolved. Comparing the previous
+        output instead would be a new optimisation, and it is the kind that leaves a
+        node resolved against stale input when it guesses wrong.
+        """
+        node = _make_template_node()
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        package_result = _make_end_mapping("PromptNode_prompt", "PromptNode", "prompt")
+
+        with _gn_mock_with_variable():
+            # Seeded inside the patch: this assignment goes through
+            # TrackedParameterOutputValues.__setitem__, which consults the display
+            # guard and emits an event, so it needs the same mocked singletons the
+            # call under test does.
+            node.parameter_output_values["prompt"] = "hyperreal"
+            executor._apply_parameter_values_to_node(node, {"PromptNode_prompt": "hyperreal"}, package_result)
+
+        unresolve = mock_engine.flow_manager.get_connections.return_value.unresolve_future_nodes
+        unresolve.assert_called_once_with(node)
+
+    def test_apply_parameter_values_writes_non_template_values_normally(self) -> None:
+        """Without a template the request must still be sent as a stored-value write."""
+        node = _make_template_node(template="plain text")
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        package_result = _make_end_mapping("PromptNode_prompt", "PromptNode", "prompt")
+
+        with _gn_mock_with_variable():
+            executor._apply_parameter_values_to_node(node, {"PromptNode_prompt": "hyperreal"}, package_result)
+
+        request = mock_engine.node_manager.on_set_parameter_value_request.call_args.args[0]
+        assert request.is_output is False
+        assert request.parameter_name == "prompt"
+        assert request.value == "hyperreal"

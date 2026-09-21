@@ -78,10 +78,57 @@ _active_post_dispatch_hooks: ContextVar[tuple[tuple[type[RequestPayload], Any], 
     "_event_manager_active_post_dispatch_hooks", default=()
 )
 
+# Result/payload types whose broadcast is suppressed for the *current logical chain* only.
+# EventSuppressionContext writes this; should_suppress_event reads it.
+#
+# Scoped to the context rather than to the manager on purpose. Suppression exists to hide
+# engine-internal bookkeeping -- rebuilding and tearing down the short-lived flows a loop runs
+# its body in -- and the types it hides (SetParameterValueResultSuccess,
+# CreateConnectionResultSuccess, CreateNodeResultSuccess) are ones an editor also asks for on
+# its own behalf. handle_request runs on arbitrary threads and asyncio can interleave another
+# task at every await inside a suppression window, so a manager-wide refcount keyed only by type
+# would silently swallow a client's own confirmations mid-loop, leaving the editor showing state
+# the engine does not have. A ContextVar is inherited by the nested requests a suppressed handler
+# dispatches -- which is exactly the lineage meant to be hidden -- and is invisible to any task
+# or thread the engine did not spawn from inside the window.
+#
+# It fails open: work handed to a thread the engine does not control (a library-internal
+# ThreadPoolExecutor) starts from a fresh context and loses the flag, so its results are
+# broadcast as they are today. Over-broadcasting is a cosmetic event; over-suppressing desyncs
+# the editor. Frozensets are replaced, never mutated, because the value object itself is shared
+# with every context that copied it.
+_suppressed_event_types: ContextVar[frozenset[type]] = ContextVar(
+    "_event_manager_suppressed_event_types", default=frozenset()
+)
+
 # Post-dispatch hooks are deliberately unbounded -- every result gets its own task so a
 # notification hook never misses a request. This is purely a "something is wrong" signal
 # for a hook that runs slower than requests arrive.
 POST_DISPATCH_HOOK_INFLIGHT_WARNING_THRESHOLD = 100
+
+
+def _suppression_candidates(event: Any) -> list[Any]:
+    """The event itself plus anything it wraps, for matching against a suppression set.
+
+    Kept a plain function so both the wrapper and the payload naming conventions live in one
+    place: ``EventResultSuccess``/``EventResultFailure`` carry the result payload as ``result``,
+    ``ExecutionEvent`` carries it as ``payload``, and ``GriptapeNodeEvent`` /
+    ``ExecutionGriptapeNodeEvent`` nest one of those under ``wrapped_event``. Suppression sets are
+    written in terms of payload types, so missing one of these attributes means the whole set
+    silently matches nothing.
+    """
+    candidates = [event]
+    wrapped_event = getattr(event, "wrapped_event", None)
+    if wrapped_event is not None:
+        candidates.append(wrapped_event)
+
+    for candidate in list(candidates):
+        for attribute_name in ("result", "payload"):
+            payload = getattr(candidate, attribute_name, None)
+            if payload is not None:
+                candidates.append(payload)
+
+    return candidates
 
 
 def _is_async_callable(callback: Any) -> bool:
@@ -182,8 +229,6 @@ class EventManager(EngineScoped):
         self._loop_thread_id: int | None = None
         # Keep a reference to the event loop for thread-safe operations
         self._event_loop: asyncio.AbstractEventLoop | None = None
-        # Per-event reference counting for event suppression
-        self._event_suppression_counts: dict[type, int] = {}
         # Worker-to-orchestrator forwarding state. Inert until
         # configure_worker_forwarding() is called at worker startup.
         self._worker_forwarding_enabled: bool = False
@@ -248,32 +293,30 @@ class EventManager(EngineScoped):
         return self._event_loop
 
     def should_suppress_event(self, event: BaseEvent | ProgressEvent) -> bool:
-        """Check if events should be suppressed from being sent to websockets.
+        """Whether this event must not reach websocket clients.
 
-        This method checks both the wrapper event type and the payload type for wrapped events.
-        For example, if InvolvedNodesEvent is in the suppression set, an ExecutionGriptapeNodeEvent
-        that wraps an InvolvedNodesEvent will be suppressed.
+        Matches the event's own type and the payload it carries, so a suppression set can name
+        either a wrapper (``ExecutionGriptapeNodeEvent``) or the thing inside it
+        (``InvolvedNodesEvent``, ``CreateNodeResultSuccess``). The payload lives under a different
+        attribute depending on the wrapper: request results expose it as ``result``, execution
+        events as ``payload``, and both may arrive already wrapped in a ``GriptapeNodeEvent``.
+
+        Suppression is scoped to the current context; see ``_suppressed_event_types``.
         """
-        event_type = type(event)
+        suppressed_types = _suppressed_event_types.get()
+        if not suppressed_types:
+            return False
 
-        # Check wrapper type first
-        if self._event_suppression_counts.get(event_type, 0) > 0:
-            return True
-
-        # For wrapped events (like ExecutionGriptapeNodeEvent), also check the payload type
-        wrapped_event = getattr(event, "wrapped_event", None)
-        if wrapped_event is not None:
-            payload = getattr(wrapped_event, "payload", None)
-            if payload is not None:
-                payload_type = type(payload)
-                if self._event_suppression_counts.get(payload_type, 0) > 0:
-                    return True
-
-        return False
+        return any(type(candidate) in suppressed_types for candidate in _suppression_candidates(event))
 
     def clear_event_suppression(self) -> None:
-        """Clear all event suppression counts."""
-        self._event_suppression_counts.clear()
+        """Drop any suppression the current context has in effect.
+
+        A safety valve for a full state reset. Suppression cannot leak past the ``with`` block
+        that opened it (``EventSuppressionContext`` restores the previous value on exit) and is
+        invisible to other contexts, so this is a no-op in the normal case.
+        """
+        _suppressed_event_types.set(frozenset())
 
     def initialize_queue(self, queue: asyncio.Queue | None = None) -> None:
         """Set the event queue for this manager.
@@ -425,7 +468,6 @@ class EventManager(EngineScoped):
                         f"'{type(request).__name__}'. Failed because hook "
                         f"'{getattr(hook, '__name__', hook)}' raised {type(exc).__name__}: {exc}"
                     )
-                    logging.getLogger("griptape_nodes").exception(msg)
                     return GenericResultFailure(exception=exc, result_details=msg)
                 if short_circuit is not None:
                     return short_circuit
@@ -448,8 +490,8 @@ class EventManager(EngineScoped):
         operation, because the result has already been returned. Specifically:
 
         - It fires for both success and failure results, including when the handler
-          raised (in that case the payload is an equivalent `GenericResultFailure`, not
-          the identical object the client received).
+          raised (in that case the payload is the `GenericResultFailure` synthesized for
+          the client).
         - `request` and `result` must be treated as read-only. The same `request` object
           is referenced by the result event still queued for the client, so mutating it
           corrupts what the client sees.
@@ -531,31 +573,6 @@ class EventManager(EngineScoped):
                 )
                 continue
             self._schedule_post_dispatch_hook(request_type, callback, request, result, active)
-
-    def _fire_post_dispatch_hooks_for_handler_exception(self, request: RequestPayload, exception: Exception) -> None:
-        """Notify hooks that no result event will be built for this request.
-
-        Neither dispatch method catches handler exceptions -- they propagate to
-        `Engine.handle_request`, which logs and returns a synthesized failure. Without
-        this the most interesting failure mode would be invisible to hooks. The payload is
-        equivalent to the one the client receives, not the identical object, which is why
-        `add_post_dispatch_hook` says so explicitly.
-
-        The caller's `try` covers the parameter-change flush as well as the handler, so a
-        handler that returned a result and then had `_flush_tracked_parameter_changes`
-        raise also lands here. That is deliberate: the exception escapes either way, the
-        client gets a synthesized failure either way, and hooks reporting success for a
-        request the client saw fail would be worse than the coarser attribution.
-        """
-        result_details = f"Unhandled exception while processing {type(request).__name__}: {exception}"
-        # `_handle_request_core` scrubs the request on its way to building the result event,
-        # but a raising handler never gets there. Without this, hooks would be the one place
-        # an omitted field still surfaces -- and those fields are omitted precisely because
-        # they are sensitive or bulky.
-        self._scrub_omitted_request_fields(request)
-        self._fire_post_dispatch_hooks(
-            request, GenericResultFailure(exception=exception, result_details=result_details)
-        )
 
     def _scrub_omitted_request_fields(self, request: RequestPayload) -> None:
         """Null out the request fields marked `omit_from_result`, in place.
@@ -1016,15 +1033,38 @@ class EventManager(EngineScoped):
         repeated here. Without the skip every violation would log
         twice -- once from the reporter and once from this loop.
 
+        A dispatcher-synthesized failure also gets its traceback attached, because nothing else
+        logs one: a handler that authors its own failure logs whatever it wants to, and
+        attaching frames to those too would duplicate what those call sites already emit.
+
         Args:
             result: The result payload containing details to log
         """
         if isinstance(result.result_details, ResultDetails):
             logger = logging.getLogger("griptape_nodes")
+            exc_info = self._exception_for_logging(result)
             for detail in result.result_details.result_details:
                 if isinstance(detail, StrictModeViolationDetail):
                     continue
-                logger.log(detail.level, detail.message)
+                logger.log(detail.level, detail.message, exc_info=exc_info)
+                exc_info = None
+
+    @staticmethod
+    def _exception_for_logging(result: ResultPayload) -> Exception | None:
+        """The exception to attach as `exc_info`, or None to log the message alone.
+
+        Restricted to `GenericResultFailure`, which this manager synthesizes and nothing else
+        logs. A handler-authored failure carries an exception too, and several already log it.
+
+        A `ForwardedException` is constructed rather than raised, so `__traceback__` is None and
+        `exc_info` would render only "NoneType: None". Its frames survive the wire on the
+        `original_traceback` attribute instead, which nothing logs here.
+        """
+        if not isinstance(result, GenericResultFailure):
+            return None
+        if result.exception is None or result.exception.__traceback__ is None:
+            return None
+        return result.exception
 
     def _handle_request_core(
         self,
@@ -1044,8 +1084,14 @@ class EventManager(EngineScoped):
             if workflow_mgr.should_squelch_workflow_altered():
                 callback_result.altered_workflow_state = False
 
-            # Override failure log level if requested
-            if callback_result.failed() and request.failure_log_level is not None:
+            # Override failure log level if requested, except for a synthesized failure:
+            # `failure_log_level` silences failures its caller EXPECTS, so honoring it for an
+            # unhandled exception would hide a crash behind a level chosen for a routine miss.
+            if (
+                callback_result.failed()
+                and request.failure_log_level is not None
+                and not isinstance(callback_result, GenericResultFailure)
+            ):
                 self._override_result_log_level(callback_result, request.failure_log_level)
 
             # Log result details (after potential level override)
@@ -1082,6 +1128,22 @@ class EventManager(EngineScoped):
         self._fire_post_dispatch_hooks(request, callback_result)
 
         return result_event
+
+    def _result_for_handler_exception(
+        self, request: RP, exception: Exception, *, context: ResultContext
+    ) -> EventResultSuccess | EventResultFailure:
+        """Build the failure result event for a handler that raised instead of returning one.
+
+        An escaping exception leaves the response future of whoever is waiting on
+        `request_id`/`response_topic` unsettled forever. `_handle_request_core` is what addresses
+        the result to that caller, and logs it.
+        """
+        result_details = f"Unhandled exception while processing {type(request).__name__}: {exception}"
+        return self._handle_request_core(
+            request,
+            GenericResultFailure(exception=exception, result_details=result_details),
+            context=context,
+        )
 
     async def ahandle_request(
         self,
@@ -1130,8 +1192,7 @@ class EventManager(EngineScoped):
                     if type(result_payload) not in RESULT_TYPES_THAT_SKIP_FLUSH:
                         self._flush_tracked_parameter_changes()
             except Exception as exc:
-                self._fire_post_dispatch_hooks_for_handler_exception(request, exc)
-                raise
+                return self._result_for_handler_exception(request, exc, context=result_context)
 
             return self._handle_request_core(
                 request,
@@ -1187,8 +1248,7 @@ class EventManager(EngineScoped):
                     if type(result_payload) not in RESULT_TYPES_THAT_SKIP_FLUSH:
                         self._flush_tracked_parameter_changes()
             except Exception as exc:
-                self._fire_post_dispatch_hooks_for_handler_exception(request, exc)
-                raise
+                return self._result_for_handler_exception(request, exc, context=result_context)
 
             return self._handle_request_core(
                 request,
@@ -1362,7 +1422,7 @@ class EventManager(EngineScoped):
             async def _broadcast_async() -> None:
                 async with asyncio.TaskGroup() as tg:
                     for listener_callback in listener_set:
-                        tg.create_task(call_function(listener_callback, app_event))
+                        tg.create_task(self._call_app_event_listener(listener_callback, app_event))
 
             if _running_loop() is not None:
                 with ThreadRunner() as runner:
@@ -1382,7 +1442,31 @@ class EventManager(EngineScoped):
 
             async with asyncio.TaskGroup() as tg:
                 for listener_callback in listener_set:
-                    tg.create_task(call_function(listener_callback, app_event))
+                    tg.create_task(self._call_app_event_listener(listener_callback, app_event))
+
+    async def _call_app_event_listener(
+        self, listener_callback: Callable[[AP], None] | Callable[[AP], Awaitable[None]], app_event: AP
+    ) -> None:
+        """Run one app event listener, keeping its failure to itself.
+
+        Listeners are independent subsystems reacting to the same event, and they run as
+        siblings in a TaskGroup. A listener that raises would cancel every sibling that
+        had not finished yet, so one broken subsystem would silently skip the rest of the
+        app's reaction to the event. Broad by design: a listener is an arbitrary callback,
+        so there is no narrower type to catch here.
+
+        Args:
+            listener_callback: The listener to invoke.
+            app_event: The app event to pass to the listener.
+        """
+        try:
+            await call_function(listener_callback, app_event)
+        except Exception:
+            logging.getLogger("griptape_nodes").exception(
+                "App event listener '%s' failed handling '%s'. The remaining listeners still ran.",
+                getattr(listener_callback, "__qualname__", listener_callback),
+                type(app_event).__name__,
+            )
 
     def _flush_tracked_parameter_changes(self) -> None:
         obj_manager = self.engine.object_manager
@@ -1395,14 +1479,24 @@ class EventManager(EngineScoped):
 
 
 class EventSuppressionContext:
-    """Context manager to suppress events from being sent to websockets.
+    """Keep engine-internal bookkeeping off the websocket while it happens.
 
-    Use this to prevent internal operations (like deserialization/deletion of iteration flows)
-    from sending events to the GUI while still allowing the operations to complete normally.
+    Wrap work the GUI must not see -- deserializing and deleting the short-lived flows a loop
+    runs its body in -- and the listed result/payload types are not broadcast for the duration.
+    The operations themselves complete normally: suppression only skips queueing the broadcast,
+    and in-process callers still receive every result in full.
 
-    Uses per-event reference counting to track nested suppression contexts.
-    Each event type maintains its own reference count, and is only unsuppressed
-    when its count reaches zero.
+    Suppression applies to the current context and to any nested request dispatched from inside
+    the block, not to the manager as a whole -- see ``_suppressed_event_types`` for why that
+    distinction is load-bearing. Nesting composes: the previous value is restored on exit, so an
+    inner block adding a type does not unsuppress what an outer block was already hiding.
+
+    One instance may be entered more than once, whether nested in itself or reused for a later
+    block. Tokens are therefore kept on a stack rather than in a single field: with one field, a
+    second ``__enter__`` overwrites the outer block's token, and the outer ``__exit__`` has nothing
+    left to restore -- so the suppressed set stays in place for the rest of the context. Nothing
+    would report it, and it fails in the harmful direction: over-broadcasting is cosmetic, a
+    permanently dark event stream desyncs the editor.
     """
 
     events_to_suppress: set[type]
@@ -1410,11 +1504,11 @@ class EventSuppressionContext:
     def __init__(self, manager: EventManager, events_to_suppress: set[type]):
         self.manager = manager
         self.events_to_suppress = events_to_suppress
+        self._tokens: list[contextvars.Token[frozenset[type]]] = []
 
     def __enter__(self) -> None:
-        for event_type in self.events_to_suppress:
-            current_count = self.manager._event_suppression_counts.get(event_type, 0)
-            self.manager._event_suppression_counts[event_type] = current_count + 1
+        currently_suppressed = _suppressed_event_types.get()
+        self._tokens.append(_suppressed_event_types.set(currently_suppressed | frozenset(self.events_to_suppress)))
 
     def __exit__(
         self,
@@ -1422,12 +1516,10 @@ class EventSuppressionContext:
         exc_value: BaseException | None,
         exc_traceback: types.TracebackType | None,
     ) -> None:
-        for event_type in self.events_to_suppress:
-            current_count = self.manager._event_suppression_counts.get(event_type, 0)
-            if current_count <= 1:
-                self.manager._event_suppression_counts.pop(event_type, None)
-            else:
-                self.manager._event_suppression_counts[event_type] = current_count - 1
+        if not self._tokens:
+            return
+
+        _suppressed_event_types.reset(self._tokens.pop())
 
 
 class EventTranslationContext:

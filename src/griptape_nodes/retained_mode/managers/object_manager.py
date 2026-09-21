@@ -49,10 +49,14 @@ class ObjectManager(EngineScoped):
     def on_rename_object_request(self, request: RenameObjectRequest) -> ResultPayload:
         # Does the source object exist?
         if request.object_name == request.requested_name:
-            return RenameObjectResultSuccess(
+            unchanged = RenameObjectResultSuccess(
                 final_name=request.requested_name,
                 result_details=f"Object '{request.requested_name}' already has the requested name",
             )
+            # Nothing changed, so this is not an edit: it must not dirty the workflow or consume an
+            # undo slot that would replay as a no-op.
+            unchanged.altered_workflow_state = False
+            return unchanged
         source_obj = self.attempt_get_object_by_name(request.object_name)
         if source_obj is None:
             details = f"Attempted to rename object '{request.object_name}', but no object of that name could be found."

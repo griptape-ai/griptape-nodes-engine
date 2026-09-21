@@ -23,6 +23,15 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.flow_events import SerializedFlowCommands
 
 
+class WorkflowStatus(StrEnum):
+    """The status of a workflow that was attempted to be loaded."""
+
+    GOOD = "GOOD"
+    FLAWED = "FLAWED"
+    UNUSABLE = "UNUSABLE"
+    MISSING = "MISSING"
+
+
 @dataclass
 @PayloadRegistry.register
 class RunWorkflowFromScratchRequest(RequestPayload):
@@ -43,7 +52,16 @@ class RunWorkflowFromScratchRequest(RequestPayload):
 @dataclass
 @PayloadRegistry.register
 class RunWorkflowFromScratchResultSuccess(ResultPayloadSuccess):
-    """Workflow loaded and started successfully from file."""
+    """Workflow loaded and started successfully from file.
+
+    Args:
+        status: Fitness of the load. FLAWED means the graph is on the canvas with placeholders
+            standing in for nodes whose library could not be registered -- editable, but not
+            runnable until that library is available. Callers that need a whole graph (the
+            headless executor, publishing) should refuse anything but GOOD.
+    """
+
+    status: WorkflowStatus = WorkflowStatus.GOOD
 
 
 @dataclass
@@ -57,13 +75,20 @@ class RunWorkflowFromScratchResultFailure(ResultPayloadFailure):
 class RunWorkflowWithCurrentStateRequest(RequestPayload):
     """Run a workflow from file, preserving current state.
 
-    Use when: Loading workflows while keeping existing node values, updating workflow structure
-    without losing progress, iterative workflow development.
+    Use when: Loading workflows into a prepared but unpopulated workflow context,
+    loading unregistered workflows.
+
+    Fails if any flow is active on the current context. A current workflow with no
+    flow on it -- the state SetWorkflowContextRequest leaves behind -- is fine; a
+    current flow is not. Use DeleteFlowRequest, ClearAllObjectStateRequest, or similar
+    first to remove any active flow.
 
     Args:
         file_path: Path to the workflow file to load while preserving current state
 
-    Results: RunWorkflowWithCurrentStateResultSuccess | RunWorkflowWithCurrentStateResultFailure (file not found, merge error)
+    Results: RunWorkflowWithCurrentStateResultSuccess |
+        RunWorkflowWithCurrentStateResultFailure (flow already active, file not found,
+        merge error)
     """
 
     file_path: str
@@ -72,13 +97,26 @@ class RunWorkflowWithCurrentStateRequest(RequestPayload):
 @dataclass
 @PayloadRegistry.register
 class RunWorkflowWithCurrentStateResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
-    """Workflow loaded successfully while preserving current state."""
+    """Workflow loaded successfully while preserving current state.
+
+    Args:
+        status: Fitness of the load. FLAWED means the graph is on the canvas with placeholders
+            standing in for nodes whose library could not be registered -- editable, but not
+            runnable until that library is available. Callers that need a whole graph (the
+            headless executor, publishing) should refuse anything but GOOD.
+    """
+
+    status: WorkflowStatus = WorkflowStatus.GOOD
 
 
 @dataclass
 @PayloadRegistry.register
 class RunWorkflowWithCurrentStateResultFailure(ResultPayloadFailure):
-    """Workflow execution with current state failed. Common causes: file not found, state merge conflict, load error."""
+    """Workflow execution with current state failed.
+
+    Common causes: a flow is already active on the current context, file not found,
+    state merge conflict, load error.
+    """
 
 
 @dataclass
@@ -103,7 +141,16 @@ class RunWorkflowFromRegistryRequest(RequestPayload):
 @dataclass
 @PayloadRegistry.register
 class RunWorkflowFromRegistryResultSuccess(ResultPayloadSuccess):
-    """Workflow from registry started successfully."""
+    """Workflow from registry started successfully.
+
+    Args:
+        status: Fitness of the load. FLAWED means the graph is on the canvas with placeholders
+            standing in for nodes whose library could not be registered -- editable, but not
+            runnable until that library is available. Callers that need a whole graph (the
+            headless executor, publishing) should refuse anything but GOOD.
+    """
+
+    status: WorkflowStatus = WorkflowStatus.GOOD
 
 
 @dataclass
@@ -380,9 +427,13 @@ class ImportWorkflowAsReferencedSubFlowResultSuccess(WorkflowAlteredMixin, Resul
 
     Args:
         created_flow_name: Name of the created sub-flow
+        status: Fitness of the imported subflow's own load. FLAWED means placeholders stand in
+            for nodes whose library could not be registered -- editable, but not runnable.
+            Callers that import in order to RUN the subflow should refuse anything but GOOD.
     """
 
     created_flow_name: str
+    status: WorkflowStatus = WorkflowStatus.GOOD
 
 
 @dataclass
@@ -547,11 +598,14 @@ class GetPublishOptionsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucce
         fields: Ordered list of fields to render in the publish dialog
         title: Optional dialog title (e.g. "Update Published Gizmo"). None uses the frontend default.
         button_label: Optional publish button label (e.g. "Update"). None uses the frontend default.
+        loading_label: Optional label shown while publishing is in progress (e.g. "Updating"). None
+            lets the frontend derive it from button_label automatically.
     """
 
     fields: list[PublishOptionField]
     title: str | None = None
     button_label: str | None = None
+    loading_label: str | None = None
 
 
 @dataclass
@@ -657,13 +711,17 @@ class BranchWorkflowRequest(RequestPayload):
 
     Args:
         workflow_name: Name of the workflow to branch
-        branched_workflow_name: Name for the branched workflow (None for auto-generated)
+        branched_workflow_name: Registry key for the branched workflow (None for auto-generated)
+        branched_workflow_display_name: Human-readable label (``metadata.name``) for the branch.
+            None derives one from the source workflow's display name, e.g. branching
+            "Shot 010 Comp" yields "Shot 010 Comp (branch 1)". Must not be blank when provided.
 
     Results: BranchWorkflowResultSuccess (with branch name) | BranchWorkflowResultFailure (branch error)
     """
 
     workflow_name: str
     branched_workflow_name: str | None = None
+    branched_workflow_display_name: str | None = None
 
 
 @dataclass
@@ -902,15 +960,6 @@ class GetWorkflowMetadataResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuc
 @PayloadRegistry.register
 class GetWorkflowMetadataResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Workflow metadata retrieval failed. Common causes: workflow not found, registry error, file load error."""
-
-
-class WorkflowStatus(StrEnum):
-    """The status of a workflow that was attempted to be loaded."""
-
-    GOOD = "GOOD"
-    FLAWED = "FLAWED"
-    UNUSABLE = "UNUSABLE"
-    MISSING = "MISSING"
 
 
 class WorkflowDependencyStatus(StrEnum):

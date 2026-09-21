@@ -9,7 +9,7 @@ Griptape Cloud, etc.) but they all expose the same surface here.
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
-from griptape_nodes.retained_mode.events.agent_events import ThreadMetadata
+from griptape_nodes.retained_mode.events.agent_events import RunRecord, ThreadMetadata
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
 
@@ -44,14 +44,11 @@ class BaseThreadStorageDriver(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def get_thread_metadata(self, thread_id: str) -> dict:
-        """Get metadata for a thread.
+    def get_thread_metadata(self, thread_id: str) -> ThreadMetadata:
+        """Return typed metadata for one thread, including its runs list.
 
-        Args:
-            thread_id: The thread identifier.
-
-        Returns:
-            Metadata dictionary.
+        list_threads() omits runs for performance; use this when the caller
+        needs per-run provider/model info (e.g. opening a thread).
         """
         raise NotImplementedError
 
@@ -91,12 +88,30 @@ class BaseThreadStorageDriver(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def is_archived(self, thread_id: str) -> bool:
+        """Return True iff this thread is archived.
+
+        Prefer this over get_thread_metadata when only the archived flag is needed;
+        implementations may read far less data (e.g. meta.json only, skipping runs.json).
+        """
+        raise NotImplementedError
+
+    @abstractmethod
     def load_history(self, thread_id: str) -> list["ModelMessage"]:
         """Load the persisted Pydantic AI message history for a thread.
 
         Returns an empty list when the thread has no history yet (e.g. a brand
         new thread). The caller is responsible for handling missing threads
         via :meth:`thread_exists`.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def append_run_record(self, thread_id: str, record: RunRecord) -> None:
+        """Append a RunRecord for this thread.
+
+        Implementations own the serialization format; callers pass a typed
+        record and never touch the on-disk shape directly.
         """
         raise NotImplementedError
 

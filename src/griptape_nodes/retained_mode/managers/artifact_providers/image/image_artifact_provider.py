@@ -188,7 +188,7 @@ class ImageArtifactProvider(BaseArtifactProvider):
             return data
 
         try:
-            metadata = collect_workflow_metadata()
+            metadata = collect_workflow_metadata(self.engine)
         except Exception as e:
             logger.warning("Attempted to collect workflow metadata for %s. Failed because: %s", file_name, e)
             return data

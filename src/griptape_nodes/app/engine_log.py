@@ -5,7 +5,7 @@ import functools
 import hashlib
 import logging
 from datetime import UTC
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from rich.logging import RichHandler
 from rich.table import Table
@@ -42,9 +42,21 @@ class _EngineRoleFilter(logging.Filter):
 
 
 class _EngineRoleHandler(RichHandler):
-    """RichHandler that inserts a worker engine designator as its own column between log level and message."""
+    """RichHandler that inserts a worker engine designator as its own column between log level and message.
+
+    Never markup-parses a message body. Log messages carry user- and model-authored text, and
+    Rich reads a bracketed sequence such as ``[/SECTION]`` as a closing style tag -- raising
+    MarkupError out of the logging call, or silently eating the text. A line that genuinely
+    wants markup opts in per-record with ``logger.info(..., extra={"markup": True})``.
+    """
 
     _COLUMN_WIDTH = 15  # display width for "Worker-XXXXXXXX"
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        # Forced rather than defaulted: the crash this prevents came from callers who passed
+        # markup=True explicitly. RichHandler already defaults it off.
+        kwargs["markup"] = False
+        super().__init__(*args, **kwargs)
 
     def render(  # type: ignore[override]
         self,
@@ -89,8 +101,3 @@ class _EngineRoleHandler(RichHandler):
 
         output.add_row(formatted_time, level, designator, msg_cell)
         return output
-
-
-_engine_role_filter = _EngineRoleFilter()
-_rich_handler = _EngineRoleHandler(show_time=True, show_path=False, markup=True, rich_tracebacks=True)
-_rich_handler.addFilter(_engine_role_filter)

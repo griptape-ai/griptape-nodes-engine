@@ -37,10 +37,11 @@ from griptape_nodes.retained_mode.events.object_events import (
     RenameObjectResultSuccess,
 )
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from griptape_nodes.retained_mode.engine import Engine
 
 # Timeout with thread dump.
 pytestmark = pytest.mark.timeout(300, method="thread")
@@ -59,7 +60,7 @@ LIBRARY_NAME = "Subflow Group Metadata Collision Library"
 )
 @pytest.mark.asyncio
 async def test_running_first_group_does_not_execute_second_groups_member(
-    tmp_path: Path, materialize_library: Callable[..., Path]
+    tmp_path: Path, engine: Engine, materialize_library: Callable[..., Path]
 ) -> None:
     """Running the first group must execute ONLY its own member, not the second group's.
 
@@ -72,35 +73,35 @@ async def test_running_first_group_does_not_execute_second_groups_member(
     library_json = materialize_library(
         tmp_path / "library", template=FIXTURE_LIBRARY_JSON_TEMPLATE, node_file=FIXTURE_NODE_FILE, name=LIBRARY_NAME
     )
-    register_result = GriptapeNodes.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
+    register_result = engine.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(register_result, RegisterLibraryFromFileResultSuccess), register_result
 
-    GriptapeNodes.ContextManager().push_workflow(workflow_name="subflow_collision_wf")
+    engine.context_manager.push_workflow(workflow_name="subflow_collision_wf")
 
-    parent_result = GriptapeNodes.handle_request(
+    parent_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="ParentFlow", set_as_new_context=False)
     )
     assert isinstance(parent_result, CreateFlowResultSuccess), parent_result
     parent_flow = parent_result.flow_name
 
-    with GriptapeNodes.ContextManager().flow(parent_flow):
+    with engine.context_manager.flow(parent_flow):
         # ChildA has a valid input; ChildB has none, so ChildB raises if it is ever executed.
-        child_a = GriptapeNodes.handle_request(
+        child_a = engine.handle_request(
             CreateNodeRequest(node_type="EchoNode", specific_library_name=LIBRARY_NAME, node_name="ChildA")
         )
         assert isinstance(child_a, CreateNodeResultSuccess), child_a
-        child_b = GriptapeNodes.handle_request(
+        child_b = engine.handle_request(
             CreateNodeRequest(node_type="EchoNode", specific_library_name=LIBRARY_NAME, node_name="ChildB")
         )
         assert isinstance(child_b, CreateNodeResultSuccess), child_b
 
-        set_result = GriptapeNodes.handle_request(
+        set_result = engine.handle_request(
             SetParameterValueRequest(node_name="ChildA", parameter_name="text", value="hello")
         )
         assert set_result.succeeded(), set_result
 
         # --- Group A around ChildA, then rename it (frees the default group name) ---
-        group_a = GriptapeNodes.handle_request(
+        group_a = engine.handle_request(
             CreateNodeRequest(
                 node_type="SubflowGroupNode",
                 specific_library_name=LIBRARY_NAME,
@@ -109,11 +110,11 @@ async def test_running_first_group_does_not_execute_second_groups_member(
             )
         )
         assert isinstance(group_a, CreateNodeResultSuccess), group_a
-        rename_a = GriptapeNodes.handle_request(RenameObjectRequest(object_name="G", requested_name="GroupA"))
+        rename_a = engine.handle_request(RenameObjectRequest(object_name="G", requested_name="GroupA"))
         assert isinstance(rename_a, RenameObjectResultSuccess), rename_a
 
         # --- Group B reuses the freed name "G", triggering the subflow-name collision ---
-        group_b = GriptapeNodes.handle_request(
+        group_b = engine.handle_request(
             CreateNodeRequest(
                 node_type="SubflowGroupNode",
                 specific_library_name=LIBRARY_NAME,
@@ -122,11 +123,11 @@ async def test_running_first_group_does_not_execute_second_groups_member(
             )
         )
         assert isinstance(group_b, CreateNodeResultSuccess), group_b
-        rename_b = GriptapeNodes.handle_request(RenameObjectRequest(object_name="G", requested_name="GroupB"))
+        rename_b = engine.handle_request(RenameObjectRequest(object_name="G", requested_name="GroupB"))
         assert isinstance(rename_b, RenameObjectResultSuccess), rename_b
 
     # Run ONLY the first group. It must not drag the second group's member into execution.
-    run_result = await GriptapeNodes.ahandle_request(
+    run_result = await engine.ahandle_request(
         StartFlowRequest(
             flow_name=parent_flow,
             flow_node_name="GroupA",
@@ -136,7 +137,7 @@ async def test_running_first_group_does_not_execute_second_groups_member(
     )
     assert isinstance(run_result, StartFlowResultSuccess), run_result
 
-    node_manager = GriptapeNodes.NodeManager()
+    node_manager = engine.node_manager
     child_a_node = node_manager.get_node_by_name("ChildA")
     child_b_node = node_manager.get_node_by_name("ChildB")
 

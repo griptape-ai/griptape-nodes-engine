@@ -13,14 +13,17 @@ import os
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 from fastmcp.client.transports import SSETransport, StdioTransport, StreamableHttpTransport
 from pydantic_ai.mcp import MCPToolset
 from pydantic_ai.toolsets.filtered import FilteredToolset
 from pydantic_ai.toolsets.prefixed import PrefixedToolset
 
 from griptape_nodes.agents.pydantic_ai.mcp_servers import (
+    BuiltMCPServer,
     _blocklist_filter,
     _compose,
+    disconnect_transport,
     mcp_server_from_config,
     streamable_http_local,
 )
@@ -32,6 +35,13 @@ def _mcp_toolset(composed: Any) -> MCPToolset:
     while not isinstance(node, MCPToolset):
         node = node.wrapped
     return node
+
+
+def _built(name: str, config: dict[str, Any]) -> BuiltMCPServer:
+    """Build a server config, asserting it was accepted."""
+    built = mcp_server_from_config(name, config)
+    assert built is not None
+    return built
 
 
 def test_stdio_without_command_returns_none() -> None:
@@ -47,6 +57,18 @@ def test_sse_without_url_returns_none() -> None:
 def test_streamable_http_without_url_returns_none() -> None:
     """A streamable-http config missing `url` is rejected."""
     assert mcp_server_from_config("svc", {"transport": "streamable_http"}) is None
+
+
+@pytest.mark.parametrize("transport", ["sse", "streamable_http"])
+@pytest.mark.parametrize("url", ["not-a-url", "localhost:8000/mcp", "ftp://host/mcp"])
+def test_an_unusable_url_returns_none_instead_of_raising(transport: str, url: str) -> None:
+    """A typo'd URL is skipped like any other bad config.
+
+    The transport constructor raises for a URL that isn't http(s), and nothing
+    validates the field on the way in. Letting that escape would abandon a whole
+    set of servers part-way through building it, over one bad entry.
+    """
+    assert mcp_server_from_config("svc", {"transport": transport, "url": url}) is None
 
 
 def test_unsupported_transport_returns_none() -> None:
@@ -66,11 +88,10 @@ def test_stdio_maps_command_args_env_cwd() -> None:
     layered on top, so the launcher (e.g. ``uv``) keeps the toolchain variables
     it needs to resolve its target command.
     """
-    composed = mcp_server_from_config(
+    transport = _built(
         "svc",
         {"transport": "stdio", "command": "uvx", "args": ["server"], "env": {"K": "V"}, "cwd": "/srv/app"},
-    )
-    transport = _mcp_toolset(composed).client.transport
+    ).transport
     assert isinstance(transport, StdioTransport)
     assert transport.command == "uvx"
     assert transport.args == ["server"]
@@ -86,32 +107,28 @@ def test_stdio_inherits_parent_env_when_config_env_empty() -> None:
     toolchain variables a launcher like ``uv`` needs, so stdio servers failed to
     spawn while HTTP servers (no subprocess) worked.
     """
-    composed = mcp_server_from_config("svc", {"transport": "stdio", "command": "uv", "env": {}})
-    transport = _mcp_toolset(composed).client.transport
+    transport = _built("svc", {"transport": "stdio", "command": "uv", "env": {}}).transport
     assert isinstance(transport, StdioTransport)
     assert transport.env == dict(os.environ)
 
 
 def test_sse_maps_url_and_headers() -> None:
     """An sse config builds an SSETransport at the configured URL."""
-    composed = mcp_server_from_config("svc", {"transport": "sse", "url": "http://h/sse", "headers": {"A": "1"}})
-    transport = _mcp_toolset(composed).client.transport
+    transport = _built("svc", {"transport": "sse", "url": "http://h/sse", "headers": {"A": "1"}}).transport
     assert isinstance(transport, SSETransport)
     assert str(transport.url) == "http://h/sse"
 
 
 def test_streamable_http_maps_url() -> None:
     """A streamable-http config builds a StreamableHttpTransport at the configured URL."""
-    composed = mcp_server_from_config("svc", {"transport": "streamable_http", "url": "http://h/mcp/"})
-    transport = _mcp_toolset(composed).client.transport
+    transport = _built("svc", {"transport": "streamable_http", "url": "http://h/mcp/"}).transport
     assert isinstance(transport, StreamableHttpTransport)
     assert str(transport.url) == "http://h/mcp/"
 
 
 def test_default_transport_is_stdio() -> None:
     """A config with no `transport` key defaults to stdio."""
-    composed = mcp_server_from_config("svc", {"command": "run"})
-    assert isinstance(_mcp_toolset(composed).client.transport, StdioTransport)
+    assert isinstance(_built("svc", {"command": "run"}).transport, StdioTransport)
 
 
 def test_compose_applies_name_prefix() -> None:
@@ -165,3 +182,34 @@ def test_blocklist_filter_drops_only_listed_bare_names() -> None:
     keep = _blocklist_filter(frozenset({"EventRequestBatch"}))
     assert keep(None, SimpleNamespace(name="CreateNodeRequest")) is True  # type: ignore[arg-type]
     assert keep(None, SimpleNamespace(name="EventRequestBatch")) is False  # type: ignore[arg-type]
+
+
+def test_returned_transport_is_the_one_the_toolset_speaks_over() -> None:
+    """The transport travels beside the toolset so callers needn't walk internals.
+
+    `MCPToolsetCache` disconnects a server through the returned transport, so it
+    has to be the same object the toolset is talking to - not a copy built from
+    the same config.
+    """
+    built = _built("svc", {"transport": "stdio", "command": "run"})
+    assert built.transport is _mcp_toolset(built.toolset).client.transport
+
+
+@pytest.mark.asyncio
+async def test_disconnect_transport_is_a_noop_for_http() -> None:
+    """HTTP transports hold no subprocess and expose no `disconnect`."""
+    built = _built("svc", {"transport": "streamable_http", "url": "http://h/mcp/"})
+
+    await disconnect_transport("svc", built.transport)
+
+
+@pytest.mark.asyncio
+async def test_disconnect_transport_survives_a_failing_teardown() -> None:
+    """A server that won't shut down cleanly is a warning, not a raised error."""
+
+    class Stubborn(StdioTransport):
+        async def disconnect(self) -> None:
+            msg = "will not go quietly"
+            raise RuntimeError(msg)
+
+    await disconnect_transport("svc", Stubborn(command="run", args=[]))

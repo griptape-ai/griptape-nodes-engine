@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -21,7 +21,9 @@ from griptape_nodes.exe_types.workflow_node import (
 )
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowRegistry, WorkflowShape
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.engine import Engine
 
 CONTROL_TYPE = "parametercontroltype"
 
@@ -53,20 +55,20 @@ def _metadata(shape: WorkflowShape | None) -> WorkflowMetadata:
     )
 
 
-def _build_live_subflow() -> str:
+def _build_live_subflow(engine: Engine) -> str:
     """Create a flow standing in for an imported workflow, and return its name.
 
     Mirrors what an import produces for the shape used by `TestResolveLiveRoutes`: a parameterless
     Start Flow node, a Start Flow node exposing `text`, and an End Flow node exposing `result`, all
     renamed because their original names were already taken on the canvas.
     """
-    GriptapeNodes.ContextManager().push_workflow(workflow_name="workflow_node_live_routes")
-    flow_result = GriptapeNodes.handle_request(
+    engine.context_manager.push_workflow(workflow_name="workflow_node_live_routes")
+    flow_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="Subflow", set_as_new_context=False)
     )
     assert isinstance(flow_result, CreateFlowResultSuccess), flow_result
 
-    flow = GriptapeNodes.FlowManager().get_flow_by_name(flow_result.flow_name)
+    flow = engine.flow_manager.get_flow_by_name(flow_result.flow_name)
     flow.add_node(StartNode(name="Start Flow_1"))
 
     start_with_text = StartNode(name="Start Flow_2")
@@ -249,7 +251,7 @@ class TestPairShapeNodes:
 class TestResolveLiveRoutes:
     """Routes are re-pointed at the imported copy of the workflow before every run."""
 
-    def test_parameterless_start_node_is_counted_and_skipped(self) -> None:
+    def test_parameterless_start_node_is_counted_and_skipped(self, engine: Engine) -> None:
         """A Start Flow node carrying only control flow contributes no route but still holds a slot.
 
         Pairing is positional, so the parameterless node has to be counted on the declared side or
@@ -268,7 +270,7 @@ class TestResolveLiveRoutes:
             workflow_metadata=_metadata(shape),
         )
         node = node_class(name="Shout It")
-        subflow_name = _build_live_subflow()
+        subflow_name = _build_live_subflow(engine)
 
         live_routes = node._resolve_live_routes(subflow_name)
 

@@ -24,6 +24,7 @@ All Parameter attributes:
 - **serializable**: bool (default True) - set False for non-serializable values (drivers, file handles, etc.)
 - **user_defined**: bool (default False)
 - **private**: bool (default False) - hide from general user editing (library/internal use)
+- **exclude_from_metadata**: bool (default False) - exclude this parameter's value from plaintext metadata outputs (sidecar JSON and embedded PNG text chunks). The parameter name is still recorded in `parameters_omitted` so the omission is auditable. Use this for parameters that hold sensitive values such as passwords or user-supplied credentials.
 - **parent_container_name**: str|None — assigns this parameter as a child of a `ParameterContainer` (i.e. a `ParameterList` or `ParameterDictionary`). Used for list-like ownership.
 - **parent_element_name**: str|None — nests this parameter under a `ParameterGroup` (a UI grouping element). Used for visual grouping in the node UI.
 

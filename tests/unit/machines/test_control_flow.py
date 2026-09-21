@@ -25,7 +25,7 @@ from griptape_nodes.machines.dag_builder import DagBuilder, DagNodeCategories
 from griptape_nodes.retained_mode.managers.flow_manager import DagExecutionType, QueueItem
 
 if TYPE_CHECKING:
-    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+    from griptape_nodes.retained_mode.engine import Engine
 
 
 def _engine_with_connections(connections: MagicMock) -> MagicMock:
@@ -52,8 +52,8 @@ def _mock_node(name: str) -> MagicMock:
 class TestDrainGlobalFlowQueue:
     """Tests for ControlFlowMachine._drain_global_flow_queue."""
 
-    def test_buckets_items_by_type_and_empties_queue(self, griptape_nodes: GriptapeNodes) -> None:
-        flow_manager = griptape_nodes.FlowManager()
+    def test_buckets_items_by_type_and_empties_queue(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
         flow_manager.global_flow_queue.queue.clear()
 
         start = _mock_node("start")
@@ -71,8 +71,8 @@ class TestDrainGlobalFlowQueue:
         # The queue must be fully drained.
         assert flow_manager.global_flow_queue.empty()
 
-    def test_empty_queue_yields_empty_categories(self, griptape_nodes: GriptapeNodes) -> None:
-        flow_manager = griptape_nodes.FlowManager()
+    def test_empty_queue_yields_empty_categories(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
         flow_manager.global_flow_queue.queue.clear()
 
         categories = ControlFlowMachine._drain_global_flow_queue(flow_manager)
@@ -180,7 +180,7 @@ class TestProcessNodesForDagIsolatedScope:
     """
 
     @pytest.mark.asyncio
-    async def test_isolated_scope_keeps_group_children(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_isolated_scope_keeps_group_children(self, engine: Engine) -> None:
         machine = ControlFlowMachine("grp_subflow", is_isolated=True)
         # Swap the fresh DagBuilder for a stub: add_node_with_dependencies becomes a no-op, and the
         # is_isolated check (dag_builder is not the global one) still holds for a MagicMock.
@@ -194,7 +194,7 @@ class TestProcessNodesForDagIsolatedScope:
         subflow = MagicMock()
         subflow.nodes = {"child_a": child_a, "child_b": child_b}
 
-        flow_manager = griptape_nodes.FlowManager()
+        flow_manager = engine.flow_manager
         captured: dict[str, list[BaseNode]] = {}
 
         def fake_classify(nodes: list[BaseNode]) -> DagNodeCategories:

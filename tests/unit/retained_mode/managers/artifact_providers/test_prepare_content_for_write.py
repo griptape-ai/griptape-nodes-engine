@@ -5,8 +5,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.artifact_events import RegisterArtifactProviderRequest
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.artifact_providers.image.image_artifact_provider import (
     ImageArtifactProvider,
 )
@@ -70,27 +70,27 @@ class TestImageArtifactProviderPrepareContentForWrite:
 class TestArtifactManagerPrepareContentForWrite:
     """Tests for ArtifactManager.prepare_content_for_write."""
 
-    def test_returns_data_unchanged_for_unknown_extension(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_returns_data_unchanged_for_unknown_extension(self, engine: Engine) -> None:
         """Test that data is returned unchanged when no provider handles the extension."""
-        artifact_manager = griptape_nodes.ArtifactManager()
+        artifact_manager = engine.artifact_manager
         data = b"some binary data"
 
         result = artifact_manager.prepare_content_for_write(data, "archive.xyz_unknown")
 
         assert result is data
 
-    def test_returns_data_unchanged_for_empty_extension(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_returns_data_unchanged_for_empty_extension(self, engine: Engine) -> None:
         """Test that data is returned unchanged when filename has no extension."""
-        artifact_manager = griptape_nodes.ArtifactManager()
+        artifact_manager = engine.artifact_manager
         data = b"some binary data"
 
         result = artifact_manager.prepare_content_for_write(data, "no_extension_file")
 
         assert result is data
 
-    def test_dispatches_to_provider_for_known_extension(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_dispatches_to_provider_for_known_extension(self, engine: Engine) -> None:
         """Test that prepare_content_for_write dispatches to the image provider for .png files."""
-        artifact_manager = griptape_nodes.ArtifactManager()
+        artifact_manager = engine.artifact_manager
         artifact_manager.on_handle_register_artifact_provider_request(
             RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider)
         )

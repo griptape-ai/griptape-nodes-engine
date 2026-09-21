@@ -102,12 +102,7 @@ class ResolveNodeState(State):
 
         # Mark all current nodes unresolved and broadcast events
         for current_node in context.current_nodes:
-            if not current_node.lock:
-                current_node.make_node_unresolved(
-                    current_states_to_trigger_change_event=set(
-                        {NodeResolutionState.UNRESOLVED, NodeResolutionState.RESOLVED, NodeResolutionState.RESOLVING}
-                    )
-                )
+            current_node.prepare_to_run_again()
             # Now broadcast that we have a current control node.
             context.engine.event_manager.put_event(
                 ExecutionGriptapeNodeEvent(
