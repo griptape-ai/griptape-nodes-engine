@@ -1,5 +1,8 @@
 """Tests for inter-library dependency resolution (GH#4740)."""
 
+import sys
+import sysconfig
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1158,3 +1161,61 @@ class TestTheInstallMessageDescribesWhatHappened:
         )
 
         assert "belong to the execution environment the orchestrator builds" in details
+
+
+class TestTheExecutionEnvironmentKeepsPrecedenceInAWorker:
+    """`.venv-exec` arrives as PYTHONPATH, which any later `sys.path.insert(0, ...)` overtakes.
+
+    It is the environment resolved over BOTH dependency sets, so for a package in both it holds the
+    only version one resolver agreed on -- the edit-time install resolved `pip_dependencies` alone,
+    and adding a heavy pin is exactly what makes the combined resolver choose differently. Splicing
+    the edit-time directory in front of it would run `process()` against the version the execution
+    resolver rejected.
+    """
+
+    def _library_with_both_venvs(self, mgr: LibraryManager, tmp_path: Path) -> str:
+        """Build `.venv` and `.venv-exec` on disk for a library, and return the exec site-packages."""
+        library_json = tmp_path / "lib" / "library.json"
+        library_json.parent.mkdir(parents=True)
+        library_json.write_text("{}")
+        info = _make_lib_info()
+        info.library_path = str(library_json)
+        mgr._library_file_path_to_info[str(library_json)] = info
+        for execution in (False, True):
+            venv = mgr._get_library_venv_path("test_lib", str(library_json), execution=execution)
+            site_packages = Path(sysconfig.get_path("purelib", vars={"base": str(venv), "platbase": str(venv)}))
+            site_packages.mkdir(parents=True, exist_ok=True)
+        exec_site_packages = mgr.execution_site_packages("test_lib")
+        assert exec_site_packages is not None, "guard: the fixture must build a usable .venv-exec"
+        return exec_site_packages
+
+    @pytest.mark.asyncio
+    async def test_the_edit_venv_is_not_spliced_ahead_of_it(
+        self, engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mgr = engine.library_manager
+        exec_site_packages = self._library_with_both_venvs(mgr, tmp_path)
+        info = mgr.get_library_info_by_library_name("test_lib")
+        assert info is not None
+        # Stands in for PYTHONPATH, which the engine sets before the worker imports anything.
+        monkeypatch.setattr(sys, "path", [exec_site_packages, *sys.path])
+
+        await mgr._add_library_edit_venv_to_sys_path("test_lib", info.library_path)
+
+        assert sys.path[0] == exec_site_packages
+
+    @pytest.mark.asyncio
+    async def test_the_edit_venv_is_spliced_when_the_execution_one_is_not_on_the_path(
+        self, engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A library this worker was not spawned for, and every in-process library, still needs it."""
+        mgr = engine.library_manager
+        self._library_with_both_venvs(mgr, tmp_path)
+        info = mgr.get_library_info_by_library_name("test_lib")
+        assert info is not None
+        monkeypatch.setattr(sys, "path", list(sys.path))
+
+        await mgr._add_library_edit_venv_to_sys_path("test_lib", info.library_path)
+
+        assert "\\.venv-exec" not in sys.path[0]
+        assert ".venv" in sys.path[0]
