@@ -103,6 +103,43 @@ class TestNodeManagerAddControlParameter:
         assert parameter.settable is False
         assert parameter.allow_variable_substitution is False
 
+    @pytest.mark.parametrize(
+        ("mode_allowed_input", "mode_allowed_output", "expected_type"),
+        [
+            (True, False, ControlParameterInput),
+            (False, True, ControlParameterOutput),
+        ],
+    )
+    def test_reconstructs_legacy_directional_control_parameter(
+        self,
+        engine: Engine,
+        *,
+        mode_allowed_input: bool,
+        mode_allowed_output: bool,
+        expected_type: type[ControlParameterInput] | type[ControlParameterOutput],
+    ) -> None:
+        """Legacy saves put the control type on both sides but retain directional mode flags."""
+        node = BaseNode(name="LegacyControlParameterNode")
+        engine.object_manager.add_object_by_name(node.name, node)
+
+        result = engine.node_manager.on_add_parameter_to_node_request(
+            AddParameterToNodeRequest(
+                node_name=node.name,
+                parameter_name="legacy_control",
+                tooltip="Legacy control",
+                type=ParameterTypeBuiltin.CONTROL_TYPE.value,
+                input_types=[ParameterTypeBuiltin.CONTROL_TYPE.value],
+                output_type=ParameterTypeBuiltin.CONTROL_TYPE.value,
+                mode_allowed_input=mode_allowed_input,
+                mode_allowed_property=False,
+                mode_allowed_output=mode_allowed_output,
+            )
+        )
+
+        assert isinstance(result, AddParameterToNodeResultSuccess)
+        parameter = node.get_parameter_by_name("legacy_control")
+        assert isinstance(parameter, expected_type)
+
 
 class TestNodeManagerResolutionStateSerialization:
     """Test that node resolution states are preserved correctly during serialization."""

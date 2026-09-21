@@ -2029,17 +2029,38 @@ class NodeManager(EngineScoped):
         # replayed (for example, while rebuilding a node-group boundary). A plain Parameter has
         # the right type information but loses the control-port shape the editor and executor use.
         if has_control_type:
-            input_shaped = (request.input_types is not None and request.output_type is None) or (
-                request.input_types is None
-                and request.output_type is None
-                and ParameterMode.INPUT in allowed_modes
-                and ParameterMode.OUTPUT not in allowed_modes
+            # Older serialized control parameters exposed their effective type on both sides,
+            # even though their mode flags remained directional. Keep those workflows rendering
+            # as the original convenience subclass while new proxy requests use one declared side.
+            input_shaped = (
+                (request.input_types is not None and request.output_type is None)
+                or (
+                    request.input_types is not None
+                    and request.output_type is not None
+                    and ParameterMode.INPUT in allowed_modes
+                    and ParameterMode.OUTPUT not in allowed_modes
+                )
+                or (
+                    request.input_types is None
+                    and request.output_type is None
+                    and ParameterMode.INPUT in allowed_modes
+                    and ParameterMode.OUTPUT not in allowed_modes
+                )
             )
-            output_shaped = (request.output_type is not None and request.input_types is None) or (
-                request.input_types is None
-                and request.output_type is None
-                and ParameterMode.OUTPUT in allowed_modes
-                and ParameterMode.INPUT not in allowed_modes
+            output_shaped = (
+                (request.output_type is not None and request.input_types is None)
+                or (
+                    request.output_type is not None
+                    and request.input_types is not None
+                    and ParameterMode.OUTPUT in allowed_modes
+                    and ParameterMode.INPUT not in allowed_modes
+                )
+                or (
+                    request.input_types is None
+                    and request.output_type is None
+                    and ParameterMode.OUTPUT in allowed_modes
+                    and ParameterMode.INPUT not in allowed_modes
+                )
             )
 
             if input_shaped:

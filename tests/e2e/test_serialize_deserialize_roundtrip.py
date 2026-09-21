@@ -165,6 +165,64 @@ class TestPlainSubflowRoundTrip:
 
 
 class TestNodeGroupRoundTrip:
+    def test_regroups_existing_control_chain_and_roundtrips_boundary_edges(
+        self, engine: Engine, library_name: str
+    ) -> None:
+        """Dragging a connected middle node into a group keeps Flow In/Out on both sides."""
+        flow = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="RegroupControlRoundTrip", set_as_new_context=False)
+        )
+        assert isinstance(flow, CreateFlowResultSuccess), flow
+
+        with engine.context_manager.flow(flow.flow_name):
+            source = _create_node(engine, "EchoNode", "Source", library_name)
+            middle = _create_node(engine, "EchoNode", "Middle", library_name)
+            sink = _create_node(engine, "EchoNode", "Sink", library_name)
+            group = _create_node(engine, "SubflowGroupNode", "Group", library_name)
+
+            for source_name, target_name in ((source, middle), (middle, sink)):
+                result = engine.handle_request(
+                    CreateConnectionRequest(
+                        source_node_name=source_name,
+                        source_parameter_name="exec_out",
+                        target_node_name=target_name,
+                        target_parameter_name="exec_in",
+                    )
+                )
+                assert isinstance(result, CreateConnectionResultSuccess), result
+
+            add_result = engine.handle_request(AddNodesToNodeGroupRequest(node_names=[middle], node_group_name=group))
+            assert isinstance(add_result, AddNodesToNodeGroupResultSuccess), add_result
+
+        original_group = _get_group(engine, group)
+        assert isinstance(original_group.get_parameter_by_name("exec_in"), ControlParameterInput)
+        assert isinstance(original_group.get_parameter_by_name("exec_out"), ControlParameterOutput)
+        assert not any(parameter.name.startswith("exec_out_") for parameter in original_group.parameters)
+
+        commands = _serialize(engine, flow.flow_name)
+
+        engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        result = _deserialize_into_fresh_context(engine, commands)
+
+        restored_group = _get_group(engine, result.node_name_mappings["Group"])
+        restored_source = result.node_name_mappings["Source"]
+        restored_middle = result.node_name_mappings["Middle"]
+        restored_sink = result.node_name_mappings["Sink"]
+        assert isinstance(restored_group.get_parameter_by_name("exec_in"), ControlParameterInput)
+        assert isinstance(restored_group.get_parameter_by_name("exec_out"), ControlParameterOutput)
+
+        edges = {
+            f"{connection.source_node.name}.{connection.source_parameter.name}"
+            f"->{connection.target_node.name}.{connection.target_parameter.name}"
+            for connection in engine.flow_manager.get_connections().connections.values()
+        }
+        assert {
+            f"{restored_source}.exec_out->{restored_group.name}.exec_in",
+            f"{restored_group.name}.exec_in->{restored_middle}.exec_in",
+            f"{restored_middle}.exec_out->{restored_group.name}.exec_out",
+            f"{restored_group.name}.exec_out->{restored_sink}.exec_in",
+        } <= edges
+
     def test_restores_control_boundary_ports_and_wall_edges(self, engine: Engine, library_name: str) -> None:
         """Control proxies keep their wall side, port shape, and edges after reload."""
         flow = engine.handle_request(
