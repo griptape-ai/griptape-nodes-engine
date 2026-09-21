@@ -48,6 +48,9 @@ from griptape_nodes.retained_mode.managers.fitness_problems.workflows import (
 )
 from griptape_nodes.retained_mode.managers.os_manager import OSManager
 from griptape_nodes.retained_mode.managers.workflow.loading import LoadProblemFrame
+from griptape_nodes.retained_mode.managers.workflow.referenced_dependencies import (
+    collect_referenced_workflow_dependencies,
+)
 from griptape_nodes.retained_mode.request_handlers import handles
 
 if TYPE_CHECKING:
@@ -534,7 +537,23 @@ class WorkflowRunner(EngineScoped):
             # behavior where a missing prereq block was survivable.
             return []
         problems: list[WorkflowProblem] = []
-        for lib_ref in load_metadata_result.metadata.node_libraries_referenced:
+
+        # Referenced sub-workflows are imported from inside this file's exec(), and that import
+        # needs their libraries registered as much as this file needs its own. Registering them here
+        # keeps the whole tree's libraries resolved before exec begins, which is the one point where
+        # a worker-backed library can start its subprocess safely (see the note above).
+        referenced_dependencies = collect_referenced_workflow_dependencies(
+            self.engine.workflow_registry, load_metadata_result.metadata
+        )
+        problems.extend(referenced_dependencies.problems)
+
+        libraries_to_register = list(load_metadata_result.metadata.node_libraries_referenced)
+        directly_referenced_names = {lib.library_name for lib in libraries_to_register}
+        libraries_to_register.extend(
+            lib for lib in referenced_dependencies.libraries if lib.library_name not in directly_referenced_names
+        )
+
+        for lib_ref in libraries_to_register:
             register_result = await self.engine.ahandle_request(
                 RegisterLibraryFromFileRequest(
                     library_name=lib_ref.library_name,
