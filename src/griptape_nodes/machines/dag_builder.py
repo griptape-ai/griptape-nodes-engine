@@ -11,12 +11,14 @@ from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeEndNode, 
 from griptape_nodes.exe_types.connections import Direction
 from griptape_nodes.exe_types.core_types import ParameterTypeBuiltin
 from griptape_nodes.exe_types.node_types import NodeResolutionState
+from griptape_nodes.retained_mode.engine import EngineScoped
 
 if TYPE_CHECKING:
     import asyncio
 
     from griptape_nodes.exe_types.connections import Connections
     from griptape_nodes.exe_types.node_types import BaseNode
+    from griptape_nodes.retained_mode.engine import Engine
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -53,14 +55,24 @@ class NodeState(StrEnum):
 
 @dataclass(kw_only=True)
 class DagNode:
-    """Represents a node in the DAG with runtime references."""
+    """Represents a node in the DAG with runtime references.
+
+    Attributes:
+        task_reference: The running task, once the node has been dispatched.
+        node_state: Where the node is in its execution lifecycle.
+        node_reference: The node itself.
+        data_dependency_only: True when the node was pulled into a graph solely to feed someone
+            else's data input, so it must not advance control when it finishes. See
+            ``ExecuteDagState._should_skip_control_flow``.
+    """
 
     task_reference: asyncio.Task | None = field(default=None)
     node_state: NodeState = field(default=NodeState.WAITING)
     node_reference: BaseNode
+    data_dependency_only: bool = field(default=False)
 
 
-class DagBuilder:
+class DagBuilder(EngineScoped):
     """Handles DAG construction independently of execution state machine."""
 
     graphs: dict[str, DirectedGraph]  # Str is the name of the start node associated here.
@@ -68,7 +80,8 @@ class DagBuilder:
     graph_to_nodes: dict[str, set[str]]  # Track which nodes belong to which graph
     start_node_candidates: dict[str, dict[str, set[str]]]  # {data_node: {graph: {boundary_nodes}}}
 
-    def __init__(self) -> None:
+    def __init__(self, engine: Engine | None = None) -> None:
+        super().__init__(engine)
         self.graphs = {}
         self.node_to_reference: dict[str, DagNode] = {}
         self.graph_to_nodes = {}
@@ -100,9 +113,7 @@ class DagBuilder:
     # Complex with the inner recursive method, but it needs connections and added_nodes.
     def add_node_with_dependencies(self, node: BaseNode, graph_name: str = "default") -> list[BaseNode]:  # noqa: C901
         """Add node and all its dependencies to DAG. Returns list of added nodes."""
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        connections = GriptapeNodes.FlowManager().get_connections()
+        connections = self.engine.flow_manager.get_connections()
         added_nodes = []
         graph = self.graphs.get(graph_name, None)
         if graph is None:
@@ -121,8 +132,14 @@ class DagBuilder:
 
             if current_node.name in self.node_to_reference:
                 return
-            # Add current node to tracking
-            dag_node = DagNode(node_reference=current_node, node_state=NodeState.WAITING)
+            # Add current node to tracking. Anything reached by the upstream walk below is here to
+            # supply data, not because control reached it, so record that it must not fire its own
+            # control output when it finishes; see _should_skip_control_flow.
+            dag_node = DagNode(
+                node_reference=current_node,
+                node_state=NodeState.WAITING,
+                data_dependency_only=current_node is not node,
+            )
             self.node_to_reference[current_node.name] = dag_node
             added_nodes.append(current_node)
 
@@ -162,6 +179,13 @@ class DagBuilder:
 
                 # Add edge from upstream to current
                 graph.add_edge(upstream_node.name, current_node.name)
+
+        # Being passed in as the root is what authorizes a node to advance control. Clear the flag
+        # if an earlier caller already adopted this node as its own data dependency, because the
+        # recursion below early-returns on nodes it has already seen and cannot clear it there.
+        root_reference = self.node_to_reference.get(node.name)
+        if root_reference is not None:
+            root_reference.data_dependency_only = False
 
         _add_node_recursive(node, set(), graph)
 
@@ -254,9 +278,7 @@ class DagBuilder:
             # If there's only one graph, we aren't looking for a control flow connection from elsewhere! We can queue. We've already looked at data dependencies.
             return True
 
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        connections = GriptapeNodes.FlowManager().get_connections()
+        connections = self.engine.flow_manager.get_connections()
 
         control_connections = self.get_number_incoming_control_connections(node.node_reference, connections)
         # If no control connections, we can queue this! Don't worry about this.
@@ -439,6 +461,24 @@ class DagBuilder:
             for node_name in self.graph_to_nodes[graph_name]:
                 self.node_to_reference.pop(node_name, None)
             self.graph_to_nodes.pop(graph_name, None)
+
+    def remove_node(self, node_name: str) -> None:
+        """Forget a node entirely, for when it is deleted while a run is in flight.
+
+        Only safe for a node the run no longer needs -- see `NodeManager._find_entangled_live_node`.
+        Removing a node the run is still waiting on would drop a successor's in-degree to zero and
+        let it start on inputs that never arrived.
+
+        Clears every structure `clear` does, for the one node. `start_node_candidates` is keyed by
+        gated node as well as read for its boundary sets, and a stale key outlives the node: the
+        entry survives, and once its boundary nodes finish `check_for_new_start_nodes` hands the
+        name to `get_node_by_name`, which raises out of the driver.
+        """
+        self.node_to_reference.pop(node_name, None)
+        self.start_node_candidates.pop(node_name, None)
+        for graph_name, graph in self.graphs.items():
+            graph.remove_node(node_name)
+            self.graph_to_nodes.get(graph_name, set()).discard(node_name)
 
     def remove_node_from_dependencies(self, completed_node: str, graph_name: str) -> list[str]:
         """Remove completed node from all dependencies, return nodes ready to execute.

@@ -1008,7 +1008,17 @@ class AddNodesToNodeGroupRequest(RequestPayload):
 @dataclass
 @PayloadRegistry.register
 class AddNodesToNodeGroupResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
-    """Node added to NodeGroup successfully."""
+    """Nodes added to NodeGroup successfully.
+
+    Fields:
+        node_names_added: The complete list of node names that ended up added to the
+            group, including any side-effect additions (e.g. the paired End node that is
+            automatically pulled in when a BaseIterativeStartNode is grouped).
+        node_group_name: Name of the NodeGroup that the nodes were added to.
+    """
+
+    node_names_added: list[str] = field(default_factory=list)
+    node_group_name: str = ""
 
 
 @dataclass
@@ -1045,7 +1055,17 @@ class RemoveNodeFromNodeGroupRequest(RequestPayload):
 @dataclass
 @PayloadRegistry.register
 class RemoveNodeFromNodeGroupResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
-    """Nodes removed from NodeGroup successfully."""
+    """Nodes removed from NodeGroup successfully.
+
+    Fields:
+        node_names_removed: The complete list of node names that ended up removed from the
+            group, including any side-effect removals (e.g. the paired End node that is
+            automatically pulled out when a BaseIterativeStartNode is ungrouped).
+        node_group_name: Name of the NodeGroup that the nodes were removed from.
+    """
+
+    node_names_removed: list[str] = field(default_factory=list)
+    node_group_name: str = ""
 
 
 @dataclass

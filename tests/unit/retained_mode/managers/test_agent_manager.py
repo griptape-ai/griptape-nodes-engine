@@ -11,12 +11,22 @@ import json
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
 from pydantic_ai.exceptions import ModelHTTPError, ModelRetry
 from pydantic_ai.messages import BinaryContent, ImageUrl, ModelMessage, ModelRequest, UserPromptPart
 
+from griptape_nodes.agents.pydantic_ai.mcp_toolset_cache import MCPToolsetCache
+from griptape_nodes.agents.pydantic_ai.runner import (
+    AgentRunResult,
+    RunEvent,
+    TextDelta,
+    ThinkingDelta,
+    ToolCall,
+    ToolResult,
+)
 from griptape_nodes.drivers.cloud_models import (
     DEPRECATED_MODELS,
     IMAGE_DEPRECATED_MODELS,
@@ -27,6 +37,10 @@ from griptape_nodes.drivers.cloud_models import (
     provider_catalog_entries,
 )
 from griptape_nodes.retained_mode.events.agent_events import (
+    AgentStreamEvent,
+    AgentThinkingEvent,
+    AgentToolCallEvent,
+    AgentToolResultEvent,
     CancelAgentRequest,
     CancelAgentResultSuccess,
     ConfigureAgentRequest,
@@ -41,6 +55,9 @@ from griptape_nodes.retained_mode.events.agent_events import (
     DeleteAgentProviderResultSuccess,
     GetAgentConfigRequest,
     GetAgentConfigResultSuccess,
+    GetThreadMetadataRequest,
+    GetThreadMetadataResultFailure,
+    GetThreadMetadataResultSuccess,
     ListAgentModelsRequest,
     ListAgentModelsResultSuccess,
     ListAgentProvidersRequest,
@@ -50,11 +67,21 @@ from griptape_nodes.retained_mode.events.agent_events import (
     ListProviderModelsResultSuccess,
     PromptDriverConfig,
     ProviderConfig,
+    RunAgentRequest,
     RunAgentRequestArtifact,
+    RunAgentResultSuccess,
+    RunRecord,
+    ThreadMetadata,
     UpdateAgentProviderRequest,
     UpdateAgentProviderResultFailure,
     UpdateAgentProviderResultSuccess,
     UpdateProviderPayload,
+)
+from griptape_nodes.retained_mode.events.mcp_events import (
+    GetEnabledMCPServersRequest,
+    GetEnabledMCPServersResultFailure,
+    GetEnabledMCPServersResultSuccess,
+    MCPServerConfig,
 )
 from griptape_nodes.retained_mode.managers.agent_manager import (
     _PROTECTED_PROVIDER_NAME,
@@ -64,11 +91,15 @@ from griptape_nodes.retained_mode.managers.agent_manager import (
     AgentManager,
     ComposedPrompt,
     _ActiveRun,
+    _build_agent_instructions,
     _cloud_http_status_of,
     _compose_prompt,
+    _compose_server_rules,
     _friendly_list_models_error,
     _message_has_image_url,
     _rehydrate_history,
+    _run_event_to_payload,
+    _RunnerCacheKey,
 )
 
 _AGENT_MANAGER_MODULE = "griptape_nodes.retained_mode.managers.agent_manager"
@@ -126,26 +157,79 @@ class TestEnsureSkillsDirectory:
         agent_manager._ensure_skills_directory(blocker)
 
 
-class TestComposeInstructions:
-    """Per-MCP-server `rules` are folded into the instructions string, not dropped."""
+class TestBuildAgentInstructions:
+    """The agent's baked-in instructions describe only what cannot change mid-session."""
 
-    def test_no_rules_returns_base_instructions(self, agent_manager: AgentManager) -> None:
-        result = agent_manager._compose_instructions([], include_image_tool=False)
+    def test_base_instructions_describe_the_engine_tools(self) -> None:
+        result = _build_agent_instructions(include_image_tool=False)
         assert "GriptapeNodes" in result
         assert "generate_image" not in result
 
-    def test_image_tool_included_when_requested(self, agent_manager: AgentManager) -> None:
-        result = agent_manager._compose_instructions([], include_image_tool=True)
+    def test_image_tool_included_when_requested(self) -> None:
+        result = _build_agent_instructions(include_image_tool=True)
         assert "generate_image" in result
 
-    def test_rules_are_appended_to_base_instructions(self, agent_manager: AgentManager) -> None:
-        composed = agent_manager._compose_instructions(
-            ["Rules for MCP server 'a':\nbe terse", "Rules for MCP server 'b':\nbe kind"],
-            include_image_tool=False,
+
+class TestComposeServerRules:
+    """Per-MCP-server `rules` become run-level instructions, not dropped."""
+
+    def test_no_servers_contributes_nothing(self) -> None:
+        assert _compose_server_rules([]) == ""
+
+    def test_each_server_is_labelled_with_its_name(self) -> None:
+        composed = _compose_server_rules(
+            [{"name": "a", "rules": "be terse"}, {"name": "b", "rules": "be kind"}],
         )
-        assert "GriptapeNodes" in composed
-        assert "be terse" in composed
-        assert "be kind" in composed
+        assert composed == "Rules for MCP server 'a':\nbe terse\n\nRules for MCP server 'b':\nbe kind"
+
+    def test_servers_without_rules_are_skipped(self) -> None:
+        composed = _compose_server_rules(
+            [{"name": "a"}, {"name": "b", "rules": "   "}, {"name": "c", "rules": None}, {"name": "d", "rules": "go"}],
+        )
+        assert composed == "Rules for MCP server 'd':\ngo"
+
+
+class _RecordingEngine:
+    """An engine stand-in that answers with `result` and keeps what it was asked."""
+
+    def __init__(self, result: object) -> None:
+        self.result = result
+        self.seen: list[GetEnabledMCPServersRequest] = []
+
+    def handle_request(self, request: GetEnabledMCPServersRequest) -> object:
+        self.seen.append(request)
+        return self.result
+
+
+class TestLookupEnabledMCPServers:
+    """Reading the enabled servers must not publish them."""
+
+    @staticmethod
+    def _manager(engine: _RecordingEngine) -> AgentManager:
+        """A manager wired to nothing but `engine`, which is all the lookup touches."""
+        manager = AgentManager.__new__(AgentManager)
+        manager._engine = engine  # type: ignore[assignment]
+        return manager
+
+    def test_the_lookup_is_not_broadcast_to_clients(self) -> None:
+        """The reply carries every server's `env` and `headers` verbatim.
+
+        This runs once per message, and a broadcast result is fanned out to
+        every connected websocket client. Nothing listens for the result of this
+        internal read - a client wanting the list asks for it itself - so
+        broadcasting it is pure credential exposure.
+        """
+        servers: dict[str, MCPServerConfig] = {"a": {"name": "a", "env": {"TOKEN": "hunter2"}}}
+        engine = _RecordingEngine(GetEnabledMCPServersResultSuccess(servers=servers, result_details="ok"))
+
+        assert self._manager(engine)._lookup_enabled_mcp_servers() == servers
+        assert [request.broadcast_result for request in engine.seen] == [False]
+
+    def test_an_unreadable_config_is_distinguishable_from_no_servers(self) -> None:
+        """`None` means "could not find out", so cached servers are left alone."""
+        engine = _RecordingEngine(GetEnabledMCPServersResultFailure(result_details="nope"))
+
+        assert self._manager(engine)._lookup_enabled_mcp_servers() is None
 
 
 class TestOnHandleListAgentModelsRequest:
@@ -210,6 +294,41 @@ class TestOnHandleCancelAgentRequest:
         # The event is set via call_soon_threadsafe; yield once so it runs.
         await asyncio.sleep(0)
         assert cancel_event.is_set()
+
+
+class TestRunEventToPayload:
+    """Every streamed payload carries the thread id so clients can route it."""
+
+    def test_text_delta_becomes_stream_event_with_thread_id(self) -> None:
+        payload = _run_event_to_payload(TextDelta(delta="hi"), "thread-1")
+
+        assert payload == AgentStreamEvent(thread_id="thread-1", token="hi")  # noqa: S106 - a streamed text token
+
+    def test_thinking_delta_becomes_thinking_event_with_thread_id(self) -> None:
+        payload = _run_event_to_payload(ThinkingDelta(delta="pondering"), "thread-1")
+
+        assert payload == AgentThinkingEvent(thread_id="thread-1", delta="pondering")
+
+    def test_tool_call_becomes_tool_call_event_with_thread_id(self) -> None:
+        payload = _run_event_to_payload(
+            ToolCall(tool_call_id="call-1", tool_name="read_file", args='{"path": "a.txt"}'), "thread-1"
+        )
+
+        assert payload == AgentToolCallEvent(
+            thread_id="thread-1", tool_call_id="call-1", tool_name="read_file", args='{"path": "a.txt"}'
+        )
+
+    def test_tool_result_becomes_tool_result_event_with_thread_id(self) -> None:
+        payload = _run_event_to_payload(
+            ToolResult(tool_call_id="call-1", tool_name="read_file", content="boom", is_error=True), "thread-1"
+        )
+
+        assert payload == AgentToolResultEvent(
+            thread_id="thread-1", tool_call_id="call-1", tool_name="read_file", content="boom", is_error=True
+        )
+
+    def test_unmapped_event_kind_is_dropped(self) -> None:
+        assert _run_event_to_payload(RunEvent(), "thread-1") is None
 
 
 @dataclass
@@ -540,7 +659,7 @@ class TestCreateAgentProvider:
         assert any(p.name == "home-ollama" for p in providers_manager._providers)
 
     def test_create_clears_runner_cache(self, providers_manager: AgentManager) -> None:
-        providers_manager._runner_cache[("griptape_cloud", "gpt-4o", "img", "", "", ())] = object()  # type: ignore[assignment]
+        providers_manager._runner_cache[_RunnerCacheKey("griptape_cloud", "gpt-4o", "img", "", "")] = object()  # type: ignore[assignment]
 
         providers_manager.on_handle_create_agent_provider_request(
             CreateAgentProviderRequest(provider=CreateProviderPayload(name="new", type="ollama"))
@@ -639,7 +758,7 @@ class TestUpdateAgentProvider:
         assert "renamed" not in names
 
     def test_update_clears_runner_cache(self, providers_manager: AgentManager) -> None:
-        providers_manager._runner_cache[("ollama", "llama3.2", "img", "http://x", "", ())] = object()  # type: ignore[assignment]
+        providers_manager._runner_cache[_RunnerCacheKey("ollama", "llama3.2", "img", "http://x", "")] = object()  # type: ignore[assignment]
 
         providers_manager.on_handle_update_agent_provider_request(
             UpdateAgentProviderRequest(name="my-ollama", provider=UpdateProviderPayload(model="gemma2"))
@@ -737,7 +856,7 @@ class TestDeleteAgentProvider:
         assert not any(p.name == "my-ollama" for p in providers_manager._providers)
 
     def test_delete_clears_runner_cache(self, providers_manager: AgentManager) -> None:
-        providers_manager._runner_cache[("ollama", "llama3.2", "img", "http://x", "", ())] = object()  # type: ignore[assignment]
+        providers_manager._runner_cache[_RunnerCacheKey("ollama", "llama3.2", "img", "http://x", "")] = object()  # type: ignore[assignment]
 
         providers_manager.on_handle_delete_agent_provider_request(DeleteAgentProviderRequest(name="my-ollama"))
 
@@ -1028,7 +1147,7 @@ class TestConfigureAgentActiveProvider:
         assert providers_manager._active_provider_name == "griptape_cloud"
 
     def test_switching_active_provider_clears_runner_cache(self, providers_manager: AgentManager) -> None:
-        providers_manager._runner_cache[("griptape_cloud", "gpt-4o", "img", "", "", ())] = object()  # type: ignore[assignment]
+        providers_manager._runner_cache[_RunnerCacheKey("griptape_cloud", "gpt-4o", "img", "", "")] = object()  # type: ignore[assignment]
 
         providers_manager.on_handle_configure_agent_request(ConfigureAgentRequest(active_provider="my-ollama"))
 
@@ -1036,7 +1155,7 @@ class TestConfigureAgentActiveProvider:
 
     def test_switching_to_same_active_provider_does_not_clear_cache(self, providers_manager: AgentManager) -> None:
         sentinel = object()
-        key = ("griptape_cloud", "gpt-4o", "img", "", "", ())
+        key = _RunnerCacheKey("griptape_cloud", "gpt-4o", "img", "", "")
         providers_manager._runner_cache[key] = sentinel  # type: ignore[assignment]
 
         # Switching to the already-active provider should not count as a change.
@@ -1075,7 +1194,7 @@ class TestBuildRunnerCredential:
         providers_manager._thread_storage = object()  # type: ignore[assignment]
         providers_manager.static_files_manager = None  # type: ignore[assignment]
 
-        providers_manager._build_runner([], provider_name="griptape_cloud")
+        providers_manager._build_runner(provider_name="griptape_cloud")
 
         assert captured["api_key"] == "the-license"
 
@@ -1085,7 +1204,7 @@ class TestBuildRunnerCredential:
         monkeypatch.setattr(_AGENT_MANAGER_MODULE + ".resolve_cloud_credential", lambda *_a, **_k: None)
 
         with pytest.raises(ValueError, match="Sign in with your Griptape license") as excinfo:
-            providers_manager._build_runner([], provider_name="griptape_cloud")
+            providers_manager._build_runner(provider_name="griptape_cloud")
 
         assert "GT_CLOUD_API_KEY" in str(excinfo.value)
 
@@ -1176,3 +1295,183 @@ class TestCloudHttpStatusOf:
     def test_returns_none_for_non_http_error(self) -> None:
         """A plain error has no status, so the caller keeps the original message."""
         assert _cloud_http_status_of(ValueError("boom"), _CLOUD_HOST) is None
+
+
+def _run_request() -> RunAgentRequest:
+    """A minimal RunAgentRequest; the payload branches don't read its fields."""
+    return RunAgentRequest(input="hello", url_artifacts=[], thread_id="t1")
+
+
+async def _stub_compose_prompt(text: str, _url_artifacts: list[RunAgentRequestArtifact]) -> ComposedPrompt:
+    """Skip artifact download; these tests only exercise the result branches."""
+    return ComposedPrompt(live=text, persist=text)
+
+
+class TestRunAgentResultPayloadContract:
+    """`_run_agent`'s three success branches must agree on the payload's keys.
+
+    The sidebar reads `output.truncated` on every reply, so a branch that omits
+    it hands the consumer `undefined` where the other branches give a boolean.
+    """
+
+    _BRANCHES = (
+        ("cancelled", AgentRunResult(thread_id="t1", output="partial", message_count=2, cancelled=True)),
+        ("truncated", AgentRunResult(thread_id="t1", output="cut off", message_count=3, truncated=True)),
+        ("normal", AgentRunResult(thread_id="t1", output="all done", message_count=3)),
+    )
+
+    @staticmethod
+    def _manager(monkeypatch: pytest.MonkeyPatch, result: AgentRunResult) -> AgentManager:
+        """An AgentManager whose runner returns `result` and whose I/O is stubbed."""
+        manager = AgentManager.__new__(AgentManager)
+        manager._active_runs = {}
+        manager._mcp_toolsets = MCPToolsetCache()
+
+        async def fake_run(*_args: object, **_kwargs: object) -> AgentRunResult:
+            return result
+
+        monkeypatch.setattr(manager, "_validate_thread_for_run", lambda _thread_id: "t1")
+        monkeypatch.setattr(manager, "_build_runner", lambda *_a, **_k: SimpleNamespace(run=fake_run))
+        manager._active_provider_name = "griptape_cloud"
+        manager._providers = []
+        # A non-empty history keeps `is_first_run` False, so the title update is skipped.
+        manager._thread_storage = SimpleNamespace(  # type: ignore[assignment]
+            load_history=lambda _t: [object()],
+            update_thread_metadata=lambda _t, **_kw: {},
+            append_run_record=lambda thread_id, record: None,  # noqa: ARG005
+        )
+        monkeypatch.setattr(
+            _AGENT_MANAGER_MODULE + "._compose_prompt",
+            _stub_compose_prompt,
+        )
+        # `engine` is a read-only property over `_engine`; set the backing field.
+        manager._engine = SimpleNamespace(  # type: ignore[assignment]
+            event_manager=SimpleNamespace(put_event=lambda _e: None),
+            # `_run_agent` reads the enabled MCP servers on every run; these
+            # tests are about the result payload, so report none configured.
+            handle_request=lambda _r: GetEnabledMCPServersResultSuccess(servers={}, result_details="none"),
+        )
+        return manager
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("branch", "result"), _BRANCHES, ids=[b for b, _ in _BRANCHES])
+    async def test_every_branch_sets_truncated(
+        self, monkeypatch: pytest.MonkeyPatch, branch: str, result: AgentRunResult
+    ) -> None:
+        manager = self._manager(monkeypatch, result)
+
+        payload = await manager._run_agent(_run_request())
+
+        assert isinstance(payload, RunAgentResultSuccess)
+        assert "truncated" in payload.output, f"the {branch} branch omits `truncated` from its payload"
+        assert payload.output["truncated"] is result.truncated
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("branch", "result"), _BRANCHES, ids=[b for b, _ in _BRANCHES])
+    async def test_branches_share_one_key_set(
+        self, monkeypatch: pytest.MonkeyPatch, branch: str, result: AgentRunResult
+    ) -> None:
+        """One shape for all outcomes, so the frontend needs no per-branch handling."""
+        manager = self._manager(monkeypatch, result)
+
+        payload = await manager._run_agent(_run_request())
+
+        assert isinstance(payload, RunAgentResultSuccess)
+        assert set(payload.output) == {"text", "message_count", "cancelled", "truncated", "generated_image_urls"}, (
+            f"the {branch} branch's payload keys differ from the other branches'"
+        )
+
+    @pytest.mark.asyncio
+    async def test_cancelled_run_does_not_append_run_record(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A cancelled run must not append a RunRecord — no assistant message was persisted."""
+        recorded: list[RunRecord] = []
+        result = AgentRunResult(thread_id="t1", output="partial", message_count=2, cancelled=True)
+        manager = self._manager(monkeypatch, result)
+        manager._thread_storage.append_run_record = lambda thread_id, record: recorded.append(record)  # noqa: ARG005
+
+        await manager._run_agent(_run_request())
+
+        assert recorded == [], "cancelled run must not record a RunRecord"
+
+    @pytest.mark.asyncio
+    async def test_normal_run_stores_provider_name_model_and_mcp_servers(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A successful run stores the resolved provider name, provider default model, and MCP servers."""
+        recorded: list[RunRecord] = []
+        result = AgentRunResult(thread_id="t1", output="done", message_count=2)
+        manager = self._manager(monkeypatch, result)
+        manager._providers = [ProviderConfig(name="my-ollama", type="ollama", model="llama3")]
+        manager._active_provider_name = "my-ollama"
+        manager._thread_storage.append_run_record = lambda thread_id, record: recorded.append(record)  # noqa: ARG005
+
+        req = RunAgentRequest(
+            input="hello",
+            url_artifacts=[],
+            thread_id="t1",
+            provider_name="my-ollama",
+            additional_mcp_servers=["brave"],
+        )
+        await manager._run_agent(req)
+
+        assert len(recorded) == 1
+        r = recorded[0]
+        assert r.message_index == 1  # message_count - 1
+        assert r.provider_name == "my-ollama"
+        assert r.model == "llama3", "model must come from the provider default, not be None"
+        assert r.mcp_servers == ["brave"]
+
+    @pytest.mark.asyncio
+    async def test_normal_run_explicit_model_name_takes_precedence(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When request.model_name is set it overrides the provider's default model."""
+        recorded: list[RunRecord] = []
+        result = AgentRunResult(thread_id="t1", output="done", message_count=2)
+        manager = self._manager(monkeypatch, result)
+        manager._providers = [ProviderConfig(name="my-ollama", type="ollama", model="llama3")]
+        manager._active_provider_name = "my-ollama"
+        manager._thread_storage.append_run_record = lambda thread_id, record: recorded.append(record)  # noqa: ARG005
+
+        req = RunAgentRequest(
+            input="hello",
+            url_artifacts=[],
+            thread_id="t1",
+            provider_name="my-ollama",
+            model_name="gpt-4o",
+        )
+        await manager._run_agent(req)
+
+        assert len(recorded) == 1
+        assert recorded[0].model == "gpt-4o", "explicit model_name must take precedence over provider default"
+
+
+class TestGetThreadMetadataHandler:
+    """`on_handle_get_thread_metadata_request` routing and guard behaviour."""
+
+    @staticmethod
+    def _manager(thread_exists: bool, metadata: object = None) -> AgentManager:  # noqa: FBT001
+        manager = AgentManager.__new__(AgentManager)
+        manager._thread_storage = SimpleNamespace(  # type: ignore[assignment]
+            thread_exists=lambda _tid: thread_exists,
+            get_thread_metadata=lambda _tid: metadata,
+        )
+        return manager
+
+    def test_missing_thread_returns_failure(self) -> None:
+        """A thread_id that doesn't exist must return GetThreadMetadataResultFailure."""
+        manager = self._manager(thread_exists=False)
+        result = manager.on_handle_get_thread_metadata_request(GetThreadMetadataRequest(thread_id="does-not-exist"))
+        assert isinstance(result, GetThreadMetadataResultFailure)
+
+    def test_existing_thread_returns_success_with_metadata(self) -> None:
+        """A valid thread_id must return GetThreadMetadataResultSuccess carrying the metadata."""
+        thread = ThreadMetadata(
+            thread_id="t1",
+            title="hello",
+            created_at="2024-01-01T00:00:00+00:00",
+            updated_at="2024-01-01T00:00:00+00:00",
+            message_count=2,
+            archived=False,
+            runs=[RunRecord(message_index=1, provider_name="griptape_cloud", model="gpt-4o")],
+        )
+        manager = self._manager(thread_exists=True, metadata=thread)
+        result = manager.on_handle_get_thread_metadata_request(GetThreadMetadataRequest(thread_id="t1"))
+        assert isinstance(result, GetThreadMetadataResultSuccess)
+        assert result.thread is thread

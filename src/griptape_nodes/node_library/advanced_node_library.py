@@ -57,7 +57,8 @@ class AdvancedNodeLibrary:
         """Called before the library is unregistered from the engine.
 
         Called before the engine deregisters any event listeners, pre-dispatch hooks,
-        or request handlers, and before the library is removed from LibraryRegistry.
+        post-dispatch hooks, or request handlers, and before the library is removed
+        from LibraryRegistry.
         Use it to release external resources acquired during load — Python bindings,
         GPU contexts, background threads, connection pools, etc.
 
@@ -122,6 +123,72 @@ class AdvancedNodeLibrary:
             def get_request_handlers(self):
                 return [
                     (ConvertColorspaceRequest, self._handle_convert_colorspace),
+                ]
+        """
+        return []
+
+    def get_post_dispatch_hooks(
+        self,
+    ) -> list[
+        tuple[
+            type[RequestPayload],
+            Callable[[RequestPayload, ResultPayload], None]
+            | Callable[[RequestPayload, ResultPayload], Awaitable[None]],
+        ]
+    ]:
+        """Return post-dispatch hooks to register with the engine.
+
+        Each entry is a (request_type, callback) pair. After the engine's own
+        handler for that request type produces a result, the callback is invoked
+        with (request, result). Unlike get_request_handlers(), this does not claim
+        the request type — any number of libraries may hook the same type, and the
+        engine's handler still runs normally.
+
+        The engine registers all returned hooks after after_library_nodes_loaded()
+        and deregisters them automatically when the library is unloaded.
+
+        Both sync and async callbacks are supported. Sync callbacks run in a worker
+        thread; async callbacks run on the engine's event loop and must not block it.
+
+        **Notification only.** The callback's return value is ignored and it cannot
+        alter the result or fail the operation. A callback that raises is logged and
+        otherwise ignored.
+
+        **Usually detached.** Whenever the engine has a live event loop the hook is
+        scheduled as a detached task, so the result reaches the client without waiting
+        for it. Some paths have no such loop — CLI commands, bootstrap workflow runs,
+        worker threads — and there the hook runs inline and blocks the caller until it
+        returns, on a transient loop rather than the engine's. Keep hooks quick, or move
+        slow work off-process, if they may fire on those paths.
+
+        **Both outcomes.** The callback is invoked for successes and failures alike,
+        including failures produced by an exception escaping the handler. Branch on
+        the result type to filter.
+
+        **Exact type matching.** A hook registered for a request type fires only for
+        that exact type, not for its subclasses.
+
+        **Read-only arguments.** Do not mutate the request or the result: both are
+        still referenced by the result event the engine is about to serialize. Fields
+        marked ``omit_from_result`` have already been cleared on the request the hook
+        receives.
+
+        **Do not issue engine requests from a hook.** The engine's operation-depth and
+        node-execution state is process-wide, so a request issued from a hook can
+        perturb an in-flight operation. Do external work (HTTP, file writes) instead.
+
+        **Orchestrator process only.** Hooks are registered on the event manager of
+        whichever process loads the library, so a worker-mode library's hooks never
+        observe requests handled by the orchestrator. Cross-worker hook support is
+        tracked in GH#4748.
+
+        **Not durable.** In-flight hooks are abandoned at process exit. Do not use
+        them where delivery must be guaranteed.
+
+        Example:
+            def get_post_dispatch_hooks(self):
+                return [
+                    (SaveWorkflowRequest, self._on_workflow_saved),
                 ]
         """
         return []

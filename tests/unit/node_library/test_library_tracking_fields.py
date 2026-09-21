@@ -23,6 +23,10 @@ class TestLibraryTrackingFields:
         lib = _make_library()
         assert lib.get_registered_pre_dispatch_hooks() == []
 
+    def test_registered_post_dispatch_hooks_starts_empty(self) -> None:
+        lib = _make_library()
+        assert lib.get_registered_post_dispatch_hooks() == []
+
     def test_registered_request_handler_types_starts_empty(self) -> None:
         lib = _make_library()
         assert lib.get_registered_request_handler_types() == []

@@ -1,3 +1,4 @@
+import mimetypes
 import os
 from pathlib import Path
 from typing import Any, ClassVar
@@ -30,7 +31,6 @@ class PublicArtifactUrlParameter:
     BUCKET_ID_NAME = "GT_CLOUD_BUCKET_ID"
     supported_artifact_types: ClassVar[list[type]] = [ImageUrlArtifact, VideoUrlArtifact, AudioUrlArtifact]
     supported_artifact_type_names: ClassVar[list[str]] = [cls.__name__ for cls in supported_artifact_types]
-    gtc_file_path: Path | None = None
 
     def __init__(
         self,
@@ -43,6 +43,7 @@ class PublicArtifactUrlParameter:
         self._parameter = artifact_url_parameter
         self._disclaimer_message = disclaimer_message
         self._request_timeout = request_timeout
+        self.gtc_file_path: Path | None = None
 
         if artifact_url_parameter.type.lower() not in [name.lower() for name in self.supported_artifact_type_names]:
             msg = (
@@ -62,7 +63,7 @@ class PublicArtifactUrlParameter:
 
         base = os.getenv("GT_CLOUD_BASE_URL", "https://cloud.griptape.ai")
         self._storage_driver = GriptapeCloudStorageDriver(
-            workspace_directory=GriptapeNodes.ConfigManager().workspace_path,
+            GriptapeNodes.ConfigManager(),
             bucket_id=self._get_bucket_id(base, api_key, timeout=self._request_timeout),
             api_key=api_key,
             base_url=base,
@@ -153,6 +154,12 @@ class PublicArtifactUrlParameter:
         )
 
     def get_public_url_for_parameter(self) -> str:
+        # A helper instance lives as long as the node, so an upload path recorded by an
+        # earlier run is cleared before anything else: it would otherwise be re-deleted by
+        # delete_uploaded_artifact, and callers read gtc_file_path to tell an upload from
+        # the already-public pass-through below.
+        self.gtc_file_path = None
+
         # Parameter values that crossed a JSON boundary (orchestrator <-> worker, workflow load)
         # arrive as serialized artifact dicts; rehydrate them back into artifacts first.
         parameter_value = hydrate_value(self._node.get_parameter_value(self._parameter.name))
@@ -175,7 +182,7 @@ class PublicArtifactUrlParameter:
         from griptape_nodes.files.file import File
 
         file_contents = File(url).read_bytes()
-        filename = Path(urlparse(url).path).name
+        filename = self._derive_upload_filename(url)
 
         self.gtc_file_path = Path("artifact_url_storage") / uuid4().hex / filename
 
@@ -188,3 +195,22 @@ class PublicArtifactUrlParameter:
         if not self.gtc_file_path:
             return
         self._storage_driver.delete_file(self.gtc_file_path)
+        # The upload is gone, so the path is forgotten: a second cleanup pass over the same
+        # helper must not issue another delete.
+        self.gtc_file_path = None
+
+    @staticmethod
+    def _derive_upload_filename(url: str) -> str:
+        """Pick the storage filename for a value being uploaded.
+
+        A data URI has no path component to take a name from -- deriving one from the URI
+        would embed the (potentially megabytes-long) base64 payload in the storage key --
+        so it gets a generated name instead. The extension matters beyond aesthetics: the
+        presigned download URL's content type is guessed from the uploaded path's
+        extension, so a bare name would serve the media without a content type.
+        """
+        if url.startswith("data:"):
+            mime_type = url.removeprefix("data:").split(";", 1)[0].split(",", 1)[0]
+            extension = mimetypes.guess_extension(mime_type) or ""
+            return f"{uuid4().hex}{extension}"
+        return Path(urlparse(url).path).name or uuid4().hex

@@ -11,7 +11,13 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
 
 from griptape_nodes.common.macro_parser import MacroSyntaxError, ParsedMacro
-from griptape_nodes.files.path_utils import parse_file_uri, resolve_file_path
+from griptape_nodes.files.path_utils import (
+    is_url,
+    parse_file_uri,
+    parse_static_server_url,
+    resolve_file_path,
+    resolve_path_safely,
+)
 from griptape_nodes.retained_mode.events.os_events import (
     ExistingFilePolicy,
     FileIOFailureReason,
@@ -175,25 +181,56 @@ async def _aresolve_file_path(file_path: str | MacroPath) -> str:
 
 
 def _resolve_plain_path(path_str: str) -> str:
-    """Resolve a plain (non-macro) path string to an absolute path.
+    """Resolve a plain (non-macro) location string to an absolute path or a URL.
 
-    Relative paths are anchored to the current workspace directory, matching how
-    OSManager resolves ReadFileRequest/WriteFileRequest paths. This keeps
-    resolve() reporting the same on-disk location the read/write pipeline
-    targets, instead of a bare relative path that a caller would resolve against
-    the process working directory. Absolute paths, ``~``/environment-variable
-    paths, and ``file://`` URIs are absolutized in place.
+    Handles four shapes of input, in this order:
+
+    1. A ``file://`` URI is converted to the local path it names, then absolutized.
+    2. A localhost static file server URL
+       (``http://localhost:8124/workspace/staticfiles/clip.mp4?t=...``) is mapped
+       back to the workspace file it serves. The engine passes node outputs
+       between nodes in this form, and the file is already on disk, so a caller
+       that needs a real path gets one without an HTTP round-trip.
+    3. Any other URL (a remote ``https://`` address, ``s3://``, …) is returned
+       unchanged. There is no local path for it to resolve to, and the consumers
+       of ``resolve()`` accept a URL: FFmpeg and ffprobe read ``http(s)``
+       natively.
+    4. Anything else is a filesystem path. Relative paths are anchored to the
+       current workspace directory, matching how OSManager resolves
+       ReadFileRequest/WriteFileRequest paths. This keeps resolve() reporting the
+       same on-disk location the read/write pipeline targets, instead of a bare
+       relative path that a caller would resolve against the process working
+       directory. Absolute paths and ``~``/environment-variable paths are
+       absolutized in place.
+
+    The URL cases exist because every path helper downstream of here assumes a
+    filesystem path. Before this branch, a static server URL fell through to
+    ``resolve_file_path`` and was mangled into a string that was neither a URL nor
+    a real path -- ``//`` collapsed to the platform separator, the whole URL
+    anchored under the workspace, and the ``?t=`` cachebuster still attached --
+    which then failed deep inside whatever consumed it.
+    https://github.com/griptape-ai/griptape-nodes-engine/issues/5283
 
     Args:
-        path_str: A plain path string containing no macro variables.
+        path_str: A plain location string containing no macro variables.
 
     Returns:
-        An absolute path string.
+        An absolute path string, or the original URL when it names no local file.
     """
     local_path = parse_file_uri(path_str)
     if local_path is not None:
         path_str = local_path
+
     workspace_path = GriptapeNodes.ConfigManager().workspace_path
+
+    if is_url(path_str):
+        static_server_path = parse_static_server_url(path_str, workspace_path)
+        # A URL naming no local file (remote host, non-localhost `file://`) has no
+        # path to resolve to, so it passes through for the consumer to fetch.
+        if static_server_path is None:
+            return path_str
+        return str(resolve_path_safely(static_server_path))
+
     return str(resolve_file_path(path_str, workspace_path))
 
 
@@ -270,14 +307,27 @@ class File:
     def resolve(self) -> str:
         """Resolve and return the absolute path string for this file.
 
-        Useful when a caller needs the path for writing (not reading). Macro
-        variables in the path are resolved against the current project at call
-        time; plain relative paths are anchored to the workspace directory (the
-        same base the read/write pipeline uses), so the returned path is always
-        absolute.
+        Useful when a caller needs a location it can hand to something that does
+        its own I/O -- a subprocess argument for FFmpeg, say -- rather than
+        reading the bytes through this object.
+
+        Macro variables in the path are resolved against the current project at
+        call time; plain relative paths are anchored to the workspace directory
+        (the same base the read/write pipeline uses).
+
+        A location that is a URL is handled rather than treated as a path. A
+        localhost static file server URL -- the form the engine passes node
+        outputs around in -- names a file that is already inside the workspace, so
+        it resolves to that file's real local path. Any other URL is returned
+        unchanged, because it has no local path to resolve to.
+
+        So the return value is an absolute local path in every case except a URL
+        naming a file that is not on this machine, where it is that URL. Callers
+        that require a local path (rather than something FFmpeg can also open over
+        HTTP) should check what they get back.
 
         Returns:
-            Absolute path string.
+            Absolute path string, or the original URL when it names no local file.
 
         Raises:
             FileLoadError: If macro resolution fails (e.g. no project loaded).
@@ -805,8 +855,10 @@ class FileDestination:
     def resolve(self) -> str:
         """Resolve and return the absolute path string for this destination.
 
+        See ``File.resolve`` for how URL locations are handled.
+
         Returns:
-            Absolute path string.
+            Absolute path string, or the original URL when it names no local file.
 
         Raises:
             FileLoadError: If macro resolution fails (e.g. no project loaded).

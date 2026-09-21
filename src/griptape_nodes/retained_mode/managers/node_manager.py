@@ -42,7 +42,7 @@ from griptape_nodes.exe_types.core_types import (
     ParameterTypeBuiltin,
 )
 from griptape_nodes.exe_types.flow import ControlFlow
-from griptape_nodes.exe_types.node_groups import SubflowNodeGroup
+from griptape_nodes.exe_types.node_groups import NodeGroupMembershipError, SubflowNodeGroup
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
 from griptape_nodes.exe_types.node_types import (
     LOCAL_EXECUTION,
@@ -55,6 +55,7 @@ from griptape_nodes.exe_types.node_types import (
     aprocess_scope,
     sanctioned_parameter_mutation,
 )
+from griptape_nodes.machines.dag_builder import NodeState
 from griptape_nodes.node_library.library_declarations import (
     ArbitraryPythonExecutionNodeProperty,
     LifecycleStageLibraryProperty,
@@ -165,6 +166,7 @@ from griptape_nodes.retained_mode.events.node_events import (
     SerializeNodeToCommandsResultFailure,
     SerializeNodeToCommandsResultSuccess,
     SerializeSelectedNodesToCommandsRequest,
+    SerializeSelectedNodesToCommandsResultFailure,
     SerializeSelectedNodesToCommandsResultSuccess,
     SetLockNodeStateRequest,
     SetLockNodeStateResultFailure,
@@ -245,6 +247,28 @@ logger = logging.getLogger("griptape_nodes")
 # Sentinel for "key not present in node.parameter_values". Distinct from None
 # so a legitimately-stored None does not collide with "missing".
 _PARAM_MISSING = object()
+
+# A node in one of these states owes the running flow nothing further, so deleting it takes
+# nothing away from the run.
+_SETTLED_NODE_STATES = frozenset({NodeState.DONE, NodeState.CANCELED, NodeState.ERRORED})
+
+# A node in one of these states has not been dispatched yet. Dispatch is when a node collects
+# values from its upstream nodes (see ExecuteDagState.collect_values_from_upstream_nodes), so a
+# node still in one of these states has NOT received its inputs and would fall back to its
+# parameter defaults if an upstream disappeared first.
+_UNCOLLECTED_NODE_STATES = frozenset({NodeState.WAITING, NodeState.QUEUED})
+
+
+@dataclass
+class _FlowCancelOutcome:
+    """What deleting a node did to the workflow that was running, if any.
+
+    Both halves are worth reporting: a delete that could not stop the run has to fail, and a delete
+    that did stop it has to say so, or the run appears to stop for no stated reason.
+    """
+
+    failure: ResultPayload | None = None
+    cancelled_for_node_name: str | None = None
 
 
 class SerializedParameterValues(NamedTuple):
@@ -857,6 +881,64 @@ class NodeManager(EngineScoped):
         if remapped_requested_node_name:
             details = f"{details}. Had to rename from original node name requested '{request.node_name}' as an object with this name already existed."
 
+        # Handle parent_group_name: add this node to an existing group.
+        # This must happen before the paired-node handling below so the auto-created
+        # End node can inherit the same group as its Start node.
+        if request.parent_group_name:
+            try:
+                # get_node_by_name raises ValueError for a missing node, not KeyError — unlike
+                # object_manager.get_object_by_name, which the _get_node_group helpers call directly.
+                parent_group = self.get_node_by_name(request.parent_group_name)
+            except ValueError:
+                parent_group = None
+                logger.warning(
+                    "Attempted to add node '%s' to parent group '%s'. Failed because group was not found.",
+                    node.name,
+                    request.parent_group_name,
+                )
+
+            if parent_group is not None and not isinstance(parent_group, BaseNodeGroup):
+                logger.warning(
+                    "Attempted to add node '%s' to '%s'. Failed because it is not a BaseNodeGroup.",
+                    node.name,
+                    request.parent_group_name,
+                )
+            elif isinstance(parent_group, BaseNodeGroup):
+                # add_nodes_to_group can fail mid-way (a SubflowNodeGroup raises RuntimeError when the
+                # per-node MoveNodeToNewFlowRequest fails). Keep node creation recoverable rather than
+                # letting that escape after the node is already registered, matching node_names_to_add below.
+                # Snapshot membership so a failure can release whatever the call actually joined: an add
+                # may take in more than it was handed (tethered companions, nodes detached from a
+                # previous owner), and the raise denies us its return value.
+                members_before_add = set(parent_group.nodes)
+                try:
+                    parent_group.add_nodes_to_group([node])
+                except Exception as err:
+                    group_failure = (
+                        f"Created the node, but could not add it to group '{request.parent_group_name}': {err}"
+                    )
+                    logger.warning(
+                        "Attempted to add node '%s' to parent group '%s'. Failed with error: %s",
+                        node.name,
+                        request.parent_group_name,
+                        err,
+                    )
+                    # A failed add leaves nodes listed as members without having been moved into the
+                    # group's subflow. Release them so they end up plainly ungrouped instead of
+                    # half-joined, and so the reported parent_group_name below matches reality.
+                    nodes_to_release = [n for name, n in parent_group.nodes.items() if name not in members_before_add]
+                    try:
+                        parent_group.remove_nodes_from_group(nodes_to_release)
+                    except Exception as cleanup_err:
+                        logger.error(
+                            "Attempted to release nodes '%s' from group '%s' after a failed add. Failed with error: %s. They may still be listed as members of the group.",
+                            [n.name for n in nodes_to_release],
+                            request.parent_group_name,
+                            cleanup_err,
+                        )
+                    details = f"{details}. {group_failure}"
+                    log_level = logging.WARNING
+
         # Special handling for paired classes (e.g., create a Start node and it automatically creates a corresponding End node already connected).
         if isinstance(node, BaseIterativeStartNode) and not request.initial_setup:
             # If it's StartLoop, create an EndLoop and connect it to the StartLoop.
@@ -873,6 +955,8 @@ class NodeManager(EngineScoped):
                 msg = f"Attempted to create a paired set of nodes for Node '{final_node_name}'. Failed because paired class '{end_class_name}' does not exist for start class '{node_class_name}'. The corresponding node will have to be created by hand and attached manually."
                 logger.error(msg)  # while this is bad, it's not unsalvageable, so we'll consider this a success.
             else:
+                # Place the paired End node in the same group as the Start node (if any).
+                paired_parent_group_name = node.parent_group.name if node.parent_group else None
                 # Create the EndNode
                 end_loop = self.engine.handle_request(
                     CreateNodeRequest(
@@ -881,6 +965,7 @@ class NodeManager(EngineScoped):
                             "position": {"x": node.metadata["position"]["x"] + 650, "y": node.metadata["position"]["y"]}
                         },
                         override_parent_flow_name=parent_flow_name,
+                        parent_group_name=paired_parent_group_name,
                     )
                 )
                 if not isinstance(end_loop, CreateNodeResultSuccess):
@@ -947,25 +1032,6 @@ class NodeManager(EngineScoped):
                     f"Failed because node is not a BaseNodeGroup."
                 )
                 logger.warning(warning_details)
-
-        # Handle parent_group_name: add this node to an existing group
-        if request.parent_group_name:
-            try:
-                parent_group = self.get_node_by_name(request.parent_group_name)
-                if isinstance(parent_group, BaseNodeGroup):
-                    parent_group.add_nodes_to_group([node])
-                else:
-                    logger.warning(
-                        "Attempted to add node '%s' to '%s'. Failed because it is not a BaseNodeGroup.",
-                        node.name,
-                        request.parent_group_name,
-                    )
-            except KeyError:
-                logger.warning(
-                    "Attempted to add node '%s' to parent group '%s'. Failed because group was not found.",
-                    node.name,
-                    request.parent_group_name,
-                )
 
         return CreateNodeResultSuccess(
             node_name=node.name,
@@ -1039,7 +1105,15 @@ class NodeManager(EngineScoped):
         return node_group
 
     def on_add_nodes_to_node_group_request(self, request: AddNodesToNodeGroupRequest) -> ResultPayload:
-        """Handle AddNodeToNodeGroupRequest to add a node to an existing NodeGroup."""
+        """Handle AddNodeToNodeGroupRequest to add a node to an existing NodeGroup.
+
+        In a SubflowNodeGroup, tethered nodes travel together: adding an iterative Start node also
+        adds its paired End node (and vice versa), so the pair is never split across the subflow
+        boundary. The GUI sends only the node the user selected, so the group layer enforces this
+        rather than the caller. A plain BaseNodeGroup has no flow of its own and groups exactly what
+        it was asked for. Either way `node_names_added` reports what actually happened, which may be
+        more than was requested. Removal mirrors this — see on_remove_node_from_node_group_request.
+        """
         flow_result = self._get_flow_for_node_group_operation(request.flow_name)
         if isinstance(flow_result, AddNodesToNodeGroupResultFailure):
             return flow_result
@@ -1055,14 +1129,17 @@ class NodeManager(EngineScoped):
         node_group = node_group_result
 
         try:
-            node_group.add_nodes_to_group(nodes)
+            nodes_added = node_group.add_nodes_to_group(nodes)
         except Exception as err:
-            details = f"Attempted to add node '{request.node_names}' to NodeGroup '{request.node_group_name}'. Failed with error: {err}"
+            details = f"Attempted to add nodes '{request.node_names}' to NodeGroup '{request.node_group_name}'. Failed with error: {err}"
             return AddNodesToNodeGroupResultFailure(result_details=details)
 
-        details = f"Successfully added node '{request.node_names}' to NodeGroup '{request.node_group_name}'"
+        node_names_added = [n.name for n in nodes_added]
+        details = f"Successfully added nodes '{node_names_added}' to NodeGroup '{request.node_group_name}'"
         return AddNodesToNodeGroupResultSuccess(
             result_details=ResultDetails(message=details, level=logging.DEBUG),
+            node_names_added=node_names_added,
+            node_group_name=request.node_group_name,
         )
 
     def _get_flow_for_remove_operation(self, flow_name: str | None) -> RemoveNodeFromNodeGroupResultFailure | None:
@@ -1126,7 +1203,13 @@ class NodeManager(EngineScoped):
         return node_group
 
     def on_remove_node_from_node_group_request(self, request: RemoveNodeFromNodeGroupRequest) -> ResultPayload:
-        """Handle RemoveNodeFromNodeGroupRequest to remove nodes from an existing NodeGroup."""
+        """Handle RemoveNodeFromNodeGroupRequest to remove nodes from an existing NodeGroup.
+
+        Mirrors the add path. In a SubflowNodeGroup, removing an iterative Start node also removes
+        its paired End node (and vice versa), so the pair never ends up split with one half still in
+        the group. A plain BaseNodeGroup removes exactly what it was asked for, skipping any node
+        that is not a member. `node_names_removed` reports what actually left the group.
+        """
         flow_result = self._get_flow_for_remove_operation(request.flow_name)
         if isinstance(flow_result, RemoveNodeFromNodeGroupResultFailure):
             return flow_result
@@ -1142,24 +1225,37 @@ class NodeManager(EngineScoped):
         node_group = node_group_result
 
         try:
-            node_group.remove_nodes_from_group(nodes)
-        except ValueError as err:
+            nodes_removed = node_group.remove_nodes_from_group(nodes)
+        except (ValueError, RuntimeError, NodeGroupMembershipError) as err:
+            # ValueError: a requested node is not a member. NodeGroupMembershipError: a
+            # SubflowNodeGroup could not move a node back to the parent flow, which tether expansion
+            # makes likelier by doubling the moves per request. RuntimeError: raised by group code
+            # predating that specific type.
             details = f"Attempted to remove nodes '{request.node_names}' from NodeGroup '{request.node_group_name}'. Failed with error: {err}"
             return RemoveNodeFromNodeGroupResultFailure(result_details=details)
 
-        details = f"Successfully removed nodes '{request.node_names}' from NodeGroup '{request.node_group_name}'"
+        node_names_removed = [n.name for n in nodes_removed]
+        details = f"Successfully removed nodes '{node_names_removed}' from NodeGroup '{request.node_group_name}'"
         return RemoveNodeFromNodeGroupResultSuccess(
             result_details=ResultDetails(message=details, level=logging.DEBUG),
+            node_names_removed=node_names_removed,
+            node_group_name=request.node_group_name,
         )
 
-    def cancel_conditionally(
+    async def cancel_conditionally(
         self, parent_flow: ControlFlow, parent_flow_name: str, node: BaseNode
-    ) -> ResultPayload | None:
-        """Conditionally cancels a parent flow if it's currently executing nodes are connected to the specified node.
+    ) -> _FlowCancelOutcome:
+        """Cancel the running flow if deleting this node would take unfinished work away from it.
 
-        This method checks if the parent flow is running, and if so, determines whether the currently
-        executing or resolving node is connected to the specified node. If a connection exists, the parent
-        flow is cancelled to prevent operations on the deleted node.
+        Only genuine entanglement cancels. Sharing a connected component with something live is not
+        enough: a node the run has already finished with, or one the run was never going to reach,
+        can be deleted while the run carries on.
+
+        The cancel is awaited rather than dispatched synchronously. `on_cancel_flow_request` is an async
+        handler that gathers the running node tasks, and those tasks belong to the engine's event loop.
+        Dispatching it from sync code bridges it onto a side loop instead, where the gather cannot bind to
+        the tasks it is waiting on -- so the cancel raised "attached to a different loop" and every delete
+        during a run was refused.
 
         Args:
             parent_flow: The control flow object that may need to be cancelled.
@@ -1167,43 +1263,141 @@ class NodeManager(EngineScoped):
             node: The base node that is trying to be deleted.
 
         Returns:
-            ResultPayload: A DeleteNodeResultFailure if cancellation was attempted but failed.
-            None: If no cancellation was needed or cancellation succeeded.
+            An outcome carrying a DeleteNodeResultFailure if cancellation was attempted but failed,
+            and the name of the live node the cancellation was for if one happened. Both are empty
+            when the delete took nothing away from the run.
 
         Note:
             This method also clears the flow queue regardless of whether cancellation occurred,
             to ensure the specified node is not processed in the future.
         """
-        if self.engine.flow_manager.check_for_existing_running_flow():
-            # get the current node executing / resolving
-            # if it's in connected nodes, cancel flow.
-            # otherwise, leave it.
-            control_node_names, resolving_node_names, _ = self.engine.flow_manager.flow_state(parent_flow)
-            connected_nodes = parent_flow.get_all_connected_nodes(node)
-            cancelled = False
-            if control_node_names is not None:
-                for control_node_name in control_node_names:
-                    control_node = self.engine.object_manager.get_object_by_name(control_node_name)
-                    if control_node in connected_nodes:
-                        result = self.engine.handle_request(CancelFlowRequest(flow_name=parent_flow_name))
-                        cancelled = True
-                        if result.failed():
-                            details = f"Attempted to delete a Node '{node.name}'. Failed because running flow could not cancel."
-                            return DeleteNodeResultFailure(result_details=details)
-            if resolving_node_names is not None and not cancelled:
-                for resolving_node_name in resolving_node_names:
-                    resolving_node = self.engine.object_manager.get_object_by_name(resolving_node_name)
-                    if resolving_node in connected_nodes:
-                        result = self.engine.handle_request(CancelFlowRequest(flow_name=parent_flow_name))
-                        if result.failed():
-                            details = f"Attempted to delete a Node '{node.name}'. Failed because running flow could not cancel."
-                            return DeleteNodeResultFailure(result_details=details)
-                        break  # Only need to cancel once
-            # Clear the execution queue, because we don't want to hit this node eventually.
-            parent_flow.clear_execution_queue()
+        if not self.engine.flow_manager.check_for_existing_running_flow():
+            return _FlowCancelOutcome()
+
+        entangled_node_name = self._find_entangled_live_node(node)
+        if entangled_node_name is not None:
+            result = await self.engine.ahandle_request(CancelFlowRequest(flow_name=parent_flow_name))
+            if result.failed():
+                details = f"Attempted to delete a Node '{node.name}'. Failed because running flow could not cancel."
+                return _FlowCancelOutcome(failure=DeleteNodeResultFailure(result_details=details))
+
+        # Clear the execution queue, because we don't want to hit this node eventually.
+        parent_flow.clear_execution_queue()
+        return _FlowCancelOutcome(cancelled_for_node_name=entangled_node_name)
+
+    def _find_entangled_live_node(self, node: BaseNode) -> str | None:
+        """Name the live node that deleting `node` would damage, or None if nothing would be.
+
+        Three ways a delete can damage a run, and only these three:
+
+        1. The node is part of the live run and has not settled, so the run is still counting on it
+           to produce something.
+        2. A node in the live run has not been dispatched yet and is fed by this node -- directly, or
+           through data nodes in between that will be pulled in along with it. Dispatch is when a node
+           collects its inputs from upstream, so a consumer that has not been dispatched has not
+           received this node's outputs and would fall back to its parameter defaults -- finishing the
+           run with the wrong answer and no indication anything went wrong.
+        3. The run is gated on this node: a data node is registered as reachable only once this node
+           finishes, and would otherwise wait forever for something that is never coming.
+
+        A consumer that is already processing or done has its values, so it is not damaged. Control
+        connections count the same as data connections here: deleting a settled node whose control
+        output feeds a node that has not started truncates the chain and can strand it.
+
+        Absence from the DAG does not mean the run will never reach the node, for two separate
+        reasons. The DAG grows along the control chain as it executes: only control *entry* nodes are
+        seeded up front, and a chain member is added when its predecessor completes, so a consumer one
+        step further down the chain is legitimately absent while its predecessor runs. And a pure data
+        node is absent until the run reaches whatever consumes it, at which point it is pulled in as a
+        dependency. Case 2 asks `_run_will_reach` about both rather than reading absence as safety.
+
+        Scope: this reads the *global* DAG. A node executing inside an isolated subflow (a group body,
+        a ForEach iteration) runs on that subflow's own `DagBuilder` and never appears here, so
+        deleting one of those does not cancel. See `FlowManager._is_node_executing`, which has the
+        same blind spot.
+        """
+        dag_builder = self.engine.flow_manager.global_dag_builder
+        dag_nodes = dag_builder.node_to_reference
+
+        own_dag_node = dag_nodes.get(node.name)
+        if own_dag_node is not None and own_dag_node.node_state not in _SETTLED_NODE_STATES:
+            return node.name
+
+        connections = self.engine.flow_manager.get_connections()
+        for connection in connections.get_all_outgoing_connections(node):
+            target_node = connection.target_node
+            target_dag_node = dag_nodes.get(target_node.name)
+            if target_dag_node is not None and target_dag_node.node_state in _UNCOLLECTED_NODE_STATES:
+                return target_node.name
+            if target_dag_node is None and self._run_will_reach(target_node):
+                return target_node.name
+
+        for gated_node_name, boundary_nodes_by_graph in dag_builder.start_node_candidates.items():
+            for boundary_node_names in boundary_nodes_by_graph.values():
+                if node.name in boundary_node_names:
+                    return gated_node_name
+
         return None
 
-    def on_delete_node_request(self, request: DeleteNodeRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915 (Complex logic, lots of edge cases)
+    def _run_will_reach(self, node: BaseNode, visited: set[str] | None = None) -> bool:
+        """Whether the live run is still going to arrive at a node that is not in the DAG yet.
+
+        A run arrives at a node in one of two ways, and both have to be asked about.
+
+        It walks into it along the control chain. That is answered by walking control connections
+        forward from the nodes the run has live right now. Anchoring on live nodes rather than on the
+        graphs' start nodes matters in both directions: a node further down the chain is correctly
+        reported as coming, while one the run has already gone past is not, because nothing live
+        leads back to it.
+
+        Or it pulls the node in as a *data dependency* of whatever consumes it, when it arrives at
+        that consumer. A node reached only by data connections has no control connections of its own,
+        so the walk above can never find it -- it is not on the control graph at all. For those, the
+        run arriving is a fact about their consumers rather than about the node, which is why this
+        recurses, asking each consumer the same pair of questions `_find_entangled_live_node` asks of
+        a direct target: already in the DAG and uncollected, or absent but still coming. Control
+        connections are excluded from that recursion on purpose: control reachability was already
+        answered exhaustively above, over every branch including untaken ones, so following a control
+        edge again could only add a false positive.
+
+        The recursion stops at any consumer the run has already placed in the DAG. Such a node is not
+        going to be pulled in again as somebody's dependency, and if it is not uncollected then it
+        took its inputs at its own dispatch -- so anything past it is reached through a value that was
+        never wrong.
+
+        One way to be here is conservative rather than necessary: an intermediate node absent because
+        it is already RESOLVED will not be rebuilt into this DAG, so the consumer would collect its
+        last-good value rather than a parameter default. Cancelling in the safe direction is the
+        policy, so that case cancels too.
+        """
+        if visited is None:
+            visited = set()
+        if node.name in visited:
+            return False
+        visited.add(node.name)
+
+        dag_builder = self.engine.flow_manager.global_dag_builder
+        connections = self.engine.flow_manager.get_connections()
+
+        for dag_node in dag_builder.node_to_reference.values():
+            if dag_node.node_state in _SETTLED_NODE_STATES:
+                continue
+            if connections.is_node_in_forward_control_path(dag_node.node_reference, node):
+                return True
+
+        for connection in connections.get_all_outgoing_connections(node):
+            if connection.source_parameter.output_type == ParameterTypeBuiltin.CONTROL_TYPE.value:
+                continue
+            consumer = connection.target_node
+            consumer_dag_node = dag_builder.node_to_reference.get(consumer.name)
+            if consumer_dag_node is not None and consumer_dag_node.node_state in _UNCOLLECTED_NODE_STATES:
+                return True
+            if consumer_dag_node is None and self._run_will_reach(consumer, visited):
+                return True
+
+        return False
+
+    async def on_delete_node_request(self, request: DeleteNodeRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915 (Complex logic, lots of edge cases)
         node_name = request.node_name
         node = None
         if node_name is None:
@@ -1230,9 +1424,14 @@ class NodeManager(EngineScoped):
                 details = f"Attempted to delete a Node '{node_name}'. Error: {err}"
                 return DeleteNodeResultFailure(result_details=details)
 
-            cancel_result = self.cancel_conditionally(parent_flow, parent_flow_name, node)
-            if cancel_result is not None:
-                return cancel_result
+            cancel_outcome = await self.cancel_conditionally(parent_flow, parent_flow_name, node)
+            if cancel_outcome.failure is not None:
+                return cancel_outcome.failure
+
+            # The node is leaving, so the live DAG has to stop naming it: it is published to the
+            # editor as an involved node, iterated on cancel, and checked before a node is allowed
+            # to start. Harmless when the run was cancelled above, since teardown clears it anyway.
+            self.engine.flow_manager.global_dag_builder.remove_node(node_name)
 
             # Call after_node_deleted hook for cleanup of a node, implemented by node author.
             try:
@@ -1306,6 +1505,15 @@ class NodeManager(EngineScoped):
             self.engine.context_manager.pop_node()
 
         details = f"Successfully deleted Node '{node_name}'."
+        # Stopping a run the artist started is not something to do silently. Say it happened, and say
+        # which node still needed the deleted one, so the reason is not left to guesswork.
+        if cancel_outcome.cancelled_for_node_name == node_name:
+            details += " Cancelled the running workflow, because this Node was still running."
+        elif cancel_outcome.cancelled_for_node_name is not None:
+            details += (
+                f" Cancelled the running workflow, because Node '{cancel_outcome.cancelled_for_node_name}' "
+                f"was still waiting on it."
+            )
         return DeleteNodeResultSuccess(result_details=details)
 
     def on_move_node_to_new_flow_request(self, request: MoveNodeToNewFlowRequest) -> ResultPayload:  # noqa: PLR0911
@@ -3383,6 +3591,8 @@ class NodeManager(EngineScoped):
         group_node: BaseNodeGroup,
         unique_uuid_to_values: dict,
         serialized_parameter_value_tracker: SerializedParameterValueTracker,
+        *,
+        serialize_all_parameter_values: bool = False,
     ) -> SerializedGroupResult:
         """Serialize a group node and its children for copy/paste operations.
 
@@ -3395,6 +3605,8 @@ class NodeManager(EngineScoped):
             group_node: The group node to serialize
             unique_uuid_to_values: Shared dictionary for tracking pickled parameter values
             serialized_parameter_value_tracker: Tracker for parameter value hashes
+            serialize_all_parameter_values: If True, capture every parameter value on the group and
+                on each child, not just the ones the ordinary save condition would record
 
         Returns:
             SerializedGroupResult containing the group command, child commands, and child UUIDs
@@ -3411,6 +3623,7 @@ class NodeManager(EngineScoped):
                 unique_parameter_uuid_to_values=unique_uuid_to_values,
                 serialized_parameter_value_tracker=serialized_parameter_value_tracker,
                 use_pickling=True,
+                serialize_all_parameter_values=serialize_all_parameter_values,
             )
         )
 
@@ -3437,6 +3650,7 @@ class NodeManager(EngineScoped):
                     unique_parameter_uuid_to_values=unique_uuid_to_values,
                     serialized_parameter_value_tracker=serialized_parameter_value_tracker,
                     use_pickling=True,
+                    serialize_all_parameter_values=serialize_all_parameter_values,
                 )
             )
 
@@ -3697,6 +3911,7 @@ class NodeManager(EngineScoped):
                     create_node_request=create_node_request,
                     workflow_manager=self.engine.workflow_manager,
                     use_pickling=request.use_pickling,
+                    serialize_all_parameter_values=request.serialize_all_parameter_values,
                 )
                 if set_param_value_requests is not None:
                     set_value_commands.extend(set_param_value_requests)
@@ -3927,7 +4142,7 @@ class NodeManager(EngineScoped):
             node = self.engine.object_manager.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 details = f"Attempted to serialize a selection of Nodes. Failed to get node '{node_name}'."
-                return SerializeNodeToCommandsResultFailure(result_details=details)
+                return SerializeSelectedNodesToCommandsResultFailure(result_details=details)
 
             if isinstance(node, BaseNodeGroup):
                 # Use special method to handle group + children
@@ -3939,7 +4154,7 @@ class NodeManager(EngineScoped):
 
                 if group_result.group_command is None:
                     details = f"Attempted to serialize a selection of Nodes. Failed to serialize group '{node_name}'."
-                    return SerializeNodeToCommandsResultFailure(result_details=details)
+                    return SerializeSelectedNodesToCommandsResultFailure(result_details=details)
 
                 # Process the group node command
                 node_commands[node_name] = group_result.group_command
@@ -3952,7 +4167,7 @@ class NodeManager(EngineScoped):
                     child_name = child_command.create_node_command.node_name
                     if not child_name:
                         details = f"Attempted to serialize group node '{node.name}'. Failed because child node command has no name."
-                        return SerializeNodeToCommandsResultFailure(result_details=details)
+                        return SerializeSelectedNodesToCommandsResultFailure(result_details=details)
                     if child_name in explicitly_selected and child_name in node_commands:
                         # We need to remove the explicitly selected name from the commands that already exist
                         node_commands.pop(child_name)
@@ -3987,7 +4202,7 @@ class NodeManager(EngineScoped):
                 )
                 if not isinstance(result, SerializeNodeToCommandsResultSuccess):
                     details = f"Attempted to serialize a selection of Nodes. Failed to serialize {node_name}."
-                    return SerializeNodeToCommandsResultFailure(result_details=details)
+                    return SerializeSelectedNodesToCommandsResultFailure(result_details=details)
                 node_commands[node_name] = result.serialized_node_commands
                 node_name_to_uuid[node_name] = result.serialized_node_commands.node_uuid
                 parameter_commands[result.serialized_node_commands.node_uuid] = result.set_parameter_value_commands
@@ -4322,7 +4537,7 @@ class NodeManager(EngineScoped):
                     try:
                         unique_parameter_uuid_to_values[unique_uuid] = copy.deepcopy(value)
                     except Exception:
-                        details = f"Attempted to serialize parameter '{parameter_name}` on node '{node_name}'. The parameter value could not be copied. It will be serialized by value. If problems arise from this, ensure the type '{type(value)}' works with copy.deepcopy()."
+                        details = f"Attempted to serialize parameter '{parameter_name}' on node '{node_name}'. The parameter value could not be copied. It will be serialized by value. If problems arise from this, ensure the type '{type(value)}' works with copy.deepcopy()."
                         logger.warning(details)
                         unique_parameter_uuid_to_values[unique_uuid] = value
                 serialized_parameter_value_tracker.add_as_serializable(value_id, unique_uuid)
@@ -5279,7 +5494,7 @@ class NodeManager(EngineScoped):
             result_details=details,
         )
 
-    def on_reset_node_to_defaults_request(self, request: ResetNodeToDefaultsRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
+    async def on_reset_node_to_defaults_request(self, request: ResetNodeToDefaultsRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
         """Reset a node to its default state while preserving connections where possible."""
         node_name = request.node_name
         node = None
@@ -5388,7 +5603,7 @@ class NodeManager(EngineScoped):
 
         # FAILURE CHECK: Delete source node
         delete_request = DeleteNodeRequest(node_name=node_name)
-        delete_result = self.on_delete_node_request(delete_request)
+        delete_result = await self.on_delete_node_request(delete_request)
         if not isinstance(delete_result, DeleteNodeResultSuccess):
             details = f"Attempted to reset Node '{node_name}'. Failed to delete original node."
             return ResetNodeToDefaultsResultFailure(result_details=details)

@@ -17,12 +17,22 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands
 
 from griptape_nodes.exe_types.core_types import Parameter
+from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_types import NodeDependencies
-from griptape_nodes.node_library.workflow_registry import Workflow, WorkflowMetadata, WorkflowRegistry, WorkflowShape
+from griptape_nodes.node_library.workflow_registry import (
+    Workflow,
+    WorkflowMetadata,
+    WorkflowRegistry,
+    WorkflowShape,
+    read_workflow_metadata,
+)
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.flow_events import SerializedFlowCommands
 from griptape_nodes.retained_mode.events.workflow_events import (
+    BranchWorkflowRequest,
+    BranchWorkflowResultFailure,
+    BranchWorkflowResultSuccess,
     CreateWorkflowFromTemplateRequest,
     CreateWorkflowFromTemplateResultFailure,
     CreateWorkflowFromTemplateResultSuccess,
@@ -45,11 +55,18 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     LoadWorkflowMetadata,
     LoadWorkflowMetadataResultFailure,
     LoadWorkflowMetadataResultSuccess,
+    MergeWorkflowBranchRequest,
+    MergeWorkflowBranchResultSuccess,
     MoveWorkflowRequest,
     MoveWorkflowResultFailure,
     MoveWorkflowResultSuccess,
+    RegisterWorkflowRequest,
     RegisterWorkflowResultFailure,
     RegisterWorkflowResultSuccess,
+    ResetWorkflowBranchRequest,
+    ResetWorkflowBranchResultSuccess,
+    RunWorkflowWithCurrentStateRequest,
+    RunWorkflowWithCurrentStateResultFailure,
     SetWorkflowMetadataRequest,
     SetWorkflowMetadataResultSuccess,
     WorkflowDependencyInfo,
@@ -57,10 +74,10 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     WorkflowInfoSummary,
     WorkflowStatus,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.context_manager import ContextManager
 from griptape_nodes.retained_mode.managers.fitness_problems.workflows import (
     InvalidTomlFormatProblem,
+    LibraryNotRegisteredProblem,
     MissingTomlSectionProblem,
 )
 from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
@@ -151,9 +168,9 @@ class TestWorkflowManager:
         assert isinstance(result["is_user_defined"], bool)
         assert result["is_user_defined"] is True
 
-    def test_on_import_workflow_request_success(self, griptape_nodes: Engine) -> None:
+    def test_on_import_workflow_request_success(self, engine: Engine) -> None:
         """Test successful workflow import."""
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         request = ImportWorkflowRequest(file_path="/path/to/workflow.py")
 
         mock_metadata = MagicMock()
@@ -182,9 +199,9 @@ class TestWorkflowManager:
             # Registry key is derived from the file path (minus extension), not from metadata.name.
             assert result.workflow_name == "workflow"
 
-    def test_on_import_workflow_request_already_registered(self, griptape_nodes: Engine) -> None:
+    def test_on_import_workflow_request_already_registered(self, engine: Engine) -> None:
         """Test import when workflow is already registered."""
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         request = ImportWorkflowRequest(file_path="/path/to/workflow.py")
 
         mock_metadata = MagicMock()
@@ -206,9 +223,9 @@ class TestWorkflowManager:
             # Registry key is derived from the file path (minus extension), not from metadata.name.
             assert result.workflow_name == "/path/to/workflow"
 
-    def test_on_import_workflow_request_metadata_load_failure(self, griptape_nodes: Engine) -> None:
+    def test_on_import_workflow_request_metadata_load_failure(self, engine: Engine) -> None:
         """Test import when metadata loading fails."""
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         request = ImportWorkflowRequest(file_path="/path/to/workflow.py")
 
         with patch.object(
@@ -222,9 +239,9 @@ class TestWorkflowManager:
             assert isinstance(result.result_details, ResultDetails)
             assert result.result_details.result_details[0].message == "Failed to load metadata"
 
-    def test_on_import_workflow_request_registration_failure(self, griptape_nodes: Engine) -> None:
+    def test_on_import_workflow_request_registration_failure(self, engine: Engine) -> None:
         """Test import when registration fails."""
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         request = ImportWorkflowRequest(file_path="/path/to/workflow.py")
 
         mock_metadata = MagicMock()
@@ -251,9 +268,9 @@ class TestWorkflowManager:
             assert isinstance(result.result_details, ResultDetails)
             assert result.result_details.result_details[0].message == "Registration failed"
 
-    def test_get_workflow_metadata_success(self, griptape_nodes: Engine) -> None:
+    def test_get_workflow_metadata_success(self, engine: Engine) -> None:
         """Ensure GetWorkflowMetadataRequest returns workflow.metadata directly."""
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         request = GetWorkflowMetadataRequest(workflow_name="my_workflow")
 
         mock_metadata = MagicMock()
@@ -266,9 +283,9 @@ class TestWorkflowManager:
         assert isinstance(result, GetWorkflowMetadataResultSuccess)
         assert result.workflow_metadata is mock_metadata
 
-    def test_get_workflow_metadata_not_found(self, griptape_nodes: Engine) -> None:
+    def test_get_workflow_metadata_not_found(self, engine: Engine) -> None:
         """Ensure GetWorkflowMetadataRequest returns failure when workflow missing."""
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         request = GetWorkflowMetadataRequest(workflow_name="missing_workflow")
 
         with patch.object(WorkflowRegistry, "get_workflow_by_name", side_effect=KeyError("not found")):
@@ -276,9 +293,9 @@ class TestWorkflowManager:
 
         assert isinstance(result, GetWorkflowMetadataResultFailure)
 
-    def test_set_workflow_metadata_success(self, griptape_nodes: Engine) -> None:
+    def test_set_workflow_metadata_success(self, engine: Engine) -> None:
         """Ensure SetWorkflowMetadataRequest replaces metadata and persists header."""
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         workflow_manager._workflows_loading_complete.set()  # type: ignore[attr-defined]
 
         # Provide a full metadata object (mock is fine as we stub header replacement)
@@ -307,9 +324,9 @@ class TestWorkflowManager:
         assert isinstance(result, SetWorkflowMetadataResultSuccess)
         write_mock.assert_called_once()
 
-    def test_on_create_workflow_from_template_request_success(self, griptape_nodes: Engine) -> None:
+    def test_on_create_workflow_from_template_request_success(self, engine: Engine) -> None:
         """Test successful create workflow from template (Griptape or user-provided)."""
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         request = CreateWorkflowFromTemplateRequest(template_name="my_template")
 
         mock_template = MagicMock()
@@ -365,9 +382,9 @@ class TestWorkflowManager:
         assert result.workflow_name == "my_template_1"
         assert result.file_path == new_full_path
 
-    def test_on_create_workflow_from_template_request_absolute_file_path(self, griptape_nodes: Engine) -> None:
+    def test_on_create_workflow_from_template_request_absolute_file_path(self, engine: Engine) -> None:
         """Test that templates with absolute file paths save the new workflow in the workspace, not at the template path."""
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         request = CreateWorkflowFromTemplateRequest(
             template_name="/some/external/library/workflows/templates/my_template"
         )
@@ -427,9 +444,9 @@ class TestWorkflowManager:
         # not the full absolute path, so the file is saved in the workspace.
         assert generate_unique_filename_calls == ["my_template"]
 
-    def test_on_create_workflow_from_template_request_template_not_found(self, griptape_nodes: Engine) -> None:
+    def test_on_create_workflow_from_template_request_template_not_found(self, engine: Engine) -> None:
         """Test create from template when template is not in registry."""
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         request = CreateWorkflowFromTemplateRequest(template_name="missing_template")
 
         with patch.object(
@@ -442,9 +459,9 @@ class TestWorkflowManager:
         assert isinstance(result, CreateWorkflowFromTemplateResultFailure)
         assert "missing_template" in str(result.result_details)
 
-    def test_on_create_workflow_from_template_request_not_a_template(self, griptape_nodes: Engine) -> None:
+    def test_on_create_workflow_from_template_request_not_a_template(self, engine: Engine) -> None:
         """Test create from template when workflow is not marked as template."""
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         request = CreateWorkflowFromTemplateRequest(template_name="regular_workflow")
 
         mock_workflow = MagicMock()
@@ -462,9 +479,9 @@ class TestWorkflowManager:
         assert isinstance(result, CreateWorkflowFromTemplateResultFailure)
         assert "not marked as a template" in str(result.result_details)
 
-    def test_on_create_workflow_from_template_request_template_file_not_found(self, griptape_nodes: Engine) -> None:
+    def test_on_create_workflow_from_template_request_template_file_not_found(self, engine: Engine) -> None:
         """Test create from template when template file does not exist."""
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         request = CreateWorkflowFromTemplateRequest(template_name="my_template")
 
         mock_template = MagicMock()
@@ -488,8 +505,8 @@ class TestWorkflowManager:
 
     # Removed tests for invalid keys/types; metadata is replaced as a whole object
 
-    def test_on_move_workflow_request_workflow_not_found(self, griptape_nodes: Engine) -> None:
-        workflow_manager = griptape_nodes.WorkflowManager()
+    def test_on_move_workflow_request_workflow_not_found(self, engine: Engine) -> None:
+        workflow_manager = engine.workflow_manager
         request = MoveWorkflowRequest(workflow_name="nonexistent", target_directory="subdir")
 
         with patch.object(WorkflowRegistry, "get_workflow_by_name", side_effect=KeyError("not found")):
@@ -498,8 +515,8 @@ class TestWorkflowManager:
         assert isinstance(result, MoveWorkflowResultFailure)
         assert "nonexistent" in str(result.result_details)
 
-    def test_on_move_workflow_request_source_file_missing(self, griptape_nodes: Engine) -> None:
-        workflow_manager = griptape_nodes.WorkflowManager()
+    def test_on_move_workflow_request_source_file_missing(self, engine: Engine) -> None:
+        workflow_manager = engine.workflow_manager
         request = MoveWorkflowRequest(workflow_name="my_workflow", target_directory="subdir")
 
         mock_workflow = MagicMock()
@@ -515,8 +532,8 @@ class TestWorkflowManager:
         assert isinstance(result, MoveWorkflowResultFailure)
         assert "/workspace/my_workflow.py" in str(result.result_details)
 
-    def test_on_move_workflow_request_target_already_exists(self, griptape_nodes: Engine) -> None:
-        workflow_manager = griptape_nodes.WorkflowManager()
+    def test_on_move_workflow_request_target_already_exists(self, engine: Engine) -> None:
+        workflow_manager = engine.workflow_manager
         request = MoveWorkflowRequest(workflow_name="my_workflow", target_directory="subdir")
 
         mock_workflow = MagicMock()
@@ -533,14 +550,14 @@ class TestWorkflowManager:
         assert isinstance(result, MoveWorkflowResultFailure)
         assert "already exists" in str(result.result_details)
 
-    def test_on_move_workflow_request_success_directory_change(self, griptape_nodes: Engine) -> None:
-        workflow_manager = griptape_nodes.WorkflowManager()
+    def test_on_move_workflow_request_success_directory_change(self, engine: Engine) -> None:
+        workflow_manager = engine.workflow_manager
         request = MoveWorkflowRequest(workflow_name="my_workflow", target_directory="subdir")
 
         mock_workflow = MagicMock()
         mock_workflow.file_path = "my_workflow.py"
 
-        config_mgr = griptape_nodes.ConfigManager()
+        config_mgr = engine.config_manager
         with (
             patch.object(WorkflowRegistry, "get_workflow_by_name", return_value=mock_workflow),
             patch.object(WorkflowRegistry, "get_complete_file_path", return_value="/workspace/my_workflow.py"),
@@ -557,16 +574,16 @@ class TestWorkflowManager:
         assert result.new_workflow_name == "subdir/my_workflow"
         mock_rekey.assert_called_once_with("my_workflow", "subdir/my_workflow")
 
-    def test_on_move_workflow_request_no_rekey_same_directory(self, griptape_nodes: Engine) -> None:
+    def test_on_move_workflow_request_no_rekey_same_directory(self, engine: Engine) -> None:
         """Moving within the same directory level produces the same registry key; no rekey occurs."""
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         # Workflow already in "subdir", moving target is also "subdir" — key stays the same.
         request = MoveWorkflowRequest(workflow_name="subdir/my_workflow", target_directory="subdir")
 
         mock_workflow = MagicMock()
         mock_workflow.file_path = "subdir/my_workflow.py"
 
-        config_mgr = griptape_nodes.ConfigManager()
+        config_mgr = engine.config_manager
         with (
             patch.object(WorkflowRegistry, "get_workflow_by_name", return_value=mock_workflow),
             patch.object(WorkflowRegistry, "get_complete_file_path", return_value="/workspace/subdir/my_workflow.py"),
@@ -582,15 +599,15 @@ class TestWorkflowManager:
         assert result.new_workflow_name == "subdir/my_workflow"
         mock_rekey.assert_not_called()
 
-    def test_on_move_workflow_request_updates_context_for_current_workflow(self, griptape_nodes: Engine) -> None:
-        workflow_manager = griptape_nodes.WorkflowManager()
+    def test_on_move_workflow_request_updates_context_for_current_workflow(self, engine: Engine) -> None:
+        workflow_manager = engine.workflow_manager
         request = MoveWorkflowRequest(workflow_name="my_workflow", target_directory="subdir")
 
         mock_workflow = MagicMock()
         mock_workflow.file_path = "my_workflow.py"
 
-        context_mgr = griptape_nodes.ContextManager()
-        config_mgr = griptape_nodes.ConfigManager()
+        context_mgr = engine.context_manager
+        config_mgr = engine.config_manager
         with (
             patch.object(WorkflowRegistry, "get_workflow_by_name", return_value=mock_workflow),
             patch.object(WorkflowRegistry, "get_complete_file_path", return_value="/workspace/my_workflow.py"),
@@ -602,21 +619,25 @@ class TestWorkflowManager:
             patch.object(context_mgr, "has_current_workflow", return_value=True),
             patch.object(context_mgr, "get_current_workflow_name", return_value="my_workflow"),
             patch.object(context_mgr, "set_current_workflow_name") as mock_set_name,
+            patch.object(context_mgr, "set_current_workflow_file_path") as mock_set_file_path,
         ):
             result = workflow_manager.on_move_workflow_request(request)
 
         assert isinstance(result, MoveWorkflowResultSuccess)
         mock_set_name.assert_called_once_with("subdir/my_workflow")
+        # The retained path travels with the key: `workflow_dir` reads it in preference to the
+        # registry, so a rekey without a repoint leaves the builtin on the pre-move directory.
+        mock_set_file_path.assert_called_once_with(str(config_mgr.workspace_path / "subdir" / "my_workflow.py"))
 
-    def test_on_move_workflow_request_does_not_update_context_for_other_workflow(self, griptape_nodes: Engine) -> None:
-        workflow_manager = griptape_nodes.WorkflowManager()
+    def test_on_move_workflow_request_does_not_update_context_for_other_workflow(self, engine: Engine) -> None:
+        workflow_manager = engine.workflow_manager
         request = MoveWorkflowRequest(workflow_name="my_workflow", target_directory="subdir")
 
         mock_workflow = MagicMock()
         mock_workflow.file_path = "my_workflow.py"
 
-        context_mgr = griptape_nodes.ContextManager()
-        config_mgr = griptape_nodes.ConfigManager()
+        context_mgr = engine.context_manager
+        config_mgr = engine.config_manager
         with (
             patch.object(WorkflowRegistry, "get_workflow_by_name", return_value=mock_workflow),
             patch.object(WorkflowRegistry, "get_complete_file_path", return_value="/workspace/my_workflow.py"),
@@ -634,9 +655,61 @@ class TestWorkflowManager:
         assert isinstance(result, MoveWorkflowResultSuccess)
         mock_set_name.assert_not_called()
 
+    def test_on_move_workflow_request_updates_context_file_path_for_current_workflow(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
+        """Moving the open workflow repoints the context's retained path at the new directory.
+
+        `workflow_dir` answers from the retained path in preference to the registry, so a Move
+        that rekeys the registry but leaves that path alone keeps resolving `{workflow_dir?:/}`
+        against the folder the file just left -- media written and read somewhere the workflow
+        no longer lives, with no error. Driven against the real registry and filesystem because
+        the bug is precisely that the two disagree.
+        """
+        from datetime import UTC, datetime
+
+        from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
+
+        workflow_manager = engine.workflow_manager
+        context_manager = engine.context_manager
+        config_manager = engine.config_manager
+
+        workspace = tmp_path.resolve()
+        (workspace / "my_workflow.py").write_text("# stub")
+        metadata = WorkflowMetadata(
+            name="my_workflow",
+            schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
+            engine_version_created_with="test",
+            node_libraries_referenced=[],
+            creation_date=datetime.now(UTC),
+        )
+
+        original_workspace = config_manager.workspace_path
+        config_manager.workspace_path = workspace
+        try:
+            with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+                WorkflowRegistry.generate_new_workflow(
+                    registry_key="my_workflow", metadata=metadata, file_path="my_workflow.py"
+                )
+                context_manager.push_workflow(workflow_name="my_workflow")
+                try:
+                    result = workflow_manager.on_move_workflow_request(
+                        MoveWorkflowRequest(workflow_name="my_workflow", target_directory="subdir")
+                    )
+
+                    assert isinstance(result, MoveWorkflowResultSuccess)
+                    assert context_manager.get_current_workflow_name() == "subdir/my_workflow"
+                    assert context_manager.get_current_workflow_file_path() == str(
+                        workspace / "subdir" / "my_workflow.py"
+                    )
+                finally:
+                    context_manager.pop_workflow()
+        finally:
+            config_manager.workspace_path = original_workspace
+
     # --- Save workflow: unsaved -> saved transition ---
 
-    def test_on_save_workflow_rekeys_context_stack_on_first_save(self, griptape_nodes: Engine) -> None:
+    def test_on_save_workflow_rekeys_context_stack_on_first_save(self, engine: Engine) -> None:
         """First save of an unsaved workflow rekeys the registry entry and updates the context stack in-place."""
         from datetime import UTC, datetime
 
@@ -652,8 +725,8 @@ class TestWorkflowManager:
             SaveWorkflowResultSuccess,
         )
 
-        workflow_manager = griptape_nodes.WorkflowManager()
-        context_manager = griptape_nodes.ContextManager()
+        workflow_manager = engine.workflow_manager
+        context_manager = engine.context_manager
 
         unsaved_key = "unsaved:abc-123"
         saved_key = "my_flow"
@@ -698,7 +771,7 @@ class TestWorkflowManager:
                 msg = f"Unexpected request type in test: {type(req).__name__}"
                 raise AssertionError(msg)
 
-            workspace = griptape_nodes.ConfigManager().workspace_path
+            workspace = engine.config_manager.workspace_path
             saved_full_path = workspace / f"{saved_key}.py"
             save_file_success = SaveWorkflowFileFromSerializedFlowResultSuccess(
                 file_path=str(saved_full_path),
@@ -708,7 +781,7 @@ class TestWorkflowManager:
 
             try:
                 with (
-                    patch.object(griptape_nodes, "ahandle_request", side_effect=fake_ahandle_request),
+                    patch.object(engine, "ahandle_request", side_effect=fake_ahandle_request),
                     patch.object(
                         workflow_manager,
                         "_save_workflow_file_inline",
@@ -735,13 +808,17 @@ class TestWorkflowManager:
 
                 # Context stack: the active workflow name is the new key
                 assert context_manager.get_current_workflow_name() == saved_key
+                # ...and it now carries the location it gained by being saved. `workflow_dir`
+                # prefers this over a registry lookup, and the lookup is what goes stale on the
+                # next project switch.
+                assert context_manager.get_current_workflow_file_path() == str(saved_full_path)
             finally:
                 if context_manager.has_current_workflow():
                     context_manager.pop_workflow()
 
-    def test_on_set_workflow_metadata_updates_unsaved_workflow_in_memory(self, griptape_nodes: Engine) -> None:
+    def test_on_set_workflow_metadata_updates_unsaved_workflow_in_memory(self, engine: Engine) -> None:
         """SetWorkflowMetadataRequest on an unsaved workflow updates registry metadata without touching disk."""
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         workflow_manager._workflows_loading_complete.set()
 
         unsaved_key = "unsaved:meta-test"
@@ -766,7 +843,7 @@ class TestWorkflowManager:
             # Still unsaved — no disk file materialized.
             assert workflow.file_path is None
 
-    def test_first_save_uses_display_name_when_requested_name_is_unsaved_key(self, griptape_nodes: Engine) -> None:
+    def test_first_save_uses_display_name_when_requested_name_is_unsaved_key(self, engine: Engine) -> None:
         """First save of an unsaved workflow derives the filename from metadata.name, not the synthetic key."""
         from griptape_nodes.retained_mode.events.flow_events import (
             GetTopLevelFlowResultSuccess,
@@ -779,9 +856,9 @@ class TestWorkflowManager:
             SaveWorkflowResultSuccess,
         )
 
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         workflow_manager._workflows_loading_complete.set()
-        context_manager = griptape_nodes.ContextManager()
+        context_manager = engine.context_manager
 
         unsaved_key = "unsaved:filename-test"
         display_name = "workflow_25"
@@ -840,7 +917,7 @@ class TestWorkflowManager:
                     result_details="ok",
                 )
 
-            workspace = griptape_nodes.ConfigManager().workspace_path
+            workspace = engine.config_manager.workspace_path
 
             def fake_resolve_destination(file_name: str, situation: str, **_vars: object) -> MagicMock:  # noqa: ARG001
                 stub = MagicMock()
@@ -849,7 +926,7 @@ class TestWorkflowManager:
 
             try:
                 with (
-                    patch.object(griptape_nodes, "ahandle_request", side_effect=fake_ahandle_request),
+                    patch.object(engine, "ahandle_request", side_effect=fake_ahandle_request),
                     patch.object(
                         workflow_manager,
                         "_save_workflow_file_inline",
@@ -951,10 +1028,10 @@ class TestWorkflowManager:
         captured["persist_calls"] = mock_persist.call_args_list
         return captured
 
-    def test_rename_preserves_workspace_subdir(self, griptape_nodes: Engine) -> None:
+    def test_rename_preserves_workspace_subdir(self, engine: Engine) -> None:
         """Renaming a workflow in a sub-directory keeps it there (bar/workflow -> bar/new_name)."""
         captured = self._run_rename(
-            griptape_nodes.WorkflowManager(),
+            engine.workflow_manager,
             self._RenameScenario(
                 workflow_name="bar/workflow",
                 requested_name="new_name",
@@ -965,10 +1042,10 @@ class TestWorkflowManager:
         )
         assert captured["save_file_name"] == "bar/new_name"
 
-    def test_rename_root_workflow_has_no_directory(self, griptape_nodes: Engine) -> None:
+    def test_rename_root_workflow_has_no_directory(self, engine: Engine) -> None:
         """Renaming a workspace-root workflow has no directory prefix."""
         captured = self._run_rename(
-            griptape_nodes.WorkflowManager(),
+            engine.workflow_manager,
             self._RenameScenario(
                 workflow_name="workflow",
                 requested_name="new_name",
@@ -979,10 +1056,10 @@ class TestWorkflowManager:
         )
         assert captured["save_file_name"] == "new_name"
 
-    def test_rename_preserves_absolute_dir_and_reregisters(self, griptape_nodes: Engine) -> None:
+    def test_rename_preserves_absolute_dir_and_reregisters(self, engine: Engine) -> None:
         """Renaming an externally-registered (absolute path) workflow keeps it external and re-registers it."""
         captured = self._run_rename(
-            griptape_nodes.WorkflowManager(),
+            engine.workflow_manager,
             self._RenameScenario(
                 workflow_name="/ext/workflow",
                 requested_name="new_name",
@@ -996,10 +1073,37 @@ class TestWorkflowManager:
         persist_calls = captured["persist_calls"]
         assert persist_calls == [call("/ext/new_name.py")]
 
-    def test_rename_returns_new_registry_key(self, griptape_nodes: Engine) -> None:
+    def test_rename_updates_context_file_path(self, engine: Engine) -> None:
+        """Renaming the open workflow moves the context's retained path onto the new file.
+
+        Rename keeps the directory, so `workflow_dir` survives either way; the path itself would
+        otherwise keep naming a file that no longer exists on disk.
+        """
+        context_manager = engine.context_manager
+
+        context_manager.push_workflow(workflow_name="bar/workflow")
+        context_manager.set_current_workflow_file_path("/workspace/bar/workflow.py")
+        try:
+            self._run_rename(
+                engine.workflow_manager,
+                self._RenameScenario(
+                    workflow_name="bar/workflow",
+                    requested_name="new_name",
+                    source_file_path="bar/workflow.py",
+                    save_file_path="/workspace/bar/new_name.py",
+                    save_workflow_name="bar/new_name",
+                ),
+            )
+
+            assert context_manager.get_current_workflow_name() == "bar/new_name"
+            assert context_manager.get_current_workflow_file_path() == "/workspace/bar/new_name.py"
+        finally:
+            context_manager.pop_workflow()
+
+    def test_rename_returns_new_registry_key(self, engine: Engine) -> None:
         """The returned new_workflow_name is the real directory-qualified key, not the bare stem."""
         captured = self._run_rename(
-            griptape_nodes.WorkflowManager(),
+            engine.workflow_manager,
             self._RenameScenario(
                 workflow_name="bar/workflow",
                 requested_name="new_name",
@@ -1010,14 +1114,14 @@ class TestWorkflowManager:
         )
         assert captured["result_new_name"] == "bar/new_name"
 
-    def test_rename_default_matches_file_name(self, griptape_nodes: Engine) -> None:
+    def test_rename_default_matches_file_name(self, engine: Engine) -> None:
         """Default behavior (MATCH_FILE_NAME): display name tracks the new file basename.
 
         Preserves historical wire behavior — callers who don't set display_name_behavior see the
         same result they did before the enum was introduced.
         """
         captured = self._run_rename(
-            griptape_nodes.WorkflowManager(),
+            engine.workflow_manager,
             self._RenameScenario(
                 workflow_name="my_workflow",
                 requested_name="my_workflow_renamed",
@@ -1029,7 +1133,7 @@ class TestWorkflowManager:
         )
         assert captured["save_display_name"] == "my_workflow_renamed"
 
-    def test_rename_preserve_existing_keeps_display_name(self, griptape_nodes: Engine) -> None:
+    def test_rename_preserve_existing_keeps_display_name(self, engine: Engine) -> None:
         """PRESERVE_EXISTING opt-in: SaveWorkflowRequest receives the source's metadata.name, not the new file stem.
 
         Fix for issue #4992 — with this enum value, renaming a workflow whose display name diverges
@@ -1038,7 +1142,7 @@ class TestWorkflowManager:
         from griptape_nodes.retained_mode.events.workflow_events import RenameDisplayNameBehavior
 
         captured = self._run_rename(
-            griptape_nodes.WorkflowManager(),
+            engine.workflow_manager,
             self._RenameScenario(
                 workflow_name="my_workflow",
                 requested_name="my_workflow_renamed",
@@ -1051,12 +1155,12 @@ class TestWorkflowManager:
         )
         assert captured["save_display_name"] == "My Cool Workflow"
 
-    def test_rename_override_uses_provided_display_name(self, griptape_nodes: Engine) -> None:
+    def test_rename_override_uses_provided_display_name(self, engine: Engine) -> None:
         """OVERRIDE forwards the caller-supplied display_name to SaveWorkflowRequest."""
         from griptape_nodes.retained_mode.events.workflow_events import RenameDisplayNameBehavior
 
         captured = self._run_rename(
-            griptape_nodes.WorkflowManager(),
+            engine.workflow_manager,
             self._RenameScenario(
                 workflow_name="my_workflow",
                 requested_name="my_workflow_renamed",
@@ -1072,7 +1176,7 @@ class TestWorkflowManager:
         )
         assert captured["save_display_name"] == "Renamed On Purpose"
 
-    def test_rename_override_strips_surrounding_whitespace(self, griptape_nodes: Engine) -> None:
+    def test_rename_override_strips_surrounding_whitespace(self, engine: Engine) -> None:
         """OVERRIDE forwards ``display_name`` stripped so validation and resolution agree on the canonical form.
 
         Regression coverage: ``_validate_rename_display_name`` gates OVERRIDE on
@@ -1083,7 +1187,7 @@ class TestWorkflowManager:
         from griptape_nodes.retained_mode.events.workflow_events import RenameDisplayNameBehavior
 
         captured = self._run_rename(
-            griptape_nodes.WorkflowManager(),
+            engine.workflow_manager,
             self._RenameScenario(
                 workflow_name="my_workflow",
                 requested_name="my_workflow_renamed",
@@ -1108,7 +1212,7 @@ class TestWorkflowManager:
     )
     def test_rename_rejects_display_name_without_override(
         self,
-        griptape_nodes: Engine,
+        engine: Engine,
         non_override_behavior: str,
     ) -> None:
         """Supplying display_name with a non-OVERRIDE behavior fails fast so it can't be silently ignored."""
@@ -1118,13 +1222,13 @@ class TestWorkflowManager:
             RenameWorkflowResultFailure,
         )
 
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
 
         async def fake_ahandle_request(req: object) -> object:
             msg = f"Save/delete must not run when display_name is used with non-OVERRIDE; got {type(req).__name__}"
             raise AssertionError(msg)
 
-        with patch.object(GriptapeNodes, "ahandle_request", side_effect=fake_ahandle_request):
+        with patch.object(engine, "ahandle_request", side_effect=fake_ahandle_request):
             result = asyncio.run(
                 workflow_manager.on_rename_workflow_request(
                     RenameWorkflowRequest(
@@ -1142,7 +1246,7 @@ class TestWorkflowManager:
     @pytest.mark.parametrize("empty_display_name", [None, "", "   "])
     def test_rename_override_rejects_missing_display_name(
         self,
-        griptape_nodes: Engine,
+        engine: Engine,
         empty_display_name: str | None,
     ) -> None:
         """OVERRIDE without a non-empty display_name fails fast without invoking the save pipeline."""
@@ -1152,13 +1256,13 @@ class TestWorkflowManager:
             RenameWorkflowResultFailure,
         )
 
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
 
         async def fake_ahandle_request(req: object) -> object:
             msg = f"Save/delete must not run when OVERRIDE has no display_name; got {type(req).__name__}"
             raise AssertionError(msg)
 
-        with patch.object(GriptapeNodes, "ahandle_request", side_effect=fake_ahandle_request):
+        with patch.object(engine, "ahandle_request", side_effect=fake_ahandle_request):
             result = asyncio.run(
                 workflow_manager.on_rename_workflow_request(
                     RenameWorkflowRequest(
@@ -1174,7 +1278,7 @@ class TestWorkflowManager:
         assert "OVERRIDE" in str(result.result_details)
 
     def test_rename_preserve_existing_falls_back_to_requested_name_when_source_display_name_blank(
-        self, griptape_nodes: Engine
+        self, engine: Engine
     ) -> None:
         """PRESERVE_EXISTING with a blank source metadata.name falls back to the requested name.
 
@@ -1186,7 +1290,7 @@ class TestWorkflowManager:
         from griptape_nodes.retained_mode.events.workflow_events import RenameDisplayNameBehavior
 
         captured = self._run_rename(
-            griptape_nodes.WorkflowManager(),
+            engine.workflow_manager,
             self._RenameScenario(
                 workflow_name="my_workflow",
                 requested_name="my_workflow_renamed",
@@ -1199,9 +1303,7 @@ class TestWorkflowManager:
         )
         assert captured["save_display_name"] == "my_workflow_renamed"
 
-    def test_rename_preserve_existing_falls_back_to_requested_name_when_source_missing(
-        self, griptape_nodes: Engine
-    ) -> None:
+    def test_rename_preserve_existing_falls_back_to_requested_name_when_source_missing(self, engine: Engine) -> None:
         """PRESERVE_EXISTING with an unregistered source workflow falls back to the requested name.
 
         Save-As-style path: caller asks to rename a workflow that isn't in the registry (e.g. the
@@ -1217,7 +1319,7 @@ class TestWorkflowManager:
             SaveWorkflowResultSuccess,
         )
 
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         captured: dict[str, object] = {}
 
         async def fake_ahandle_request(req: object) -> object:
@@ -1250,7 +1352,7 @@ class TestWorkflowManager:
         assert isinstance(result, RenameWorkflowResultSuccess)
         assert captured["save_display_name"] == "never_registered_renamed"
 
-    def test_rename_surfaces_delete_failure_from_bookkeeping(self, griptape_nodes: Engine) -> None:
+    def test_rename_surfaces_delete_failure_from_bookkeeping(self, engine: Engine) -> None:
         """When the post-save delete of the old registry entry fails, rename surfaces RenameWorkflowResultFailure.
 
         Save succeeds, but the follow-up DeleteWorkflowRequest for the old key comes back as
@@ -1266,7 +1368,7 @@ class TestWorkflowManager:
             SaveWorkflowResultSuccess,
         )
 
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         mock_source = MagicMock()
         mock_source.file_path = "old.py"
         mock_source.metadata.name = "Old Display"
@@ -1287,7 +1389,7 @@ class TestWorkflowManager:
             patch.object(WorkflowRegistry, "has_workflow_with_name", return_value=True),
             patch.object(WorkflowRegistry, "get_workflow_by_name", return_value=mock_source),
             patch.object(workflow_manager, "_persist_external_workflow_registration"),
-            patch.object(GriptapeNodes, "ahandle_request", side_effect=fake_ahandle_request),
+            patch.object(engine, "ahandle_request", side_effect=fake_ahandle_request),
         ):
             result = asyncio.run(
                 workflow_manager.on_rename_workflow_request(
@@ -1301,9 +1403,9 @@ class TestWorkflowManager:
         assert "'old'" in str(result.result_details)
         assert "'new'" in str(result.result_details)
 
-    def test_resolve_named_save_path_absolute_skips_sub_dirs(self, griptape_nodes: Engine) -> None:
+    def test_resolve_named_save_path_absolute_skips_sub_dirs(self, engine: Engine) -> None:
         """An absolute requested name routes the full path to _build_workflow_save_path with no sub_dirs."""
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         # Anchor to the current filesystem root so the path is absolute on Windows
         # (which needs a drive letter) as well as POSIX.
         abs_requested = Path(Path.cwd().anchor) / "ext" / "new_name"
@@ -1323,9 +1425,9 @@ class TestWorkflowManager:
         assert resolved.file_name == "new_name"
         assert resolved.relative_file_path == str(abs_path)
 
-    def test_resolve_named_save_path_relative_passes_sub_dirs(self, griptape_nodes: Engine) -> None:
+    def test_resolve_named_save_path_relative_passes_sub_dirs(self, engine: Engine) -> None:
         """A relative requested name splits into stem + sub_dirs (unchanged behavior)."""
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         fake_destination = MagicMock()
 
         with patch.object(
@@ -1340,7 +1442,7 @@ class TestWorkflowManager:
         mock_build.assert_called_once_with("new_name.py", sub_dirs="team", situation_name="save_workflow")
         assert resolved.file_name == "new_name"
 
-    def test_delete_active_workflow_clears_context_stack(self, griptape_nodes: Engine) -> None:
+    def test_delete_active_workflow_clears_context_stack(self, engine: Engine) -> None:
         """Deleting the active workflow tears down its flows and pops the context stack.
 
         Regression guard for the "phantom workflow" bug: a frontend that reloads after
@@ -1349,10 +1451,10 @@ class TestWorkflowManager:
         from griptape_nodes.exe_types.flow import ControlFlow
         from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
 
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         workflow_manager._workflows_loading_complete.set()
-        context_manager = griptape_nodes.ContextManager()
-        object_manager = griptape_nodes.ObjectManager()
+        context_manager = engine.context_manager
+        object_manager = engine.object_manager
 
         workflow_key = "unsaved:delete-active"
 
@@ -1361,7 +1463,7 @@ class TestWorkflowManager:
             context_manager.push_workflow(workflow_name=workflow_key)
 
             # Create a top-level flow under the active workflow so there's state to tear down.
-            create_result = griptape_nodes.handle_request(CreateFlowRequest(parent_flow_name=None))
+            create_result = engine.handle_request(CreateFlowRequest(parent_flow_name=None))
             assert isinstance(create_result, CreateFlowResultSuccess)
             flow_name = create_result.flow_name
             assert object_manager.has_object_with_name(flow_name)
@@ -1383,15 +1485,15 @@ class TestWorkflowManager:
                 if context_manager.has_current_workflow():
                     context_manager.pop_workflow()
 
-    def test_delete_non_active_workflow_leaves_context_untouched(self, griptape_nodes: Engine) -> None:
+    def test_delete_non_active_workflow_leaves_context_untouched(self, engine: Engine) -> None:
         """Deleting a workflow that isn't the active one must not touch the context stack.
 
         Covers the published-workflow subprocess cleanup path, which deletes by key without
         expecting the context stack to change.
         """
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         workflow_manager._workflows_loading_complete.set()
-        context_manager = griptape_nodes.ContextManager()
+        context_manager = engine.context_manager
 
         active_key = "unsaved:keep-me"
         other_key = "unsaved:delete-me"
@@ -1418,13 +1520,13 @@ class TestWorkflowManager:
                     context_manager.pop_workflow()
 
     @pytest.mark.asyncio
-    async def test_startup_scan_skips_unsaved_prefix_files(self, griptape_nodes: Engine, tmp_path: Path) -> None:
+    async def test_startup_scan_skips_unsaved_prefix_files(self, engine: Engine, tmp_path: Path) -> None:
         """Leaked `unsaved:<uuid>.py` files on disk must be skipped during the workspace scan.
 
         Pre-fix saves wrote these files; `_determine_save_target` no longer does, but any
         previously-leaked file must not trip the scanner with `Failed to register workflow`.
         """
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
 
         header = WorkflowManager.WORKFLOW_METADATA_HEADER
         metadata_block = "\n".join(
@@ -1454,16 +1556,16 @@ class TestWorkflowManager:
     # --- Metadata header parse failures ---
 
     @pytest.mark.asyncio
-    async def test_malformed_toml_header_reports_unusable(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
+    async def test_malformed_toml_header_reports_unusable(self, engine: Engine, tmp_path: Path) -> None:
         """A header that is not valid TOML is UNUSABLE, not a crash.
 
         The read path parses with tomllib, which is stricter than the tomlkit it replaced,
         so this pins the strictness: a header this rejects must land in UNUSABLE with an
         InvalidTomlFormatProblem rather than reaching schema validation.
         """
-        workflow_manager = griptape_nodes.WorkflowManager()
-        griptape_nodes.ConfigManager().workspace_path = tmp_path
-        griptape_nodes.LibraryManager()._libraries_loading_complete.set()
+        workflow_manager = engine.workflow_manager
+        engine.config_manager.workspace_path = tmp_path
+        engine.library_manager._libraries_loading_complete.set()
 
         header = WorkflowManager.WORKFLOW_METADATA_HEADER
         # Unclosed table declaration: parses as a header block, fails as TOML.
@@ -1480,18 +1582,16 @@ class TestWorkflowManager:
         assert any(isinstance(problem, InvalidTomlFormatProblem) for problem in info.problems)
 
     @pytest.mark.asyncio
-    async def test_header_missing_griptape_nodes_section_reports_unusable(
-        self, griptape_nodes: GriptapeNodes, tmp_path: Path
-    ) -> None:
+    async def test_header_missing_griptape_nodes_section_reports_unusable(self, engine: Engine, tmp_path: Path) -> None:
         """A header without [tool.griptape-nodes] is UNUSABLE.
 
         Covers both ways the section lookup can fail now that tomllib returns plain dicts:
         the key being absent (KeyError) and `tool` being a scalar, so subscripting it raises
         TypeError. Both must be caught and reported, not escape as an unhandled error.
         """
-        workflow_manager = griptape_nodes.WorkflowManager()
-        griptape_nodes.ConfigManager().workspace_path = tmp_path
-        griptape_nodes.LibraryManager()._libraries_loading_complete.set()
+        workflow_manager = engine.workflow_manager
+        engine.config_manager.workspace_path = tmp_path
+        engine.library_manager._libraries_loading_complete.set()
 
         header = WorkflowManager.WORKFLOW_METADATA_HEADER
         cases = {
@@ -1511,22 +1611,92 @@ class TestWorkflowManager:
             assert info.status is WorkflowManager.WorkflowStatus.UNUSABLE, file_name
             assert any(isinstance(problem, MissingTomlSectionProblem) for problem in info.problems), file_name
 
+    @pytest.mark.asyncio
+    async def test_unregistered_library_reports_flawed_not_unusable(self, engine: Engine, tmp_path: Path) -> None:
+        """A header naming a library that is not registered leaves the workflow FLAWED.
+
+        Such a workflow opens, with ErrorProxyNode placeholders standing in for that library's
+        nodes (issue #5505). UNUSABLE would tell the artist not to bother opening the thing they
+        can in fact open and edit.
+        """
+        workflow_manager = engine.workflow_manager
+        engine.config_manager.workspace_path = tmp_path
+        engine.library_manager._libraries_loading_complete.set()
+
+        header = WorkflowManager.WORKFLOW_METADATA_HEADER
+        (tmp_path / "missing_library.py").write_text(
+            "\n".join(
+                [
+                    f"# /// {header}",
+                    "# [tool.griptape-nodes]",
+                    '# name = "missing_library"',
+                    f'# schema_version = "{WorkflowMetadata.LATEST_SCHEMA_VERSION}"',
+                    '# engine_version_created_with = "0.0.0"',
+                    '# node_libraries_referenced = [["Nowhere Library", "1.0.0"]]',
+                    "# ///",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        result = await workflow_manager.on_load_workflow_metadata_request(
+            LoadWorkflowMetadata(file_name="missing_library.py")
+        )
+
+        assert isinstance(result, LoadWorkflowMetadataResultSuccess)
+        info = workflow_manager._workflow_file_path_to_info[str(tmp_path / "missing_library.py")]
+        assert info.status is WorkflowManager.WorkflowStatus.FLAWED
+        assert any(isinstance(problem, LibraryNotRegisteredProblem) for problem in info.problems)
+
+    @pytest.mark.asyncio
+    async def test_a_malformed_dependency_version_is_still_unusable(self, engine: Engine, tmp_path: Path) -> None:
+        """Only the not-registered case was downgraded; a header the engine cannot parse still is not loadable."""
+        workflow_manager = engine.workflow_manager
+        engine.config_manager.workspace_path = tmp_path
+        engine.library_manager._libraries_loading_complete.set()
+
+        header = WorkflowManager.WORKFLOW_METADATA_HEADER
+        (tmp_path / "bad_version.py").write_text(
+            "\n".join(
+                [
+                    f"# /// {header}",
+                    "# [tool.griptape-nodes]",
+                    '# name = "bad_version"',
+                    f'# schema_version = "{WorkflowMetadata.LATEST_SCHEMA_VERSION}"',
+                    '# engine_version_created_with = "0.0.0"',
+                    '# node_libraries_referenced = [["Nowhere Library", "not-a-version"]]',
+                    "# ///",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        result = await workflow_manager.on_load_workflow_metadata_request(
+            LoadWorkflowMetadata(file_name="bad_version.py")
+        )
+
+        assert isinstance(result, LoadWorkflowMetadataResultSuccess)
+        info = workflow_manager._workflow_file_path_to_info[str(tmp_path / "bad_version.py")]
+        assert info.status is WorkflowManager.WorkflowStatus.UNUSABLE
+
     # --- WorkflowInfo payload helpers ---
 
-    def test_build_workflow_info_key_uses_workspace_join(self, griptape_nodes: Engine) -> None:
+    def test_build_workflow_info_key_uses_workspace_join(self, engine: Engine) -> None:
         """_build_workflow_info_key matches the key construction used when storing info (no symlink resolution)."""
-        workflow_manager = griptape_nodes.WorkflowManager()
-        workspace = griptape_nodes.ConfigManager().workspace_path
+        workflow_manager = engine.workflow_manager
+        workspace = engine.config_manager.workspace_path
 
         key = workflow_manager._build_workflow_info_key("workflows/my_workflow.py")
 
         assert key == str(workspace / "workflows/my_workflow.py")
 
-    def test_build_workflow_info_payload_good_status_no_problems(self, griptape_nodes: Engine) -> None:
+    def test_build_workflow_info_payload_good_status_no_problems(self, engine: Engine) -> None:
         """_build_workflow_info_payload produces correct payload for a GOOD workflow with no problems."""
         from griptape_nodes.retained_mode.managers.workflow_manager import WorkflowManager
 
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         wf_info = WorkflowManager.WorkflowInfo(
             status=WorkflowStatus.GOOD,
             workflow_path="/workspace/workflows/my_workflow.py",
@@ -1542,14 +1712,14 @@ class TestWorkflowManager:
         assert payload.problems == []
         assert payload.workflow_dependencies == []
 
-    def test_build_workflow_info_payload_collates_problems(self, griptape_nodes: Engine) -> None:
+    def test_build_workflow_info_payload_collates_problems(self, engine: Engine) -> None:
         """_build_workflow_info_payload calls collate_problems_for_display on each problem type."""
         from griptape_nodes.retained_mode.managers.fitness_problems.workflows.library_not_registered_problem import (
             LibraryNotRegisteredProblem,
         )
         from griptape_nodes.retained_mode.managers.workflow_manager import WorkflowManager
 
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         wf_info = WorkflowManager.WorkflowInfo(
             status=WorkflowStatus.UNUSABLE,
             workflow_path="/workspace/workflows/broken.py",
@@ -1566,11 +1736,11 @@ class TestWorkflowManager:
         assert "lib-a" in payload.problems[0]
         assert "lib-b" in payload.problems[0]
 
-    def test_build_workflow_info_payload_includes_dependencies(self, griptape_nodes: Engine) -> None:
+    def test_build_workflow_info_payload_includes_dependencies(self, engine: Engine) -> None:
         """_build_workflow_info_payload passes WorkflowDependencyInfo instances through directly."""
         from griptape_nodes.retained_mode.managers.workflow_manager import WorkflowManager
 
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         wf_info = WorkflowManager.WorkflowInfo(
             status=WorkflowStatus.FLAWED,
             workflow_path="/workspace/workflows/flawed.py",
@@ -1597,9 +1767,9 @@ class TestWorkflowManager:
 
     # --- GetWorkflowInfoRequest ---
 
-    def test_on_get_workflow_info_request_workflow_not_in_registry_fails(self, griptape_nodes: Engine) -> None:
+    def test_on_get_workflow_info_request_workflow_not_in_registry_fails(self, engine: Engine) -> None:
         """GetWorkflowInfoRequest with unknown workflow_name returns failure."""
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         request = GetWorkflowInfoRequest(workflow_name="missing_workflow")
 
         with patch.object(WorkflowRegistry, "get_workflow_by_name", side_effect=KeyError("not found")):
@@ -1608,9 +1778,9 @@ class TestWorkflowManager:
         assert isinstance(result, GetWorkflowInfoResultFailure)
         assert "missing_workflow" in str(result.result_details)
 
-    def test_on_get_workflow_info_request_no_info_for_path_fails(self, griptape_nodes: Engine) -> None:
+    def test_on_get_workflow_info_request_no_info_for_path_fails(self, engine: Engine) -> None:
         """GetWorkflowInfoRequest returns failure when no WorkflowInfo is stored for the resolved path."""
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         request = GetWorkflowInfoRequest(workflow_name="my_workflow")
 
         mock_workflow = MagicMock()
@@ -1622,17 +1792,17 @@ class TestWorkflowManager:
 
         assert isinstance(result, GetWorkflowInfoResultFailure)
 
-    def test_on_get_workflow_info_request_success(self, griptape_nodes: Engine) -> None:
+    def test_on_get_workflow_info_request_success(self, engine: Engine) -> None:
         """GetWorkflowInfoRequest succeeds when WorkflowInfo exists for the workflow."""
         from griptape_nodes.retained_mode.managers.workflow_manager import WorkflowManager
 
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         request = GetWorkflowInfoRequest(workflow_name="my_workflow")
 
         mock_workflow = MagicMock()
         mock_workflow.file_path = "workflows/my_workflow.py"
 
-        workspace = griptape_nodes.ConfigManager().workspace_path
+        workspace = engine.config_manager.workspace_path
         info_key = str(workspace / "workflows/my_workflow.py")
         wf_info = WorkflowManager.WorkflowInfo(
             status=WorkflowStatus.GOOD,
@@ -1652,9 +1822,9 @@ class TestWorkflowManager:
 
     # --- ListAllWorkflowInfoRequest ---
 
-    def test_on_list_all_workflow_info_request_registry_failure(self, griptape_nodes: Engine) -> None:
+    def test_on_list_all_workflow_info_request_registry_failure(self, engine: Engine) -> None:
         """ListAllWorkflowInfoRequest returns failure when listing workflows raises."""
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         request = ListAllWorkflowInfoRequest()
 
         with patch.object(WorkflowRegistry, "list_workflows", side_effect=Exception("registry error")):
@@ -1663,14 +1833,14 @@ class TestWorkflowManager:
         assert isinstance(result, ListAllWorkflowInfoResultFailure)
         assert "registry error" in str(result.result_details)
 
-    def test_on_list_all_workflow_info_request_success(self, griptape_nodes: Engine) -> None:
+    def test_on_list_all_workflow_info_request_success(self, engine: Engine) -> None:
         """ListAllWorkflowInfoRequest returns info for every workflow that has a stored WorkflowInfo."""
         from griptape_nodes.retained_mode.managers.workflow_manager import WorkflowManager
 
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         request = ListAllWorkflowInfoRequest()
 
-        workspace = griptape_nodes.ConfigManager().workspace_path
+        workspace = engine.config_manager.workspace_path
         info_key = str(workspace / "workflows/my_workflow.py")
         wf_info = WorkflowManager.WorkflowInfo(
             status=WorkflowStatus.GOOD,
@@ -1692,9 +1862,9 @@ class TestWorkflowManager:
         assert "my_workflow" in result.workflow_infos
         assert result.workflow_infos["my_workflow"].status == "GOOD"
 
-    def test_on_list_all_workflow_info_request_skips_workflows_without_info(self, griptape_nodes: Engine) -> None:
+    def test_on_list_all_workflow_info_request_skips_workflows_without_info(self, engine: Engine) -> None:
         """ListAllWorkflowInfoRequest omits workflows that have no stored WorkflowInfo."""
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         request = ListAllWorkflowInfoRequest()
 
         mock_workflow = MagicMock()
@@ -1710,9 +1880,9 @@ class TestWorkflowManager:
         assert isinstance(result, ListAllWorkflowInfoResultSuccess)
         assert result.workflow_infos == {}
 
-    def test_on_list_all_workflow_info_request_skips_unknown_registry_keys(self, griptape_nodes: Engine) -> None:
+    def test_on_list_all_workflow_info_request_skips_unknown_registry_keys(self, engine: Engine) -> None:
         """ListAllWorkflowInfoRequest skips registry keys that can't be looked up."""
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         request = ListAllWorkflowInfoRequest()
 
         with (
@@ -1726,13 +1896,13 @@ class TestWorkflowManager:
 
     # --- _build_workflow_save_path ---
 
-    def test_build_workflow_save_path_returns_destination_from_situation(self, griptape_nodes: Engine) -> None:
+    def test_build_workflow_save_path_returns_destination_from_situation(self, engine: Engine) -> None:
         """The destination from the save_workflow situation is returned verbatim — no upstream macro resolution.
 
         Resolving the macro upstream would strip the seed-and-retry context needed
         for unresolved required ``{x:NN}`` slots inside OSManager (issue #4941).
         """
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
 
         fake_destination = MagicMock()
 
@@ -1748,9 +1918,9 @@ class TestWorkflowManager:
         fake_destination.resolve.assert_not_called()
         assert save_path.relative_file_path == "my_workflow.py"
 
-    def test_build_workflow_save_path_preserves_sub_dirs(self, griptape_nodes: Engine) -> None:
+    def test_build_workflow_save_path_preserves_sub_dirs(self, engine: Engine) -> None:
         """sub_dirs flow through as macro variables and into the registry-relative display string."""
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
 
         fake_destination = MagicMock()
 
@@ -1791,18 +1961,16 @@ class TestWorkflowManager:
             workflow_shape=WorkflowShape(inputs={}, outputs={}) if with_shape else None,
         )
 
-    def _generate(self, griptape_nodes: Engine, *, with_shape: bool = False) -> str:
-        workflow_manager = griptape_nodes.WorkflowManager()
+    def _generate(self, engine: Engine, *, with_shape: bool = False) -> str:
+        workflow_manager = engine.workflow_manager
         return workflow_manager._generate_workflow_file_content(
             serialized_flow_commands=self._empty_serialized_flow_commands(),
             workflow_metadata=self._minimal_workflow_metadata(with_shape=with_shape),
         )
 
-    def test_generate_workflow_file_content_wraps_graph_building_in_async_build_workflow(
-        self, griptape_nodes: Engine
-    ) -> None:
+    def test_generate_workflow_file_content_wraps_graph_building_in_async_build_workflow(self, engine: Engine) -> None:
         """Saved workflows must wrap graph-building statements in `async def build_workflow()`."""
-        content = self._generate(griptape_nodes)
+        content = self._generate(engine)
 
         # The file must declare build_workflow as an async function.
         module = ast.parse(content)
@@ -1811,13 +1979,13 @@ class TestWorkflowManager:
         ]
         assert len(build_workflow_defs) == 1, "build_workflow must be defined exactly once as async"
 
-    def test_generate_workflow_file_content_is_inert_at_import(self, griptape_nodes: Engine) -> None:
+    def test_generate_workflow_file_content_is_inert_at_import(self, engine: Engine) -> None:
         """A shape-free saved workflow must contain no module-level side effects.
 
         Only function/class definitions and imports should appear at the top level so that
         `exec()`-ing the module does not mutate engine state until build_workflow() is awaited.
         """
-        content = self._generate(griptape_nodes)
+        content = self._generate(engine)
         module = ast.parse(content)
 
         allowed_top_level = (
@@ -1833,9 +2001,9 @@ class TestWorkflowManager:
                 f"Unexpected top-level statement of type {type(node).__name__} in shape-free workflow"
             )
 
-    def test_generate_workflow_file_content_prereq_lives_inside_build_workflow(self, griptape_nodes: Engine) -> None:
+    def test_generate_workflow_file_content_prereq_lives_inside_build_workflow(self, engine: Engine) -> None:
         """Prerequisite code (context_manager setup) must live inside build_workflow, not at module scope."""
-        content = self._generate(griptape_nodes)
+        content = self._generate(engine)
         module = ast.parse(content)
 
         build_workflow = next(
@@ -1846,7 +2014,7 @@ class TestWorkflowManager:
         assert "context_manager.push_workflow(file_path=__file__)" in body_src
 
     def test_generate_workflow_file_content_registers_declared_libraries_in_build_workflow(
-        self, griptape_nodes: Engine
+        self, engine: Engine
     ) -> None:
         """build_workflow() must register every library named in node_libraries_referenced.
 
@@ -1858,7 +2026,7 @@ class TestWorkflowManager:
         """
         from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
 
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         metadata = WorkflowMetadata(
             name="test_workflow",
             schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
@@ -1896,7 +2064,7 @@ class TestWorkflowManager:
         assert "RegisterLibraryFromFileRequest" in top_level_imports
 
     def test_generate_workflow_file_content_omits_register_calls_when_no_libraries_declared(
-        self, griptape_nodes: Engine
+        self, engine: Engine
     ) -> None:
         """With an empty node_libraries_referenced list, no register calls are emitted.
 
@@ -1904,10 +2072,10 @@ class TestWorkflowManager:
         a library, and makes sure the empty-loop branch in _generate_workflow_run_prerequisite_code
         does not regress to emitting stray RegisterLibraryFromFileRequest noise.
         """
-        content = self._generate(griptape_nodes)
+        content = self._generate(engine)
         assert "RegisterLibraryFromFileRequest" not in content
 
-    def test_generated_build_workflow_registers_libraries_before_creating_nodes(self, griptape_nodes: Engine) -> None:
+    def test_generated_build_workflow_registers_libraries_before_creating_nodes(self, engine: Engine) -> None:
         """build_workflow() must dispatch RegisterLibraryFromFileRequest before any CreateNodeRequest.
 
         Captures the runtime contract for issue #4584: when a generated workflow runs as a
@@ -1922,7 +2090,7 @@ class TestWorkflowManager:
         from griptape_nodes.retained_mode.events.library_events import RegisterLibraryFromFileRequest
         from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, SerializedNodeCommands
 
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
 
         flow = SerializedFlowCommands(
             flow_initialization_command=_CreateFlowRequest(
@@ -1965,7 +2133,7 @@ class TestWorkflowManager:
 
         dispatched: list[object] = []
 
-        original_ahandle = GriptapeNodes.ahandle_request
+        original_ahandle = engine.ahandle_request
 
         async def recording_ahandle_request(request: object) -> object:
             dispatched.append(request)
@@ -1973,7 +2141,9 @@ class TestWorkflowManager:
 
         exec_globals: dict[str, object] = {"__file__": "runtime_order_test.py"}
         exec(compile(script_source, "<runtime_order_test>", "exec"), exec_globals)  # noqa: S102
-        with patch.object(GriptapeNodes, "ahandle_request", side_effect=recording_ahandle_request):
+        # The generated source calls the facade, which resolves to this engine, so stubbing the
+        # instance method is enough to record what build_workflow dispatches.
+        with patch.object(engine, "ahandle_request", side_effect=recording_ahandle_request):
             asyncio.run(exec_globals["build_workflow"]())  # type: ignore[operator]
 
         register_indices = [i for i, req in enumerate(dispatched) if isinstance(req, RegisterLibraryFromFileRequest)]
@@ -1990,9 +2160,9 @@ class TestWorkflowManager:
             f" got order {[type(r).__name__ for r in dispatched]}"
         )
 
-    def test_generate_workflow_file_content_empty_build_workflow_has_pass_body(self, griptape_nodes: Engine) -> None:
+    def test_generate_workflow_file_content_empty_build_workflow_has_pass_body(self, engine: Engine) -> None:
         """If we somehow produce no graph-building statements, build_workflow should still be valid Python."""
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         # Stub out the two generators so main_body ends up empty and the `or [ast.Pass()]` branch runs.
         with (
             patch.object(workflow_manager, "_generate_workflow_run_prerequisite_code", return_value=[]),
@@ -2014,19 +2184,33 @@ class TestWorkflowManager:
         assert len(build_workflow.body) == 1
         assert isinstance(build_workflow.body[0], ast.Pass)
 
-    def test_generate_workflow_file_content_aexecute_awaits_build_workflow_first(self, griptape_nodes: Engine) -> None:
-        """aexecute_workflow must `await build_workflow()` before running the executor.
+    def test_generate_workflow_file_content_aexecute_builds_inside_executor_context(self, engine: Engine) -> None:
+        """aexecute_workflow must `await build_workflow()` inside the executor's `async with`.
 
-        Shape-bearing workflows emit execute_workflow + aexecute_workflow, and the async
-        version is expected to construct the graph before invoking the executor.
+        Entering the executor context is what activates the project passed via
+        `--project-file-path`, and only then is a packaged bundle's own
+        griptape_nodes_config.json read -- which is what registers the bundle's libraries.
+        Building the graph before entering would create nodes from libraries nothing has
+        registered yet, so a bundle run on a machine that does not already know those
+        libraries comes up full of Error Proxy nodes.
         """
-        content = self._generate(griptape_nodes, with_shape=True)
+        content = self._generate(engine, with_shape=True)
         module = ast.parse(content)
 
         aexecute = next(
             node for node in module.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "aexecute_workflow"
         )
-        first_stmt = aexecute.body[0]
+        async_with = next(stmt for stmt in aexecute.body if isinstance(stmt, ast.AsyncWith))
+
+        # Nothing may await build_workflow() outside the executor context.
+        outside = [stmt for stmt in aexecute.body if stmt is not async_with]
+        assert not any(
+            isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "build_workflow"
+            for stmt in outside
+            for node in ast.walk(stmt)
+        ), ast.unparse(aexecute)
+
+        first_stmt = async_with.body[0]
         # Expected shape: `await build_workflow()`
         assert isinstance(first_stmt, ast.Expr)
         assert isinstance(first_stmt.value, ast.Await)
@@ -2035,9 +2219,9 @@ class TestWorkflowManager:
         assert isinstance(call.func, ast.Name)
         assert call.func.id == "build_workflow"
 
-    def test_generate_workflow_file_content_ensure_context_is_async(self, griptape_nodes: Engine) -> None:
+    def test_generate_workflow_file_content_ensure_context_is_async(self, engine: Engine) -> None:
         """_ensure_workflow_context is now async and must await ahandle_request."""
-        content = self._generate(griptape_nodes, with_shape=True)
+        content = self._generate(engine, with_shape=True)
         module = ast.parse(content)
 
         ensure = next(
@@ -2050,13 +2234,13 @@ class TestWorkflowManager:
         # Sanity check: the old sync variant is gone.
         assert "GriptapeNodes.handle_request(" not in body_src
 
-    def test_generate_workflow_file_content_is_valid_python(self, griptape_nodes: Engine) -> None:
+    def test_generate_workflow_file_content_is_valid_python(self, engine: Engine) -> None:
         """Generated content must parse cleanly (no smuggled-string comments left behind)."""
-        content = self._generate(griptape_nodes, with_shape=True)
+        content = self._generate(engine, with_shape=True)
         # ast.parse raises SyntaxError if rewrite_string_comments left bad output behind.
         ast.parse(content)
 
-    def test_collect_object_imports_routes_dynamic_module_to_deferred(self, griptape_nodes: Engine) -> None:
+    def test_collect_object_imports_routes_dynamic_module_to_deferred(self, engine: Engine) -> None:
         """Dynamic library class imports must go into deferred_imports, not import_recorder.
 
         Regression for #4738: _collect_object_imports previously routed all imports through
@@ -2066,7 +2250,7 @@ class TestWorkflowManager:
         """
         from griptape_nodes.retained_mode.managers.workflow_manager import ImportRecorder
 
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         fake_class = type("FakeClass", (), {})
         fake_module = MagicMock()
         fake_module.__name__ = "gtn_dynamic_module_foo_py_123"
@@ -2079,9 +2263,9 @@ class TestWorkflowManager:
                 "griptape_nodes.retained_mode.managers.workflow_manager.getmodule",
                 return_value=fake_module,
             ),
-            patch.object(griptape_nodes.LibraryManager(), "is_dynamic_module", return_value=True),
+            patch.object(engine.library_manager, "is_dynamic_module", return_value=True),
             patch.object(
-                griptape_nodes.LibraryManager(),
+                engine.library_manager,
                 "get_stable_namespace_for_dynamic_module",
                 return_value="my_lib.foo",
             ),
@@ -2108,7 +2292,7 @@ class TestWorkflowVariablePersistence:
             node_libraries_referenced=[],
         )
 
-    def test_generate_create_variable_code_emits_expected_call(self, griptape_nodes: Engine) -> None:
+    def test_generate_create_variable_code_emits_expected_call(self, engine: Engine) -> None:
         """The AST helper should produce a single CreateVariableRequest call per command."""
         import ast
 
@@ -2117,7 +2301,7 @@ class TestWorkflowVariablePersistence:
         from griptape_nodes.retained_mode.events.variable_events import CreateVariableRequest
         from griptape_nodes.retained_mode.managers.workflow_manager import ImportRecorder
 
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         import_recorder = ImportRecorder()
 
         serialized_command = SerializedFlowCommands.SerializedVariableCommand(
@@ -2152,29 +2336,29 @@ class TestWorkflowVariablePersistence:
         imports_text = import_recorder.generate_imports()
         assert "CreateVariableRequest" in imports_text
 
-    def _push_clean_flow_context(self, griptape_nodes: Engine, flow_name: str = "ControlFlow_1") -> str:
+    def _push_clean_flow_context(self, engine: Engine, flow_name: str = "ControlFlow_1") -> str:
         """Clear state, push a workflow context, and create a single empty flow. Returns the flow name."""
         from griptape_nodes.retained_mode.events.flow_events import (
             CreateFlowRequest,
             CreateFlowResultSuccess,
         )
 
-        variables_manager = griptape_nodes.VariablesManager()
-        context_manager = griptape_nodes.ContextManager()
+        variables_manager = engine.variables_manager
+        context_manager = engine.context_manager
 
         if context_manager.has_current_workflow():
-            GriptapeNodes.clear_current_workflow_data()
+            engine.clear_current_workflow_data()
         variables_manager.clear_object_state()
 
         context_manager.push_workflow(workflow_name="round_trip_workflow")
 
-        flow_result = GriptapeNodes.handle_request(
+        flow_result = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name=flow_name, set_as_new_context=False)
         )
         assert isinstance(flow_result, CreateFlowResultSuccess)
         return flow_result.flow_name
 
-    def test_declared_variable_gets_serialized(self, griptape_nodes: Engine) -> None:
+    def test_declared_variable_gets_serialized(self, engine: Engine) -> None:
         """A flow-scoped variable that is declared via a VariableReference should be serialized."""
         from griptape_nodes.exe_types.node_types import VariableReference
         from griptape_nodes.retained_mode.events.variable_events import (
@@ -2183,11 +2367,11 @@ class TestWorkflowVariablePersistence:
         )
         from griptape_nodes.retained_mode.variable_types import VariableScope
 
-        flow_manager = griptape_nodes.FlowManager()
-        flow_name = self._push_clean_flow_context(griptape_nodes)
+        flow_manager = engine.flow_manager
+        flow_name = self._push_clean_flow_context(engine)
 
         assert isinstance(
-            GriptapeNodes.handle_request(
+            engine.handle_request(
                 CreateVariableRequest(
                     name="declared_var", type="str", is_global=False, value="dog", owning_flow=flow_name
                 )
@@ -2205,18 +2389,18 @@ class TestWorkflowVariablePersistence:
         assert {cmd.create_variable_command.name for cmd in commands} == {"declared_var"}
         assert len(unique_values) == 1
 
-    def test_orphan_variable_is_dropped(self, griptape_nodes: Engine) -> None:
+    def test_orphan_variable_is_dropped(self, engine: Engine) -> None:
         """A variable in engine state with no declared reference must not be serialized."""
         from griptape_nodes.retained_mode.events.variable_events import (
             CreateVariableRequest,
             CreateVariableResultSuccess,
         )
 
-        flow_manager = griptape_nodes.FlowManager()
-        flow_name = self._push_clean_flow_context(griptape_nodes)
+        flow_manager = engine.flow_manager
+        flow_name = self._push_clean_flow_context(engine)
 
         assert isinstance(
-            GriptapeNodes.handle_request(
+            engine.handle_request(
                 CreateVariableRequest(
                     name="orphan_var", type="str", is_global=False, value="cat", owning_flow=flow_name
                 )
@@ -2234,13 +2418,13 @@ class TestWorkflowVariablePersistence:
         assert commands == []
         assert unique_values == {}
 
-    def test_declared_but_missing_variable_is_dropped(self, griptape_nodes: Engine) -> None:
+    def test_declared_but_missing_variable_is_dropped(self, engine: Engine) -> None:
         """A reference to a variable that does not exist in the flow should not produce a command."""
         from griptape_nodes.exe_types.node_types import VariableReference
         from griptape_nodes.retained_mode.variable_types import VariableScope
 
-        flow_manager = griptape_nodes.FlowManager()
-        flow_name = self._push_clean_flow_context(griptape_nodes)
+        flow_manager = engine.flow_manager
+        flow_name = self._push_clean_flow_context(engine)
 
         unique_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, object] = {}
         commands = flow_manager._serialize_variables_for_flow(
@@ -2251,7 +2435,7 @@ class TestWorkflowVariablePersistence:
 
         assert commands == []
 
-    def test_global_only_scope_is_skipped(self, griptape_nodes: Engine) -> None:
+    def test_global_only_scope_is_skipped(self, engine: Engine) -> None:
         """GLOBAL_ONLY references are deferred for now and must not produce a command."""
         from griptape_nodes.exe_types.node_types import VariableReference
         from griptape_nodes.retained_mode.events.variable_events import (
@@ -2260,13 +2444,13 @@ class TestWorkflowVariablePersistence:
         )
         from griptape_nodes.retained_mode.variable_types import VariableScope
 
-        flow_manager = griptape_nodes.FlowManager()
-        flow_name = self._push_clean_flow_context(griptape_nodes)
+        flow_manager = engine.flow_manager
+        flow_name = self._push_clean_flow_context(engine)
 
         # Create a flow-scoped variable with the same name as a pretend-global. It should not match,
         # because the GLOBAL_ONLY scope is unsupported for serialization and must be skipped.
         assert isinstance(
-            GriptapeNodes.handle_request(
+            engine.handle_request(
                 CreateVariableRequest(
                     name="shared_name", type="str", is_global=False, value="local", owning_flow=flow_name
                 )
@@ -2283,7 +2467,7 @@ class TestWorkflowVariablePersistence:
 
         assert commands == []
 
-    def test_hierarchical_reference_only_serializes_at_owning_flow(self, griptape_nodes: Engine) -> None:
+    def test_hierarchical_reference_only_serializes_at_owning_flow(self, engine: Engine) -> None:
         """A HIERARCHICAL reference resolved against a child flow must not serialize an ancestor-owned variable."""
         from griptape_nodes.exe_types.node_types import VariableReference
         from griptape_nodes.retained_mode.events.flow_events import (
@@ -2296,10 +2480,10 @@ class TestWorkflowVariablePersistence:
         )
         from griptape_nodes.retained_mode.variable_types import VariableScope
 
-        flow_manager = griptape_nodes.FlowManager()
-        parent_flow_name = self._push_clean_flow_context(griptape_nodes, flow_name="ParentFlow")
+        flow_manager = engine.flow_manager
+        parent_flow_name = self._push_clean_flow_context(engine, flow_name="ParentFlow")
 
-        child_flow_result = GriptapeNodes.handle_request(
+        child_flow_result = engine.handle_request(
             CreateFlowRequest(parent_flow_name=parent_flow_name, flow_name="ChildFlow", set_as_new_context=False)
         )
         assert isinstance(child_flow_result, CreateFlowResultSuccess)
@@ -2307,7 +2491,7 @@ class TestWorkflowVariablePersistence:
 
         # Variable lives on the parent.
         assert isinstance(
-            GriptapeNodes.handle_request(
+            engine.handle_request(
                 CreateVariableRequest(
                     name="ancestor_var",
                     type="str",
@@ -2339,7 +2523,7 @@ class TestWorkflowVariablePersistence:
         )
         assert {cmd.create_variable_command.name for cmd in parent_commands} == {"ancestor_var"}
 
-    def test_save_load_preserves_flow_scoped_variables(self, griptape_nodes: Engine) -> None:
+    def test_save_load_preserves_flow_scoped_variables(self, engine: Engine) -> None:
         """Round-trip: declare a flow-scoped variable, serialize, clear, exec, confirm it is restored."""
         from griptape_nodes.exe_types.node_types import NodeDependencies, VariableReference
         from griptape_nodes.retained_mode.events.flow_events import (
@@ -2354,12 +2538,12 @@ class TestWorkflowVariablePersistence:
         )
         from griptape_nodes.retained_mode.variable_types import VariableScope
 
-        workflow_manager = griptape_nodes.WorkflowManager()
-        variables_manager = griptape_nodes.VariablesManager()
-        flow_name = self._push_clean_flow_context(griptape_nodes)
+        workflow_manager = engine.workflow_manager
+        variables_manager = engine.variables_manager
+        flow_name = self._push_clean_flow_context(engine)
 
         assert isinstance(
-            GriptapeNodes.handle_request(
+            engine.handle_request(
                 CreateVariableRequest(
                     name="flow_scoped_var", type="str", is_global=False, value="dog", owning_flow=flow_name
                 )
@@ -2374,7 +2558,7 @@ class TestWorkflowVariablePersistence:
         from griptape_nodes.retained_mode.events.flow_events import SerializedFlowCommands
         from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands
 
-        flow_manager = griptape_nodes.FlowManager()
+        flow_manager = engine.flow_manager
         original_aggregate = flow_manager._aggregate_flow_dependencies
 
         def aggregate_with_declared_ref(
@@ -2392,7 +2576,7 @@ class TestWorkflowVariablePersistence:
             "_aggregate_flow_dependencies",
             side_effect=aggregate_with_declared_ref,
         ):
-            serialize_result = GriptapeNodes.handle_request(SerializeFlowToCommandsRequest(flow_name=flow_name))
+            serialize_result = engine.handle_request(SerializeFlowToCommandsRequest(flow_name=flow_name))
 
         assert isinstance(serialize_result, SerializeFlowToCommandsResultSuccess)
         serialized_commands = serialize_result.serialized_flow_commands
@@ -2414,7 +2598,7 @@ class TestWorkflowVariablePersistence:
         assert "name='flow_scoped_var'" in script_source
 
         # Clear everything, then exec the script and confirm the variable is rebuilt.
-        GriptapeNodes.clear_current_workflow_data()
+        engine.clear_current_workflow_data()
         variables_manager.clear_object_state()
 
         exec_globals: dict[str, object] = {"__file__": "test_workflow.py"}
@@ -2425,7 +2609,7 @@ class TestWorkflowVariablePersistence:
         build_workflow = exec_globals["build_workflow"]
         asyncio.run(build_workflow())  # type: ignore[operator]
 
-        flow_value = GriptapeNodes.handle_request(
+        flow_value = engine.handle_request(
             GetVariableValueRequest(
                 name="flow_scoped_var", starting_flow=flow_name, lookup_scope=VariableScope.CURRENT_FLOW_ONLY
             )
@@ -2433,7 +2617,7 @@ class TestWorkflowVariablePersistence:
         assert isinstance(flow_value, GetVariableValueResultSuccess)
         assert flow_value.value == "dog"
 
-    def test_save_drops_orphan_variables_end_to_end(self, griptape_nodes: Engine) -> None:
+    def test_save_drops_orphan_variables_end_to_end(self, engine: Engine) -> None:
         """The var.py scenario: a variable with no declaring node must not survive serialization."""
         from griptape_nodes.retained_mode.events.flow_events import (
             SerializeFlowToCommandsRequest,
@@ -2444,12 +2628,12 @@ class TestWorkflowVariablePersistence:
             CreateVariableResultSuccess,
         )
 
-        flow_name = self._push_clean_flow_context(griptape_nodes)
+        flow_name = self._push_clean_flow_context(engine)
 
         # Simulate the bug: a variable was created (via some now-deleted SetVariable node) but no
         # node currently declares it.
         assert isinstance(
-            GriptapeNodes.handle_request(
+            engine.handle_request(
                 CreateVariableRequest(
                     name="orphan_var", type="str", is_global=False, value="stale", owning_flow=flow_name
                 )
@@ -2457,7 +2641,7 @@ class TestWorkflowVariablePersistence:
             CreateVariableResultSuccess,
         )
 
-        serialize_result = GriptapeNodes.handle_request(SerializeFlowToCommandsRequest(flow_name=flow_name))
+        serialize_result = engine.handle_request(SerializeFlowToCommandsRequest(flow_name=flow_name))
         assert isinstance(serialize_result, SerializeFlowToCommandsResultSuccess)
         assert serialize_result.serialized_flow_commands.serialized_variable_commands == []
 
@@ -2509,7 +2693,7 @@ class TestVariableReferenceAccess:
             VariableReference(name="foo", scope=VariableScope.HIERARCHICAL, access=VariableAccess.READ_WRITE),
         }
 
-    def test_serializer_ignores_access(self, griptape_nodes: Engine) -> None:
+    def test_serializer_ignores_access(self, engine: Engine) -> None:
         """Serialization filtering is access-agnostic: any declared reference keeps the variable."""
         from griptape_nodes.exe_types.node_types import VariableAccess, VariableReference
         from griptape_nodes.retained_mode.events.variable_events import (
@@ -2518,12 +2702,12 @@ class TestVariableReferenceAccess:
         )
         from griptape_nodes.retained_mode.variable_types import VariableScope
 
-        flow_manager = griptape_nodes.FlowManager()
+        flow_manager = engine.flow_manager
         persistence = TestWorkflowVariablePersistence()
-        flow_name = persistence._push_clean_flow_context(griptape_nodes)
+        flow_name = persistence._push_clean_flow_context(engine)
 
         assert isinstance(
-            GriptapeNodes.handle_request(
+            engine.handle_request(
                 CreateVariableRequest(name="only_read", type="str", is_global=False, value="cat", owning_flow=flow_name)
             ),
             CreateVariableResultSuccess,
@@ -2545,27 +2729,37 @@ class TestVariableReferenceAccess:
 class TestLibraryResolutionOnLoad:
     """run_workflow resolves declared libraries before exec via the metadata header."""
 
-    def test_ensure_libraries_dispatches_ahandle_request_per_library(self, griptape_nodes: Engine) -> None:
-        """_ensure_libraries_for_workflow dispatches one RegisterLibraryFromFileRequest per declared library."""
+    @staticmethod
+    def _metadata(*libraries: tuple[str, str]) -> WorkflowMetadata:
         from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
-        from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
-        from griptape_nodes.retained_mode.events.library_events import (
-            RegisterLibraryFromFileRequest,
-            RegisterLibraryFromFileResultSuccess,
-        )
-        from griptape_nodes.retained_mode.events.workflow_events import LoadWorkflowMetadataResultSuccess
 
-        workflow_manager = griptape_nodes.WorkflowManager()
-        metadata = WorkflowMetadata(
+        return WorkflowMetadata(
             name="t",
             schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
             engine_version_created_with="0.0.0",
             node_libraries_referenced=[
-                LibraryNameAndVersion(library_name="Example Library", library_version="0.1.0"),
-                LibraryNameAndVersion(library_name="Other Library", library_version="0.2.0"),
+                LibraryNameAndVersion(library_name=name, library_version=version) for name, version in libraries
             ],
         )
+
+    def _resolve(self, engine: Engine, metadata: WorkflowMetadata, ahandle_request: object) -> list:
+        """Drive _ensure_libraries_for_workflow against a stubbed metadata header and dispatcher."""
+        from griptape_nodes.retained_mode.events.workflow_events import LoadWorkflowMetadataResultSuccess
+
+        workflow_manager = engine.workflow_manager
         load_result = LoadWorkflowMetadataResultSuccess(metadata=metadata, result_details="ok")
+        with (
+            patch.object(workflow_manager, "on_load_workflow_metadata_request", AsyncMock(return_value=load_result)),
+            patch.object(engine, "ahandle_request", ahandle_request),
+        ):
+            return asyncio.run(workflow_manager._ensure_libraries_for_workflow(relative_file_path="whatever.py"))
+
+    def test_ensure_libraries_dispatches_ahandle_request_per_library(self, engine: Engine) -> None:
+        """_ensure_libraries_for_workflow dispatches one RegisterLibraryFromFileRequest per declared library."""
+        from griptape_nodes.retained_mode.events.library_events import (
+            RegisterLibraryFromFileRequest,
+            RegisterLibraryFromFileResultSuccess,
+        )
 
         dispatched: list[RegisterLibraryFromFileRequest] = []
 
@@ -2576,80 +2770,94 @@ class TestLibraryResolutionOnLoad:
                 result_details="ok",
             )
 
-        with (
-            patch.object(workflow_manager, "on_load_workflow_metadata_request", AsyncMock(return_value=load_result)),
-            patch.object(griptape_nodes, "ahandle_request", side_effect=fake_ahandle_request),
-        ):
-            result = asyncio.run(
-                workflow_manager._ensure_libraries_for_workflow(
-                    relative_file_path="whatever.py",
-                    complete_file_path=Path("whatever.py"),
-                )
-            )
+        problems = self._resolve(
+            engine,
+            self._metadata(("Example Library", "0.1.0"), ("Other Library", "0.2.0")),
+            fake_ahandle_request,
+        )
 
-        assert result is None
+        assert problems == []
         assert [r.library_name for r in dispatched] == ["Example Library", "Other Library"]
         assert all(r.perform_discovery_if_not_found for r in dispatched)
 
-    def test_ensure_libraries_returns_failure_when_registration_fails(self, griptape_nodes: Engine) -> None:
-        """A failed library registration short-circuits with a WorkflowExecutionResult failure."""
-        from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
-        from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
+    def test_ensure_libraries_reports_the_library_instead_of_refusing_the_load(self, engine: Engine) -> None:
+        """A failed registration becomes a problem, not a refusal: the caller still execs the file.
+
+        A library that will not register costs execution, never editing (issue #5505). The nodes
+        it owns come back as placeholders, which is only possible if the load continues.
+        """
         from griptape_nodes.retained_mode.events.library_events import RegisterLibraryFromFileResultFailure
-        from griptape_nodes.retained_mode.events.workflow_events import LoadWorkflowMetadataResultSuccess
+        from griptape_nodes.retained_mode.managers.fitness_problems.workflows import LibraryNotRegisteredProblem
 
-        workflow_manager = griptape_nodes.WorkflowManager()
-        metadata = WorkflowMetadata(
-            name="t",
-            schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
-            engine_version_created_with="0.0.0",
-            node_libraries_referenced=[
-                LibraryNameAndVersion(library_name="Missing Library", library_version="0.1.0"),
-            ],
+        problems = self._resolve(
+            engine,
+            self._metadata(("Missing Library", "0.1.0")),
+            AsyncMock(return_value=RegisterLibraryFromFileResultFailure(result_details="not found")),
         )
-        load_result = LoadWorkflowMetadataResultSuccess(metadata=metadata, result_details="ok")
 
-        with (
-            patch.object(workflow_manager, "on_load_workflow_metadata_request", AsyncMock(return_value=load_result)),
-            patch.object(
-                GriptapeNodes,
-                "ahandle_request",
-                AsyncMock(return_value=RegisterLibraryFromFileResultFailure(result_details="not found")),
+        assert problems == [LibraryNotRegisteredProblem(library_name="Missing Library", reason="not found")]
+
+    def test_ensure_libraries_records_the_registration_reason(self, engine: Engine) -> None:
+        """The reason travels on the problem, so "it's switched off" isn't left for the reader to guess.
+
+        The disabled case is the one that needs it: the library is on disk and named in the
+        user's config, so a bare "not registered" sends them hunting for something already there.
+        """
+        from griptape_nodes.retained_mode.events.library_events import RegisterLibraryFromFileResultFailure
+        from griptape_nodes.retained_mode.managers.fitness_problems.workflows import LibraryNotRegisteredProblem
+
+        disabled = "Library at '/libs/x/griptape_nodes_library.json' is disabled in libraries_to_register"
+        problems = self._resolve(
+            engine,
+            self._metadata(("Missing Library", "0.1.0")),
+            AsyncMock(return_value=RegisterLibraryFromFileResultFailure(result_details=disabled)),
+        )
+
+        assert problems[0].reason == disabled
+        collated = LibraryNotRegisteredProblem.collate_problems_for_display(problems)
+        assert "disabled in libraries_to_register" in collated
+
+    def test_ensure_libraries_attempts_every_library_after_one_fails(self, engine: Engine) -> None:
+        """One unresolvable library does not stop the others from registering.
+
+        Short-circuiting here would strand libraries later in the list, turning their perfectly
+        loadable nodes into placeholders too.
+        """
+        from griptape_nodes.retained_mode.events.library_events import (
+            RegisterLibraryFromFileRequest,
+            RegisterLibraryFromFileResultFailure,
+            RegisterLibraryFromFileResultSuccess,
+        )
+
+        dispatched: list[RegisterLibraryFromFileRequest] = []
+
+        async def fake_ahandle_request(request: object) -> object:
+            dispatched.append(request)  # type: ignore[arg-type]
+            library_name = request.library_name  # type: ignore[attr-defined]
+            if library_name == "Present Library":
+                return RegisterLibraryFromFileResultSuccess(library_name=library_name, result_details="ok")
+            return RegisterLibraryFromFileResultFailure(result_details="not found")
+
+        problems = self._resolve(
+            engine,
+            self._metadata(
+                ("Missing Library", "0.1.0"), ("Present Library", "0.2.0"), ("Also Missing Library", "0.3.0")
             ),
-        ):
-            result = asyncio.run(
-                workflow_manager._ensure_libraries_for_workflow(
-                    relative_file_path="whatever.py",
-                    complete_file_path=Path("whatever.py"),
-                )
-            )
+            fake_ahandle_request,
+        )
 
-        assert result is not None
-        assert result.execution_successful is False
-        assert "Missing Library" in result.execution_details
+        assert [r.library_name for r in dispatched] == ["Missing Library", "Present Library", "Also Missing Library"]
+        # The library that loaded is not reported as a problem.
+        assert [p.library_name for p in problems] == ["Missing Library", "Also Missing Library"]
 
-    def test_ensure_libraries_failure_message_uses_filename_and_renders_semver(self, griptape_nodes: Engine) -> None:
-        """Failure message uses the workflow file name (not full path) and renders v<version> for semver values."""
+    def test_ensure_libraries_suppresses_the_inner_registration_toast(self, engine: Engine) -> None:
+        """The run result names the library, so the inner request must not toast on top of it."""
         import logging as _logging
 
-        from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
-        from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
         from griptape_nodes.retained_mode.events.library_events import (
             RegisterLibraryFromFileRequest,
             RegisterLibraryFromFileResultFailure,
         )
-        from griptape_nodes.retained_mode.events.workflow_events import LoadWorkflowMetadataResultSuccess
-
-        workflow_manager = griptape_nodes.WorkflowManager()
-        metadata = WorkflowMetadata(
-            name="t",
-            schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
-            engine_version_created_with="0.0.0",
-            node_libraries_referenced=[
-                LibraryNameAndVersion(library_name="Missing Library", library_version="1.2.3"),
-            ],
-        )
-        load_result = LoadWorkflowMetadataResultSuccess(metadata=metadata, result_details="ok")
 
         dispatched: list[RegisterLibraryFromFileRequest] = []
 
@@ -2657,135 +2865,226 @@ class TestLibraryResolutionOnLoad:
             dispatched.append(request)  # type: ignore[arg-type]
             return RegisterLibraryFromFileResultFailure(result_details="not found")
 
-        with (
-            patch.object(workflow_manager, "on_load_workflow_metadata_request", AsyncMock(return_value=load_result)),
-            patch.object(griptape_nodes, "ahandle_request", side_effect=fake_ahandle_request),
-        ):
-            result = asyncio.run(
-                workflow_manager._ensure_libraries_for_workflow(
-                    relative_file_path="nested/dir/corridorKey.py",
-                    complete_file_path=Path("/abs/path/to/nested/dir/corridorKey.py"),
-                )
-            )
+        self._resolve(engine, self._metadata(("Missing Library", "1.2.3")), fake_ahandle_request)
 
-        assert result is not None
-        assert result.execution_successful is False
-        # Filename only, not the absolute path
-        assert "corridorKey.py" in result.execution_details
-        assert "/abs/path/to" not in result.execution_details
-        # Semver version renders with v-prefix
-        assert "v1.2.3" in result.execution_details
-        assert "Missing Library" in result.execution_details
-        # Inner request is suppressed at DEBUG so the GUI doesn't double-toast.
         assert len(dispatched) == 1
         assert dispatched[0].failure_log_level == _logging.DEBUG
 
-    def test_ensure_libraries_failure_message_omits_non_semver_version(self, griptape_nodes: Engine) -> None:
-        """Non-semver `library_version` values (e.g. unavailable-library placeholder) are not rendered as v<...>."""
-        from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
-        from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
-        from griptape_nodes.retained_mode.events.library_events import RegisterLibraryFromFileResultFailure
-        from griptape_nodes.retained_mode.events.workflow_events import LoadWorkflowMetadataResultSuccess
-
-        workflow_manager = griptape_nodes.WorkflowManager()
-        placeholder = "<version unavailable; workflow was saved when library was unable to be loaded>"
-        metadata = WorkflowMetadata(
-            name="t",
-            schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
-            engine_version_created_with="0.0.0",
-            node_libraries_referenced=[
-                LibraryNameAndVersion(library_name="Missing Library", library_version=placeholder),
-            ],
-        )
-        load_result = LoadWorkflowMetadataResultSuccess(metadata=metadata, result_details="ok")
-
-        with (
-            patch.object(workflow_manager, "on_load_workflow_metadata_request", AsyncMock(return_value=load_result)),
-            patch.object(
-                GriptapeNodes,
-                "ahandle_request",
-                AsyncMock(return_value=RegisterLibraryFromFileResultFailure(result_details="not found")),
+    @pytest.mark.parametrize(
+        ("case_name", "stored_version"),
+        [
+            ("semver", "1.2.3"),
+            (
+                "unavailable_placeholder",
+                "<version unavailable; workflow was saved when library was unable to be loaded>",
             ),
-        ):
-            result = asyncio.run(
-                workflow_manager._ensure_libraries_for_workflow(
-                    relative_file_path="corridorKey.py",
-                    complete_file_path=Path("corridorKey.py"),
-                )
-            )
+        ],
+    )
+    def test_ensure_libraries_never_reports_the_declared_version(
+        self, engine: Engine, case_name: str, stored_version: str
+    ) -> None:
+        """A library that never registered has no version to compare against, so none is rendered.
 
-        assert result is not None
-        assert result.execution_successful is False
-        assert "Missing Library" in result.execution_details
-        # Placeholder must not leak into the user-facing message in any form
-        assert placeholder not in result.execution_details
-        assert " v" not in result.execution_details.split("Missing Library", 1)[1]
-
-    def test_ensure_libraries_failure_message_omits_empty_version(self, griptape_nodes: Engine) -> None:
-        """An empty `library_version` falls through the semver check and renders no version suffix."""
-        from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
-        from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
+        The version-mismatch problems cover a library that IS present at the wrong version. Not
+        rendering it here also keeps the non-semver placeholder a workflow stores when saved
+        without its library from ever reaching the reader.
+        """
+        del case_name
         from griptape_nodes.retained_mode.events.library_events import RegisterLibraryFromFileResultFailure
-        from griptape_nodes.retained_mode.events.workflow_events import LoadWorkflowMetadataResultSuccess
+        from griptape_nodes.retained_mode.managers.fitness_problems.workflows import LibraryNotRegisteredProblem
 
-        workflow_manager = griptape_nodes.WorkflowManager()
-        metadata = WorkflowMetadata(
-            name="t",
-            schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
-            engine_version_created_with="0.0.0",
-            node_libraries_referenced=[
-                LibraryNameAndVersion(library_name="Missing Library", library_version=""),
-            ],
+        problems = self._resolve(
+            engine,
+            self._metadata(("Missing Library", stored_version)),
+            AsyncMock(return_value=RegisterLibraryFromFileResultFailure(result_details="not found")),
         )
-        load_result = LoadWorkflowMetadataResultSuccess(metadata=metadata, result_details="ok")
 
-        with (
-            patch.object(workflow_manager, "on_load_workflow_metadata_request", AsyncMock(return_value=load_result)),
-            patch.object(
-                GriptapeNodes,
-                "ahandle_request",
-                AsyncMock(return_value=RegisterLibraryFromFileResultFailure(result_details="not found")),
-            ),
-        ):
-            result = asyncio.run(
-                workflow_manager._ensure_libraries_for_workflow(
-                    relative_file_path="corridorKey.py",
-                    complete_file_path=Path("corridorKey.py"),
-                )
-            )
+        collated = LibraryNotRegisteredProblem.collate_problems_for_display(problems)
+        assert "Missing Library" in collated
+        assert stored_version not in collated
 
-        assert result is not None
-        assert result.execution_successful is False
-        assert "Missing Library" in result.execution_details
-        assert " v" not in result.execution_details.split("Missing Library", 1)[1]
-
-    def test_ensure_libraries_is_noop_when_metadata_missing(self, griptape_nodes: Engine) -> None:
-        """If metadata can't be loaded, _ensure_libraries_for_workflow returns None (tolerant fallback)."""
+    def test_ensure_libraries_is_noop_when_metadata_missing(self, engine: Engine) -> None:
+        """If metadata can't be loaded, _ensure_libraries_for_workflow reports nothing (tolerant fallback)."""
         from griptape_nodes.retained_mode.events.workflow_events import LoadWorkflowMetadataResultFailure
 
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         load_result = LoadWorkflowMetadataResultFailure(result_details="no metadata")
 
         ahandle_spy = AsyncMock()
         with (
             patch.object(workflow_manager, "on_load_workflow_metadata_request", AsyncMock(return_value=load_result)),
-            patch.object(GriptapeNodes, "ahandle_request", ahandle_spy),
+            patch.object(engine, "ahandle_request", ahandle_spy),
         ):
-            result = asyncio.run(
-                workflow_manager._ensure_libraries_for_workflow(
-                    relative_file_path="whatever.py",
-                    complete_file_path=Path("whatever.py"),
-                )
-            )
+            problems = asyncio.run(workflow_manager._ensure_libraries_for_workflow(relative_file_path="whatever.py"))
 
-        assert result is None
+        assert problems == []
         ahandle_spy.assert_not_awaited()
+
+
+class TestRunResultRendering:
+    """A run's problems reach the caller as warnings, ahead of its own detail."""
+
+    _PLACEHOLDERS = (
+        "Nodes from the libraries above opened as placeholders. "
+        "They preserve the graph but cannot run until their library is available."
+    )
+
+    def _result(self, *, successful: bool, libraries: tuple[str, ...]) -> WorkflowManager.WorkflowExecutionResult:
+        from griptape_nodes.retained_mode.events.workflow_events import WorkflowStatus
+        from griptape_nodes.retained_mode.managers.fitness_problems.workflows import LibraryNotRegisteredProblem
+
+        problems = tuple(LibraryNotRegisteredProblem(library_name=name, reason="not found") for name in libraries)
+        if successful:
+            status = WorkflowStatus.FLAWED if problems else WorkflowStatus.GOOD
+        else:
+            status = WorkflowStatus.UNUSABLE
+        return WorkflowManager.WorkflowExecutionResult(
+            execution_successful=successful,
+            execution_details="ran the file",
+            status=status,
+            problems=problems,
+        )
+
+    def test_problems_of_one_type_are_collated_into_a_single_warning(self, engine: Engine) -> None:
+        """Grouping is what lets five unregistered libraries say so once instead of five times."""
+        details = engine.workflow_manager._execution_result_details(
+            self._result(successful=True, libraries=("Library A", "Library B")), level=logging.DEBUG
+        )
+
+        assert [detail.level for detail in details] == [logging.WARNING, logging.WARNING, logging.DEBUG]
+        assert "Library A" in details[0].message
+        assert "Library B" in details[0].message
+        assert details[1].message == self._PLACEHOLDERS
+        assert details[2].message == "ran the file"
+
+    def test_a_failed_load_is_not_told_its_nodes_became_placeholders(self, engine: Engine) -> None:
+        """Nothing opened, so promising placeholders next to an ERROR would misinform.
+
+        The failure branch of on_run_workflow_from_registry_request clears all object state, so
+        the canvas the message would be describing does not exist.
+        """
+        details = engine.workflow_manager._execution_result_details(
+            self._result(successful=False, libraries=("Library A",)), level=logging.ERROR
+        )
+
+        assert [(detail.level, detail.message) for detail in details] == [
+            (logging.WARNING, "'Library A' not registered. not found"),
+            (logging.ERROR, "ran the file"),
+        ]
+
+    def test_a_clean_run_renders_only_its_own_detail(self, engine: Engine) -> None:
+        details = engine.workflow_manager._execution_result_details(
+            self._result(successful=True, libraries=()), level=logging.DEBUG
+        )
+
+        assert [(detail.level, detail.message) for detail in details] == [(logging.DEBUG, "ran the file")]
+
+    def test_an_explicit_message_replaces_the_run_detail(self, engine: Engine) -> None:
+        """A wrapping handler keeps its own wording and still reports the problems."""
+        details = engine.workflow_manager._execution_result_details(
+            self._result(successful=True, libraries=("Library A",)),
+            level=logging.DEBUG,
+            message="Successfully imported workflow 'x' as referenced sub flow 'y'",
+        )
+
+        assert details[-1].message == "Successfully imported workflow 'x' as referenced sub flow 'y'"
+        assert "Library A" in details[0].message
+
+
+class TestRunWorkflowWithCurrentStateRequest:
+    """The handler refuses to load a workflow while a flow is still on the Current Context.
+
+    A saved workflow file asks for its own top-level flow with ``parent_flow_name=None``. Replayed
+    while a flow is open, that ``None`` reads as "use the current context", so the incoming flow is
+    adopted as an invisible child of the flow already on screen.
+    """
+
+    _WORKFLOW_FILE = "some_workflow.py"
+    _OPEN_FLOW_NAME = "ControlFlow_1"
+
+    @pytest.fixture
+    def context_manager(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> Mock:
+        """The engine's ContextManager, so each test states the flow stack it is loading into."""
+        context_manager = Mock(spec=ContextManager)
+        monkeypatch.setattr(engine, "_context_manager", context_manager)
+        return context_manager
+
+    @pytest.fixture
+    def run_workflow(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+        """WorkflowManager.run_workflow, so no workflow file is ever exec'd."""
+        run_workflow = AsyncMock(
+            spec=engine.workflow_manager.run_workflow,
+            return_value=WorkflowManager.WorkflowExecutionResult(
+                execution_successful=True, execution_details="ran the file"
+            ),
+        )
+        monkeypatch.setattr(engine.workflow_manager, "run_workflow", run_workflow)
+        return run_workflow
+
+    @pytest.fixture
+    def get_complete_file_path(self, monkeypatch: pytest.MonkeyPatch) -> Mock:
+        """Workspace path resolution, so no workspace config is needed."""
+        get_complete_file_path = Mock(
+            spec=WorkflowRegistry.get_complete_file_path, return_value=f"/workspace/{self._WORKFLOW_FILE}"
+        )
+        monkeypatch.setattr(WorkflowRegistry, "get_complete_file_path", get_complete_file_path)
+        return get_complete_file_path
+
+    @pytest.fixture
+    def anyio_path(self, monkeypatch: pytest.MonkeyPatch) -> Mock:
+        """The file-exists check, reporting a file so the test touches no filesystem."""
+        path = Mock(spec=anyio.Path)
+        path.is_file = AsyncMock(spec=anyio.Path.is_file, return_value=True)
+        anyio_path = Mock(spec=anyio.Path, return_value=path)
+        monkeypatch.setattr(anyio, "Path", anyio_path)
+        return anyio_path
+
+    @pytest.mark.asyncio
+    async def test_refuses_while_a_flow_is_open(
+        self,
+        engine: Engine,
+        context_manager: Mock,
+        run_workflow: AsyncMock,
+        get_complete_file_path: Mock,  # noqa: ARG002
+        anyio_path: Mock,  # noqa: ARG002
+    ) -> None:
+        open_flow = Mock(spec=ControlFlow)
+        open_flow.name = self._OPEN_FLOW_NAME
+        context_manager.has_current_flow.return_value = True
+        context_manager.get_current_flow.return_value = open_flow
+
+        result = await engine.workflow_manager.on_run_workflow_with_current_state_request(
+            RunWorkflowWithCurrentStateRequest(file_path=self._WORKFLOW_FILE)
+        )
+
+        assert isinstance(result, RunWorkflowWithCurrentStateResultFailure), result
+        # The guard is a precondition on engine state, so the file never gets exec'd.
+        run_workflow.assert_not_called()
+        assert self._OPEN_FLOW_NAME in str(result.result_details), result.result_details
+
+    @pytest.mark.asyncio
+    async def test_allows_a_workflow_context_with_no_open_flow(
+        self,
+        engine: Engine,
+        context_manager: Mock,
+        run_workflow: AsyncMock,
+        get_complete_file_path: Mock,  # noqa: ARG002
+        anyio_path: Mock,  # noqa: ARG002
+    ) -> None:
+        context_manager.has_current_flow.return_value = False
+
+        await engine.workflow_manager.on_run_workflow_with_current_state_request(
+            RunWorkflowWithCurrentStateRequest(file_path=self._WORKFLOW_FILE)
+        )
+
+        # Getting past the guard is the behaviour under test; what the run then does is mocked away.
+        run_workflow.assert_called_once_with(relative_file_path=self._WORKFLOW_FILE)
 
 
 class TestWorkflowsLoadingGate:
     """Gated handlers must not deadlock when invoked during library load (issue #4470)."""
 
-    def test_workflows_loading_complete_is_set_on_init(self, griptape_nodes: Engine) -> None:
+    def test_workflows_loading_complete_is_set_on_init(self, engine: Engine) -> None:
         """The gate starts as set so handlers invoked before first refresh return immediately.
 
         The hazard is: a node __init__ fires a workflow query during library load, but
@@ -2793,18 +3092,18 @@ class TestWorkflowsLoadingGate:
         started unset, the handler would block forever. Starting set means handlers
         see an empty registry (the truth during startup) and return a clean empty result.
         """
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
 
         assert workflow_manager._workflows_loading_complete.is_set()
 
-    def test_list_all_workflows_returns_immediately_before_first_refresh(self, griptape_nodes: Engine) -> None:
+    def test_list_all_workflows_returns_immediately_before_first_refresh(self, engine: Engine) -> None:
         """on_list_all_workflows_request does not hang when invoked before refresh_workflow_registry."""
         from griptape_nodes.retained_mode.events.workflow_events import (
             ListAllWorkflowsRequest,
             ListAllWorkflowsResultSuccess,
         )
 
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
 
         async def gated() -> object:
             return await asyncio.wait_for(
@@ -2820,7 +3119,7 @@ class TestWorkflowsLoadingGate:
 class TestWorkflowMetadataTransitiveDeps:
     """node_libraries_referenced in saved workflow metadata includes transitive library_dependencies."""
 
-    def test_transitive_library_dep_included_in_metadata(self, griptape_nodes: Engine) -> None:
+    def test_transitive_library_dep_included_in_metadata(self, engine: Engine) -> None:
         """When lib-a has library_dependency on lib-b, generated metadata lists both in node_libraries_referenced."""
         from datetime import UTC, datetime
 
@@ -2828,8 +3127,8 @@ class TestWorkflowMetadataTransitiveDeps:
         from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
         from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 
-        workflow_manager = griptape_nodes.WorkflowManager()
-        lib_mgr = griptape_nodes.LibraryManager()
+        workflow_manager = engine.workflow_manager
+        lib_mgr = engine.library_manager
 
         commands = SerializedFlowCommands(
             flow_initialization_command=None,
@@ -2895,9 +3194,7 @@ class TestWorkflowSaveSituationMacro:
         return tmp_path.resolve()
 
     @pytest.fixture(autouse=True)
-    def setup_versioned_save_workflow_project(
-        self, temp_dir: Path, griptape_nodes: Engine
-    ) -> "Generator[None, None, None]":
+    def setup_versioned_save_workflow_project(self, temp_dir: Path, engine: Engine) -> "Generator[None, None, None]":
         """Load a project that overrides save_workflow to CREATE_NEW with a `{_index:03}` slot.
 
         Mirrors the fixture in TestCreateNewMacroIndexSeed: the project is loaded
@@ -2916,7 +3213,7 @@ class TestWorkflowSaveSituationMacro:
             SetCurrentProjectRequest,
         )
 
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
+        original_workspace = engine.config_manager.workspace_path
 
         versioned_save_workflow = SituationTemplate(
             name="save_workflow",
@@ -2933,16 +3230,16 @@ class TestWorkflowSaveSituationMacro:
 
         project_yml = temp_dir / "project_template.yml"
         project_yml.write_text(custom_template.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
-        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        load_result = engine.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
         assert isinstance(load_result, LoadProjectTemplateResultSuccess)
-        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+        engine.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
 
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        engine.config_manager.workspace_path = temp_dir
 
         yield
 
-        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=None))
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.handle_request(SetCurrentProjectRequest(project_id=None))
+        engine.config_manager.workspace_path = original_workspace
 
     @staticmethod
     def _empty_commands() -> SerializedFlowCommands:
@@ -2958,9 +3255,9 @@ class TestWorkflowSaveSituationMacro:
             node_types_used=set(),
         )
 
-    def _save(self, griptape_nodes: Engine, file_name: str) -> str:
+    def _save(self, engine: Engine, file_name: str) -> str:
         """Drive _save_workflow_file_inline against the versioned save_workflow situation."""
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         destination, _relative = workflow_manager._build_workflow_save_path(f"{file_name}.py")
 
         result = workflow_manager._save_workflow_file_inline(
@@ -2985,25 +3282,25 @@ class TestWorkflowSaveSituationMacro:
         )
         return result.file_path
 
-    def test_first_save_writes_v001(self, griptape_nodes: Engine, temp_dir: Path) -> None:
+    def test_first_save_writes_v001(self, engine: Engine, temp_dir: Path) -> None:
         """Bug #4941: the first save with `{_index:03}` must produce v001 (not fail with MISSING_REQUIRED)."""
-        saved_path = self._save(griptape_nodes, "my_workflow")
+        saved_path = self._save(engine, "my_workflow")
 
         assert Path(saved_path) == temp_dir / "my_workflow_v001.py"
         assert (temp_dir / "my_workflow_v001.py").exists()
 
-    def test_successive_saves_increment_padded_index(self, griptape_nodes: Engine, temp_dir: Path) -> None:
+    def test_successive_saves_increment_padded_index(self, engine: Engine, temp_dir: Path) -> None:
         """Saving the same workflow three times produces v001, v002, v003 (padding preserved)."""
         for _ in range(3):
-            self._save(griptape_nodes, "my_workflow")
+            self._save(engine, "my_workflow")
 
         assert (temp_dir / "my_workflow_v001.py").exists()
         assert (temp_dir / "my_workflow_v002.py").exists()
         assert (temp_dir / "my_workflow_v003.py").exists()
 
-    def test_sub_dirs_route_into_subdirectory(self, griptape_nodes: Engine, temp_dir: Path) -> None:
+    def test_sub_dirs_route_into_subdirectory(self, engine: Engine, temp_dir: Path) -> None:
         """A sub-directory in the requested name routes into `{sub_dirs?:/}` and still picks v001."""
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         destination, relative = workflow_manager._build_workflow_save_path("my_workflow.py", sub_dirs="episode")
         assert relative == str(Path("episode") / "my_workflow.py")
 
@@ -3043,7 +3340,7 @@ class TestCreateVersionedWorkflow:
         return tmp_path.resolve()
 
     @pytest.fixture(autouse=True)
-    def setup_default_project(self, temp_dir: Path, griptape_nodes: Engine) -> "Generator[None, None, None]":
+    def setup_default_project(self, temp_dir: Path, engine: Engine) -> "Generator[None, None, None]":
         """Load the default project template (which ships create_versioned_workflow).
 
         Same fixture ordering as TestWorkflowSaveSituationMacro: load + activate
@@ -3057,31 +3354,31 @@ class TestCreateVersionedWorkflow:
             SetCurrentProjectRequest,
         )
 
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
+        original_workspace = engine.config_manager.workspace_path
 
         project_yml = temp_dir / "project_template.yml"
         project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
-        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        load_result = engine.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
         assert isinstance(load_result, LoadProjectTemplateResultSuccess)
-        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+        engine.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
 
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        engine.config_manager.workspace_path = temp_dir
 
         yield
 
         WorkflowRegistry._workflows.clear()
-        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=None))
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.handle_request(SetCurrentProjectRequest(project_id=None))
+        engine.config_manager.workspace_path = original_workspace
 
     @staticmethod
     def _determine(
-        griptape_nodes: Engine,
+        engine: Engine,
         *,
         requested_file_name: str | None,
         current_workflow_name: str | None,
         create_versioned: bool,
     ) -> WorkflowManager.SaveWorkflowTargetInfo:
-        return griptape_nodes.WorkflowManager()._determine_save_target(
+        return engine.workflow_manager._determine_save_target(
             requested_file_name=requested_file_name,
             current_workflow_name=current_workflow_name,
             create_versioned=create_versioned,
@@ -3105,7 +3402,7 @@ class TestCreateVersionedWorkflow:
         )
         WorkflowRegistry.generate_new_workflow(registry_key=registry_key, metadata=metadata, file_path=file_name)
 
-    def test_create_versioned_short_circuits_overwrite_existing(self, griptape_nodes: Engine, temp_dir: Path) -> None:
+    def test_create_versioned_short_circuits_overwrite_existing(self, engine: Engine, temp_dir: Path) -> None:
         """Even when the workflow is already saved, create_versioned=True routes through the versioned situation.
 
         Without this fix, the OVERWRITE_EXISTING branch would win on the second
@@ -3119,7 +3416,7 @@ class TestCreateVersionedWorkflow:
             )
 
             target = self._determine(
-                griptape_nodes,
+                engine,
                 requested_file_name="my_flow_v001",
                 current_workflow_name="my_flow_v001",
                 create_versioned=True,
@@ -3136,9 +3433,7 @@ class TestCreateVersionedWorkflow:
             # The OVERWRITE_EXISTING path-mode is NOT taken.
             assert target.file_path is None
 
-    def test_create_versioned_match_path_passes_full_matched_dict_through(
-        self, griptape_nodes: Engine, temp_dir: Path
-    ) -> None:
+    def test_create_versioned_match_path_passes_full_matched_dict_through(self, engine: Engine, temp_dir: Path) -> None:
         """Saving over `my_flow_v001` produces a destination whose MacroPath carries every matched variable.
 
         The destination's MacroPath has every variable the situation's macro
@@ -3157,7 +3452,7 @@ class TestCreateVersionedWorkflow:
             )
 
             target = self._determine(
-                griptape_nodes,
+                engine,
                 requested_file_name=None,
                 current_workflow_name="my_flow_v001",
                 create_versioned=True,
@@ -3172,9 +3467,7 @@ class TestCreateVersionedWorkflow:
             assert macro_vars.get("file_extension") == "py"
             assert macro_vars.get("_index") == 1
 
-    def test_create_versioned_match_recovers_index_when_stem_contains_v(
-        self, griptape_nodes: Engine, temp_dir: Path
-    ) -> None:
+    def test_create_versioned_match_recovers_index_when_stem_contains_v(self, engine: Engine, temp_dir: Path) -> None:
         """Reverse-match handles base names that themselves contain the ``_v`` anchor lookalike.
 
         Regression coverage for the cjkindel review on #4989: previously the
@@ -3195,7 +3488,7 @@ class TestCreateVersionedWorkflow:
             )
 
             target = self._determine(
-                griptape_nodes,
+                engine,
                 requested_file_name=None,
                 current_workflow_name="my_v1_report_v007",
                 create_versioned=True,
@@ -3210,7 +3503,7 @@ class TestCreateVersionedWorkflow:
             assert macro_vars.get("file_extension") == "py"
 
     def test_create_versioned_with_requested_name_matching_existing_workflow_runs_match(
-        self, griptape_nodes: Engine, temp_dir: Path
+        self, engine: Engine, temp_dir: Path
     ) -> None:
         """The UI re-sends the open workflow's key as ``file_name``; we still reverse-match.
 
@@ -3234,7 +3527,7 @@ class TestCreateVersionedWorkflow:
 
             # UI sends the loaded workflow's registry key as requested_file_name.
             target = self._determine(
-                griptape_nodes,
+                engine,
                 requested_file_name="my_flow_v002",
                 current_workflow_name="my_flow_v002",
                 create_versioned=True,
@@ -3251,7 +3544,7 @@ class TestCreateVersionedWorkflow:
             # the whole prior stem ("my_flow_v002") and _index would be unbound.
             assert macro_vars.get("file_name_base") != "my_flow_v002"
 
-    def test_create_versioned_false_preserves_overwrite_existing(self, griptape_nodes: Engine, temp_dir: Path) -> None:
+    def test_create_versioned_false_preserves_overwrite_existing(self, engine: Engine, temp_dir: Path) -> None:
         """create_versioned=False against a saved workflow keeps the standard OVERWRITE_EXISTING path."""
         with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
             self._register_saved_workflow(
@@ -3259,7 +3552,7 @@ class TestCreateVersionedWorkflow:
             )
 
             target = self._determine(
-                griptape_nodes,
+                engine,
                 requested_file_name="my_flow",
                 current_workflow_name="my_flow",
                 create_versioned=False,
@@ -3271,7 +3564,7 @@ class TestCreateVersionedWorkflow:
             assert target.file_path.name == "my_flow.py"
 
     def test_warning_logged_when_save_workflow_customized_to_create_new(
-        self, griptape_nodes: Engine, temp_dir: Path, caplog: pytest.LogCaptureFixture
+        self, engine: Engine, temp_dir: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         """A project that flips `save_workflow` to create_new triggers a warning on non-versioned saves.
 
@@ -3304,13 +3597,13 @@ class TestCreateVersionedWorkflow:
         )
         project_yml = temp_dir / "project_template.yml"
         project_yml.write_text(custom.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
-        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        load_result = engine.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
         assert isinstance(load_result, LoadProjectTemplateResultSuccess)
-        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+        engine.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
 
         with patch.dict(WorkflowRegistry._workflows, {}, clear=True), caplog.at_level("WARNING"):
             self._determine(
-                griptape_nodes,
+                engine,
                 requested_file_name="my_flow",
                 current_workflow_name=None,
                 create_versioned=False,
@@ -3321,7 +3614,7 @@ class TestCreateVersionedWorkflow:
         )
 
     def test_warning_logged_when_create_versioned_workflow_customized_to_overwrite(
-        self, griptape_nodes: Engine, temp_dir: Path, caplog: pytest.LogCaptureFixture
+        self, engine: Engine, temp_dir: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         """Inverse mismatch: create_versioned=True against a `create_versioned_workflow` flipped to overwrite.
 
@@ -3360,13 +3653,13 @@ class TestCreateVersionedWorkflow:
         )
         project_yml = temp_dir / "project_template.yml"
         project_yml.write_text(custom.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
-        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        load_result = engine.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
         assert isinstance(load_result, LoadProjectTemplateResultSuccess)
-        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+        engine.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
 
         with patch.dict(WorkflowRegistry._workflows, {}, clear=True), caplog.at_level("WARNING"):
             self._determine(
-                griptape_nodes,
+                engine,
                 requested_file_name="my_flow",
                 current_workflow_name=None,
                 create_versioned=True,
@@ -3394,11 +3687,11 @@ class TestCreateVersionedWorkflow:
         # is what makes the seed-and-retry produce v001/v002/...
         assert "_index" in situation.macro or "#" in situation.macro
 
-    def test_first_versioned_save_with_no_registry_entry(self, griptape_nodes: Engine) -> None:
+    def test_first_versioned_save_with_no_registry_entry(self, engine: Engine) -> None:
         """create_versioned=True on a brand-new workflow uses the requested name and lands at CREATE_VERSIONED."""
         with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
             target = self._determine(
-                griptape_nodes,
+                engine,
                 requested_file_name="brand_new_flow",
                 current_workflow_name=None,
                 create_versioned=True,
@@ -3417,7 +3710,7 @@ class TestCreateVersionedWorkflow:
 
     # --- #4956 helper: Step 2 (match) / Step 3 (no-match) / Step 1b (unsaved) -----------
 
-    def test_step2_match_path_with_customized_versioned_macro(self, griptape_nodes: Engine, temp_dir: Path) -> None:
+    def test_step2_match_path_with_customized_versioned_macro(self, engine: Engine, temp_dir: Path) -> None:
         """Customizing the versioned situation's macro still round-trips: matched dict goes through verbatim.
 
         Regression coverage for #4956 — confirms we don't hardcode any variable
@@ -3455,11 +3748,11 @@ class TestCreateVersionedWorkflow:
         )
         project_yml = temp_dir / "project_template.yml"
         project_yml.write_text(custom.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
-        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        load_result = engine.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
         assert isinstance(load_result, LoadProjectTemplateResultSuccess)
-        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+        engine.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
         # SetCurrentProjectRequest re-derives workspace_path; force it back.
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        engine.config_manager.workspace_path = temp_dir
 
         with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
             # Workflow that was previously saved under this customized macro
@@ -3472,7 +3765,7 @@ class TestCreateVersionedWorkflow:
             )
 
             target = self._determine(
-                griptape_nodes,
+                engine,
                 requested_file_name=None,
                 current_workflow_name="my_flow.0017",
                 create_versioned=True,
@@ -3487,7 +3780,7 @@ class TestCreateVersionedWorkflow:
             assert macro_vars.get("_index") == 17  # noqa: PLR2004 - literal version from setup
             assert macro_vars.get("file_extension") == "py"
 
-    def test_step3_no_match_path_falls_back_to_file_stem(self, griptape_nodes: Engine, temp_dir: Path) -> None:
+    def test_step3_no_match_path_falls_back_to_file_stem(self, engine: Engine, temp_dir: Path) -> None:
         """A workflow saved under a NON-versioned situation produces a new versioned series on create_versioned.
 
         The file `random_name.py` doesn't match the versioned situation's macro
@@ -3506,7 +3799,7 @@ class TestCreateVersionedWorkflow:
             )
 
             target = self._determine(
-                griptape_nodes,
+                engine,
                 requested_file_name=None,
                 current_workflow_name="random_name",
                 create_versioned=True,
@@ -3522,7 +3815,7 @@ class TestCreateVersionedWorkflow:
                 "Step 3 (no-match) must leave _index unbound so the seed-and-retry assigns 1 on write."
             )
 
-    def test_step1b_unsaved_workflow_uses_display_name(self, griptape_nodes: Engine) -> None:
+    def test_step1b_unsaved_workflow_uses_display_name(self, engine: Engine) -> None:
         """create_versioned=True on an unsaved workflow uses display_name as the base.
 
         The unsaved workflow has no file_path → Step 1b kicks in →
@@ -3535,7 +3828,7 @@ class TestCreateVersionedWorkflow:
             _register_unsaved_workflow(key=unsaved_key, name="My Pretty Flow")
 
             target = self._determine(
-                griptape_nodes,
+                engine,
                 requested_file_name=None,
                 current_workflow_name=unsaved_key,
                 create_versioned=True,
@@ -3549,9 +3842,7 @@ class TestCreateVersionedWorkflow:
             # No index assigned yet — the seed handles that on write.
             assert "_index" not in macro_vars
 
-    def test_create_versioned_invalid_situation_macro_raises_value_error(
-        self, griptape_nodes: Engine, temp_dir: Path
-    ) -> None:
+    def test_create_versioned_invalid_situation_macro_raises_value_error(self, engine: Engine, temp_dir: Path) -> None:
         """A malformed situation macro surfaces as a clear ValueError, not an opaque crash.
 
         ``SituationTemplate`` validates macro syntax at template load, so
@@ -3578,15 +3869,13 @@ class TestCreateVersionedWorkflow:
                 pytest.raises(ValueError, match="create_versioned_workflow"),
             ):
                 self._determine(
-                    griptape_nodes,
+                    engine,
                     requested_file_name=None,
                     current_workflow_name="my_flow_v001",
                     create_versioned=True,
                 )
 
-    def test_create_versioned_missing_situation_raises_value_error(
-        self, griptape_nodes: Engine, temp_dir: Path
-    ) -> None:
+    def test_create_versioned_missing_situation_raises_value_error(self, engine: Engine, temp_dir: Path) -> None:
         """When the active project lacks the versioned situation, the reverse-match raises with the situation name.
 
         Pins the GetSituationResultSuccess guard at the top of
@@ -3606,7 +3895,7 @@ class TestCreateVersionedWorkflow:
                 temp_dir, registry_key="my_flow_v001", file_name="my_flow_v001.py", display_name="my_flow"
             )
 
-            real_handle = griptape_nodes.handle_request
+            real_handle = engine.handle_request
 
             def fake_handle(req: RequestPayload) -> object:
                 if isinstance(req, GetSituationRequest):
@@ -3614,18 +3903,18 @@ class TestCreateVersionedWorkflow:
                 return real_handle(req)
 
             with (
-                patch.object(griptape_nodes, "handle_request", side_effect=fake_handle),
+                patch.object(engine, "handle_request", side_effect=fake_handle),
                 pytest.raises(ValueError, match="not found in the active project template"),
             ):
                 self._determine(
-                    griptape_nodes,
+                    engine,
                     requested_file_name=None,
                     current_workflow_name="my_flow_v001",
                     create_versioned=True,
                 )
 
     def test_create_versioned_match_dispatch_failure_surfaces_underlying_cause(
-        self, griptape_nodes: Engine, temp_dir: Path
+        self, engine: Engine, temp_dir: Path
     ) -> None:
         """When the match handler crashes, the error message includes the underlying exception.
 
@@ -3646,7 +3935,7 @@ class TestCreateVersionedWorkflow:
                 temp_dir, registry_key="my_flow_v001", file_name="my_flow_v001.py", display_name="my_flow"
             )
 
-            real_handle = griptape_nodes.handle_request
+            real_handle = engine.handle_request
             synthetic_exc = RuntimeError("synthetic match-handler crash for test")
 
             def fake_handle(req: RequestPayload) -> object:
@@ -3658,11 +3947,11 @@ class TestCreateVersionedWorkflow:
                 return real_handle(req)
 
             with (
-                patch.object(griptape_nodes, "handle_request", side_effect=fake_handle),
+                patch.object(engine, "handle_request", side_effect=fake_handle),
                 pytest.raises(ValueError, match="synthetic match-handler crash") as exc_info,
             ):
                 self._determine(
-                    griptape_nodes,
+                    engine,
                     requested_file_name=None,
                     current_workflow_name="my_flow_v001",
                     create_versioned=True,
@@ -3675,7 +3964,7 @@ class TestCreateVersionedWorkflow:
 
     def test_create_versioned_timestamp_fallback_when_no_candidate_workflow(
         self,
-        griptape_nodes: Engine,
+        engine: Engine,
     ) -> None:
         """Step 5: no current AND no target workflow → timestamp-derived filename.
 
@@ -3687,7 +3976,7 @@ class TestCreateVersionedWorkflow:
         with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
             # Empty registry + no current workflow + no target → Step 5.
             target = self._determine(
-                griptape_nodes,
+                engine,
                 requested_file_name=None,
                 current_workflow_name=None,
                 create_versioned=True,
@@ -3725,7 +4014,7 @@ class TestSaveWorkflowDisplayNameFallback:
 
     @staticmethod
     def _capture_display_name(
-        griptape_nodes: Engine,
+        engine: Engine,
         *,
         request_file_name: str | None,
         request_display_name: str | None,
@@ -3747,8 +4036,8 @@ class TestSaveWorkflowDisplayNameFallback:
             SaveWorkflowRequest,
         )
 
-        workflow_manager = griptape_nodes.WorkflowManager()
-        context_manager = griptape_nodes.ContextManager()
+        workflow_manager = engine.workflow_manager
+        context_manager = engine.context_manager
 
         empty_commands = SerializedFlowCommands(
             flow_initialization_command=None,
@@ -3783,7 +4072,7 @@ class TestSaveWorkflowDisplayNameFallback:
         def capture_inline(**kwargs: object) -> SaveWorkflowFileFromSerializedFlowResultSuccess:
             # display_name is what we're testing — record it then return success.
             captured["display_name"] = kwargs.get("display_name")  # type: ignore[assignment]
-            workspace = griptape_nodes.ConfigManager().workspace_path
+            workspace = engine.config_manager.workspace_path
             file_name = kwargs.get("file_name", "stub")
             return SaveWorkflowFileFromSerializedFlowResultSuccess(
                 file_path=str(workspace / f"{file_name}.py"),
@@ -3798,7 +4087,7 @@ class TestSaveWorkflowDisplayNameFallback:
 
         try:
             with (
-                patch.object(griptape_nodes, "ahandle_request", side_effect=fake_ahandle_request),
+                patch.object(engine, "ahandle_request", side_effect=fake_ahandle_request),
                 patch.object(workflow_manager, "_save_workflow_file_inline", side_effect=capture_inline),
                 patch.object(workflow_manager, "extract_workflow_shape", side_effect=ValueError("no shape")),
             ):
@@ -3813,7 +4102,7 @@ class TestSaveWorkflowDisplayNameFallback:
 
         return captured.get("display_name")
 
-    def test_explicit_request_display_name_wins(self, griptape_nodes: Engine) -> None:
+    def test_explicit_request_display_name_wins(self, engine: Engine) -> None:
         """Branch 1: ``request.display_name`` is explicit caller intent and always wins.
 
         Even when the registry has an existing display_name AND request.file_name
@@ -3824,7 +4113,7 @@ class TestSaveWorkflowDisplayNameFallback:
             _register_unsaved_workflow(key=unsaved_key, name="In-Memory Label")
 
             captured = TestSaveWorkflowDisplayNameFallback._capture_display_name(
-                griptape_nodes,
+                engine,
                 request_file_name="some_file_name",
                 request_display_name="Caller-Specified Label",
                 current_workflow_name=unsaved_key,
@@ -3832,7 +4121,7 @@ class TestSaveWorkflowDisplayNameFallback:
 
             assert captured == "Caller-Specified Label"
 
-    def test_existing_registry_display_name_used_when_request_omits(self, griptape_nodes: Engine) -> None:
+    def test_existing_registry_display_name_used_when_request_omits(self, engine: Engine) -> None:
         """Branch 2: when request.display_name is None, the registry's existing display_name wins over the file_name.
 
         Pins the "preserve human-readable label across re-saves" rule — a
@@ -3843,7 +4132,7 @@ class TestSaveWorkflowDisplayNameFallback:
         from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
 
         registry_key = "preserved_display_name_test"
-        workspace = griptape_nodes.ConfigManager().workspace_path
+        workspace = engine.config_manager.workspace_path
         stub_path = workspace / f"{registry_key}.py"
         with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
             stub_path.write_text("# stub")
@@ -3860,7 +4149,7 @@ class TestSaveWorkflowDisplayNameFallback:
                 )
 
                 captured = TestSaveWorkflowDisplayNameFallback._capture_display_name(
-                    griptape_nodes,
+                    engine,
                     request_file_name=registry_key,
                     request_display_name=None,
                     current_workflow_name=registry_key,
@@ -3871,9 +4160,7 @@ class TestSaveWorkflowDisplayNameFallback:
             finally:
                 stub_path.unlink(missing_ok=True)
 
-    def test_no_request_display_name_no_existing_metadata_uses_resolved_file_name_stem(
-        self, griptape_nodes: Engine
-    ) -> None:
+    def test_no_request_display_name_no_existing_metadata_uses_resolved_file_name_stem(self, engine: Engine) -> None:
         """Branch 3: fresh Save As with no registry entry — the resolved stem becomes the display name.
 
         This is the case that the manual-test bug surfaced: typing "a" should
@@ -3887,7 +4174,7 @@ class TestSaveWorkflowDisplayNameFallback:
             _register_unsaved_workflow(key=unsaved_key, name="ignored - we use resolved file_name")
 
             captured = TestSaveWorkflowDisplayNameFallback._capture_display_name(
-                griptape_nodes,
+                engine,
                 request_file_name="episode/my_wf",
                 request_display_name=None,
                 current_workflow_name=unsaved_key,
@@ -3896,7 +4183,7 @@ class TestSaveWorkflowDisplayNameFallback:
             # _resolve_named_save_path returns parts.stem — "my_wf", not "episode/my_wf".
             assert captured == "my_wf"
 
-    def test_first_save_of_unsaved_uses_metadata_derived_stem_not_synthetic_key(self, griptape_nodes: Engine) -> None:
+    def test_first_save_of_unsaved_uses_metadata_derived_stem_not_synthetic_key(self, engine: Engine) -> None:
         """Fresh save of an unsaved workflow must not surface "unsaved:<uuid>" as the display name.
 
         Regression guard for the bug where branch 3 read ``Path(request.file_name).stem``
@@ -3909,7 +4196,7 @@ class TestSaveWorkflowDisplayNameFallback:
             _register_unsaved_workflow(key=unsaved_key, name="My Cool Workflow")
 
             captured = TestSaveWorkflowDisplayNameFallback._capture_display_name(
-                griptape_nodes,
+                engine,
                 request_file_name=unsaved_key,
                 request_display_name=None,
                 current_workflow_name=unsaved_key,
@@ -3920,7 +4207,7 @@ class TestSaveWorkflowDisplayNameFallback:
             # The resolved stem is the sanitized metadata.name.
             assert captured == "My_Cool_Workflow"
 
-    def test_typed_save_as_name_survives_versioned_resolution(self, griptape_nodes: Engine) -> None:
+    def test_typed_save_as_name_survives_versioned_resolution(self, engine: Engine) -> None:
         """The user typed "a" — display name stays "a" even when the macro resolves the file to "a_v001".
 
         Pins the versioned-save UI re-save fix from commit 5c3f0bf3: branch 3 must feed off
@@ -3933,7 +4220,7 @@ class TestSaveWorkflowDisplayNameFallback:
             _register_unsaved_workflow(key=unsaved_key, name="ignored - user typed a new name")
 
             captured = TestSaveWorkflowDisplayNameFallback._capture_display_name(
-                griptape_nodes,
+                engine,
                 request_file_name="a",
                 request_display_name=None,
                 current_workflow_name=unsaved_key,
@@ -3941,7 +4228,7 @@ class TestSaveWorkflowDisplayNameFallback:
 
             assert captured == "a"
 
-    def test_metadata_derived_stem_used_when_no_file_name_and_no_existing(self, griptape_nodes: Engine) -> None:
+    def test_metadata_derived_stem_used_when_no_file_name_and_no_existing(self, engine: Engine) -> None:
         """Branch 3 (no request.file_name path): the metadata-derived stem still fills the display name.
 
         Prior expectation for this scenario was ``None`` (rung 4), because rung 3 keyed off
@@ -3954,7 +4241,7 @@ class TestSaveWorkflowDisplayNameFallback:
             _register_unsaved_workflow(key=unsaved_key, name="Used Only For Filename Derivation")
 
             captured = TestSaveWorkflowDisplayNameFallback._capture_display_name(
-                griptape_nodes,
+                engine,
                 request_file_name=None,
                 request_display_name=None,
                 current_workflow_name=unsaved_key,
@@ -4052,7 +4339,7 @@ class TestScrubForAstConstant:
         assert result.value == (1,)
         assert type(result.value) is tuple
 
-    def test_generate_workflow_file_content_scrubs_button_in_ui_options(self, griptape_nodes: Engine) -> None:
+    def test_generate_workflow_file_content_scrubs_button_in_ui_options(self, engine: Engine) -> None:
         """End-to-end regression for #5013: a Button in ui_options must not break the saved file.
 
         Drives the real generator (``_generate_workflow_file_content``) with a node whose
@@ -4105,7 +4392,7 @@ class TestScrubForAstConstant:
             node_libraries_referenced=[],
             workflow_shape=None,
         )
-        content = griptape_nodes.WorkflowManager()._generate_workflow_file_content(
+        content = engine.workflow_manager._generate_workflow_file_content(
             serialized_flow_commands=flow_commands,
             workflow_metadata=metadata,
         )
@@ -4131,8 +4418,8 @@ class TestSelectTopLevelImportedFlow:
         engine.flow_manager = flow_manager
         return engine
 
-    def test_selects_flow_parented_to_import_target(self, griptape_nodes: Engine) -> None:
-        workflow_manager = griptape_nodes.WorkflowManager()
+    def test_selects_flow_parented_to_import_target(self, engine: Engine) -> None:
+        workflow_manager = engine.workflow_manager
         # Top-level flow is parented to the target; the group's body flow is parented to the top-level.
         mock_engine = self._flow_manager_with_parents({"ControlFlow_2": "ParentFlow", "Group_subflow": "ControlFlow_2"})
 
@@ -4143,9 +4430,9 @@ class TestSelectTopLevelImportedFlow:
         assert selected == "ControlFlow_2"
 
     def test_falls_back_deterministically_when_none_parented_to_target(
-        self, griptape_nodes: Engine, caplog: pytest.LogCaptureFixture
+        self, engine: Engine, caplog: pytest.LogCaptureFixture
     ) -> None:
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         mock_engine = self._flow_manager_with_parents({"Zeta_flow": "Other", "Alpha_flow": "Other"})
 
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
@@ -4161,9 +4448,9 @@ class TestSelectTopLevelImportedFlow:
         ), f"expected a fallback warning, got: {[r.getMessage() for r in caplog.records]}"
 
     def test_falls_back_deterministically_when_multiple_parented_to_target(
-        self, griptape_nodes: Engine, caplog: pytest.LogCaptureFixture
+        self, engine: Engine, caplog: pytest.LogCaptureFixture
     ) -> None:
-        workflow_manager = griptape_nodes.WorkflowManager()
+        workflow_manager = engine.workflow_manager
         mock_engine = self._flow_manager_with_parents({"Zeta_flow": "ParentFlow", "Alpha_flow": "ParentFlow"})
 
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
@@ -4183,10 +4470,8 @@ class TestExecuteWorkflowImport:
     """WorkflowManager._execute_workflow_import tests."""
 
     @pytest.mark.asyncio
-    async def test_returns_top_level_imported_flow(
-        self, griptape_nodes: Engine, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        workflow_manager = griptape_nodes.WorkflowManager()
+    async def test_returns_top_level_imported_flow(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
+        workflow_manager = engine.workflow_manager
 
         request = ImportWorkflowAsReferencedSubFlowRequest(
             workflow_name="wf", flow_name="ParentFlow", imported_flow_metadata=None, track_as_referenced=False
@@ -4201,11 +4486,11 @@ class TestExecuteWorkflowImport:
             {"ParentFlow": object()},
             {"ParentFlow": object(), "ControlFlow_2": object(), "Group_subflow": object()},
         ]
-        monkeypatch.setattr(griptape_nodes, "_object_manager", object_manager)
+        monkeypatch.setattr(engine, "_object_manager", object_manager)
 
         # ContextManager().flow(...) is used purely as a context manager wrapping the import.
         context_manager = MagicMock(spec=ContextManager)
-        monkeypatch.setattr(griptape_nodes, "_context_manager", context_manager)
+        monkeypatch.setattr(engine, "_context_manager", context_manager)
 
         monkeypatch.setattr(
             workflow_manager,
@@ -4222,7 +4507,7 @@ class TestExecuteWorkflowImport:
         result = await workflow_manager._execute_workflow_import(request, workflow, "ParentFlow")
 
         # It selects via the helper (passing the new-flows set, target flow, workflow name, and engine)...
-        select_mock.assert_called_once_with({"ControlFlow_2", "Group_subflow"}, "ParentFlow", "wf", griptape_nodes)
+        select_mock.assert_called_once_with({"ControlFlow_2", "Group_subflow"}, "ParentFlow", "wf", engine)
         # ...and returns exactly what the helper chose.
         assert isinstance(result, ImportWorkflowAsReferencedSubFlowResultSuccess)
         assert result.created_flow_name == "ControlFlow_2"
@@ -4246,7 +4531,7 @@ class TestSaveWorkflowOverwriteProtection:
         return tmp_path.resolve()
 
     @pytest.fixture(autouse=True)
-    def setup_default_project(self, temp_dir: Path, griptape_nodes: Engine) -> "Generator[None, None, None]":
+    def setup_default_project(self, temp_dir: Path, engine: Engine) -> "Generator[None, None, None]":
         """Load + activate the default project template, then force the workspace.
 
         Same ordering as TestCreateVersionedWorkflow: activate first so
@@ -4260,21 +4545,21 @@ class TestSaveWorkflowOverwriteProtection:
             SetCurrentProjectRequest,
         )
 
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
+        original_workspace = engine.config_manager.workspace_path
 
         project_yml = temp_dir / "project_template.yml"
         project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
-        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        load_result = engine.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
         assert isinstance(load_result, LoadProjectTemplateResultSuccess)
-        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+        engine.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
 
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        engine.config_manager.workspace_path = temp_dir
 
         yield
 
         WorkflowRegistry._workflows.clear()
-        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=None))
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        engine.handle_request(SetCurrentProjectRequest(project_id=None))
+        engine.config_manager.workspace_path = original_workspace
 
     @staticmethod
     def _register_saved_workflow(temp_dir: Path, *, registry_key: str, contents: str) -> Path:
@@ -4294,7 +4579,7 @@ class TestSaveWorkflowOverwriteProtection:
 
     @staticmethod
     def _save(
-        griptape_nodes: Engine,
+        engine: Engine,
         *,
         file_name: str,
         current_workflow_name: str,
@@ -4309,8 +4594,8 @@ class TestSaveWorkflowOverwriteProtection:
         )
         from griptape_nodes.retained_mode.events.workflow_events import SaveWorkflowRequest
 
-        workflow_manager = griptape_nodes.WorkflowManager()
-        context_manager = griptape_nodes.ContextManager()
+        workflow_manager = engine.workflow_manager
+        context_manager = engine.context_manager
 
         empty_commands = SerializedFlowCommands(
             flow_initialization_command=None,
@@ -4349,7 +4634,7 @@ class TestSaveWorkflowOverwriteProtection:
             if context_manager.has_current_workflow():
                 context_manager.pop_workflow()
 
-    def test_self_save_with_dotted_name_succeeds(self, griptape_nodes: Engine, temp_dir: Path) -> None:
+    def test_self_save_with_dotted_name_succeeds(self, engine: Engine, temp_dir: Path) -> None:
         """Re-saving the open workflow succeeds even with ``overwrite_existing=False``.
 
         ``%d.%m_%H.%M`` is the engine's own default auto-generated name, so a
@@ -4365,7 +4650,7 @@ class TestSaveWorkflowOverwriteProtection:
             stub_path = self._register_saved_workflow(temp_dir, registry_key=registry_key, contents="# original")
 
             result = self._save(
-                griptape_nodes,
+                engine,
                 file_name=registry_key,
                 current_workflow_name=registry_key,
                 overwrite_existing=False,
@@ -4377,7 +4662,7 @@ class TestSaveWorkflowOverwriteProtection:
             assert "# original" not in stub_path.read_text()
 
     def test_collision_with_different_workflow_reports_policy_no_overwrite(
-        self, griptape_nodes: Engine, temp_dir: Path
+        self, engine: Engine, temp_dir: Path
     ) -> None:
         """Saving onto another workflow's file fails with the typed reason and leaves it intact.
 
@@ -4393,7 +4678,7 @@ class TestSaveWorkflowOverwriteProtection:
             victim_path = self._register_saved_workflow(temp_dir, registry_key="theirs", contents="# theirs")
 
             result = self._save(
-                griptape_nodes,
+                engine,
                 file_name="theirs",
                 current_workflow_name="mine",
                 overwrite_existing=False,
@@ -4404,7 +4689,7 @@ class TestSaveWorkflowOverwriteProtection:
             # The other workflow's file is untouched.
             assert victim_path.read_text() == "# theirs"
 
-    def test_collision_overwrites_when_permitted(self, griptape_nodes: Engine, temp_dir: Path) -> None:
+    def test_collision_overwrites_when_permitted(self, engine: Engine, temp_dir: Path) -> None:
         """``overwrite_existing=True`` (the default) still replaces the other workflow's file."""
         from griptape_nodes.retained_mode.events.workflow_events import SaveWorkflowResultSuccess
 
@@ -4413,7 +4698,7 @@ class TestSaveWorkflowOverwriteProtection:
             victim_path = self._register_saved_workflow(temp_dir, registry_key="theirs", contents="# theirs")
 
             result = self._save(
-                griptape_nodes,
+                engine,
                 file_name="theirs",
                 current_workflow_name="mine",
                 overwrite_existing=True,
@@ -4421,3 +4706,338 @@ class TestSaveWorkflowOverwriteProtection:
 
             assert isinstance(result, SaveWorkflowResultSuccess)
             assert victim_path.read_text() != "# theirs"
+
+
+class TestWorkflowBranchDisplayNames:
+    """Regression coverage: a branch's ``metadata.name`` must be a title, not a registry key.
+
+    A registry key is a file path (``shots/sh010/comp``); ``metadata.name`` is the human-readable
+    label the editor shows. Three sites used to write the key into the label, so any branch of a
+    workflow living in a subdirectory read as a file path in the UI. Two of them overwrote a
+    previously-correct label and persisted it to disk, so each test asserts the registry entry *and*
+    the on-disk header.
+
+    Driven through ``GriptapeNodes.handle_request`` with real files in a real temp workspace, since
+    the persisted header is half the bug.
+    """
+
+    SOURCE_KEY = "shots/sh010/comp"
+    SOURCE_DISPLAY_NAME = "Shot 010 Comp"
+
+    @pytest.fixture
+    def temp_dir(self, tmp_path: Path) -> Path:
+        return tmp_path.resolve()
+
+    @pytest.fixture(autouse=True)
+    def workspace(self, temp_dir: Path, engine: Engine) -> "Generator[None, None, None]":
+        """Point the workspace at a temp dir so registry keys resolve to real files."""
+        original_workspace = engine.config_manager.workspace_path
+        engine.config_manager.workspace_path = temp_dir
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            yield
+        engine.config_manager.workspace_path = original_workspace
+
+    @staticmethod
+    def _register_workflow(engine: Engine, temp_dir: Path, *, registry_key: str, display_name: str) -> Path:
+        """Write a workflow file carrying a real metadata header and register it."""
+        metadata = WorkflowMetadata(
+            name=display_name,
+            schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
+            engine_version_created_with="test",
+            node_libraries_referenced=[],
+            creation_date=datetime.now(UTC),
+        )
+        header = engine.workflow_manager._generate_workflow_metadata_header(metadata)
+        assert header is not None
+
+        relative_file_path = f"{registry_key}.py"
+        file_path = temp_dir / relative_file_path
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(f"{header}\n\nprint('body')\n", encoding="utf-8")
+
+        WorkflowRegistry.generate_new_workflow(
+            registry_key=registry_key, metadata=metadata, file_path=relative_file_path
+        )
+        return file_path
+
+    @staticmethod
+    def _persisted_display_name(temp_dir: Path, registry_key: str) -> str:
+        """Read ``metadata.name`` back out of the workflow file on disk."""
+        return read_workflow_metadata(temp_dir / f"{registry_key}.py").name
+
+    def _register_source(self, engine: Engine, temp_dir: Path) -> Path:
+        return self._register_workflow(
+            engine, temp_dir, registry_key=self.SOURCE_KEY, display_name=self.SOURCE_DISPLAY_NAME
+        )
+
+    def test_branch_of_nested_workflow_gets_readable_display_name(self, engine: Engine, temp_dir: Path) -> None:
+        """The reported bug: the branch's label was the full registry key path.
+
+        The key still carries the directories (it is a file path), but the label is derived from the
+        source's display name.
+        """
+        self._register_source(engine, temp_dir)
+
+        result = engine.handle_request(BranchWorkflowRequest(workflow_name=self.SOURCE_KEY))
+
+        assert isinstance(result, BranchWorkflowResultSuccess)
+        branch_key = result.branched_workflow_name
+        assert branch_key == "shots/sh010/comp_branch_1"
+
+        branch = WorkflowRegistry.get_workflow_by_name(branch_key)
+        assert branch.metadata.name == "Shot 010 Comp (branch 1)"
+        assert self._persisted_display_name(temp_dir, branch_key) == "Shot 010 Comp (branch 1)"
+        # The branch relationship is keyed on the registry key, not the label.
+        assert branch.metadata.branched_from == self.SOURCE_KEY
+
+    def test_branch_leaves_source_display_name_alone(self, engine: Engine, temp_dir: Path) -> None:
+        """Branching must not touch the source's label."""
+        self._register_source(engine, temp_dir)
+
+        result = engine.handle_request(BranchWorkflowRequest(workflow_name=self.SOURCE_KEY))
+
+        assert isinstance(result, BranchWorkflowResultSuccess)
+        source = WorkflowRegistry.get_workflow_by_name(self.SOURCE_KEY)
+        assert source.metadata.name == self.SOURCE_DISPLAY_NAME
+        assert self._persisted_display_name(temp_dir, self.SOURCE_KEY) == self.SOURCE_DISPLAY_NAME
+
+    def test_branch_counter_stays_in_step_with_registry_key(self, engine: Engine, temp_dir: Path) -> None:
+        """The label's counter tracks the key's counter, so branches stay distinguishable."""
+        self._register_source(engine, temp_dir)
+
+        first = engine.handle_request(BranchWorkflowRequest(workflow_name=self.SOURCE_KEY))
+        second = engine.handle_request(BranchWorkflowRequest(workflow_name=self.SOURCE_KEY))
+
+        assert isinstance(first, BranchWorkflowResultSuccess)
+        assert isinstance(second, BranchWorkflowResultSuccess)
+        assert first.branched_workflow_name == "shots/sh010/comp_branch_1"
+        assert second.branched_workflow_name == "shots/sh010/comp_branch_2"
+        assert WorkflowRegistry.get_workflow_by_name(first.branched_workflow_name).metadata.name == (
+            "Shot 010 Comp (branch 1)"
+        )
+        assert WorkflowRegistry.get_workflow_by_name(second.branched_workflow_name).metadata.name == (
+            "Shot 010 Comp (branch 2)"
+        )
+
+    def test_branch_uses_explicit_display_name_when_provided(self, engine: Engine, temp_dir: Path) -> None:
+        """A caller-supplied label wins over the derivation, and is stripped."""
+        self._register_source(engine, temp_dir)
+
+        result = engine.handle_request(
+            BranchWorkflowRequest(workflow_name=self.SOURCE_KEY, branched_workflow_display_name="  Lighting Test  ")
+        )
+
+        assert isinstance(result, BranchWorkflowResultSuccess)
+        branch_key = result.branched_workflow_name
+        assert WorkflowRegistry.get_workflow_by_name(branch_key).metadata.name == "Lighting Test"
+        assert self._persisted_display_name(temp_dir, branch_key) == "Lighting Test"
+
+    def test_branch_rejects_blank_display_name(self, engine: Engine, temp_dir: Path) -> None:
+        """A whitespace-only label would leave the branch looking nameless, so refuse it."""
+        self._register_source(engine, temp_dir)
+
+        result = engine.handle_request(
+            BranchWorkflowRequest(workflow_name=self.SOURCE_KEY, branched_workflow_display_name="   ")
+        )
+
+        assert isinstance(result, BranchWorkflowResultFailure)
+        assert "empty display name" in str(result.result_details)
+        # Nothing was created.
+        assert WorkflowRegistry.get_branches_of_workflow(self.SOURCE_KEY) == []
+
+    def test_branch_with_caller_supplied_key_labels_from_final_segment(self, engine: Engine, temp_dir: Path) -> None:
+        """When the caller picks the key, its last segment is the label -- never the whole path."""
+        self._register_source(engine, temp_dir)
+
+        result = engine.handle_request(
+            BranchWorkflowRequest(workflow_name=self.SOURCE_KEY, branched_workflow_name="shots/sh010/my_experiment")
+        )
+
+        assert isinstance(result, BranchWorkflowResultSuccess)
+        branch_key = result.branched_workflow_name
+        assert branch_key == "shots/sh010/my_experiment"
+        assert WorkflowRegistry.get_workflow_by_name(branch_key).metadata.name == "my_experiment"
+        assert self._persisted_display_name(temp_dir, branch_key) == "my_experiment"
+
+    def test_branch_of_path_shaped_label_does_not_propagate_the_path(self, engine: Engine, temp_dir: Path) -> None:
+        """Branches created before this fix carry their key as their label; don't carry it forward."""
+        self._register_workflow(
+            engine,
+            temp_dir,
+            registry_key="shots/sh010/comp_branch_1",
+            display_name="shots/sh010/comp_branch_1",
+        )
+
+        result = engine.handle_request(BranchWorkflowRequest(workflow_name="shots/sh010/comp_branch_1"))
+
+        assert isinstance(result, BranchWorkflowResultSuccess)
+        branch_key = result.branched_workflow_name
+        assert WorkflowRegistry.get_workflow_by_name(branch_key).metadata.name == "comp_branch_1 (branch 1)"
+
+    def test_branch_falls_back_to_key_segment_when_source_label_blank(self, engine: Engine, temp_dir: Path) -> None:
+        """A corrupt (blank) source label falls back to the file name, not to emptiness."""
+        self._register_workflow(engine, temp_dir, registry_key=self.SOURCE_KEY, display_name="   ")
+
+        result = engine.handle_request(BranchWorkflowRequest(workflow_name=self.SOURCE_KEY))
+
+        assert isinstance(result, BranchWorkflowResultSuccess)
+        branch_key = result.branched_workflow_name
+        assert WorkflowRegistry.get_workflow_by_name(branch_key).metadata.name == "comp (branch 1)"
+
+    def test_merge_preserves_source_display_name(self, engine: Engine, temp_dir: Path) -> None:
+        """Merging changes the source's contents, never its title.
+
+        This site read the branch's ``branched_from`` (a registry key) into the source's
+        ``metadata.name``, overwriting a correct label with a path and writing it to disk.
+        """
+        self._register_source(engine, temp_dir)
+        branch_result = engine.handle_request(BranchWorkflowRequest(workflow_name=self.SOURCE_KEY))
+        assert isinstance(branch_result, BranchWorkflowResultSuccess)
+
+        merge_result = engine.handle_request(
+            MergeWorkflowBranchRequest(workflow_name=branch_result.branched_workflow_name)
+        )
+
+        assert isinstance(merge_result, MergeWorkflowBranchResultSuccess)
+        source = WorkflowRegistry.get_workflow_by_name(self.SOURCE_KEY)
+        assert source.metadata.name == self.SOURCE_DISPLAY_NAME
+        assert self._persisted_display_name(temp_dir, self.SOURCE_KEY) == self.SOURCE_DISPLAY_NAME
+
+    def test_reset_preserves_branch_display_name(self, engine: Engine, temp_dir: Path) -> None:
+        """Resetting discards the branch's content changes, not its title.
+
+        This site wrote the branch's own registry key into its ``metadata.name`` and persisted it,
+        so a reset silently renamed the branch to its file path.
+        """
+        self._register_source(engine, temp_dir)
+        branch_result = engine.handle_request(
+            BranchWorkflowRequest(workflow_name=self.SOURCE_KEY, branched_workflow_display_name="Lighting Test")
+        )
+        assert isinstance(branch_result, BranchWorkflowResultSuccess)
+        branch_key = branch_result.branched_workflow_name
+
+        reset_result = engine.handle_request(ResetWorkflowBranchRequest(workflow_name=branch_key))
+
+        assert isinstance(reset_result, ResetWorkflowBranchResultSuccess)
+        assert WorkflowRegistry.get_workflow_by_name(branch_key).metadata.name == "Lighting Test"
+        assert self._persisted_display_name(temp_dir, branch_key) == "Lighting Test"
+
+
+class TestRepairPathShapedDisplayName:
+    """Workflows already on disk carry a registry key as their ``metadata.name``.
+
+    The pre-fix branch/merge/reset sites wrote the path-derived key into the display name and
+    persisted it, so those files are still out there. They carry the *current* schema version -- the
+    bug was never a schema change -- so registration keys on the damage itself: a display name that
+    exactly equals its own registry key.
+
+    Repair is in-memory. The file keeps the old header until its next save, so each test asserts the
+    registry entry shows the readable name while the file on disk is untouched.
+    """
+
+    @pytest.fixture
+    def temp_dir(self, tmp_path: Path) -> Path:
+        return tmp_path.resolve()
+
+    @pytest.fixture(autouse=True)
+    def workspace(self, temp_dir: Path, engine: Engine) -> "Generator[None, None, None]":
+        original_workspace = engine.config_manager.workspace_path
+        engine.config_manager.workspace_path = temp_dir
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            yield
+        engine.config_manager.workspace_path = original_workspace
+
+    @staticmethod
+    def _write_and_register(engine: Engine, temp_dir: Path, *, relative_file_path: str, display_name: str) -> Path:
+        """Write a real workflow file with `display_name` in its header, then register it from disk."""
+        metadata = WorkflowMetadata(
+            name=display_name,
+            schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
+            engine_version_created_with="test",
+            node_libraries_referenced=[],
+            creation_date=datetime.now(UTC),
+        )
+        header = engine.workflow_manager._generate_workflow_metadata_header(metadata)
+        assert header is not None
+
+        file_path = temp_dir / relative_file_path
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(f"{header}\n\nprint('body')\n", encoding="utf-8")
+
+        result = engine.handle_request(RegisterWorkflowRequest(metadata=metadata, file_name=relative_file_path))
+        assert isinstance(result, RegisterWorkflowResultSuccess)
+        return file_path
+
+    def test_legacy_branch_name_is_repaired_on_load(self, engine: Engine, temp_dir: Path) -> None:
+        """The reported symptom, loaded from a file a pre-fix build wrote."""
+        file_path = self._write_and_register(
+            engine,
+            temp_dir,
+            relative_file_path="shots/sh010/comp_branch_1.py",
+            display_name="shots/sh010/comp_branch_1",
+        )
+
+        workflow = WorkflowRegistry.get_workflow_by_name("shots/sh010/comp_branch_1")
+        assert workflow.metadata.name == "comp_branch_1"
+        # In-memory only: the header on disk is deliberately left for the next save to rewrite.
+        assert read_workflow_metadata(file_path).name == "shots/sh010/comp_branch_1"
+
+    def test_legacy_merged_source_name_is_repaired_on_load(self, engine: Engine, temp_dir: Path) -> None:
+        """The merge site overwrote a *source* workflow's title with its key; same fingerprint."""
+        self._write_and_register(
+            engine, temp_dir, relative_file_path="shots/sh010/comp.py", display_name="shots/sh010/comp"
+        )
+
+        assert WorkflowRegistry.get_workflow_by_name("shots/sh010/comp").metadata.name == "comp"
+
+    def test_deeper_nesting_keeps_only_the_final_segment(self, engine: Engine, temp_dir: Path) -> None:
+        """The deeper the folder structure the worse the old label read; only the file name survives."""
+        self._write_and_register(
+            engine,
+            temp_dir,
+            relative_file_path="show/seq/shots/sh010/comp_branch_2.py",
+            display_name="show/seq/shots/sh010/comp_branch_2",
+        )
+
+        workflow = WorkflowRegistry.get_workflow_by_name("show/seq/shots/sh010/comp_branch_2")
+        assert workflow.metadata.name == "comp_branch_2"
+
+    def test_real_display_name_is_left_alone(self, engine: Engine, temp_dir: Path) -> None:
+        """A proper title never equals its own registry key, so it is never touched."""
+        self._write_and_register(
+            engine,
+            temp_dir,
+            relative_file_path="shots/sh010/comp.py",
+            display_name="Shot 010 Comp",
+        )
+
+        assert WorkflowRegistry.get_workflow_by_name("shots/sh010/comp").metadata.name == "Shot 010 Comp"
+
+    def test_deliberate_separator_in_a_title_is_left_alone(self, engine: Engine, temp_dir: Path) -> None:
+        """Only exact key equality triggers repair -- a slash someone typed on purpose survives."""
+        self._write_and_register(
+            engine,
+            temp_dir,
+            relative_file_path="shots/sh010/comp.py",
+            display_name="Lighting / Comp",
+        )
+
+        assert WorkflowRegistry.get_workflow_by_name("shots/sh010/comp").metadata.name == "Lighting / Comp"
+
+    def test_workspace_root_workflow_matching_its_stem_is_left_alone(self, engine: Engine, temp_dir: Path) -> None:
+        """Name == key with no directories is the normal unnamed-workflow case, not the bug."""
+        self._write_and_register(engine, temp_dir, relative_file_path="my_flow.py", display_name="my_flow")
+
+        assert WorkflowRegistry.get_workflow_by_name("my_flow").metadata.name == "my_flow"
+
+    def test_repaired_workflow_branches_with_a_readable_label(self, engine: Engine, temp_dir: Path) -> None:
+        """The payoff: branching a legacy workflow no longer carries the path forward."""
+        self._write_and_register(
+            engine, temp_dir, relative_file_path="shots/sh010/comp.py", display_name="shots/sh010/comp"
+        )
+
+        result = engine.handle_request(BranchWorkflowRequest(workflow_name="shots/sh010/comp"))
+
+        assert isinstance(result, BranchWorkflowResultSuccess)
+        branch = WorkflowRegistry.get_workflow_by_name(result.branched_workflow_name)
+        assert branch.metadata.name == "comp (branch 1)"

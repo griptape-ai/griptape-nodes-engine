@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from PIL import Image, ImageOps
 from pydantic import PositiveInt  # noqa: TC002 - Runtime validation, not type-only
@@ -16,7 +16,6 @@ from griptape_nodes.retained_mode.events.os_events import (
     WriteFileRequest,
     WriteFileResultSuccess,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_preview_generator import (
     BaseArtifactPreviewGenerator,
 )
@@ -24,6 +23,9 @@ from griptape_nodes.retained_mode.managers.artifact_providers.base_generator_par
     BaseGeneratorParameters,
     Field,
 )
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.engine import Engine
 
 
 class PILThumbnailParameters(BaseGeneratorParameters):
@@ -50,13 +52,15 @@ class PILThumbnailGenerator(BaseArtifactPreviewGenerator):
     Resizes images to fit within max_width x max_height while preserving aspect ratio.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         source_file_location: str,
         preview_format: str,
         destination_preview_directory: str,
         destination_preview_file_name: str,
         params: dict[str, Any],
+        *,
+        engine: Engine | None = None,
     ) -> None:
         """Initialize the generator.
 
@@ -66,12 +70,18 @@ class PILThumbnailGenerator(BaseArtifactPreviewGenerator):
             destination_preview_directory: Directory where the preview should be saved
             destination_preview_file_name: Filename for the preview
             params: Generator parameters (max_width, max_height)
+            engine: The engine whose request bus this generator reads and writes files through
 
         Raises:
             ValidationError: If parameters are invalid
         """
         super().__init__(
-            source_file_location, preview_format, destination_preview_directory, destination_preview_file_name, params
+            source_file_location,
+            preview_format,
+            destination_preview_directory,
+            destination_preview_file_name,
+            params,
+            engine=engine,
         )
 
         # Validate and convert dict -> Pydantic model
@@ -112,7 +122,7 @@ class PILThumbnailGenerator(BaseArtifactPreviewGenerator):
             workspace_only=False,
             should_transform_image_content_to_thumbnail=False,
         )
-        read_result = await GriptapeNodes.ahandle_request(read_request)
+        read_result = await self.engine.ahandle_request(read_request)
 
         if not isinstance(read_result, ReadFileResultSuccess):
             msg = f"Failed to read source image: {read_result.result_details}"
@@ -146,7 +156,7 @@ class PILThumbnailGenerator(BaseArtifactPreviewGenerator):
             create_parents=True,
             existing_file_policy=ExistingFilePolicy.OVERWRITE,
         )
-        write_result = await GriptapeNodes.ahandle_request(write_request)
+        write_result = await self.engine.ahandle_request(write_request)
 
         if not isinstance(write_result, WriteFileResultSuccess):
             msg = f"Failed to write preview image: {write_result.result_details}"

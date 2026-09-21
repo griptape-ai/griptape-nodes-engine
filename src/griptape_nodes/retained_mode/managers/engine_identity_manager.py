@@ -27,7 +27,6 @@ from griptape_nodes.retained_mode.events.app_events import (
     SetEngineNameResultSuccess,
 )
 from griptape_nodes.retained_mode.events.base_events import (
-    BaseEvent,
     ResultDetails,
     ResultPayload,
 )
@@ -205,8 +204,6 @@ class EngineIdentityManager:
             )
             self._add_or_update_engine(engine_data)
 
-        # Register engine with BaseEvent
-        BaseEvent._engine_id = engine_data.id
         self._active_engine_id = engine_data.id
         logger.debug("Initialized engine ID: %s", engine_data.id)
         return engine_data

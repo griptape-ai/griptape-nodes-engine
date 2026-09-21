@@ -600,6 +600,7 @@ class Engine:
                 heartbeat_id=request.heartbeat_id,
                 engine_version=engine_version,
                 engine_name=engine_name,
+                engine_os=self._os_manager.platform_name(),
                 engine_id=self._engine_identity_manager.active_engine_id,
                 session_id=self._session_manager.active_session_id,
                 timestamp=datetime.now(tz=UTC).isoformat(),

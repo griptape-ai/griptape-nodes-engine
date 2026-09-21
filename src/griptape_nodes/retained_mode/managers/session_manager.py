@@ -2,7 +2,7 @@
 
 Handles storing and retrieving multiple session information across engine restarts.
 Sessions are tied to specific engines, with each engine maintaining its own session store.
-Supports multiple concurrent sessions per engine with one active session managed through BaseEvent.
+Supports multiple concurrent sessions per engine with one active session.
 Storage structure: ~/.local/state/griptape_nodes/engines/{engine_id}/sessions.json
 """
 
@@ -29,11 +29,11 @@ from griptape_nodes.retained_mode.events.app_events import (
     SessionHeartbeatResultFailure,
     SessionHeartbeatResultSuccess,
 )
-from griptape_nodes.retained_mode.events.base_events import BaseEvent, ResultPayload
 
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.engine_identity_manager import EngineIdentityManager
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
 
@@ -74,7 +74,6 @@ class SessionManager:
         self._engine_identity_manager = engine_identity_manager
         self._sessions_data = self._load_sessions_data()
         self._active_session_id = self._get_or_initialize_active_session()
-        BaseEvent._session_id = self._active_session_id
         if event_manager is not None:
             event_manager.assign_manager_to_request_type(AppStartSessionRequest, self.handle_session_start_request)
             event_manager.assign_manager_to_request_type(AppEndSessionRequest, self.handle_session_end_request)
@@ -98,7 +97,6 @@ class SessionManager:
             session_id: The session ID to set as active
         """
         self._active_session_id = session_id
-        BaseEvent._session_id = session_id
         logger.debug("Set active session ID to: %s", session_id)
 
     @property
@@ -129,7 +127,6 @@ class SessionManager:
 
         # Set as active session
         self._active_session_id = session_id
-        BaseEvent._session_id = session_id
         logger.info("Saved and activated session: %s for engine: %s", session_id, engine_id)
 
     def remove_session(self, session_id: str) -> None:
@@ -151,7 +148,6 @@ class SessionManager:
             self._active_session_id = (
                 self._sessions_data.sessions[0].session_id if self._sessions_data.sessions else None
             )
-            BaseEvent._session_id = self._active_session_id
             logger.info(
                 "Removed active session %s for engine %s, set new active session to: %s",
                 session_id,
@@ -166,7 +162,6 @@ class SessionManager:
         """Clear all saved session data for the current engine."""
         # Clear active session
         self._active_session_id = None
-        BaseEvent._session_id = None
 
         # Clear in-memory session data
         self._sessions_data = SessionsStorage(sessions=[])

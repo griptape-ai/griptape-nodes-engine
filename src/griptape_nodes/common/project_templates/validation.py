@@ -99,6 +99,30 @@ class ProjectValidationInfo:
         )
         self.status = ProjectValidationStatus.UNUSABLE
 
+    def add_recoverable_error(self, field_path: str, message: str, line_number: int | None = None) -> None:
+        """Add an error that leaves the template loadable, downgrading status to FLAWED at most.
+
+        For problems that block USING the project but not representing it -- e.g. a declared
+        workspace_dir/libraries_dir that cannot be resolved. Recording these as ERROR severity while
+        keeping the template usable is what lets the project load, appear in listings, and be edited
+        (so the user can fix the bad value in the app) while activation refuses it. Does not upgrade
+        a status that is already UNUSABLE; early returns if status is MISSING.
+        """
+        if self.status == ProjectValidationStatus.MISSING:
+            return
+
+        self.problems.append(
+            ProjectValidationProblem(
+                line_number=line_number,
+                field_path=field_path,
+                message=message,
+                severity=ProjectValidationProblemSeverity.ERROR,
+            ),
+        )
+
+        if self.status == ProjectValidationStatus.GOOD:
+            self.status = ProjectValidationStatus.FLAWED
+
     def add_warning(self, field_path: str, message: str, line_number: int | None = None) -> None:
         """Add a warning to the problems list.
 

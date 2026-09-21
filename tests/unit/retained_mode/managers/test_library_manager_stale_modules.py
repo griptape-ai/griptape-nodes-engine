@@ -28,8 +28,8 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
     from pathlib import Path
 
+    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
-    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 LIBRARY_NAME = "Stale Module Test Library"
 STABLE_NAMESPACE = "griptape_nodes.node_libraries.stale_module_test_library.some_node"
@@ -91,10 +91,8 @@ def _unload(manager: LibraryManager) -> None:
 
 
 class TestStaleModuleDetection:
-    def test_a_library_that_never_loaded_a_module_needs_no_restart(
-        self, griptape_nodes: GriptapeNodes, tmp_path: Path
-    ) -> None:
-        manager = griptape_nodes.LibraryManager()
+    def test_a_library_that_never_loaded_a_module_needs_no_restart(self, engine: Engine, tmp_path: Path) -> None:
+        manager = engine.library_manager
         _register_library(manager, tmp_path)
 
         _unload(manager)
@@ -103,8 +101,8 @@ class TestStaleModuleDetection:
         assert manager._was_reloaded_after_its_modules_were_imported(LIBRARY_NAME) is False
         assert manager.explain_stale_module_failure(LIBRARY_NAME) is None
 
-    def test_reloading_after_a_module_loaded_is_remembered(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
-        manager = griptape_nodes.LibraryManager()
+    def test_reloading_after_a_module_loaded_is_remembered(self, engine: Engine, tmp_path: Path) -> None:
+        manager = engine.library_manager
         _register_library(manager, tmp_path)
         _pretend_a_node_module_loaded(manager)
 
@@ -116,8 +114,8 @@ class TestStaleModuleDetection:
         assert "Restart the engine" in explanation
         assert LIBRARY_NAME in explanation
 
-    def test_the_marker_survives_a_successful_re_register(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
-        manager = griptape_nodes.LibraryManager()
+    def test_the_marker_survives_a_successful_re_register(self, engine: Engine, tmp_path: Path) -> None:
+        manager = engine.library_manager
         _register_library(manager, tmp_path)
         _pretend_a_node_module_loaded(manager)
         _unload(manager)
@@ -126,23 +124,23 @@ class TestStaleModuleDetection:
         # Only restarting the process clears cached modules, so re-registering must not clear it.
         assert manager._was_reloaded_after_its_modules_were_imported(LIBRARY_NAME) is True
 
-    def test_an_untouched_library_is_never_blamed(self, griptape_nodes: GriptapeNodes) -> None:
-        manager = griptape_nodes.LibraryManager()
+    def test_an_untouched_library_is_never_blamed(self, engine: Engine) -> None:
+        manager = engine.library_manager
 
         assert manager._was_reloaded_after_its_modules_were_imported("Some Other Library") is False
         assert manager.explain_stale_module_failure("Some Other Library") is None
 
 
 class TestNodeImportProblemReporting:
-    def test_no_problems_recorded(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
-        manager = griptape_nodes.LibraryManager()
+    def test_no_problems_recorded(self, engine: Engine, tmp_path: Path) -> None:
+        manager = engine.library_manager
         _register_library(manager, tmp_path)
 
         assert manager._library_has_node_import_problems(LIBRARY_NAME) is False
         assert manager.get_library_name_for_node_type("SomeNode") is None
 
-    def test_import_problems_are_found_and_attributed(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
-        manager = griptape_nodes.LibraryManager()
+    def test_import_problems_are_found_and_attributed(self, engine: Engine, tmp_path: Path) -> None:
+        manager = engine.library_manager
         _register_library(
             manager,
             tmp_path,
@@ -159,8 +157,8 @@ class TestNodeImportProblemReporting:
 class TestReloadResultsReportRestart:
     """Every path that reloads a library in place has to report the restart, not just updates."""
 
-    def test_a_clean_reload_reports_no_restart(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
-        manager = griptape_nodes.LibraryManager()
+    def test_a_clean_reload_reports_no_restart(self, engine: Engine, tmp_path: Path) -> None:
+        manager = engine.library_manager
         _register_library(manager, tmp_path)
         _pretend_a_node_module_loaded(manager)
         _unload(manager)
@@ -181,9 +179,9 @@ class TestReloadResultsReportRestart:
         assert switch_result.restart_required is False
 
     def test_a_stale_reload_reports_a_restart_for_updates_and_ref_switches(
-        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+        self, engine: Engine, tmp_path: Path
     ) -> None:
-        manager = griptape_nodes.LibraryManager()
+        manager = engine.library_manager
         _register_library(manager, tmp_path)
         _pretend_a_node_module_loaded(manager)
         _unload(manager)
@@ -204,10 +202,8 @@ class TestReloadResultsReportRestart:
         assert "Restart the engine" in _first_detail_message(switch_result)
         assert switch_result.new_ref == "dev"
 
-    def test_an_import_failure_without_a_reload_asks_for_no_restart(
-        self, griptape_nodes: GriptapeNodes, tmp_path: Path
-    ) -> None:
-        manager = griptape_nodes.LibraryManager()
+    def test_an_import_failure_without_a_reload_asks_for_no_restart(self, engine: Engine, tmp_path: Path) -> None:
+        manager = engine.library_manager
         _register_library(manager, tmp_path, problems=[_import_problem()])
 
         # The library is simply broken: it was never reloaded on top of imported modules, so a

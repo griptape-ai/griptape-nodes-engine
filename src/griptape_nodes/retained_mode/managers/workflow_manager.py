@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextvars
 import logging
 import pickle
 import re
 import sys
 from collections import defaultdict
+from contextlib import nullcontext
 from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -65,6 +67,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowRequest,
     GetTopLevelFlowRequest,
     GetTopLevelFlowResultSuccess,
+    SerializedConnectionKey,
     SerializedFlowCommands,
     SerializeFlowToCommandsRequest,
     SerializeFlowToCommandsResultSuccess,
@@ -77,6 +80,7 @@ from griptape_nodes.retained_mode.events.library_events import (
     ListRegisteredLibrariesRequest,
     ListRegisteredLibrariesResultSuccess,
     RegisterLibraryFromFileRequest,
+    RegisterLibraryFromFileResultFailure,
 )
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.os_events import (
@@ -198,6 +202,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     WorkflowInfoSummary,
     WorkflowStatus,
 )
+from griptape_nodes.retained_mode.managers.event_manager import EventSuppressionContext
 from griptape_nodes.retained_mode.managers.fitness_problems.workflows import (
     InvalidDependencyVersionStringProblem,
     InvalidLibraryVersionStringProblem,
@@ -222,7 +227,7 @@ from griptape_nodes.utils.file_utils import find_files_recursive
 from griptape_nodes.utils.string_utils import normalize_display_name
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Iterable, Sequence
     from types import TracebackType
 
     from griptape_nodes.exe_types.core_types import Parameter
@@ -243,12 +248,73 @@ WorkflowShapeNodes = dict[str, NodeParameterMap]  # {node_name: {param_name: par
 
 logger = logging.getLogger("griptape_nodes")
 
+# WorkflowManager.LoadProblemFrame writes this; is_loading_workflow reads it. Scoped to the
+# current context so concurrent loads cannot pop or read each other's frames.
+_load_problem_frames: contextvars.ContextVar[tuple[list[WorkflowProblem], ...]] = contextvars.ContextVar(
+    "workflow_load_problem_frames", default=()
+)
+
 
 class WorkflowRegistrationResult(NamedTuple):
     """Result of processing workflows for registration."""
 
     succeeded: list[str]
     failed: list[str]
+
+
+@dataclass
+class WorkflowCodegenState:
+    """Variable names and counters shared by every Flow written into one generated workflow file.
+
+    A generated file is a single flat script, so node and flow variable names have to be unique
+    across the whole file rather than per Flow. Nested node groups also break any per-Flow view of
+    the graph: a group's ``node_names_to_add`` can name a child that was created inside a deeper
+    subflow, and a connection can join nodes that live in different subflows. Threading one of these
+    through the whole recursion keeps every level looking at the same names.
+    """
+
+    node_uuid_to_node_variable_name: dict[SerializedNodeCommands.NodeUUID, str] = field(default_factory=dict)
+    subflow_name_to_variable_name: dict[str, str] = field(default_factory=dict)
+    next_node_index: int = 0
+    next_flow_index: int = 0
+    emitted_connection_keys: set[SerializedConnectionKey] = field(default_factory=set)
+
+    def reserve_node_index(self) -> int:
+        """Claim the next unused node variable index."""
+        node_index = self.next_node_index
+        self.next_node_index += 1
+        return node_index
+
+    def reserve_flow_index(self) -> int:
+        """Claim the next unused flow variable index."""
+        flow_index = self.next_flow_index
+        self.next_flow_index += 1
+        return flow_index
+
+    def take_unemitted_connections(
+        self, connections: list[SerializedFlowCommands.IndirectConnectionSerialization]
+    ) -> list[SerializedFlowCommands.IndirectConnectionSerialization]:
+        """Filter out connections already written elsewhere in the file, claiming the rest.
+
+        Each Flow's serialized connections include those of its subflows, so the same edge is
+        offered once per level of nesting. Emitting it every time would re-create the connection
+        repeatedly, which for a node group means tearing down and rebuilding the proxy parameter
+        the edge was routed through.
+
+        Args:
+            connections: The connections the current Flow would like to emit
+
+        Returns:
+            Only the connections no other Flow has emitted yet
+        """
+        unemitted_connections = []
+        for connection in connections:
+            connection_key = connection.key()
+            if connection_key in self.emitted_connection_keys:
+                continue
+            self.emitted_connection_keys.add(connection_key)
+            unemitted_connections.append(connection)
+        return unemitted_connections
 
 
 class WorkflowManager(EngineScoped):
@@ -316,11 +382,76 @@ class WorkflowManager(EngineScoped):
 
     _referenced_workflow_stack: list[str] = field(default_factory=list)
 
+    class LoadProblemFrame:
+        """Collects one workflow load's problems, bubbling them into the enclosing load on exit.
+
+        A workflow file can import another workflow as a referenced subflow, and that import
+        runs as a nested request dispatched from inside the outer file's exec() -- so the inner
+        load's problems have no return path to the outer one. Without bubbling, an outer load
+        reports GOOD while the canvas holds the inner load's placeholders, and a caller that
+        gates on status (the headless executor) runs an incomplete graph.
+
+        The stack lives in a ContextVar rather than on the manager because loads genuinely run
+        concurrently: in PARALLEL execution mode a WorkflowNode loads its subflow from inside a
+        node body, and those bodies run as separate tasks. A shared list would let one task pop
+        another's frame, so a load would report a library a *different* workflow was missing --
+        or see a sibling's open frame and suppress the only report of its own. A task inherits a
+        copy of the context, so a nested load still reaches the enclosing frame (same task) while
+        siblings stay isolated. `EventSuppressionContext` is contextvar-scoped for the same reason.
+        """
+
+        def __init__(self) -> None:
+            self.problems: list[WorkflowProblem] = []
+            self._tokens: list[contextvars.Token[tuple[list[WorkflowProblem], ...]]] = []
+
+        def __enter__(self) -> WorkflowManager.LoadProblemFrame:
+            self._tokens.append(_load_problem_frames.set((*_load_problem_frames.get(), self.problems)))
+            return self
+
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc_value: BaseException | None,
+            exc_traceback: TracebackType | None,
+        ) -> None:
+            frames = _load_problem_frames.get()
+            if len(frames) > 1:
+                enclosing = frames[-2]
+                # A library the outer file declares for itself AND reaches through a subflow
+                # would otherwise be counted twice, and the collated display would name it
+                # twice while claiming two libraries are missing.
+                enclosing.extend(problem for problem in self.problems if problem not in enclosing)
+            if self._tokens:
+                _load_problem_frames.reset(self._tokens.pop())
+
+    def is_loading_workflow(self) -> bool:
+        """Whether a workflow load is in progress, so its result will report the problems found.
+
+        Read after a nested load has closed, so a frame still on the stack is an ENCLOSING load.
+        That makes this the complement of the bubble in LoadProblemFrame.__exit__: exactly one of
+        the two names any given problem. A frame that stopped bubbling would have to stop
+        answering True here as well, or nothing would report it.
+        """
+        return len(_load_problem_frames.get()) > 0
+
     class WorkflowExecutionResult(NamedTuple):
-        """Result of a workflow execution."""
+        """Result of a workflow execution.
+
+        `status` and `problems` mirror WorkflowInfo's fields, so a load's fitness is described
+        the same way whether it was assessed from the metadata header or observed while
+        replaying the file. Both are populated whether or not the run succeeded: a library that
+        never loads leaves the load FLAWED (its nodes come back as placeholders), and is the
+        likeliest explanation when the load fails outright.
+
+        Keeping the problems typed rather than pre-rendered lets a caller decide per problem
+        class -- an executor can refuse a FLAWED load that the editor is happy to open -- and
+        leaves the wording to each problem's own collate_problems_for_display.
+        """
 
         execution_successful: bool
         execution_details: str
+        status: WorkflowStatus = WorkflowStatus.GOOD
+        problems: tuple[WorkflowProblem, ...] = ()
 
     class SaveWorkflowScenario(StrEnum):
         """Scenarios for saving workflows."""
@@ -636,7 +767,7 @@ class WorkflowManager(EngineScoped):
 
         return find_metadata_blocks(workflow_content, block_name)
 
-    def print_workflow_load_status(self, min_status: WorkflowStatus = WorkflowStatus.FLAWED) -> None:  # noqa: PLR0915
+    def print_workflow_load_status(self, min_status: WorkflowStatus = WorkflowStatus.FLAWED) -> None:
         workflow_file_paths = self.get_workflows_attempted_to_load()
         workflow_infos = []
         for workflow_file_path in workflow_file_paths:
@@ -720,16 +851,7 @@ class WorkflowManager(EngineScoped):
             if not wf_info.problems:
                 problems = "No problems detected."
             else:
-                # Group problems by type
-                problems_by_type = defaultdict(list)
-                for problem in wf_info.problems:
-                    problems_by_type[type(problem)].append(problem)
-
-                # Collate each group
-                collated_strings = []
-                for problem_class, instances in problems_by_type.items():
-                    collated_display = problem_class.collate_problems_for_display(instances)
-                    collated_strings.append(collated_display)
+                collated_strings = self.collate_problems_by_type(wf_info.problems)
 
                 # Format for display
                 if len(collated_strings) == 1:
@@ -815,6 +937,17 @@ class WorkflowManager(EngineScoped):
         # Resolve path using utility function
         workspace_path = self.engine.config_manager.workspace_path
         complete_file_path = resolve_workspace_path(Path(relative_file_path), workspace_path)
+        # Problems found anywhere under this load land in the frame, including those of a
+        # referenced subflow imported from inside exec() -- see LoadProblemFrame.
+        with WorkflowManager.LoadProblemFrame() as frame:
+            return await self._run_workflow_in_frame(
+                relative_file_path=relative_file_path, complete_file_path=complete_file_path, frame=frame
+            )
+
+    async def _run_workflow_in_frame(
+        self, *, relative_file_path: str, complete_file_path: Path, frame: LoadProblemFrame
+    ) -> WorkflowExecutionResult:
+        """Read, resolve libraries for, and exec one workflow file, recording problems in `frame`."""
         try:
             async with await anyio.open_file(Path(complete_file_path), encoding="utf-8") as file:
                 workflow_content = await file.read()
@@ -823,53 +956,77 @@ class WorkflowManager(EngineScoped):
             # The metadata header lists every library the workflow uses; each must
             # be registered (discovery is triggered if needed) so node construction
             # inside the script can succeed.
-            library_resolution_error = await self._ensure_libraries_for_workflow(
-                relative_file_path=relative_file_path,
-                complete_file_path=complete_file_path,
+            frame.problems.extend(await self._ensure_libraries_for_workflow(relative_file_path=relative_file_path))
+
+            # _generate_workflow_run_prerequisite_code emits one registration per header entry,
+            # so each library we just failed to register is about to fail again on a request the
+            # GUI would toast -- that equivalence is what makes suppressing the type here safe.
+            # It is conditional because an unreadable header pre-registers nothing: there the
+            # in-file failures are the only record of what the workflow needs.
+            duplicate_library_failures = (
+                EventSuppressionContext(self.engine.event_manager, {RegisterLibraryFromFileResultFailure})
+                if any(isinstance(problem, LibraryNotRegisteredProblem) for problem in frame.problems)
+                else nullcontext()
             )
-            if library_resolution_error is not None:
-                return library_resolution_error
+            with duplicate_library_failures:
+                # Execute the workflow module with a dedicated namespace so `__file__` resolves
+                # to the workflow path and the `if __name__ == "__main__"` guard does not fire
+                # (which would try to spin up a second event loop via asyncio.run).
+                namespace: dict[str, Any] = {
+                    "__file__": str(complete_file_path),
+                    "__name__": "__gtn_workflow__",
+                }
+                exec(workflow_content, namespace)  # noqa: S102
 
-            # Execute the workflow module with a dedicated namespace so `__file__` resolves
-            # to the workflow path and the `if __name__ == "__main__"` guard does not fire
-            # (which would try to spin up a second event loop via asyncio.run).
-            namespace: dict[str, Any] = {
-                "__file__": str(complete_file_path),
-                "__name__": "__gtn_workflow__",
-            }
-            exec(workflow_content, namespace)  # noqa: S102
+                # New-style workflows wrap graph-building requests in `async def build_workflow()`
+                # so the module is inert at import time. Await it here. Legacy workflows without
+                # build_workflow() have already executed their requests top-to-bottom during exec().
+                workflow_builder = namespace.get("build_workflow")
+                if workflow_builder is not None and iscoroutinefunction(workflow_builder):
+                    await workflow_builder()
 
-            # New-style workflows wrap graph-building requests in `async def build_workflow()`
-            # so the module is inert at import time. Await it here. Legacy workflows without
-            # build_workflow() have already executed their requests top-to-bottom during exec().
-            workflow_builder = namespace.get("build_workflow")
-            if workflow_builder is not None and iscoroutinefunction(workflow_builder):
-                await workflow_builder()
-
-            # After workflow execution, ensure there's always a current context by pushing
-            # the top-level flow if the context is empty. This fixes regressions where
-            # with Workflow Schema version 0.6.0+ workflows expect context to be established.
-            await self._ensure_workflow_context_established()
+                # After workflow execution, ensure there's always a current context by pushing
+                # the top-level flow if the context is empty. This fixes regressions where
+                # with Workflow Schema version 0.6.0+ workflows expect context to be established.
+                await self._ensure_workflow_context_established()
 
         except Exception as e:
             return WorkflowManager.WorkflowExecutionResult(
                 execution_successful=False,
                 execution_details=f"Failed to run workflow on path '{complete_file_path}'. Exception: {e}",
+                status=WorkflowStatus.UNUSABLE,
+                problems=tuple(frame.problems),
             )
         return WorkflowManager.WorkflowExecutionResult(
             execution_successful=True,
             execution_details=f"Succeeded in running workflow on path '{complete_file_path}'.",
+            # A problem that did not stop the load leaves it recoverable: the graph is on the
+            # canvas, with placeholders where the missing library's nodes belong.
+            status=WorkflowStatus.FLAWED if frame.problems else WorkflowStatus.GOOD,
+            problems=tuple(frame.problems),
         )
 
-    async def _ensure_libraries_for_workflow(
-        self, *, relative_file_path: str, complete_file_path: Path
-    ) -> WorkflowExecutionResult | None:
-        """Ensure every library the workflow declares is registered before exec.
+    async def _ensure_libraries_for_workflow(self, *, relative_file_path: str) -> list[WorkflowProblem]:
+        """Register every library the workflow declares before exec, tolerating the ones that won't.
 
         Reads node_libraries_referenced from the workflow's TOML metadata header
         and dispatches a RegisterLibraryFromFileRequest for each entry via
-        ahandle_request. Returns a failure WorkflowExecutionResult if a library
-        cannot be resolved; None on success.
+        ahandle_request. Returns a LibraryNotRegisteredProblem per library that
+        would not register; an empty list when every library resolved. That is the
+        same problem type on_load_workflow_metadata_request records for the same
+        condition, so the two paths describe it identically.
+
+        A library that cannot be registered does not by itself stop the load. The
+        nodes it owns come back from CreateNodeRequest as ErrorProxyNode placeholders
+        that carry the reason and preserve the graph's values and connections, so the
+        rest of the workflow stays open and editable and only execution is lost.
+        Refusing the load instead would deny the artist the one view that shows
+        which nodes need the library (issue #5505).
+
+        The load can still fail downstream for a reason the missing library causes:
+        a parameter value whose CLASS the library declares is emitted as a hard
+        import inside build_workflow() (see _build_deferred_import_statements), and
+        that raises before any node is created. Only the node types are recoverable.
 
         The engine (not the workflow file itself) owns library registration
         because worker-backed libraries spin up a dedicated subprocess when they
@@ -888,36 +1045,77 @@ class WorkflowManager(EngineScoped):
             # Fall through to exec without pre-registering libraries; the engine
             # startup path may have already loaded them. This mirrors prior
             # behavior where a missing prereq block was survivable.
-            return None
+            return []
+        problems: list[WorkflowProblem] = []
         for lib_ref in load_metadata_result.metadata.node_libraries_referenced:
             register_result = await self.engine.ahandle_request(
                 RegisterLibraryFromFileRequest(
                     library_name=lib_ref.library_name,
                     perform_discovery_if_not_found=True,
-                    # The outer RunWorkflowFromRegistry failure already names the missing library
-                    # in a user-readable form; suppressing this inner result keeps the GUI from
-                    # showing a duplicate `RegisterLibraryFromFile Failed` toast on top of it.
+                    # The run result carries this library in a user-readable form already;
+                    # suppressing this inner result keeps the GUI from showing a
+                    # `RegisterLibraryFromFile Failed` toast on top of it.
                     failure_log_level=logging.DEBUG,
                 )
             )
             if not register_result.succeeded():
-                # `library_version` may carry a non-semver placeholder (e.g. when the workflow was
-                # saved while the library was already unavailable, see node_manager._serialize_node_to_commands).
-                # Only render the version suffix when the stored value parses as semver.
-                has_real_version = bool(lib_ref.library_version) and semver.VersionInfo.is_valid(
-                    lib_ref.library_version
+                # The declared version is deliberately not reported. A library that never
+                # registered has no version to compare against, which is why the not-registered
+                # problem carries none -- the version-mismatch problems cover the case where a
+                # library IS present at the wrong version. It also keeps the non-semver
+                # placeholder a workflow stores when saved without its library (see
+                # node_manager._serialize_node_to_commands) from ever reaching the reader.
+                problems.append(
+                    LibraryNotRegisteredProblem(
+                        library_name=lib_ref.library_name,
+                        reason=str(getattr(register_result, "result_details", "")) or None,
+                    )
                 )
-                version_suffix = f" v{lib_ref.library_version}" if has_real_version else ""
-                inner_details = getattr(register_result, "result_details", "")
-                details = (
-                    f"Workflow '{complete_file_path.name}' requires library "
-                    f"'{lib_ref.library_name}'{version_suffix}, which is not loaded. {inner_details}"
+        return problems
+
+    @staticmethod
+    def collate_problems_by_type(problems: Iterable[WorkflowProblem]) -> list[str]:
+        """Group problems by type and let each type render its own instances, one string per group.
+
+        Every problem class owns its wording and its singular/plural form, so grouping is what
+        lets a workflow with five unregistered libraries say so once instead of five times.
+        """
+        problems_by_type: dict[type, list[WorkflowProblem]] = defaultdict(list)
+        for problem in problems:
+            problems_by_type[type(problem)].append(problem)
+        return [
+            problem_class.collate_problems_for_display(instances)
+            for problem_class, instances in problems_by_type.items()
+        ]
+
+    @classmethod
+    def _execution_result_details(
+        cls, execution_result: WorkflowExecutionResult, *, level: int, message: str | None = None
+    ) -> list[ResultDetail]:
+        """The run's problems as warnings, ahead of its detail (or `message` in its place).
+
+        The problems come first: they explain both the placeholders on a successful load and,
+        on a failed one, the most likely reason the file could not be replayed. Every handler
+        that consumes a WorkflowExecutionResult reports them, or the load looks clean to the
+        caller while its graph is quietly full of placeholders.
+        """
+        details = [
+            ResultDetail(message=problem, level=logging.WARNING)
+            for problem in cls.collate_problems_by_type(execution_result.problems)
+        ]
+        # Only a load that survived has placeholders to point at; a failed one cleared the
+        # canvas. Said once for the whole load rather than per problem, which is what keeps
+        # the problems' own wording intact.
+        if execution_result.problems and execution_result.execution_successful:
+            details.append(
+                ResultDetail(
+                    message="Nodes from the libraries above opened as placeholders. "
+                    "They preserve the graph but cannot run until their library is available.",
+                    level=logging.WARNING,
                 )
-                return WorkflowManager.WorkflowExecutionResult(
-                    execution_successful=False,
-                    execution_details=details,
-                )
-        return None
+            )
+        details.append(ResultDetail(message=message or execution_result.execution_details, level=level))
+        return details
 
     async def on_run_workflow_from_scratch_request(self, request: RunWorkflowFromScratchRequest) -> ResultPayload:
         # Squelch any ResultPayloads that indicate the workflow was changed, because we are loading it into a blank slate.
@@ -939,15 +1137,34 @@ class WorkflowManager(EngineScoped):
             # Run the file, goddamn it
             execution_result = await self.run_workflow(relative_file_path=relative_file_path)
             if execution_result.execution_successful:
-                return RunWorkflowFromScratchResultSuccess(result_details=execution_result.execution_details)
+                return RunWorkflowFromScratchResultSuccess(
+                    status=execution_result.status,
+                    result_details=ResultDetails(
+                        *self._execution_result_details(execution_result, level=logging.DEBUG)
+                    ),
+                )
 
             logger.error(execution_result.execution_details)
-            return RunWorkflowFromScratchResultFailure(result_details=execution_result.execution_details)
+            return RunWorkflowFromScratchResultFailure(
+                result_details=ResultDetails(*self._execution_result_details(execution_result, level=logging.ERROR))
+            )
 
     async def on_run_workflow_with_current_state_request(
         self, request: RunWorkflowWithCurrentStateRequest
     ) -> ResultPayload:
         relative_file_path = request.file_path
+        if self.engine.context_manager.has_current_flow():
+            # Disallow opening a workflow inside another workflow this way. It would
+            # become an invisible child flow (no way to reach it in the UI), persisted
+            # with the parent workflow on save, and executed invisibly whenever the
+            # parent workflow was executed.
+            open_flow_name = self.engine.context_manager.get_current_flow().name
+            details = (
+                f"Attempted to open workflow '{relative_file_path}' while the flow '{open_flow_name}' is still open. "
+                "Close the current workflow first, before opening this one."
+            )
+            return RunWorkflowWithCurrentStateResultFailure(result_details=details)
+
         complete_file_path = WorkflowRegistry.get_complete_file_path(relative_file_path=relative_file_path)
         if not await anyio.Path(complete_file_path).is_file():
             details = f"Failed to find file. Path '{complete_file_path}' doesn't exist."
@@ -955,9 +1172,14 @@ class WorkflowManager(EngineScoped):
         execution_result = await self.run_workflow(relative_file_path=relative_file_path)
 
         if execution_result.execution_successful:
-            return RunWorkflowWithCurrentStateResultSuccess(result_details=execution_result.execution_details)
+            return RunWorkflowWithCurrentStateResultSuccess(
+                status=execution_result.status,
+                result_details=ResultDetails(*self._execution_result_details(execution_result, level=logging.DEBUG)),
+            )
         logger.error(execution_result.execution_details)
-        return RunWorkflowWithCurrentStateResultFailure(result_details=execution_result.execution_details)
+        return RunWorkflowWithCurrentStateResultFailure(
+            result_details=ResultDetails(*self._execution_result_details(execution_result, level=logging.ERROR))
+        )
 
     async def on_run_workflow_from_registry_request(self, request: RunWorkflowFromRegistryRequest) -> ResultPayload:
         await self._workflows_loading_complete.wait()
@@ -1009,7 +1231,7 @@ class WorkflowManager(EngineScoped):
                 result_messages = []
                 if context_warning:
                     result_messages.append(ResultDetail(message=context_warning, level=logging.WARNING))
-                result_messages.append(ResultDetail(message=execution_result.execution_details, level=logging.ERROR))
+                result_messages.extend(self._execution_result_details(execution_result, level=logging.ERROR))
 
                 # Attempt to clear everything out, as we modified the engine state getting here.
                 clear_all_request = ClearAllObjectStateRequest(i_know_what_im_doing=True)
@@ -1022,8 +1244,10 @@ class WorkflowManager(EngineScoped):
         result_messages = []
         if context_warning:
             result_messages.append(ResultDetail(message=context_warning, level=logging.WARNING))
-        result_messages.append(ResultDetail(message=execution_result.execution_details, level=logging.DEBUG))
-        return RunWorkflowFromRegistryResultSuccess(result_details=ResultDetails(*result_messages))
+        result_messages.extend(self._execution_result_details(execution_result, level=logging.DEBUG))
+        return RunWorkflowFromRegistryResultSuccess(
+            status=execution_result.status, result_details=ResultDetails(*result_messages)
+        )
 
     def _persist_external_workflow_registration(self, full_path: str) -> None:
         """Persist an out-of-workspace workflow path to global config so it survives restarts.
@@ -1049,6 +1273,10 @@ class WorkflowManager(EngineScoped):
             if isinstance(request.metadata, dict):
                 request.metadata = WorkflowMetadata(**request.metadata)
 
+            request.metadata.name = self._repair_path_shaped_display_name(
+                display_name=request.metadata.name, registry_key=registry_key
+            )
+
             WorkflowRegistry.generate_new_workflow(
                 registry_key=registry_key, metadata=request.metadata, file_path=request.file_name
             )
@@ -1062,6 +1290,39 @@ class WorkflowManager(EngineScoped):
                 level=logging.DEBUG,
             ),
         )
+
+    def _repair_path_shaped_display_name(self, *, display_name: str, registry_key: str) -> str:
+        """Repair a display name that an older branch/merge/reset wrote as a registry key.
+
+        Those three sites used to write the path-derived registry key straight into ``metadata.name``,
+        so a branch of "Shot 010 Comp" living under ``shots/sh010/`` loaded as
+        "shots/sh010/comp_branch_1" everywhere the editor shows a workflow title. Files written by
+        those versions are still on disk, and they carry the *current* schema version -- the bug was
+        never a schema change -- so there is no version to gate on. We key on the damage itself.
+
+        Exact equality with the registry key is the fingerprint: a title someone actually typed does
+        not coincide with its own file path. Everything else is left alone, including a name that
+        merely happens to contain a separator, which may well be deliberate.
+
+        In-memory only. Rewriting headers during load would touch a pile of user files, churning
+        mtimes and git diffs for a cosmetic label; the repaired name persists on its own the next
+        time the workflow is saved for any other reason.
+        """
+        if display_name != registry_key:
+            return display_name
+        if "/" not in registry_key:
+            # A workspace-root workflow whose title matches its file stem. Nothing path-shaped here,
+            # and nothing the three sites broke -- they only read badly with directories in the key.
+            return display_name
+
+        repaired_name = PurePosixPath(registry_key).name
+        logger.debug(
+            "Workflow '%s' carries its registry key as its display name (written by a pre-fix branch, "
+            "merge, or reset). Showing it as '%s'; the file keeps the old name until its next save.",
+            registry_key,
+            repaired_name,
+        )
+        return repaired_name
 
     async def on_import_workflow_request(self, request: ImportWorkflowRequest) -> ResultPayload:
         # First, attempt to load metadata from the file
@@ -1326,10 +1587,13 @@ class WorkflowManager(EngineScoped):
                 )
 
         # If the renamed workflow is the current context, update the context name so the
-        # heartbeat and other callers reflect the new registry key immediately.
+        # heartbeat and other callers reflect the new registry key immediately. The retained
+        # path moves with it: rename keeps the directory, so `workflow_dir` is unaffected, but
+        # the path itself would otherwise name a file that no longer exists.
         context_manager = self.engine.context_manager
         if context_manager.has_current_workflow() and context_manager.get_current_workflow_name() == old_workflow_name:
             context_manager.set_current_workflow_name(new_workflow_name)
+            context_manager.set_current_workflow_file_path(str(save_result.file_path))
 
         return None
 
@@ -1343,13 +1607,7 @@ class WorkflowManager(EngineScoped):
 
     def _build_workflow_info_payload(self, wf_info: WorkflowInfo) -> WorkflowInfoSummary:
         """Build a WorkflowInfoSummary from a WorkflowInfo, collating problems for display."""
-        problems_by_type: dict[type, list] = defaultdict(list)
-        for problem in wf_info.problems:
-            problems_by_type[type(problem)].append(problem)
-        collated_problems = [
-            problem_class.collate_problems_for_display(instances)
-            for problem_class, instances in problems_by_type.items()
-        ]
+        collated_problems = self.collate_problems_by_type(wf_info.problems)
         return WorkflowInfoSummary(
             status=wf_info.status,
             workflow_name=wf_info.workflow_name,
@@ -1544,7 +1802,7 @@ class WorkflowManager(EngineScoped):
         return GetWorkflowRunCommandResultSuccess(
             run_command=run_command,
             workflow_shape=workflow_shape,
-            engine_os=self.engine.os_manager._get_platform_name(),
+            engine_os=self.engine.os_manager.platform_name(),
             result_details=ResultDetails(message=f"Run command: {run_command}", level=logging.DEBUG),
         )
 
@@ -1764,6 +2022,11 @@ class WorkflowManager(EngineScoped):
                     and context_manager.get_current_workflow_name() == old_registry_key
                 ):
                     context_manager.set_current_workflow_name(new_registry_key)
+                    # The context also retains the workflow's path, and that is what
+                    # `workflow_dir` answers with. Move is the one operation that changes the
+                    # directory, so without this the builtin keeps resolving to the folder the
+                    # file just left.
+                    context_manager.set_current_workflow_file_path(str(new_absolute_path))
 
         except OSError as e:
             error_messages = []
@@ -1868,8 +2131,10 @@ class WorkflowManager(EngineScoped):
             # See how our desired version compares against the actual library we (may) have.
             # Check if library is registered (silent check - no error logging)
             if library_name not in registered_libraries:
-                # Library not registered
-                had_critical_error = True
+                # Library not registered. Recoverable, not critical: the workflow opens with
+                # ErrorProxyNode placeholders standing in for that library's nodes, so calling it
+                # UNUSABLE would contradict what the editor is about to show (issue #5505). The
+                # version-mismatch and malformed-metadata problems below stay critical.
                 problems.append(LibraryNotRegisteredProblem(library_name=library_name))
                 dependency_infos.append(
                     WorkflowManager.WorkflowDependencyInfo(
@@ -1887,8 +2152,9 @@ class WorkflowManager(EngineScoped):
             library_metadata_result = self.engine.library_manager.get_library_metadata_request(library_metadata_request)
 
             if not isinstance(library_metadata_result, GetLibraryMetadataResultSuccess):
-                # Should not happen since we verified library is registered, but handle gracefully
-                had_critical_error = True
+                # Should not happen since we verified library is registered, but handle gracefully.
+                # Recoverable for the same reason as the unregistered case above: the library IS
+                # in the registry, so its nodes still construct -- only its version is unknown.
                 problems.append(LibraryNotRegisteredProblem(library_name=library_name))
                 dependency_infos.append(
                     WorkflowManager.WorkflowDependencyInfo(
@@ -2503,6 +2769,11 @@ class WorkflowManager(EngineScoped):
             for workflow_context_state in self.engine.context_manager._workflow_stack:
                 if workflow_context_state._name == unsaved_source_key:
                     workflow_context_state._name = registry_key
+                    # The context also retains the workflow's path, and `workflow_dir` prefers
+                    # it over a registry lookup. An unsaved context has no path; this save is
+                    # where it gets one, so record it here or the builtin keeps falling back to
+                    # the registry key -- the thing that goes stale on the next project switch.
+                    workflow_context_state._file_path = str(save_file_result.file_path)
             registered_workflows = WorkflowRegistry.list_workflows()
 
         if registry_key not in registered_workflows:
@@ -3199,7 +3470,7 @@ class WorkflowManager(EngineScoped):
             is_template=is_template,
         )
 
-    def _generate_workflow_file_content(  # noqa: PLR0912, PLR0915, C901
+    def _generate_workflow_file_content(
         self,
         serialized_flow_commands: SerializedFlowCommands,
         workflow_metadata: WorkflowMetadata,
@@ -3263,195 +3534,17 @@ class WorkflowManager(EngineScoped):
         # Helper returns an ast.Module; unpack its body into statements.
         main_body.extend(cast("ast.stmt", stmt) for stmt in unique_values_node.body)
 
-        # Keep track of each flow and node index we've created
-        flow_creation_index = 0
+        # Names are shared by every Flow in the file, at any nesting depth.
+        codegen_state = WorkflowCodegenState()
 
-        # See if this serialized flow has a flow initialization command; if it does, we'll need to insert that
-        flow_initialization_command = serialized_flow_commands.flow_initialization_command
-
-        match flow_initialization_command:
-            case CreateFlowRequest():
-                # Generate create flow context AST module
-                create_flow_context_module = self._generate_create_flow(
-                    flow_initialization_command, import_recorder, flow_creation_index
-                )
-                main_body.extend(cast("ast.stmt", node) for node in create_flow_context_module.body)
-            case ImportWorkflowAsReferencedSubFlowRequest():
-                # Generate import workflow context AST module
-                import_workflow_context_module = self._generate_import_workflow(
-                    flow_initialization_command, import_recorder, flow_creation_index
-                )
-                main_body.extend(cast("ast.stmt", node) for node in import_workflow_context_module.body)
-            case None:
-                # No initialization command, deserialize into current context
-                pass
-
-        # Generate assign flow context AST node, if we have any children commands
-        # Skip content generation for referenced workflows - they should only have the import command
-        is_referenced_workflow = isinstance(flow_initialization_command, ImportWorkflowAsReferencedSubFlowRequest)
-        has_content_to_serialize = (
-            len(serialized_flow_commands.serialized_node_commands) > 0
-            or len(serialized_flow_commands.serialized_connections) > 0
-            or len(serialized_flow_commands.set_parameter_value_commands) > 0
-            or len(serialized_flow_commands.sub_flows_commands) > 0
-            or len(serialized_flow_commands.set_lock_commands_per_node) > 0
-            or len(serialized_flow_commands.serialized_variable_commands) > 0
+        main_body.extend(
+            self._generate_flow_code(
+                serialized_flow_commands=serialized_flow_commands,
+                import_recorder=import_recorder,
+                codegen_state=codegen_state,
+                parent_flow_creation_index=None,
+            )
         )
-
-        if not is_referenced_workflow and has_content_to_serialize:
-            # Keep track of all of the nodes we create and the generated variable names for them
-            node_uuid_to_node_variable_name: dict[SerializedNodeCommands.NodeUUID, str] = {}
-
-            # Keep track of subflow names to their generated variable names (for node group metadata)
-            subflow_name_to_variable_name: dict[str, str] = {}
-
-            # Create the "with..." statement
-            assign_flow_context_node = self._generate_assign_flow_context(
-                flow_initialization_command=flow_initialization_command, flow_creation_index=flow_creation_index
-            )
-
-            # Emit flow-scoped variable creation INSIDE the flow "with" block, BEFORE any
-            # node creation. Ordering matters: SetVariable nodes' before_value_set hook fires
-            # during initial_setup and calls has_variable(); having the variable already
-            # present ensures that hook is a no-op adopt rather than a duplicate create.
-            flow_scoped_variable_asts = self._generate_create_variable_code(
-                serialized_variable_commands=serialized_flow_commands.serialized_variable_commands,
-                unique_values_dict_name="top_level_unique_values_dict",
-                import_recorder=import_recorder,
-            )
-            assign_flow_context_node.body.extend(flow_scoped_variable_asts)
-
-            # Separate regular nodes from NodeGroup nodes in main flow
-
-            regular_node_commands = []
-            node_group_commands = []
-            for serialized_node_command in serialized_flow_commands.serialized_node_commands:
-                # Check if this is a NodeGroup by checking the SerializedNodeCommands flag
-                if serialized_node_command.is_node_group:
-                    node_group_commands.append(serialized_node_command)
-                else:
-                    regular_node_commands.append(serialized_node_command)
-
-            # Track the running node index across all flows to ensure unique variable names
-            current_node_index = 0
-
-            # Generate regular nodes in main flow first (NOT NodeGroups yet)
-            for serialized_node_command in regular_node_commands:
-                node_creation_ast = self._generate_node_creation_code(
-                    serialized_node_command,
-                    current_node_index,
-                    import_recorder,
-                    node_uuid_to_node_variable_name=node_uuid_to_node_variable_name,
-                    subflow_name_to_variable_name=subflow_name_to_variable_name,
-                )
-                assign_flow_context_node.body.extend(node_creation_ast)
-                current_node_index += 1
-
-            # Process sub-flows - for each sub-flow, generate its nodes
-            for sub_flow_index, sub_flow_commands in enumerate(serialized_flow_commands.sub_flows_commands):
-                sub_flow_creation_index = flow_creation_index + 1 + sub_flow_index
-
-                # Generate initialization command for the sub-flow
-                sub_flow_initialization_command = sub_flow_commands.flow_initialization_command
-                if sub_flow_initialization_command is not None:
-                    # Track the subflow name to variable mapping for node groups
-                    if isinstance(sub_flow_initialization_command, CreateFlowRequest):
-                        original_subflow_name = sub_flow_initialization_command.flow_name
-                        subflow_variable_name = f"flow{sub_flow_creation_index}_name"
-                        if original_subflow_name:
-                            subflow_name_to_variable_name[original_subflow_name] = subflow_variable_name
-
-                    match sub_flow_initialization_command:
-                        case CreateFlowRequest():
-                            sub_flow_create_node = self._generate_create_flow(
-                                sub_flow_initialization_command,
-                                import_recorder,
-                                sub_flow_creation_index,
-                                parent_flow_creation_index=flow_creation_index,
-                            )
-                            assign_flow_context_node.body.append(cast("ast.stmt", sub_flow_create_node))
-                        case ImportWorkflowAsReferencedSubFlowRequest():
-                            sub_flow_import_node = self._generate_import_workflow(
-                                sub_flow_initialization_command, import_recorder, sub_flow_creation_index
-                            )
-                            assign_flow_context_node.body.append(cast("ast.stmt", sub_flow_import_node))
-
-                # Generate the nodes in this subflow (just like we do for main flow)
-                if sub_flow_commands.serialized_node_commands or sub_flow_commands.serialized_variable_commands:
-                    # Create "with" statement for subflow
-                    subflow_context_node = self._generate_assign_flow_context(
-                        flow_initialization_command=sub_flow_initialization_command,
-                        flow_creation_index=sub_flow_creation_index,
-                    )
-                    # Emit flow-scoped variable creation BEFORE any node creation in this subflow,
-                    # for the same reason as the top-level flow.
-                    subflow_variable_asts = self._generate_create_variable_code(
-                        serialized_variable_commands=sub_flow_commands.serialized_variable_commands,
-                        unique_values_dict_name="top_level_unique_values_dict",
-                        import_recorder=import_recorder,
-                    )
-                    subflow_context_node.body.extend(subflow_variable_asts)
-                    # Generate nodes in subflow, passing current index and getting next available
-                    subflow_nodes, current_node_index = self._generate_nodes_in_flow(
-                        sub_flow_commands,
-                        import_recorder,
-                        node_uuid_to_node_variable_name,
-                        current_node_index,
-                        subflow_name_to_variable_name,
-                    )
-                    subflow_context_node.body.extend(subflow_nodes)
-
-                    # Generate connections for nodes in this subflow (must be in subflow context)
-                    subflow_connection_asts = self._generate_connections_code(
-                        serialized_connections=sub_flow_commands.serialized_connections,
-                        node_uuid_to_node_variable_name=node_uuid_to_node_variable_name,
-                        import_recorder=import_recorder,
-                    )
-                    subflow_context_node.body.extend(subflow_connection_asts)
-
-                    # Generate parameter values for nodes in this subflow (must be in subflow context)
-                    subflow_parameter_value_asts = self._generate_set_parameter_value_code(
-                        set_parameter_value_commands=sub_flow_commands.set_parameter_value_commands,
-                        lock_commands=sub_flow_commands.set_lock_commands_per_node,
-                        node_uuid_to_node_variable_name=node_uuid_to_node_variable_name,
-                        unique_values_dict_name="top_level_unique_values_dict",
-                        import_recorder=import_recorder,
-                    )
-                    subflow_context_node.body.extend(subflow_parameter_value_asts)
-
-                    assign_flow_context_node.body.append(subflow_context_node)
-
-            # Generate NodeGroup nodes LAST (after subflows, so child nodes exist)
-            for serialized_node_command in node_group_commands:
-                node_creation_ast = self._generate_node_creation_code(
-                    serialized_node_command,
-                    current_node_index,
-                    import_recorder,
-                    node_uuid_to_node_variable_name=node_uuid_to_node_variable_name,
-                    subflow_name_to_variable_name=subflow_name_to_variable_name,
-                )
-                assign_flow_context_node.body.extend(node_creation_ast)
-                current_node_index += 1
-
-            # Now generate the connection code and add it to the flow context
-            connection_asts = self._generate_connections_code(
-                serialized_connections=serialized_flow_commands.serialized_connections,
-                node_uuid_to_node_variable_name=node_uuid_to_node_variable_name,
-                import_recorder=import_recorder,
-            )
-            assign_flow_context_node.body.extend(connection_asts)
-
-            # Generate parameter values for main flow only (subflow parameter values generated inside their contexts)
-            set_parameter_value_asts = self._generate_set_parameter_value_code(
-                set_parameter_value_commands=serialized_flow_commands.set_parameter_value_commands,
-                lock_commands=serialized_flow_commands.set_lock_commands_per_node,
-                node_uuid_to_node_variable_name=node_uuid_to_node_variable_name,
-                unique_values_dict_name="top_level_unique_values_dict",
-                import_recorder=import_recorder,
-            )
-            assign_flow_context_node.body.extend(set_parameter_value_asts)
-
-            main_body.append(cast("ast.stmt", assign_flow_context_node))
 
         # Wrap all graph-building statements in `async def build_workflow()` so the file is
         # inert until build_workflow() is awaited (by the engine loader or the CLI entrypoint).
@@ -3705,7 +3798,6 @@ class WorkflowManager(EngineScoped):
             )
         )
 
-        # `await build_workflow()` constructs the graph before the executor runs;
         # build_workflow() is the async function emitted by _generate_workflow_file_content
         # that contains all graph-building requests.
         await_main_call = ast.Expr(
@@ -3718,13 +3810,17 @@ class WorkflowManager(EngineScoped):
             )
         )
 
+        # Build the graph inside the executor's context manager. Entering it activates
+        # the project passed via --project-file-path, and only then is a bundle's own
+        # griptape_nodes_config.json read, which is what registers the bundle's required
+        # node libraries.
+        with_stmt.body = [await_main_call, ensure_context_call, *with_stmt.body]
+
         # === Generate async aexecute_workflow function ===
         async_func_def = ast.AsyncFunctionDef(
             name="aexecute_workflow",
             args=args,
             body=[
-                await_main_call,
-                ensure_context_call,
                 executor_assign,
                 with_stmt,
                 return_stmt,
@@ -4324,10 +4420,12 @@ class WorkflowManager(EngineScoped):
         # Emit `await GriptapeNodes.ahandle_request(RegisterLibraryFromFileRequest(...))` once
         # per declared library so build_workflow() registers its own dependencies before any
         # CreateNodeRequest runs. Without this, running the workflow file as a standalone script
-        # (uv run workflow.py) would have no libraries registered when nodes are created, since
-        # LocalWorkflowExecutor's __aenter__ runs after build_workflow() and is gated by
-        # skip_library_loading=True. perform_discovery_if_not_found=True lets the registration
-        # find the library JSON via the engine's normal config-driven discovery path.
+        # (uv run workflow.py) would have no libraries registered when nodes are created:
+        # LocalWorkflowExecutor is constructed with skip_library_loading=True, so app
+        # initialization deliberately loads none. perform_discovery_if_not_found=True lets the
+        # registration find the library JSON via the engine's normal config-driven discovery
+        # path, which resolves against the bundle's own config layer -- activated by entering
+        # the executor's context manager, which build_workflow() now runs inside.
         if library_names:
             import_recorder.add_from_import(
                 "griptape_nodes.retained_mode.events.library_events", "RegisterLibraryFromFileRequest"
@@ -4932,41 +5030,207 @@ class WorkflowManager(EngineScoped):
 
         return with_stmt
 
-    def _generate_nodes_in_flow(
+    def _generate_flow_code(
         self,
         serialized_flow_commands: SerializedFlowCommands,
         import_recorder: ImportRecorder,
-        node_uuid_to_node_variable_name: dict[SerializedNodeCommands.NodeUUID, str],
-        starting_node_index: int,
-        subflow_name_to_variable_name: dict[str, str],
-    ) -> tuple[list[ast.stmt], int]:
-        """Generate node creation code for nodes in a flow.
+        codegen_state: WorkflowCodegenState,
+        parent_flow_creation_index: int | None,
+    ) -> list[ast.stmt]:
+        """Generate the code that rebuilds one Flow, then recurse into its subflows.
+
+        Recursion is what makes nested node groups work: a group's subflow can itself hold another
+        group with its own subflow, to any depth. Handling only the first level of subflows left the
+        deeper nodes out of the file entirely, so the groups that owned them were rebuilt empty and
+        any connection reaching one of them could not be written at all.
 
         Args:
-            serialized_flow_commands: Commands for the flow
+            serialized_flow_commands: Commands for the Flow being generated
             import_recorder: Import recorder for tracking imports
-            node_uuid_to_node_variable_name: Mapping from node UUIDs to variable names
-            starting_node_index: The starting index for node variable names
-            subflow_name_to_variable_name: Mapping from subflow names to variable names
+            codegen_state: Variable names and counters shared across the whole file
+            parent_flow_creation_index: Index of the enclosing Flow's variable, or None at the top
 
         Returns:
-            Tuple of (list of AST statements, next available node index)
+            The statements that recreate this Flow and everything inside it
         """
-        node_creation_asts = []
-        current_index = starting_node_index
-        for serialized_node_command in serialized_flow_commands.serialized_node_commands:
-            node_creation_ast = self._generate_node_creation_code(
-                serialized_node_command,
-                current_index,
-                import_recorder,
-                node_uuid_to_node_variable_name=node_uuid_to_node_variable_name,
-                subflow_name_to_variable_name=subflow_name_to_variable_name,
-            )
-            node_creation_asts.extend(node_creation_ast)
-            current_index += 1
-        return node_creation_asts, current_index
+        flow_initialization_command = serialized_flow_commands.flow_initialization_command
+        flow_creation_index = codegen_state.reserve_flow_index()
 
-    def _generate_node_creation_code(  # noqa: C901, PLR0912, PLR0915
+        flow_statements = self._generate_flow_initialization_code(
+            flow_initialization_command=flow_initialization_command,
+            import_recorder=import_recorder,
+            codegen_state=codegen_state,
+            flow_creation_index=flow_creation_index,
+            parent_flow_creation_index=parent_flow_creation_index,
+        )
+
+        # A referenced workflow carries its own file, so only the import belongs here.
+        if isinstance(flow_initialization_command, ImportWorkflowAsReferencedSubFlowRequest):
+            return flow_statements
+
+        if not self._flow_has_content_to_generate(serialized_flow_commands):
+            return flow_statements
+
+        flow_context_node = self._generate_assign_flow_context(
+            flow_initialization_command=flow_initialization_command, flow_creation_index=flow_creation_index
+        )
+
+        # Emit flow-scoped variable creation INSIDE the flow "with" block, BEFORE any
+        # node creation. Ordering matters: SetVariable nodes' before_value_set hook fires
+        # during initial_setup and calls has_variable(); having the variable already
+        # present ensures that hook is a no-op adopt rather than a duplicate create.
+        flow_context_node.body.extend(
+            self._generate_create_variable_code(
+                serialized_variable_commands=serialized_flow_commands.serialized_variable_commands,
+                unique_values_dict_name="top_level_unique_values_dict",
+                import_recorder=import_recorder,
+            )
+        )
+
+        # A node group has to be created after the nodes it claims as members, and its members can
+        # live in this Flow's subflows, so groups are held back until the subflows are written.
+        regular_node_commands = []
+        node_group_commands = []
+        for serialized_node_command in serialized_flow_commands.serialized_node_commands:
+            if serialized_node_command.is_node_group:
+                node_group_commands.append(serialized_node_command)
+            else:
+                regular_node_commands.append(serialized_node_command)
+
+        for serialized_node_command in regular_node_commands:
+            flow_context_node.body.extend(
+                self._generate_node_creation_code(
+                    serialized_node_command,
+                    codegen_state.reserve_node_index(),
+                    import_recorder,
+                    node_uuid_to_node_variable_name=codegen_state.node_uuid_to_node_variable_name,
+                    subflow_name_to_variable_name=codegen_state.subflow_name_to_variable_name,
+                )
+            )
+
+        for sub_flow_commands in serialized_flow_commands.sub_flows_commands:
+            flow_context_node.body.extend(
+                self._generate_flow_code(
+                    serialized_flow_commands=sub_flow_commands,
+                    import_recorder=import_recorder,
+                    codegen_state=codegen_state,
+                    parent_flow_creation_index=flow_creation_index,
+                )
+            )
+
+        for serialized_node_command in node_group_commands:
+            flow_context_node.body.extend(
+                self._generate_node_creation_code(
+                    serialized_node_command,
+                    codegen_state.reserve_node_index(),
+                    import_recorder,
+                    node_uuid_to_node_variable_name=codegen_state.node_uuid_to_node_variable_name,
+                    subflow_name_to_variable_name=codegen_state.subflow_name_to_variable_name,
+                )
+            )
+
+        # Connections come last, once every node in this Flow's whole subtree exists — including the
+        # groups written just above, whose proxy parameters are what boundary-crossing edges attach to.
+        # Claiming edges here, after the subflows were already written, is safe: an edge is only ever
+        # collected by the Flow holding both endpoints or one level above them (_get_connections_for_flow),
+        # so a subflow can never claim an edge that reaches a group node declared out here.
+        flow_context_node.body.extend(
+            self._generate_connections_code(
+                serialized_connections=codegen_state.take_unemitted_connections(
+                    serialized_flow_commands.serialized_connections
+                ),
+                node_uuid_to_node_variable_name=codegen_state.node_uuid_to_node_variable_name,
+                import_recorder=import_recorder,
+            )
+        )
+
+        flow_context_node.body.extend(
+            self._generate_set_parameter_value_code(
+                set_parameter_value_commands=serialized_flow_commands.set_parameter_value_commands,
+                lock_commands=serialized_flow_commands.set_lock_commands_per_node,
+                node_uuid_to_node_variable_name=codegen_state.node_uuid_to_node_variable_name,
+                unique_values_dict_name="top_level_unique_values_dict",
+                import_recorder=import_recorder,
+            )
+        )
+
+        flow_statements.append(cast("ast.stmt", flow_context_node))
+        return flow_statements
+
+    def _generate_flow_initialization_code(
+        self,
+        flow_initialization_command: CreateFlowRequest | ImportWorkflowAsReferencedSubFlowRequest | None,
+        import_recorder: ImportRecorder,
+        codegen_state: WorkflowCodegenState,
+        flow_creation_index: int,
+        parent_flow_creation_index: int | None,
+    ) -> list[ast.stmt]:
+        """Generate the statements that bring one Flow into existence.
+
+        Args:
+            flow_initialization_command: How the Flow is created, or None to reuse the current one
+            import_recorder: Import recorder for tracking imports
+            codegen_state: Variable names and counters shared across the whole file
+            flow_creation_index: Index of this Flow's own variable
+            parent_flow_creation_index: Index of the enclosing Flow's variable, or None at the top
+
+        Returns:
+            The statements that create the Flow (empty when it already exists)
+
+        Raises:
+            TypeError: If the Flow is created by a command this generator does not know how to write
+        """
+        match flow_initialization_command:
+            case CreateFlowRequest():
+                # A subflow names its parent by variable so it lands in the right spot in the tree.
+                create_flow_module = self._generate_create_flow(
+                    flow_initialization_command,
+                    import_recorder,
+                    flow_creation_index,
+                    parent_flow_creation_index=parent_flow_creation_index,
+                )
+                if flow_initialization_command.flow_name:
+                    codegen_state.subflow_name_to_variable_name[flow_initialization_command.flow_name] = (
+                        f"flow{flow_creation_index}_name"
+                    )
+                return [cast("ast.stmt", node) for node in create_flow_module.body]
+            case ImportWorkflowAsReferencedSubFlowRequest():
+                import_workflow_module = self._generate_import_workflow(
+                    flow_initialization_command, import_recorder, flow_creation_index
+                )
+                return [cast("ast.stmt", node) for node in import_workflow_module.body]
+            case None:
+                # No initialization command; the contents are rebuilt into the current context.
+                return []
+            case _:
+                # A new way of creating a Flow was added without teaching this generator to write it.
+                # This one does fail the save, unlike the skip-and-log guards elsewhere in codegen:
+                # emitting nothing writes a file whose Flow is never created, so every node inside it
+                # lands wherever the script happened to be pointing. That is a wrong graph that loads
+                # without complaint, which is worse than a save the artist knows did not happen.
+                msg = f"Attempted to save a workflow. Failed because a flow is created in a way this version cannot write out: {type(flow_initialization_command).__name__}."
+                raise TypeError(msg)
+
+    @staticmethod
+    def _flow_has_content_to_generate(serialized_flow_commands: SerializedFlowCommands) -> bool:
+        """Whether a Flow holds anything worth emitting a context block for.
+
+        Args:
+            serialized_flow_commands: Commands for the Flow being generated
+
+        Returns:
+            True if the Flow has nodes, connections, values, locks, variables, or subflows
+        """
+        return (
+            len(serialized_flow_commands.serialized_node_commands) > 0
+            or len(serialized_flow_commands.serialized_connections) > 0
+            or len(serialized_flow_commands.set_parameter_value_commands) > 0
+            or len(serialized_flow_commands.sub_flows_commands) > 0
+            or len(serialized_flow_commands.set_lock_commands_per_node) > 0
+            or len(serialized_flow_commands.serialized_variable_commands) > 0
+        )
+
+    def _generate_node_creation_code(  # noqa: C901, PLR0912
         self,
         serialized_node_command: SerializedNodeCommands,
         node_index: int,
@@ -5012,27 +5276,36 @@ class WorkflowManager(EngineScoped):
                     # Special handling for node_names_to_add - these are now UUIDs, convert to variable references
                     if field_value is create_node_request.node_names_to_add and field_value:
                         # field_value is now a list of UUIDs (converted in _serialize_package_nodes_for_local_execution)
-                        # Convert each UUID to an AST Name node referencing the generated variable
-                        node_var_ast_list = []
-                        for node_uuid in field_value:
-                            if node_uuid in node_uuid_to_node_variable_name:
-                                variable_name = node_uuid_to_node_variable_name[node_uuid]
-                                node_var_ast_list.append(ast.Name(id=variable_name, ctx=ast.Load()))
-                            else:
-                                logger.info(
-                                    "NodeGroup child UUID '%s' not found in node_uuid_to_node_variable_name. Available UUIDs: %s...",
-                                    node_uuid,
-                                    list(node_uuid_to_node_variable_name.keys())[:5],
-                                )
-                        if node_var_ast_list:
-                            create_node_request_args.append(
-                                ast.keyword(arg=field.name, value=ast.List(elts=node_var_ast_list, ctx=ast.Load()))
+                        # Convert each UUID to an AST Name node referencing the generated variable.
+                        # Every member was written by now: members live in this group's subflow, and
+                        # a Flow's groups are written after its subflows (see _generate_flow_code).
+                        # Dropping the ones we cannot name would write the group out empty, which
+                        # saves cleanly and then loads as a group the artist has to refill by hand,
+                        # so fail the save instead of quietly losing the grouping.
+                        unnamed_member_uuids = [
+                            node_uuid for node_uuid in field_value if node_uuid not in node_uuid_to_node_variable_name
+                        ]
+                        if unnamed_member_uuids:
+                            group_name = create_node_request.node_name or create_node_request.node_type
+                            logger.error(
+                                "Cannot write the members of group '%s': node(s) %s were never written to the file",
+                                group_name,
+                                ", ".join(unnamed_member_uuids),
                             )
-                        else:
-                            logger.info(
-                                "NodeGroup node_names_to_add resulted in empty variable list. Original UUIDs: %s",
-                                field_value,
+                            msg = f"Attempted to save a workflow. Failed because {len(unnamed_member_uuids)} of the {len(field_value)} nodes in the group '{group_name}' had not been written to the file yet."
+                            raise ValueError(msg)
+                        create_node_request_args.append(
+                            ast.keyword(
+                                arg=field.name,
+                                value=ast.List(
+                                    elts=[
+                                        ast.Name(id=node_uuid_to_node_variable_name[node_uuid], ctx=ast.Load())
+                                        for node_uuid in field_value
+                                    ],
+                                    ctx=ast.Load(),
+                                ),
                             )
+                        )
                     else:
                         create_node_request_args.append(
                             self._keyword_from_field_value(field.name, field_value, create_node_request)
@@ -5192,6 +5465,19 @@ class WorkflowManager(EngineScoped):
         node_uuid_to_node_variable_name: dict[SerializedNodeCommands.NodeUUID, str],
         import_recorder: ImportRecorder,
     ) -> list[ast.stmt]:
+        """Write the statements that reconnect a Flow's nodes.
+
+        Args:
+            serialized_connections: The connections this Flow is responsible for writing
+            node_uuid_to_node_variable_name: Variable name written for each node so far, file-wide
+            import_recorder: Import recorder for tracking imports
+
+        Returns:
+            The statements creating each connection
+
+        Raises:
+            ValueError: If an endpoint's node has not been written into the file yet
+        """
         # Ensure necessary imports are recorded
         import_recorder.add_from_import(
             "griptape_nodes.retained_mode.events.connection_events", "CreateConnectionRequest"
@@ -5200,7 +5486,29 @@ class WorkflowManager(EngineScoped):
         connection_asts = []
 
         for connection in serialized_connections:
-            # Match the connection's node UUID back to its variable name.
+            # Match the connection's node UUID back to its variable name. Both endpoints must already
+            # have been written, since the generated file refers to them by variable. Which Flow
+            # writes a given edge depends on the traversal (see _generate_flow_code), so say what
+            # went missing if that ever slips rather than letting a bare KeyError escape mid-save.
+            missing_endpoints = [
+                endpoint_uuid
+                for endpoint_uuid in (connection.source_node_uuid, connection.target_node_uuid)
+                if endpoint_uuid not in node_uuid_to_node_variable_name
+            ]
+            if missing_endpoints:
+                # Skip rather than raise: raising here fails the save outright, and losing one edge
+                # is a smaller harm than an artist being unable to persist their work at all. Which
+                # Flow writes a given edge depends on the traversal, so a graph shape nobody has
+                # tried yet is a likelier cause than real corruption -- _get_connections_for_flow
+                # already carries one such case (transient loop-body flows). Logged at error so it
+                # surfaces as a bug rather than passing silently.
+                logger.error(
+                    "Cannot write the connection to '%s': node(s) %s were never written to the file. "
+                    "Skipping this connection; the saved workflow will be missing it.",
+                    connection.target_parameter_name,
+                    ", ".join(missing_endpoints),
+                )
+                continue
             source_node_variable_name = node_uuid_to_node_variable_name[connection.source_node_uuid]
             target_node_variable_name = node_uuid_to_node_variable_name[connection.target_node_uuid]
 
@@ -5331,8 +5639,36 @@ class WorkflowManager(EngineScoped):
         unique_values_dict_name: str,
         import_recorder: ImportRecorder,
     ) -> list[ast.stmt]:
+        """Write the statements that restore saved parameter values and lock states.
+
+        Args:
+            set_parameter_value_commands: Value commands for the nodes of one Flow, keyed by node
+            lock_commands: Lock-state commands for those same nodes
+            node_uuid_to_node_variable_name: Variable name written for each node so far, file-wide
+            unique_values_dict_name: Name of the generated dict holding the pickled values
+            import_recorder: Import recorder for tracking imports
+
+        Returns:
+            The statements setting each value
+
+        Raises:
+            ValueError: If a node carrying values has not been written into the file yet
+        """
         parameter_value_asts = []
         for node_uuid, indirect_set_parameter_value_commands in set_parameter_value_commands.items():
+            # Values are keyed per Flow and written after that Flow's nodes and subflows, so the node
+            # is always named by now. Say which node went missing if that ever stops holding, rather
+            # than letting a bare KeyError escape halfway through writing the file.
+            if node_uuid not in node_uuid_to_node_variable_name:
+                # Skip rather than raise, for the same reason as the connection case above: this
+                # guards a traversal invariant, and failing the save means the artist cannot persist
+                # anything, which is worse than a saved file missing one node's values.
+                logger.error(
+                    "Cannot write saved values: node '%s' was never written to the file. "
+                    "Skipping its values; the saved workflow will not restore them.",
+                    node_uuid,
+                )
+                continue
             node_variable_name = node_uuid_to_node_variable_name[node_uuid]
             lock_node_command = lock_commands.get(node_uuid)
             parameter_value_asts.extend(
@@ -5867,7 +6203,9 @@ class WorkflowManager(EngineScoped):
 
         if not workflow_result.execution_successful:
             details = f"Attempted to import workflow '{request.workflow_name}' as referenced sub flow. Failed because workflow execution failed: {workflow_result.execution_details}"
-            return ImportWorkflowAsReferencedSubFlowResultFailure(result_details=details)
+            return ImportWorkflowAsReferencedSubFlowResultFailure(
+                result_details=self._import_result_details(workflow_result, details, level=logging.ERROR)
+            )
 
         # Get flows after importing to find the new referenced sub flow
         flows_after = set(obj_manager.get_filtered_subset(type=ControlFlow).keys())
@@ -5900,8 +6238,24 @@ class WorkflowManager(EngineScoped):
             f"Successfully imported workflow '{request.workflow_name}' as referenced sub flow '{created_flow_name}'"
         )
         return ImportWorkflowAsReferencedSubFlowResultSuccess(
-            created_flow_name=created_flow_name, result_details=details
+            created_flow_name=created_flow_name,
+            status=workflow_result.status,
+            result_details=self._import_result_details(workflow_result, details, level=logging.DEBUG),
         )
+
+    def _import_result_details(
+        self, workflow_result: WorkflowExecutionResult, message: str, *, level: int
+    ) -> ResultDetails:
+        """Render an import result, naming the subflow's problems only if nobody else will.
+
+        Nested inside a load, the subflow's problems have already bubbled into the enclosing
+        frame and will be reported on that load's result; naming them here too would warn twice
+        for one condition. Imported on its own -- the editor dropping a workflow into a flow --
+        there is no such load, so this is the only result that can name them.
+        """
+        if self.is_loading_workflow():
+            return ResultDetails(message=message, level=level)
+        return ResultDetails(*self._execution_result_details(workflow_result, level=level, message=message))
 
     @staticmethod
     def _select_top_level_imported_flow(
@@ -5965,15 +6319,20 @@ class WorkflowManager(EngineScoped):
             )
             return BranchWorkflowResultFailure(result_details=details)
 
-        # Generate branch name if not provided
-        branch_name = request.branched_workflow_name
-        if branch_name is None:
-            base_name = request.workflow_name
-            counter = 1
-            branch_name = f"{base_name}_branch_{counter}"
-            while WorkflowRegistry.has_workflow_with_name(branch_name):
-                counter += 1
-                branch_name = f"{base_name}_branch_{counter}"
+        # A caller-supplied display name has to actually say something; a blank label would leave the
+        # branch looking nameless everywhere the editor shows a workflow title.
+        requested_display_name = request.branched_workflow_display_name
+        if requested_display_name is not None and not requested_display_name.strip():
+            details = (
+                f"Attempted to branch workflow '{request.workflow_name}' with an empty display name. "
+                "Provide a display name with at least one non-whitespace character, or leave it unset "
+                "to name the branch after the workflow it came from."
+            )
+            return BranchWorkflowResultFailure(result_details=details)
+
+        branch_naming = self._resolve_branch_naming(request=request, source_workflow=source_workflow)
+        branch_name = branch_naming.registry_key
+        branch_display_name = branch_naming.display_name
 
         # Check if branch name already exists
         if WorkflowRegistry.has_workflow_with_name(branch_name):
@@ -5983,7 +6342,8 @@ class WorkflowManager(EngineScoped):
         try:
             # Create branch metadata by copying source metadata
             branch_metadata = WorkflowMetadata(
-                name=branch_name,
+                # The display name, not the registry key: `branch_name` is a file path.
+                name=branch_display_name,
                 schema_version=source_workflow.metadata.schema_version,
                 engine_version_created_with=source_workflow.metadata.engine_version_created_with,
                 node_libraries_referenced=source_workflow.metadata.node_libraries_referenced.copy(),
@@ -6041,6 +6401,81 @@ class WorkflowManager(EngineScoped):
 
             traceback.print_exc()
             return BranchWorkflowResultFailure(result_details=details)
+
+    class _BranchNaming(NamedTuple):
+        """The two distinct names a new branch needs.
+
+        `registry_key` is the workspace-relative file path minus its extension, used to key the
+        registry. `display_name` is the human-readable title stored as `metadata.name`. Conflating
+        them is what made branches show up in the editor as file paths.
+        """
+
+        registry_key: str
+        display_name: str
+
+    def _resolve_branch_naming(self, *, request: BranchWorkflowRequest, source_workflow: Workflow) -> _BranchNaming:
+        """Pick the registry key and display name for a new branch of ``source_workflow``.
+
+        The two are resolved together because the label depends on how the key was chosen: an
+        auto-generated key contributes its ``_branch_<n>`` counter to the label, while a
+        caller-supplied key does not. ``request.branched_workflow_display_name``, when given, wins
+        over either derivation; ``on_branch_workflow_request`` has already rejected a blank one.
+        """
+        branch_counter = None
+        branch_registry_key = request.branched_workflow_name
+        if branch_registry_key is None:
+            branch_counter = 1
+            branch_registry_key = f"{request.workflow_name}_branch_{branch_counter}"
+            while WorkflowRegistry.has_workflow_with_name(branch_registry_key):
+                branch_counter += 1
+                branch_registry_key = f"{request.workflow_name}_branch_{branch_counter}"
+
+        requested_display_name = request.branched_workflow_display_name
+        if requested_display_name is not None:
+            return self._BranchNaming(registry_key=branch_registry_key, display_name=requested_display_name.strip())
+
+        derived_display_name = self._derive_branch_display_name(
+            source_display_name=source_workflow.metadata.name,
+            source_registry_key=request.workflow_name,
+            branch_registry_key=branch_registry_key,
+            branch_counter=branch_counter,
+        )
+        return self._BranchNaming(registry_key=branch_registry_key, display_name=derived_display_name)
+
+    def _derive_branch_display_name(
+        self,
+        *,
+        source_display_name: str | None,
+        source_registry_key: str,
+        branch_registry_key: str,
+        branch_counter: int | None,
+    ) -> str:
+        """Compute the human-readable label (``metadata.name``) for a new branch.
+
+        A registry key is a file path; ``metadata.name`` is a title. Using the key as the label makes
+        a branch of "Shot 010 Comp" read as "shots/sh010/comp_branch_1" everywhere the editor shows a
+        workflow name, and the deeper the folder structure the worse it reads.
+
+        * ``branch_counter`` is set when the caller auto-generated the branch key as
+          ``<source key>_branch_<counter>``. The label mirrors that counter so it stays in step with
+          the key: "Shot 010 Comp (branch 1)".
+        * ``branch_counter`` is None when the caller supplied ``branched_workflow_name`` themselves.
+          They chose the key, so its final path segment is the most faithful label available.
+        """
+        if branch_counter is None:
+            return PurePosixPath(branch_registry_key).name
+
+        source_label = (source_display_name or "").strip()
+        if source_label:
+            # Keep only the final segment. A path-shaped source label is exactly the bug this
+            # derivation exists to fix -- branches created before it carry their full registry key as
+            # their name -- so deriving from one verbatim would carry the path forward.
+            source_label = PurePosixPath(source_label).name.strip()
+        if not source_label:
+            # A blank (or purely separator) display name means the source's own metadata is corrupt.
+            # A label off the file path beats propagating emptiness onto the branch.
+            source_label = PurePosixPath(source_registry_key).name
+        return f"{source_label} (branch {branch_counter})"
 
     def on_create_workflow_from_template_request(self, request: CreateWorkflowFromTemplateRequest) -> ResultPayload:
         """Create a new workflow file from a template (Griptape-provided or user-provided)."""
@@ -6158,7 +6593,11 @@ class WorkflowManager(EngineScoped):
         try:
             # Create updated metadata for source workflow - update timestamp
             merged_metadata = WorkflowMetadata(
-                name=source_workflow_name,
+                # Carry the source's existing display name across. `source_workflow_name` came from
+                # the branch's `branched_from`, which holds a registry key (a file path), so using it
+                # here would overwrite the source's correct title with a path and persist that to disk.
+                # A merge changes the source's contents, never what it is called.
+                name=source_workflow.metadata.name,
                 schema_version=source_workflow.metadata.schema_version,
                 engine_version_created_with=source_workflow.metadata.engine_version_created_with,
                 node_libraries_referenced=source_workflow.metadata.node_libraries_referenced.copy(),
@@ -6259,7 +6698,11 @@ class WorkflowManager(EngineScoped):
 
             # Create updated metadata for branch workflow - preserve branch relationship and source timestamp
             reset_metadata = WorkflowMetadata(
-                name=request.workflow_name,
+                # Keep the branch's own display name. A reset discards the branch's *content* changes;
+                # its identity fields below (creation_date, branched_from, is_template) are likewise
+                # kept from the branch, and its title belongs with them. `request.workflow_name` is a
+                # registry key, so using it would overwrite the branch's title with a path on disk.
+                name=branch_workflow.metadata.name,
                 schema_version=source_workflow.metadata.schema_version,
                 engine_version_created_with=source_workflow.metadata.engine_version_created_with,
                 node_libraries_referenced=source_workflow.metadata.node_libraries_referenced.copy(),
@@ -6604,7 +7047,9 @@ class WorkflowManager(EngineScoped):
                 # find_files_recursive skips hidden directories (.venv, .git) and
                 # bounds recursion depth, so a deep or symlink-looped tree can't stall
                 # the boot scan.
-                for workflow_file in await find_files_recursive(path, "*.py"):
+                for workflow_file in await find_files_recursive(
+                    path, "*.py", max_depth=self.engine.config_manager.discovery_max_depth
+                ):
                     # Unsaved workflows are ephemeral; any file with this prefix is a
                     # leak from a pre-fix save and cannot be registered (the registry
                     # rejects unsaved keys paired with a file path).

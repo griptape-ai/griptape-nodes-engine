@@ -43,7 +43,6 @@ from griptape_nodes.retained_mode.events.os_events import (
     CopyTreeRequest,
     CopyTreeResultSuccess,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.settings import (
     DEFAULT_LIBRARIES_DIRECTORY,
     LIBRARIES_DIRECTORY_KEY,
@@ -58,6 +57,7 @@ from griptape_nodes.utils.library_utils import (
 from griptape_nodes.utils.version_utils import get_current_version
 
 if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
 
 logger = logging.getLogger("project_packager")
@@ -253,9 +253,9 @@ def _unique_dirname(name: str, used: set[str]) -> str:
     return f"{name}_{index}"
 
 
-def _copy_tree(source_path: Path, destination_path: Path, ignore_patterns: list[str]) -> None:
+def _copy_tree(engine: Engine, source_path: Path, destination_path: Path, ignore_patterns: list[str]) -> None:
     """Copy a directory tree via the engine's OS event system."""
-    result = GriptapeNodes.handle_request(
+    result = engine.handle_request(
         CopyTreeRequest(
             source_path=str(source_path),
             destination_path=str(destination_path),
@@ -276,6 +276,7 @@ def _copy_tree(source_path: Path, destination_path: Path, ignore_patterns: list[
 
 
 def package_project_to_zip(
+    engine: Engine,
     project_info: ProjectInfo,
     adjacent_config: dict,
     destination_zip: Path,
@@ -284,24 +285,26 @@ def package_project_to_zip(
     """Bundle a loaded project into a portable .zip at destination_zip.
 
     Convenience entrypoint: constructs a ProjectExporter and runs it.
+    engine is used to issue the copy-tree requests that stage the package.
     required_secret_keys is the KEY-NAME list to record in the manifest (collected
     by the caller; the packager never reads secret VALUES).
     """
-    return ProjectExporter(project_info, adjacent_config, destination_zip).run(required_secret_keys)
+    return ProjectExporter(engine, project_info, adjacent_config, destination_zip).run(required_secret_keys)
 
 
 class ProjectExporter:
     """Bundle a project base directory into a portable .zip.
 
-    Holds the packaging inputs (project, adjacent config, destination) plus the
-    per-run staging directory, so the pipeline helpers read shared state off self
-    instead of threading it through every signature.
+    Holds the packaging inputs (engine, project, adjacent config, destination) plus
+    the per-run staging directory, so the pipeline helpers read shared state off
+    self instead of threading it through every signature.
 
     Usage:
-        result = ProjectExporter(project_info, adjacent_config, destination).run(required_secret_keys)
+        result = ProjectExporter(engine, project_info, adjacent_config, destination).run(required_secret_keys)
     """
 
-    def __init__(self, project_info: ProjectInfo, adjacent_config: dict, destination_zip: Path) -> None:
+    def __init__(self, engine: Engine, project_info: ProjectInfo, adjacent_config: dict, destination_zip: Path) -> None:
+        self._engine = engine
         self._project_info = project_info
         self._adjacent_config = adjacent_config
         self._destination_zip = destination_zip
@@ -358,7 +361,7 @@ class ProjectExporter:
 
     def _mirror_base_dir(self) -> None:
         """Copy the project base-dir tree into staging, excluding secrets and caches."""
-        _copy_tree(self._project_base_dir, self._staging, _MIRROR_IGNORE_PATTERNS)
+        _copy_tree(self._engine, self._project_base_dir, self._staging, _MIRROR_IGNORE_PATTERNS)
 
     def _prune_download_library_sink(self) -> None:
         """Remove the downloaded-library sink from the mirrored tree.
@@ -462,7 +465,7 @@ class ProjectExporter:
         for local in classification.copied:
             dest_dirname = _unique_dirname(local.containing_dir.name, used_dirnames)
             used_dirnames.add(dest_dirname)
-            _copy_tree(local.containing_dir, libraries_root / dest_dirname, _LIBRARY_COPY_IGNORE_PATTERNS)
+            _copy_tree(self._engine, local.containing_dir, libraries_root / dest_dirname, _LIBRARY_COPY_IGNORE_PATTERNS)
 
             if local.path_within_containing_dir is None:
                 package_relative = f"{COPIED_LIBRARIES_DIRNAME}/{dest_dirname}"

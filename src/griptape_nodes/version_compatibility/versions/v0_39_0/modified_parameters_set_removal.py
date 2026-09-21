@@ -8,7 +8,6 @@ from griptape_nodes.retained_mode.events.app_events import (
     GetEngineVersionRequest,
     GetEngineVersionResultSuccess,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries.modified_parameters_set_deprecation_warning_problem import (
     ModifiedParametersSetDeprecationWarningProblem,
 )
@@ -45,7 +44,7 @@ class ModifiedParametersSetRemovalCheck(LibraryVersionCompatibilityCheck):
     def check_library(self, library_data: LibrarySchema) -> list[LibraryVersionCompatibilityIssue]:
         """Perform the modified_parameters_set deprecation check."""
         # Get current engine version
-        engine_version_result = GriptapeNodes.handle_request(GetEngineVersionRequest())
+        engine_version_result = self.engine.handle_request(GetEngineVersionRequest())
         if not isinstance(engine_version_result, GetEngineVersionResultSuccess):
             # If we can't get current engine version, skip version-specific warnings
             return []

@@ -108,6 +108,7 @@ from griptape_nodes.retained_mode.managers.artifact_providers.utils import (
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.utils.async_utils import to_thread
+from griptape_nodes.utils.ffmpeg_cache import install_ffmpeg_cache_redirect
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -139,7 +140,10 @@ class PreviewMetadata(BaseModel):
         preview_generator_parameters: Parameters supplied to preview generator
     """
 
-    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.1.0"
+    # Raising this is the only thing that invalidates previews already on disk, since the sidecar
+    # records a generator's parameters but nothing about how it encoded. Raise it when a generator's
+    # output changes; every media type's previews then rebuild once.
+    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.2.0"
 
     version: str
     source_macro_path: str
@@ -181,7 +185,7 @@ class ArtifactManager(EngineScoped):
         """
         super().__init__(engine)
         # Provider registry for managing artifact providers
-        self._registry = ProviderRegistry()
+        self._registry = ProviderRegistry(engine=engine)
 
         if event_manager is not None:
             event_manager.assign_manager_to_request_type(
@@ -344,6 +348,31 @@ class ArtifactManager(EngineScoped):
             return None
         return provider.check_read_permission(source_path)
 
+    async def extract_artifact_metadata(self, source_path: str) -> dict | None:
+        """Extract source-file metadata via the format's provider, off the event loop.
+
+        Resolves the provider through ``_provider_for_format`` so the
+        multi-provider-per-format policy stays centralized. Returns None when no
+        provider claims the extension or the provider cannot extract metadata
+        (built-in providers return None rather than raise on unreadable files).
+        Exceptions from third-party providers propagate; callers own their
+        failure policy.
+
+        Args:
+            source_path: Absolute path to the source file.
+
+        Returns:
+            The provider's metadata as a dict, or None.
+        """
+        extension = Path(source_path).suffix.lstrip(".").lower()
+        if not extension:
+            return None
+        provider = self._provider_for_format(extension)
+        if provider is None:
+            return None
+        metadata = await to_thread(provider.get_artifact_metadata, source_path)
+        return metadata.model_dump() if metadata else None
+
     def _provider_for_format(self, fmt: str) -> BaseArtifactProvider | None:
         """Resolve the registered provider that handles ``fmt`` (empty → None).
 
@@ -365,11 +394,21 @@ class ArtifactManager(EngineScoped):
     async def on_app_initialization_complete(self, _payload: AppInitializationComplete) -> None:
         """Handle app initialization complete event.
 
-        Registers default artifact providers after the system is fully initialized.
+        Installs the process-wide ffmpeg cache redirect, then registers default artifact
+        providers, after the system is fully initialized.
 
         Args:
             _payload: App initialization complete payload
         """
+        # Move ffmpeg's lock file and downloaded binaries out of `static_ffmpeg`'s own package
+        # directory, which is read-only when the engine runs from a packaged app (notably the
+        # Linux AppImage's FUSE mount). Lives here rather than in engine boot because the video
+        # artifact provider is what depends on `static_ffmpeg`, and every process that can run
+        # nodes broadcasts AppInitializationComplete before executing them. Process-wide and
+        # installed once, like `install_file_url_support`; later broadcasts (and later engines)
+        # no-op. See utils/ffmpeg_cache.py.
+        install_ffmpeg_cache_redirect(self.engine.config_manager.get_config_value("ffmpeg_directory", default=""))
+
         # Register default providers (order matters: Image, Video, Audio)
         # Generator settings are now registered automatically via _register_provider_settings()
         failures = []

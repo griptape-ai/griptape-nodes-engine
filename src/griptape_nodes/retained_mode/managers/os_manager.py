@@ -543,7 +543,9 @@ class OSManager(EngineScoped):
             path_str: Path string that may contain ~, environment variables, or special folder names
 
         Returns:
-            Expanded Path object
+            Expanded, absolute Path object. A result that is still relative after expansion is
+            anchored on the workspace directory. Windows special folders resolve to their
+            actual system paths (e.g. OneDrive redirection).
         """
         resolved = None
         if self.is_windows():
@@ -562,17 +564,25 @@ class OSManager(EngineScoped):
             expanded_user = os.path.expanduser(expanded_vars)  # noqa: PTH111
             final_path = Path(expanded_user)
 
+        # Anchor a relative expansion result on the workspace directory. Expansion leaves a
+        # path relative when the string contains '%' or '$' but no resolvable variable
+        # (e.g. "foo%20bar.txt", "report$.txt", "$UNSET_VAR/sub").
+        if not final_path.is_absolute():
+            final_path = self._get_workspace_path() / final_path
+
         return resolve_path_safely(final_path)
 
     def _resolve_file_path(self, path_str: str, *, workspace_only: bool = False) -> Path:
         """Resolve a file path, handling absolute, relative, and tilde paths.
 
         Args:
-            path_str: Path string that may be absolute, relative, or start with ~
+            path_str: Path string that may be absolute, start with ~, or be a path relative
+                to the workspace directory
             workspace_only: If True and path is invalid, fall back to workspace directory
 
         Returns:
-            Resolved Path object
+            Absolute, resolved Path object. Relative paths resolve against the workspace
+            directory.
         """
         try:
             if path_needs_expansion(path_str):
@@ -1361,6 +1371,10 @@ class OSManager(EngineScoped):
 
     @staticmethod
     def platform() -> str:
+        """Get `sys.platform` as-is, spellings and all ("win32", "darwin", "linux").
+
+        For a value collapsed onto the platforms we support, use `platform_name()`.
+        """
         return sys.platform
 
     @staticmethod
@@ -1374,6 +1388,23 @@ class OSManager(EngineScoped):
     @staticmethod
     def is_linux() -> bool:
         return os_utils.is_linux()
+
+    @staticmethod
+    def platform_name() -> str:
+        """Get the platform as a `Platform` value, for anything keyed by which OS we are on.
+
+        Unlike `platform()`, this collapses the `sys.platform` spellings onto the three
+        platforms we support -- "win32" reports as "windows", "linux" and "linux2" both as
+        "linux". A platform we do not recognize falls back to `sys.platform`, which is always
+        set, so the result is never empty.
+        """
+        if OSManager.is_windows():
+            return Platform.WINDOWS
+        if OSManager.is_mac():
+            return Platform.DARWIN
+        if OSManager.is_linux():
+            return Platform.LINUX
+        return sys.platform
 
     def replace_process(self, args: list[Any]) -> None:
         """Replace the current process with a new one.
@@ -1442,7 +1473,7 @@ class OSManager(EngineScoped):
         logger.info("Attempting to open path: %s on platform: %s", path, sys.platform)
 
         try:
-            platform_name = sys.platform
+            raw_platform = sys.platform
             if self.is_windows():
                 # Linter complains but this is the recommended way on Windows
                 # We can ignore this warning as we've validated the path
@@ -1484,7 +1515,7 @@ class OSManager(EngineScoped):
                 )
                 logger.info("Opened path on Linux: %s", path)
             else:
-                details = f"Unsupported platform: '{platform_name}'"
+                details = f"Unsupported platform: '{raw_platform}'"
                 logger.info(details)
                 return OpenAssociatedFileResultFailure(
                     failure_reason=FileIOFailureReason.IO_ERROR, result_details=details
@@ -1902,6 +1933,7 @@ class OSManager(EngineScoped):
                 scan_sequences,
                 mapping,
                 mapping.filename_pattern,
+                engine=self.engine,
                 policy=request.policy,
                 no_token_behavior=request.no_token_behavior,
                 start=request.start_number,
@@ -2781,7 +2813,7 @@ class OSManager(EngineScoped):
 
         # Write sidecar metadata file if caller opted in by providing file_metadata
         if request.file_metadata is not None:
-            write_sidecar(final_file_path, request.file_metadata)
+            write_sidecar(final_file_path, request.file_metadata, self.engine)
 
         if used_indexed_fallback:
             msg = f"File written to indexed path: {final_file_path} (original path '{path_display}' already existed)"
@@ -4366,7 +4398,7 @@ class OSManager(EngineScoped):
     def _create_system_os_instance_direct(self) -> None:
         """Create system OS instance (direct version for init)."""
         os_capabilities = {
-            "platform": self._get_platform_name(),
+            "platform": self.platform_name(),
             "arch": self._get_architecture(),
             "version": self._get_platform_version(),
         }
@@ -4453,7 +4485,7 @@ class OSManager(EngineScoped):
     def _create_system_os_instance(self) -> None:
         """Create system OS instance."""
         os_capabilities = {
-            "platform": self._get_platform_name(),
+            "platform": self.platform_name(),
             "arch": self._get_architecture(),
             "version": self._get_platform_version(),
         }
@@ -4584,19 +4616,9 @@ class OSManager(EngineScoped):
         logger.debug("MPS detected: Apple Silicon Mac")
         return True
 
-    def _get_platform_name(self) -> str:
-        """Get platform name using existing sys.platform detection."""
-        if self.is_windows():
-            return Platform.WINDOWS
-        if self.is_mac():
-            return Platform.DARWIN
-        if self.is_linux():
-            return Platform.LINUX
-        return sys.platform
-
     def _get_architecture(self) -> str:
         """Get system architecture, normalized across platforms."""
-        platform = self._get_platform_name()
+        platform = self.platform_name()
         if platform == Platform.WINDOWS:
             arch = os.environ.get("PROCESSOR_ARCHITECTURE", "unknown").lower()
         else:

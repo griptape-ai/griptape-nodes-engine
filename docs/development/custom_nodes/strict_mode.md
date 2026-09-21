@@ -96,3 +96,40 @@ node's execution -- including from `before_value_set` /
 parameter value), ignore the warning. If this is a read of flow /
 connection state, consider whether the data could be passed in via
 parameters instead of fetched per-call.
+
+#### `connection-hooks-inert-on-worker`
+
+A node class in a worker-hosted library overrides one or more
+connection lifecycle hooks (`allow_incoming_connection`,
+`before_incoming_connection`, `after_incoming_connection`, their
+outgoing counterparts, or the `_removed` variants). Connections are
+orchestrator-owned state, so these hooks are invoked on the
+orchestrator -- where a worker-hosted library is represented by a
+synthesized stub class that does not carry the override. The
+author's code never runs, silently.
+
+Fires once per node class at library load, during the worker's
+schema probe. Hooks implemented by engine-owned bases and components
+are not flagged; the rule targets code the library author can
+change.
+
+**Remediation**: dynamic parameters driven by connections are not
+supported for isolated libraries. Run the library in Shared mode, or
+remove the override.
+
+#### `value-hooks-execute-only-on-worker`
+
+A node class in a worker-hosted library overrides `before_value_set`
+/ `after_value_set`. For an isolated library these hooks fire only
+during execute-time input hydration, on the transient worker-side
+node: transforming an incoming value still works, but the hooks do
+not run when a value changes in the editor, and any parameter-list
+mutation they make is discarded with the transient node.
+
+Fires once per node class at library load, during the worker's
+schema probe. Hooks implemented by engine-owned bases and components
+are not flagged.
+
+**Remediation**: keep value hooks to value transformation. If the
+node needs editor-time reactivity (adjusting parameters as values
+change), run the library in Shared mode.

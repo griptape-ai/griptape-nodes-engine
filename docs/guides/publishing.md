@@ -172,6 +172,24 @@ it guarantees the file travels with the published workflow.
     than an absolute path. That keeps the reference valid after the bundle is
     moved to another machine or deployed to the cloud.
 
+!!! warning "Files outside your project folder don't travel"
+
+    A file reached from outside the folders that travel with the bundle — an
+    external drive or a network mount, whether referenced directly or through a
+    [directory](projects/directories.md) you pointed there — has no place inside
+    the bundle, so it is left where it is. The published workflow still looks for
+    it at that same absolute path, so it runs anywhere that path exists and fails
+    anywhere it doesn't.
+
+    That is what you want for shared storage a render farm already mounts. For a
+    file that should travel, copy it into your project folder and reference the
+    copy.
+
+    Each file left out is recorded in the engine log as
+    `will not be bundled because ...`, along with the reason. If a published
+    workflow can't find a file it needs, that log line is the place to start; see
+    [Exporting engine logs](../troubleshooting.md#exporting-engine-logs).
+
 **When do I need this?** Use `SelectFromProject` for any file loaded from your
 project that doesn't show up in the published bundle — for example an image,
 audio clip, video, or text file that a node reads but that goes missing after you
@@ -215,6 +233,36 @@ requires it to handle `PublishWorkflowRequest` and return a result. Publishers
 that need to bundle the common ingredients can reuse the engine's
 `WorkflowPackager` (as the Folder and Nuke publishers do) rather than
 reimplementing that logic.
+
+**Finding the workflow inside the bundle.** `package_to_folder` returns a
+`PackagedBundle` telling you where it put things. Every path on it is relative to
+the folder you packaged into. Use `entrypoint_workflow_path` — the workflow your
+publisher launches — whenever you need to point at the workflow file (an
+entrypoint script, a copy into a version folder, a README). Do not rebuild that
+location from the workflow's file name; the packager owns the bundle's layout and
+may change it:
+
+```python
+packaged = self._packager.package_to_folder(destination, workflow)
+workflow_in_bundle = destination / packaged.entrypoint_workflow_path
+```
+
+`packaged.library_paths` holds the path to each copied library's definition
+file.
+
+**Reserving your publisher's own file names.** If your publisher writes files
+into the bundle itself, tell the packager about them so they get the same
+collision protection as the engine's own — otherwise a bundled workflow or static
+file can land on one of your files and silently replace it (or be replaced by
+it). Pass them as bundle-relative paths to `package_to_folder`:
+
+```python
+self._packager.package_to_folder(
+    destination,
+    workflow,
+    additional_reserved_paths=[Path("run.py"), Path("README.md")],
+)
+```
 
 **Declaring node dependencies.** The permanent fix for the static-files gap above
 is for each node to declare the files it uses, which benefits *every* publisher.

@@ -1,12 +1,16 @@
 """Unit tests for LocalFileDriver."""
 
 import platform
+import sys
+from collections.abc import Iterator
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 import pytest
 
 from griptape_nodes.files.drivers.local_file_driver import LocalFileDriver
 from griptape_nodes.files.path_utils import parse_file_uri
+from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 
 
 class TestLocalFileDriver:
@@ -272,3 +276,214 @@ class TestLocalFileDriverFileURI:
 
         with pytest.raises(ValueError, match="Invalid file:// URI"):
             driver.get_size(invalid_uri)
+
+
+class TestLocalFileDriverRelativePaths:
+    """Tests that relative paths anchor on the workspace directory, never the process CWD."""
+
+    @pytest.fixture
+    def driver(self) -> LocalFileDriver:
+        """Create a LocalFileDriver instance."""
+        return LocalFileDriver()
+
+    @pytest.fixture
+    def workspace_path(self, tmp_path: Path) -> Path:
+        """Create a workspace directory holding the files the driver should find."""
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        (workspace / "config.json").write_text("workspace copy")
+        (workspace / "foo%20bar.png").write_text("workspace percent copy")
+        (workspace / "report$.txt").write_text("workspace dollar copy")
+        (workspace / "workspace_only.json").write_text("workspace only copy")
+        nested_dir = workspace / "data"
+        nested_dir.mkdir()
+        (nested_dir / "nested.json").write_text("workspace nested copy")
+        return workspace
+
+    @pytest.fixture
+    def cwd_path(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        """Create a decoy directory with same-named, different-content files, and chdir into it."""
+        cwd = tmp_path / "cwd"
+        cwd.mkdir()
+        (cwd / "config.json").write_text("cwd copy")
+        (cwd / "foo%20bar.png").write_text("cwd percent copy")
+        (cwd / "report$.txt").write_text("cwd dollar copy")
+        (cwd / "cwd_only.json").write_text("cwd only copy")
+        nested_dir = cwd / "data"
+        nested_dir.mkdir()
+        (nested_dir / "nested.json").write_text("cwd nested copy")
+        monkeypatch.chdir(cwd)
+        return cwd
+
+    @pytest.fixture
+    def home_path(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        """Create a fake home directory and point ~ expansion at it."""
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / "config.json").write_text("home copy")
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        return home
+
+    @pytest.fixture
+    def mock_config_manager(self, workspace_path: Path) -> Mock:
+        """Mock the ConfigManager so its workspace_path is our test workspace."""
+        config_manager = Mock(spec=ConfigManager)
+        config_manager.workspace_path = workspace_path
+        return config_manager
+
+    @pytest.fixture
+    def mock_config_manager_accessor(self, mock_config_manager: Mock) -> Iterator[Mock]:
+        """Patch the facade accessor the driver uses to reach the ConfigManager.
+
+        Patched by dotted string rather than an imported `GriptapeNodes` reference: the
+        driver (src/griptape_nodes/files/drivers/local_file_driver.py) still calls the
+        facade's `ConfigManager()` classmethod, and `patch()` handles saving and restoring
+        the classmethod descriptor correctly on teardown.
+        """
+        with patch(
+            "griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes.ConfigManager",
+            return_value=mock_config_manager,
+        ) as accessor:
+            yield accessor
+
+    @pytest.mark.asyncio
+    async def test_read_bare_relative_path_uses_workspace_not_cwd(
+        self,
+        driver: LocalFileDriver,
+        cwd_path: Path,  # noqa: ARG002
+        mock_config_manager_accessor: Mock,
+    ) -> None:
+        """Test a bare relative path reads the workspace copy, not the same-named CWD copy."""
+        content = await driver.read("config.json", timeout=10.0)
+
+        assert content == b"workspace copy"
+        mock_config_manager_accessor.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_read_relative_path_with_subdirectories_uses_workspace(
+        self,
+        driver: LocalFileDriver,
+        cwd_path: Path,  # noqa: ARG002
+        mock_config_manager_accessor: Mock,
+    ) -> None:
+        """Test a relative path with subdirectories anchors under the workspace."""
+        content = await driver.read("data/nested.json", timeout=10.0)
+
+        assert content == b"workspace nested copy"
+        mock_config_manager_accessor.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_read_percent_encoded_relative_path_uses_workspace(
+        self,
+        driver: LocalFileDriver,
+        cwd_path: Path,  # noqa: ARG002
+        mock_config_manager_accessor: Mock,
+    ) -> None:
+        """Test a relative name containing '%' still anchors on the workspace after expansion.
+
+        '%' makes `path_needs_expansion` True, so expansion runs, but a URL-encoded filename
+        has no env var to substitute and comes back relative. It must still be anchored.
+        """
+        content = await driver.read("foo%20bar.png", timeout=10.0)
+
+        assert content == b"workspace percent copy"
+        mock_config_manager_accessor.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_read_dollar_relative_path_with_no_matching_env_var_uses_workspace(
+        self,
+        driver: LocalFileDriver,
+        cwd_path: Path,  # noqa: ARG002
+        mock_config_manager_accessor: Mock,
+    ) -> None:
+        """Test a relative name containing '$' with no matching env var anchors on the workspace."""
+        content = await driver.read("report$.txt", timeout=10.0)
+
+        assert content == b"workspace dollar copy"
+        mock_config_manager_accessor.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_exists_finds_relative_path_present_only_in_workspace(
+        self,
+        driver: LocalFileDriver,
+        cwd_path: Path,  # noqa: ARG002
+        mock_config_manager_accessor: Mock,
+    ) -> None:
+        """Test exists() is True for a relative name that exists only in the workspace."""
+        assert await driver.exists("workspace_only.json") is True
+        mock_config_manager_accessor.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_exists_misses_relative_path_present_only_in_cwd(
+        self,
+        driver: LocalFileDriver,
+        cwd_path: Path,  # noqa: ARG002
+        mock_config_manager_accessor: Mock,
+    ) -> None:
+        """Test exists() is False for a relative name that exists only in the process CWD."""
+        assert await driver.exists("cwd_only.json") is False
+        mock_config_manager_accessor.assert_called_once_with()
+
+    def test_get_size_bare_relative_path_measures_workspace_not_cwd(
+        self,
+        driver: LocalFileDriver,
+        cwd_path: Path,  # noqa: ARG002
+        mock_config_manager_accessor: Mock,
+    ) -> None:
+        """Test get_size() measures the workspace copy, not the shorter same-named CWD copy."""
+        size = driver.get_size("config.json")
+
+        assert size == len("workspace copy")
+        mock_config_manager_accessor.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_read_absolute_path_does_not_consult_workspace(
+        self,
+        driver: LocalFileDriver,
+        tmp_path: Path,
+        mock_config_manager_accessor: Mock,
+    ) -> None:
+        """Test an absolute path reads as-is without ever asking for the workspace directory."""
+        absolute_file = tmp_path / "absolute.json"
+        absolute_file.write_text("absolute copy")
+
+        content = await driver.read(str(absolute_file), timeout=10.0)
+
+        assert content == b"absolute copy"
+        mock_config_manager_accessor.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_read_tilde_path_expands_to_home_not_workspace(
+        self,
+        driver: LocalFileDriver,
+        home_path: Path,  # noqa: ARG002
+        mock_config_manager_accessor: Mock,
+    ) -> None:
+        """Test a ~ path expands to the home directory without the workspace prefixed onto it."""
+        content = await driver.read("~/config.json", timeout=10.0)
+
+        assert content == b"home copy"
+        mock_config_manager_accessor.assert_not_called()
+
+    @pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX symlinks")
+    @pytest.mark.asyncio
+    async def test_read_relative_path_through_symlink_collapses_dotdot_lexically(
+        self,
+        driver: LocalFileDriver,
+        tmp_path: Path,
+        workspace_path: Path,
+        mock_config_manager_accessor: Mock,
+    ) -> None:
+        """Test '..' after a symlinked directory cancels the link name instead of walking through it."""
+        outside_dir = tmp_path / "mnt"
+        symlink_target = outside_dir / "target"
+        symlink_target.mkdir(parents=True)
+        (outside_dir / "b").write_bytes(b"mnt b")
+        (workspace_path / "b").write_bytes(b"workspace b")
+        (workspace_path / "link").symlink_to(symlink_target, target_is_directory=True)
+
+        content = await driver.read("link/../b", timeout=10.0)
+
+        assert content == b"workspace b"
+        mock_config_manager_accessor.assert_called_once_with()

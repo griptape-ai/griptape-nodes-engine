@@ -37,7 +37,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
     from pathlib import Path
 
-    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+    from griptape_nodes.retained_mode.engine import Engine
 
 _GOOD_NODE_SOURCE = """
 from griptape_nodes.exe_types.node_types import BaseNode
@@ -145,8 +145,8 @@ class TestLazyNodeLoadingDefault:
 
 
 class TestEagerLoading:
-    def test_broken_node_is_reported_at_load(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
-        manager = griptape_nodes.LibraryManager()
+    def test_broken_node_is_reported_at_load(self, engine: Engine, tmp_path: Path) -> None:
+        manager = engine.library_manager
         schema = _write_library(tmp_path)
         library = LibraryRegistry.generate_new_library(library_data=schema)
         info = _library_info(schema, tmp_path)
@@ -164,8 +164,8 @@ class TestEagerLoading:
 
 
 class TestLazyLoading:
-    def test_broken_node_is_not_reported_until_used(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
-        manager = griptape_nodes.LibraryManager()
+    def test_broken_node_is_not_reported_until_used(self, engine: Engine, tmp_path: Path) -> None:
+        manager = engine.library_manager
         schema = _write_library(tmp_path)
         library = LibraryRegistry.generate_new_library(library_data=schema)
         info = _library_info(schema, tmp_path)
@@ -187,9 +187,9 @@ class TestLazyLoading:
 
 
 class TestShouldLazyLoadNodes:
-    def test_worker_always_eager(self, griptape_nodes: GriptapeNodes) -> None:
-        manager = griptape_nodes.LibraryManager()
-        config_mgr = griptape_nodes.ConfigManager()
+    def test_worker_always_eager(self, engine: Engine) -> None:
+        manager = engine.library_manager
+        config_mgr = engine.config_manager
         # Even with the setting on, a worker loads eagerly.
         with (
             patch.object(manager, "_is_worker", True),
@@ -197,18 +197,18 @@ class TestShouldLazyLoadNodes:
         ):
             assert manager._should_lazy_load_nodes() is False
 
-    def test_orchestrator_honors_setting_enabled(self, griptape_nodes: GriptapeNodes) -> None:
-        manager = griptape_nodes.LibraryManager()
-        config_mgr = griptape_nodes.ConfigManager()
+    def test_orchestrator_honors_setting_enabled(self, engine: Engine) -> None:
+        manager = engine.library_manager
+        config_mgr = engine.config_manager
         with (
             patch.object(manager, "_is_worker", False),
             patch.object(config_mgr, "get_config_value", return_value=True),
         ):
             assert manager._should_lazy_load_nodes() is True
 
-    def test_orchestrator_honors_setting_disabled(self, griptape_nodes: GriptapeNodes) -> None:
-        manager = griptape_nodes.LibraryManager()
-        config_mgr = griptape_nodes.ConfigManager()
+    def test_orchestrator_honors_setting_disabled(self, engine: Engine) -> None:
+        manager = engine.library_manager
+        config_mgr = engine.config_manager
         with (
             patch.object(manager, "_is_worker", False),
             patch.object(config_mgr, "get_config_value", return_value=False),
@@ -217,8 +217,8 @@ class TestShouldLazyLoadNodes:
 
 
 class TestMultipleNodesPerFile:
-    def test_sibling_classes_share_a_single_module_import(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
-        manager = griptape_nodes.LibraryManager()
+    def test_sibling_classes_share_a_single_module_import(self, engine: Engine, tmp_path: Path) -> None:
+        manager = engine.library_manager
         marker = tmp_path / "import_count.txt"
         (tmp_path / "siblings.py").write_text(_SIBLINGS_SOURCE.format(marker=str(marker)))
         schema = _schema(
@@ -250,10 +250,8 @@ class TestMultipleNodesPerFile:
 
 
 class TestDescribeNodeTypeWithLazyImportFailure:
-    def test_describe_returns_metadata_only_when_lazy_import_fails(
-        self, griptape_nodes: GriptapeNodes, tmp_path: Path
-    ) -> None:
-        manager = griptape_nodes.LibraryManager()
+    def test_describe_returns_metadata_only_when_lazy_import_fails(self, engine: Engine, tmp_path: Path) -> None:
+        manager = engine.library_manager
         schema = _write_library(tmp_path)
         library = LibraryRegistry.generate_new_library(library_data=schema)
         info = _library_info(schema, tmp_path)
@@ -298,10 +296,8 @@ class TestStableNamespaceImportUnderLazyLoading:
             ):
                 del sys.modules[module_name]
 
-    def _register_lazy_library(
-        self, griptape_nodes: GriptapeNodes, tmp_path: Path
-    ) -> tuple[LibraryManager, LibrarySchema]:
-        manager = griptape_nodes.LibraryManager()
+    def _register_lazy_library(self, engine: Engine, tmp_path: Path) -> tuple[LibraryManager, LibrarySchema]:
+        manager = engine.library_manager
         schema = _write_library(tmp_path)
         library = LibraryRegistry.generate_new_library(library_data=schema)
         info = _library_info(schema, tmp_path)
@@ -310,10 +306,8 @@ class TestStableNamespaceImportUnderLazyLoading:
         )
         return manager, schema
 
-    def test_stable_namespace_imports_before_any_class_resolution(
-        self, griptape_nodes: GriptapeNodes, tmp_path: Path
-    ) -> None:
-        self._register_lazy_library(griptape_nodes, tmp_path)
+    def test_stable_namespace_imports_before_any_class_resolution(self, engine: Engine, tmp_path: Path) -> None:
+        self._register_lazy_library(engine, tmp_path)
         assert self.GOOD_STABLE_NAMESPACE not in sys.modules
 
         module = importlib.import_module(self.GOOD_STABLE_NAMESPACE)
@@ -324,8 +318,8 @@ class TestStableNamespaceImportUnderLazyLoading:
         library = LibraryRegistry.get_library("Lazy Flag Test Library")
         assert library.get_node_class("GoodNode") is module.GoodNode
 
-    def test_unpickle_resolves_stable_namespace_reference(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
-        self._register_lazy_library(griptape_nodes, tmp_path)
+    def test_unpickle_resolves_stable_namespace_reference(self, engine: Engine, tmp_path: Path) -> None:
+        self._register_lazy_library(engine, tmp_path)
         assert self.GOOD_STABLE_NAMESPACE not in sys.modules
 
         # A GLOBAL-opcode pickle referencing the stable namespace, as found inside saved
@@ -335,8 +329,8 @@ class TestStableNamespaceImportUnderLazyLoading:
 
         assert node_class.__name__ == "GoodNode"
 
-    def test_parent_packages_resolve_as_namespace_packages(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
-        self._register_lazy_library(griptape_nodes, tmp_path)
+    def test_parent_packages_resolve_as_namespace_packages(self, engine: Engine, tmp_path: Path) -> None:
+        self._register_lazy_library(engine, tmp_path)
 
         root_package = importlib.import_module("griptape_nodes.node_libraries")
         library_package = importlib.import_module("griptape_nodes.node_libraries.lazy_flag_test_library")
@@ -344,24 +338,22 @@ class TestStableNamespaceImportUnderLazyLoading:
         assert root_package.__path__ is not None
         assert library_package.__path__ is not None
 
-    def test_broken_module_import_raises_import_error(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
-        self._register_lazy_library(griptape_nodes, tmp_path)
+    def test_broken_module_import_raises_import_error(self, engine: Engine, tmp_path: Path) -> None:
+        self._register_lazy_library(engine, tmp_path)
 
         with pytest.raises(ImportError):
             importlib.import_module(self.BROKEN_STABLE_NAMESPACE)
 
-    def test_unregistered_library_is_no_longer_importable(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
-        manager, schema = self._register_lazy_library(griptape_nodes, tmp_path)
+    def test_unregistered_library_is_no_longer_importable(self, engine: Engine, tmp_path: Path) -> None:
+        manager, schema = self._register_lazy_library(engine, tmp_path)
 
         manager._unregister_all_stable_module_aliases_for_library(schema.name)
 
         with pytest.raises(ModuleNotFoundError):
             importlib.import_module(self.GOOD_STABLE_NAMESPACE)
 
-    def test_loaded_module_import_is_not_reexecuted_by_class_resolution(
-        self, griptape_nodes: GriptapeNodes, tmp_path: Path
-    ) -> None:
-        manager = griptape_nodes.LibraryManager()
+    def test_loaded_module_import_is_not_reexecuted_by_class_resolution(self, engine: Engine, tmp_path: Path) -> None:
+        manager = engine.library_manager
         marker = tmp_path / "import_count.txt"
         (tmp_path / "siblings.py").write_text(_SIBLINGS_SOURCE.format(marker=str(marker)))
         schema = _schema(

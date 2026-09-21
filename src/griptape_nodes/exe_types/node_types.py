@@ -116,6 +116,41 @@ _sanctioned_mutation: ContextVar[bool] = ContextVar("_node_types_sanctioned_muta
 _in_aprocess: ContextVar[bool] = ContextVar("_node_types_in_aprocess", default=False)
 
 
+class _PreservedTemplate(NamedTuple):
+    """A stored {VAR} template that must survive a resolved output value.
+
+    A one-field wrapper rather than returning the template bare: the template can
+    itself be any value, so a ``Any | <sentinel>`` return type would collapse to
+    ``Any`` and pyright would not flag a caller that forgot the sentinel check.
+    Wrapping makes ``_variable_template_to_preserve`` return ``... | None``, so
+    forgetting the check is a real type error.
+    """
+
+    value: Any
+
+
+def _differs(raw_value: Any, output_value: Any) -> bool:
+    """Whether a stored template and a resolved output are different values.
+
+    ``!=`` is not guaranteed to return a bool: numpy arrays and DataFrames
+    return elementwise results whose truthiness raises. A stored template is a
+    str/dict/list (that is what ``contains_variable_macro`` matches), but the
+    output it is compared against can be any type a node chose to emit. Fall back
+    to "same", which keeps the pre-existing behaviour of showing and storing the
+    real output.
+
+    This does not make such outputs safe in general: the ``old_value != value``
+    comparison in ``TrackedParameterOutputValues.__setitem__`` is unguarded and
+    raises first on every write after the first. Guarding only here keeps an
+    elementwise ``__ne__`` from turning template preservation into a new failure
+    mode; it does not fix the pre-existing one.
+    """
+    try:
+        return bool(raw_value != output_value)
+    except Exception:
+        return False
+
+
 @contextmanager
 def sanctioned_parameter_mutation() -> Iterator[None]:
     """Mark the enclosed block as a request-driven parameter mutation.
@@ -284,6 +319,8 @@ class BaseNode(ABC):
     )
     lock: bool = False  # When lock is true, the node is locked and can't be modified. When lock is false, the node is unlocked and can be modified.
     _cancellation_requested: threading.Event  # Event indicating if cancellation has been requested for this node
+    _inputs_to_reset_after_execution: set[str]  # Input values a connection teardown deferred until this node finishes
+    _deferred_inputs_were_reset: bool  # Whether one of those deferred resets actually fired
 
     @property
     def parameters(self) -> list[Parameter]:
@@ -312,6 +349,8 @@ class BaseNode(ABC):
         self.process_generator = None
         self._tracked_parameters = []
         self._cancellation_requested = threading.Event()
+        self._inputs_to_reset_after_execution = set()
+        self._deferred_inputs_were_reset = False
         self._parent_group = None
         self.set_entry_control_parameter(None)
 
@@ -334,6 +373,26 @@ class BaseNode(ABC):
     @parent_group.setter
     def parent_group(self, parent_group: BaseNode | None) -> None:
         self._parent_group = parent_group
+
+    def prepare_to_run_again(self) -> None:
+        """Clear this node's resolution so it executes again, and tell the editor it did.
+
+        Locked nodes keep the values they were locked with, so they are left alone.
+
+        Unlike a bare ``make_node_unresolved``, the change event fires from every state
+        rather than only from the ones that made visible progress: a node that is about to
+        run needs its status cleared in the editor even if it already looked unresolved.
+        """
+        if self.lock:
+            return
+
+        self.make_node_unresolved(
+            current_states_to_trigger_change_event={
+                NodeResolutionState.UNRESOLVED,
+                NodeResolutionState.RESOLVED,
+                NodeResolutionState.RESOLVING,
+            }
+        )
 
     # This is gross and we need to have a universal pass on resolution state changes and emission of events. That's what this ticket does!
     # https://github.com/griptape-ai/griptape-nodes/issues/994
@@ -588,6 +647,15 @@ class BaseNode(ABC):
         """
         # Default behavior is to do nothing, and indicate no other modified Parameters.
         return None  # noqa: RET501
+
+    def get_nodes_to_group_with(self) -> list[BaseNode]:
+        """Nodes that must share this node's node group membership.
+
+        Override when a node is only meaningful alongside a partner, e.g. an iterative Start node
+        and its paired End node. Node groups both pull these in on add and pull them out on remove,
+        so the pair is never split across a group boundary.
+        """
+        return []
 
     def after_node_deleted(self) -> None:
         """Called before a node is deleted. Override to perform cleanup (e.g. deleting a loaded subflow)."""
@@ -1076,6 +1144,42 @@ class BaseNode(ABC):
             err = f"Attempted to remove value for Parameter '{param_name}' but no value was set."
             raise KeyError(err)
 
+    def reset_input_value_after_execution(self, param_name: str) -> None:
+        """Reset this input to its default once the node stops executing, rather than right now.
+
+        Deleting a connection into an input that cannot hold a value on its own resets that input to
+        the parameter default. Doing that while the node is mid-`process` would make it finish on the
+        default instead of the value it is actually running on, so the reset waits until it is done.
+        """
+        self._inputs_to_reset_after_execution.add(param_name)
+
+    def reset_deferred_input_values(self) -> None:
+        """Apply any input resets that were deferred while this node was executing.
+
+        Called once execution ends, however it ends. A parameter whose value has gone away in the
+        meantime needs no reset and is not an error.
+
+        Records that a reset fired rather than acting on it. The node's resolution state is not
+        settled until the driver reaps the task, which happens after this runs, so unresolving from
+        here would be overwritten moments later. See `consume_deferred_reset_flag`.
+        """
+        deferred_param_names = self._inputs_to_reset_after_execution
+        self._inputs_to_reset_after_execution = set()
+        for param_name in deferred_param_names:
+            if param_name in self.parameter_values:
+                self.remove_parameter_value(param_name)
+                self._deferred_inputs_were_reset = True
+
+    def consume_deferred_reset_flag(self) -> bool:
+        """Whether a deferred input reset fired during the execution that just ended.
+
+        Clears the flag on the way out, so the run that follows does not start from a node still
+        claiming a reset that belonged to the last one.
+        """
+        was_reset = self._deferred_inputs_were_reset
+        self._deferred_inputs_were_reset = False
+        return was_reset
+
     def get_next_control_output(self) -> Parameter | None:
         # The default behavior for nodes is to find the first control output found.
         # Advanced nodes can override this behavior (e.g., nodes that have multiple possible
@@ -1307,8 +1411,29 @@ class BaseNode(ABC):
                     raise RuntimeError(msg) from e
         else:
             self.parameter_output_values[parameter_name] = value
-        # Publish the event up!
 
+        # ProgressEvent carries a streamed *delta* that the UI concatenates into the
+        # same field, so emitting it would rebuild the resolved text on top of the
+        # preserved template one chunk at a time -- the same leak shape as
+        # publish_update_to_parameter. Streaming is display-only; the accumulated
+        # output value above is what downstream nodes read.
+        #
+        # Suppression has to be re-checked here rather than inferred from the write
+        # above: the assignment branches emitted a display-suppressed
+        # AlterElementEvent via __setitem__, but the in-place `.append()` fallback
+        # never goes through __setitem__ and so emitted nothing at all.
+        #
+        # This is a display decision, so it asks _variable_template_to_preserve --
+        # the same predicate __setitem__ used -- and not the narrower
+        # should_preserve_stored_template. Disagreeing with __setitem__ would leave
+        # the field suppressed but still receiving deltas, which is the leak.
+        if (
+            self._variable_template_to_preserve(parameter_name, self.parameter_output_values[parameter_name])
+            is not None
+        ):
+            return
+
+        # Publish the event up!
         GriptapeNodes.EventManager().put_event(
             ProgressEvent(value=value, node_name=self.name, parameter_name=parameter_name)
         )
@@ -1321,11 +1446,14 @@ class BaseNode(ABC):
         if parameter:
             data_type = parameter.type
             self.parameter_output_values[parameter_name] = value
+            # The write above already emitted a display-suppressed AlterElementEvent.
+            # Suppress here too, or this event lands second and overwrites the
+            # template the UI was just told to keep.
             payload = ParameterValueUpdateEvent(
                 node_name=self.name,
                 parameter_name=parameter_name,
                 data_type=data_type,
-                value=safe_unstructure(value),
+                value=safe_unstructure(self.get_display_value_for_output(parameter_name, value)),
             )
 
             GriptapeNodes.EventManager().put_event(
@@ -1507,27 +1635,115 @@ class BaseNode(ABC):
             return text
         return VariableResolver.resolve_string(text, variables, self.name)
 
+    def _substitution_would_rewrite(self, raw_value: Any) -> bool:
+        r"""Whether substitution would actually rewrite a token in `raw_value`.
+
+        Display suppression settles for ``contains_variable_macro``, the cheap
+        ``\{[A-Za-z_]`` heuristic, because a false positive there only misdraws a
+        field while a false negative is the leak the guard exists to stop.
+        Declining a stored-state write is not so forgiving. The heuristic also
+        fires on LaTeX (``\textbf{x}``), CSS (``{color: red}``) and prose that
+        mentions a dict literal, and declining the write for one of those would
+        freeze that parameter's stored value for good -- no group run would ever
+        update it again. So parse the tokens instead of trusting the brace.
+
+        Delegates the token-level judgement to ``VariableResolver.would_substitute``,
+        which asks the resolver itself rather than re-deriving its rules.
+
+        Copy-back callers run on the orchestrator, where the variable dict is
+        available. Where it is not -- a node with no parent flow, as transient worker
+        nodes have -- fall back to trusting the heuristic, which errs toward keeping
+        the user's text rather than overwriting it. (Substitution being off is not
+        one of those cases: ``_variable_template_to_preserve`` has already returned
+        early by then, so the only caller never reaches here.)
+
+        The dict is resolved per call, keyed on *this* node's name, rather than reusing
+        the one the run substituted with. That leaves a narrow skew -- delete a variable
+        between the run and the copy-back and the write goes through -- but the
+        alternatives are worse: seeding one dict for a whole copy-back loop would hand
+        one flow's variables to a node in another (see the no-per-flow-key note on
+        ``get_variables_if_enabled``), and ``_resolve_variables_for_node`` cannot be
+        swapped in as-is because it returns ``{}`` where this returns ``None``, and
+        those two invert the guard.
+        """
+        # get_variables_without_memoizing, not get_variables_if_enabled: this runs
+        # outside aprocess_scope(), where the latter's memo write has no reset token
+        # and would leave a stale variable dict on the surrounding context.
+        variables = VariableResolver.get_variables_without_memoizing(self.name)
+        if variables is None:
+            return True
+        return VariableResolver.would_substitute(raw_value, variables)
+
+    def _variable_template_to_preserve(self, parameter_name: str, output_value: Any) -> _PreservedTemplate | None:
+        """Return the stored {VAR} template that must survive `output_value`.
+
+        Returns None when the resolved output can be used as-is. Single source of
+        truth for both display suppression and for callers that write execution
+        results back onto a node.
+
+        The conditions mirror the substitution gate in ``get_parameter_value``:
+        there is only a template worth preserving where substitution would
+        actually have replaced it. A parameter that opts out
+        (``allow_variable_substitution=False``) or that is fed by an incoming
+        connection never gets substituted, so its output is genuine and its
+        stored value must stay writable.
+        """
+        if not VariableResolver.is_substitution_enabled():
+            return None
+        parameter = self.get_parameter_by_name(parameter_name)
+        if parameter is None:
+            return None
+        raw_value = self.parameter_values.get(parameter_name, parameter.default_value)
+        # One short-circuiting chain rather than a ladder of early returns, so the
+        # cheap checks stay ordered ahead of the expensive ones. The connection
+        # lookup is last: it reaches through the GriptapeNodes singleton to the
+        # FlowManager, and the checks before it already rule out the common case.
+        substitution_would_have_applied = (
+            ParameterMode.PROPERTY in parameter.allowed_modes
+            and parameter.allow_variable_substitution
+            and VariableResolver.contains_variable_macro(raw_value)
+            and _differs(raw_value, output_value)
+            and not self._param_has_incoming_connection(parameter_name)
+        )
+        return _PreservedTemplate(raw_value) if substitution_would_have_applied else None
+
     def get_display_value_for_output(self, parameter_name: str, output_value: Any) -> Any:
         """Return the UI display value for an output parameter.
 
-        For PROPERTY parameters whose stored template contains a variable macro
-        and the output differs from the template, returns the template so users
-        always see and can edit the {VAR} syntax rather than the resolved value.
-
-        Honors the per-workflow substitution toggle: when substitution is disabled
-        the template is never shown in place of the real output.
+        Returns the stored template, so users always see and can edit the {VAR}
+        syntax rather than the resolved value, whenever
+        ``_variable_template_to_preserve`` finds one worth preserving (see there
+        for the full set of conditions). Otherwise returns `output_value`.
         """
-        if not VariableResolver.is_substitution_enabled():
+        template = self._variable_template_to_preserve(parameter_name, output_value)
+        if template is None:
             return output_value
-        parameter = self.get_parameter_by_name(parameter_name)
-        if parameter is None:
-            return output_value
-        if ParameterMode.PROPERTY not in parameter.allowed_modes:
-            return output_value
-        raw_value = self.parameter_values.get(parameter_name, parameter.default_value)
-        if VariableResolver.contains_variable_macro(raw_value) and raw_value != output_value:
-            return raw_value
-        return output_value
+        return template.value
+
+    def should_preserve_stored_template(self, parameter_name: str, output_value: Any) -> bool:
+        """Whether writing `output_value` into stored state would destroy a {VAR} template.
+
+        ``parameter_values`` is where ``get_display_value_for_output`` reads the
+        template from, so a caller that copies execution results back onto a node
+        must not route a resolved value through ``set_parameter_value`` when this
+        returns True -- doing so makes the loss permanent rather than cosmetic
+        (a browser refresh cannot recover it, and a save persists the substituted
+        string). Such callers should write to ``parameter_output_values`` only.
+
+        Strictly narrower than display suppression: it adds
+        ``_substitution_would_rewrite`` on top, because getting this wrong in
+        either direction is permanent, whereas a wrongly suppressed *display* is
+        only cosmetic. The two cannot disagree in the dangerous direction -- a
+        skipped write always implies a suppressed display.
+
+        Because of that asymmetry this is the wrong predicate for a display
+        decision; use ``get_display_value_for_output`` or
+        ``_variable_template_to_preserve`` for those.
+        """
+        template = self._variable_template_to_preserve(parameter_name, output_value)
+        if template is None:
+            return False
+        return self._substitution_would_rewrite(template.value)
 
     def _report_parameter_mutation_if_in_aprocess(self, *, parameter_name: str, mutation: str) -> None:
         """Report parameter-mutation-during-aprocess when a node mutates its own params directly.
@@ -1588,7 +1804,11 @@ class BaseNode(ABC):
             )
         else:
             event_data = parameter.to_event(self)
-            # Mirror display-preservation guard from TrackedParameterOutputValues._emit_parameter_change_event.
+            # Display-preservation guard. Gated on _in_aprocess here, unlike
+            # TrackedParameterOutputValues._emit_parameter_change_event, because this
+            # value comes from Parameter.to_event -> node.get_parameter_value(), which
+            # only substitutes inside aprocess. Outside it the value is already the
+            # template, so the guard would be a no-op.
             if _in_aprocess.get() and "value" in event_data:
                 event_data["value"] = self.get_display_value_for_output(parameter.name, event_data["value"])
             # Publish the event
@@ -1810,8 +2030,16 @@ class TrackedParameterOutputValues(dict[str, Any]):
             # typed. Only suppress when substitution actually changed the value
             # (raw contains "{" and differs from the output); other PROPERTY|OUTPUT
             # parameters like loop counters show their computed value normally.
+            #
+            # Deliberately NOT gated on _in_aprocess: the orchestrator copies
+            # worker/group outputs back into parameter_output_values after
+            # aprocess_scope has exited, so gating here let a node inside a
+            # ForEach/ForLoop group display the last iteration's resolved text.
+            # get_display_value_for_output is itself narrow enough to be safe
+            # unconditionally -- it only substitutes for a PROPERTY parameter
+            # whose stored value contains a macro and differs from the output.
             display_value = value
-            if not deleted and _in_aprocess.get():
+            if not deleted:
                 display_value = self._node.get_display_value_for_output(parameter_name, value)
             event_data["value"] = display_value
 

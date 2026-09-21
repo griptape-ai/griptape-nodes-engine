@@ -1,14 +1,20 @@
 """Tests for WorkflowPackager: library dependency resolution and clean-rebuild publishing."""
 
 import json
+import logging
+import re
+import shutil
 import subprocess
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from collections.abc import Callable
+from pathlib import Path, PureWindowsPath
+from unittest.mock import DEFAULT, MagicMock, Mock, call, create_autospec, patch
 
 import pytest
 from dotenv import dotenv_values
 
 from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
+from griptape_nodes.node_library.workflow_registry import Workflow, WorkflowMetadata, WorkflowRegistry
+from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.os_events import (
     DeleteFileRequest,
     DeleteFileResultSuccess,
@@ -18,13 +24,28 @@ from griptape_nodes.retained_mode.events.os_events import (
     RenameFileResultFailure,
     WriteFileResultSuccess,
 )
+from griptape_nodes.retained_mode.events.project_events import (
+    GetCurrentProjectRequest,
+    GetCurrentProjectResultSuccess,
+    GetPathForMacroRequest,
+    GetPathForMacroResultFailure,
+    GetPathForMacroResultSuccess,
+    PathResolutionFailureReason,
+)
 from griptape_nodes.retained_mode.events.secrets_events import (
     GetAllSecretValuesRequest,
     GetAllSecretValuesResultSuccess,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
+from griptape_nodes.retained_mode.managers.event_manager import EventManager
+from griptape_nodes.retained_mode.publishing import workflow_packager
 from griptape_nodes.retained_mode.publishing.workflow_packager import (
     DOWNLOAD_MODELS_SCRIPT_NAME,
+    RESERVED_BUNDLE_PATHS,
+    WORKFLOW_DIR_MACRO,
+    FileReferenceOutcome,
+    PackagedBundle,
+    ResolvedFileReference,
     WorkflowPackager,
 )
 
@@ -99,8 +120,8 @@ class TestResolveAllLibraryDeps:
         assert captured[0] == initial
 
 
-class TestCollectDependenciesTransitive:
-    """collect_dependencies includes pip deps from transitive library dependencies."""
+class TestCollectDependencies:
+    """Tests for collecting library and engine package dependencies."""
 
     def test_includes_pip_deps_from_transitive_library(self) -> None:
         """Workflow uses Library A; A depends on Library B; B's pip deps appear in result."""
@@ -127,6 +148,41 @@ class TestCollectDependenciesTransitive:
 
         assert "numpy>=1.0" in result
         assert "requests>=2.0" in result
+
+    def test_pins_full_git_sha(self) -> None:
+        """The engine dependency uses the full SHA returned by get_install_source verbatim."""
+        packager = WorkflowPackager("test_workflow")
+        workflow = _make_workflow_mock([])
+        full_sha = "d1e0a500e25ced659d30d82f0cae4073523e42a5"
+
+        with (
+            patch(
+                "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.LibraryManager",
+                return_value=_make_lib_manager_mock([]),
+            ),
+            patch.object(packager, "get_engine_version", return_value="v0.92.0"),
+            patch.object(packager, "get_install_source", return_value=("git", full_sha)),
+        ):
+            result = packager.collect_dependencies(workflow)
+
+        assert f"griptape-nodes-engine @ git+https://github.com/griptape-ai/griptape-nodes.git@{full_sha}" in result
+
+    def test_pins_engine_version_tag_for_pypi(self) -> None:
+        """A pypi install pins the released version tag rather than a commit."""
+        packager = WorkflowPackager("test_workflow")
+        workflow = _make_workflow_mock([])
+
+        with (
+            patch(
+                "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.LibraryManager",
+                return_value=_make_lib_manager_mock([]),
+            ),
+            patch.object(packager, "get_engine_version", return_value="v0.92.0"),
+            patch.object(packager, "get_install_source", return_value=("pypi", None)),
+        ):
+            result = packager.collect_dependencies(workflow)
+
+        assert "griptape-nodes-engine @ git+https://github.com/griptape-ai/griptape-nodes.git@v0.92.0" in result
 
 
 class TestCollectPipInstallFlagsTransitive:
@@ -157,8 +213,632 @@ class TestCollectPipInstallFlagsTransitive:
         assert "--extra-index-url=https://b.example.com" in result
 
 
+def _macro_handler(  # noqa: ANN202
+    resolved_path: Path,
+    absolute_path: Path,
+    workflow_dir: Path | None = None,
+):
+    """Build a handle_request stub answering macro resolution for one file reference.
+
+    Mirrors ProjectManager.on_get_path_for_macro_request, whose ``resolved_path`` is the macro
+    string after substitution: absolute when a directory macro is absolute-rooted, relative
+    otherwise. ``{workflow_dir}`` is answered separately because copy_static_files resolves it
+    on its own to locate the workflow anchor; None makes it unresolvable, as it is for a
+    workflow that has never been saved. Any other request returns a MagicMock, so the
+    current-project lookup fails its isinstance check and leaves the project anchor out.
+    """
+
+    def handle_request(request: object) -> object:
+        if isinstance(request, GetPathForMacroRequest):
+            if request.parsed_macro.template == WORKFLOW_DIR_MACRO:
+                if workflow_dir is None:
+                    return GetPathForMacroResultFailure(
+                        failure_reason=PathResolutionFailureReason.MACRO_RESOLUTION_ERROR,
+                        result_details="no current workflow",
+                    )
+                return GetPathForMacroResultSuccess(
+                    resolved_path=workflow_dir,
+                    absolute_path=workflow_dir,
+                    result_details="resolved",
+                )
+            return GetPathForMacroResultSuccess(
+                resolved_path=resolved_path,
+                absolute_path=absolute_path,
+                result_details="resolved",
+            )
+        return MagicMock()
+
+    return handle_request
+
+
+def _handle_request_patch(handler):  # noqa: ANN001, ANN202
+    """Patch the packager's handle_request with the given stub."""
+    return patch(
+        "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.handle_request",
+        side_effect=handler,
+    )
+
+
+def _macro_resolution_patch(  # noqa: ANN202
+    resolved_path: Path,
+    absolute_path: Path,
+    workflow_dir: Path | None = None,
+):
+    """Patch handle_request so a macro reference resolves to the given pair of paths."""
+    return _handle_request_patch(_macro_handler(resolved_path, absolute_path, workflow_dir))
+
+
+def _workspace_patch(workspace_dir: Path):  # noqa: ANN202
+    """Patch the config manager so the workspace anchor is ``workspace_dir``."""
+    return patch(
+        "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.ConfigManager",
+        return_value=MagicMock(workspace_path=workspace_dir),
+    )
+
+
 class TestCopyStaticFiles:
-    """copy_static_files handles the case where the destination resolves back onto the source."""
+    """copy_static_files places dependencies safely where the published bundle expects them."""
+
+    def test_bundles_file_referenced_by_absolute_macro_path(self, tmp_path: Path) -> None:
+        """A macro that substitutes to an absolute path still lands inside the bundle.
+
+        The v1 default anchors `{inputs}` on `{workflow_dir}`, so `{inputs}/image.jpg`
+        substitutes to an absolute string. Joining that onto the destination discards the
+        destination, which silently dropped every macro-referenced dependency.
+        """
+        packager = WorkflowPackager("test_workflow")
+        workspace = tmp_path / "ws"
+        source = workspace / "inputs" / "image.jpg"
+        source.parent.mkdir(parents=True)
+        source.write_text("data")
+        destination = tmp_path / "bundle"
+
+        with (
+            _macro_resolution_patch(resolved_path=source, absolute_path=source, workflow_dir=workspace),
+            _workspace_patch(workspace),
+            patch.object(packager, "copy_file") as mock_copy_file,
+            patch.object(packager, "copy_tree") as mock_copy_tree,
+        ):
+            packager.copy_static_files([("node", "{inputs}/image.jpg")], destination)
+
+        mock_copy_file.assert_called_once_with(source, destination / "inputs" / "image.jpg")
+        mock_copy_tree.assert_not_called()
+
+    def test_bundles_file_relative_to_the_workflow_not_the_workspace(self, tmp_path: Path) -> None:
+        """A workflow in a subdirectory resolves against its own directory, not the workspace.
+
+        The bundle copies the workflow file to its root, so `{inputs}` resolves there at run
+        time. Anchoring on the workspace instead would bundle the file under `shots/inputs/`,
+        where nothing looks for it.
+        """
+        packager = WorkflowPackager("test_workflow")
+        workspace = tmp_path / "ws"
+        workflow_dir = workspace / "shots"
+        source = workflow_dir / "inputs" / "image.jpg"
+        source.parent.mkdir(parents=True)
+        source.write_text("data")
+        destination = tmp_path / "bundle"
+
+        with (
+            _macro_resolution_patch(resolved_path=source, absolute_path=source, workflow_dir=workflow_dir),
+            _workspace_patch(workspace),
+            patch.object(packager, "copy_file") as mock_copy_file,
+            patch.object(packager, "copy_tree") as mock_copy_tree,
+        ):
+            packager.copy_static_files([("node", "{inputs}/image.jpg")], destination)
+
+        mock_copy_file.assert_called_once_with(source, destination / "inputs" / "image.jpg")
+        mock_copy_tree.assert_not_called()
+
+    def test_bundles_file_referenced_by_relative_path(self, tmp_path: Path) -> None:
+        """A reference that substitutes to a relative path keeps bundling as it did before."""
+        packager = WorkflowPackager("test_workflow")
+        workspace = tmp_path / "ws"
+        source = workspace / "inputs" / "image.jpg"
+        source.parent.mkdir(parents=True)
+        source.write_text("data")
+        destination = tmp_path / "bundle"
+
+        with (
+            _macro_resolution_patch(
+                resolved_path=Path("inputs/image.jpg"), absolute_path=source, workflow_dir=workspace
+            ),
+            _workspace_patch(workspace),
+            patch.object(packager, "copy_file") as mock_copy_file,
+            patch.object(packager, "copy_tree") as mock_copy_tree,
+        ):
+            packager.copy_static_files([("node", "inputs/image.jpg")], destination)
+
+        mock_copy_file.assert_called_once_with(source, destination / "inputs" / "image.jpg")
+        mock_copy_tree.assert_not_called()
+
+    def test_relative_resolution_wins_over_a_deeper_anchor(self, tmp_path: Path) -> None:
+        """A workspace-relative reference keeps its own path even when a deeper anchor contains it.
+
+        A v0 project resolves `{outputs}` relative to the workspace. With the workflow saved at
+        `<ws>/outputs/render.py`, the workflow's own directory is the deepest anchor containing
+        the file, and stripping it would drop the `outputs/` segment the bundle still resolves
+        `{outputs}` to.
+        """
+        packager = WorkflowPackager("test_workflow")
+        workspace = tmp_path / "ws"
+        workflow_dir = workspace / "outputs"
+        source = workflow_dir / "plate.png"
+        source.parent.mkdir(parents=True)
+        source.write_text("data")
+        destination = tmp_path / "bundle"
+
+        with (
+            _macro_resolution_patch(
+                resolved_path=Path("outputs/plate.png"), absolute_path=source, workflow_dir=workflow_dir
+            ),
+            _workspace_patch(workspace),
+            patch.object(packager, "copy_file") as mock_copy_file,
+        ):
+            packager.copy_static_files([("node", "{outputs}/plate.png")], destination)
+
+        mock_copy_file.assert_called_once_with(source, destination / "outputs" / "plate.png")
+
+    @pytest.mark.parametrize("escaping_reference", ["../shared/image.jpg", "~/media/image.jpg"])
+    def test_does_not_write_outside_the_bundle_for_an_escaping_reference(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, escaping_reference: str
+    ) -> None:
+        """A relative reference the resolver rewrote is anchor-checked, not trusted verbatim.
+
+        `..` and `~` are both "relative" but name somewhere the bundle has no say over. Joining
+        either onto the destination writes outside the bundle, or creates a literal `~` inside
+        it, and reports the dependency as bundled either way.
+        """
+        packager = WorkflowPackager("test_workflow")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        source = tmp_path / "shared" / "image.jpg"
+        source.parent.mkdir(parents=True)
+        source.write_text("data")
+        destination = tmp_path / "bundle"
+
+        with (
+            # resolved_path keeps the raw substituted string; absolute_path is what the resolver
+            # made of it, exactly as ProjectManager returns them.
+            _macro_resolution_patch(
+                resolved_path=Path(escaping_reference), absolute_path=source, workflow_dir=workspace
+            ),
+            _workspace_patch(workspace),
+            patch.object(packager, "copy_file") as mock_copy_file,
+            caplog.at_level(logging.WARNING, logger="workflow_packager"),
+        ):
+            packager.copy_static_files([("node", escaping_reference)], destination)
+
+        mock_copy_file.assert_not_called()
+        assert "outside the folders that travel with the bundle" in caplog.text
+
+    def test_bundles_one_source_needed_at_two_destinations(self, tmp_path: Path) -> None:
+        """A file two references place differently is copied to both places.
+
+        One reference can resolve relatively and another be anchor-stripped, so the same source
+        legitimately has two homes in the bundle. Skipping by source would bundle only the first.
+        """
+        packager = WorkflowPackager("test_workflow")
+        workspace = tmp_path / "ws"
+        workflow_dir = workspace / "shots"
+        source = workflow_dir / "inputs" / "image.jpg"
+        source.parent.mkdir(parents=True)
+        source.write_text("data")
+        destination = tmp_path / "bundle"
+
+        def handle_request(request: object) -> object:
+            if isinstance(request, GetPathForMacroRequest):
+                template = request.parsed_macro.template
+                if template == WORKFLOW_DIR_MACRO:
+                    return GetPathForMacroResultSuccess(
+                        resolved_path=workflow_dir, absolute_path=workflow_dir, result_details="resolved"
+                    )
+                # The plain relative spelling stays relative through substitution; the macro
+                # spelling resolves absolutely against the workflow directory.
+                resolved = Path("shots/inputs/image.jpg") if template.startswith("shots/") else source
+                return GetPathForMacroResultSuccess(
+                    resolved_path=resolved, absolute_path=source, result_details="resolved"
+                )
+            return MagicMock()
+
+        with (
+            _handle_request_patch(handle_request),
+            _workspace_patch(workspace),
+            patch.object(packager, "copy_file") as mock_copy_file,
+        ):
+            packager.copy_static_files([("a", "shots/inputs/image.jpg"), ("b", "{inputs}/image.jpg")], destination)
+
+        destinations = {call.args[1] for call in mock_copy_file.call_args_list}
+        assert destinations == {
+            destination / "shots" / "inputs" / "image.jpg",
+            destination / "inputs" / "image.jpg",
+        }
+
+    def test_refuses_an_anchor_reference_even_when_a_shallower_anchor_exists(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A reference equal to the workflow directory is refused, not placed under the workspace.
+
+        Every anchor collapses onto the bundle root, so `{workflow_dir}` resolves there when the
+        published workflow runs and a copy under the workspace-relative name (`shots/`) is
+        somewhere nothing looks. It is also the shape that makes `copy_tree` walk a source
+        containing its own destination when the bundle is written inside that folder.
+        """
+        packager = WorkflowPackager("test_workflow")
+        workspace = tmp_path / "ws"
+        workflow_dir = workspace / "shots"
+        workflow_dir.mkdir(parents=True)
+        destination = workflow_dir / "bundle"
+
+        with (
+            _macro_resolution_patch(resolved_path=workflow_dir, absolute_path=workflow_dir, workflow_dir=workflow_dir),
+            _workspace_patch(workspace),
+            patch.object(packager, "copy_tree") as mock_copy_tree,
+            patch.object(packager, "copy_file") as mock_copy_file,
+            caplog.at_level(logging.WARNING, logger="workflow_packager"),
+        ):
+            packager.copy_static_files([("node", "{workflow_dir}")], destination)
+
+        mock_copy_tree.assert_not_called()
+        mock_copy_file.assert_not_called()
+        assert "the folder the bundle itself replaces" in caplog.text
+
+    def test_refuses_a_relatively_resolved_reference_that_is_an_anchor(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The anchor refusal holds for a reference that resolved relatively, not just absolutely.
+
+        A v0 project resolves `shots` against the workspace onto the workflow's own directory, so
+        the relative shortcut supplies the destination and would otherwise reach `copy_tree`.
+        """
+        packager = WorkflowPackager("test_workflow")
+        workspace = tmp_path / "ws"
+        workflow_dir = workspace / "shots"
+        workflow_dir.mkdir(parents=True)
+        destination = workflow_dir / "bundle"
+
+        with (
+            _macro_resolution_patch(resolved_path=Path("shots"), absolute_path=workflow_dir, workflow_dir=workflow_dir),
+            _workspace_patch(workspace),
+            patch.object(packager, "copy_tree") as mock_copy_tree,
+            caplog.at_level(logging.WARNING, logger="workflow_packager"),
+        ):
+            packager.copy_static_files([("node", "shots")], destination)
+
+        mock_copy_tree.assert_not_called()
+        assert "the folder the bundle itself replaces" in caplog.text
+
+    def test_refuses_a_directory_that_contains_the_bundle(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A referenced directory the bundle is written inside is refused, anchor or not.
+
+        `copy_tree` walks the source lazily while creating directories in it, so copying a folder
+        into a bundle nested inside that folder never terminates. `{outputs}` is no anchor, so no
+        anchor comparison can catch this one.
+        """
+        packager = WorkflowPackager("test_workflow")
+        workspace = tmp_path / "ws"
+        source = workspace / "outputs"
+        source.mkdir(parents=True)
+        destination = source / "mybundle"
+
+        with (
+            _macro_resolution_patch(resolved_path=source, absolute_path=source, workflow_dir=workspace),
+            _workspace_patch(workspace),
+            patch.object(packager, "copy_tree") as mock_copy_tree,
+            caplog.at_level(logging.WARNING, logger="workflow_packager"),
+        ):
+            packager.copy_static_files([("node", "{outputs}")], destination)
+
+        mock_copy_tree.assert_not_called()
+        assert "the bundle is being written inside it" in caplog.text
+
+    def test_reports_an_unresolvable_absolute_macro_by_its_cause(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An absolute macro with an unset variable names the variable, not a location.
+
+        The string still carries its braces, so treating it as a plain absolute path would report
+        where it "resolves to" and bury the reason.
+        """
+        packager = WorkflowPackager("test_workflow")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        destination = tmp_path / "bundle"
+
+        def handle_request(request: object) -> object:
+            if isinstance(request, GetPathForMacroRequest):
+                return GetPathForMacroResultFailure(
+                    failure_reason=PathResolutionFailureReason.MISSING_REQUIRED_VARIABLES,
+                    missing_variables={"shot"},
+                    result_details="missing shot",
+                )
+            return MagicMock()
+
+        with (
+            _handle_request_patch(handle_request),
+            _workspace_patch(workspace),
+            patch.object(packager, "copy_file") as mock_copy_file,
+            caplog.at_level(logging.WARNING, logger="workflow_packager"),
+        ):
+            packager.copy_static_files([("node", "/Volumes/plates/{shot}/bg.exr")], destination)
+
+        mock_copy_file.assert_not_called()
+        assert "missing shot" in caplog.text
+        assert "outside the folders that travel with the bundle" not in caplog.text
+
+    def test_bundles_an_absolute_path_when_the_macro_layer_cannot_resolve(self, tmp_path: Path) -> None:
+        """A variable-free absolute path still bundles when resolution fails for other reasons.
+
+        Resolution fails with no current project, but the value is a literal path, so the
+        fallback can still place it.
+        """
+        packager = WorkflowPackager("test_workflow")
+        workspace = tmp_path / "ws"
+        source = workspace / "inputs" / "image.jpg"
+        source.parent.mkdir(parents=True)
+        source.write_text("data")
+        destination = tmp_path / "bundle"
+
+        def handle_request(request: object) -> object:
+            if isinstance(request, GetPathForMacroRequest):
+                return GetPathForMacroResultFailure(
+                    failure_reason=PathResolutionFailureReason.MACRO_RESOLUTION_ERROR,
+                    result_details="no current project",
+                )
+            return MagicMock()
+
+        with (
+            _handle_request_patch(handle_request),
+            _workspace_patch(workspace),
+            patch.object(packager, "copy_file") as mock_copy_file,
+        ):
+            packager.copy_static_files([("node", str(source))], destination)
+
+        mock_copy_file.assert_called_once_with(source, destination / "inputs" / "image.jpg")
+
+    def test_bundles_a_directory_under_an_anchor(self, tmp_path: Path) -> None:
+        """A directory reference inside an anchor is copied as a tree."""
+        packager = WorkflowPackager("test_workflow")
+        workspace = tmp_path / "ws"
+        source = workspace / "inputs" / "plates"
+        source.mkdir(parents=True)
+        (source / "p.exr").write_text("data")
+        destination = tmp_path / "bundle"
+
+        with (
+            _macro_resolution_patch(resolved_path=source, absolute_path=source, workflow_dir=workspace),
+            _workspace_patch(workspace),
+            patch.object(packager, "copy_tree") as mock_copy_tree,
+            patch.object(packager, "copy_file") as mock_copy_file,
+        ):
+            packager.copy_static_files([("node", "{inputs}/plates")], destination)
+
+        mock_copy_tree.assert_called_once_with(source, destination / "inputs" / "plates")
+        mock_copy_file.assert_not_called()
+
+    def test_bundles_a_file_under_the_project_anchor(self, tmp_path: Path) -> None:
+        """A file under the project base directory but outside the workspace still bundles.
+
+        The project directory can sit above the workspace, so it is the only anchor that places
+        such a file.
+        """
+        packager = WorkflowPackager("test_workflow")
+        project_dir = tmp_path / "project"
+        workspace = project_dir / "workspace"
+        workspace.mkdir(parents=True)
+        source = project_dir / "assets" / "logo.png"
+        source.parent.mkdir(parents=True)
+        source.write_text("data")
+        destination = tmp_path / "bundle"
+
+        def handle_request(request: object) -> object:
+            if isinstance(request, GetPathForMacroRequest):
+                if request.parsed_macro.template == WORKFLOW_DIR_MACRO:
+                    return GetPathForMacroResultSuccess(
+                        resolved_path=workspace, absolute_path=workspace, result_details="resolved"
+                    )
+                return GetPathForMacroResultSuccess(
+                    resolved_path=source, absolute_path=source, result_details="resolved"
+                )
+            if isinstance(request, GetCurrentProjectRequest):
+                return GetCurrentProjectResultSuccess(
+                    project_info=MagicMock(project_base_dir=project_dir), result_details="current"
+                )
+            return MagicMock()
+
+        with (
+            _handle_request_patch(handle_request),
+            _workspace_patch(workspace),
+            patch.object(packager, "copy_file") as mock_copy_file,
+        ):
+            packager.copy_static_files([("node", "{project_dir}/assets/logo.png")], destination)
+
+        mock_copy_file.assert_called_once_with(source, destination / "assets" / "logo.png")
+
+    def test_skips_a_reference_that_is_an_anchor_itself(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        """A directory reference resolving to an anchor is not copied into the bundle root.
+
+        `relative_to` yields `.` for a path equal to its anchor, which would make the whole
+        workspace -- including the bundle being written inside it -- the thing being copied. The
+        reason given says the bundle replaces that folder, not that it lies outside the project.
+        """
+        packager = WorkflowPackager("test_workflow")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        destination = workspace / "bundle"
+
+        with (
+            _macro_resolution_patch(resolved_path=workspace, absolute_path=workspace, workflow_dir=workspace),
+            _workspace_patch(workspace),
+            patch.object(packager, "copy_file") as mock_copy_file,
+            patch.object(packager, "copy_tree") as mock_copy_tree,
+            caplog.at_level(logging.WARNING, logger="workflow_packager"),
+        ):
+            packager.copy_static_files([("node", "{workspace_dir}")], destination)
+
+        mock_copy_tree.assert_not_called()
+        mock_copy_file.assert_not_called()
+        assert "the folder the bundle itself replaces" in caplog.text
+        assert "outside the folders that travel with the bundle" not in caplog.text
+
+    def test_bundles_when_an_anchor_and_the_file_are_spelled_differently(self, tmp_path: Path) -> None:
+        """An anchor that resolved its symlinks still matches a path that did not.
+
+        ``ConfigManager.workspace_path`` resolves symlinks; a `{workflow_dir}`-derived path keeps
+        the spelling the context was entered with. A workspace reached through a symlinked parent
+        would otherwise match no anchor and drop every dependency.
+        """
+        packager = WorkflowPackager("test_workflow")
+        real_workspace = tmp_path / "real_ws"
+        (real_workspace / "inputs").mkdir(parents=True)
+        (real_workspace / "inputs" / "image.jpg").write_text("data")
+        linked_workspace = tmp_path / "linked_ws"
+        linked_workspace.symlink_to(real_workspace, target_is_directory=True)
+        source = linked_workspace / "inputs" / "image.jpg"
+        destination = tmp_path / "bundle"
+
+        with (
+            _macro_resolution_patch(resolved_path=source, absolute_path=source),
+            _workspace_patch(real_workspace),
+            patch.object(packager, "copy_file") as mock_copy_file,
+        ):
+            packager.copy_static_files([("node", "{inputs}/image.jpg")], destination)
+
+        mock_copy_file.assert_called_once_with(source, destination / "inputs" / "image.jpg")
+
+    def test_warns_when_two_files_claim_one_bundle_destination(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Two sources landing on one bundle path is reported, since one node reads the other's file."""
+        packager = WorkflowPackager("test_workflow")
+        workspace = tmp_path / "ws"
+        workflow_dir = workspace / "shots"
+        from_workspace = workspace / "inputs" / "image.jpg"
+        from_workflow = workflow_dir / "inputs" / "image.jpg"
+        for source in (from_workspace, from_workflow):
+            source.parent.mkdir(parents=True)
+            source.write_text("data")
+        destination = tmp_path / "bundle"
+
+        resolutions = {
+            "{workspace_dir}/inputs/image.jpg": from_workspace,
+            "{inputs}/image.jpg": from_workflow,
+        }
+
+        def handle_request(request: object) -> object:
+            if isinstance(request, GetPathForMacroRequest):
+                template = request.parsed_macro.template
+                if template == WORKFLOW_DIR_MACRO:
+                    return GetPathForMacroResultSuccess(
+                        resolved_path=workflow_dir, absolute_path=workflow_dir, result_details="resolved"
+                    )
+                resolved = resolutions[template]
+                return GetPathForMacroResultSuccess(
+                    resolved_path=resolved, absolute_path=resolved, result_details="resolved"
+                )
+            return MagicMock()
+
+        with (
+            _handle_request_patch(handle_request),
+            _workspace_patch(workspace),
+            patch.object(packager, "copy_file"),
+            caplog.at_level(logging.WARNING, logger="workflow_packager"),
+        ):
+            packager.copy_static_files(
+                [("a", "{workspace_dir}/inputs/image.jpg"), ("b", "{inputs}/image.jpg")], destination
+            )
+
+        assert "both belong at" in caplog.text
+
+    def test_bundles_file_through_a_symlinked_project_directory(self, tmp_path: Path) -> None:
+        """A media directory symlinked onto other storage still bundles.
+
+        Matching on symlink-resolved paths would take the file to the link target, match no
+        anchor, and report a file plainly inside the project as being outside it.
+        """
+        packager = WorkflowPackager("test_workflow")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        shared = tmp_path / "shared_storage"
+        (shared / "images").mkdir(parents=True)
+        (shared / "images" / "image.jpg").write_text("data")
+        (workspace / "inputs").symlink_to(shared, target_is_directory=True)
+        source = workspace / "inputs" / "images" / "image.jpg"
+        destination = tmp_path / "bundle"
+
+        with (
+            _macro_resolution_patch(resolved_path=source, absolute_path=source, workflow_dir=workspace),
+            _workspace_patch(workspace),
+            patch.object(packager, "copy_file") as mock_copy_file,
+            patch.object(packager, "copy_tree") as mock_copy_tree,
+        ):
+            packager.copy_static_files([("node", "{inputs}/images/image.jpg")], destination)
+
+        mock_copy_file.assert_called_once_with(source, destination / "inputs" / "images" / "image.jpg")
+        mock_copy_tree.assert_not_called()
+
+    def test_reports_a_file_that_resolves_outside_every_anchor(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A file on an external volume has no place in the bundle, and the log says why."""
+        packager = WorkflowPackager("test_workflow")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        source = tmp_path / "external" / "image.jpg"
+        source.parent.mkdir(parents=True)
+        source.write_text("data")
+        destination = tmp_path / "bundle"
+
+        with (
+            _macro_resolution_patch(resolved_path=source, absolute_path=source, workflow_dir=workspace),
+            _workspace_patch(workspace),
+            patch.object(packager, "copy_file") as mock_copy_file,
+            patch.object(packager, "copy_tree") as mock_copy_tree,
+            caplog.at_level(logging.WARNING, logger="workflow_packager"),
+        ):
+            packager.copy_static_files([("node", "{external}/image.jpg")], destination)
+
+        mock_copy_file.assert_not_called()
+        mock_copy_tree.assert_not_called()
+        assert "{external}/image.jpg" in caplog.text
+        assert "outside the folders that travel with the bundle" in caplog.text
+
+    def test_reports_an_unresolvable_macro_as_such(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        """A macro that will not resolve is not reported as a path outside the project.
+
+        The two failures are unrelated and the user acts on them differently, so the message
+        names the missing variable rather than guessing at a location.
+        """
+        packager = WorkflowPackager("test_workflow")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        destination = tmp_path / "bundle"
+
+        def handle_request(request: object) -> object:
+            if isinstance(request, GetPathForMacroRequest):
+                return GetPathForMacroResultFailure(
+                    failure_reason=PathResolutionFailureReason.MISSING_REQUIRED_VARIABLES,
+                    missing_variables={"shot_name"},
+                    result_details="missing shot_name",
+                )
+            return MagicMock()
+
+        with (
+            patch(
+                "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.handle_request",
+                side_effect=handle_request,
+            ),
+            _workspace_patch(workspace),
+            patch.object(packager, "copy_file") as mock_copy_file,
+            caplog.at_level(logging.WARNING, logger="workflow_packager"),
+        ):
+            packager.copy_static_files([("node", "{inputs}/{shot_name}.jpg")], destination)
+
+        mock_copy_file.assert_not_called()
+        assert "shot_name" in caplog.text
+        assert "outside the folders that travel with the bundle" not in caplog.text
 
     def test_skips_copy_when_source_and_dest_are_same_file(self, tmp_path: Path) -> None:
         """A file whose destination resolves to itself is left in place instead of copied."""
@@ -166,15 +846,20 @@ class TestCopyStaticFiles:
         source = tmp_path / "inputs" / "images" / "img.jpg"
         source.parent.mkdir(parents=True)
         source.write_text("data")
-        relative = Path("inputs/images/img.jpg")
+        resolved = ResolvedFileReference(absolute_path=source, bundle_relative_path=Path("inputs/images/img.jpg"))
 
         # destination is the project root itself, so dest == source.
         with (
-            patch.object(packager, "_resolve_file_reference", return_value=(source, relative)),
+            patch.object(
+                packager,
+                "_resolve_file_reference",
+                return_value=FileReferenceOutcome(reference=resolved, failure=None),
+            ),
             patch(
                 "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.handle_request",
                 return_value=MagicMock(),
             ),
+            _workspace_patch(tmp_path),
             patch.object(packager, "copy_file") as mock_copy_file,
             patch.object(packager, "copy_tree") as mock_copy_tree,
         ):
@@ -190,14 +875,20 @@ class TestCopyStaticFiles:
         source.parent.mkdir(parents=True)
         source.write_text("data")
         relative = Path("inputs/images/img.jpg")
+        resolved = ResolvedFileReference(absolute_path=source, bundle_relative_path=relative)
         destination = tmp_path / "bundle"
 
         with (
-            patch.object(packager, "_resolve_file_reference", return_value=(source, relative)),
+            patch.object(
+                packager,
+                "_resolve_file_reference",
+                return_value=FileReferenceOutcome(reference=resolved, failure=None),
+            ),
             patch(
                 "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.handle_request",
                 return_value=MagicMock(),
             ),
+            _workspace_patch(tmp_path),
             patch.object(packager, "copy_file") as mock_copy_file,
             patch.object(packager, "copy_tree") as mock_copy_tree,
         ):
@@ -205,6 +896,70 @@ class TestCopyStaticFiles:
 
         mock_copy_file.assert_called_once_with(source, destination / relative)
         mock_copy_tree.assert_not_called()
+
+
+class TestValidateStaticFileDestination:
+    """Tests for the static-file-specific reserved-path collision error."""
+
+    @pytest.fixture
+    def packager(self) -> WorkflowPackager:
+        """Return a packager whose workflow name is asserted in collision errors."""
+        return WorkflowPackager("test_workflow")
+
+    @pytest.fixture
+    def stubbed_bundle_path_display(self, monkeypatch: pytest.MonkeyPatch) -> Mock:
+        """Replace bundle-path rendering, returning the stub standing in for it."""
+        return _stub_bundle_path_display(monkeypatch)
+
+    @pytest.mark.parametrize("reserved_relative_path", RESERVED_BUNDLE_PATHS, ids=str)
+    def test_reserved_destination_raises(self, reserved_relative_path: Path, packager: WorkflowPackager) -> None:
+        """A static file whose bundle destination is reserved raises an actionable error."""
+        value = f"{{inputs}}/{reserved_relative_path}"
+
+        with pytest.raises(TypeError) as exc_info:
+            packager._validate_static_file_destination(
+                reserved_relative_path,
+                "MyNode",
+                value,
+                RESERVED_BUNDLE_PATHS,
+            )
+
+        assert f"collides with '{reserved_relative_path.as_posix()}'" in str(exc_info.value)
+        assert "MyNode" in str(exc_info.value)
+        assert "test_workflow" in str(exc_info.value)
+        assert value in str(exc_info.value)
+
+    def test_bundle_paths_are_rendered_for_display(
+        self, packager: WorkflowPackager, stubbed_bundle_path_display: Mock
+    ) -> None:
+        """Both bundle paths in the message go through display rendering, unlike the artist's own reference."""
+        destination = Path("v1")
+        reserved = Path("v1/run.py")
+
+        with pytest.raises(TypeError) as exc_info:
+            packager._validate_static_file_destination(destination, "MyNode", "{inputs}/v1", [reserved])
+
+        assert "belongs at '<displayed:v1>'" in str(exc_info.value)
+        assert "collides with '<displayed:v1/run.py>'" in str(exc_info.value)
+        stubbed_bundle_path_display.assert_has_calls([call(destination), call(reserved)])
+
+    def test_message_names_the_reserved_entry_as_declared(self, packager: WorkflowPackager) -> None:
+        """The error quotes the publisher's own spelling so they can find it in their declaration."""
+        with pytest.raises(TypeError) as exc_info:
+            packager._validate_static_file_destination(
+                Path("run.py"), "MyNode", "{inputs}/run.py", [Path("nested/../run.py")]
+            )
+
+        assert "collides with 'nested/../run.py'" in str(exc_info.value)
+
+    def test_unreserved_library_destination_does_not_raise(self, packager: WorkflowPackager) -> None:
+        """The deliberately unreserved libraries directory remains available to static files."""
+        packager._validate_static_file_destination(
+            Path("libraries/my_library/asset.png"),
+            "MyNode",
+            "libraries/my_library/asset.png",
+            RESERVED_BUNDLE_PATHS,
+        )
 
 
 class TestGetInstallSource:
@@ -296,45 +1051,6 @@ class TestGetInstallSource:
 
         assert source == "file"
         assert commit is None
-
-
-class TestCollectDependenciesEnginePin:
-    """collect_dependencies pins the engine to the full commit SHA for git installs."""
-
-    def test_pins_full_git_sha(self) -> None:
-        """The engine dependency uses the full SHA returned by get_install_source verbatim."""
-        packager = WorkflowPackager("test_workflow")
-        workflow = _make_workflow_mock([])
-        full_sha = "d1e0a500e25ced659d30d82f0cae4073523e42a5"
-
-        with (
-            patch(
-                "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.LibraryManager",
-                return_value=_make_lib_manager_mock([]),
-            ),
-            patch.object(packager, "get_engine_version", return_value="v0.92.0"),
-            patch.object(packager, "get_install_source", return_value=("git", full_sha)),
-        ):
-            result = packager.collect_dependencies(workflow)
-
-        assert f"griptape-nodes-engine @ git+https://github.com/griptape-ai/griptape-nodes.git@{full_sha}" in result
-
-    def test_pins_engine_version_tag_for_pypi(self) -> None:
-        """A pypi install pins the released version tag rather than a commit."""
-        packager = WorkflowPackager("test_workflow")
-        workflow = _make_workflow_mock([])
-
-        with (
-            patch(
-                "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.LibraryManager",
-                return_value=_make_lib_manager_mock([]),
-            ),
-            patch.object(packager, "get_engine_version", return_value="v0.92.0"),
-            patch.object(packager, "get_install_source", return_value=("pypi", None)),
-        ):
-            result = packager.collect_dependencies(workflow)
-
-        assert "griptape-nodes-engine @ git+https://github.com/griptape-ai/griptape-nodes.git@v0.92.0" in result
 
 
 def _write_file_via_real_fs(request: MagicMock) -> MagicMock:
@@ -712,14 +1428,14 @@ class TestStagedPublish:
 
         assert (destination / "run.py").read_text(encoding="utf-8") == "new"
 
-    def test_restores_the_previous_bundle_if_the_swap_fails(self, tmp_path: Path) -> None:
+    def test_restores_the_previous_bundle_if_the_swap_fails(self, tmp_path: Path, engine: Engine) -> None:
         """A failure moving the new bundle into place leaves the destination populated."""
         packager = WorkflowPackager("test_workflow")
         destination = tmp_path / "bundle"
         destination.mkdir()
         (destination / "run.py").write_text("previous", encoding="utf-8")
 
-        real_handle_request = GriptapeNodes.handle_request
+        real_handle_request = engine.handle_request
         staged_bundle_move_attempted = False
 
         def fail_moving_new_bundle_into_place(request: object) -> object:
@@ -749,14 +1465,14 @@ class TestStagedPublish:
 
         assert (destination / "run.py").read_text(encoding="utf-8") == "previous"
 
-    def test_keeps_the_moved_aside_bundle_when_rollback_fails(self, tmp_path: Path) -> None:
+    def test_keeps_the_moved_aside_bundle_when_rollback_fails(self, tmp_path: Path, engine: Engine) -> None:
         """If the destination cannot be restored, the only copy of the bundle is not deleted."""
         packager = WorkflowPackager("test_workflow")
         destination = tmp_path / "bundle"
         destination.mkdir()
         (destination / "run.py").write_text("previous", encoding="utf-8")
 
-        real_handle_request = GriptapeNodes.handle_request
+        real_handle_request = engine.handle_request
 
         def fail_every_move_to_the_destination(request: object) -> object:
             """Refuse both the swap and the rollback, leaving the destination missing."""
@@ -784,14 +1500,14 @@ class TestStagedPublish:
         assert len(moved_aside) == 1
         assert (moved_aside[0] / "run.py").read_text(encoding="utf-8") == "previous"
 
-    def test_failure_names_the_destination_not_a_working_directory(self, tmp_path: Path) -> None:
+    def test_failure_names_the_destination_not_a_working_directory(self, tmp_path: Path, engine: Engine) -> None:
         """Every swap failure names the bundle the user published to, whichever move failed."""
         packager = WorkflowPackager("test_workflow")
         destination = tmp_path / "bundle"
         destination.mkdir()
         (destination / "run.py").write_text("previous", encoding="utf-8")
 
-        real_handle_request = GriptapeNodes.handle_request
+        real_handle_request = engine.handle_request
 
         def fail_moving_the_previous_bundle_aside(request: object) -> object:
             """Refuse the destination -> aside move, whose target is an internal path."""
@@ -818,14 +1534,14 @@ class TestStagedPublish:
         assert f"'{destination}'" in str(failure.value)
         assert ".publish-" not in str(failure.value)
 
-    def test_cleanup_failure_does_not_fail_the_publish(self, tmp_path: Path) -> None:
+    def test_cleanup_failure_does_not_fail_the_publish(self, tmp_path: Path, engine: Engine) -> None:
         """A working directory that cannot be removed is logged, not raised over."""
         packager = WorkflowPackager("test_workflow")
         destination = tmp_path / "bundle"
         destination.mkdir()
         (destination / "run.py").write_text("previous", encoding="utf-8")
 
-        real_handle_request = GriptapeNodes.handle_request
+        real_handle_request = engine.handle_request
 
         def fail_deletes(request: object) -> object:
             """Report every delete as failed, leaving the working directories on disk."""
@@ -844,7 +1560,7 @@ class TestStagedPublish:
 
         assert (destination / "run.py").read_text(encoding="utf-8") == "new"
 
-    def test_swap_routes_through_engine_requests(self, tmp_path: Path) -> None:
+    def test_swap_routes_through_engine_requests(self, tmp_path: Path, engine: Engine) -> None:
         """Staging directory creation and the swap go through OS request handlers."""
         packager = WorkflowPackager("test_workflow")
         destination = tmp_path / "bundle"
@@ -852,7 +1568,7 @@ class TestStagedPublish:
         (destination / "run.py").write_text("previous", encoding="utf-8")
         seen: list[type] = []
 
-        real_handle_request = GriptapeNodes.handle_request
+        real_handle_request = engine.handle_request
 
         def record(request: object) -> object:
             seen.append(type(request))
@@ -872,3 +1588,547 @@ class TestStagedPublish:
         assert MakeDirectoryRequest in seen
         assert seen.count(RenameFileRequest) == expected_renames
         assert (destination / "run.py").read_text(encoding="utf-8") == "new"
+
+
+class TestWriteConfig:
+    """write_config serialises the library list the bundle's engine reads back at startup."""
+
+    @pytest.fixture
+    def handle_request_writing_to_disk(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Let the packager's write requests reach the real filesystem."""
+        _stub_handle_request(monkeypatch, side_effect=_write_file_via_real_fs)
+
+    @pytest.mark.usefixtures("handle_request_writing_to_disk")
+    def test_library_paths_are_written_as_forward_slash_strings(self, tmp_path: Path) -> None:
+        """The library paths reach the JSON as plain strings, separators unchanged.
+
+        JSON has no path type, so handing this a `Path` would either fail outright or write
+        whatever `str()` gives it -- backslash-separated on Windows, which the engine reading
+        the bundle cannot resolve.
+        """
+        WorkflowPackager.write_config(tmp_path, ["libraries/my_library/griptape_nodes_library.json"])
+
+        written = json.loads((tmp_path / "griptape_nodes_config.json").read_text(encoding="utf-8"))
+        registered = written["app_events"]["on_app_initialization_complete"]["libraries_to_register"]
+
+        assert registered == ["libraries/my_library/griptape_nodes_library.json"]
+
+
+class TestFindReservedCollision:
+    """Tests for matching a bundle destination against reserved files and directories."""
+
+    def test_empty_destination_is_ignored(self, caplog: pytest.LogCaptureFixture) -> None:
+        """An empty destination cannot meaningfully collide with a bundle entry."""
+        with caplog.at_level(logging.WARNING, logger="workflow_packager"):
+            result = WorkflowPackager._find_reserved_collision(Path(), [Path("run.py")])
+
+        assert result is None
+        assert "empty bundle destination" in caplog.text
+
+    def test_bundle_root_reserved_path_is_ignored(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Reserving the bundle root does not turn every destination into a collision."""
+        with caplog.at_level(logging.WARNING, logger="workflow_packager"):
+            result = WorkflowPackager._find_reserved_collision(Path("child.py"), [Path()])
+
+        assert result is None
+        assert "names the bundle root" in caplog.text
+
+    def test_absolute_reserved_path_is_ignored(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        """An absolute entry cannot match a bundle-relative destination."""
+        with caplog.at_level(logging.WARNING, logger="workflow_packager"):
+            result = WorkflowPackager._find_reserved_collision(
+                Path("download_models.py"), [tmp_path / "download_models.py"]
+            )
+
+        assert result is None
+        assert "because it is absolute" in caplog.text
+
+    def test_search_continues_after_an_invalid_reserved_path(self) -> None:
+        """Skipping an invalid entry does not disarm the remaining collision guard."""
+        reserved = Path("download_models.py")
+
+        result = WorkflowPackager._find_reserved_collision(reserved, [Path(), reserved])
+
+        assert result == reserved
+
+    def test_exact_destination_collides(self) -> None:
+        """A destination equal to a reserved entry collides with it."""
+        reserved = Path("download_models.py")
+
+        assert WorkflowPackager._find_reserved_collision(reserved, [reserved]) == reserved
+
+    def test_destination_under_reserved_directory_collides(self) -> None:
+        """A destination nested under a reserved directory collides with it."""
+        reserved = Path("v1")
+
+        assert WorkflowPackager._find_reserved_collision(Path("v1/foo.exr"), [reserved]) == reserved
+
+    @pytest.mark.parametrize("destination", [Path("a"), Path("a/b")], ids=["far-above", "direct-parent"])
+    def test_destination_which_is_ancestor_of_reserved_file_collides(self, destination: Path) -> None:
+        """Every destination directory required by a nested reserved file collides."""
+        reserved = Path("a/b/c.py")
+
+        assert WorkflowPackager._find_reserved_collision(destination, [reserved]) == reserved
+
+    def test_destination_beside_reserved_file_does_not_collide(self) -> None:
+        """Reserving a nested file does not reserve its siblings."""
+        result = WorkflowPackager._find_reserved_collision(Path("v1/my_static_file.txt"), [Path("v1/run.py")])
+
+        assert result is None
+
+    def test_destination_sharing_name_prefix_does_not_collide(self) -> None:
+        """Matching path components does not confuse `v10` with `v1`."""
+        result = WorkflowPackager._find_reserved_collision(Path("v10"), [Path("v1/run.py")])
+
+        assert result is None
+
+    def test_destination_spelled_with_dot_dot_collides(self) -> None:
+        """A destination routed through a parent segment names the reserved entry it lands on."""
+        reserved = Path("run.py")
+
+        assert WorkflowPackager._find_reserved_collision(Path("nested/../run.py"), [reserved]) == reserved
+
+    def test_reserved_entry_spelled_with_dot_dot_collides(self) -> None:
+        """A reserved entry routed through a parent segment still guards the file it lands on."""
+        reserved = Path("nested/../run.py")
+
+        collision = WorkflowPackager._find_reserved_collision(Path("run.py"), [reserved])
+
+        assert collision == reserved
+        assert collision is not None
+        assert collision.as_posix() == "nested/../run.py"
+
+    def test_reserved_entry_spelled_with_leading_dot_collides(self) -> None:
+        """A reserved entry spelled `./run.py` still guards `run.py`."""
+        reserved = Path("./run.py")
+
+        assert WorkflowPackager._find_reserved_collision(Path("run.py"), [reserved]) == reserved
+
+    def test_escaping_reserved_path_is_ignored(self, caplog: pytest.LogCaptureFixture) -> None:
+        """An entry that climbs out of the bundle cannot match a bundle-relative destination."""
+        with caplog.at_level(logging.WARNING, logger="workflow_packager"):
+            result = WorkflowPackager._find_reserved_collision(Path("outside.txt"), [Path("../outside.txt")])
+
+        assert result is None
+        assert "points outside the bundle root" in caplog.text
+
+    def test_search_continues_after_an_escaping_reserved_path(self) -> None:
+        """Skipping an escaping entry does not disarm the remaining collision guard."""
+        reserved = Path("download_models.py")
+
+        result = WorkflowPackager._find_reserved_collision(reserved, [Path("../outside.txt"), reserved])
+
+        assert result == reserved
+
+    def test_escaping_destination_is_ignored(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A destination outside the bundle names no bundle entry, so nothing can be compared."""
+        with caplog.at_level(logging.WARNING, logger="workflow_packager"):
+            result = WorkflowPackager._find_reserved_collision(Path("../run.py"), [Path("run.py")])
+
+        assert result is None
+        assert "points outside the bundle root" in caplog.text
+
+
+class TestFoldPathParts:
+    """Tests for platform-independent reserved-path comparison normalization."""
+
+    def test_folds_each_path_component(self) -> None:
+        """Mixed-case directory and file names normalize independently."""
+        assert WorkflowPackager._fold_path_parts(Path("V1/Download_Models.py")) == (
+            "v1",
+            "download_models.py",
+        )
+
+    def test_uses_unicode_case_folding(self) -> None:
+        """Unicode spellings that lower() misses normalize for collision checks."""
+        assert WorkflowPackager._fold_path_parts(Path("griptape_nodes_con\ufb01g.json")) == (
+            "griptape_nodes_config.json",
+        )
+
+    def test_collapses_dot_segments(self) -> None:
+        """Detours through `.` and a parent segment fold to the entry they actually name."""
+        assert WorkflowPackager._fold_path_parts(Path("./nested/../V1/./Run.py")) == ("v1", "run.py")
+
+    def test_folds_a_root_naming_path_to_no_parts(self) -> None:
+        """A path that climbs back to where it started names the bundle root, not an entry in it."""
+        assert WorkflowPackager._fold_path_parts(Path("v1/..")) == ()
+
+    def test_keeps_the_escape_of_a_path_leaving_the_bundle_root(self) -> None:
+        """A path that climbs past the bundle root keeps the `..` that says so."""
+        assert WorkflowPackager._fold_path_parts(Path("nested/../../outside.txt")) == ("..", "outside.txt")
+
+
+class TestBundlePathForDisplay:
+    """Tests for spelling a bundle-relative path in artist-facing messages."""
+
+    def test_renders_windows_separators_as_posix(self) -> None:
+        """A path carrying Windows separators names the same bundle position as it does on Linux."""
+        assert WorkflowPackager._bundle_path_for_display(PureWindowsPath("v1/run.py")) == "v1/run.py"
+
+    def test_leaves_a_posix_path_alone(self) -> None:
+        """A path already spelled with forward slashes survives rendering unchanged."""
+        assert WorkflowPackager._bundle_path_for_display(Path("v1/run.py")) == "v1/run.py"
+
+
+class TestValidateEntrypointBundleDestination:
+    """Tests for the entrypoint-specific reserved-path collision error."""
+
+    @pytest.fixture
+    def stubbed_bundle_path_display(self, monkeypatch: pytest.MonkeyPatch) -> Mock:
+        """Replace bundle-path rendering, returning the stub standing in for it."""
+        return _stub_bundle_path_display(monkeypatch)
+
+    def test_collision_raises_and_names_the_workflow(self) -> None:
+        """A colliding workflow basename raises an actionable workflow-specific error."""
+        with pytest.raises(TypeError, match=re.escape("collides with 'download_models.py'")) as exc_info:
+            WorkflowPackager.validate_entrypoint_bundle_destination(
+                Path("download_models.py"), "download_models", RESERVED_BUNDLE_PATHS
+            )
+
+        assert "Attempted to publish workflow 'download_models'." in str(exc_info.value)
+        assert "the workflow it uses" not in str(exc_info.value)
+
+    def test_bundle_paths_are_rendered_for_display(self, stubbed_bundle_path_display: Mock) -> None:
+        """Both bundle paths in the message go through display rendering."""
+        destination = Path("v1/run.py")
+        reserved = Path("v1")
+
+        with pytest.raises(TypeError) as exc_info:
+            WorkflowPackager.validate_entrypoint_bundle_destination(destination, "run", [reserved])
+
+        assert "copied to '<displayed:v1/run.py>'" in str(exc_info.value)
+        assert "collides with '<displayed:v1>'" in str(exc_info.value)
+        stubbed_bundle_path_display.assert_has_calls([call(destination), call(reserved)])
+
+    def test_non_collision_does_not_raise(self) -> None:
+        """A workflow whose flattened basename is available is accepted."""
+        WorkflowPackager.validate_entrypoint_bundle_destination(
+            Path("my_workflow.py"), "my_workflow", RESERVED_BUNDLE_PATHS
+        )
+
+
+class TestPackageToFolder:
+    """Tests for building and reporting the contents of a standard workflow bundle.
+
+    Publishers extend the collision guard via `additional_reserved_paths`; the engine must
+    union it with its own `RESERVED_BUNDLE_PATHS` rather than replace it, so a publisher can
+    never accidentally drop an engine-written path (e.g. `pyproject.toml`) from the guard.
+    """
+
+    @pytest.fixture
+    def packager(self) -> WorkflowPackager:
+        """Return a packager publishing the workflow named ``root``."""
+        return WorkflowPackager("root")
+
+    @pytest.fixture
+    def root_workflow(self) -> Workflow:
+        """Return the saved workflow whose file flattens to ``root.py`` in the bundle."""
+        return _make_packageable_workflow("root", "root.py")
+
+    @pytest.fixture
+    def workspace(self, tmp_path: Path) -> Path:
+        """Create the workspace and entrypoint file copied by the packaging tests."""
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        (workspace / "root.py").write_text("# the root workflow")
+        return workspace
+
+    @pytest.fixture
+    def stubbed_copy_file(self, monkeypatch: pytest.MonkeyPatch, packager: WorkflowPackager) -> Mock:
+        """Copy files for real through an autospecced spy."""
+
+        def copy_for_real(source_path: str | Path, destination_path: str | Path) -> None:
+            destination = Path(destination_path)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(source_path, destination)
+
+        return _stub_packager_method(monkeypatch, packager, "copy_file", side_effect=copy_for_real)
+
+    @pytest.fixture
+    def stubbed_copy_libraries(self, monkeypatch: pytest.MonkeyPatch, packager: WorkflowPackager) -> Mock:
+        """Report no copied libraries unless a test provides a report."""
+        return _stub_packager_method(monkeypatch, packager, "copy_libraries", return_value=[])
+
+    @pytest.fixture(autouse=True)
+    def package_to_folder_stubs(  # noqa: PLR0913, PLR0917
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        packager: WorkflowPackager,
+        workspace: Path,
+        stubbed_copy_file: Mock,  # noqa: ARG002
+        stubbed_copy_libraries: Mock,  # noqa: ARG002
+    ) -> None:
+        """Isolate package orchestration while leaving its entrypoint copy real."""
+        config_manager = Mock(spec=ConfigManager, workspace_path=tmp_path)
+        monkeypatch.setattr(
+            workflow_packager.GriptapeNodes,
+            "ConfigManager",
+            create_autospec(workflow_packager.GriptapeNodes.ConfigManager, return_value=config_manager),
+        )
+        monkeypatch.setattr(
+            workflow_packager.GriptapeNodes,
+            "EventManager",
+            create_autospec(
+                workflow_packager.GriptapeNodes.EventManager,
+                return_value=Mock(spec=EventManager),
+            ),
+        )
+        _stub_handle_request(monkeypatch)
+        _stub_complete_file_path(monkeypatch, lambda path: str(workspace / path))
+        _stub_packager_method(monkeypatch, packager, "_resolve_all_library_deps", return_value=[])
+        _stub_packager_method(monkeypatch, packager, "write_config")
+        _stub_packager_method(monkeypatch, packager, "write_project_template")
+        _stub_packager_method(monkeypatch, packager, "collect_all_nodes", return_value=[])
+        _stub_packager_method(monkeypatch, packager, "write_download_models_script")
+        _stub_packager_method(monkeypatch, packager, "write_env")
+        _stub_packager_method(monkeypatch, packager, "write_pyproject_toml")
+
+    @staticmethod
+    def _stub_static_file_lookups(
+        monkeypatch: pytest.MonkeyPatch,
+        packager: WorkflowPackager,
+        references: list[tuple[str, str]],
+        resolved: ResolvedFileReference,
+    ) -> None:
+        """Make package_to_folder discover and resolve the given static-file references."""
+        _stub_packager_method(monkeypatch, packager, "gather_static_file_references", return_value=references)
+        _stub_packager_method(
+            monkeypatch,
+            packager,
+            "_resolve_file_reference",
+            return_value=FileReferenceOutcome(reference=resolved, failure=None),
+        )
+
+    def test_entrypoint_basename_matching_additional_reserved_path_raises(
+        self, tmp_path: Path, packager: WorkflowPackager, stubbed_copy_file: Mock
+    ) -> None:
+        """The entrypoint workflow's own flattened basename honours additional_reserved_paths."""
+        workflow = _make_packageable_workflow("root", "companion.py")
+
+        with pytest.raises(TypeError, match=re.escape("collides with 'companion.py'")):
+            packager.package_to_folder(tmp_path, workflow, additional_reserved_paths=[Path("companion.py")])
+
+        stubbed_copy_file.assert_not_called()
+
+    def test_engine_reserved_path_still_rejected_when_additional_reserved_paths_supplied(
+        self, tmp_path: Path, packager: WorkflowPackager, stubbed_copy_file: Mock
+    ) -> None:
+        """An engine reserved path is still rejected even when additional_reserved_paths is supplied.
+
+        Proves `package_to_folder` unions `additional_reserved_paths` with `RESERVED_BUNDLE_PATHS`
+        rather than replacing it -- if it replaced it, an entrypoint workflow flattening onto
+        `pyproject.toml` would sail through because `publisher_file.py` alone doesn't cover it.
+        """
+        workflow = _make_packageable_workflow("root", "pyproject.toml")
+
+        with pytest.raises(TypeError, match=re.escape("collides with 'pyproject.toml'")):
+            packager.package_to_folder(tmp_path, workflow, additional_reserved_paths=[Path("publisher_file.py")])
+
+        stubbed_copy_file.assert_not_called()
+
+    def test_static_file_on_the_parent_of_a_reserved_file_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, packager: WorkflowPackager, root_workflow: Workflow
+    ) -> None:
+        """A bundled static file landing on the directory a publisher's file needs stops the publish."""
+        source = tmp_path / "assets" / "v1"
+        source.parent.mkdir(parents=True)
+        source.write_text("data")
+        resolved = ResolvedFileReference(absolute_path=source, bundle_relative_path=Path("v1"))
+        self._stub_static_file_lookups(monkeypatch, packager, [("MyNode", "{inputs}/v1")], resolved)
+
+        with pytest.raises(TypeError, match=re.escape("collides with 'v1/run.py'")) as exc_info:
+            packager.package_to_folder(
+                tmp_path / "bundle", root_workflow, additional_reserved_paths=[Path("v1/run.py")]
+            )
+
+        assert "MyNode" in str(exc_info.value)
+
+    def test_static_file_on_a_publisher_declared_file_raises(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        packager: WorkflowPackager,
+        root_workflow: Workflow,
+        stubbed_copy_file: Mock,
+    ) -> None:
+        """A static file landing on a path the publisher writes itself stops the publish."""
+        source = tmp_path / "assets" / "run.py"
+        source.parent.mkdir(parents=True)
+        source.write_text("data")
+        resolved = ResolvedFileReference(absolute_path=source, bundle_relative_path=Path("run.py"))
+        self._stub_static_file_lookups(monkeypatch, packager, [("MyNode", "{inputs}/run.py")], resolved)
+
+        with pytest.raises(TypeError, match=re.escape("collides with 'run.py'")) as exc_info:
+            packager.package_to_folder(tmp_path / "bundle", root_workflow, additional_reserved_paths=[Path("run.py")])
+
+        assert "MyNode" in str(exc_info.value)
+        stubbed_copy_file.assert_called_once_with(
+            str(tmp_path / "workspace" / "root.py"), tmp_path / "bundle" / "root.py"
+        )
+
+    def test_static_file_under_a_publisher_declared_directory_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, packager: WorkflowPackager, root_workflow: Workflow
+    ) -> None:
+        """A static file landing inside a directory the publisher writes itself stops the publish."""
+        source = tmp_path / "assets" / "foo.exr"
+        source.parent.mkdir(parents=True)
+        source.write_text("data")
+        resolved = ResolvedFileReference(absolute_path=source, bundle_relative_path=Path("v1/foo.exr"))
+        self._stub_static_file_lookups(monkeypatch, packager, [("MyNode", "{inputs}/v1/foo.exr")], resolved)
+
+        with pytest.raises(TypeError, match="collides with 'v1'") as exc_info:
+            packager.package_to_folder(tmp_path / "bundle", root_workflow, additional_reserved_paths=[Path("v1")])
+
+        assert "MyNode" in str(exc_info.value)
+
+    def test_static_file_on_the_published_workflow_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, packager: WorkflowPackager, root_workflow: Workflow
+    ) -> None:
+        """A static file landing on the workflow's own copy stops the publish.
+
+        The workflow is the one file the bundle cannot do without, and it is copied before the
+        static files, so an unguarded collision overwrites it and the published bundle runs the
+        artist's asset as its entrypoint.
+        """
+        source = tmp_path / "assets" / "root.py"
+        source.parent.mkdir(parents=True)
+        source.write_text("data")
+        resolved = ResolvedFileReference(absolute_path=source, bundle_relative_path=Path("root.py"))
+        self._stub_static_file_lookups(monkeypatch, packager, [("MyNode", "{inputs}/root.py")], resolved)
+
+        with pytest.raises(TypeError, match=re.escape("collides with 'root.py'")) as exc_info:
+            packager.package_to_folder(tmp_path / "bundle", root_workflow)
+
+        assert "MyNode" in str(exc_info.value)
+
+    def test_mixed_case_static_file_under_a_reserved_directory_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, packager: WorkflowPackager, root_workflow: Workflow
+    ) -> None:
+        """A mixed-case spelling of a reserved directory still collides."""
+        source = tmp_path / "assets" / "foo.exr"
+        source.parent.mkdir(parents=True)
+        source.write_text("data")
+        resolved = ResolvedFileReference(absolute_path=source, bundle_relative_path=Path("V1/foo.exr"))
+        self._stub_static_file_lookups(monkeypatch, packager, [("MyNode", "{inputs}/V1/foo.exr")], resolved)
+
+        with pytest.raises(TypeError, match="collides with 'v1'"):
+            packager.package_to_folder(tmp_path / "bundle", root_workflow, additional_reserved_paths=[Path("v1")])
+
+    def test_reported_entrypoint_path_locates_the_copy(
+        self, tmp_path: Path, packager: WorkflowPackager, root_workflow: Workflow
+    ) -> None:
+        """Reading through the reported path finds the source workflow bytes."""
+        destination = tmp_path / "bundle"
+
+        result = packager.package_to_folder(destination, root_workflow)
+
+        assert (destination / result.entrypoint_workflow_path).read_text() == "# the root workflow"
+
+    def test_reported_entrypoint_path_is_bundle_relative(
+        self, tmp_path: Path, packager: WorkflowPackager, root_workflow: Workflow
+    ) -> None:
+        """The reported path survives the bundle being moved."""
+        result = packager.package_to_folder(tmp_path / "bundle", root_workflow)
+
+        assert not result.entrypoint_workflow_path.is_absolute()
+
+    def test_reports_copied_library_paths(
+        self,
+        tmp_path: Path,
+        packager: WorkflowPackager,
+        root_workflow: Workflow,
+        stubbed_copy_libraries: Mock,
+    ) -> None:
+        """The library paths returned by copy_libraries are included in the report."""
+        stubbed_copy_libraries.return_value = ["libraries/my_library/griptape_nodes_library.json"]
+
+        result = packager.package_to_folder(tmp_path / "bundle", root_workflow)
+
+        assert result.library_paths == (Path("libraries/my_library/griptape_nodes_library.json"),)
+
+
+class TestPackagedBundle:
+    """The shape of the packager's report, which publishers in other repos depend on."""
+
+    def test_is_not_a_tuple(self) -> None:
+        """Not a tuple, so gaining a field later cannot break positional unpacking."""
+        bundle = PackagedBundle(entrypoint_workflow_path=Path("root.py"), library_paths=())
+
+        assert not isinstance(bundle, tuple)
+
+    def test_fields_cannot_be_rebound(self) -> None:
+        """Frozen, so a publisher cannot rewrite the report it was handed."""
+        bundle = PackagedBundle(entrypoint_workflow_path=Path("root.py"), library_paths=())
+
+        with pytest.raises(AttributeError):
+            setattr(bundle, "entrypoint_workflow_path", Path("elsewhere.py"))  # noqa: B010
+
+    def test_is_hashable(self) -> None:
+        """Every field is immutable, so the report can be a dict key or set member."""
+        bundle = PackagedBundle(
+            entrypoint_workflow_path=Path("root.py"),
+            library_paths=(Path("libraries/my_library/griptape_nodes_library.json"),),
+        )
+
+        assert hash(bundle) == hash(
+            PackagedBundle(
+                entrypoint_workflow_path=Path("root.py"),
+                library_paths=(Path("libraries/my_library/griptape_nodes_library.json"),),
+            )
+        )
+
+
+def _stub_handle_request(monkeypatch: pytest.MonkeyPatch, side_effect: Callable[..., object] | None = None) -> Mock:
+    """Replace the packager's request entry point, returning the stub standing in for it."""
+    handle_request = create_autospec(workflow_packager.GriptapeNodes.handle_request, side_effect=side_effect)
+    monkeypatch.setattr(workflow_packager.GriptapeNodes, "handle_request", handle_request)
+    return handle_request
+
+
+def _stub_complete_file_path(monkeypatch: pytest.MonkeyPatch, resolve: Callable[[str], str]) -> None:
+    """Resolve a workflow's registry-relative file path with ``resolve`` instead of the workspace."""
+    monkeypatch.setattr(
+        WorkflowRegistry,
+        "get_complete_file_path",
+        create_autospec(WorkflowRegistry.get_complete_file_path, side_effect=resolve),
+    )
+
+
+def _stub_bundle_path_display(monkeypatch: pytest.MonkeyPatch) -> Mock:
+    """Replace bundle-path rendering with a marker, returning the stub standing in for it."""
+    display = create_autospec(
+        WorkflowPackager._bundle_path_for_display, side_effect=lambda path: f"<displayed:{path.as_posix()}>"
+    )
+    # Wrapped, because an autospecced function bound as a plain class attribute would be
+    # handed `self` by the instance-method call site.
+    monkeypatch.setattr(WorkflowPackager, "_bundle_path_for_display", staticmethod(display))
+    return display
+
+
+def _stub_packager_method(
+    monkeypatch: pytest.MonkeyPatch,
+    packager: WorkflowPackager,
+    method_name: str,
+    *,
+    return_value: object = DEFAULT,
+    side_effect: Callable[..., object] | None = None,
+) -> Mock:
+    """Replace one of ``packager``'s own methods with a mock specced from the real one.
+
+    Returns the stub, so a test can assert on the calls the packager made to it.
+    """
+    stub = create_autospec(getattr(packager, method_name), return_value=return_value, side_effect=side_effect)
+    monkeypatch.setattr(packager, method_name, stub)
+    return stub
+
+
+def _make_packageable_workflow(name: str, file_path: str) -> Workflow:
+    """Return a saved Workflow carrying the fields packaging reads."""
+    metadata = WorkflowMetadata(
+        name=name,
+        schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
+        engine_version_created_with="0.1.0",
+        node_libraries_referenced=[],
+    )
+    return Workflow(registry_key=WorkflowRegistry._RegistryKey(), metadata=metadata, file_path=file_path)

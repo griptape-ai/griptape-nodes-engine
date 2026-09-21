@@ -6,6 +6,8 @@ from an upstream failure -- in addition to the original UrlArtifact / bare-strin
 paths. See griptape-ai/griptape-nodes-engine#4688.
 """
 
+import re
+from pathlib import Path
 from typing import Any, NamedTuple
 from unittest.mock import Mock
 
@@ -20,6 +22,10 @@ from griptape_nodes.exe_types.param_components.artifact_url.public_artifact_url_
 from tests.unit.exe_types.mocks import MockNode
 
 PUBLIC_URL = "https://cloud.example/public/artifact.png"
+DATA_URI_PNG = "data:image/png;base64,iVBORw0KGgo="
+
+# _derive_upload_filename generates uuid4().hex names for values with no usable path name.
+GENERATED_NAME = r"[0-9a-f]{32}"
 
 
 class ComponentFixture(NamedTuple):
@@ -74,6 +80,44 @@ class TestGetPublicUrlForParameter:
         # The error should name the parameter so the editor points at the real cause.
         assert "image" in str(excinfo.value)
         driver.upload_file.assert_not_called()
+
+    def test_data_uri_uploads_under_generated_filename(self, mocker: Any) -> None:
+        # A data URI has no path name; the storage key must get a generated name with a
+        # real extension (the presigned download's content type is guessed from it), not
+        # a name derived from the base64 payload.
+        component, driver = _make_component(DATA_URI_PNG)
+        read_bytes_mock = mocker.patch("griptape_nodes.files.file.File.read_bytes", return_value=b"png-bytes")
+
+        assert component.get_public_url_for_parameter() == PUBLIC_URL
+
+        read_bytes_mock.assert_called_once()
+        uploaded_path = driver.upload_file.call_args.kwargs["path"]
+        assert re.fullmatch(rf"{GENERATED_NAME}\.png", uploaded_path.name)
+        assert uploaded_path.parts[0] == "artifact_url_storage"
+        assert driver.upload_file.call_args.kwargs["file_content"] == b"png-bytes"
+        assert component.gtc_file_path == uploaded_path
+
+
+class TestDeriveUploadFilename:
+    def test_url_path_name_is_preserved(self) -> None:
+        name = PublicArtifactUrlParameter._derive_upload_filename("https://example.com/dir/a.png")
+        assert name == "a.png"
+
+    def test_local_path_name_is_preserved(self) -> None:
+        name = PublicArtifactUrlParameter._derive_upload_filename("/inputs/frame.jpeg")
+        assert name == "frame.jpeg"
+
+    def test_data_uri_gets_generated_name_with_extension(self) -> None:
+        name = PublicArtifactUrlParameter._derive_upload_filename(DATA_URI_PNG)
+        assert re.fullmatch(rf"{GENERATED_NAME}\.png", name)
+
+    def test_data_uri_with_unknown_mime_gets_extensionless_generated_name(self) -> None:
+        name = PublicArtifactUrlParameter._derive_upload_filename("data:application/x-unknown-thing;base64,AAAA")
+        assert re.fullmatch(GENERATED_NAME, name)
+
+    def test_url_with_empty_path_name_gets_generated_name(self) -> None:
+        name = PublicArtifactUrlParameter._derive_upload_filename("https://example.com/")
+        assert re.fullmatch(GENERATED_NAME, name)
 
 
 class TestGetBucketId:
@@ -158,3 +202,58 @@ class TestGetBucketId:
 
         with pytest.raises(RuntimeError, match="No Griptape Cloud storage buckets found"):
             PublicArtifactUrlParameter._get_bucket_id("https://base", "key")
+
+
+class TestUploadPathLifecycle:
+    """Covers gtc_file_path across runs -- see griptape-ai/griptape-nodes-engine#4872.
+
+    A helper instance lives as long as the node, so the path recorded by an upload used to
+    outlive the run that made it. A later run whose input was already public took the
+    pass-through path and then deleted that stale path, 404ing on an asset it had already
+    deleted itself and failing a successful generation in cleanup.
+    """
+
+    STALE_PATH = Path("artifact_url_storage/deadbeef/reference.mp4")
+
+    def test_pass_through_clears_a_path_from_an_earlier_run(self) -> None:
+        component, driver = _make_component("https://example.com/img.png")
+        component.gtc_file_path = self.STALE_PATH
+
+        component.get_public_url_for_parameter()
+
+        assert component.gtc_file_path is None
+        driver.upload_file.assert_not_called()
+
+    def test_cleanup_after_a_pass_through_run_deletes_nothing(self) -> None:
+        component, driver = _make_component("https://example.com/img.png")
+        component.gtc_file_path = self.STALE_PATH
+
+        component.get_public_url_for_parameter()
+        component.delete_uploaded_artifact()
+
+        driver.delete_file.assert_not_called()
+
+    def test_delete_forgets_the_path(self) -> None:
+        component, driver = _make_component("https://example.com/img.png")
+        component.gtc_file_path = self.STALE_PATH
+
+        component.delete_uploaded_artifact()
+
+        driver.delete_file.assert_called_once_with(self.STALE_PATH)
+        assert component.gtc_file_path is None
+
+    def test_second_cleanup_pass_deletes_nothing(self) -> None:
+        component, driver = _make_component("https://example.com/img.png")
+        component.gtc_file_path = self.STALE_PATH
+
+        component.delete_uploaded_artifact()
+        component.delete_uploaded_artifact()
+
+        assert driver.delete_file.call_count == 1
+
+    def test_delete_is_skipped_when_nothing_was_uploaded(self) -> None:
+        component, driver = _make_component("https://example.com/img.png")
+
+        component.delete_uploaded_artifact()
+
+        driver.delete_file.assert_not_called()

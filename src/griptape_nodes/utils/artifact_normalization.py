@@ -9,8 +9,8 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
+from griptape_nodes.files.path_utils import parse_static_server_url
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 logger = logging.getLogger(__name__)
@@ -31,20 +31,13 @@ def _resolve_localhost_url_to_path(url: str) -> str:
     if not isinstance(url, str):
         return url
 
-    # Strip query parameters (cachebuster ?t=...)
-    if "?" in url:
-        url = url.split("?", maxsplit=1)[0]
-
-    # Check if it's a localhost URL (any port)
-    if url.startswith(("http://localhost:", "https://localhost:")):
-        parsed = urlparse(url)
-        # Extract path after /workspace/
-        if "/workspace/" in parsed.path:
-            workspace_relative_path = parsed.path.split("/workspace/", 1)[1]
-            return workspace_relative_path
-
-    # Not a localhost workspace URL, return as-is
-    return url
+    # `parse_static_server_url` needs a workspace to join against, but this function's
+    # contract is to return a *workspace-relative* path (callers anchor it themselves via
+    # `_resolve_file_path`). Passing an empty base makes the result the relative remainder.
+    local_path = parse_static_server_url(url, Path())
+    if local_path is None:
+        return url
+    return str(local_path)
 
 
 def _resolve_file_path(file_path: str) -> Path | None:  # noqa: PLR0911

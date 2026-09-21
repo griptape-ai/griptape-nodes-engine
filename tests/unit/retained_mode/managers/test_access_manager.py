@@ -7,12 +7,14 @@ behavior across a per-candidate loop, and failure paths.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
 from griptape_nodes.exe_types.node_types import BaseNode
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.engine import Engine
 
 
 class _ProbeNode(BaseNode):
@@ -97,13 +99,13 @@ class TestAccessManager:
 
     # ---------- Per-node request ----------
 
-    def test_for_node_unknown_node_type_returns_failure(self, griptape_nodes: GriptapeNodes) -> None:  # noqa: ARG002
+    def test_for_node_unknown_node_type_returns_failure(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.events.access_events import (
             QueryModelAccessForNodeRequest,
             QueryModelAccessForNodeResultFailure,
         )
 
-        result = GriptapeNodes.handle_request(QueryModelAccessForNodeRequest(node_type="Missing"))
+        result = engine.handle_request(QueryModelAccessForNodeRequest(node_type="Missing"))
         assert isinstance(result, QueryModelAccessForNodeResultFailure)
         # Message is clean prose: names the node type, no KeyError quote/tuple repr.
         details = str(result.result_details)
@@ -113,7 +115,7 @@ class TestAccessManager:
 
     def test_for_node_missing_in_specified_library_returns_clean_failure(
         self,
-        griptape_nodes: GriptapeNodes,  # noqa: ARG002
+        engine: Engine,
     ) -> None:
         from griptape_nodes.retained_mode.events.access_events import (
             QueryModelAccessForNodeRequest,
@@ -122,7 +124,7 @@ class TestAccessManager:
 
         self._register()
 
-        result = GriptapeNodes.handle_request(
+        result = engine.handle_request(
             QueryModelAccessForNodeRequest(node_type="NotRegistered", specific_library_name=self._LIBRARY_NAME)
         )
         assert isinstance(result, QueryModelAccessForNodeResultFailure)
@@ -134,7 +136,7 @@ class TestAccessManager:
             f"Failed because it is not registered in library '{self._LIBRARY_NAME}'."
         )
 
-    def test_for_node_no_hook_all_models_allowed(self, griptape_nodes: GriptapeNodes) -> None:  # noqa: ARG002
+    def test_for_node_no_hook_all_models_allowed(self, engine: Engine) -> None:
         from griptape_nodes.node_library.library_declarations import ModelUsageNodeProperty
         from griptape_nodes.retained_mode.events.access_events import (
             QueryModelAccessForNodeRequest,
@@ -146,14 +148,14 @@ class TestAccessManager:
             library_declarations=[self._catalog()],
         )
 
-        result = GriptapeNodes.handle_request(
+        result = engine.handle_request(
             QueryModelAccessForNodeRequest(node_type=_ProbeNode.__name__, specific_library_name=self._LIBRARY_NAME)
         )
         assert isinstance(result, QueryModelAccessForNodeResultSuccess)
         assert [v.model_id for v in result.verdicts] == ["gtc_claude_opus_4_7", "gtc_claude_sonnet_4_6"]
         assert all(v.denial is None for v in result.verdicts)
 
-    def test_for_node_hook_denies_one_model_only(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_for_node_hook_denies_one_model_only(self, engine: Engine) -> None:
         from griptape_nodes.node_library.library_declarations import ModelUsageNodeProperty
         from griptape_nodes.retained_mode.events.access_events import (
             QueryModelAccessForNodeRequest,
@@ -171,13 +173,13 @@ class TestAccessManager:
                 return CheckpointDenial(failures=(CheckpointFailure(detail="Opus is not in your plan."),))
             return None
 
-        griptape_nodes.EventManager().add_authorization_hook(deny)
+        engine.event_manager.add_authorization_hook(deny)
         try:
-            result = GriptapeNodes.handle_request(
+            result = engine.handle_request(
                 QueryModelAccessForNodeRequest(node_type=_ProbeNode.__name__, specific_library_name=self._LIBRARY_NAME)
             )
         finally:
-            griptape_nodes.EventManager().remove_authorization_hook(deny)
+            engine.event_manager.remove_authorization_hook(deny)
 
         assert isinstance(result, QueryModelAccessForNodeResultSuccess)
         denied = [v for v in result.verdicts if v.denial is not None]
@@ -187,7 +189,7 @@ class TestAccessManager:
         assert denied[0].denial is not None
         assert denied[0].denial.messages() == ["Opus is not in your plan."]
 
-    def test_for_node_verdict_carries_provider_model_id(self, griptape_nodes: GriptapeNodes) -> None:  # noqa: ARG002
+    def test_for_node_verdict_carries_provider_model_id(self, engine: Engine) -> None:
         from griptape_nodes.node_library.library_declarations import ModelUsageNodeProperty
         from griptape_nodes.retained_mode.events.access_events import (
             QueryModelAccessForNodeRequest,
@@ -199,7 +201,7 @@ class TestAccessManager:
             library_declarations=[self._catalog()],
         )
 
-        result = GriptapeNodes.handle_request(
+        result = engine.handle_request(
             QueryModelAccessForNodeRequest(node_type=_ProbeNode.__name__, specific_library_name=self._LIBRARY_NAME)
         )
         assert isinstance(result, QueryModelAccessForNodeResultSuccess)
@@ -207,7 +209,7 @@ class TestAccessManager:
         assert result.verdicts[0].model_id == "gtc_claude_opus_4_7"
         assert result.verdicts[0].provider_model_id == "claude-opus-4-7"
 
-    def test_for_node_unknown_candidate_no_catalog_enrichment(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_for_node_unknown_candidate_no_catalog_enrichment(self, engine: Engine) -> None:
         """Per-node request with an EXPLICIT candidate list including an unknown id.
 
         Verifies the explicit-override path: the engine asks the hook for the id
@@ -225,9 +227,9 @@ class TestAccessManager:
         def record(checkpoint: object) -> None:
             seen_attributes.append(dict(checkpoint.attributes))  # type: ignore[attr-defined]
 
-        griptape_nodes.EventManager().add_authorization_hook(record)
+        engine.event_manager.add_authorization_hook(record)
         try:
-            result = GriptapeNodes.handle_request(
+            result = engine.handle_request(
                 QueryModelAccessForNodeRequest(
                     node_type=_ProbeNode.__name__,
                     candidate_model_ids=["not_in_catalog"],
@@ -235,14 +237,14 @@ class TestAccessManager:
                 )
             )
         finally:
-            griptape_nodes.EventManager().remove_authorization_hook(record)
+            engine.event_manager.remove_authorization_hook(record)
 
         assert isinstance(result, QueryModelAccessForNodeResultSuccess)
         assert result.verdicts[0].model_id == "not_in_catalog"
         assert result.verdicts[0].provider_model_id is None
         assert seen_attributes == [{"node_type": _ProbeNode.__name__, "id": "not_in_catalog"}]
 
-    def test_for_node_per_candidate_loop_does_not_trip_recursion_guard(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_for_node_per_candidate_loop_does_not_trip_recursion_guard(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.events.access_events import (
             QueryModelAccessForNodeRequest,
             QueryModelAccessForNodeResultSuccess,
@@ -255,9 +257,9 @@ class TestAccessManager:
         def record(checkpoint: object) -> None:
             seen_model_ids.append(checkpoint.attributes["id"])  # type: ignore[attr-defined]
 
-        griptape_nodes.EventManager().add_authorization_hook(record)
+        engine.event_manager.add_authorization_hook(record)
         try:
-            result = GriptapeNodes.handle_request(
+            result = engine.handle_request(
                 QueryModelAccessForNodeRequest(
                     node_type=_ProbeNode.__name__,
                     candidate_model_ids=["gtc_claude_opus_4_7", "gtc_claude_sonnet_4_6", "not_in_catalog"],
@@ -265,7 +267,7 @@ class TestAccessManager:
                 )
             )
         finally:
-            griptape_nodes.EventManager().remove_authorization_hook(record)
+            engine.event_manager.remove_authorization_hook(record)
 
         assert isinstance(result, QueryModelAccessForNodeResultSuccess)
         # Each candidate produces exactly one verdict and one hook call -- the
@@ -273,7 +275,7 @@ class TestAccessManager:
         assert seen_model_ids == ["gtc_claude_opus_4_7", "gtc_claude_sonnet_4_6", "not_in_catalog"]
         assert [v.model_id for v in result.verdicts] == seen_model_ids
 
-    def test_for_node_action_is_offer_model(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_for_node_action_is_offer_model(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.events.access_events import QueryModelAccessForNodeRequest
 
         self._register(library_declarations=[self._catalog()])
@@ -283,9 +285,9 @@ class TestAccessManager:
         def record(checkpoint: object) -> None:
             seen_actions.append(checkpoint.action)  # type: ignore[attr-defined]
 
-        griptape_nodes.EventManager().add_authorization_hook(record)
+        engine.event_manager.add_authorization_hook(record)
         try:
-            GriptapeNodes.handle_request(
+            engine.handle_request(
                 QueryModelAccessForNodeRequest(
                     node_type=_ProbeNode.__name__,
                     candidate_model_ids=["gtc_claude_opus_4_7"],
@@ -293,11 +295,11 @@ class TestAccessManager:
                 )
             )
         finally:
-            griptape_nodes.EventManager().remove_authorization_hook(record)
+            engine.event_manager.remove_authorization_hook(record)
 
         assert seen_actions == ["OfferModel"]
 
-    def test_for_node_request_derives_model_ids_from_declarations(self, griptape_nodes: GriptapeNodes) -> None:  # noqa: ARG002
+    def test_for_node_request_derives_model_ids_from_declarations(self, engine: Engine) -> None:
         from griptape_nodes.node_library.library_declarations import ModelUsageNodeProperty
         from griptape_nodes.retained_mode.events.access_events import (
             QueryModelAccessForNodeRequest,
@@ -309,13 +311,13 @@ class TestAccessManager:
             library_declarations=[self._catalog()],
         )
 
-        result = GriptapeNodes.handle_request(
+        result = engine.handle_request(
             QueryModelAccessForNodeRequest(node_type=_ProbeNode.__name__, specific_library_name=self._LIBRARY_NAME)
         )
         assert isinstance(result, QueryModelAccessForNodeResultSuccess)
         assert [v.model_id for v in result.verdicts] == ["gtc_claude_opus_4_7"]
 
-    def test_for_node_request_expands_provider_usage(self, griptape_nodes: GriptapeNodes) -> None:  # noqa: ARG002
+    def test_for_node_request_expands_provider_usage(self, engine: Engine) -> None:
         from griptape_nodes.node_library.library_declarations import ModelProviderUsageNodeProperty
         from griptape_nodes.retained_mode.events.access_events import (
             QueryModelAccessForNodeRequest,
@@ -327,7 +329,7 @@ class TestAccessManager:
             library_declarations=[self._catalog()],
         )
 
-        result = GriptapeNodes.handle_request(
+        result = engine.handle_request(
             QueryModelAccessForNodeRequest(node_type=_ProbeNode.__name__, specific_library_name=self._LIBRARY_NAME)
         )
         assert isinstance(result, QueryModelAccessForNodeResultSuccess)
@@ -336,7 +338,7 @@ class TestAccessManager:
 
     def test_for_node_request_with_no_model_declarations_returns_empty_verdicts(
         self,
-        griptape_nodes: GriptapeNodes,  # noqa: ARG002
+        engine: Engine,
     ) -> None:
         from griptape_nodes.retained_mode.events.access_events import (
             QueryModelAccessForNodeRequest,
@@ -345,13 +347,13 @@ class TestAccessManager:
 
         self._register(library_declarations=[self._catalog()])
 
-        result = GriptapeNodes.handle_request(
+        result = engine.handle_request(
             QueryModelAccessForNodeRequest(node_type=_ProbeNode.__name__, specific_library_name=self._LIBRARY_NAME)
         )
         assert isinstance(result, QueryModelAccessForNodeResultSuccess)
         assert result.verdicts == []
 
-    def test_for_node_explicit_candidates_override_declarations(self, griptape_nodes: GriptapeNodes) -> None:  # noqa: ARG002
+    def test_for_node_explicit_candidates_override_declarations(self, engine: Engine) -> None:
         from griptape_nodes.node_library.library_declarations import ModelUsageNodeProperty
         from griptape_nodes.retained_mode.events.access_events import (
             QueryModelAccessForNodeRequest,
@@ -364,7 +366,7 @@ class TestAccessManager:
             library_declarations=[self._catalog()],
         )
 
-        result = GriptapeNodes.handle_request(
+        result = engine.handle_request(
             QueryModelAccessForNodeRequest(
                 node_type=_ProbeNode.__name__,
                 specific_library_name=self._LIBRARY_NAME,
@@ -374,7 +376,7 @@ class TestAccessManager:
         assert isinstance(result, QueryModelAccessForNodeResultSuccess)
         assert [v.model_id for v in result.verdicts] == ["gtc_claude_sonnet_4_6"]
 
-    def test_for_node_preserves_candidate_input_order(self, griptape_nodes: GriptapeNodes) -> None:  # noqa: ARG002
+    def test_for_node_preserves_candidate_input_order(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.events.access_events import (
             QueryModelAccessForNodeRequest,
             QueryModelAccessForNodeResultSuccess,
@@ -382,7 +384,7 @@ class TestAccessManager:
 
         self._register(library_declarations=[self._catalog()])
 
-        result = GriptapeNodes.handle_request(
+        result = engine.handle_request(
             QueryModelAccessForNodeRequest(
                 node_type=_ProbeNode.__name__,
                 candidate_model_ids=["gtc_claude_sonnet_4_6", "gtc_claude_opus_4_7"],
@@ -392,7 +394,7 @@ class TestAccessManager:
         assert isinstance(result, QueryModelAccessForNodeResultSuccess)
         assert [v.model_id for v in result.verdicts] == ["gtc_claude_sonnet_4_6", "gtc_claude_opus_4_7"]
 
-    def test_for_node_catalog_enrichment_attributes_reach_the_hook(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_for_node_catalog_enrichment_attributes_reach_the_hook(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.events.access_events import QueryModelAccessForNodeRequest
 
         self._register(library_declarations=[self._catalog()])
@@ -402,9 +404,9 @@ class TestAccessManager:
         def record(checkpoint: object) -> None:
             seen_attributes.append(dict(checkpoint.attributes))  # type: ignore[attr-defined]
 
-        griptape_nodes.EventManager().add_authorization_hook(record)
+        engine.event_manager.add_authorization_hook(record)
         try:
-            GriptapeNodes.handle_request(
+            engine.handle_request(
                 QueryModelAccessForNodeRequest(
                     node_type=_ProbeNode.__name__,
                     candidate_model_ids=["gtc_claude_opus_4_7"],
@@ -412,7 +414,7 @@ class TestAccessManager:
                 )
             )
         finally:
-            griptape_nodes.EventManager().remove_authorization_hook(record)
+            engine.event_manager.remove_authorization_hook(record)
 
         assert seen_attributes == [
             {
@@ -425,7 +427,7 @@ class TestAccessManager:
 
     # ---------- Bare request (QueryModelAccessRequest) ----------
 
-    def test_bare_request_no_node_no_catalog_attributes(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_bare_request_no_node_no_catalog_attributes(self, engine: Engine) -> None:
         """Bare request: hook sees `ID` only, even when a library is registered.
 
         The bare form must NOT enrich opportunistically -- it has no library scope
@@ -446,13 +448,13 @@ class TestAccessManager:
         def record(checkpoint: object) -> None:
             seen_attributes.append(dict(checkpoint.attributes))  # type: ignore[attr-defined]
 
-        griptape_nodes.EventManager().add_authorization_hook(record)
+        engine.event_manager.add_authorization_hook(record)
         try:
-            result = GriptapeNodes.handle_request(
+            result = engine.handle_request(
                 QueryModelAccessRequest(candidate_model_ids=["gtc_claude_opus_4_7", "anything"])
             )
         finally:
-            griptape_nodes.EventManager().remove_authorization_hook(record)
+            engine.event_manager.remove_authorization_hook(record)
 
         assert isinstance(result, QueryModelAccessResultSuccess)
         # `provider_model_id` is None because the bare form does NOT consult any catalog.
@@ -462,7 +464,7 @@ class TestAccessManager:
             {"id": "anything"},
         ]
 
-    def test_bare_request_hook_can_deny_on_bare_model_id(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_bare_request_hook_can_deny_on_bare_model_id(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.events.access_events import (
             QueryModelAccessRequest,
             QueryModelAccessResultSuccess,
@@ -474,13 +476,13 @@ class TestAccessManager:
                 return CheckpointDenial(failures=(CheckpointFailure(detail="Opus is not in your plan."),))
             return None
 
-        griptape_nodes.EventManager().add_authorization_hook(deny)
+        engine.event_manager.add_authorization_hook(deny)
         try:
-            result = GriptapeNodes.handle_request(
+            result = engine.handle_request(
                 QueryModelAccessRequest(candidate_model_ids=["gtc_claude_opus_4_7", "gtc_claude_sonnet_4_6"])
             )
         finally:
-            griptape_nodes.EventManager().remove_authorization_hook(deny)
+            engine.event_manager.remove_authorization_hook(deny)
 
         assert isinstance(result, QueryModelAccessResultSuccess)
         denied = [v for v in result.verdicts if v.denial is not None]
@@ -488,7 +490,7 @@ class TestAccessManager:
 
     # ---------- Catalog-scoped request (QueryModelAccessForCatalogRequest) ----------
 
-    def test_for_catalog_enriches_when_id_resolves(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_for_catalog_enriches_when_id_resolves(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.events.access_events import QueryModelAccessForCatalogRequest
 
         self._register(library_declarations=[self._catalog()])
@@ -498,16 +500,16 @@ class TestAccessManager:
         def record(checkpoint: object) -> None:
             seen_attributes.append(dict(checkpoint.attributes))  # type: ignore[attr-defined]
 
-        griptape_nodes.EventManager().add_authorization_hook(record)
+        engine.event_manager.add_authorization_hook(record)
         try:
-            GriptapeNodes.handle_request(
+            engine.handle_request(
                 QueryModelAccessForCatalogRequest(
                     library_name=self._LIBRARY_NAME,
                     candidate_model_ids=["gtc_claude_opus_4_7"],
                 )
             )
         finally:
-            griptape_nodes.EventManager().remove_authorization_hook(record)
+            engine.event_manager.remove_authorization_hook(record)
 
         # No "node_type" attribute -- catalog-scoped form has no node attribution.
         assert seen_attributes == [
@@ -518,9 +520,7 @@ class TestAccessManager:
             }
         ]
 
-    def test_for_catalog_unknown_library_returns_success_with_bare_verdicts(
-        self, griptape_nodes: GriptapeNodes
-    ) -> None:
+    def test_for_catalog_unknown_library_returns_success_with_bare_verdicts(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.events.access_events import (
             QueryModelAccessForCatalogRequest,
             QueryModelAccessForCatalogResultSuccess,
@@ -532,16 +532,16 @@ class TestAccessManager:
         def record(checkpoint: object) -> None:
             seen_attributes.append(dict(checkpoint.attributes))  # type: ignore[attr-defined]
 
-        griptape_nodes.EventManager().add_authorization_hook(record)
+        engine.event_manager.add_authorization_hook(record)
         try:
-            result = GriptapeNodes.handle_request(
+            result = engine.handle_request(
                 QueryModelAccessForCatalogRequest(
                     library_name="library-that-does-not-exist",
                     candidate_model_ids=["gtc_claude_opus_4_7"],
                 )
             )
         finally:
-            griptape_nodes.EventManager().remove_authorization_hook(record)
+            engine.event_manager.remove_authorization_hook(record)
 
         assert isinstance(result, QueryModelAccessForCatalogResultSuccess)
         assert result.verdicts[0].model_id == "gtc_claude_opus_4_7"
@@ -549,7 +549,7 @@ class TestAccessManager:
         # Hook still got the bare model_id, no enrichment.
         assert seen_attributes == [{"id": "gtc_claude_opus_4_7"}]
 
-    def test_for_catalog_unknown_id_no_enrichment_but_query_still_happens(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_for_catalog_unknown_id_no_enrichment_but_query_still_happens(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.events.access_events import (
             QueryModelAccessForCatalogRequest,
             QueryModelAccessForCatalogResultSuccess,
@@ -562,16 +562,16 @@ class TestAccessManager:
         def record(checkpoint: object) -> None:
             seen_attributes.append(dict(checkpoint.attributes))  # type: ignore[attr-defined]
 
-        griptape_nodes.EventManager().add_authorization_hook(record)
+        engine.event_manager.add_authorization_hook(record)
         try:
-            result = GriptapeNodes.handle_request(
+            result = engine.handle_request(
                 QueryModelAccessForCatalogRequest(
                     library_name=self._LIBRARY_NAME,
                     candidate_model_ids=["not_in_catalog"],
                 )
             )
         finally:
-            griptape_nodes.EventManager().remove_authorization_hook(record)
+            engine.event_manager.remove_authorization_hook(record)
 
         assert isinstance(result, QueryModelAccessForCatalogResultSuccess)
         assert result.verdicts[0].model_id == "not_in_catalog"
@@ -588,7 +588,7 @@ class TestCodecAccess:
     surfaced via a Failure result, not silently defaulted.
     """
 
-    def test_read_direction_uses_read_video_codec_action(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_read_direction_uses_read_video_codec_action(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.events.access_events import (
             CodecAccessDirection,
             QueryCodecAccessRequest,
@@ -600,18 +600,18 @@ class TestCodecAccess:
         def record(checkpoint: object) -> None:
             seen_actions.append(checkpoint.action)  # type: ignore[attr-defined]
 
-        griptape_nodes.EventManager().add_authorization_hook(record)
+        engine.event_manager.add_authorization_hook(record)
         try:
-            result = GriptapeNodes.handle_request(
+            result = engine.handle_request(
                 QueryCodecAccessRequest(candidate_codecs=["h264"], direction=CodecAccessDirection.READ)
             )
         finally:
-            griptape_nodes.EventManager().remove_authorization_hook(record)
+            engine.event_manager.remove_authorization_hook(record)
 
         assert isinstance(result, QueryCodecAccessResultSuccess)
         assert seen_actions == ["ReadVideoCodec"]
 
-    def test_write_direction_uses_write_video_codec_action(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_write_direction_uses_write_video_codec_action(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.events.access_events import (
             CodecAccessDirection,
             QueryCodecAccessRequest,
@@ -623,18 +623,18 @@ class TestCodecAccess:
         def record(checkpoint: object) -> None:
             seen_actions.append(checkpoint.action)  # type: ignore[attr-defined]
 
-        griptape_nodes.EventManager().add_authorization_hook(record)
+        engine.event_manager.add_authorization_hook(record)
         try:
-            result = GriptapeNodes.handle_request(
+            result = engine.handle_request(
                 QueryCodecAccessRequest(candidate_codecs=["hevc"], direction=CodecAccessDirection.WRITE)
             )
         finally:
-            griptape_nodes.EventManager().remove_authorization_hook(record)
+            engine.event_manager.remove_authorization_hook(record)
 
         assert isinstance(result, QueryCodecAccessResultSuccess)
         assert seen_actions == ["WriteVideoCodec"]
 
-    def test_unknown_direction_returns_failure(self, griptape_nodes: GriptapeNodes) -> None:  # noqa: ARG002
+    def test_unknown_direction_returns_failure(self, engine: Engine) -> None:
         # Exercises the runtime `case _:` guard for wire-side stray values --
         # ``direction`` is a StrEnum so pyright catches Python-side typos, but
         # a request deserialized from the WS boundary can still carry any
@@ -645,7 +645,7 @@ class TestCodecAccess:
             QueryCodecAccessResultFailure,
         )
 
-        result = GriptapeNodes.handle_request(
+        result = engine.handle_request(
             QueryCodecAccessRequest(candidate_codecs=["h264"], direction="rewrite")  # type: ignore[arg-type]
         )
 
@@ -655,7 +655,7 @@ class TestCodecAccess:
         assert "read" in details.lower()
         assert "write" in details.lower()
 
-    def test_container_format_threaded_through_checkpoint_attributes(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_container_format_threaded_through_checkpoint_attributes(self, engine: Engine) -> None:
         # A policy that only cares about codec+container pairing (e.g. hevc in
         # mp4 is denied but hevc in mkv is allowed) needs the container to
         # appear on the checkpoint attributes; the request field carries it.
@@ -670,20 +670,20 @@ class TestCodecAccess:
         def record(checkpoint: object) -> None:
             seen_attributes.append(dict(checkpoint.attributes))  # type: ignore[attr-defined]
 
-        griptape_nodes.EventManager().add_authorization_hook(record)
+        engine.event_manager.add_authorization_hook(record)
         try:
-            result = GriptapeNodes.handle_request(
+            result = engine.handle_request(
                 QueryCodecAccessRequest(
                     candidate_codecs=["hevc"], direction=CodecAccessDirection.WRITE, container_format="mp4"
                 )
             )
         finally:
-            griptape_nodes.EventManager().remove_authorization_hook(record)
+            engine.event_manager.remove_authorization_hook(record)
 
         assert isinstance(result, QueryCodecAccessResultSuccess)
         assert seen_attributes == [{"id": "hevc", "container_format": "mp4"}]
 
-    def test_container_format_omitted_when_none(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_container_format_omitted_when_none(self, engine: Engine) -> None:
         # When the caller doesn't scope the query to a container, the attribute
         # is not populated -- a policy that requires the pairing key still
         # denies deterministically (missing key), not on a synthesized default.
@@ -697,17 +697,17 @@ class TestCodecAccess:
         def record(checkpoint: object) -> None:
             seen_attributes.append(dict(checkpoint.attributes))  # type: ignore[attr-defined]
 
-        griptape_nodes.EventManager().add_authorization_hook(record)
+        engine.event_manager.add_authorization_hook(record)
         try:
-            GriptapeNodes.handle_request(
+            engine.handle_request(
                 QueryCodecAccessRequest(candidate_codecs=["h264"], direction=CodecAccessDirection.READ)
             )
         finally:
-            griptape_nodes.EventManager().remove_authorization_hook(record)
+            engine.event_manager.remove_authorization_hook(record)
 
         assert seen_attributes == [{"id": "h264"}]
 
-    def test_denied_verdict_carries_denial(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_denied_verdict_carries_denial(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.events.access_events import (
             CodecAccessDirection,
             QueryCodecAccessRequest,
@@ -720,9 +720,9 @@ class TestCodecAccess:
                 return CheckpointDenial(failures=(CheckpointFailure(detail="HEVC write is not in your plan."),))
             return None
 
-        griptape_nodes.EventManager().add_authorization_hook(deny_hevc)
+        engine.event_manager.add_authorization_hook(deny_hevc)
         try:
-            result = GriptapeNodes.handle_request(
+            result = engine.handle_request(
                 QueryCodecAccessRequest(
                     candidate_codecs=["h264", "hevc", "vp9"],
                     direction=CodecAccessDirection.WRITE,
@@ -730,7 +730,7 @@ class TestCodecAccess:
                 )
             )
         finally:
-            griptape_nodes.EventManager().remove_authorization_hook(deny_hevc)
+            engine.event_manager.remove_authorization_hook(deny_hevc)
 
         assert isinstance(result, QueryCodecAccessResultSuccess)
         assert [v.codec for v in result.verdicts] == ["h264", "hevc", "vp9"]
@@ -740,7 +740,7 @@ class TestCodecAccess:
         assert all(v.container_format == "mp4" for v in result.verdicts)
 
     def test_id_attribute_parity_between_query_and_enforcement(
-        self, griptape_nodes: GriptapeNodes, monkeypatch: pytest.MonkeyPatch
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A single hook keying on attributes["id"] must deny both paths for the same codec.
 
@@ -772,15 +772,15 @@ class TestCodecAccess:
             return None
 
         # --- Query path: QueryCodecAccessRequest ---
-        griptape_nodes.EventManager().add_authorization_hook(deny_hevc_by_id)
+        engine.event_manager.add_authorization_hook(deny_hevc_by_id)
         try:
-            query_result = GriptapeNodes.handle_request(
+            query_result = engine.handle_request(
                 QueryCodecAccessRequest(
                     candidate_codecs=["hevc"], direction=CodecAccessDirection.WRITE, container_format="mp4"
                 )
             )
         finally:
-            griptape_nodes.EventManager().remove_authorization_hook(deny_hevc_by_id)
+            engine.event_manager.remove_authorization_hook(deny_hevc_by_id)
 
         assert isinstance(query_result, QueryCodecAccessResultSuccess)
         assert query_result.verdicts[0].denial is not None
@@ -797,13 +797,13 @@ class TestCodecAccess:
         provider = VideoArtifactProvider(registry=None)  # type: ignore[arg-type]
 
         seen_attributes.clear()
-        griptape_nodes.EventManager().add_authorization_hook(deny_hevc_by_id)
+        engine.event_manager.add_authorization_hook(deny_hevc_by_id)
         try:
             # OSManager stages before calling this; a stand-in path is fine
             # since ffprobe is mocked.
             enforcement_denial = provider.check_write_format_from_path("/tmp/staged.mp4", "mp4")  # noqa: S108
         finally:
-            griptape_nodes.EventManager().remove_authorization_hook(deny_hevc_by_id)
+            engine.event_manager.remove_authorization_hook(deny_hevc_by_id)
 
         # The critical assertion: the enforcement path denies for the SAME
         # hook shape that the query path denies for.

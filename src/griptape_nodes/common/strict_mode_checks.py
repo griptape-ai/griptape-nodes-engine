@@ -142,4 +142,57 @@ RULES: dict[str, StrictModeRule] = {
         ),
         worker_escalation=False,
     ),
+    "connection-hooks-inert-on-worker": StrictModeRule(
+        rule_id="connection-hooks-inert-on-worker",
+        default_severity=StrictModeSeverity.WARNING,
+        correctness=False,
+        description=(
+            "A node class in a worker-hosted library overrides "
+            "connection lifecycle hooks (allow/before/after "
+            "incoming/outgoing connection and their _removed "
+            "variants). Connections are orchestrator-owned state and "
+            "these hooks are invoked there, where a worker-hosted "
+            "library is represented by a synthesized stub that does "
+            "not carry the override -- the author's code never runs, "
+            "silently."
+        ),
+        remediation_template=(
+            "Node class '{node_class}' overrides {hook_names}, which "
+            "never fire for a worker-hosted (Isolated) library: "
+            "connection hooks run on the orchestrator against a stub "
+            "class. Dynamic parameters driven by connections are not "
+            "supported under isolation; run the library in Shared "
+            "mode or remove the override."
+        ),
+        # Reported during library load on the worker; escalating to ERROR
+        # would alarm on a node that otherwise executes fine.
+        worker_escalation=False,
+    ),
+    "value-hooks-execute-only-on-worker": StrictModeRule(
+        rule_id="value-hooks-execute-only-on-worker",
+        default_severity=StrictModeSeverity.WARNING,
+        correctness=False,
+        description=(
+            "A node class in a worker-hosted library overrides "
+            "before_value_set/after_value_set. Editor value edits run "
+            "these hooks on the orchestrator's stub (never the "
+            "author's code); the author's hooks fire on the worker "
+            "only during execute-time input hydration, on a transient "
+            "node discarded after process."
+        ),
+        remediation_template=(
+            "Node class '{node_class}' overrides {hook_names}. For a "
+            "worker-hosted (Isolated) library these fire only during "
+            "execute-time input hydration -- transforming values "
+            "still works, but the hooks do not run when a value "
+            "changes in the editor, and any parameter-list mutation "
+            "they make is discarded with the transient node. If the "
+            "node needs editor-time reactivity, run the library in "
+            "Shared mode."
+        ),
+        # Same load-time reporting channel as
+        # parameter-behaviors-dropped-in-schema; ERROR would be too harsh
+        # for a node that still executes correctly.
+        worker_escalation=False,
+    ),
 }

@@ -52,6 +52,7 @@ class ParameterNumber(Parameter):
         serializable: bool = True,
         user_defined: bool = False,
         private: bool = False,
+        exclude_from_metadata: bool = False,
         element_id: str | None = None,
         element_type: str | None = None,
         parent_container_name: str | None = None,
@@ -91,6 +92,7 @@ class ParameterNumber(Parameter):
             serializable: Whether the parameter is serializable
             user_defined: Whether the parameter is user-defined
             private: Whether this parameter is private
+            exclude_from_metadata: Whether this parameter is excluded from plaintext sidecar and image metadata
             element_id: Element ID
             element_type: Element type
             parent_container_name: Name of parent container
@@ -162,6 +164,7 @@ class ParameterNumber(Parameter):
             serializable=serializable,
             user_defined=user_defined,
             private=private,
+            exclude_from_metadata=exclude_from_metadata,
             element_id=element_id,
             element_type=element_type,
             parent_container_name=parent_container_name,

@@ -7,6 +7,7 @@ Comprehensive path handling utilities including:
 - Path normalization (Windows long paths, etc.)
 - Workspace operations (relative path conversions)
 - file:// URI parsing
+- URL discrimination (telling a URL apart from a filesystem path)
 
 These utilities provide consistent path handling across the codebase
 and are used by OSManager, FileDrivers, and workspace managers.
@@ -34,8 +35,21 @@ _LINUX_MOUNT_STRIP_PATTERN = r"^/(mnt|media)/[^/]+/?"
 # may treat `\` as a shell escape rather than a directory separator.
 _WINDOWS_SEPARATOR_MATCH_PATTERN = r"^(?:[A-Z]:\\|\\\\)"
 
+# A URL scheme followed by `://`, e.g. `http://`, `https://`, `s3://`.
+#
+# The scheme must be at least TWO characters. That is what keeps a Windows drive letter
+# (`C:`, always exactly one character) from being read as a scheme -- so a path spelled
+# `C://outputs/clip.mp4` stays a path. RFC 3986 permits single-character schemes, but no
+# scheme this codebase handles is one character, and misreading a drive letter is the far
+# more likely failure.
+_URL_SCHEME_MATCH_PATTERN = r"^[A-Za-z][A-Za-z0-9+.\-]+://"
+
+# The path segment that the static file server mounts the workspace directory under.
+_STATIC_SERVER_WORKSPACE_SEGMENT = "/workspace/"
+
 _WINDOWS_DRIVE_PATTERN = re.compile(_WINDOWS_DRIVE_MATCH_PATTERN, re.IGNORECASE)
 _WINDOWS_SEPARATOR_PATTERN = re.compile(_WINDOWS_SEPARATOR_MATCH_PATTERN, re.IGNORECASE)
+_URL_SCHEME_PATTERN = re.compile(_URL_SCHEME_MATCH_PATTERN)
 _WINDOWS_UNC_PATTERN = re.compile(_WINDOWS_UNC_MATCH_PATTERN)
 _MACOS_VOLUME_PATTERN = re.compile(_MACOS_VOLUME_MATCH_PATTERN)
 _LINUX_MOUNT_PATTERN = re.compile(_LINUX_MOUNT_MATCH_PATTERN)
@@ -248,6 +262,105 @@ def parse_file_uri(location: str) -> str | None:
         path = path[1:]
 
     return path
+
+
+def is_url(location: str) -> bool:
+    r"""Return True if ``location`` carries a URL scheme rather than being a filesystem path.
+
+    This is the discriminator to reach for before handing a string to any path
+    helper in this module. Those helpers assume a filesystem path, so a URL that
+    reaches them is silently mangled rather than rejected: ``resolve_file_path``
+    anchors ``http://host/a.mp4`` to the base directory and collapses ``//`` to
+    the platform separator, producing a string that is neither a URL nor a real
+    path.
+
+    A Windows drive letter is NOT a scheme -- see ``_URL_SCHEME_MATCH_PATTERN``
+    for why the two-character minimum is what separates them.
+
+    ``file://`` URLs count as URLs here. They are still *convertible* to a local
+    path; use ``parse_file_uri`` for that. Callers that want "is this something I
+    must not treat as a path" should test this function first and convert
+    ``file://`` afterwards.
+
+    Args:
+        location: String to classify.
+
+    Returns:
+        True if the string begins with a URL scheme followed by ``://``.
+
+    Examples:
+        >>> is_url("http://localhost:8124/workspace/staticfiles/clip.mp4?t=1")
+        True
+        >>> is_url("https://example.com/clip.mp4")
+        True
+        >>> is_url("file:///outputs/clip.mp4")
+        True
+        >>> is_url(r"C:\Users\artist\clip.mp4")
+        False
+        >>> is_url("C://Users/artist/clip.mp4")
+        False
+        >>> is_url("/outputs/clip.mp4")
+        False
+        >>> is_url("outputs/clip.mp4")
+        False
+    """
+    return _URL_SCHEME_PATTERN.match(location) is not None
+
+
+def parse_static_server_url(location: str, workspace_path: Path) -> Path | None:
+    """Map a static file server URL back to the workspace file it serves.
+
+    The engine hands node outputs around as static server URLs
+    (``http://localhost:8124/workspace/staticfiles/<name>.mp4?t=<cachebuster>``).
+    Those URLs address a file that already exists inside the workspace, so a
+    consumer that needs a real path -- to hand to a subprocess like FFmpeg, say --
+    can have one without an HTTP round-trip.
+
+    Only ``localhost`` URLs qualify. A remote host may serve a ``/workspace/``
+    path too, but its files are not on this machine, so there is no local path to
+    return.
+
+    Args:
+        location: Location string, which may or may not be a static server URL.
+        workspace_path: The workspace directory the static server serves from.
+
+    Returns:
+        The local Path of the served file, or None if ``location`` is not a
+        localhost static server URL.
+
+    Examples:
+        >>> parse_static_server_url(
+        ...     "http://localhost:8124/workspace/staticfiles/clip.mp4?t=1786574231",
+        ...     Path("/home/artist/GriptapeNodes"),
+        ... )
+        PosixPath('/home/artist/GriptapeNodes/staticfiles/clip.mp4')
+        >>> parse_static_server_url("http://localhost:8124/api/health", Path("/ws")) is None
+        True
+        >>> parse_static_server_url("https://example.com/workspace/clip.mp4", Path("/ws")) is None
+        True
+    """
+    if not location.startswith(("http://localhost:", "https://localhost:")):
+        return None
+
+    # Strip the cachebuster (`?t=...`) before parsing: it is addressing metadata for
+    # the HTTP server, not part of the filename.
+    url_without_query = location.split("?", maxsplit=1)[0]
+    parsed = urlparse(url_without_query)
+
+    if _STATIC_SERVER_WORKSPACE_SEGMENT not in parsed.path:
+        return None
+
+    workspace_relative_path = parsed.path.split(_STATIC_SERVER_WORKSPACE_SEGMENT, 1)[1]
+    if not workspace_relative_path:
+        return None
+
+    # Deliberately NOT percent-decoded. `LocalStorageDriver.create_signed_download_url`
+    # builds these URLs with `Path.as_posix()` and no encoding step, so the path segment
+    # is already the literal filename -- decoding it would corrupt a file whose name
+    # genuinely contains a `%`. This mirrors what the read path
+    # (`StaticServerFileDriver`) does, which is the point: `File.resolve()` and
+    # `File.read_bytes()` must agree on which file a URL names.
+    return workspace_path / workspace_relative_path
 
 
 def sanitize_path_string(path: str | Path) -> str:

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import threading
 import time
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
@@ -459,8 +460,23 @@ class TestSpawnWorker:
         with patch("asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
             await worker_manager.spawn_worker(args, "My Library")
 
-        mock_exec.assert_called_once_with(*args, env=ANY)
+        mock_exec.assert_called_once_with(*args, env=ANY, stdout=sys.stdout, stderr=sys.stderr)
         assert worker_manager._managed_worker_processes["My Library"] is mock_proc
+
+    @pytest.mark.asyncio
+    async def test_spawn_hands_worker_the_orchestrator_stdio(self, worker_manager: WorkerManager) -> None:
+        # Worker logs must land in the same stream as orchestrator logs. Implicit stdio
+        # inheritance is POSIX-only: on Windows a redirected stdout (e.g. the desktop app's
+        # pipe) never reaches the child unless passed explicitly, so the worker would log
+        # to an invisible console instead.
+        with patch("asyncio.create_subprocess_exec", return_value=MagicMock()) as mock_exec:
+            await worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "my-key")
+
+        assert mock_exec.call_args.kwargs["stdout"] is sys.stdout
+        assert mock_exec.call_args.kwargs["stderr"] is sys.stderr
+        # Worker stdout is a pipe under a GUI-hosted orchestrator; unbuffered output keeps
+        # log lines from stalling in Python's block buffer.
+        assert mock_exec.call_args.kwargs["env"]["PYTHONUNBUFFERED"] == "1"
 
     @pytest.mark.asyncio
     async def test_spawn_env_stamps_orchestrator_engine_id(self, worker_manager: WorkerManager) -> None:

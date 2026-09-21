@@ -92,11 +92,7 @@ The migration guide includes replacements for all deprecated image processing, d
 
 ## How do I uninstall Griptape Nodes?
 
-```bash
-griptape-nodes self uninstall
-```
-
-To reinstall, follow the instructions on the [installation](installation.md) page.
+See [Uninstalling Griptape Nodes](uninstalling.md).
 
 ## How do I update Griptape Nodes?
 
@@ -121,7 +117,7 @@ gtn libraries sync
 You can connect with us through several channels:
 
 - [Website](https://www.griptape.ai) - Visit our homepage for general information
-- [Discord](https://discord.gg/gnWRz88eym) - Join our community for questions and discussions
+- [Discord](https://discord.com/invite/rpWWNmgGv9) - Join our community for questions and discussions
 - [GitHub](https://github.com/griptape-ai/griptape-nodes) - Submit issues or contribute to the codebase
 
 These same links are also available as the three icons in the footer (bottom right) of every documentation page.

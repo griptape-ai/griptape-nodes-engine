@@ -111,6 +111,36 @@ wall parameter rather than getting one each.
 A plain **Group** doesn't do any of this — it has no subflow to wall off, so
 connections just pass straight through its boundary.
 
+## Nesting groups inside groups
+
+A group can hold another group, as deeply as you like. Drop a group onto
+another group's body, or select a group along with other nodes and press
+`Cmd/Ctrl+G`, and the inner group becomes a child of the outer one — carrying
+everything already inside it along with it.
+
+Nesting is how you break a large flow into readable layers: a ForEach Group
+whose body is itself a Subflow Node Group, say, so each iteration runs a
+named cluster of work instead of a sprawl of loose nodes.
+
+Everything a single group does applies at each level. Running the outer group
+runs the inner ones as part of it, so you don't need to run them separately.
+Collapsing, rolling up, and **Fit to nodes** each act on the group you invoke
+them on, leaving whatever is nested inside untouched.
+
+Connections nest the same way. A connection from outside the outer group to a
+node buried two levels down passes through a wall parameter on *each* group it
+crosses, so you can trace the value inward one boundary at a time. Connections
+that stay entirely within one group don't get wall parameters, no matter how
+deeply that group is nested — only crossing a boundary creates one.
+
+**Ungroup** peels off one layer at a time. Ungrouping the outer group leaves
+the inner group intact and drops it, still holding its children, onto the
+canvas where it was. Deleting a group does the same to whatever it held.
+
+The one arrangement the editor won't allow is a group that ends up inside
+itself — dropping a group into one of its own descendants is refused, since
+there would be no outermost group left to run.
+
 ## Collapsing and rolling up
 
 Click the chevron in a group's header to **collapse** it. A collapsed group

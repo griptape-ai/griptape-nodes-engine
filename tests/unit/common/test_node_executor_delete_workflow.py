@@ -2,6 +2,7 @@
 
 import tempfile
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import anyio
@@ -18,7 +19,7 @@ MODULE_PATH = "griptape_nodes.common.node_executor"
 
 
 def _make_executor() -> NodeExecutor:
-    return NodeExecutor.__new__(NodeExecutor)
+    return NodeExecutor(engine=MagicMock())
 
 
 def _make_delete_success() -> DeleteWorkflowResultSuccess:
@@ -36,20 +37,18 @@ class TestDeleteWorkflowKeyDerivation:
             workflow_path = workspace / "my_flow.py"
             await workflow_path.touch()
 
-            mock_gn = MagicMock()
-            mock_gn.ConfigManager.return_value.workspace_path = workspace
-            mock_gn.ahandle_request = AsyncMock(return_value=_make_delete_success())
+            executor = _make_executor()
+            mock_engine = cast("MagicMock", executor.engine)
+            mock_engine.config_manager.workspace_path = workspace
+            mock_engine.ahandle_request = AsyncMock(return_value=_make_delete_success())
 
-            with (
-                patch(f"{MODULE_PATH}.GriptapeNodes", mock_gn),
-                patch(f"{MODULE_PATH}.WorkflowRegistry") as mock_registry,
-            ):
+            with patch(f"{MODULE_PATH}.WorkflowRegistry") as mock_registry:
                 # Mark as already registered so key derivation is the only thing being tested.
                 mock_registry.has_workflow_with_name.return_value = True
 
-                await _make_executor()._delete_workflow(workflow_path=Path(workflow_path))
+                await executor._delete_workflow(workflow_path=Path(workflow_path))
 
-            delete_request = mock_gn.ahandle_request.call_args.args[0]
+            delete_request = mock_engine.ahandle_request.call_args.args[0]
             assert isinstance(delete_request, DeleteWorkflowRequest)
             assert delete_request.name == "my_flow"
 
@@ -62,19 +61,17 @@ class TestDeleteWorkflowKeyDerivation:
             await workflow_path.parent.mkdir()
             await workflow_path.touch()
 
-            mock_gn = MagicMock()
-            mock_gn.ConfigManager.return_value.workspace_path = workspace
-            mock_gn.ahandle_request = AsyncMock(return_value=_make_delete_success())
+            executor = _make_executor()
+            mock_engine = cast("MagicMock", executor.engine)
+            mock_engine.config_manager.workspace_path = workspace
+            mock_engine.ahandle_request = AsyncMock(return_value=_make_delete_success())
 
-            with (
-                patch(f"{MODULE_PATH}.GriptapeNodes", mock_gn),
-                patch(f"{MODULE_PATH}.WorkflowRegistry") as mock_registry,
-            ):
+            with patch(f"{MODULE_PATH}.WorkflowRegistry") as mock_registry:
                 mock_registry.has_workflow_with_name.return_value = True
 
-                await _make_executor()._delete_workflow(workflow_path=Path(workflow_path))
+                await executor._delete_workflow(workflow_path=Path(workflow_path))
 
-            delete_request = mock_gn.ahandle_request.call_args.args[0]
+            delete_request = mock_engine.ahandle_request.call_args.args[0]
             assert isinstance(delete_request, DeleteWorkflowRequest)
             assert delete_request.name == "subdir/my_flow"
 
@@ -89,19 +86,17 @@ class TestDeleteWorkflowKeyDerivation:
             workflow_path = await anyio.Path(other_dir).resolve() / "my_flow.py"
             await workflow_path.touch()
 
-            mock_gn = MagicMock()
-            mock_gn.ConfigManager.return_value.workspace_path = workspace
-            mock_gn.ahandle_request = AsyncMock(return_value=_make_delete_success())
+            executor = _make_executor()
+            mock_engine = cast("MagicMock", executor.engine)
+            mock_engine.config_manager.workspace_path = workspace
+            mock_engine.ahandle_request = AsyncMock(return_value=_make_delete_success())
 
-            with (
-                patch(f"{MODULE_PATH}.GriptapeNodes", mock_gn),
-                patch(f"{MODULE_PATH}.WorkflowRegistry") as mock_registry,
-            ):
+            with patch(f"{MODULE_PATH}.WorkflowRegistry") as mock_registry:
                 mock_registry.has_workflow_with_name.return_value = True
 
-                await _make_executor()._delete_workflow(workflow_path=Path(workflow_path))
+                await executor._delete_workflow(workflow_path=Path(workflow_path))
 
-            delete_request = mock_gn.ahandle_request.call_args.args[0]
+            delete_request = mock_engine.ahandle_request.call_args.args[0]
             assert isinstance(delete_request, DeleteWorkflowRequest)
             expected_key = (await anyio.Path(other_dir).resolve() / "my_flow").as_posix()
             assert delete_request.name == expected_key
@@ -122,18 +117,16 @@ class TestDeleteWorkflowRegistrationFallback:
             mock_metadata_result = MagicMock(spec=LoadWorkflowMetadataResultSuccess)
             mock_metadata_result.metadata = mock_metadata
 
-            mock_gn = MagicMock()
-            mock_gn.ConfigManager.return_value.workspace_path = workspace
+            executor = _make_executor()
+            mock_engine = cast("MagicMock", executor.engine)
+            mock_engine.config_manager.workspace_path = workspace
             # First ahandle_request call loads metadata; second issues DeleteWorkflowRequest.
-            mock_gn.ahandle_request = AsyncMock(side_effect=[mock_metadata_result, _make_delete_success()])
+            mock_engine.ahandle_request = AsyncMock(side_effect=[mock_metadata_result, _make_delete_success()])
 
-            with (
-                patch(f"{MODULE_PATH}.GriptapeNodes", mock_gn),
-                patch(f"{MODULE_PATH}.WorkflowRegistry") as mock_registry,
-            ):
+            with patch(f"{MODULE_PATH}.WorkflowRegistry") as mock_registry:
                 mock_registry.has_workflow_with_name.return_value = False
 
-                await _make_executor()._delete_workflow(workflow_path=Path(workflow_path))
+                await executor._delete_workflow(workflow_path=Path(workflow_path))
 
             mock_registry.generate_new_workflow.assert_called_once_with(
                 registry_key="my_flow", metadata=mock_metadata, file_path="my_flow.py"
@@ -147,16 +140,14 @@ class TestDeleteWorkflowRegistrationFallback:
             workflow_path = workspace / "my_flow.py"
             await workflow_path.touch()
 
-            mock_gn = MagicMock()
-            mock_gn.ConfigManager.return_value.workspace_path = workspace
-            mock_gn.ahandle_request = AsyncMock(return_value=_make_delete_success())
+            executor = _make_executor()
+            mock_engine = cast("MagicMock", executor.engine)
+            mock_engine.config_manager.workspace_path = workspace
+            mock_engine.ahandle_request = AsyncMock(return_value=_make_delete_success())
 
-            with (
-                patch(f"{MODULE_PATH}.GriptapeNodes", mock_gn),
-                patch(f"{MODULE_PATH}.WorkflowRegistry") as mock_registry,
-            ):
+            with patch(f"{MODULE_PATH}.WorkflowRegistry") as mock_registry:
                 mock_registry.has_workflow_with_name.return_value = True
 
-                await _make_executor()._delete_workflow(workflow_path=Path(workflow_path))
+                await executor._delete_workflow(workflow_path=Path(workflow_path))
 
             mock_registry.generate_new_workflow.assert_not_called()

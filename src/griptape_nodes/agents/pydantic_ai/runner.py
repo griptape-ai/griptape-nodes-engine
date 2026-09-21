@@ -63,6 +63,7 @@ if TYPE_CHECKING:
 
     from pydantic_ai._run_context import RunContext
     from pydantic_ai.messages import ModelMessage, UserContent
+    from pydantic_ai.settings import ModelSettings
     from pydantic_ai.toolsets import AbstractToolset
     from pydantic_ai.usage import UsageLimits
 
@@ -139,6 +140,10 @@ class AgentRunResult:
         cancelled: ``True`` when the run was stopped via its cancel event before
             completing. A cancelled run does not persist its turn to the thread,
             so ``message_count`` reflects the pre-run history length.
+        truncated: ``True`` when the model stopped because it hit the output
+            token limit rather than finishing its reply. ``output`` holds the
+            partial text, which is complete-looking but ends mid-thought, so
+            callers should tell the user rather than render it as a normal turn.
     """
 
     thread_id: str
@@ -146,6 +151,7 @@ class AgentRunResult:
     message_count: int
     image_urls: list[str] = field(default_factory=list)
     cancelled: bool = False
+    truncated: bool = False
 
 
 @dataclass
@@ -166,6 +172,7 @@ class PydanticAgentRunner:
     auto_load_skills: bool = True
     skills_directory: str = DEFAULT_SKILLS_DIRECTORY
     usage_limits: UsageLimits | None = None
+    model_settings: ModelSettings | None = None
 
     _agent: Agent[Any, str] = field(init=False)
     _image_toolset: ImageGenerationToolset | None = field(init=False, default=None)
@@ -173,63 +180,146 @@ class PydanticAgentRunner:
     def __post_init__(self) -> None:
         toolsets: list[Any] = list(self.mcp_servers)
         instructions = self._build_instructions()
-        capabilities = self._build_skills_capabilities()
         agent_kwargs: dict[str, Any] = {
             "instructions": instructions,
             "toolsets": toolsets or None,
-            "capabilities": capabilities or None,
         }
         if self.system_prompt:
             agent_kwargs["system_prompt"] = self.system_prompt
-        self._agent = Agent(
-            build_model(self.model_name, provider=self.provider, api_key=self.api_key, base_url=self.base_url),
-            **agent_kwargs,
+        # `build_model` resolves `settings=None` to the catalog preset for this
+        # model, so read the cap back off the built model rather than off
+        # `self.model_settings` — the latter is None on the normal sidebar path.
+        model = build_model(
+            self.model_name,
+            provider=self.provider,
+            api_key=self.api_key,
+            base_url=self.base_url,
+            settings=self.model_settings,
         )
+        self._agent = Agent(model, **agent_kwargs)
         if self.image_config is not None:
             if self.static_files_manager is None:
                 msg = "image_config requires a static_files_manager to persist generated images."
                 raise ValueError(msg)
             self._image_toolset = register_image_tools(self._agent, self.image_config, self.static_files_manager)
+        resolved_settings = model.settings or {}
         logger.info(
-            "PydanticAgentRunner ready: model=%s workspace=%s mcp_servers=%d image_tool=%s skills=%d usage_limits=%s",
+            "PydanticAgentRunner ready: model=%s workspace=%s mcp_servers=%d image_tool=%s skills_library=%s "
+            "usage_limits=%s max_tokens=%s",
             self.model_name,
             self.workspace_root,
             len(self.mcp_servers),
             self._image_toolset is not None,
-            len(capabilities),
+            self._skills_library(),
             self.usage_limits,
+            # "provider default" is the honest description of sending no
+            # max_tokens: the ceiling exists, we just don't choose it.
+            resolved_settings.get("max_tokens", "provider default"),
         )
 
     def _build_instructions(self) -> str | None:
         """Compose the instruction string from the user's input.
 
-        Skill guidance is injected separately by :class:`SkillsCapability` via
-        its own ``get_instructions`` hook, so it is not concatenated here.
+        Each skill is its own deferred capability, so its guidance reaches the
+        model through Pydantic AI's ``load_capability`` tool rather than being
+        concatenated here.
         """
         return self.instructions or None
+
+    def _skills_library(self) -> Path | None:
+        """The skills directory to scan, or ``None`` when there is nothing to scan."""
+        if not self.auto_load_skills:
+            return None
+        skills_dir = self.workspace_root / self.skills_directory
+        if not skills_dir.is_dir():
+            return None
+        return skills_dir
 
     def _build_skills_capabilities(self) -> list[SkillsCapability]:
         """Build the skills capability exposing ``.agents/skills`` to the agent.
 
-        Returns an empty list when skills are disabled or the skills directory
-        is absent so the agent is created without a skills capability rather
-        than an empty one. ``run_skill_script`` is excluded because the workspace
-        already exposes a gated shell tool and skills here ship no scripts;
-        ``auto_reload`` re-scans the directory before each run so edits land
-        without restarting the engine.
+        Built per run rather than per runner: discovery is a construction-time
+        snapshot, so rebuilding it each turn is what makes an edited skill land
+        without restarting the engine. ``scripts=False`` leaves
+        ``run_skill_script`` unregistered because the workspace already exposes a
+        gated shell tool and skills here ship no scripts.
+
+        Returns an empty list when skills are disabled, the directory is absent,
+        or no skill in it loads, so the run proceeds without skills instead of
+        failing on a bad ``SKILL.md``.
         """
-        if not self.auto_load_skills:
+        skills_dir = self._skills_library()
+        if skills_dir is None:
             return []
-        skills_dir = self.workspace_root / self.skills_directory
-        if not skills_dir.is_dir():
+        capability = self._load_skills(skills_dir)
+        if capability is None:
+            capability = self._load_usable_skills(skills_dir)
+        if capability is None:
             return []
-        return [
-            SkillsCapability(
+        return [capability]
+
+    def _load_skills(
+        self,
+        skills_dir: Path,
+        include: list[str] | None = None,
+        *,
+        index_resources: bool = True,
+    ) -> SkillsCapability | None:
+        """Build a capability over ``skills_dir``, or ``None`` when the loader rejects a skill.
+
+        The loader validates every selected skill while constructing and raises on the
+        first one it rejects, so this succeeds only when all of them load. ``ValueError``
+        is a frontmatter report and ``OSError`` an unreadable ``SKILL.md``; both cost
+        skills rather than the run.
+
+        ``index_resources=False`` skips indexing bundled *resources*, which a probe does
+        not need and which is the bulk of what makes probing expensive. Scripts are still
+        discovered, so a library shipping them pays more per probe than one that does not.
+        """
+        exclude_resources = None if index_resources else ["*"]
+        try:
+            return SkillsCapability(
                 directories=[skills_dir],
-                exclude_tools={"run_skill_script"},
-                auto_reload=True,
+                scripts=False,
+                include=include,
+                exclude_resources=exclude_resources,
             )
+        except (ValueError, OSError) as e:
+            logger.warning(
+                "Attempted to load skills %s from %s. Failed because of: %s",
+                include if include is not None else "(all)",
+                skills_dir,
+                e,
+            )
+            return None
+
+    def _load_usable_skills(self, skills_dir: Path) -> SkillsCapability | None:
+        """Build a capability over only the skills in ``skills_dir`` that load on their own.
+
+        One rejected ``SKILL.md`` fails the whole library, so probe each skill by name
+        first: ``include`` filters before the loader parses anything, which pins a
+        rejection to the skill that caused it and keeps the others. Returns ``None`` when
+        nothing survives.
+
+        Probing costs a construction per skill, and every construction walks the whole
+        library's bundled files, so probes skip indexing its resources: a probe only has
+        to answer whether the frontmatter parses, and the survivors' resources are indexed
+        by the build below.
+        """
+        try:
+            candidates = sorted(entry.name for entry in skills_dir.iterdir() if (entry / "SKILL.md").is_file())
+        except OSError as e:
+            logger.warning("Attempted to list the skills in %s. Failed because of: %s", skills_dir, e)
+            return None
+
+        usable = [
+            name
+            for name in candidates
+            if self._load_skills(skills_dir, include=[name], index_resources=False) is not None
         ]
+        if not usable:
+            return None
+        return self._load_skills(skills_dir, include=usable)
 
     @property
     def agent(self) -> Agent[Any, str]:
@@ -249,6 +339,8 @@ class PydanticAgentRunner:
         cancel_event: asyncio.Event | None = None,
         persist_prompt: str | Sequence[UserContent] | None = None,
         history_rehydrator: Callable[[list[ModelMessage]], Awaitable[list[ModelMessage]]] | None = None,
+        extra_toolsets: Sequence[AbstractToolset[Any]] | None = None,
+        extra_instructions: str | None = None,
     ) -> AgentRunResult:
         """Run the agent against ``prompt``, streaming events and saving history.
 
@@ -277,6 +369,15 @@ class PydanticAgentRunner:
                 input: the pristine history is persisted again after this turn,
                 so any in-place edit would leak back onto disk. ``None`` sends
                 the loaded history to the model unchanged.
+            extra_toolsets: Toolsets to attach to this run only, on top of the
+                ones baked into the agent. Pydantic AI treats run-level toolsets
+                as additive, so these do not replace ``mcp_servers``. Use this
+                for toolsets whose configuration can change between runs - an
+                MCP server the user just edited - so the run picks up the
+                current config without rebuilding the agent.
+            extra_instructions: Instructions to append for this run only, in the
+                same additive spirit. Guidance that belongs to a toolset passed
+                via ``extra_toolsets`` travels here, so the two stay in sync.
 
         Returns:
             An :class:`AgentRunResult` describing the new state of the thread.
@@ -294,11 +395,16 @@ class PydanticAgentRunner:
             model_history = await history_rehydrator(history)
         run_id = thread_id[:8]
 
+        # Rebuilt every run so skill edits land without an engine restart.
+        capabilities = self._build_skills_capabilities()
+
         logger.info(
-            "[run %s] start: model=%s history_len=%d prompt=%r",
+            "[run %s] start: model=%s history_len=%d skills=%s run_toolsets=%d prompt=%r",
             run_id,
             self.model_name,
             len(history),
+            [name for capability in capabilities for name in capability.skill_names],
+            len(extra_toolsets or []),
             _prompt_preview(prompt),
         )
         started = time.monotonic()
@@ -317,6 +423,9 @@ class PydanticAgentRunner:
                 message_history=model_history,
                 usage_limits=self.usage_limits,
                 event_stream_handler=event_handler,
+                capabilities=capabilities or None,
+                toolsets=list(extra_toolsets) if extra_toolsets else None,
+                instructions=extra_instructions or None,
             )
         )
         try:
@@ -354,30 +463,16 @@ class PydanticAgentRunner:
 
         elapsed = time.monotonic() - started
         text = "".join(text_buffer)
-        logger.info(
-            "[run %s] done in %.2fs: requests=%d tool_calls=%d "
-            "input_tokens=%d output_tokens=%d new_messages=%d output=%r",
-            run_id,
-            elapsed,
-            usage.requests,
-            counters.tool_calls,
-            usage.input_tokens,
-            usage.output_tokens,
-            len(new_messages),
-            _preview(text),
+        truncated = _hit_output_limit(new_messages)
+        _log_run_outcome(
+            run_id=run_id,
+            elapsed=elapsed,
+            usage=usage,
+            counters=counters,
+            new_messages=new_messages,
+            text=text,
+            truncated=truncated,
         )
-        if not text and counters.tool_calls == 0:
-            logger.warning(
-                "[run %s] empty assistant turn: model returned no text and no tool calls.",
-                run_id,
-            )
-        elif not text:
-            logger.warning(
-                "[run %s] assistant produced no final text after %d tool calls. "
-                "The chat sidebar may render this turn as silent.",
-                run_id,
-                counters.tool_calls,
-            )
 
         # We persist `history + new_messages` rather than `all_messages()`, which
         # assumes the loaded history is a sequence of complete turns ending in a
@@ -405,6 +500,7 @@ class PydanticAgentRunner:
             output=text,
             message_count=len(messages_to_save),
             image_urls=list(counters.image_urls),
+            truncated=truncated,
         )
 
     @staticmethod
@@ -605,6 +701,82 @@ def _apply_persist_prompt(messages: list[ModelMessage], persist_prompt: str | Se
             new_parts[index] = replace(part, content=persist_prompt)
             message.parts = new_parts
             return
+
+
+def _log_run_outcome(  # noqa: PLR0913
+    *,
+    run_id: str,
+    elapsed: float,
+    usage: Any,
+    counters: _RunCounters,
+    new_messages: Sequence[ModelMessage],
+    text: str,
+    truncated: bool,
+) -> None:
+    """Log the one-line run summary plus any warnings the outcome warrants.
+
+    Split out of :meth:`PydanticAgentRunner.run` to keep that method under the
+    complexity limit; it is pure logging and has no effect on the result.
+    """
+    logger.info(
+        "[run %s] done in %.2fs: requests=%d tool_calls=%d "
+        "input_tokens=%d output_tokens=%d new_messages=%d finish_reason=%s output=%r",
+        run_id,
+        elapsed,
+        usage.requests,
+        counters.tool_calls,
+        usage.input_tokens,
+        usage.output_tokens,
+        len(new_messages),
+        _final_finish_reason(new_messages),
+        _preview(text),
+    )
+    if truncated:
+        # Worth a warning even though the run "succeeded": the reply ends
+        # mid-thought and looks identical to a completed one, so without this
+        # line a cap is indistinguishable from a dropped stream.
+        logger.warning(
+            "[run %s] response truncated at the output token limit (output_tokens=%d). "
+            "The reply is incomplete; raise max_tokens for this model to allow longer responses.",
+            run_id,
+            usage.output_tokens,
+        )
+    if not text and counters.tool_calls == 0:
+        logger.warning(
+            "[run %s] empty assistant turn: model returned no text and no tool calls.",
+            run_id,
+        )
+    elif not text:
+        logger.warning(
+            "[run %s] assistant produced no final text after %d tool calls. "
+            "The chat sidebar may render this turn as silent.",
+            run_id,
+            counters.tool_calls,
+        )
+
+
+def _final_finish_reason(messages: Sequence[ModelMessage]) -> str | None:
+    """Return the ``finish_reason`` of the turn's last model response, if any.
+
+    Pydantic AI normalizes provider-specific reasons onto OpenTelemetry values
+    (``stop``, ``length``, ``content_filter``, ``tool_call``, ``error``). The
+    final response is the one that ended the turn; earlier ones in a multi-step
+    run finish with ``tool_call`` and say nothing about how the turn ended.
+    Returns ``None`` when the provider reported no reason.
+    """
+    for message in reversed(messages):
+        if isinstance(message, ModelResponse):
+            return message.finish_reason
+    return None
+
+
+def _hit_output_limit(messages: Sequence[ModelMessage]) -> bool:
+    """Return True when the turn ended because the model ran out of output tokens.
+
+    ``length`` is the normalized reason for hitting ``max_tokens`` — or, when no
+    ``max_tokens`` was sent, whatever default the upstream provider imposed.
+    """
+    return _final_finish_reason(messages) == "length"
 
 
 def _preview(value: str) -> str:

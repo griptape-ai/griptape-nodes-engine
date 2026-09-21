@@ -33,10 +33,11 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     ImportWorkflowRequest,
     ImportWorkflowResultSuccess,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from griptape_nodes.retained_mode.engine import Engine
 
 # Timeout with thread dump.
 pytestmark = pytest.mark.timeout(300, method="thread")
@@ -49,25 +50,25 @@ FIXTURE_NODE_FILE = FIXTURE_LIBRARY_DIR / "subflow_echo_node.py"
 LIBRARY_NAME = "Subflow Import Flow Selection Library"
 
 
-def _write_grouped_workflow_file(library_json: Path, workflow_path: Path) -> None:
+def _write_grouped_workflow_file(engine: Engine, library_json: Path, workflow_path: Path) -> None:
     """Write a self-contained grouped workflow ``.py`` to ``workflow_path``.
 
     Builds a flow whose only node is a group (which owns a nested body flow), serializes it to a
     self-contained module, and clears the in-process build so the import starts from a clean slate.
     """
-    register_result = GriptapeNodes.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
+    register_result = engine.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(register_result, RegisterLibraryFromFileResultSuccess), register_result
 
-    GriptapeNodes.ContextManager().push_workflow(workflow_name="grouped_inner_workflow")
+    engine.context_manager.push_workflow(workflow_name="grouped_inner_workflow")
 
-    flow_result = GriptapeNodes.handle_request(
+    flow_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="ControlFlow_1", set_as_new_context=False)
     )
     assert isinstance(flow_result, CreateFlowResultSuccess), flow_result
     flow_name = flow_result.flow_name
 
-    with GriptapeNodes.ContextManager().flow(flow_name):
-        group_result = GriptapeNodes.handle_request(
+    with engine.context_manager.flow(flow_name):
+        group_result = engine.handle_request(
             CreateNodeRequest(
                 node_type="SubflowGroupNode",
                 specific_library_name=LIBRARY_NAME,
@@ -76,7 +77,7 @@ def _write_grouped_workflow_file(library_json: Path, workflow_path: Path) -> Non
             )
         )
         assert isinstance(group_result, CreateNodeResultSuccess), group_result
-        echo_result = GriptapeNodes.handle_request(
+        echo_result = engine.handle_request(
             CreateNodeRequest(
                 node_type="EchoNode",
                 specific_library_name=LIBRARY_NAME,
@@ -87,7 +88,7 @@ def _write_grouped_workflow_file(library_json: Path, workflow_path: Path) -> Non
         )
         assert isinstance(echo_result, CreateNodeResultSuccess), echo_result
 
-    serialize_result = GriptapeNodes.handle_request(
+    serialize_result = engine.handle_request(
         SerializeFlowToCommandsRequest(flow_name=flow_name, include_create_flow_command=True)
     )
     assert isinstance(serialize_result, SerializeFlowToCommandsResultSuccess), serialize_result
@@ -99,14 +100,14 @@ def _write_grouped_workflow_file(library_json: Path, workflow_path: Path) -> Non
         node_libraries_referenced=list(serialize_result.serialized_flow_commands.node_dependencies.libraries),
         workflow_shape=None,
     )
-    content = GriptapeNodes.WorkflowManager()._generate_workflow_file_content(
+    content = engine.workflow_manager._generate_workflow_file_content(
         serialized_flow_commands=serialize_result.serialized_flow_commands,
         workflow_metadata=metadata,
     )
     workflow_path.write_text(content)
 
     # Drop the in-process build so the import below starts from a clean parent flow.
-    GriptapeNodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+    engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
 
 
 @pytest.mark.skipif(
@@ -115,29 +116,29 @@ def _write_grouped_workflow_file(library_json: Path, workflow_path: Path) -> Non
 )
 @pytest.mark.asyncio
 async def test_import_binds_to_top_level_flow_not_group_body(
-    tmp_path: Path, materialize_library: Callable[..., Path]
+    tmp_path: Path, engine: Engine, materialize_library: Callable[..., Path]
 ) -> None:
     """Importing a group-containing workflow must return the top-level imported flow."""
     library_json = materialize_library(
         tmp_path / "library", template=FIXTURE_LIBRARY_JSON_TEMPLATE, node_file=FIXTURE_NODE_FILE, name=LIBRARY_NAME
     )
     workflow_path = tmp_path / "grouped_inner_workflow.py"
-    _write_grouped_workflow_file(library_json, workflow_path)
+    _write_grouped_workflow_file(engine, library_json, workflow_path)
 
     # Register the workflow file so it can be imported by name.
-    import_workflow_result = await GriptapeNodes.ahandle_request(ImportWorkflowRequest(file_path=str(workflow_path)))
+    import_workflow_result = await engine.ahandle_request(ImportWorkflowRequest(file_path=str(workflow_path)))
     assert isinstance(import_workflow_result, ImportWorkflowResultSuccess), import_workflow_result
     workflow_name = import_workflow_result.workflow_name
 
     # Fresh parent flow to import into.
-    GriptapeNodes.ContextManager().push_workflow(workflow_name="parent_workflow")
-    parent_result = GriptapeNodes.handle_request(
+    engine.context_manager.push_workflow(workflow_name="parent_workflow")
+    parent_result = engine.handle_request(
         CreateFlowRequest(parent_flow_name=None, flow_name="ParentFlow", set_as_new_context=False)
     )
     assert isinstance(parent_result, CreateFlowResultSuccess), parent_result
     parent_flow = parent_result.flow_name
 
-    import_result = await GriptapeNodes.ahandle_request(
+    import_result = await engine.ahandle_request(
         ImportWorkflowAsReferencedSubFlowRequest(workflow_name=workflow_name, flow_name=parent_flow)
     )
     assert isinstance(import_result, ImportWorkflowAsReferencedSubFlowResultSuccess), import_result
@@ -145,7 +146,7 @@ async def test_import_binds_to_top_level_flow_not_group_body(
     # The imported workflow created two flows (its top-level flow + the group's body flow). The
     # returned flow must be the TOP-LEVEL one, i.e. the flow whose parent is the import target.
     # The group's body flow is parented to that top-level flow, so returning it would be the bug.
-    flow_manager = GriptapeNodes.FlowManager()
+    flow_manager = engine.flow_manager
     created_flow = import_result.created_flow_name
     assert flow_manager.get_parent_flow(created_flow) == parent_flow, (
         f"import bound to '{created_flow}' (parent '{flow_manager.get_parent_flow(created_flow)}') "

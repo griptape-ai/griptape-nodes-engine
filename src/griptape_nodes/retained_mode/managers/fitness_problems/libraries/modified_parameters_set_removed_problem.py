@@ -27,18 +27,29 @@ class ModifiedParametersSetRemovedProblem(LibraryProblem):
         if len(instances) == 1:
             version = instances[0].library_engine_version
             return (
-                f"This library (built for engine version {version}) is incompatible with Griptape Nodes 0.39+. "
-                "The 'modified_parameters_set' parameter has been removed from BaseNode methods: 'after_incoming_connection', 'after_outgoing_connection', 'after_incoming_connection_removed', 'after_outgoing_connection_removed', 'before_value_set', and 'after_value_set'. "
-                "If this library overrides any of these methods, it will not load or function properly. Please update to a newer version of this library or contact the library author immediately."
+                f"This library was not loaded because its griptape-nodes-library.json declares engine_version {version}, "
+                "and Griptape Nodes 0.39.0 removed the 'modified_parameters_set' parameter from these BaseNode methods: "
+                "'after_incoming_connection', 'after_outgoing_connection', 'after_incoming_connection_removed', "
+                "'after_outgoing_connection_removed', 'before_value_set', and 'after_value_set'. "
+                "To load it: if any of its nodes override one of those methods, remove the 'modified_parameters_set' "
+                "parameter from that method; then set 'engine_version' under 'metadata' in griptape-nodes-library.json "
+                "to the version of Griptape Nodes you are running. "
+                "If you did not write this library, ask its author for a version built for 0.39.0 or later."
             )
 
         # Multiple libraries with this issue - list them sorted by version
         sorted_instances = sorted(instances, key=lambda p: p.library_engine_version)
         error_lines = []
         for i, problem in enumerate(sorted_instances, 1):
-            error_lines.append(
-                f"  {i}. Library built for engine version {problem.library_engine_version} is incompatible due to modified_parameters_set removal"
-            )
+            error_lines.append(f"  {i}. Library declaring engine_version {problem.library_engine_version}")
 
-        header = f"Encountered {len(instances)} libraries incompatible due to modified_parameters_set removal:"
-        return header + "\n" + "\n".join(error_lines)
+        header = (
+            f"{len(instances)} libraries were not loaded because they declare an engine_version older than 0.39.0, "
+            "which removed the 'modified_parameters_set' parameter from the BaseNode connection and value-set methods:"
+        )
+        footer = (
+            "For each one: remove the 'modified_parameters_set' parameter from any node method that still takes it, "
+            "then set 'engine_version' under 'metadata' in that library's griptape-nodes-library.json to the version "
+            "of Griptape Nodes you are running."
+        )
+        return header + "\n" + "\n".join(error_lines) + "\n" + footer

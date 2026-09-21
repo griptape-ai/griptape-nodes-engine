@@ -1,14 +1,18 @@
 """Unit tests for File and FileDestination."""
 
+from __future__ import annotations
+
 import base64
 from io import BytesIO
 from pathlib import Path
+from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
 from PIL import Image
 
 from griptape_nodes.common.macro_parser import MacroSyntaxError, ParsedMacro
+from griptape_nodes.files.drivers.static_server_file_driver import StaticServerFileDriver
 from griptape_nodes.files.file import (
     File,
     FileContent,
@@ -31,9 +35,13 @@ from griptape_nodes.retained_mode.events.project_events import (
     PathResolutionFailureReason,
 )
 
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.engine import Engine
+
 HANDLE_REQUEST_PATH = "griptape_nodes.files.file.GriptapeNodes.handle_request"
 AHANDLE_REQUEST_PATH = "griptape_nodes.files.file.GriptapeNodes.ahandle_request"
 CONFIG_MANAGER_PATH = "griptape_nodes.files.file.GriptapeNodes.ConfigManager"
+STATIC_SERVER_CONFIG_MANAGER_PATH = "griptape_nodes.files.drivers.static_server_file_driver.GriptapeNodes.ConfigManager"
 
 
 class TestFileConstructor:
@@ -1150,6 +1158,125 @@ class TestFileResolve:
         assert exc_info.value.failure_reason == FileIOFailureReason.MISSING_MACRO_VARIABLES
 
 
+class TestFileResolveUrls:
+    """Tests that File.resolve() treats URL locations as URLs, not filesystem paths.
+
+    A node output travels between nodes as a static file server URL. Consumers that
+    hand a location to a subprocess (FFmpeg, ffprobe) call resolve() rather than
+    read_bytes(), so resolve() has to recognize these rather than normalizing them
+    as paths.
+    https://github.com/griptape-ai/griptape-nodes-engine/issues/5283
+    """
+
+    def test_resolve_static_server_url_returns_local_workspace_path(self, tmp_path: Path) -> None:
+        """The reported repro: a Decode Media output wired into a video-processing node."""
+        url = "http://localhost:8124/workspace/staticfiles/clip.mp4?t=1786574231"
+
+        with patch(CONFIG_MANAGER_PATH) as mock_config_manager:
+            mock_config_manager.return_value.workspace_path = tmp_path
+            result = File(url).resolve()
+
+        assert Path(result) == tmp_path / "staticfiles" / "clip.mp4"
+
+    def test_resolve_static_server_url_does_not_anchor_url_to_workspace(self, tmp_path: Path) -> None:
+        """Regression guard for the exact mangling in the bug report.
+
+        The URL used to be joined onto the workspace directory, leaving a string
+        that was neither a URL nor a real path.
+        """
+        url = "http://localhost:8124/workspace/staticfiles/clip.mp4?t=1786574231"
+
+        with patch(CONFIG_MANAGER_PATH) as mock_config_manager:
+            mock_config_manager.return_value.workspace_path = tmp_path
+            result = File(url).resolve()
+
+        assert "http:" not in result
+        assert "localhost" not in result
+        assert "?t=" not in result
+
+    def test_resolve_static_server_url_agrees_with_read_path(self, tmp_path: Path) -> None:
+        """resolve() must name the same file StaticServerFileDriver would read.
+
+        The two disagreeing is what made the original failure hard to place:
+        read_bytes() on the same File worked fine.
+        """
+        url = "http://localhost:8124/workspace/staticfiles/clip.mp4?t=1786574231"
+        driver = StaticServerFileDriver()
+
+        with patch(CONFIG_MANAGER_PATH) as mock_config_manager:
+            mock_config_manager.return_value.workspace_path = tmp_path
+            resolved = File(url).resolve()
+
+        with patch(STATIC_SERVER_CONFIG_MANAGER_PATH) as mock_config_manager:
+            mock_config_manager.return_value.workspace_path = tmp_path
+            driver_path = driver._resolve_to_local_path(url)
+
+        assert Path(resolved) == driver_path
+
+    def test_resolve_remote_url_passes_through_unchanged(self, tmp_path: Path) -> None:
+        """A remote URL has no local path to resolve to, so it passes through.
+
+        FFmpeg and ffprobe read http(s) natively, so the consumer can still use it.
+        """
+        url = "https://example.com/videos/clip.mp4"
+
+        with patch(CONFIG_MANAGER_PATH) as mock_config_manager:
+            mock_config_manager.return_value.workspace_path = tmp_path
+            result = File(url).resolve()
+
+        assert result == url
+
+    def test_resolve_remote_url_with_query_string_passes_through_unchanged(self, tmp_path: Path) -> None:
+        """A signed URL's query string is load-bearing and must survive intact."""
+        url = "https://example.com/videos/clip.mp4?token=abc123&expires=1786574231"
+
+        with patch(CONFIG_MANAGER_PATH) as mock_config_manager:
+            mock_config_manager.return_value.workspace_path = tmp_path
+            result = File(url).resolve()
+
+        assert result == url
+
+    def test_resolve_localhost_url_outside_workspace_passes_through(self, tmp_path: Path) -> None:
+        """A localhost URL that isn't a static-file URL names no workspace file."""
+        url = "http://localhost:8124/api/videos/clip.mp4"
+
+        with patch(CONFIG_MANAGER_PATH) as mock_config_manager:
+            mock_config_manager.return_value.workspace_path = tmp_path
+            result = File(url).resolve()
+
+        assert result == url
+
+    def test_resolve_file_uri_still_converts_to_local_path(self, tmp_path: Path) -> None:
+        """The pre-existing file:// behavior is unchanged."""
+        target = tmp_path / "outputs" / "clip.mp4"
+
+        with patch(CONFIG_MANAGER_PATH) as mock_config_manager:
+            mock_config_manager.return_value.workspace_path = tmp_path
+            result = File(target.as_uri()).resolve()
+
+        assert Path(result) == target
+
+    def test_resolve_windows_drive_path_is_not_treated_as_url(self, tmp_path: Path) -> None:
+        r"""A `C:` drive letter is a drive letter, not a URL scheme.
+
+        `C://outputs/clip.mp4` is the spelling a naive `://` check misreads.
+        """
+        with patch(CONFIG_MANAGER_PATH) as mock_config_manager:
+            mock_config_manager.return_value.workspace_path = tmp_path
+            result = File("C://outputs/clip.mp4").resolve()
+
+        assert result != "C://outputs/clip.mp4"
+        assert "outputs" in result
+
+    def test_resolve_relative_path_still_anchors_to_workspace(self, tmp_path: Path) -> None:
+        """Non-URL locations are unaffected by the URL branch."""
+        with patch(CONFIG_MANAGER_PATH) as mock_config_manager:
+            mock_config_manager.return_value.workspace_path = tmp_path
+            result = File("outputs/clip.mp4").resolve()
+
+        assert Path(result) == tmp_path / "outputs" / "clip.mp4"
+
+
 def _pil_bytes(fmt: str, mode: str = "RGB") -> bytes:
     buf = BytesIO()
     Image.new(mode, (1, 1), color=0 if mode == "P" else "white").save(buf, format=fmt)
@@ -1165,7 +1292,7 @@ def _jpeg_bytes() -> bytes:
 
 
 @pytest.fixture
-def _registered_providers() -> None:
+def _registered_providers(engine: Engine) -> None:
     """Ensure default artifact providers are registered with the ArtifactManager.
 
     Validation goes through ``ArtifactManager.sniff_extension``, which dispatches
@@ -1174,14 +1301,13 @@ def _registered_providers() -> None:
     so we register the default providers manually here.
     """
     from griptape_nodes.retained_mode.events.artifact_events import RegisterArtifactProviderRequest
-    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
     from griptape_nodes.retained_mode.managers.artifact_providers import (
         AudioArtifactProvider,
         ImageArtifactProvider,
         VideoArtifactProvider,
     )
 
-    artifact_manager = GriptapeNodes.ArtifactManager()
+    artifact_manager = engine.artifact_manager
     for provider_class in (ImageArtifactProvider, VideoArtifactProvider, AudioArtifactProvider):
         artifact_manager.on_handle_register_artifact_provider_request(
             RegisterArtifactProviderRequest(provider_class=provider_class)

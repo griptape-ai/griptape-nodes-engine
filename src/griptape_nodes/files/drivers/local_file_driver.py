@@ -10,8 +10,10 @@ from griptape_nodes.files.path_utils import (
     normalize_path_for_platform,
     parse_file_uri,
     path_needs_expansion,
+    resolve_path_safely,
     sanitize_path_string,
 )
+from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 
 class LocalFileDriver(BaseFileDriver):
@@ -21,7 +23,8 @@ class LocalFileDriver(BaseFileDriver):
     For writing files, use OSManager directly.
 
     This driver is automatically registered last (priority 100) as it matches all
-    absolute paths and file:// URIs (fallback driver).
+    absolute paths, workspace-relative paths, and file:// URIs (fallback driver).
+    Relative paths are anchored on the workspace directory, never the process CWD.
     """
 
     @property
@@ -51,11 +54,12 @@ class LocalFileDriver(BaseFileDriver):
     def _resolve_path(self, location: str) -> Path:
         """Resolve a location string to a local filesystem Path.
 
-        Handles file:// URI parsing, path sanitization, expansion, and
-        platform normalization.
+        Handles file:// URI parsing, path sanitization, expansion, anchoring of
+        relative paths on the workspace directory, and platform normalization.
 
         Args:
-            location: Absolute file path, file:// URI, or path with ~
+            location: Absolute file path, file:// URI, path with ~, or a path
+                relative to the workspace directory
 
         Returns:
             Resolved Path object
@@ -84,6 +88,13 @@ class LocalFileDriver(BaseFileDriver):
         else:
             path = Path(clean_location)
 
+        # Anchor a relative path on the workspace directory. Mirrors File.resolve()
+        # logic so reported path matches opened path.
+        if not path.is_absolute():
+            workspace_path = GriptapeNodes.ConfigManager().workspace_path
+            # Normalise joined path without evaluating symlinks en route.
+            path = resolve_path_safely(workspace_path / path)
+
         # Normalize for platform (Windows long paths, etc.)
         return Path(normalize_path_for_platform(path))
 
@@ -91,7 +102,8 @@ class LocalFileDriver(BaseFileDriver):
         """Read file from local filesystem with validation.
 
         Args:
-            location: Absolute file path, file:// URI, or path with ~
+            location: Absolute file path, file:// URI, path with ~, or a path
+                relative to the workspace directory
             timeout: Ignored for local files
 
         Returns:
@@ -119,7 +131,8 @@ class LocalFileDriver(BaseFileDriver):
         """Check if file exists on local filesystem.
 
         Args:
-            location: Absolute file path or file:// URI
+            location: Absolute file path, file:// URI, path with ~, or a path
+                relative to the workspace directory
 
         Returns:
             True if file exists and is a file (not directory)
@@ -135,7 +148,8 @@ class LocalFileDriver(BaseFileDriver):
         """Get file size from local filesystem.
 
         Args:
-            location: Absolute file path or file:// URI
+            location: Absolute file path, file:// URI, path with ~, or a path
+                relative to the workspace directory
 
         Returns:
             File size in bytes
