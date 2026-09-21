@@ -3401,6 +3401,11 @@ class LibraryManager(EngineScoped):
         process -- a worker receives it as PYTHONPATH at spawn, before it imports anything. See the
         body for why splicing it into a running interpreter would not work.
 
+        Where both exist, the execution environment must keep precedence: it is the one resolved
+        over both dependency sets, so it holds the only versions of a shared package that one
+        resolver agreed on. PYTHONPATH sits at `sys.path[1]`, which any `insert(0, ...)` would
+        overtake, so `_add_library_edit_venv_to_sys_path` declines rather than ordering around it.
+
         Args:
             library_name: Name of the library (for venv lookup)
             library_file_path: Path to the library JSON file (for venv lookup)
@@ -3415,13 +3420,36 @@ class LibraryManager(EngineScoped):
         # at import time has cached the answer, so adding the directory to a running interpreter
         # cannot give the library its own versions. A worker receives it as PYTHONPATH at spawn.
 
+    def _execution_env_is_already_on_sys_path(self, library_name: str) -> bool:
+        """Whether this library's execution site-packages is on `sys.path` already.
+
+        True in the worker this library was spawned for, where the engine passed that directory as
+        PYTHONPATH. Compared as resolved paths because the value on `sys.path` came from the
+        environment and need not be spelled the way `execution_site_packages` spells it.
+        """
+        execution_site_packages = self.execution_site_packages(library_name)
+        if execution_site_packages is None:
+            return False
+        target = Path(execution_site_packages).resolve()
+        return any(Path(entry).resolve() == target for entry in sys.path if entry)
+
     async def _add_library_edit_venv_to_sys_path(self, library_name: str, library_file_path: str) -> None:
         """Add a library's EDIT-time venv site-packages to sys.path, if it exists.
 
         Only the edit-time environment is ever spliced. The execution environment reaches a worker
         as PYTHONPATH at spawn, because adding it to a running interpreter cannot give the library
         its own versions of anything already imported.
+
+        Skipped entirely when PYTHONPATH already carries this library's execution environment. That
+        environment is resolved over BOTH dependency sets, so it provides everything the edit-time
+        set does, at the versions one resolver chose -- and splicing lands at `sys.path[0]`, ahead
+        of PYTHONPATH, so a package present in both would otherwise bind the edit-time version that
+        the combined resolver rejected. A library the worker was not spawned for is unaffected: its
+        execution directory is not on the path, so its edit-time venv is still spliced.
         """
+        if self._execution_env_is_already_on_sys_path(library_name):
+            return
+
         venv_path = self._get_library_venv_path(library_name, library_file_path, execution=False)
         if not await anyio.Path(venv_path).exists():
             return
