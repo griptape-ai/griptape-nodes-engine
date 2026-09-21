@@ -187,6 +187,7 @@ plugins:
           - reference/command_line_interface.md: gtn CLI reference
           - reference/configuration_reference.md: Every engine setting with type, default, and env var
         Enterprise:
+          - enterprise/on_premises_quick_start.md: Step-by-step rollout of an on-premises deployment, from Cloud API key to activated workstations
           - enterprise/admin_dashboard.md: Manage license keys, access groups, and permission templates from the editor's admin interface
           - enterprise/admin_server.md: Run a single in-network proxy so app instances avoid public internet access
           - enterprise/using_the_admin_server.md: Activate the desktop app with a license through the Admin Server
@@ -560,6 +561,7 @@ nav:
       - Command Line Interface: reference/command_line_interface.md
       - Configuration Reference: reference/configuration_reference.md
   - Enterprise:
+      - On-Premises Quick Start: enterprise/on_premises_quick_start.md
       - Admin Dashboard: enterprise/admin_dashboard.md
       - Admin Server: enterprise/admin_server.md
       - Using the Admin Server: enterprise/using_the_admin_server.md
