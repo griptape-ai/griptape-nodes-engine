@@ -27,9 +27,6 @@ if TYPE_CHECKING:
     from griptape_nodes.exe_types.node_types import BaseNode
     from griptape_nodes.retained_mode.managers.resource_manager import ResourceManager
 
-_MISSING = object()
-
-
 class KeyVerdict(Enum):
     """What a string turned out to be, as far as this worker's cache is concerned.
 

@@ -309,7 +309,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         if node is not None:
             # Raw: this dict goes to the editor and is json-serialized. A process-local value is a key
             # there, never the object it stands for.
-            event_dict["value"] = node.get_raw_parameter_value(self.name)
+            event_dict["value"] = node._get_raw_parameter_value(self.name)
         return event_dict
 
     @property

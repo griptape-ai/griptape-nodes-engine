@@ -94,12 +94,12 @@ class _ComputedValueNode(DataNode):
             )
         )
 
-    def get_raw_parameter_value(self, param_name: str) -> Any:
+    def _get_raw_parameter_value(self, param_name: str) -> Any:
         # The raw accessor is where "stored or computed" lives: it is what the engine reads for saving,
         # dispatch and events, and what the translating `get_parameter_value` is built on.
         if param_name == "computed":
             return "computed-value"
-        return super().get_raw_parameter_value(param_name)
+        return super()._get_raw_parameter_value(param_name)
 
     def process(self) -> None:
         pass

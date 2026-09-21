@@ -127,7 +127,7 @@ class TestHandingAnObjectToTheNextNode:
         producer.parameter_output_values["pipeline"] = Pipeline("flux")
         _hand_over(producer, consumer)
 
-        raw = consumer.get_raw_parameter_value("pipeline")
+        raw = consumer._get_raw_parameter_value("pipeline")
 
         assert isinstance(raw, str)
         # Namespaced by the worker holding it, not by the library: the cache belongs to the process.
@@ -342,7 +342,7 @@ class TestBothDictsCross:
 
         consumer.set_parameter_value("pipeline", key)
 
-        assert consumer.get_raw_parameter_value("pipeline") == key
+        assert consumer._get_raw_parameter_value("pipeline") == key
 
 
 class TestOutputtingACachedResourceKey:
@@ -455,7 +455,7 @@ class TestAConsumerThatDeclaresNothing:
         consumer.set_parameter_value("model", _egress(producer)["pipeline"])
 
         assert isinstance(consumer.parameter_values["model"], str)
-        assert isinstance(consumer.get_raw_parameter_value("model"), str)
+        assert isinstance(consumer._get_raw_parameter_value("model"), str)
 
     def test_an_ordinary_string_on_an_undeclared_input_is_untouched(self) -> None:
         consumer = self._plain_consumer()
@@ -484,4 +484,4 @@ class TestRemovingARowFromAContainer:
 
         consumer.remove_parameter_value(first.name)
 
-        assert isinstance(consumer.get_raw_parameter_value("pipelines"), list)
+        assert isinstance(consumer._get_raw_parameter_value("pipelines"), list)

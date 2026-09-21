@@ -1093,7 +1093,7 @@ class BaseNode(ABC):
         A `serializable=False` parameter's value is held in the process that produced it and travels as a
         key, so this is where the key becomes the object again -- the node reads its parameter normally.
         Engine code that moves values between nodes, saves them, or sends them to the editor wants the key
-        and calls `get_raw_parameter_value`, which is also the one to override for a computed value.
+        and calls `_get_raw_parameter_value`, which is also the one to override for a computed value.
 
         The reading parameter's own declaration is not consulted. Only the producer declares the flag, and
         its key travels down connections to consumers that declare nothing -- gating translation on the
@@ -1102,19 +1102,20 @@ class BaseNode(ABC):
         Raises:
             RuntimeError: if the value is a key this process is no longer holding, naming the parameter.
         """
-        value = self.get_raw_parameter_value(param_name)
+        value = self._get_raw_parameter_value(param_name)
         return self.local_objects.resolve_if_held(value, parameter_name=param_name, node_name=self.name)
 
-    def get_raw_parameter_value(self, param_name: str) -> Any:
-        """The value as stored, with no held-object substitution.
+    def _get_raw_parameter_value(self, param_name: str) -> Any:
+        """The value as stored, with no cached-object substitution. Engine-internal.
 
-        For engine code: what is in a parameter is a key when the object is held, and a key is what has to
-        travel to a worker, into a saved workflow, or to the editor. Node bodies want
-        `get_parameter_value`.
+        What is in a parameter is a reference when the object is cached, and a reference is what has to
+        travel to a worker, into a saved workflow, or to the editor. Node authors want
+        `get_parameter_value` and have no use for this one, which is why it is private: two public readers
+        would only raise the question of which to pick.
 
-        **Override this one, not `get_parameter_value`**, to compute a value rather than store it. Saving,
-        dispatch, events and metadata all read through here, so an override on the wrapper would be
-        bypassed by every one of them and the engine would persist something the node never reports.
+        Saving, dispatch, events and metadata all read through here, so an engine subclass computing a
+        value rather than storing it overrides this rather than the public wrapper -- an override there
+        would be bypassed by every one of them.
         """
         param = self.get_parameter_by_name(param_name)
         if param is None:
@@ -1179,7 +1180,7 @@ class BaseNode(ABC):
                 # Raw: this copies the remaining rows along rather than reading them for use. Resolving
                 # here would raise on a key whose object sits in a worker, out of a connection delete and
                 # out of the run's finally, and would write live objects back into parameter_values.
-                new_val = self.get_raw_parameter_value(parameter.parent_container_name)
+                new_val = self._get_raw_parameter_value(parameter.parent_container_name)
                 if new_val is not None:
                     # Don't set the container to None (that would make it empty)
                     self.set_parameter_value(parameter.parent_container_name, new_val)
@@ -1889,7 +1890,7 @@ class BaseNode(ABC):
             event_data = parameter.to_event(self)
             # Display-preservation guard. Gated on _in_aprocess here, unlike
             # TrackedParameterOutputValues._emit_parameter_change_event, because this
-            # value comes from Parameter.to_event -> node.get_raw_parameter_value(),
+            # value comes from Parameter.to_event -> node._get_raw_parameter_value(),
             # and substitution only happens inside aprocess. Outside it the value is
             # already the template, so the guard would be a no-op.
             if _in_aprocess.get() and "value" in event_data:
@@ -2076,7 +2077,7 @@ class TrackedParameterOutputValues(dict[str, Any]):
                 # Here, we are emitting an event with those set values, to not misrepresent the values of the parameters in the UI.
                 # Raw: this goes to the editor, which shows the stored value. Translating here would put
                 # a held object into an event payload and json-serialize it on the way out.
-                value = self._node.get_raw_parameter_value(key)
+                value = self._node._get_raw_parameter_value(key)
                 self._emit_parameter_change_event(key, value, deleted=True)
 
     def silent_clear(self) -> None:
@@ -2396,7 +2397,7 @@ class EndNode(BaseNode):
             if param.type != ParameterTypeBuiltin.CONTROL_TYPE:
                 # Raw: this copies a value along rather than reading it for use, so a held value
                 # stays the key it already is instead of being resolved and parked a second time.
-                value = self.get_raw_parameter_value(param.name)
+                value = self._get_raw_parameter_value(param.name)
                 self.parameter_output_values[param.name] = value
         entry_parameter = self._entry_control_parameter
         # Update which control parameter to flag as the output value.
@@ -2699,7 +2700,7 @@ def handle_container_parameter(current_node: BaseNode, parameter: Parameter) -> 
             # `parameter_values`, and that dict is the payload of an ExecuteNodeRequest. Translating here
             # would put a live object in it and send it to a worker as JSON. The node still sees objects:
             # its read resolves the whole list on the way out.
-            value = current_node.get_raw_parameter_value(child.name)
+            value = current_node._get_raw_parameter_value(child.name)
             if value is not None:
                 build_parameter_value.append(value)
         return build_parameter_value

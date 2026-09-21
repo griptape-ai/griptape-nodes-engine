@@ -1203,7 +1203,7 @@ class FlowManager(EngineScoped):
             value = source_node.parameter_output_values[source_param.name]
         # if it doesn't let's use the one in parameter_values! that's the most updated.
         elif source_param.name in source_node.parameter_values:
-            value = source_node.get_raw_parameter_value(source_param.name)
+            value = source_node._get_raw_parameter_value(source_param.name)
         # if not even that.. then does it have a default value?
         elif source_param.default_value:
             value = source_param.default_value
@@ -2501,7 +2501,7 @@ class FlowManager(EngineScoped):
                 continue
 
             # Get the value from the SubflowNodeGroup parameter
-            param_value = node_group_node.get_raw_parameter_value(param_name=prefixed_param_name)
+            param_value = node_group_node._get_raw_parameter_value(param_name=prefixed_param_name)
 
             # Skip if no value is set
             if param_value is None:

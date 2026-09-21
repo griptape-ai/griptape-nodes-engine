@@ -126,7 +126,7 @@ class TestCollectParameterValues:
         # A Mock answers truthy to everything; these values are not parked keys.
         node.local_objects.contains_a_parked_object.return_value = False
         node.parameters = [p1, p2]
-        node.get_raw_parameter_value.side_effect = values.get
+        node._get_raw_parameter_value.side_effect = values.get
 
         engine = Mock()
         engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
@@ -146,7 +146,7 @@ class TestCollectParameterValues:
         # A Mock answers truthy to everything; these values are not parked keys.
         node.local_objects.contains_a_parked_object.return_value = False
         node.parameters = [pub, priv]
-        node.get_raw_parameter_value.side_effect = values.get
+        node._get_raw_parameter_value.side_effect = values.get
 
         engine = Mock()
         engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
@@ -165,7 +165,7 @@ class TestCollectParameterValues:
         # A Mock answers truthy to everything; these values are not parked keys.
         node.local_objects.contains_a_parked_object.return_value = False
         node.parameters = [p]
-        node.get_raw_parameter_value.return_value = None
+        node._get_raw_parameter_value.return_value = None
 
         engine = Mock()
         engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
@@ -183,7 +183,7 @@ class TestCollectParameterValues:
         # A Mock answers truthy to everything; these values are not parked keys.
         node.local_objects.contains_a_parked_object.return_value = False
         node.parameters = [p]
-        node.get_raw_parameter_value.return_value = "some_value"
+        node._get_raw_parameter_value.return_value = "some_value"
 
         engine = Mock()
         engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
@@ -203,7 +203,7 @@ class TestCollectParameterValues:
         # A Mock answers truthy to everything; these values are not parked keys.
         node.local_objects.contains_a_parked_object.return_value = False
         node.parameters = [p1, p2, p3]
-        node.get_raw_parameter_value.side_effect = values.get
+        node._get_raw_parameter_value.side_effect = values.get
 
         engine = Mock()
         engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
@@ -257,7 +257,7 @@ class TestCollectRawProvenance:
         # A Mock answers truthy to everything; these values are not parked keys.
         node.local_objects.contains_a_parked_object.return_value = False
         node.parameters = [priv, pub]
-        node.get_raw_parameter_value.side_effect = param_values.get
+        node._get_raw_parameter_value.side_effect = param_values.get
 
         engine = _make_engine(resolving_nodes=["MyNode"])
         engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
@@ -314,7 +314,7 @@ class TestCollectSidecarProvenance:
         # A Mock answers truthy to everything; these values are not parked keys.
         node.local_objects.contains_a_parked_object.return_value = False
         node.parameters = [priv, pub]
-        node.get_raw_parameter_value.side_effect = param_values.get
+        node._get_raw_parameter_value.side_effect = param_values.get
 
         engine = _make_engine(resolving_nodes=["MyNode"])
         engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
@@ -335,7 +335,7 @@ class TestCollectSidecarProvenance:
         # A Mock answers truthy to everything; these values are not parked keys.
         node.local_objects.contains_a_parked_object.return_value = False
         node.parameters = [pub]
-        node.get_raw_parameter_value.return_value = "hello"
+        node._get_raw_parameter_value.return_value = "hello"
 
         engine = _make_engine(resolving_nodes=["MyNode"])
         engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
@@ -380,7 +380,7 @@ class TestCollectWorkflowMetadata:
         # A Mock answers truthy to everything; these values are not parked keys.
         node.local_objects.contains_a_parked_object.return_value = False
         node.parameters = [priv, pub]
-        node.get_raw_parameter_value.side_effect = param_values.get
+        node._get_raw_parameter_value.side_effect = param_values.get
 
         engine = _make_engine(resolving_nodes=["MyNode"])
         engine.object_manager.attempt_get_object_by_name_as_type.return_value = node
