@@ -10,8 +10,8 @@ from typing import Any
 from griptape.artifacts import TextArtifact
 from griptape.drivers.prompt.openai import OpenAiChatPromptDriver
 
-from griptape_nodes.common.parameter_hydration import dehydrate_parameter_values
 from griptape_nodes.exe_types.core_types import Parameter, ParameterList, ParameterMode
+from griptape_nodes.exe_types.local_objects import cache_outputs_for_egress, caches_its_values
 from griptape_nodes.exe_types.node_types import BaseNode
 
 _STEPS = 30
@@ -46,7 +46,7 @@ def _node(name: str = "LoadPipeline", *, on_drop: Any = None) -> _LibraryNode:
 
 
 def _send(node: _LibraryNode) -> dict:
-    return dehydrate_parameter_values(node.parameter_output_values, node=node, are_outputs=True)
+    return cache_outputs_for_egress(node.parameter_output_values, node=node)
 
 
 class TestWhatCrosses:
@@ -375,7 +375,7 @@ class TestDeclaringItOnAContainer:
         node.add_parameter(latents)
 
         assert latents.serializable is False
-        assert latents.is_process_local is False
+        assert caches_its_values(latents) is False
 
     def test_an_ordinary_container_is_fine(self) -> None:
         node = _LibraryNode(name="Batch", metadata={"library": "Diffusers"})

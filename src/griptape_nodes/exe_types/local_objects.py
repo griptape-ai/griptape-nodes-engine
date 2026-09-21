@@ -14,14 +14,49 @@ which library it came from, and which node produced it.
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass
+from enum import Enum, auto
 from typing import TYPE_CHECKING, Any
 
-if TYPE_CHECKING:
-    from collections.abc import Callable
+from griptape_nodes.exe_types.elements.containers import ParameterContainer
 
+if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping
+
+    from griptape_nodes.exe_types.elements.parameter import Parameter
+    from griptape_nodes.exe_types.node_types import BaseNode
     from griptape_nodes.retained_mode.managers.resource_manager import ResourceManager
 
 _MISSING = object()
+
+
+class KeyVerdict(Enum):
+    """What a string turned out to be, as far as this worker's cache is concerned.
+
+    One question with four answers, rather than the several booleans this used to be. Every call site
+    switches on the verdict, so "which predicate belongs here" stops being a thing anyone can get wrong --
+    and the answers are exhaustive, so a new call site cannot quietly forget a case.
+    """
+
+    NOT_A_KEY = auto()
+    HELD = auto()
+    RELEASED = auto()
+    ELSEWHERE = auto()
+
+
+@dataclass(frozen=True)
+class KeyLookup:
+    """A verdict, plus what the caller needs to act on it."""
+
+    verdict: KeyVerdict
+    value: Any = None
+    # Whether the engine took this on a parameter's behalf, rather than the library naming it through
+    # `put`. Only the engine's own entries are the engine's to displace or release.
+    slot_bound: bool = False
+
+    @property
+    def is_a_key(self) -> bool:
+        return self.verdict is not KeyVerdict.NOT_A_KEY
 
 
 class LocalObjectScope:
@@ -102,55 +137,34 @@ class LocalObjectScope:
             on_drop=on_drop,
         )
 
-    def is_parked_by_engine(self, key: Any) -> bool:
-        """Whether `key` names an entry the engine parked, rather than one a library keyed through `put`.
+    def look_up(self, value: Any) -> KeyLookup:
+        """What `value` is, as far as this worker's cache is concerned. The one question about a string.
 
-        Recorded on the entry, not inferred from the key's shape: a library key can look like anything,
-        including exactly like a minted one (`sd-xl-1.0#a1b2c3d4`).
+        Every key this cache holds carries this worker's prefix, so anything without it is either another
+        process's key -- decided by shape, without touching the store -- or not a key at all.
         """
-        return self._manager().is_parked_key(key)
+        if not isinstance(value, str):
+            return KeyLookup(KeyVerdict.NOT_A_KEY)
+        if not value.startswith(f"{self.owner}:"):
+            if self._manager().has_minted_key_shape(value):
+                return KeyLookup(KeyVerdict.ELSEWHERE)
+            return KeyLookup(KeyVerdict.NOT_A_KEY)
+        entry = self._manager().entry_for(value)
+        if entry is None:
+            return KeyLookup(KeyVerdict.RELEASED)
+        return KeyLookup(KeyVerdict.HELD, value=entry.value, slot_bound=entry.is_slot_bound)
 
     def parked_keys_within(self, value: Any) -> set[str]:
-        """Every parked key reachable inside `value`, `value` itself included.
+        """Every cache key reachable inside `value`, `value` itself included.
 
-        One walk answers both questions the engine asks of a stored value: whether it carries a key at all,
-        which the save and metadata guards need, and which keys those are, which the release scan needs when
-        a node is deleted. They were two walks asking nearly the same thing, and that is exactly how one of
-        them came to recurse while the other did not.
-
-        A key reaches a parameter bare or nested, because a container carries its children's values, so
-        asking only about the value itself misses one a level down.
+        What the release scan collects and what the save and metadata guards ask about. A key reaches a
+        parameter bare or nested, because a container carries its children's values.
         """
-        found: set[str] = set()
-        self._collect_parked(value, found=found, seen=set())
-        return found
+        return collect_leaves(value, lambda leaf: self.look_up(leaf).is_a_key)
 
     def contains_a_parked_object(self, value: Any) -> bool:
-        """Whether a parked key is anywhere in `value`, including nested inside it."""
+        """Whether a cache key is anywhere in `value`, including nested inside it."""
         return bool(self.parked_keys_within(value))
-
-    def _collect_parked(self, value: Any, *, found: set[str], seen: set[int]) -> None:
-        # `seen` does two jobs, and both are load-bearing on the save path: a self-referential value would
-        # recurse forever, and one whose substructure is shared rather than cyclic would be visited
-        # exponentially. Either takes out the save of a workflow that saved perfectly well before.
-        if self.names_a_parked_object(value):
-            found.add(value)
-            return
-        if not isinstance(value, (dict, list, tuple, set)):
-            return
-        if id(value) in seen:
-            return
-        seen.add(id(value))
-        items = value.values() if isinstance(value, dict) else value
-        for item in items:
-            self._collect_parked(item, found=found, seen=seen)
-
-    def names_a_parked_object(self, value: Any) -> bool:
-        """Whether `value` is an engine-minted key, including one whose object lives in another process.
-
-        For "may this be written out" questions. `is_parked_by_engine` is the exact, local-entry answer.
-        """
-        return self._manager().names_a_parked_object(value)
 
     def release_parked(self, key: Any) -> bool:
         """Release `key` in every process, but only if the engine parked it for this library.
@@ -159,11 +173,13 @@ class LocalObjectScope:
         library's to release, and stable by construction, so releasing it would drop that resource in
         every process holding it.
         """
-        # Shape-checked before it goes anywhere: the orchestrator holds no entries at all, so a key with
-        # no local record is broadcast to every worker on the assumption one of them parked it. An
-        # ordinary string on an unpersistable parameter -- an API token is the documented example -- would
-        # otherwise be put on the wire verbatim to libraries that never saw it.
-        if not self._manager().names_a_parked_object(key):
+        lookup = self.look_up(key)
+        # Checked before it goes anywhere: a key with no local record is broadcast to every worker on the
+        # assumption one of them holds it, so an ordinary string -- an API token is the documented example
+        # -- would otherwise be put on the wire to libraries that never saw it.
+        if not lookup.is_a_key:
+            return False
+        if lookup.verdict is KeyVerdict.HELD and not lookup.slot_bound:
             return False
         return self._manager().release_parked_key(key, owner=self.owner)
 
@@ -192,49 +208,56 @@ class LocalObjectScope:
         return self._manager().local_object_key(self._namespaced(suffix), owner=self.owner)
 
     def get(self, key: str) -> Any | None:
-        """The object behind `key`, or None if this library is not holding it in this process."""
-        if not self._is_own_key(key):
-            return None
-        return self._manager().get_local_object(key, owner=self.owner)
+        """The object behind `key`, or None if this worker's cache is not holding it."""
+        return self.look_up(key).value
 
     def require(self, key: str, *, parameter_name: str | None = None, node_name: str | None = None) -> Any:
         """The object behind `key`, raising if this process is not holding it.
 
-        Use this rather than improvising a recovery path around `get`: rebuilding from the producing
-        node's internals only works while everything shares one process.
+        Use this rather than improvising a recovery path around `get`: rebuilding from the producing node's
+        internals only works while everything shares one process.
 
-        Pass `parameter_name` when the key came from a parameter, so the failure points at the input to
-        look at. The producing node cannot be named, because on a miss its record went with the entry.
+        Pass `parameter_name` when the key came from a parameter, so the failure points at the input to look
+        at. The producing node cannot be named, because on a miss its record went with the entry.
 
         Raises:
-            RuntimeError: if the object is not held.
+            RuntimeError: if the object is not held here, with the reason it is not.
         """
         where_node = node_name if node_name is not None else self._source
-        if not self._is_own_key(key):
-            raise RuntimeError(self._unusable_key_message(key, parameter_name=parameter_name, node_name=where_node))
-
-        # One lookup against a sentinel, rather than asking whether it is held and then reading it: a
-        # concurrent drop between those two calls would make this return None from a method contracted to
-        # raise, and the caller would fail somewhere deeper with no useful message.
-        value = self._manager().get_local_object(key, owner=self.owner, default=_MISSING)
-        if value is _MISSING:
-            raise RuntimeError(self._gone_message(parameter_name=parameter_name, node_name=where_node))
-        return value
+        lookup = self.look_up(key)
+        if lookup.verdict is KeyVerdict.HELD:
+            return lookup.value
+        if lookup.verdict is KeyVerdict.RELEASED:
+            raise RuntimeError(self._released_message(parameter_name=parameter_name, node_name=where_node))
+        if lookup.verdict is KeyVerdict.ELSEWHERE:
+            raise RuntimeError(self._elsewhere_message(parameter_name=parameter_name, node_name=where_node))
+        raise RuntimeError(self._not_a_key_message(key, parameter_name=parameter_name, node_name=where_node))
 
     def resolve_if_held(self, value: Any, *, parameter_name: str, node_name: str) -> Any:
-        """`value`, with anything in it that names a held object replaced by the object.
+        """`value`, with anything in it that names a cached object replaced by the object.
 
         What a node's parameter read goes through, so a library reads its parameter normally and gets the
         object. Whether to translate is a question about the value, not about the parameter doing the
-        reading: the producer's `serializable=False` is what parked the object, and the key then travels
-        down a connection to consumers that declare nothing. Gating on the reader's own declaration hands
-        a key string to every consumer that did not also declare the flag. A value naming nothing held is
-        returned untouched.
+        reading: only the producer declares, and the key then travels down a connection to consumers that
+        declare nothing. Containers are walked, because a container carries its children's values.
 
         Raises:
-            RuntimeError: if a key names an object this process cannot hand over.
+            RuntimeError: if something in `value` names an object this process cannot hand over.
         """
-        return self._resolve_within(value, parameter_name=parameter_name, node_name=node_name, memo={})
+        if not self._manager().could_hold_a_key():
+            return value
+
+        def resolve(leaf: Any) -> Any:
+            lookup = self.look_up(leaf)
+            if lookup.verdict is KeyVerdict.HELD:
+                return lookup.value
+            if lookup.verdict is KeyVerdict.RELEASED:
+                raise RuntimeError(self._released_message(parameter_name=parameter_name, node_name=node_name))
+            if lookup.verdict is KeyVerdict.ELSEWHERE:
+                raise RuntimeError(self._elsewhere_message(parameter_name=parameter_name, node_name=node_name))
+            return leaf
+
+        return substitute_leaves(value, resolve)
 
     def key_held_in_slot(self, slot: str, value: Any) -> str | None:
         """The key this node already holds `value` under in `slot`, or None."""
@@ -267,94 +290,23 @@ class LocalObjectScope:
         # what it put. Only reachable from tests and embedders; every registered node has a library.
         return self._manager().drop_objects_for_library(self._library)
 
-    def _resolve_within(self, value: Any, *, parameter_name: str, node_name: str, memo: dict[int, Any]) -> Any:
-        if isinstance(value, str):
-            if not self._names_a_held_object(value):
-                return value
-            if not self._is_own_key(value):
-                # A key another library parked is refused rather than handed over as a string: it can
-                # never resolve here, and saying so beats the node failing on a str it expected an object
-                # to be.
-                raise RuntimeError(
-                    self._unusable_key_message(value, parameter_name=parameter_name, node_name=node_name)
-                )
-            return self.require(value, parameter_name=parameter_name, node_name=node_name)
-        # Lists and dicts are walked because a container parameter carries its children's values, so a
-        # ParameterList fed by three producers holds three keys and `get_parameter_list_value` is what the
-        # node reads. Sets and tuples are not: resolving into a set would re-hash objects that are
-        # routinely unhashable, and into a tuple subclass would lose what it was. The release scan walks
-        # those too, and that asymmetry is safe in the direction it runs -- it counts a key as referenced
-        # rather than freeing one still in use.
-        if not isinstance(value, (list, dict)):
-            return value
-        if id(value) in memo:
-            return memo[id(value)]
-        # Seeded with the original before recursing, so a container reaching itself terminates, and so two
-        # rows carrying the same list get the same resolved list rather than the second one coming back
-        # with its keys intact.
-        memo[id(value)] = value
-        originals = list(value.values()) if isinstance(value, dict) else list(value)
-        resolved = [
-            self._resolve_within(item, parameter_name=parameter_name, node_name=node_name, memo=memo)
-            for item in originals
-        ]
-        # Nothing in here was a key, so hand back the object that was stored. Rebuilding unconditionally
-        # would make every read of an ordinary list or dict parameter a copy, and a node that mutates what
-        # it read in place would silently stop persisting the change.
-        if all(new is old for new, old in zip(resolved, originals, strict=True)):
-            return value
-        if isinstance(value, dict):
-            rebuilt: Any = dict(zip(value.keys(), resolved, strict=True))
-        else:
-            rebuilt = resolved
-        memo[id(value)] = rebuilt
-        return rebuilt
-
-    def _names_a_held_object(self, value: Any) -> bool:
-        """Whether `value` names an object held here or in another process.
-
-        The entry is the authority when it is here, and either kind counts: a key its owner named through
-        `put` has no shape to match. The minted shape is the fallback for an object sitting in a worker,
-        where there is no entry to consult and handing the node a string is the wrong answer.
-        """
-        manager = self._manager()
-        return manager.holds_any_key(value) or manager.names_a_parked_object(value)
-
-    def _is_own_key(self, key: Any) -> bool:
-        """Whether this worker minted `key`, which is the same question as whether it can resolve it."""
-        return isinstance(key, str) and key.startswith(f"{self.owner}:")
-
-    def _unusable_key_message(self, key: Any, *, parameter_name: str | None, node_name: str) -> str:
-        # A key arrives as a parameter value, so it can be any type or missing entirely, and each way of
-        # being wrong calls for a different fix by whoever built the graph. `is None` first, then the type,
-        # then emptiness: asking whether a tensor is empty raises out of numpy, and a one-element tensor
-        # answers falsy.
-        if key is None:
+    def _not_a_key_message(self, key: Any, *, parameter_name: str | None, node_name: str) -> str:
+        """Nothing the cache recognises arrived: unwired, or wired to something that is not a reference."""
+        # `is None` first, then the type, then emptiness: asking whether a tensor is empty raises out of
+        # numpy, and a one-element tensor answers falsy.
+        if key is None or (isinstance(key, str) and not key):
             cause = "nothing is connected to it"
-            remedy = "Connect a node that produces one."
         elif not isinstance(key, str):
             cause = "the value it received is not a reference to a held object"
-            remedy = "Connect a node that produces one."
-        elif not key:
-            cause = "nothing is connected to it"
-            remedy = "Connect a node that produces one."
         else:
-            # Minted somewhere else: another worker, or the orchestrator reading what a worker made. The
-            # object may be perfectly alive over there, so this must not send anyone off to re-run a
-            # producer that already succeeded.
-            cause = "it is held in another process, and an object cannot leave the process that built it"
-            remedy = (
-                "Read it from a node that runs in the same place as the one that made it, or have that node "
-                "output a saved file instead."
-            )
-        return f"Attempted to read {self._where(parameter_name, node_name)}. Failed due to: {cause}. {remedy}"
+            cause = "the value it received is not a reference to a held object"
+        return (
+            f"Attempted to read {self._where(parameter_name, node_name)}. Failed due to: {cause}. "
+            f"Connect a node that produces one."
+        )
 
-    def _gone_message(self, *, parameter_name: str | None, node_name: str) -> str:
-        """Why a key minted in THIS worker no longer resolves: whatever it named has been released.
-
-        A key from anywhere else never reaches here -- it is not this worker's to look up, and
-        `_unusable_key_message` says so instead.
-        """
+    def _released_message(self, *, parameter_name: str | None, node_name: str) -> str:
+        """This worker minted the key and no longer holds what it named, so re-running the producer helps."""
         if parameter_name is not None:
             remedy = f"Re-run whatever is connected to '{parameter_name}'."
         else:
@@ -363,6 +315,20 @@ class LocalObjectScope:
             f"Attempted to read {self._where(parameter_name, node_name)}. Failed due to: it is no longer "
             f"available, which happens after the workflow is reloaded or the node that made it is re-run. "
             f"{remedy}"
+        )
+
+    def _elsewhere_message(self, *, parameter_name: str | None, node_name: str) -> str:
+        """Minted by some other process, so this one has nothing to look up.
+
+        Either a worker that is still running and still holding it, or one that has since been replaced --
+        a respawned worker gets a fresh id, so a key from the old one lands here too. The remedy has to
+        cover both, because this process cannot tell them apart.
+        """
+        return (
+            f"Attempted to read {self._where(parameter_name, node_name)}. Failed due to: it is held in "
+            f"another process, and an object cannot leave the process that built it. Read it from a node "
+            f"that runs in the same place as the one that made it, or re-run that node if its worker has "
+            f"restarted since."
         )
 
     @staticmethod
@@ -378,3 +344,150 @@ class LocalObjectScope:
         from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         return GriptapeNodes.ResourceManager()
+
+
+# --- walking a parameter value -------------------------------------------------------------------
+#
+# The cache asks three questions of a value, and every one of them has to walk it: is this already data,
+# which cached keys are in here, and turn the keys into objects. A parameter value is whatever a node
+# assigned, so all three have to survive a container that refers to itself and one whose substructure is
+# shared rather than nested. Hand-rolling that guard per question is what produced five separate defects
+# in this feature's history, so the rules live here, once:
+#
+#   * a container reached twice is visited once. Without this, shared substructure is exponential in its
+#     depth rather than linear in its size.
+#   * a container that reaches itself terminates. What that *means* differs by question, so each one seeds
+#     its own answer for the revisit rather than sharing one.
+#   * substitution hands back the value it was given when nothing changed, so a node that reads a list and
+#     mutates it in place is mutating the stored list.
+#
+# Nothing outside the cache uses these. Other walks over the same shape -- variable substitution, artifact
+# hydration -- are separate concerns that happen to share a spine, and coupling them here would tie the
+# cache to code that has no reason to know about it.
+
+_CONTAINER_TYPES = (list, tuple, dict, set)
+
+
+def _children(container: Any) -> Any:
+    return container.values() if isinstance(container, dict) else container
+
+
+def is_plain_data(value: Any) -> bool:
+    """Whether `value` is already something JSON can carry, so the cache has no reason to take it."""
+    return _is_plain_data(value, memo={})
+
+
+def _is_plain_data(value: Any, *, memo: dict[int, bool]) -> bool:
+    if isinstance(value, (str, int, float, bool, type(None))):
+        return True
+    if not isinstance(value, (list, tuple, dict)):
+        return False
+    if id(value) in memo:
+        return memo[id(value)]
+    # A back-reference is not data: `json.dumps` refuses a circular structure outright, so the honest
+    # answer is that the cache should take this value rather than let the transport fail on it.
+    memo[id(value)] = False
+    if isinstance(value, dict):
+        # json.dumps coerces int/float/bool/None keys rather than refusing them, so a dict keyed by frame
+        # number travels perfectly well.
+        keys_ok = all(isinstance(key, (str, int, float, bool)) or key is None for key in value)
+    else:
+        keys_ok = True
+    result = keys_ok and all(_is_plain_data(child, memo=memo) for child in _children(value))
+    memo[id(value)] = result
+    return result
+
+
+def collect_leaves(value: Any, keep: Callable[[Any], bool]) -> set[Any]:
+    """Every leaf inside `value` that `keep` accepts, `value` itself included."""
+    found: set[Any] = set()
+    _collect_leaves(value, keep, found=found, seen=set())
+    return found
+
+
+def _collect_leaves(value: Any, keep: Callable[[Any], bool], *, found: set[Any], seen: set[int]) -> None:
+    if not isinstance(value, _CONTAINER_TYPES):
+        if keep(value):
+            found.add(value)
+        return
+    if id(value) in seen:
+        return
+    seen.add(id(value))
+    for child in _children(value):
+        _collect_leaves(child, keep, found=found, seen=seen)
+
+
+def substitute_leaves(value: Any, transform: Callable[[Any], Any]) -> Any:
+    """`value` with every leaf replaced by `transform(leaf)`, or `value` itself if nothing changed.
+
+    Sets are walked but cannot be rebuilt: their members would have to be re-hashed after substitution and
+    the objects this exists for are routinely unhashable. A set whose members would change raises rather
+    than silently handing back the originals.
+
+    Raises:
+        TypeError: if a substitution would have to rebuild a set.
+    """
+    return _substitute_leaves(value, transform, memo={})
+
+
+def _substitute_leaves(value: Any, transform: Callable[[Any], Any], *, memo: dict[int, Any]) -> Any:
+    if not isinstance(value, _CONTAINER_TYPES):
+        return transform(value)
+    if id(value) in memo:
+        return memo[id(value)]
+    # Seeded with the original before descending, so a container that reaches itself terminates and two
+    # places referring to one container get one substituted container back rather than two.
+    memo[id(value)] = value
+    originals = list(_children(value))
+    substituted = [_substitute_leaves(child, transform, memo=memo) for child in originals]
+    if all(new is old for new, old in zip(substituted, originals, strict=True)):
+        return value
+    if isinstance(value, set):
+        msg = (
+            "Attempted to read a value held in this process. Failed due to: it is inside a set, which "
+            "cannot be rebuilt around it. Put held values in a list or a dictionary instead."
+        )
+        raise TypeError(msg)
+    if isinstance(value, dict):
+        rebuilt: Any = dict(zip(value.keys(), substituted, strict=True))
+    elif isinstance(value, tuple):
+        rebuilt = tuple(substituted)
+    else:
+        rebuilt = substituted
+    memo[id(value)] = rebuilt
+    return rebuilt
+
+
+def caches_its_values(parameter: Parameter) -> bool:
+    """Whether this parameter's values belong in the cache.
+
+    The cache asks; the parameter types do not answer. `serializable=False` is the author's declaration
+    that the value cannot be written out, and a container is excluded because it has no single object to
+    hold and nowhere to attach a release hook -- its children are ordinary parameters and are cached on
+    their own account.
+    """
+    return not parameter.serializable and not isinstance(parameter, ParameterContainer)
+
+
+def cache_outputs_for_egress(values: Mapping[str, Any], *, node: BaseNode) -> dict[str, Any]:
+    """`values` with anything the cache takes replaced by its key.
+
+    Called where a worker's output values are about to leave the process, and nowhere else, so a node's own
+    dicts keep the real objects and a graph that never crosses a boundary caches nothing. Inputs never come
+    through here: caching one would mint a key the far side has nothing to resolve against, since the object
+    is in the sending process while the node runs elsewhere.
+
+    A declared output goes in the cache unless the value is already plain data -- a key for an API token
+    would be unresolvable over there. Everything else passes through exactly as it did before the cache
+    existed, including a value the transport can only manage by stringifying.
+    """
+    cached: dict[str, Any] = {}
+    # A copy, because node bodies write their outputs from worker threads and a dict that changes size
+    # mid-iteration raises.
+    for name, value in dict(values).items():
+        parameter = node.get_parameter_by_name(name)
+        if parameter is not None and caches_its_values(parameter):
+            cached[name] = node.park_for_egress(parameter, value, travels_as_data=is_plain_data(value))
+            continue
+        cached[name] = value
+    return cached

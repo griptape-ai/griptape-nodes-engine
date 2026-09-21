@@ -624,15 +624,6 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         self._output_type = canonical_type_name(value)
 
     @property
-    def is_process_local(self) -> bool:
-        """Whether the engine holds this parameter's values in the process that produced them.
-
-        `serializable=False` is the declaration: a value that cannot be written into a saved workflow
-        cannot cross a process boundary either. Containers answer False -- see ParameterContainer.
-        """
-        return not self.serializable
-
-    @property
     def on_local_object_drop(self) -> Callable[[Any], None] | None:
         """What to run when the engine releases the object this parameter referred to.
 

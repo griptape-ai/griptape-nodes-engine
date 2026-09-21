@@ -343,17 +343,15 @@ class BaseNode(ABC):
         if metadata is None:
             self.metadata = {}
         else:
-            # Copied: the identity minted below is written in, and a caller reusing one dict
-            # across two nodes would otherwise give the second the first one's identity.
-            self.metadata = dict(metadata)
-        # The identity held objects are parked under. Display names are recycled -- delete Producer_1 and
-        # the next node created gets Producer_1 back -- so parking under the name would let a new node
-        # displace and free a dead node's object while a consumer still holds its key. Minted once here
-        # and carried in metadata, it survives the trip to a worker's transient node (ExecuteNodeRequest
-        # copies metadata) and survives rename, so a renamed node keeps displacing its own prior objects.
-        # Any path that writes node metadata must preserve this key; losing it only orphans entries until
-        # workflow teardown, but serialization must keep stripping it (on_serialize_node_to_commands).
-        self.metadata.setdefault("local_object_source", f"{name}@{uuid.uuid4().hex[:8]}")
+            self.metadata = metadata
+        # The identity cached objects are held under. Display names are recycled -- delete Producer_1 and
+        # the next node created gets Producer_1 back -- so caching under the name would let a new node
+        # displace and free a dead node's object while a consumer still holds its key. An attribute rather
+        # than a metadata entry, because metadata is client-writable and a replayed copy would give two
+        # live nodes one identity. A worker's transient node adopts the orchestrator's through
+        # ExecuteNodeRequest.local_object_source; it survives rename, so a renamed node keeps displacing
+        # its own prior objects.
+        self.local_object_source = f"{name}@{uuid.uuid4().hex[:8]}"
         self.parameter_values = {}
         self.parameter_output_values = TrackedParameterOutputValues(self)
         self._local_objects = None
@@ -1366,7 +1364,7 @@ class BaseNode(ABC):
         if self._local_objects is None:
             self._local_objects = LocalObjectScope(
                 library=self.metadata.get("library"),
-                source=str(self.metadata["local_object_source"]),
+                source=self.local_object_source,
             )
         return self._local_objects
 

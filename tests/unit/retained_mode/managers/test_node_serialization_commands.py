@@ -16,8 +16,8 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from griptape_nodes.common.parameter_hydration import dehydrate_parameter_values
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
+from griptape_nodes.exe_types.local_objects import cache_outputs_for_egress
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
 from griptape_nodes.exe_types.node_groups.subflow_node_group import SubflowNodeGroup
 from griptape_nodes.exe_types.node_types import LOCAL_EXECUTION, DataNode, NodeDependencies
@@ -611,10 +611,10 @@ class TestLocalObjectIdentityIsNeverCopied:
     def test_creating_a_node_with_a_supplied_identity_mints_a_fresh_one(
         self, engine: Engine, library_name: str
     ) -> None:
-        """Serialization is one way in; a client replaying metadata through CreateNode is the other.
+        """A client cannot hand a node someone else's cache identity, because metadata no longer carries it.
 
-        Node metadata is readable over the bus, so a client duplicating a node by handing its metadata
-        straight back would otherwise get two live nodes sharing one cache identity.
+        Node metadata is readable over the bus. While the identity lived in it, every write path needed its
+        own strip; as an attribute there is nothing for a replayed copy to poison.
         """
         original_name = _create_text_node(engine, library_name, "Original")
         original = engine.node_manager.get_node_by_name(original_name)
@@ -622,7 +622,7 @@ class TestLocalObjectIdentityIsNeverCopied:
         clone_name = _create_text_node(engine, library_name, "Clone", metadata=dict(original.metadata))
         clone = engine.node_manager.get_node_by_name(clone_name)
 
-        assert clone.metadata["local_object_source"] != original.metadata["local_object_source"]
+        assert clone.local_object_source != original.local_object_source
 
     def test_a_pasted_node_gets_its_own_identity(self, engine: Engine, library_name: str) -> None:
         node_name = _create_text_node(engine, library_name, "Original")
@@ -634,7 +634,6 @@ class TestLocalObjectIdentityIsNeverCopied:
         assert isinstance(serialize_result, SerializeNodeToCommandsResultSuccess)
         create_command = serialize_result.serialized_node_commands.create_node_command
         assert create_command.metadata is not None
-        assert "local_object_source" not in create_command.metadata
 
         paste_result = engine.node_manager.on_deserialize_node_from_commands(
             DeserializeNodeFromCommandsRequest(serialized_node_commands=serialize_result.serialized_node_commands)
@@ -642,7 +641,7 @@ class TestLocalObjectIdentityIsNeverCopied:
         assert isinstance(paste_result, DeserializeNodeFromCommandsResultSuccess)
         clone = engine.node_manager.get_node_by_name(paste_result.node_name)
 
-        assert clone.metadata["local_object_source"] != original.metadata["local_object_source"]
+        assert clone.local_object_source != original.local_object_source
 
     def test_a_pasted_nodes_first_park_leaves_the_originals_object_alone(
         self, engine: Engine, library_name: str
@@ -673,10 +672,10 @@ class TestLocalObjectIdentityIsNeverCopied:
                 )
             )
         original.parameter_output_values["pipe"] = object()
-        key = dehydrate_parameter_values(original.parameter_output_values, node=original, are_outputs=True)["pipe"]
+        key = cache_outputs_for_egress(original.parameter_output_values, node=original)["pipe"]
 
         clone.parameter_output_values["pipe"] = object()
-        dehydrate_parameter_values(clone.parameter_output_values, node=clone, are_outputs=True)
+        cache_outputs_for_egress(clone.parameter_output_values, node=clone)
 
         assert released == []
         assert engine.resource_manager.get_local_object(key, owner=original.local_objects.owner) is not None

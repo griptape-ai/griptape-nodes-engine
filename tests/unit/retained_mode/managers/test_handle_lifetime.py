@@ -14,8 +14,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from griptape_nodes.common.parameter_hydration import dehydrate_parameter_values
 from griptape_nodes.exe_types.core_types import Parameter, ParameterList, ParameterMode
+from griptape_nodes.exe_types.local_objects import cache_outputs_for_egress
 from griptape_nodes.exe_types.node_types import BaseNode, NodeResolutionState
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.connection_events import (
@@ -152,7 +152,7 @@ def graph(engine: Engine, flow_name: str) -> tuple[_Producer, _Consumer]:
 
 def _egress(node: BaseNode) -> dict:
     """The payload leaving the process, which is where a value that cannot travel becomes a key."""
-    return dehydrate_parameter_values(node.parameter_output_values, node=node, are_outputs=True)
+    return cache_outputs_for_egress(node.parameter_output_values, node=node)
 
 
 def _produce(producer: _Producer, consumer: _Consumer, label: str) -> str:
@@ -465,9 +465,10 @@ class TestTheRealRunPathReleases:
         first_run.parameter_output_values["latent"] = Held("first")
         _egress(first_run)
 
-        # ExecuteNodeRequest carries dict(node.metadata), which is what makes the identity stable
-        # across transient instances; a node with different metadata is a different node.
-        second_run = _Producer(name="Producer", metadata=dict(first_run.metadata))
+        # ExecuteNodeRequest carries local_object_source, and the worker's transient node adopts it. That
+        # is what makes the identity stable across instances; a node that mints its own is a different node.
+        second_run = _Producer(name="Producer")
+        second_run.local_object_source = first_run.local_object_source
         second_run.parameter_output_values["latent"] = Held("second")
         _egress(second_run)
 
@@ -655,7 +656,6 @@ class TestALibraryKeyIsNotTheEnginesToRelease:
             Held("shared"), key="sd-xl-1.0#a1b2c3d4", on_drop=lambda value: released.append(value.label)
         )
 
-        assert builder.local_objects.is_parked_by_engine(lookalike) is False
         assert builder.local_objects.release_parked(lookalike) is False
         assert released == []
         assert _is_held(engine, lookalike)

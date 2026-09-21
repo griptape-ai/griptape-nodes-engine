@@ -24,7 +24,7 @@ hold.
 
 A list or dictionary parameter is unaffected: declaring `serializable=False` on one still keeps it out of
 saved workflows exactly as before. It adds no holding, because a container builds its value from its
-children, and unsendable values inside one reaching a boundary get an error naming the remedy.
+children. Put the value on an ordinary parameter marked `serializable=False` if you want it cached.
 
 ## Branched workflows show a title instead of a file path
 

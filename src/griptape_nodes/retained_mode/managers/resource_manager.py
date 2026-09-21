@@ -74,6 +74,17 @@ class LocalObjectEntry:
     slot: str | None = None
     on_drop: Callable[[Any], None] | None = None
 
+    @property
+    def is_slot_bound(self) -> bool:
+        """Whether the engine took this on a parameter's behalf, rather than the library naming it.
+
+        `slot` carries both facts deliberately: which slot to displace, and whose entry this is. A separate
+        lifetime field would say the same thing twice and every caller would have to keep the two agreeing.
+        Only a slot-bound entry is the engine's to displace or release; a library-named one is stable by
+        construction and several sources may hold it.
+        """
+        return self.slot is not None
+
 
 _SAME_VALUE_UNSET = object()
 
@@ -107,6 +118,8 @@ class ResourceManager(EngineScoped):
         self._capability_instances: dict[str, ResourceInstance] = {}
         # Maps an engine-minted key to a live object a library parked in THIS process.
         self._local_objects: dict[str, LocalObjectEntry] = {}
+        # Latched on the first entry and never cleared: see could_hold_a_key.
+        self._has_ever_cached = False
         # Node bodies that yield a callable run on real threads (`async_utils.to_thread`), and parallel
         # resolution runs several node tasks at once, so two nodes can be inside these methods together.
         # Every mutation happens under this lock; release hooks run outside it, since a hook is caller
@@ -402,6 +415,7 @@ class ResourceManager(EngineScoped):
                     owner=owner, source=source, slot=slot, keep_key=full_key, keep_value=value
                 )
             self._local_objects[full_key] = entry
+            self._has_ever_cached = True
             displaced_value_survives = displaced is not None and self._value_still_held_locked(displaced.value)
             if displaced_slot_entries:
                 self._pending_worker_releases.extend(displaced_slot_entries)
@@ -436,7 +450,7 @@ class ResourceManager(EngineScoped):
             return [
                 key
                 for key, entry in self._local_objects.items()
-                if entry.owner == owner and entry.source == source and entry.slot is not None
+                if entry.owner == owner and entry.source == source and entry.is_slot_bound
             ]
 
     def key_held_in_slot(self, *, owner: str, source: str, slot: str, value: Any) -> str | None:
@@ -452,34 +466,29 @@ class ResourceManager(EngineScoped):
                     return key
         return None
 
-    def names_a_parked_object(self, value: Any) -> bool:
-        """Whether `value` is a key the engine minted, whether or not THIS process holds the entry.
+    def could_hold_a_key(self) -> bool:
+        """Whether a key could plausibly appear in this process at all.
 
-        The entry is the authority when it is here, and shape is the fallback when it is not: a worker
-        parked the object, so the orchestrator has no entry to consult, and deciding "may this be written
-        into a saved workflow" still has to come out right.
-
-        A false positive costs a value: the save drops it and stamps the node UNRESOLVED, and metadata
-        collection reports it omitted. A false negative writes a dead key into the file. So the pattern is
-        deliberately narrow on both sides -- do not widen it casually. Release decisions use the exact
-        `is_parked_key`, where a false positive would free someone else's object.
+        Asked before walking a parameter value, because a node read is the hottest path this touches and
+        most engines never spawn a worker at all. Both halves are latched rather than current: a key this
+        process minted and has since released still deserves "re-run the producer" instead of being handed
+        back as a string, and so does one from a worker that has since died.
         """
-        return self.is_parked_key(value) or (isinstance(value, str) and bool(_MINTED_KEY.match(value)))
+        return self._has_ever_cached or self.engine.worker_manager.has_ever_had_a_worker()
 
-    def holds_any_key(self, value: Any) -> bool:
-        """Whether the store currently holds anything under `value`, for any owner and either kind."""
-        if not isinstance(value, str):
-            return False
+    def entry_for(self, key: str) -> LocalObjectEntry | None:
+        """The entry this process holds under `key`, or None. The cache's only exact lookup."""
         with self._local_objects_lock:
-            return value in self._local_objects
+            return self._local_objects.get(key)
 
-    def is_parked_key(self, key: Any) -> bool:
-        """Whether `key` names an entry the engine parked for a parameter, rather than one its owner named."""
-        if not isinstance(key, str):
-            return False
-        with self._local_objects_lock:
-            entry = self._local_objects.get(key)
-        return entry is not None and entry.slot is not None
+    def has_minted_key_shape(self, value: Any) -> bool:
+        """Whether `value` looks like a key this engine minted, without consulting the store.
+
+        How a process recognises a key it could not possibly hold: the object is in the worker that made
+        it, so there is no entry here to consult. Shape is the only evidence available, which is why the
+        pattern is narrow -- a false positive turns an ordinary string into an error.
+        """
+        return isinstance(value, str) and bool(_MINTED_KEY.match(value))
 
     def local_object_key(self, suffix: str, *, owner: str) -> str:
         """The key `put_local_object` would produce for this suffix, without putting anything.
@@ -542,7 +551,7 @@ class ResourceManager(EngineScoped):
         """
         with self._local_objects_lock:
             entry = self._local_objects.get(key)
-            if entry is not None and (entry.owner != owner or entry.slot is None):
+            if entry is not None and (entry.owner != owner or not entry.is_slot_bound):
                 return False
             if entry is None:
                 self._pending_worker_releases.append(key)
@@ -559,7 +568,7 @@ class ResourceManager(EngineScoped):
         """
         with self._local_objects_lock:
             entry = self._local_objects.get(key)
-            if entry is None or entry.slot is None:
+            if entry is None or not entry.is_slot_bound:
                 return False
             del self._local_objects[key]
             survives = self._value_still_held_locked(entry.value)
@@ -669,11 +678,6 @@ class ResourceManager(EngineScoped):
 
         self._invoke_hooks_once_per_object(to_release)
         return len(doomed)
-
-    def _value_still_held(self, value: Any) -> bool:
-        """Whether any current entry holds this very object."""
-        with self._local_objects_lock:
-            return self._value_still_held_locked(value)
 
     def _value_still_held_locked(self, value: Any) -> bool:
         """`_value_still_held` for callers already holding the lock.

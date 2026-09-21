@@ -19,14 +19,9 @@ This module is the targeted post-structure pass for exactly those fields.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from griptape.artifacts import BaseArtifact
-
-if TYPE_CHECKING:
-    from collections.abc import Mapping
-
-    from griptape_nodes.exe_types.node_types import BaseNode
 
 logger = logging.getLogger(__name__)
 
@@ -61,42 +56,3 @@ def hydrate_value(value: Any) -> Any:
     if isinstance(value, list):
         return [hydrate_value(item) for item in value]
     return value
-
-
-def dehydrate_parameter_values(values: Mapping[str, Any], *, node: BaseNode, are_outputs: bool) -> dict[str, Any]:
-    """Parameter values with anything the cache is holding replaced by its key.
-
-    The outbound half of this module. Called where values are about to leave the process -- a worker
-    dispatch or a worker result -- and nowhere else, so a node's own dicts keep the real objects and a
-    graph that never crosses a boundary never caches anything.
-
-    An output whose author declared it unpersistable goes in the cache unless the value is already plain
-    data: a key for an API token would be unresolvable on the far side, while anything richer is held
-    rather than unstructured, because cattrs turns any attrs class into a dict of its fields and the
-    inbound mirror cannot put it back. Every other value is passed through exactly as it was before this
-    existed, including one the transport can only manage by stringifying it.
-    """
-    dehydrated: dict[str, Any] = {}
-    # A copy, because node bodies write their outputs from worker threads and a dict that changes size
-    # mid-iteration raises. `_keys_referenced_by` snapshots for the same reason.
-    for name, value in dict(values).items():
-        parameter = node.get_parameter_by_name(name)
-        if are_outputs and parameter is not None and parameter.is_process_local:
-            dehydrated[name] = node.park_for_egress(parameter, value, travels_as_data=_is_json_safe(value))
-            continue
-        dehydrated[name] = value
-    return dehydrated
-
-
-def _is_json_safe(value: Any) -> bool:
-    if isinstance(value, (str, int, float, bool, type(None))):
-        return True
-    if isinstance(value, (list, tuple)):
-        return all(_is_json_safe(item) for item in value)
-    if isinstance(value, dict):
-        # json.dumps coerces int/float/bool/None keys rather than refusing them, so a dict keyed by frame
-        # number travels fine and must not be reported as unsendable.
-        return all(isinstance(k, (str, int, float, bool)) or k is None for k in value) and all(
-            _is_json_safe(v) for v in value.values()
-        )
-    return False

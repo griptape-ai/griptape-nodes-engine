@@ -10,12 +10,13 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 from uuid import uuid4
 
-from griptape_nodes.common.parameter_hydration import dehydrate_parameter_values, hydrate_parameter_values
+from griptape_nodes.common.parameter_hydration import hydrate_parameter_values
 from griptape_nodes.common.strict_mode import (
     STRICT_MODE,
     StrictModeScopeKind,
     StrictModeSeverity,
 )
+from griptape_nodes.exe_types.local_objects import cache_outputs_for_egress
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -830,20 +831,11 @@ class NodeManager(EngineScoped):
                 specific_library_name=request.specific_library_name,
                 event_manager=self.engine.event_manager,
             )
-            # The identity held objects are cached under belongs to one live node and is minted in
-            # BaseNode.__init__. It travels in metadata so a worker's transient node keeps it, and metadata
-            # is readable by clients (GetNodeMetadata, GetAllNodeInfo), so a client duplicating a node by
-            # replaying it would otherwise get two live nodes sharing one identity -- and the second one's
-            # first cached object would displace and free the first's while a consumer still names its key.
-            # Serialization strips it for the same reason; this is the other way in.
-            requested_metadata = request.metadata
-            if requested_metadata is not None and "local_object_source" in requested_metadata:
-                requested_metadata = {k: v for k, v in requested_metadata.items() if k != "local_object_source"}
             node = LibraryRegistry.create_node(
                 name=final_node_name,
                 node_type=request.node_type,
                 specific_library_name=request.specific_library_name,
-                metadata=requested_metadata,
+                metadata=request.metadata,
             )
         # modifying to exception to try to catch all possible issues with node creation.
         except Exception as err:
@@ -3218,7 +3210,7 @@ class NodeManager(EngineScoped):
         # reach, and this is the last chance to run its release hook.
         candidates.update(
             self.engine.resource_manager.parked_keys_for(
-                owner=node.local_objects.owner, source=node.metadata["local_object_source"]
+                owner=node.local_objects.owner, source=node.local_object_source
             )
         )
         if not candidates:
@@ -3440,7 +3432,7 @@ class NodeManager(EngineScoped):
                 ),
             )
         try:
-            return LibraryRegistry.create_node(
+            transient = LibraryRegistry.create_node(
                 node_type=node_type,
                 name=node_name,
                 metadata=dict(request.node_metadata),
@@ -3450,6 +3442,11 @@ class NodeManager(EngineScoped):
             return ExecuteNodeResultFailure(
                 result_details=f"Failed to create node '{node_name}' of type '{node_type}': {e}",
             )
+        if request.local_object_source is not None:
+            # Adopt the orchestrator's identity. A fresh node is built for every execution, so without this
+            # each run would cache under a new identity and nothing would ever displace anything.
+            transient.local_object_source = request.local_object_source
+        return transient
 
     async def _execute_node_via_worker(
         self,
@@ -3466,14 +3463,6 @@ class NodeManager(EngineScoped):
         (NodeExecutor.execute) so the write path is identical for local and
         worker routes.
         """
-        # The one route where inputs actually cross. The request carries a copy of the node's values, so
-        # substituting here leaves the live node holding its objects.
-        node = self.engine.object_manager.attempt_get_object_by_name_as_type(request.node_name, BaseNode)
-        if node is not None:
-            request.parameter_values = dehydrate_parameter_values(
-                request.parameter_values, node=node, are_outputs=False
-            )
-
         worker_engine_id, worker_request_topic = worker
         # Assign the request_id on the payload itself so the worker handler can
         # read it from request.request_id. WorkerManager.route_to_worker will
@@ -3650,7 +3639,7 @@ class NodeManager(EngineScoped):
         # NodeExecutor, which copies it onto this very node, so parking here would put a key in the dict
         # the node just wrote its object into.
         if self.engine.library_manager.is_worker:
-            output_values = dehydrate_parameter_values(node.parameter_output_values, node=node, are_outputs=True)
+            output_values = cache_outputs_for_egress(node.parameter_output_values, node=node)
         else:
             output_values = dict(node.parameter_output_values)
         return ExecuteNodeResultSuccess(
@@ -3858,11 +3847,6 @@ class NodeManager(EngineScoped):
                 # Remove node_names_in_group from metadata - it's redundant and will be regenerated
                 metadata_copy = copy.deepcopy(node.metadata)
                 metadata_copy.pop("node_names_in_group", None)
-                # The identity held objects are parked under is per live node, never per serialized form:
-                # duplicate/paste and saved files all rebuild from these commands, and a second node with
-                # the same identity displaces and frees the original's still-referenced objects. The
-                # deserialized node mints a fresh one in BaseNode.__init__.
-                metadata_copy.pop("local_object_source", None)
 
                 # Remove subflow_name for copy/paste operations (so pasted groups create fresh subflows)
                 # Keep it for workflow file generation (so it can be extracted and used as a variable reference)
@@ -3896,7 +3880,6 @@ class NodeManager(EngineScoped):
                 # Get the creation details for regular nodes
                 metadata_copy = copy.deepcopy(node.metadata)
                 # Per live node, never per serialized form -- see the group branch above.
-                metadata_copy.pop("local_object_source", None)
                 create_node_request = CreateNodeRequest(
                     node_type=serialized_node_type,
                     node_name=node_name,

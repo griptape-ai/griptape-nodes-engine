@@ -107,6 +107,8 @@ class WorkerManager(EngineScoped):
 
         # Orchestrator-side registry: worker_engine_id → WorkerRegistration
         self._workers: dict[str, WorkerRegistration] = {}
+        # Latched on first registration and never cleared: see has_ever_had_a_worker.
+        self._has_ever_had_a_worker = False
 
         # Subprocesses spawned by this orchestrator (library_name → process)
         self._managed_worker_processes: dict[str, asyncio.subprocess.Process] = {}
@@ -213,6 +215,7 @@ class WorkerManager(EngineScoped):
         session_id = self.engine.get_session_id()
         request_topic = f"sessions/{session_id}/workers/{wid}/request"
         self._workers[wid] = WorkerRegistration(request_topic=request_topic, worker_key=request.library_name)
+        self._has_ever_had_a_worker = True
         self._worker_last_seen[wid] = time.monotonic()
 
         if request.library_name:
@@ -302,6 +305,16 @@ class WorkerManager(EngineScoped):
                 msg = f"Orchestrator heartbeat lost ({elapsed:.1f}s since last heartbeat); worker is shutting down."
                 logger.warning(msg)
                 raise RuntimeError(msg)
+
+    def has_ever_had_a_worker(self) -> bool:
+        """Whether a worker has registered at any point in this process's life.
+
+        A latch, not a live count. A worker that has been evicted or has died leaves keys behind in the
+        graph's parameter values, and a reader has to be told those name an object in another process rather
+        than handed the key string. Asking whether one is registered *now* would lose that the moment the
+        worker went away.
+        """
+        return self._has_ever_had_a_worker
 
     def get_worker_for_key(self, key: str) -> tuple[str, str] | None:
         """Return (worker_engine_id, worker_request_topic) for a worker registered under key, or None.

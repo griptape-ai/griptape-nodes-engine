@@ -11,8 +11,8 @@ tests/unit/retained_mode/managers/test_handle_lifetime.py.
 
 import pytest
 
-from griptape_nodes.common.parameter_hydration import dehydrate_parameter_values
 from griptape_nodes.exe_types.core_types import Parameter, ParameterList, ParameterMode
+from griptape_nodes.exe_types.local_objects import cache_outputs_for_egress, caches_its_values
 from griptape_nodes.exe_types.node_types import BaseNode
 
 
@@ -80,10 +80,9 @@ def _consumer(name: str = "Generate") -> _LibraryNode:
     return node
 
 
-def _egress(node: _LibraryNode, *, are_outputs: bool = True) -> dict:
+def _egress(node: _LibraryNode) -> dict:
     """The payload that leaves the process, which is where a value becomes a key."""
-    values = node.parameter_output_values if are_outputs else node.parameter_values
-    return dehydrate_parameter_values(values, node=node, are_outputs=are_outputs)
+    return cache_outputs_for_egress(node.parameter_output_values, node=node)
 
 
 def _hand_over(producer: _LibraryNode, consumer: _LibraryNode, param: str = "pipeline") -> None:
@@ -190,6 +189,9 @@ class TestWhatTheAuthorSeesWhenSomethingIsWrong:
         too, so anything a library does outside `process` lands here.
         """
         consumer = _consumer()
+        # A key from another process can only be here because a worker existed, which is the condition the
+        # read's fast path latches on. Without one, no value in this process can name a cached object.
+        consumer.local_objects._manager().engine.worker_manager._has_ever_had_a_worker = True
         consumer.set_parameter_value("pipeline", "some-other-worker:LoadPipeline@abc12345.pipeline#deadbeef")
 
         with pytest.raises(RuntimeError) as caught:
@@ -258,7 +260,7 @@ class TestWhatTheAuthorSeesWhenSomethingIsWrong:
 
         node.parameter_output_values["latents"] = batch
 
-        assert latents.is_process_local is False
+        assert caches_its_values(latents) is False
         assert node.parameter_output_values["latents"] is batch
 
 
@@ -330,7 +332,7 @@ class TestBothDictsCross:
         pipeline = Pipeline("flux")
         node.set_parameter_value("incoming", pipeline)
 
-        assert _egress(node, are_outputs=False)["incoming"] is pipeline
+        assert node.parameter_values["incoming"] is pipeline
 
     def test_a_key_arriving_on_an_input_is_not_parked_again(self) -> None:
         """A consumer receives keys, and re-parking one would wrap the string as though it were an object."""
@@ -403,7 +405,6 @@ class TestAParameterWithAnInputAndAnOutputValue:
 
         # What reset_deferred_input_values does after a run whose connection was cut mid-execution.
         node.set_parameter_value("pipeline", None)
-        _egress(node, are_outputs=False)
 
         assert released == []
         assert node.local_objects.get(key) is published
@@ -419,7 +420,7 @@ class TestAParameterWithAnInputAndAnOutputValue:
         assert node.local_objects.get(out_key) is outgoing
         # The input value is still the object the node was handed; nothing minted a key for it.
         assert node.get_parameter_value("pipeline") is incoming
-        assert _egress(node, are_outputs=False)["pipeline"] is incoming
+        assert node.parameter_values["pipeline"] is incoming
 
 
 class TestAConsumerThatDeclaresNothing:

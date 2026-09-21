@@ -332,6 +332,7 @@ class NodeExecutor(EngineScoped):
                     parameter_values=dict(node.parameter_values),
                     node_metadata=cast("NodeMetadata", dict(node.metadata)),
                     variables=self._resolve_variables_for_node(node.name),
+                    local_object_source=node.local_object_source,
                 )
             )
             if not isinstance(result, ExecuteNodeResultSuccess):
@@ -350,7 +351,6 @@ class NodeExecutor(EngineScoped):
             # reads from parameter_output_values.
             for name, value in result.parameter_output_values.items():
                 node.parameter_output_values[name] = value
-
         finally:
             current_executing_node_name.reset(token)
             # A connection torn down while this node was running left its input value in place so the
