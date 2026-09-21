@@ -12,7 +12,12 @@ tests/unit/retained_mode/managers/test_handle_lifetime.py.
 import pytest
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterList, ParameterMode
-from griptape_nodes.exe_types.local_objects import cache_outputs_for_egress, caches_its_values
+from griptape_nodes.exe_types.local_objects import (
+    cache_outputs_for_egress,
+    caches_its_values,
+    is_reference,
+    make_reference,
+)
 from griptape_nodes.exe_types.node_types import BaseNode
 
 
@@ -115,7 +120,7 @@ class TestHandingAnObjectToTheNextNode:
 
         # The producer keeps the object it assigned. Only what crossed became a key.
         assert isinstance(producer.parameter_output_values["pipeline"], Pipeline)
-        assert isinstance(_egress(producer)["pipeline"], str)
+        assert is_reference(_egress(producer)["pipeline"])
         assert isinstance(consumer.get_parameter_value("pipeline"), Pipeline)
 
     def test_the_engine_sees_the_key_where_the_node_sees_the_object(self) -> None:
@@ -129,9 +134,9 @@ class TestHandingAnObjectToTheNextNode:
 
         raw = consumer._get_raw_parameter_value("pipeline")
 
-        assert isinstance(raw, str)
-        # Namespaced by the worker holding it, not by the library: the cache belongs to the process.
-        assert raw.startswith(f"{consumer.local_objects.owner}:")
+        assert is_reference(raw)
+        # The envelope names the worker holding it, so a reader compares ids rather than parsing a string.
+        assert raw["worker"] == consumer.local_objects.owner
         assert consumer.get_parameter_value("pipeline") is not raw
 
 
@@ -172,7 +177,7 @@ class TestWhatTheAuthorSeesWhenSomethingIsWrong:
         producer.parameter_output_values["pipeline"] = Pipeline("flux")
         key = _egress(producer)["pipeline"]
         consumer.set_parameter_value("pipeline", key)
-        assert producer.local_objects.drop(key) is True
+        assert producer.local_objects.drop(key["key"]) is True
 
         with pytest.raises(RuntimeError) as caught:
             consumer.get_parameter_value("pipeline")
@@ -192,7 +197,9 @@ class TestWhatTheAuthorSeesWhenSomethingIsWrong:
         # A key from another process can only be here because a worker existed, which is the condition the
         # read's fast path latches on. Without one, no value in this process can name a cached object.
         consumer.local_objects._manager().engine.worker_manager._has_ever_had_a_worker = True
-        consumer.set_parameter_value("pipeline", "some-other-worker:LoadPipeline@abc12345.pipeline#deadbeef")
+        consumer.set_parameter_value(
+            "pipeline", make_reference(worker="some-other-worker", key="LoadPipeline.pipeline#deadbeef")
+        )
 
         with pytest.raises(RuntimeError) as caught:
             consumer.get_parameter_value("pipeline")
@@ -358,10 +365,10 @@ class TestOutputtingACachedResourceKey:
         pipeline = Pipeline("flux")
         cache_key = producer.local_objects.put(pipeline, key="flux-config-hash")
 
-        producer.parameter_output_values["pipeline"] = cache_key
+        producer.parameter_output_values["pipeline"] = producer.local_objects.reference_for(cache_key)
         _hand_over(producer, consumer)
 
-        assert producer.parameter_output_values["pipeline"] == cache_key
+        assert producer.parameter_output_values["pipeline"]["key"] == cache_key
         assert consumer.get_parameter_value("pipeline") is pipeline
 
     def test_the_release_hook_is_not_handed_the_key(self) -> None:
@@ -371,7 +378,7 @@ class TestOutputtingACachedResourceKey:
         pipeline = Pipeline("flux")
         cache_key = producer.local_objects.put(pipeline, key="cfg")
 
-        producer.parameter_output_values["pipeline"] = cache_key
+        producer.parameter_output_values["pipeline"] = producer.local_objects.reference_for(cache_key)
         _egress(producer)
         producer.parameter_output_values.silent_clear()
         producer.parameter_output_values["pipeline"] = Pipeline("second")
@@ -407,7 +414,7 @@ class TestAParameterWithAnInputAndAnOutputValue:
         node.set_parameter_value("pipeline", None)
 
         assert released == []
-        assert node.local_objects.get(key) is published
+        assert node.local_objects.get(key["key"]) is published
 
     def test_only_the_output_side_is_held(self) -> None:
         node = _producer()
@@ -417,7 +424,7 @@ class TestAParameterWithAnInputAndAnOutputValue:
         node.parameter_output_values["pipeline"] = outgoing
         out_key = _egress(node)["pipeline"]
 
-        assert node.local_objects.get(out_key) is outgoing
+        assert node.local_objects.get(out_key["key"]) is outgoing
         # The input value is still the object the node was handed; nothing minted a key for it.
         assert node.get_parameter_value("pipeline") is incoming
         assert node.parameter_values["pipeline"] is incoming
@@ -454,8 +461,8 @@ class TestAConsumerThatDeclaresNothing:
         producer.parameter_output_values["pipeline"] = Pipeline("flux")
         consumer.set_parameter_value("model", _egress(producer)["pipeline"])
 
-        assert isinstance(consumer.parameter_values["model"], str)
-        assert isinstance(consumer._get_raw_parameter_value("model"), str)
+        assert is_reference(consumer.parameter_values["model"])
+        assert is_reference(consumer._get_raw_parameter_value("model"))
 
     def test_an_ordinary_string_on_an_undeclared_input_is_untouched(self) -> None:
         consumer = self._plain_consumer()

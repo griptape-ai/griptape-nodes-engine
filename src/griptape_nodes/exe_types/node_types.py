@@ -28,7 +28,7 @@ from griptape_nodes.exe_types.core_types import (
     ParameterMode,
     ParameterTypeBuiltin,
 )
-from griptape_nodes.exe_types.local_objects import LocalObjectScope
+from griptape_nodes.exe_types.local_objects import LocalObjectScope, is_reference, make_reference
 from griptape_nodes.exe_types.param_components.execution_status_component import ExecutionStatusComponent
 from griptape_nodes.exe_types.variable_resolver import VariableResolver
 from griptape_nodes.retained_mode.events.base_events import (
@@ -1378,21 +1378,25 @@ class BaseNode(ABC):
         anything at all.
 
         Runs wherever the value was produced, so an object built in a worker stays in that worker and only
-        its key crosses. A value that is already a key is passed through: it came from an upstream that
-        parked it, and parking it again would wrap the string as though it were the object. None passes
-        through so a consumer is told nothing is connected rather than resolving to None.
+        the reference crosses. A value that is already a reference passes through: it came from an upstream
+        that cached it. None passes through too, so a consumer is told nothing is connected rather than
+        resolving to None.
         """
         scope = self.local_objects
         slot = parameter.name
         if travels_as_data:
-            scope.vacate_slot(slot, keeping=value if isinstance(value, str) else None)
+            # Nothing fresh was cached this run, so whatever this slot held last run is now unreachable --
+            # unless the value passing through is a reference to that very entry.
+            keeping = str(value["key"]) if is_reference(value) else None
+            scope.vacate_slot(slot, keeping=keeping)
             return value
         # Egress can happen more than once for one object, so reuse the key this slot already holds it
         # under rather than minting a second one for the same thing.
         existing = scope.key_held_in_slot(slot, value)
         if existing is not None:
-            return existing
-        return scope.park(value, parameter_name=parameter.name, slot=slot, on_drop=parameter.on_local_object_drop)
+            return make_reference(worker=scope.owner, key=existing)
+        key = scope.park(value, parameter_name=parameter.name, slot=slot, on_drop=parameter.on_local_object_drop)
+        return make_reference(worker=scope.owner, key=key)
 
     def clear_node(self) -> None:
         # set state to unresolved

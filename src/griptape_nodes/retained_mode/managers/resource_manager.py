@@ -1,5 +1,4 @@
 import logging
-import re
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -88,11 +87,6 @@ class LocalObjectEntry:
 
 _SAME_VALUE_UNSET = object()
 
-# What `LocalObjectScope.park` mints: owner, then the producing node's identity, its parameter, and a
-# random tail. Only for recognising a key whose entry lives in another process.
-# The owner must not be followed by a slash, or a URL is a match ("https://host/a@deadbeef.png#a1b2c3d4"),
-# and the parameter segment is greedy because a parameter may be named with a dot or a hash.
-_MINTED_KEY = re.compile(r"^[^\s:/]+:[^/].*@[0-9a-f]{8}\..+#[0-9a-f]{8}$")
 
 
 class ResourceManager(EngineScoped):
@@ -480,15 +474,6 @@ class ResourceManager(EngineScoped):
         """The entry this process holds under `key`, or None. The cache's only exact lookup."""
         with self._local_objects_lock:
             return self._local_objects.get(key)
-
-    def has_minted_key_shape(self, value: Any) -> bool:
-        """Whether `value` looks like a key this engine minted, without consulting the store.
-
-        How a process recognises a key it could not possibly hold: the object is in the worker that made
-        it, so there is no entry here to consult. Shape is the only evidence available, which is why the
-        pattern is narrow -- a false positive turns an ordinary string into an error.
-        """
-        return isinstance(value, str) and bool(_MINTED_KEY.match(value))
 
     def local_object_key(self, suffix: str, *, owner: str) -> str:
         """The key `put_local_object` would produce for this suffix, without putting anything.

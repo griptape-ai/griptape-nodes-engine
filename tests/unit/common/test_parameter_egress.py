@@ -11,7 +11,7 @@ from griptape.artifacts import TextArtifact
 from griptape.drivers.prompt.openai import OpenAiChatPromptDriver
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterList, ParameterMode
-from griptape_nodes.exe_types.local_objects import cache_outputs_for_egress, caches_its_values
+from griptape_nodes.exe_types.local_objects import cache_outputs_for_egress, caches_its_values, is_reference
 from griptape_nodes.exe_types.node_types import BaseNode
 
 _STEPS = 30
@@ -57,9 +57,9 @@ class TestWhatCrosses:
 
         sent = _send(node)
 
-        assert isinstance(sent["pipeline"], str)
+        assert is_reference(sent["pipeline"])
         assert node.parameter_output_values["pipeline"] is pipeline
-        assert node.local_objects.get(sent["pipeline"]) is pipeline
+        assert node.local_objects.get(sent["pipeline"]["key"]) is pipeline
 
     def test_ordinary_data_is_sent_as_data(self) -> None:
         node = _node()
@@ -232,28 +232,29 @@ class TestReadingAnOrdinaryContainer:
 
 
 class TestReleasingOnDelete:
-    def test_a_plain_string_is_not_broadcast_as_a_key(self) -> None:
-        """An API token is declared serializable=False and travels as data; it is not a key.
+    def test_a_plain_string_is_never_collected_as_something_to_release(self) -> None:
+        """An API token is declared serializable=False and travels as data. It is not a reference.
 
-        The orchestrator holds no entries, so anything reaching the broadcast with no local record is
-        assumed to be parked in a worker and sent to all of them.
+        Deleting a node broadcasts what it owns to every worker, so a value mistaken for a reference here
+        would put a secret on the wire to libraries that never saw it. The envelope is what prevents that:
+        only a reference is ever collected, and a string cannot be one whatever it looks like. The previous
+        design matched a pattern against strings and had to be kept deliberately narrow for this reason.
         """
         node = _node()
-        manager = node.local_objects._manager()
-        manager._pending_worker_releases.clear()
-        # Snapshotted at the moment the fan-out fires, because scheduling drains the queue: the return
-        # value was already False without the shape check, so the queue contents are the only evidence.
-        queued_when_sent: list[list[str]] = []
-        original = manager.engine.worker_manager.schedule_pending_local_object_releases
-        manager.engine.worker_manager.schedule_pending_local_object_releases = lambda: queued_when_sent.append(
-            list(manager._pending_worker_releases)
-        )
-        try:
-            node.local_objects.release_parked("sk-secret-123")
-        finally:
-            manager.engine.worker_manager.schedule_pending_local_object_releases = original
+        node.parameter_output_values["pipeline"] = "sk-secret-123"
 
-        assert queued_when_sent == []
+        assert node.local_objects.parked_keys_within("sk-secret-123") == set()
+        assert node.local_objects.parked_keys_within({"token": "sk-secret-123"}) == set()
+        # And the shape the old pattern would have matched.
+        assert node.local_objects.parked_keys_within("Lib:Producer@abc12345.pipeline#deadbeef") == set()
+
+    def test_a_reference_is_collected(self) -> None:
+        """The other half: what the node does own is found, so deletion releases it."""
+        node = _node()
+        node.parameter_output_values["pipeline"] = Pipeline("flux")
+        sent = _send(node)
+
+        assert node.local_objects.parked_keys_within(sent["pipeline"]) == {sent["pipeline"]["key"]}
 
 
 class TestWhatCountsAsArrivingIntact:
@@ -270,8 +271,8 @@ class TestWhatCountsAsArrivingIntact:
 
         sent = _send(node)
 
-        assert isinstance(sent["pipeline"], str)
-        assert node.local_objects.get(sent["pipeline"]) is driver
+        assert is_reference(sent["pipeline"])
+        assert node.local_objects.get(sent["pipeline"]["key"]) is driver
 
     def test_an_artifact_on_a_held_parameter_is_held(self) -> None:
         """The declaration decides, not whether cattrs happens to manage a round trip.
@@ -285,8 +286,8 @@ class TestWhatCountsAsArrivingIntact:
 
         sent = _send(node)
 
-        assert isinstance(sent["pipeline"], str)
-        assert node.local_objects.get(sent["pipeline"]) is artifact
+        assert is_reference(sent["pipeline"])
+        assert node.local_objects.get(sent["pipeline"]["key"]) is artifact
 
     def test_an_artifact_on_an_ordinary_parameter_still_travels(self) -> None:
         """Undeclared, the pre-existing transport handles it: out as a dict, hydrated back on arrival."""

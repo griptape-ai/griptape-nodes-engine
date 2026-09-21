@@ -10,12 +10,13 @@ while a consumer still holds it. A key is a value, not an edge, so a consumer ke
 connection goes and can still run with what it has.
 """
 
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterList, ParameterMode
-from griptape_nodes.exe_types.local_objects import cache_outputs_for_egress
+from griptape_nodes.exe_types.local_objects import cache_outputs_for_egress, is_reference
 from griptape_nodes.exe_types.node_types import BaseNode, NodeResolutionState
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.connection_events import (
@@ -136,8 +137,13 @@ def _disconnect(engine: Engine, parameter_name: str) -> None:
     assert isinstance(result, DeleteConnectionResultSuccess)
 
 
-def _is_held(engine: Engine, key: str) -> bool:
-    return engine.resource_manager.get_local_object(key, owner=_owner(engine)) is not None
+def _is_held(engine: Engine, reference: Any) -> bool:
+    """Whether the cache still holds what `reference` stands for.
+
+    Takes the envelope a parameter carries, or the bare store key, since tests deal in both.
+    """
+    key = reference["key"] if is_reference(reference) else reference
+    return engine.resource_manager.entry_for(key) is not None
 
 
 @pytest.fixture
@@ -299,7 +305,7 @@ class TestTheConsumerIsDeleted:
 
         assert producer.released == []
         assert _is_held(engine, key)
-        resolved = producer.local_objects.get(_egress(producer)["latent"])
+        resolved = producer.local_objects.get(_egress(producer)["latent"]["key"])
         assert resolved is not None
         assert resolved.label == "latent"
 
@@ -498,7 +504,7 @@ class TestARelayDoesNotReleaseItsUpstream:
 
         assert producer.released == []
         assert _is_held(engine, upstream_key)
-        still_held = producer.local_objects.get(upstream_key)
+        still_held = producer.local_objects.get(upstream_key["key"])
         assert still_held is not None
         assert still_held.label == "upstream"
 
@@ -599,7 +605,7 @@ class TestOneObjectInSeveralEntries:
         _egress(producer)
 
         assert producer.released == []
-        assert engine.resource_manager.get_local_object(second_key, owner=_owner(engine)) is shared
+        assert engine.resource_manager.get_local_object(second_key["key"], owner=_owner(engine)) is shared
 
     def test_reparking_leaves_the_library_cached_copy_alone(self, engine: Engine, flow_name: str) -> None:
         """A library caches the pipeline under a config hash AND assigns it to a handle output.

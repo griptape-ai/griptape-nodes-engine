@@ -672,7 +672,7 @@ class TestLocalObjectIdentityIsNeverCopied:
                 )
             )
         original.parameter_output_values["pipe"] = object()
-        key = cache_outputs_for_egress(original.parameter_output_values, node=original)["pipe"]
+        key = cache_outputs_for_egress(original.parameter_output_values, node=original)["pipe"]["key"]
 
         clone.parameter_output_values["pipe"] = object()
         cache_outputs_for_egress(clone.parameter_output_values, node=clone)

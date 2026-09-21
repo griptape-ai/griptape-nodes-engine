@@ -27,6 +27,23 @@ if TYPE_CHECKING:
     from griptape_nodes.exe_types.node_types import BaseNode
     from griptape_nodes.retained_mode.managers.resource_manager import ResourceManager
 
+# What a parameter value holds when the cache is holding the real thing. A typed envelope rather than a
+# string, so recognising one is a structural question: no pattern to match, and no chance of mistaking an
+# ordinary string a node happened to produce for a reference. The worker id travels in it, so a reader
+# compares it to its own and never parses anything.
+_REFERENCE_KIND = "local_object_reference"
+
+
+def make_reference(*, worker: str, key: str) -> dict[str, str]:
+    """The envelope for an object held in `worker` under `key`."""
+    return {"kind": _REFERENCE_KIND, "worker": worker, "key": key}
+
+
+def is_reference(value: Any) -> bool:
+    """Whether `value` is a cache reference envelope."""
+    return isinstance(value, dict) and value.get("kind") == _REFERENCE_KIND
+
+
 class KeyVerdict(Enum):
     """What a string turned out to be, as far as this worker's cache is concerned.
 
@@ -135,18 +152,18 @@ class LocalObjectScope:
         )
 
     def look_up(self, value: Any) -> KeyLookup:
-        """What `value` is, as far as this worker's cache is concerned. The one question about a string.
+        """What `value` is, as far as this worker's cache is concerned. The one question about a value.
 
-        Every key this cache holds carries this worker's prefix, so anything without it is either another
-        process's key -- decided by shape, without touching the store -- or not a key at all.
+        Only an envelope is ever a reference. A string is just a string, whatever it looks like, which is
+        what makes this free of false positives -- the previous shape-matching pattern had to be kept narrow
+        to avoid mistaking a URL for a reference, and still could not tell a library name containing a slash
+        from one that did not.
         """
-        if not isinstance(value, str):
+        if not is_reference(value):
             return KeyLookup(KeyVerdict.NOT_A_KEY)
-        if not value.startswith(f"{self.owner}:"):
-            if self._manager().has_minted_key_shape(value):
-                return KeyLookup(KeyVerdict.ELSEWHERE)
-            return KeyLookup(KeyVerdict.NOT_A_KEY)
-        entry = self._manager().entry_for(value)
+        if value.get("worker") != self.owner:
+            return KeyLookup(KeyVerdict.ELSEWHERE)
+        entry = self._manager().entry_for(str(value.get("key")))
         if entry is None:
             return KeyLookup(KeyVerdict.RELEASED)
         return KeyLookup(KeyVerdict.HELD, value=entry.value, slot_bound=entry.is_slot_bound)
@@ -170,13 +187,15 @@ class LocalObjectScope:
         library's to release, and stable by construction, so releasing it would drop that resource in
         every process holding it.
         """
-        lookup = self.look_up(key)
-        # Checked before it goes anywhere: a key with no local record is broadcast to every worker on the
-        # assumption one of them holds it, so an ordinary string -- an API token is the documented example
-        # -- would otherwise be put on the wire to libraries that never saw it.
-        if not lookup.is_a_key:
+        # A store key, taken from a reference envelope or from this process's own record -- not a parameter
+        # value, so `look_up` does not apply. A key with no local record is still broadcast, because the
+        # object it names is cached in the worker that produced it and this process is the orchestrator.
+        if not isinstance(key, str):
             return False
-        if lookup.verdict is KeyVerdict.HELD and not lookup.slot_bound:
+        entry = self._manager().entry_for(key)
+        if entry is not None and not entry.is_slot_bound:
+            # The library named this one and several sources may hold it; releasing it here would drop that
+            # resource for all of them.
             return False
         return self._manager().release_parked_key(key, owner=self.owner)
 
@@ -189,6 +208,15 @@ class LocalObjectScope:
         given the full key can resolve it, because the worker matches.
         """
         return f"{self._library}/{suffix}"
+
+    def reference_for(self, key: str) -> dict[str, str]:
+        """The envelope to put in a parameter so a downstream node resolves `key`.
+
+        For handing a library-cached object downstream: assign `reference_for(key)` to the output rather
+        than the key itself. A bare string is never treated as a reference -- that is what makes an ordinary
+        string value safe from being mistaken for one -- so it has to be said explicitly.
+        """
+        return make_reference(worker=self.owner, key=key)
 
     def key_for(self, suffix: str) -> str:
         """The full key for a suffix this library chose, without putting anything.
@@ -205,8 +233,17 @@ class LocalObjectScope:
         return self._manager().local_object_key(self._namespaced(suffix), owner=self.owner)
 
     def get(self, key: str) -> Any | None:
-        """The object behind `key`, or None if this worker's cache is not holding it."""
-        return self.look_up(key).value
+        """The object this worker's cache holds under `key`, or None.
+
+        Takes a store key, which is what `put` and `key_for` hand back -- not the envelope a parameter
+        carries. `look_up` is the question about a parameter value; this is the question about a key.
+        """
+        if not isinstance(key, str):
+            return None
+        entry = self._manager().entry_for(key)
+        if entry is None:
+            return None
+        return entry.value
 
     def require(self, key: str, *, parameter_name: str | None = None, node_name: str | None = None) -> Any:
         """The object behind `key`, raising if this process is not holding it.
@@ -218,17 +255,19 @@ class LocalObjectScope:
         at. The producing node cannot be named, because on a miss its record went with the entry.
 
         Raises:
-            RuntimeError: if the object is not held here, with the reason it is not.
+            RuntimeError: if the object is not held here.
         """
         where_node = node_name if node_name is not None else self._source
-        lookup = self.look_up(key)
-        if lookup.verdict is KeyVerdict.HELD:
-            return lookup.value
-        if lookup.verdict is KeyVerdict.RELEASED:
+        if not isinstance(key, str):
+            # RuntimeError, not TypeError: every failure a library author can cause here carries the same
+            # artist-readable shape, and the caller catches one type.
+            raise RuntimeError(  # noqa: TRY004
+                self._not_a_key_message(key, parameter_name=parameter_name, node_name=where_node)
+            )
+        entry = self._manager().entry_for(key)
+        if entry is None:
             raise RuntimeError(self._released_message(parameter_name=parameter_name, node_name=where_node))
-        if lookup.verdict is KeyVerdict.ELSEWHERE:
-            raise RuntimeError(self._elsewhere_message(parameter_name=parameter_name, node_name=where_node))
-        raise RuntimeError(self._not_a_key_message(key, parameter_name=parameter_name, node_name=where_node))
+        return entry.value
 
     def resolve_if_held(self, value: Any, *, parameter_name: str, node_name: str) -> Any:
         """`value`, with anything in it that names a cached object replaced by the object.
@@ -357,6 +396,9 @@ class LocalObjectScope:
 #     its own answer for the revisit rather than sharing one.
 #   * substitution hands back the value it was given when nothing changed, so a node that reads a list and
 #     mutates it in place is mutating the stored list.
+#   * a reference envelope is a leaf in all three, never a container to descend. It is a dict, so getting
+#     this wrong in one of them and not the others is exactly the shape of bug this module exists to make
+#     unrepresentable.
 #
 # Nothing outside the cache uses these. Other walks over the same shape -- variable substitution, artifact
 # hydration -- are separate concerns that happen to share a spine, and coupling them here would tie the
@@ -376,6 +418,9 @@ def is_plain_data(value: Any) -> bool:
 
 def _is_plain_data(value: Any, *, memo: dict[int, bool]) -> bool:
     if isinstance(value, (str, int, float, bool, type(None))):
+        return True
+    # A reference is already data, and already stands for something cached: leave it be.
+    if is_reference(value):
         return True
     if not isinstance(value, (list, tuple, dict)):
         return False
@@ -403,6 +448,10 @@ def collect_leaves(value: Any, keep: Callable[[Any], bool]) -> set[Any]:
 
 
 def _collect_leaves(value: Any, keep: Callable[[Any], bool], *, found: set[Any], seen: set[int]) -> None:
+    if is_reference(value):
+        if keep(value):
+            found.add(value["key"])
+        return
     if not isinstance(value, _CONTAINER_TYPES):
         if keep(value):
             found.add(value)
@@ -428,6 +477,10 @@ def substitute_leaves(value: Any, transform: Callable[[Any], Any]) -> Any:
 
 
 def _substitute_leaves(value: Any, transform: Callable[[Any], Any], *, memo: dict[int, Any]) -> Any:
+    # An envelope is a dict, so it would otherwise be descended into as a container and its own fields
+    # substituted. It is a leaf: the thing being stood for.
+    if is_reference(value):
+        return transform(value)
     if not isinstance(value, _CONTAINER_TYPES):
         return transform(value)
     if id(value) in memo:
