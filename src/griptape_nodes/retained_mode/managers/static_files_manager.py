@@ -98,7 +98,6 @@ class StaticFilesManager(EngineScoped):
         self.secrets_manager = secrets_manager
 
         self.storage_backend = config_manager.get_config_value("storage_backend", default=StorageBackend.LOCAL)
-        workspace_directory = config_manager.workspace_path
 
         # Where the workspace is served, resolved in on_app_initialization_complete. Staying None
         # until then is also what tells that handler it has not settled this yet, so a second
@@ -121,7 +120,7 @@ class StaticFilesManager(EngineScoped):
                     logger.warning(
                         "GT_CLOUD_BUCKET_ID secret is not available, falling back to local storage. Run `gtn init` to set it up."
                     )
-                    self.storage_driver = LocalStorageDriver(workspace_directory, base_url=base_url)
+                    self.storage_driver = LocalStorageDriver(config_manager, self.engine.os_manager, base_url=base_url)
                 elif not cloud_credential:
                     # Without this the driver would send "Bearer None" and every
                     # upload would fail with an opaque 401 instead of naming the
@@ -130,19 +129,19 @@ class StaticFilesManager(EngineScoped):
                         "Falling back to local storage because %s",
                         MISSING_CREDENTIAL_MESSAGE,
                     )
-                    self.storage_driver = LocalStorageDriver(workspace_directory, base_url=base_url)
+                    self.storage_driver = LocalStorageDriver(config_manager, self.engine.os_manager, base_url=base_url)
                 else:
                     static_files_directory = config_manager.get_config_value(
                         "static_files_directory", default="staticfiles"
                     )
                     self.storage_driver = GriptapeCloudStorageDriver(
-                        workspace_directory,
+                        config_manager,
                         bucket_id=bucket_id,
                         api_key=cloud_credential,
                         static_files_directory=static_files_directory,
                     )
             case StorageBackend.LOCAL:
-                self.storage_driver = LocalStorageDriver(workspace_directory, base_url=base_url)
+                self.storage_driver = LocalStorageDriver(config_manager, self.engine.os_manager, base_url=base_url)
             case _:
                 msg = f"Invalid storage backend: {self.storage_backend}"
                 raise ValueError(msg)
@@ -319,11 +318,10 @@ class StaticFilesManager(EngineScoped):
         if not api_key:
             return None
 
-        workspace_directory = self.config_manager.workspace_path
         static_files_directory = self.config_manager.get_config_value("static_files_directory", default="staticfiles")
 
         return GriptapeCloudStorageDriver(
-            workspace_directory,
+            self.config_manager,
             bucket_id=bucket_id,
             api_key=api_key,
             static_files_directory=static_files_directory,

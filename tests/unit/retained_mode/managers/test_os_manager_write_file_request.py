@@ -599,7 +599,7 @@ class TestSidecarMetadata:
         sidecar_path = temp_dir / ".griptape-nodes-metadata" / "output.txt.json"
         assert sidecar_path.exists()
         data = _json.loads(sidecar_path.read_text())
-        assert data["schema_version"] == "0.1.0"
+        assert data["schema_version"] == "0.2.0"
         assert "saved_at" in data
 
     def test_sidecar_contains_situation_info_when_provided(self, engine: Engine, temp_dir: Path) -> None:
@@ -651,7 +651,7 @@ class TestSidecarMetadata:
         sidecar_path = actual_path.parent / ".griptape-nodes-metadata" / (actual_path.name + ".json")
         assert sidecar_path.exists(), "Sidecar should be created at the actual indexed fallback path"
         data = _json.loads(sidecar_path.read_text())
-        assert data["schema_version"] == "0.1.0"
+        assert data["schema_version"] == "0.2.0"
 
     def test_sidecar_file_extension_unchanged_for_alias_extensions(self, engine: Engine, temp_dir: Path) -> None:
         """Sidecar's ``file_extension`` variable must reflect the on-disk name, not the raw sniff.

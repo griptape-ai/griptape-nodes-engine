@@ -1,4 +1,4 @@
-from griptape_nodes.utils.dict_utils import merge_dicts, normalize_secrets_to_register
+from griptape_nodes.utils.dict_utils import drop_blank_values, merge_dicts, normalize_secrets_to_register
 
 
 class TestNormalizeSecretsToRegister:
@@ -29,6 +29,44 @@ class TestNormalizeSecretsToRegister:
         """Test that empty dict returns empty dict."""
         result = normalize_secrets_to_register({})
         assert result == {}
+
+
+class TestDropBlankValues:
+    """Tests for drop_blank_values function."""
+
+    def test_drops_empty_and_whitespace_only_strings(self) -> None:
+        """A value that is only whitespace configures nothing, same as an empty one."""
+        assert drop_blank_values({"a": "", "b": "   ", "c": "\t\n", "d": "keep"}) == {"d": "keep"}
+
+    def test_keeps_non_string_falsy_values(self) -> None:
+        """The rule is about blank strings; False, 0, and empty containers are real values."""
+        layer = {"a": False, "b": 0, "c": [], "d": {}, "e": None}
+
+        assert drop_blank_values(layer) == layer
+
+    def test_recurses_into_nested_dicts(self) -> None:
+        """A blank nested setting drops without taking its siblings or its parent with it."""
+        layer = {"agent": {"system_prompt": "  ", "model": "opus"}}
+
+        assert drop_blank_values(layer) == {"agent": {"model": "opus"}}
+
+    def test_leaves_list_entries_alone(self) -> None:
+        """A blank inside a list is a different problem; the entry keeps its position."""
+        layer = {"libraries_to_register": ["", "/path/to/lib"]}
+
+        assert drop_blank_values(layer) == layer
+
+    def test_does_not_mutate_the_input(self) -> None:
+        """Callers hold the loaded layer; filtering hands back a copy."""
+        layer = {"a": "", "nested": {"b": ""}}
+
+        drop_blank_values(layer)
+
+        assert layer == {"a": "", "nested": {"b": ""}}
+
+    def test_preserves_surrounding_whitespace_on_a_real_value(self) -> None:
+        """Only wholly blank values drop; a padded value is not trimmed."""
+        assert drop_blank_values({"url": " https://example.com "}) == {"url": " https://example.com "}
 
 
 class TestMergeDicts:

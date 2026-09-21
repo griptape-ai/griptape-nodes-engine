@@ -11,6 +11,7 @@ import pytest
 import griptape_nodes.retained_mode.managers.config_manager as config_manager_module
 import griptape_nodes.retained_mode.managers.secrets_manager as secrets_manager_module
 from griptape_nodes.node_library.library_registry import LibraryRegistry
+from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
 from griptape_nodes.retained_mode.engine import current_engine, reset_root_engine
 from griptape_nodes.retained_mode.events.connection_events import (
     CreateConnectionRequest,
@@ -36,11 +37,13 @@ def _isolated_engine_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Ite
     background threads segfault the child at interpreter shutdown.
 
     Dropping the root engine forces the managers to re-initialize against the patched paths
-    and gives each test a fresh object registry. ``LibraryRegistry`` keeps its state in
-    ``ClassVar`` dicts that the engine does not own, so it is reset explicitly.
+    and gives each test a fresh object registry. ``LibraryRegistry`` and ``WorkflowRegistry``
+    keep their state in ``ClassVar`` dicts that the engine does not own, so they are reset
+    explicitly.
     """
     reset_root_engine()
     LibraryRegistry._clear()
+    WorkflowRegistry.clear_user_workflows()
 
     for key in list(os.environ):
         if key.startswith(("GT_CLOUD_", "GTN_CONFIG_")):
@@ -57,6 +60,7 @@ def _isolated_engine_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Ite
     finally:
         reset_root_engine()
         LibraryRegistry._clear()
+        WorkflowRegistry.clear_user_workflows()
 
 
 @pytest.fixture
@@ -153,13 +157,16 @@ def write_isolated_config() -> Callable[..., None]:
 def create_node(engine: Engine) -> Callable[..., str]:
     """Return a helper that creates a node from the given library and asserts success."""
 
-    def _create(node_type: str, node_name: str, flow_name: str, *, library_name: str) -> str:
+    def _create(
+        node_type: str, node_name: str, flow_name: str, *, library_name: str, metadata: dict | None = None
+    ) -> str:
         result = engine.handle_request(
             CreateNodeRequest(
                 node_type=node_type,
                 specific_library_name=library_name,
                 node_name=node_name,
                 override_parent_flow_name=flow_name,
+                metadata=metadata,
             )
         )
         assert isinstance(result, CreateNodeResultSuccess), result

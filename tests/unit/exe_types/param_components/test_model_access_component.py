@@ -111,6 +111,14 @@ def _catalog():  # noqa: ANN202
                         provider_model_id="beta",
                         key_support=KeySupport.REQUIRES_GRIPTAPE_KEY,
                     ),
+                    # Mirrors the real shape a readable name hides: a vendor prefix
+                    # and a build date the display name drops.
+                    "gtc_test_dated": Model(
+                        display_name="Dated Pro",
+                        family="TestFam",
+                        provider_model_id="vendor-dated-pro-260101",
+                        key_support=KeySupport.REQUIRES_GRIPTAPE_KEY,
+                    ),
                 },
             ),
         }
@@ -139,7 +147,7 @@ def _build_probe_node_with_component(
     from griptape_nodes.node_library.library_declarations import ModelUsageNodeProperty
 
     _register_probe_node(
-        node_declarations=[ModelUsageNodeProperty(model_ids=["gtc_test_alpha", "gtc_test_beta"])],
+        node_declarations=[ModelUsageNodeProperty(model_ids=["gtc_test_alpha", "gtc_test_beta", "gtc_test_dated"])],
         library_declarations=[_catalog()],
     )
 
@@ -254,14 +262,89 @@ class TestInstall:
             ui = param.ui_options
             assert ui["dropdown_row_icons"] is True
             assert ui["dropdown_row_subtitles"] is True
-            # Alpha row carries the denial decoration; beta is bare.
+            # Both rows keep the provider id as `name` and gain the catalog name as `label`.
+            # Alpha carries the denial decoration; neither id earns a subtitle, since
+            # "Alpha"/"Beta" spell their ids.
             data_by_name = {row["name"]: row for row in ui["data"]}
+            assert data_by_name["alpha"]["label"] == "Alpha"
             assert data_by_name["alpha"]["icon"] == "shield-off"
             assert data_by_name["alpha"]["subtitle"] == "Not permitted by your license"
+            assert data_by_name["beta"]["label"] == "Beta"
             assert "icon" not in data_by_name["beta"]
             assert "subtitle" not in data_by_name["beta"]
         finally:
             engine.event_manager.remove_authorization_hook(deny_alpha)
+
+    def test_id_is_shown_as_a_subtitle_only_when_the_label_drops_detail(self) -> None:
+        """A dated id earns a second line; an id its label already spells does not.
+
+        Two thirds of the real catalog names a model the way its id spells it
+        ("GPT-5.5" / ``gpt-5.5``), and ``o3``'s display name IS ``o3``, so an
+        unconditional subtitle would double every such row's height to repeat the
+        text above it.
+        """
+        node, _helper = _install_probe_node_with_helper(
+            model_choices=["beta", "vendor-dated-pro-260101"],
+            default_model="beta",
+        )
+
+        param = node.get_parameter_by_name("model")
+        assert param is not None
+        data_by_name = {row["name"]: row for row in param.ui_options["data"]}
+        # "Dated Pro" drops the prefix and the build date, so the id is worth showing.
+        assert data_by_name["vendor-dated-pro-260101"]["label"] == "Dated Pro"
+        assert data_by_name["vendor-dated-pro-260101"]["subtitle"] == "vendor-dated-pro-260101"
+        # "Beta" differs from `beta` only in case.
+        assert "subtitle" not in data_by_name["beta"]
+
+    def test_denial_subtitle_outranks_the_id_subtitle(self, engine) -> None:  # noqa: ANN001
+        """A gated row says why it is gated, even when its id would earn a subtitle.
+
+        The two subtitle writers meet only here: a dated id claims the subtitle,
+        and a denial then replaces it. Writing them in the other order would leave
+        a gated row showing its build id where the reason should be, and the artist
+        would see no explanation for a model they cannot use.
+        """
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+
+        def deny_dated(checkpoint: object) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("id") == "gtc_test_dated":  # type: ignore[attr-defined]
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Dated Pro not enabled."),))
+            return None
+
+        engine.event_manager.add_authorization_hook(deny_dated)
+        try:
+            node, _helper = _install_probe_node_with_helper(
+                model_choices=["beta", "vendor-dated-pro-260101"],
+                default_model="beta",
+            )
+
+            param = node.get_parameter_by_name("model")
+            assert param is not None
+            data_by_name = {row["name"]: row for row in param.ui_options["data"]}
+            dated = data_by_name["vendor-dated-pro-260101"]
+            assert dated["label"] == "Dated Pro"
+            assert dated["icon"] == "shield-off"
+            assert dated["subtitle"] == "Not permitted by your license"
+        finally:
+            engine.event_manager.remove_authorization_hook(deny_dated)
+
+    def test_choice_the_catalog_does_not_describe_carries_no_label(self) -> None:
+        """An undeclared choice renders as its own id rather than an invented name.
+
+        The component does not synthesize a label, and it omits the id subtitle
+        too: with no label the id is already the row's visible text, so repeating
+        it would print the same string twice.
+        """
+        node, _helper = _install_probe_node_with_helper(
+            model_choices=["alpha", "gamma"],
+            default_model="alpha",
+        )
+
+        param = node.get_parameter_by_name("model")
+        assert param is not None
+        data_by_name = {row["name"]: row for row in param.ui_options["data"]}
+        assert data_by_name["gamma"] == {"name": "gamma"}
 
     def test_install_preserves_parameter_identity(self) -> None:
         """Install must not change parameter name / type / tooltip / stored value."""

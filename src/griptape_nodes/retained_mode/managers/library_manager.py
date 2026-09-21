@@ -4534,6 +4534,7 @@ class LibraryManager(EngineScoped):
                         serializable=schema.serializable,
                         user_defined=schema.user_defined,
                         private=schema.private,
+                        exclude_from_metadata=schema.exclude_from_metadata,
                         ui_options=schema.ui_options,
                     )
                 )
@@ -5164,6 +5165,7 @@ class LibraryManager(EngineScoped):
                         settable=param.settable,
                         serializable=param.serializable,
                         private=param.private,
+                        exclude_from_metadata=param.exclude_from_metadata,
                         ui_options=self._try_json_serialize(param.ui_options) if param.ui_options else None,
                     )
                 )

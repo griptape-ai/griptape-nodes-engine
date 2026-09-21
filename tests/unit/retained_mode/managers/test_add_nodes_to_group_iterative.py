@@ -155,7 +155,7 @@ class TestAddNodesToGroupIterativePath:
         """Push a workflow and flow context so group-operation helpers can find a current flow."""
         self.engine = engine
         engine.context_manager.push_workflow(workflow_name="test_workflow")
-        flow = ControlFlow(name="test_flow")
+        flow = ControlFlow(name="test_flow", engine=engine)
         engine.object_manager.add_object_by_name(flow.name, flow)
         engine.context_manager.push_flow(flow)
 
@@ -379,7 +379,7 @@ class TestRemoveNodesFromGroupIterativePath:
         """Push a workflow and flow context so group-operation helpers can find a current flow."""
         self.engine = engine
         engine.context_manager.push_workflow(workflow_name="test_workflow")
-        flow = ControlFlow(name="test_flow")
+        flow = ControlFlow(name="test_flow", engine=engine)
         engine.object_manager.add_object_by_name(flow.name, flow)
         engine.context_manager.push_flow(flow)
 
@@ -503,7 +503,7 @@ class TestPlainNodeGroupDoesNotTether:
         """Push a workflow and flow context so group-operation helpers can find a current flow."""
         self.engine = engine
         engine.context_manager.push_workflow(workflow_name="test_workflow")
-        flow = ControlFlow(name="test_flow")
+        flow = ControlFlow(name="test_flow", engine=engine)
         engine.object_manager.add_object_by_name(flow.name, flow)
         engine.context_manager.push_flow(flow)
 
@@ -572,7 +572,7 @@ class TestCrossGroupMoveKeepsTetheredCompanion:
         """Push a workflow and flow context so group-operation helpers can find a current flow."""
         self.engine = engine
         engine.context_manager.push_workflow(workflow_name="test_workflow")
-        flow = ControlFlow(name="test_flow")
+        flow = ControlFlow(name="test_flow", engine=engine)
         engine.object_manager.add_object_by_name(flow.name, flow)
         engine.context_manager.push_flow(flow)
 

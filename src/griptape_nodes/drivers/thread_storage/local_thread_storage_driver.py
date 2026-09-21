@@ -1,15 +1,18 @@
 """Local filesystem thread storage driver, backed by Pydantic AI message history.
 
-Each thread lives in two files inside ``threads_directory``:
+Each thread lives in three files inside ``threads_directory``:
 
   * ``thread_{id}.json``       - the message history, encoded by
     :class:`pydantic_ai.messages.ModelMessagesTypeAdapter`.
   * ``thread_{id}.meta.json``  - a small metadata dict (title, timestamps,
     archived flag, optional ``local_id``).
+  * ``thread_{id}.runs.json``  - per-run provider/model records; absent until
+    the first run completes (old threads without this file are unaffected).
 
-Splitting the two keeps history reads cheap when listing threads (we don't
-deserialize messages we never show) and keeps metadata writes atomic when the
-agent isn't actually saving any new messages.
+Splitting the files keeps history reads cheap when listing threads (we don't
+deserialize messages we never show), keeps metadata writes atomic when the
+agent isn't saving new messages, and keeps run records out of the listing hot
+path (loaded only via ``get_thread_metadata``).
 """
 
 from __future__ import annotations
@@ -17,13 +20,14 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from dataclasses import asdict
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 
 from griptape_nodes.drivers.thread_storage.base_thread_storage_driver import BaseThreadStorageDriver
-from griptape_nodes.retained_mode.events.agent_events import ThreadMetadata
+from griptape_nodes.retained_mode.events.agent_events import RunRecord, ThreadMetadata
 from griptape_nodes.utils.file_utils import atomic_write_bytes
 
 if TYPE_CHECKING:
@@ -64,9 +68,6 @@ class LocalThreadStorageDriver(BaseThreadStorageDriver):
         atomic_write_bytes(self._history_path(thread_id), b"[]")
         return thread_id, meta
 
-    def get_thread_metadata(self, thread_id: str) -> dict:
-        return self._read_meta(thread_id)
-
     def update_thread_metadata(self, thread_id: str, **updates: object) -> dict:
         meta = self._read_meta(thread_id)
         for key, value in updates.items():
@@ -76,6 +77,32 @@ class LocalThreadStorageDriver(BaseThreadStorageDriver):
         meta.setdefault("created_at", meta["updated_at"])
         self._write_meta(thread_id, meta)
         return meta
+
+    def append_run_record(self, thread_id: str, record: RunRecord) -> None:
+        runs_path = self._runs_path(thread_id)
+        if runs_path.exists():
+            try:
+                raw: list[dict] = json.loads(runs_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                logger.exception("Failed to read runs file for thread %s; starting fresh.", thread_id)
+                raw = []
+        else:
+            raw = []
+        raw.append(asdict(record))
+        atomic_write_bytes(runs_path, json.dumps(raw, indent=2).encode("utf-8"))
+
+    def get_thread_metadata(self, thread_id: str) -> ThreadMetadata:
+        meta = self._read_meta(thread_id)
+        return ThreadMetadata(
+            thread_id=thread_id,
+            title=meta.get("title"),
+            created_at=meta.get("created_at", ""),
+            updated_at=meta.get("updated_at", ""),
+            message_count=meta.get("message_count", 0),
+            archived=meta.get("archived", False),
+            local_id=meta.get("local_id"),
+            runs=self._load_runs(thread_id),
+        )
 
     def list_threads(self) -> list[ThreadMetadata]:
         if not self.threads_directory.exists():
@@ -100,6 +127,26 @@ class LocalThreadStorageDriver(BaseThreadStorageDriver):
         threads.sort(key=lambda t: t.updated_at, reverse=True)
         return threads
 
+    def _runs_path(self, thread_id: str) -> Path:
+        return self.threads_directory / f"thread_{thread_id}.runs.json"
+
+    def _load_runs(self, thread_id: str) -> list[RunRecord]:
+        runs_path = self._runs_path(thread_id)
+        if not runs_path.exists():
+            return []
+        try:
+            raw: list[dict] = json.loads(runs_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            logger.exception("Failed to read runs file for thread %s.", thread_id)
+            return []
+        runs = []
+        for r in raw:
+            try:
+                runs.append(RunRecord(**r))
+            except TypeError:
+                logger.warning("Skipping malformed run record in thread %s: %s", thread_id, r)
+        return runs
+
     def delete_thread(self, thread_id: str) -> None:
         if not self.thread_exists(thread_id):
             msg = f"Thread {thread_id} not found"
@@ -112,9 +159,13 @@ class LocalThreadStorageDriver(BaseThreadStorageDriver):
 
         self._history_path(thread_id).unlink(missing_ok=True)
         self._meta_path(thread_id).unlink(missing_ok=True)
+        self._runs_path(thread_id).unlink(missing_ok=True)
 
     def thread_exists(self, thread_id: str) -> bool:
         return self._meta_path(thread_id).exists()
+
+    def is_archived(self, thread_id: str) -> bool:
+        return bool(self._read_meta(thread_id).get("archived", False))
 
     def load_history(self, thread_id: str) -> list[ModelMessage]:
         path = self._history_path(thread_id)

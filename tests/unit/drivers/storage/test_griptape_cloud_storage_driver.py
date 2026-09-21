@@ -24,7 +24,7 @@ class TestGriptapeCloudStorageDriverCreateSignedUploadUrl:
     def cloud_storage_driver(self) -> GriptapeCloudStorageDriver:
         """Create GriptapeCloudStorageDriver instance for testing."""
         return GriptapeCloudStorageDriver(
-            workspace_directory=Path("/workspace"),
+            Mock(workspace_path=Path("/workspace")),
             bucket_id=TEST_BUCKET_ID,
             api_key=TEST_API_KEY,
         )
@@ -131,7 +131,7 @@ class TestGriptapeCloudStorageDriverParseCloudAssetPath:
     def cloud_storage_driver(self) -> GriptapeCloudStorageDriver:
         """Create GriptapeCloudStorageDriver instance for testing."""
         return GriptapeCloudStorageDriver(
-            workspace_directory=Path("/workspace"),
+            Mock(workspace_path=Path("/workspace")),
             bucket_id="test-bucket-123",
             api_key="test-api-key",
             base_url="https://cloud.griptape.ai",
@@ -227,7 +227,7 @@ class TestGriptapeCloudStorageDriverUploadTimeout:
     def test_upload_file_uses_timeout_parameter(self) -> None:
         """upload_file should pass timeout parameter to signed URL upload request."""
         driver = GriptapeCloudStorageDriver(
-            workspace_directory=Path("/workspace"),
+            Mock(workspace_path=Path("/workspace")),
             bucket_id=TEST_BUCKET_ID,
             api_key=TEST_API_KEY,
         )
@@ -490,7 +490,7 @@ class TestGriptapeCloudStorageDriverDeleteFile:
     @pytest.fixture
     def cloud_storage_driver(self) -> GriptapeCloudStorageDriver:
         return GriptapeCloudStorageDriver(
-            workspace_directory=Path("/workspace"),
+            Mock(workspace_path=Path("/workspace")),
             bucket_id=TEST_BUCKET_ID,
             api_key=TEST_API_KEY,
         )

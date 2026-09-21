@@ -32,6 +32,7 @@ from griptape_nodes.retained_mode.events.parameter_events import SetParameterVal
 from griptape_nodes.retained_mode.events.workflow_events import (
     ImportWorkflowAsReferencedSubFlowRequest,
     ImportWorkflowAsReferencedSubFlowResultSuccess,
+    WorkflowStatus,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
@@ -379,6 +380,26 @@ class WorkflowNode(ControlNode):
                 f"Failed because the workflow could not be loaded: {import_result.result_details}"
             )
             raise RuntimeError(msg)  # noqa: TRY004 - the import failed at run time; this is not a type error
+
+        # A FLAWED subflow loaded, but with placeholders standing in for nodes whose library would
+        # not register. This node is about to RUN it, and nothing downstream stops a placeholder
+        # that never resolves: ErrorProxyNode refuses only at validate_before_node_run, so a
+        # placeholder off the resolution path would let the subflow report output computed without
+        # it. Refuse here, the way the headless executor does for the same reason.
+        if import_result.status is not WorkflowStatus.GOOD:
+            # The import already built a flow full of nodes. Hand it to the usual cleanup before
+            # refusing: left behind it would sit in ObjectManager for the rest of the session and
+            # keep its node names, so a later import of the same workflow gets suffixed ones.
+            # Tracking it only to discard it is deliberate -- the key must not outlive this call,
+            # or the next one would find a live subflow tracked and reuse it without re-checking.
+            self.metadata[SUBFLOW_NAME_KEY] = import_result.created_flow_name
+            self._discard_subflow()
+            msg = (
+                f"Attempted to load the workflow at '{self.workflow_file_path}' for node '{self.name}'. "
+                f"Failed because it loaded with status {import_result.status}, which cannot be executed: "
+                f"{import_result.result_details}"
+            )
+            raise RuntimeError(msg)
 
         self.metadata[SUBFLOW_NAME_KEY] = import_result.created_flow_name
         return import_result.created_flow_name

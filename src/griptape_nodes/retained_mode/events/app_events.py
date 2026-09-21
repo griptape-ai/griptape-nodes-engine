@@ -234,6 +234,7 @@ class WorkerParameterSchema:
     settable: bool
     serializable: bool
     private: bool
+    exclude_from_metadata: bool
     ui_options: dict | None
 
 

@@ -1,8 +1,11 @@
 import asyncio
+import json
 import threading
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
+from mcp.types import CallToolRequestParams
 
 from griptape_nodes.retained_mode.events.base_events import RequestPayload
 from griptape_nodes.servers import mcp as mcp_module
@@ -18,7 +21,15 @@ from griptape_nodes.servers.mcp import (
     _summarize_result_details,
     _trim_batch_results,
     _trim_response,
+    call_tool,
+    list_tools,
 )
+
+if TYPE_CHECKING:
+    from mcp.server.context import ServerRequestContext
+
+# The 2.x handlers take a ServerRequestContext they never read, so tests pass a stand-in.
+_NO_CONTEXT = cast("ServerRequestContext[Any]", None)
 
 
 class TestSummarizeResultDetails:
@@ -247,6 +258,111 @@ class TestEventRequestBatchToolName:
         # The batch tool is intentionally synthetic; gating it on SUPPORTED_REQUEST_EVENTS would
         # require a fake RequestPayload subclass and break call_tool's payload-class lookup.
         assert EVENT_REQUEST_BATCH_TOOL_NAME not in SUPPORTED_REQUEST_EVENTS
+
+
+class TestListTools:
+    @pytest.mark.asyncio
+    async def test_advertises_every_request_event_plus_the_batch_envelope(self) -> None:
+        result = await list_tools(_NO_CONTEXT, None)
+
+        names = {tool.name for tool in result.tools}
+        assert names == set(SUPPORTED_REQUEST_EVENTS) | {EVENT_REQUEST_BATCH_TOOL_NAME}
+
+    @pytest.mark.asyncio
+    async def test_every_tool_carries_an_object_input_schema(self) -> None:
+        result = await list_tools(_NO_CONTEXT, None)
+
+        assert all(tool.input_schema.get("type") == "object" for tool in result.tools)
+
+
+class TestCallTool:
+    """The 2.x low-level server no longer converts a handler raise into an error result.
+
+    `call_tool` catches its own failures so a bad tool name or bad arguments still reach the
+    client as `CallToolResult(is_error=True)` text it can read and retry from, rather than a
+    JSON-RPC protocol error that carries no actionable message.
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_trimmed_payload_as_text_content(self) -> None:
+        async def fake_dispatch(_payload: object, timeout_ms: int | None = None) -> dict[str, Any]:  # noqa: ARG001
+            return {"result_type": "ListRegisteredLibrariesResultSuccess", "result": {"libraries": ["demo"]}}
+
+        with patch.object(mcp_module, "_dispatch_to_engine", fake_dispatch):
+            result = await call_tool(
+                _NO_CONTEXT, CallToolRequestParams(name="ListRegisteredLibrariesRequest", arguments={})
+            )
+
+        assert result.is_error is False
+        assert json.loads(result.content[0].text) == {"ok": True, "libraries": ["demo"]}  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_treats_missing_arguments_as_empty(self) -> None:
+        seen: dict[str, object] = {}
+
+        async def fake_dispatch(payload: object, timeout_ms: int | None = None) -> dict[str, Any]:  # noqa: ARG001
+            seen["payload"] = payload
+            return {"result_type": "ListRegisteredLibrariesResultSuccess", "result": {}}
+
+        with patch.object(mcp_module, "_dispatch_to_engine", fake_dispatch):
+            result = await call_tool(_NO_CONTEXT, CallToolRequestParams(name="ListRegisteredLibrariesRequest"))
+
+        assert result.is_error is False
+        assert isinstance(seen["payload"], SUPPORTED_REQUEST_EVENTS["ListRegisteredLibrariesRequest"])
+
+    @pytest.mark.asyncio
+    async def test_reports_unsupported_tool_as_error_result(self) -> None:
+        result = await call_tool(_NO_CONTEXT, CallToolRequestParams(name="NopeRequest", arguments={}))
+
+        assert result.is_error is True
+        assert "Unsupported tool: NopeRequest" in result.content[0].text  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_reports_bad_arguments_as_error_result(self) -> None:
+        result = await call_tool(
+            _NO_CONTEXT, CallToolRequestParams(name="CreateNodeRequest", arguments={"bogus_field": 1})
+        )
+
+        assert result.is_error is True
+        assert result.content[0].text  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_reports_dispatch_timeout_as_error_result(self) -> None:
+        async def timing_out_dispatch(_payload: object, timeout_ms: int | None = None) -> dict[str, Any]:  # noqa: ARG001
+            raise TimeoutError
+
+        with patch.object(mcp_module, "_dispatch_to_engine", timing_out_dispatch):
+            result = await call_tool(
+                _NO_CONTEXT, CallToolRequestParams(name="ListRegisteredLibrariesRequest", arguments={})
+            )
+
+        assert result.is_error is True
+
+    @pytest.mark.asyncio
+    async def test_dispatches_the_batch_envelope(self) -> None:
+        async def fake_batch_dispatch(pairs: list[tuple[str, dict[str, Any]]], timeout_ms: int) -> list[Any]:  # noqa: ARG001
+            return [{"result_type": "CreateNodeResultSuccess", "result": {"node_name": "A_1"}} for _ in pairs]
+
+        with patch.object(mcp_module, "_dispatch_batch_to_engine", fake_batch_dispatch):
+            result = await call_tool(
+                _NO_CONTEXT,
+                CallToolRequestParams(
+                    name=EVENT_REQUEST_BATCH_TOOL_NAME,
+                    arguments={"requests": [{"request_type": "CreateNodeRequest", "request": {"node_type": "X"}}]},
+                ),
+            )
+
+        assert result.is_error is False
+        assert json.loads(result.content[0].text) == [{"ok": True, "node_name": "A_1"}]  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_reports_malformed_batch_as_error_result(self) -> None:
+        result = await call_tool(
+            _NO_CONTEXT, CallToolRequestParams(name=EVENT_REQUEST_BATCH_TOOL_NAME, arguments={"requests": []})
+        )
+
+        assert result.is_error is True
+        assert "empty" in result.content[0].text  # type: ignore[union-attr]
 
 
 class TestDispatchToEngineShield:

@@ -63,7 +63,7 @@ class PublicArtifactUrlParameter:
 
         base = os.getenv("GT_CLOUD_BASE_URL", "https://cloud.griptape.ai")
         self._storage_driver = GriptapeCloudStorageDriver(
-            workspace_directory=GriptapeNodes.ConfigManager().workspace_path,
+            GriptapeNodes.ConfigManager(),
             bucket_id=self._get_bucket_id(base, api_key, timeout=self._request_timeout),
             api_key=api_key,
             base_url=base,
