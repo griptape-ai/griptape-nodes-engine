@@ -88,7 +88,6 @@ class LocalObjectEntry:
 _SAME_VALUE_UNSET = object()
 
 
-
 class ResourceManager(EngineScoped):
     """What this machine has, and what this process is holding.
 
@@ -114,6 +113,8 @@ class ResourceManager(EngineScoped):
         self._local_objects: dict[str, LocalObjectEntry] = {}
         # Latched on the first entry and never cleared: see could_hold_a_key.
         self._has_ever_cached = False
+        # Release hooks held back because a node was executing: see drain_deferred_releases.
+        self._deferred_releases: dict[str, LocalObjectEntry] = {}
         # Node bodies that yield a callable run on real threads (`async_utils.to_thread`), and parallel
         # resolution runs several node tasks at once, so two nodes can be inside these methods together.
         # Every mutation happens under this lock; release hooks run outside it, since a hook is caller
@@ -423,7 +424,7 @@ class ResourceManager(EngineScoped):
         # obvious way to write the reuse this API recommends, and tearing down the value that is now
         # live in the map would hand the next reader a released object.
         if displaced is not None and displaced.value is not value and not displaced_value_survives:
-            self._invoke_on_drop(full_key, displaced)
+            self._invoke_hooks_once_per_object({full_key: displaced})
         self._invoke_hooks_once_per_object(displaced_slot_entries)
         if displaced_slot_entries:
             # Releasing an entry here is what queues its key; this drains the queue. A worker's own slot is
@@ -520,7 +521,7 @@ class ResourceManager(EngineScoped):
             survives = self._value_still_held_locked(entry.value)
 
         if not survives:
-            self._invoke_on_drop(key, entry)
+            self._invoke_hooks_once_per_object({key: entry})
         return True
 
     def release_parked_key(self, key: str, *, owner: str) -> bool:
@@ -558,7 +559,11 @@ class ResourceManager(EngineScoped):
             del self._local_objects[key]
             survives = self._value_still_held_locked(entry.value)
         if not survives:
-            self._invoke_on_drop(key, entry)
+            # Immediately, not deferred like a release this process decided on its own. The orchestrator
+            # replaced or deleted this value before sending the message, so a node running here now was
+            # handed the new one and cannot be holding this object. Waiting would pin the memory for the
+            # length of a render.
+            self._invoke_hooks_once_per_object({key: entry}, defer_during_execution=False)
         return True
 
     def vacate_slot(self, *, owner: str, source: str, slot: str, keeping: str | None = None) -> None:
@@ -673,13 +678,40 @@ class ResourceManager(EngineScoped):
         """
         return any(entry.value is value for entry in self._local_objects.values())
 
-    def _invoke_hooks_once_per_object(self, removed: dict[str, LocalObjectEntry]) -> None:
+    def drain_deferred_releases(self) -> int:
+        """Run the release hooks held back during node execution. Returns how many objects went.
+
+        Called once a node has finished, which is the only point at which it is safe: a hook frees what the
+        object holds -- GPU memory, a file handle -- and a consumer that read the object is using it for as
+        long as it runs. The map's lock cannot help there, because the consumer stopped consulting the map
+        the moment it had the object in hand.
+        """
+        with self._local_objects_lock:
+            deferred = self._deferred_releases
+            self._deferred_releases = {}
+        if deferred:
+            self._run_hooks(deferred)
+        return len(deferred)
+
+    def _invoke_hooks_once_per_object(
+        self, removed: dict[str, LocalObjectEntry], *, defer_during_execution: bool = True
+    ) -> None:
         """Run release hooks for a batch of removed entries, once per distinct object.
 
         One object can sit in several entries -- parked on two outputs, or parked and also cached under
         a library key -- and a batch removal takes them all at once. Freeing is per object, not per
         entry, so the hook runs once: the first entry carrying one, since an entry may have none.
         """
+        if removed and defer_during_execution and self.engine.event_manager.in_node_execution():
+            # A node is running and may be using one of these. Held until it finishes rather than freed
+            # underneath it; `drain_deferred_releases` runs them then.
+            with self._local_objects_lock:
+                self._deferred_releases.update(removed)
+            return
+
+        self._run_hooks(removed)
+
+    def _run_hooks(self, removed: dict[str, LocalObjectEntry]) -> None:
         seen: set[int] = set()
         for key, entry in removed.items():
             if id(entry.value) in seen:

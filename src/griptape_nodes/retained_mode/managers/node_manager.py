@@ -3536,6 +3536,12 @@ class NodeManager(EngineScoped):
         finally:
             if tracked_request_id:
                 self._worker_inflight_aprocesses.pop(tracked_request_id, None)
+            # Release hooks held back while this node ran. A hook frees what the object holds, and a node
+            # that read the object is using it for as long as it runs -- the store's lock cannot help,
+            # because the reader stopped consulting the store the moment it had the object.
+            dropped = self.engine.resource_manager.drain_deferred_releases()
+            if dropped:
+                logger.debug("Released %d held object(s) deferred while '%s' was running.", dropped, node.name)
 
     async def _hydrate_and_run_node_inner(self, node: BaseNode, request: ExecuteNodeRequest) -> ResultPayload:
         node_name = request.node_name

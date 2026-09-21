@@ -383,3 +383,34 @@ class TestDeclaringItOnAContainer:
         node.add_parameter(ParameterList(name="latents", output_type="Latent", tooltip=""))
 
         assert node.get_parameter_by_name("latents") is not None
+
+
+class TestReleasingWhileANodeRuns:
+    """A hook frees what the object holds, so it must not run while a node is using the object.
+
+    The store's lock cannot help: a consumer stops consulting the store the moment it has the object in
+    hand, and then holds it for as long as it runs. So engine-initiated releases wait for the node to
+    finish rather than freeing underneath it.
+    """
+
+    def test_a_release_waits_for_the_running_node(self) -> None:
+        node = _node()
+        released: list[str] = []
+        node.local_objects.put(Pipeline("first"), key="cfg", on_drop=lambda value: released.append(value.label))
+        manager = node.local_objects._manager()
+
+        with manager.engine.event_manager.worker_node_execution_scope():
+            node.local_objects.put(Pipeline("second"), key="cfg")
+            assert released == []
+
+        assert manager.drain_deferred_releases() == 1
+        assert released == ["first"]
+
+    def test_outside_execution_a_release_is_immediate(self) -> None:
+        node = _node()
+        released: list[str] = []
+        node.local_objects.put(Pipeline("first"), key="cfg", on_drop=lambda value: released.append(value.label))
+
+        node.local_objects.put(Pipeline("second"), key="cfg")
+
+        assert released == ["first"]
