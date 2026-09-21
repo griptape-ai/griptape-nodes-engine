@@ -45,6 +45,8 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     AddParameterToNodeRequest,
     AddParameterToNodeResultSuccess,
     AlterParameterDetailsRequest,
+    SetParameterValueRequest,
+    SetParameterValueResultSuccess,
 )
 
 if TYPE_CHECKING:
@@ -210,6 +212,48 @@ def _create_text_node(engine: Engine, library_name: str, node_name: str, **kwarg
     return result.node_name
 
 
+def _create_metadata_driven_node(engine: Engine, library_name: str, node_name: str, *dynamic_names: str) -> str:
+    result = engine.handle_request(
+        CreateNodeRequest(
+            node_type="_MetadataDrivenNode",
+            specific_library_name=library_name,
+            node_name=node_name,
+            metadata={"dynamic_parameters": list(dynamic_names)},
+        )
+    )
+    assert isinstance(result, CreateNodeResultSuccess), result
+    return result.node_name
+
+
+def _round_trip(engine: Engine, node_name: str) -> BaseNode:
+    """Serialize a node, replay its commands and its saved values, and return the resulting node.
+
+    Values travel separately from the element-modification commands, keyed by UUID into a pool the
+    caller owns, so restoring them mirrors what FlowManager does on paste and workflow load.
+    """
+    unique_values: dict = {}
+    serialize_result = engine.node_manager.on_serialize_node_to_commands(
+        SerializeNodeToCommandsRequest(node_name=node_name, unique_parameter_uuid_to_values=unique_values)
+    )
+    assert isinstance(serialize_result, SerializeNodeToCommandsResultSuccess), serialize_result
+
+    deserialize_result = engine.handle_request(
+        DeserializeNodeFromCommandsRequest(serialized_node_commands=serialize_result.serialized_node_commands)
+    )
+    assert isinstance(deserialize_result, DeserializeNodeFromCommandsResultSuccess), deserialize_result
+
+    for indirect_command in serialize_result.set_parameter_value_commands:
+        set_command = indirect_command.set_parameter_value_command
+        set_command.value = unique_values[indirect_command.unique_value_uuid]
+        set_command.node_name = deserialize_result.node_name
+        set_result = engine.handle_request(set_command)
+        assert isinstance(set_result, SetParameterValueResultSuccess), set_result
+
+    new_node = engine.object_manager.get_object_by_name(deserialize_result.node_name)
+    assert isinstance(new_node, BaseNode)
+    return new_node
+
+
 class TestSerializeNodeToCommandsBasics:
     """create_node_command carries the identity and placement info needed to recreate the node."""
 
@@ -305,12 +349,12 @@ class TestElementModificationCommands:
         assert alter_commands[0].tooltip == "Changed tooltip"
         assert alter_commands[0].default_value == "changed default"
 
-    def test_parameter_the_class_does_not_declare_is_left_out(self, engine: Engine, library_name: str) -> None:
-        """A parameter absent from the class produces no command, and the node still round trips.
+    def test_parameter_added_after_construction_is_left_out(self, engine: Engine, library_name: str) -> None:
+        """A parameter the node grew mid-run produces no command and no value, and still round trips.
 
         Nodes add such parameters transiently while they run — a scratch parameter feeding a media
-        upload, removed once the run ends. An alter command would target a parameter that the
-        recreated node never has, failing the deserialize.
+        upload, removed once the run ends. ``__init__`` will not rebuild it, so a command targeting
+        it finds no element on the recreated node and fails the whole deserialize.
         """
         node_name = _create_text_node(engine, library_name, "N1")
         node = engine.object_manager.get_object_by_name(node_name)
@@ -323,6 +367,10 @@ class TestElementModificationCommands:
                 allowed_modes={ParameterMode.PROPERTY},
             )
         )
+        set_result = engine.handle_request(
+            SetParameterValueRequest(node_name=node_name, parameter_name="_scratch_upload", value="scratch")
+        )
+        assert isinstance(set_result, SetParameterValueResultSuccess), set_result
 
         result = engine.node_manager.on_serialize_node_to_commands(SerializeNodeToCommandsRequest(node_name=node_name))
 
@@ -332,46 +380,68 @@ class TestElementModificationCommands:
             for command in result.serialized_node_commands.element_modification_commands
             if getattr(command, "parameter_name", None) == "_scratch_upload"
         ]
-        deserialize_result = engine.handle_request(
-            DeserializeNodeFromCommandsRequest(serialized_node_commands=result.serialized_node_commands)
-        )
-        assert isinstance(deserialize_result, DeserializeNodeFromCommandsResultSuccess), deserialize_result
-        new_node = engine.object_manager.get_object_by_name(deserialize_result.node_name)
-        assert isinstance(new_node, BaseNode)
+        assert not [
+            command
+            for command in result.set_parameter_value_commands
+            if command.set_parameter_value_command.parameter_name == "_scratch_upload"
+        ]
+        new_node = _round_trip(engine, node_name)
         assert new_node.get_parameter_by_name("_scratch_upload") is None
 
     def test_metadata_driven_parameters_are_not_added_twice(self, engine: Engine, library_name: str) -> None:
         """A node rebuilding its dynamic parameters in ``__init__`` keeps the same parameter names.
 
-        The reference instance carries these too, so they take the alter path. Adding them instead
-        would collide with the ones ``__init__`` already created and rename them to ``<name>_1``.
+        ``__init__`` recreates them from the metadata the create command carries, so an add would
+        collide with the parameter already there and rename it to ``<name>_1``.
         """
-        create_result = engine.handle_request(
-            CreateNodeRequest(
-                node_type="_MetadataDrivenNode",
-                specific_library_name=library_name,
-                node_name="MD1",
-                metadata={"dynamic_parameters": ["prompt_1"]},
-            )
-        )
-        assert isinstance(create_result, CreateNodeResultSuccess), create_result
-        node = engine.object_manager.get_object_by_name(create_result.node_name)
+        node_name = _create_metadata_driven_node(engine, library_name, "MD1", "prompt_1")
+        node = engine.object_manager.get_object_by_name(node_name)
         assert isinstance(node, BaseNode)
         names_before = [parameter.name for parameter in node.parameters]
         assert "prompt_1" in names_before
 
-        result = engine.node_manager.on_serialize_node_to_commands(
-            SerializeNodeToCommandsRequest(node_name=create_result.node_name)
-        )
+        result = engine.node_manager.on_serialize_node_to_commands(SerializeNodeToCommandsRequest(node_name=node_name))
+
         assert isinstance(result, SerializeNodeToCommandsResultSuccess)
-        deserialize_result = engine.handle_request(
-            DeserializeNodeFromCommandsRequest(serialized_node_commands=result.serialized_node_commands)
+        assert not [
+            command
+            for command in result.serialized_node_commands.element_modification_commands
+            if isinstance(command, AddParameterToNodeRequest) and command.parameter_name == "prompt_1"
+        ]
+        new_node = _round_trip(engine, node_name)
+        assert [parameter.name for parameter in new_node.parameters] == names_before
+
+    def test_metadata_driven_parameter_value_survives_the_round_trip(self, engine: Engine, library_name: str) -> None:
+        """A value set on a metadata-driven parameter is saved, since the copy has somewhere to put it.
+
+        The reference instance is built with metadata narrowed to library and node_type, so it lacks
+        this parameter even though the recreated node has it. Reading that absence as "the copy will
+        not have it either" drops the value on every save, not just on paste.
+        """
+        node_name = _create_metadata_driven_node(engine, library_name, "MD1", "prompt_1")
+        set_result = engine.handle_request(
+            SetParameterValueRequest(node_name=node_name, parameter_name="prompt_1", value="a typed prompt")
+        )
+        assert isinstance(set_result, SetParameterValueResultSuccess), set_result
+
+        new_node = _round_trip(engine, node_name)
+
+        assert new_node.get_parameter_value("prompt_1") == "a typed prompt"
+
+    def test_metadata_driven_parameter_alteration_survives_the_round_trip(
+        self, engine: Engine, library_name: str
+    ) -> None:
+        """An edit to a metadata-driven parameter's details is saved, for the same reason."""
+        node_name = _create_metadata_driven_node(engine, library_name, "MD1", "prompt_1")
+        engine.handle_request(
+            AlterParameterDetailsRequest(node_name=node_name, parameter_name="prompt_1", tooltip="Retitled")
         )
 
-        assert isinstance(deserialize_result, DeserializeNodeFromCommandsResultSuccess), deserialize_result
-        new_node = engine.object_manager.get_object_by_name(deserialize_result.node_name)
-        assert isinstance(new_node, BaseNode)
-        assert [parameter.name for parameter in new_node.parameters] == names_before
+        new_node = _round_trip(engine, node_name)
+
+        altered = new_node.get_parameter_by_name("prompt_1")
+        assert altered is not None
+        assert altered.tooltip == "Retitled"
 
 
 class TestLockState:

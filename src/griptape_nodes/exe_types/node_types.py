@@ -321,10 +321,22 @@ class BaseNode(ABC):
     _cancellation_requested: threading.Event  # Event indicating if cancellation has been requested for this node
     _inputs_to_reset_after_execution: set[str]  # Input values a connection teardown deferred until this node finishes
     _deferred_inputs_were_reset: bool  # Whether one of those deferred resets actually fired
+    _parameters_added_after_construction: set[str]
 
     @property
     def parameters(self) -> list[Parameter]:
         return self.root_ui_element.find_elements_by_type(Parameter)
+
+    @property
+    def parameters_added_after_construction(self) -> set[str]:
+        """Names of parameters the node grew outside its declarative ``__init__``.
+
+        A parameter declared in ``__init__`` reappears whenever the node is recreated from its
+        create command, even one built from the node's own metadata rather than hardcoded. One
+        added mid-run does not. Serialization consults this to tell those two apart, since the
+        commands it emits are replayed against a freshly created node.
+        """
+        return self._parameters_added_after_construction
 
     def __hash__(self) -> int:
         return hash(self.name)
@@ -351,6 +363,7 @@ class BaseNode(ABC):
         self._cancellation_requested = threading.Event()
         self._inputs_to_reset_after_execution = set()
         self._deferred_inputs_were_reset = False
+        self._parameters_added_after_construction = set()
         self._parent_group = None
         self.set_entry_control_parameter(None)
 
@@ -736,6 +749,7 @@ class BaseNode(ABC):
             parameter_group.add_child(param)
         else:
             self.add_node_element(param)
+        self._record_if_added_after_construction(param.name)
         self._emit_parameter_lifecycle_event(param)
 
     def remove_parameter_element_by_name(self, element_name: str) -> None:
@@ -745,6 +759,7 @@ class BaseNode(ABC):
 
     def remove_parameter_element(self, param: BaseNodeElement) -> None:
         self._report_parameter_mutation_if_in_aprocess(parameter_name=param.name, mutation="remove_parameter_element")
+        self._parameters_added_after_construction.discard(param.name)
         # Emit event before removal if it's a Parameter
         if isinstance(param, Parameter):
             self._emit_parameter_lifecycle_event(param)
@@ -1789,6 +1804,16 @@ class BaseNode(ABC):
                 mutation=mutation,
             ),
         )
+
+    def _record_if_added_after_construction(self, parameter_name: str) -> None:
+        """Populate ``parameters_added_after_construction``, off the same flag as the detector above."""
+        # Lazy import: library_registry imports BaseNode from this module,
+        # so importing at module load creates a cycle.
+        from griptape_nodes.node_library.library_registry import LibraryRegistry
+
+        if LibraryRegistry.is_constructing_node():
+            return
+        self._parameters_added_after_construction.add(parameter_name)
 
     def _emit_parameter_lifecycle_event(self, parameter: BaseNodeElement, *, remove: bool = False) -> None:
         """Emit an AlterElementEvent for parameter add/remove operations."""
