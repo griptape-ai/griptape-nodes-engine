@@ -189,6 +189,7 @@ plugins:
         Enterprise:
           - enterprise/on_premises_quick_start.md: Step-by-step rollout of an on-premises deployment, from Cloud API key to activated workstations
           - enterprise/admin_dashboard.md: Manage license keys, access groups, and permission templates from the editor's admin interface
+          - enterprise/cedar_policies.md: Cedar reference for hand-written permission templates - checkpoints, resource attributes, context facts, annotations, examples
           - enterprise/admin_server.md: Run a single in-network proxy so app instances avoid public internet access
           - enterprise/using_the_admin_server.md: Activate the desktop app with a license through the Admin Server
           - enterprise/disabling_app_updates.md: Turn off desktop app updates on a managed machine with a machine-level policy.json file
@@ -563,6 +564,7 @@ nav:
   - Enterprise:
       - On-Premises Quick Start: enterprise/on_premises_quick_start.md
       - Admin Dashboard: enterprise/admin_dashboard.md
+      - Cedar Policies: enterprise/cedar_policies.md
       - Admin Server: enterprise/admin_server.md
       - Using the Admin Server: enterprise/using_the_admin_server.md
       - Disabling App Updates: enterprise/disabling_app_updates.md
