@@ -530,12 +530,10 @@ class LibraryManager(EngineScoped):
         is_sandbox: bool
         library_name: str | None = None
         library_version: str | None = None
-        # Why this library cannot execute right now, phrased for whoever has to act on it.
-        # A library can be perfectly loaded and editable while execution is unavailable. Set when
-        # its worker is evicted. Deliberately NOT set when execution dependencies fail to install:
-        # that happens in the worker's own process against the worker's own LibraryInfo, so the
-        # orchestrator never learns it -- the worker reports that itself when a run is attempted.
-        # None means nothing is known to be wrong.
+        # Why this library cannot execute right now; None when nothing is known to be wrong. A
+        # library can be perfectly loaded and editable while execution is unavailable. Set when its
+        # worker is evicted, and deliberately NOT when execution dependencies fail to install: that
+        # happens in the worker's own process, so the orchestrator never learns it.
         execution_unavailable_reason: str | None = None
         # The path string the user wrote in `libraries_to_register` before workspace
         # resolution / `~`-expansion / symlink-following. Surfaced to the GUI so the
@@ -791,13 +789,11 @@ class LibraryManager(EngineScoped):
                 notification.library_name,
             )
             return
-        # Only a legacy worker-mode library takes its fitness from the worker: for that kind the
-        # orchestrator never loaded the library itself, so the worker's verdict is the only one
-        # there is. An exec-deps library loaded REAL nodes here and derived its own fitness from
-        # doing so. Overwriting that misreports both ways -- a clean worker paints over a
-        # genuinely FLAWED local load, leaving the settings panel claiming health while a broken
-        # node sits on the canvas; a FLAWED worker downgrades a copy that is perfectly editable --
-        # and in neither case does the reason travel, since only the log gets problem_details.
+        # Only a legacy worker-mode library takes its fitness from the worker: the orchestrator
+        # never loaded it, so the worker's verdict is the only one there is. An exec-deps library
+        # loaded REAL nodes here and derived its own fitness from doing so, and overwriting that
+        # misreports in both directions without the reason travelling -- only the log gets
+        # problem_details.
         if library_info.requires_worker:
             library_info.fitness = LibraryManager.LibraryFitness(notification.fitness)
             library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.LOADED
@@ -993,15 +989,13 @@ class LibraryManager(EngineScoped):
                 # WorkerManager owns the gate execution routing waits on, and clears its own
                 # account of any previous attempt.
                 self._worker_manager.expect_worker(library_info.library_name)
-                # A fresh attempt, so an account of a PREVIOUS one no longer describes the
-                # situation. Not conditioned on the result: StartWorkerRequest only SCHEDULES the
-                # spawn and always reports success, so a spawn that dies records its own reason
-                # from the task's exception handler (WorkerManager._log_spawn_error).
+                # A fresh attempt, so an account of a previous one no longer applies. Not
+                # conditioned on the result: StartWorkerRequest only SCHEDULES the spawn, so one
+                # that dies records its own reason from _log_spawn_error.
                 #
-                # An unmet requirement is not an account of an attempt -- the machine still lacks
-                # the resource -- and it is the ONLY gate get_worker_for_library has. Clearing it
-                # would leave a legacy worker-mode library, whose spawn is deliberately not
-                # skipped above, dispatching to a worker that cannot load it.
+                # An unmet requirement is not an account of an attempt -- the machine still lacks the
+                # resource -- and it is the ONLY gate get_worker_for_library has, so clearing it
+                # would dispatch to a worker that cannot load the library.
                 if not has_unmet_requirement:
                     library_info.execution_unavailable_reason = None
                 await self.engine.ahandle_request(StartWorkerRequest(library_name=library_info.library_name))
@@ -2297,9 +2291,8 @@ class LibraryManager(EngineScoped):
         # In that case we still return a success payload with the library-level metadata and a
         # WARNING entry in result_details, so callers can present the node at all instead of
         # getting an opaque failure for every such node type.
-        # Resolving the class imports the node's module (lazy registration defers this to
-        # first use). A broken module raises here; return the library-level metadata with a
-        # WARNING rather than an opaque failure, matching the probe-failure path below.
+        # Resolving the class imports the node's module, which deferred registration put off until
+        # first use, so a broken module raises here rather than at load.
         try:
             node_class = library.get_node_class(request.node_type)
         except (ImportError, AttributeError, TypeError) as err:
@@ -2702,13 +2695,10 @@ class LibraryManager(EngineScoped):
                         )
                         if requirements_check_result is not None:
                             # A declared resource this machine does not have costs EXECUTION, not
-                            # loading. Nothing about a missing GPU stops the orchestrator importing
-                            # base-clean node modules, drawing their parameters, or saving a
-                            # workflow that uses them -- and refusing to register took all of that
-                            # away, leaving placeholder nodes reading "Library not found" on every
-                            # machine that was only ever going to edit. It is the same rule the
-                            # engine applies to a dependency that will not install: the capability
-                            # gates the run, and the artist finds out when they run.
+                            # loading: a missing GPU does not stop the orchestrator importing node
+                            # modules, drawing their parameters, or saving a workflow that uses them.
+                            # Same rule as a dependency that will not install -- the capability gates
+                            # the run, and the artist finds out when they run.
                             library_info.fitness = LibraryManager.LibraryFitness.FLAWED
                             library_info.problems.append(requirements_check_result)
                             library_info.execution_unavailable_reason = self._describe_unmet_requirements(
@@ -2803,16 +2793,12 @@ class LibraryManager(EngineScoped):
                                         dep_result.result_details,
                                     )
 
-                    # A worker-mode library still reaches the install: the orchestrator has to
-                    # build its EXECUTION environment, because the worker receives that directory
-                    # as PYTHONPATH and so cannot create it. Only the edit-time venv is the
-                    # worker's to build, and `_this_process_owns_the_edit_venv` is what declines
-                    # it here. Skipping the call outright left a library declaring both worker
-                    # mode and execution dependencies with no `.venv-exec` from either process.
-                    #
-                    # The lifecycle still reports WORKER_DELEGATED, and completes through LOADED so
-                    # the library is registered in LibraryRegistry for the editor and for workflow
-                    # loading.
+                    # A worker-mode library still reaches the install, because the orchestrator has
+                    # to build its EXECUTION environment: the worker receives that directory as
+                    # PYTHONPATH and so cannot create it. Only the edit-time venv is the worker's,
+                    # and `_this_process_owns_the_edit_venv` is what declines it here. The lifecycle
+                    # still reports WORKER_DELEGATED and completes through LOADED, so the library is
+                    # registered for the editor and for workflow loading.
                     delegated_to_worker = library_info.requires_worker and not self._is_worker
                     install_result = await self.install_library_dependencies_request(
                         InstallLibraryDependenciesRequest(library_file_path=library_info.library_path)
@@ -7414,9 +7400,7 @@ class LibraryManager(EngineScoped):
         # It has to be the builder, because the worker receives that directory as PYTHONPATH and so
         # cannot be the process that creates it.
         #
-        # A failed build costs execution and nothing else. Returning a registration failure meant
-        # the library did not load at all: no node types, and placeholder nodes reading "Library not
-        # found" in any workflow that used it.
+        # A failed build costs execution and nothing else: the library keeps its node types.
         installed_exec_count = 0
         execution_failure: str | None = None
         # Gated on the execution set alone -- never the edit-time one -- so a library that needs
@@ -7425,11 +7409,8 @@ class LibraryManager(EngineScoped):
         # versions of anything they share, and a worker with both on sys.path binds whichever
         # landed first.
         #
-        # Awaited, exactly like the edit-time install above. Backgrounding it to keep a torch
-        # install off the startup path bought a cancel-and-replace protocol, a task registry keyed
-        # by venv directory, and a readiness event for spawn to wait on -- coordination whose only
-        # purpose was to make an install that had not finished look like one that had. Holding
-        # startup is the honest behaviour; installing less often is the way to make it cheap.
+        # Awaited rather than backgrounded: a spawn needs the directory to exist, so anything that
+        # let startup continue would have to make an unfinished install look finished.
         if not self._is_worker and execution_dependencies:
             try:
                 await self._install_dependency_set(
@@ -7440,10 +7421,8 @@ class LibraryManager(EngineScoped):
                     execution=True,
                 )
             except DependencyInstallError as e:
-                # Costs execution and nothing else: the library keeps its real node classes on the
-                # orchestrator and stays editable, and the reason is recorded so a spawn refusal can
-                # say why. Recorded on execution_env_failure rather than
-                # execution_unavailable_reason, which _start_workers clears before every attempt.
+                # Recorded on execution_env_failure, not execution_unavailable_reason, which
+                # _start_workers clears before every attempt -- the spawn refusal reads this one.
                 execution_failure = f"its execution dependencies could not be installed ({e})."
                 library_info = self.get_library_info_by_library_name(library_name)
                 if library_info is not None:

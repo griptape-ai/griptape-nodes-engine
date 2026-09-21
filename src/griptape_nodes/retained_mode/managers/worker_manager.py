@@ -150,11 +150,8 @@ class WorkerManager(EngineScoped):
         self._session_ready_event: asyncio.Event = asyncio.Event()
 
         # Whether a library's execution is available yet, and why not, keyed by library name.
-        #
-        # Held here rather than on LibraryInfo because these answer questions about a PROCESS: is
-        # one coming, has it loaded the library, did it die. LibraryManager used to own both fields
-        # and this manager wrote them, so a record with one owner had two writers -- and the clear
-        # before a spawn raced the write on a refusal.
+        # Held here rather than on LibraryInfo because they answer questions about a PROCESS: is one
+        # coming, has it loaded the library, did it die. One owner, so one writer.
         self._execution_ready: dict[str, asyncio.Event] = {}
         self._worker_unavailable: dict[str, str] = {}
 
@@ -423,14 +420,11 @@ class WorkerManager(EngineScoped):
 
             # No workspace variable here: GTN_CONFIG_ outranks the runtime project override, so a worker
             # handed one could never follow its orchestrator onto a project's workspace again. The
-            # workspace arrives with the project, adopted from the registration reply.
+            # workspace arrives with the project the orchestrator activates on it.
 
-            # Hand the worker the URL of the static server the orchestrator is ALREADY serving
-            # this workspace on. Without it the worker starts its own server, wins an arbitrary
-            # OS-assigned port, and hands back asset URLs on that port -- which die when the
-            # worker is evicted and are already dead by the time a saved workflow is reopened.
-            # Both processes share the workspace on disk, so the orchestrator's long-lived
-            # server is the right place to serve anything a worker writes.
+            # Both processes share the workspace on disk, so the orchestrator's long-lived server
+            # is the one that must serve it: a worker serving its own wins an arbitrary port, and
+            # every asset URL on it is dead by the time a saved workflow is reopened.
             static_base_url = await self._orchestrator_static_server_base_url()
             if static_base_url is not None:
                 worker_environ[ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV] = static_base_url
@@ -532,20 +526,11 @@ class WorkerManager(EngineScoped):
             request_id, tag=worker_engine_id, resolve_failures_as_payload=True
         )
 
-        # The publish is inside the `try` because it is an await like any other: a cancellation
-        # delivered while it is parked on send_message, or a raise out of the transport, would
-        # otherwise leave the entry tracked with nobody left to settle it.
-        #
-        # No wall-clock timeout on the response: long-running AI workloads (diffusion, multi-pass
-        # refinement) routinely exceed any sensible default. Worker liveness is enforced by the
-        # heartbeat loop, which evicts a silent worker and fails its in-flight requests with
-        # WorkerGoneError, so a dead worker still surfaces to the caller without a per-request
-        # ceiling.
-        #
-        # The future is settled by whichever loop the transport runs on, which is not this one.
-        # wrap_future adapts it for this loop and installs the threadsafe wakeup. A CancelledError
-        # out of the response await means only one thing -- the caller was cancelled -- because a
-        # worker going away raises WorkerGoneError instead.
+        # Both awaits belong inside the `try`: either can unwind and leave the entry tracked with
+        # nobody to settle it. No wall-clock timeout on the response, because long-running AI
+        # workloads exceed any sensible default and the heartbeat loop already fails a silent
+        # worker's requests with WorkerGoneError. That is also why a CancelledError here means only
+        # that the caller was cancelled. wrap_future adapts a future the transport loop settles.
         try:
             await self.forward_event_to_worker(
                 event_request.model_copy(update={"request_id": request_id}),

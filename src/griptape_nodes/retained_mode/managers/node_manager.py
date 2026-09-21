@@ -3289,15 +3289,13 @@ class NodeManager(EngineScoped):
         # scope, not ours. Decide forwarding first; only open a local scope when
         # this process is actually going to execute the node.
         if not is_worker:
-            # "This library cannot run right now" is an expected, recoverable state -- an evicted
-            # worker, or one that never started -- and get_worker_for_library reports it by raising.
-            # Left to propagate it came out of the handler as "Unhandled exception while processing
-            # async ExecuteNodeRequest: ..." with advice to restart the engine, burying a message
-            # written specifically for an artist. It is a node failure, so report it as one.
+            # "This library cannot run right now" is expected and recoverable -- an evicted worker,
+            # or one that never started -- and get_worker_for_library reports it by raising. Caught
+            # here so it reads as the node failure it is, rather than an unhandled engine error that
+            # buries a message written for an artist.
             #
-            # The wait comes first: a worker is routable the moment it registers, but it loads
-            # its library after registering, and forwarding into that window fails node creation
-            # over there. Bounded by the startup grace, which surfaces here as a node failure.
+            # The wait comes first: a worker is routable the moment it registers but loads its
+            # library after, and forwarding into that window fails node creation over there.
             try:
                 if library_name:
                     await self.engine.worker_manager.wait_until_executable(library_name)
@@ -3676,12 +3674,11 @@ class NodeManager(EngineScoped):
                     deferred[param_name] = value
                     continue
                 made_progress = True
-                # Skip when the node already holds this value. The local path calls
-                # ExecuteNodeRequest with dict(node.parameter_values) on the same in-memory
-                # instance, so every iteration would be a no-op mutation that still ran
-                # before/after_value_set hooks and emitted a lifecycle event -- observably
-                # breaking nodes like LoadImage. On the worker the node is fresh, so current
-                # is _PARAM_MISSING and the normal set path runs.
+                # Skip when the node already holds this value. The local path passes
+                # dict(node.parameter_values) for the same in-memory instance, so setting it again
+                # would fire before/after_value_set and emit a lifecycle event for no change --
+                # observably breaking nodes like LoadImage. On a worker the node is fresh, so
+                # current is _PARAM_MISSING and the normal set path runs.
                 current = node.parameter_values.get(param_name, _PARAM_MISSING)
                 if current is value or current == value:
                     continue

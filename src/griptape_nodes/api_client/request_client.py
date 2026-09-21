@@ -73,12 +73,11 @@ class RequestClient:
 
         # Map of request_id -> pending request where tag identifies the originating worker/caller
         self._pending_requests: dict[str, _PendingRequest] = {}
-        # threading.Lock, not asyncio.Lock: this guards state reached from more than one loop --
-        # _try_match runs on the transport loop while _track_request and discard_request run on the
-        # loop that issued the request. An asyncio.Lock binds to the loop that first awaits it and
-        # only checks on the CONTENDED path, so a cross-loop acquire raises intermittently while the
-        # uncontended fast path excludes nothing at all. Every section it guards is synchronous
-        # bookkeeping -- no await inside -- so a plain lock cannot deadlock here.
+        # threading.Lock, not asyncio.Lock: _try_match runs on the transport loop while
+        # _track_request and discard_request run on the loop that issued the request. An asyncio.Lock
+        # binds to the loop that first awaits it and only checks on the CONTENDED path, so a
+        # cross-loop acquire raises intermittently while the fast path excludes nothing. Every
+        # section it guards is synchronous, so a plain lock cannot deadlock here.
         self._lock = threading.Lock()
 
         # Track subscribed response topics

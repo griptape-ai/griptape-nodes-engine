@@ -203,36 +203,28 @@ _LOCAL_ONLY_ARTIFACT_REQUESTS: frozenset[type[RequestPayload]] = frozenset(
 )
 
 
-# os_events is swept wholesale rather than listed, so a filesystem request added later is local
-# without anyone remembering this file. The reason is the shared-on-disk workspace: the worker's own
-# answer is the authoritative one, and forwarding a write corrupts it (`content` is `str | bytes`
-# and the wire form resolves back to `str`).
-#
 # OpenAssociatedFileRequest is the one filesystem request deliberately NOT local: it hands a path to
 # the OS to open in the user's default application, and that side effect belongs where the user is,
 # not in a headless subprocess.
 _FORWARDING_FILESYSTEM_REQUESTS: frozenset[type[RequestPayload]] = frozenset({os_events.OpenAssociatedFileRequest})
 
 
-# Every request in these modules is local unless named in _FORWARDING_FILESYSTEM_REQUESTS, which
-# _candidate_request_types subtracts. os_events is swept wholesale because it is filesystem work
-# almost throughout, and the workspace is shared on disk -- stated as a module-wide rule rather than a
-# list because the list kept being incomplete. "Almost": DeduceSequencesFromFileListRequest does no
-# I/O and is local for a different reason (category 3 below), so the sweep is a good default rather
-# than a guarantee, which is why the pinning test makes each member a reviewed decision.
+# Swept wholesale, minus _FORWARDING_FILESYSTEM_REQUESTS: the workspace is shared on disk, so the
+# worker's own answer is the authoritative one and forwarding a write corrupts it (`content` is
+# `str | bytes` and the wire form resolves back to `str`). A rule rather than a list because the
+# list kept being incomplete. It is a good default and not a guarantee -- DeduceSequencesFromFileList
+# does no I/O and is local for another reason -- so the pinning test makes each member a decision.
 _WHOLESALE_LOCAL_MODULES = (os_events,)
 
 
 def _local_only_by_derivation() -> frozenset[type[RequestPayload]]:
     """The request types routed local by rule rather than one at a time.
 
-    Only os_events is swept. A request added to it later is local without anyone remembering this
-    file, and the cost is that it is also ROUTED without anyone deciding, so
-    `tests/unit/app/test_worker_routing_filesystem.py` pins the exact membership: a new one fails
-    that test and forces the call.
+    A request added to a swept module is routed without anyone deciding, so
+    `tests/unit/app/test_worker_routing_filesystem.py` pins the membership and a new one fails it.
 
-    artifact_events is not swept. Its local members are named in _LOCAL_ONLY_ARTIFACT_REQUESTS,
-    because what binds them is what each request DOES, which no rule over field types can see.
+    artifact_events is not swept: what binds its local members is what each request DOES, which no
+    rule over field types can see, so they are named in _LOCAL_ONLY_ARTIFACT_REQUESTS.
     """
     derived: set[type[RequestPayload]] = set(_LOCAL_ONLY_ARTIFACT_REQUESTS)
     for module in _WHOLESALE_LOCAL_MODULES:
@@ -273,9 +265,8 @@ LOCAL_ONLY_REQUEST_TYPES: frozenset[type[RequestPayload]] = frozenset(
         # allowlist, so the cost of forgetting a new request type is a round trip, not a wrong answer
         # resolved against the worker's own copy.
         #
-        # Grouped by the reason that BINDS each entry, since the reasons expire differently: 1, 2 and
-        # 4 are permanent, 3 goes away if serialization improves. An entry with several reasons sits
-        # under the one that would still keep it local once the others were solved.
+        # Grouped by the reason that BINDS each entry. An entry with several sits under the one that
+        # would still keep it local once the others were solved.
         #
         # --- 1. Belongs to this process ---------------------------------------------------------
         #
@@ -307,10 +298,9 @@ LOCAL_ONLY_REQUEST_TYPES: frozenset[type[RequestPayload]] = frozenset(
         #
         # --- 2. The worker's own answer is the correct one ---------------------------------------
         #
-        # `test_worker_routing_filesystem.py` pins the membership and comments it by group. All of
-        # os_events, because the workspace is shared on disk (OpenAssociatedFileRequest excepted --
-        # opening a file in the user's app belongs where the user is), plus the named
-        # artifact_events requests that answer out of this process's provider registry.
+        # All of os_events, because the workspace is shared on disk (OpenAssociatedFileRequest
+        # excepted), plus the named artifact_events requests that answer out of this process's
+        # provider registry.
         *_LOCAL_ONLY_FILESYSTEM_REQUESTS,
         # The payload IS the file body, so forwarding would base64 a whole generated asset across
         # the boundary on every save. The worker writes it through its own storage driver instead and
@@ -476,33 +466,24 @@ def register_broadcast_handlers(
             return RefreshSecretsResultFailure(result_details=details)
         return RefreshSecretsResultSuccess(result_details="Refreshed secrets from shared .env file.")
 
-    # Serializes adoptions against each other. Activation awaits internally, so two that arrive
-    # close together each run as their own task and interleave: the older can pass the staleness
-    # check, suspend, and FINISH after the newer, leaving the worker on the older project while
-    # both replies report success. One sender does not fix this -- overlap is a property of the
-    # await, not of who sent it. The staleness check must not be hoisted out of the lock: it reads
-    # the generation the previous holder records.
+    # Activation awaits internally, so two arriving close together interleave: the older can pass
+    # the staleness check, suspend, and finish after the newer, leaving the worker on the older
+    # project while both report success. Overlap is a property of the await, not of who sent it. The
+    # staleness check must stay inside the lock -- it reads the generation the previous holder wrote.
     #
-    # TODO(griptape-ai/internal#266): replace this and the generations
-    # with a single-consumer queue, which makes the ordering structural rather than a rule every
-    # future caller has to remember.
+    # TODO(griptape-ai/internal#266): a single-consumer queue replaces this and the generations,
+    # making the ordering structural rather than a rule every future caller has to remember.
     adoption_lock = asyncio.Lock()
 
     async def handle_activate_project(request: ActivateProjectRequest) -> ResultPayload:
-        # A ReloadConfigRequest may land concurrently: a post-init orchestrator switch
-        # persists project_file, which emits ConfigChanged -> ReloadConfigRequest to every
-        # worker, right alongside this activation. Both are SkipTheLine and run as separate
-        # tasks, so they interleave. It is safe because _activate_project below does
-        # clear_project_layers() + a full re-merge, so a concurrent load_configs() only
-        # refreshes the user layer idempotently and cannot leave layers half-applied.
+        # A concurrent ReloadConfigRequest is safe to interleave with this: _activate_project does
+        # clear_project_layers() plus a full re-merge, so a load_configs() landing alongside it only
+        # refreshes the user layer idempotently.
         #
-        # A worker boots like an engine off the same shared on-disk config, so the
-        # orchestrator's project id is usually already loaded in the worker's registry.
-        # But a worker's registry is frozen at boot: if the orchestrator switched to a
-        # project it registered AFTER this worker spawned, the id is absent here. Re-read
-        # the shared config and re-run registered-project discovery (engine-style) so the
-        # worker learns it. Fail loud if the id is still unknown -- silently landing on a
-        # stale project while reporting success is exactly the divergence we must avoid.
+        # A worker's project registry is frozen at boot, so a project the orchestrator registered
+        # after this worker spawned is absent here. Re-read the shared config and re-run discovery so
+        # the worker learns it, and fail loud if the id is still unknown: landing on a stale project
+        # while reporting success is the divergence this whole path exists to prevent.
         async with adoption_lock:
             if project_manager.is_stale_adoption(request.project_id, request.generation):
                 # Settled, not adopted: a newer activation already landed, so whatever is waiting
