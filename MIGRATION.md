@@ -75,6 +75,17 @@ previous test's temporary directory.
 A test that needs an engine it can hold, rather than a reset between cases, can use
 `engine_scope()` from the same module.
 
+## `package_to_folder` reports where it put the workflow
+
+`WorkflowPackager.package_to_folder` returned a `list[str]` of library paths. It now returns a
+`PackagedBundle`:
+
+```python
+packaged = packager.package_to_folder(destination, workflow)
+packaged.entrypoint_workflow_path  # Path, relative to the bundle root
+packaged.library_paths  # tuple[Path, ...], relative to the bundle root
+```
+
 # v0.64.0
 
 This guide documents the removal of deprecated nodes from Griptape Nodes libraries in version 0.64.0.

@@ -8,6 +8,7 @@ operations (rename, archive, delete, list).
 from __future__ import annotations
 
 import itertools
+import json
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from unittest.mock import patch
@@ -16,6 +17,7 @@ import pytest
 from pydantic_ai.messages import ImageUrl, ModelMessage, ModelRequest, ModelResponse, TextPart, UserPromptPart
 
 from griptape_nodes.drivers.thread_storage.local_thread_storage_driver import LocalThreadStorageDriver
+from griptape_nodes.retained_mode.events.agent_events import RunRecord
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -146,4 +148,58 @@ def test_update_thread_metadata_rename(storage: LocalThreadStorageDriver) -> Non
     thread_id, _ = storage.create_thread(title="old name")
     updated = storage.update_thread_metadata(thread_id, title="new name")
     assert updated["title"] == "new name"
-    assert storage.get_thread_metadata(thread_id)["title"] == "new name"
+    assert storage.get_thread_metadata(thread_id).title == "new name"
+
+
+def test_append_run_record_appears_in_get_thread_metadata(storage: LocalThreadStorageDriver) -> None:
+    """append_run_record persists a RunRecord that get_thread_metadata returns."""
+    thread_id, _ = storage.create_thread(title="conversation")
+    record = RunRecord(message_index=1, provider_name="griptape_cloud", model="claude-sonnet-5", mcp_servers=["brave"])
+    storage.append_run_record(thread_id, record)
+
+    thread = storage.get_thread_metadata(thread_id)
+    assert thread.runs is not None
+    assert len(thread.runs) == 1
+    assert thread.runs[0] == record
+
+
+def test_append_run_record_accumulates_across_turns(storage: LocalThreadStorageDriver) -> None:
+    """Multiple append_run_record calls accumulate in order, not overwrite."""
+    thread_id, _ = storage.create_thread()
+    storage.append_run_record(thread_id, RunRecord(message_index=1, provider_name="ollama", model="llama3"))
+    storage.append_run_record(thread_id, RunRecord(message_index=3, provider_name="griptape_cloud", model="gpt-4o"))
+
+    thread = storage.get_thread_metadata(thread_id)
+    assert thread.runs is not None
+    assert len(thread.runs) == 2  # noqa: PLR2004
+    assert thread.runs[0].message_index == 1
+    assert thread.runs[1].message_index == 3  # noqa: PLR2004
+
+
+def test_list_threads_omits_runs(storage: LocalThreadStorageDriver) -> None:
+    """list_threads does not load runs — use get_thread_metadata for that."""
+    thread_id, _ = storage.create_thread(title="fast-list")
+    storage.append_run_record(thread_id, RunRecord(message_index=1, provider_name="ollama", model="llama3"))
+
+    thread = next(t for t in storage.list_threads() if t.thread_id == thread_id)
+    assert thread.runs is None, "list_threads must not deserialize runs"
+
+
+def test_get_thread_metadata_skips_malformed_run_records(storage: LocalThreadStorageDriver) -> None:
+    """A malformed run record in runs.json is skipped without crashing get_thread_metadata."""
+    thread_id, _ = storage.create_thread(title="resilient")
+    runs_path = storage.threads_directory / f"thread_{thread_id}.runs.json"
+    runs_path.write_text(
+        json.dumps(
+            [
+                {"bad_field": "value"},  # missing required fields — must be skipped
+                {"message_index": 1, "provider_name": "ollama", "model": "llama3", "mcp_servers": []},
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    thread = storage.get_thread_metadata(thread_id)
+    assert thread.runs is not None
+    assert len(thread.runs) == 1
+    assert thread.runs[0].message_index == 1
