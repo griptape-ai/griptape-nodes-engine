@@ -201,6 +201,14 @@ class LocalObjectScope:
             raise RuntimeError(self._unusable_key_message(value, parameter_name=parameter_name, node_name=node_name))
         return self.require(value, parameter_name=parameter_name, node_name=node_name)
 
+    def source_of(self, key: Any) -> str | None:
+        """Which node parked `key`, or None if nothing here holds it."""
+        return self._manager().source_of(key)
+
+    def key_held_in_slot(self, slot: str, value: Any) -> str | None:
+        """The key this node already holds `value` under in `slot`, or None."""
+        return self._manager().key_held_in_slot(owner=self._owner, source=self._source, slot=slot, value=value)
+
     def drop(self, key: str) -> bool:
         """Release one object this library is holding. Returns whether it was released."""
         # An unhashable key -- the held object itself, passed in place of its key -- would raise out of the

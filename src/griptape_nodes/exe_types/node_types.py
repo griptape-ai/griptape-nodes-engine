@@ -1043,7 +1043,7 @@ class BaseNode(ABC):
             else:
                 final_value = self.before_value_set(parameter=parameter, value=candidate_value)
             # ACTUALLY SET THE NEW VALUE
-            self.parameter_values[param_name] = self._value_to_store(parameter, final_value)
+            self.parameter_values[param_name] = final_value
 
             # If a parameter value has been set at the top level of a container, wipe all children.
             # Allow custom node logic to respond after it's been set. Record any modified parameters for cascading.
@@ -1051,7 +1051,7 @@ class BaseNode(ABC):
             if emit_change:
                 self._emit_parameter_lifecycle_event(parameter)
         else:
-            self.parameter_values[param_name] = self._value_to_store(parameter, candidate_value)
+            self.parameter_values[param_name] = candidate_value
         # handle with container parameters
         if parameter.parent_container_name is not None:
             # Does it have a parent container
@@ -1365,37 +1365,32 @@ class BaseNode(ABC):
             )
         return self._local_objects
 
-    def _value_to_store(self, parameter: Parameter, value: Any) -> Any:
-        """What actually goes into `parameter_values`: the value, or a key standing in for it."""
-        if not parameter.is_process_local:
-            return value
-        return self.park_process_local_value(parameter, value, is_output=False)
+    def park_for_egress(self, parameter: Parameter, value: Any, *, is_output: bool, sendable: bool) -> Any:
+        """Hold `value` in this process and return the key to send in its place.
 
-    def park_process_local_value(self, parameter: Parameter, value: Any, *, is_output: bool) -> Any:
-        """Hold `value` in this process and return the key to store in the parameter instead of it.
-
-        Called from both write paths -- the output dict and `set_parameter_value` -- because a value that
-        reached `parameter_values` unparked would be a live object in a dict that is json-serialized on
-        every worker dispatch and every editor read.
+        Called only where a parameter value is about to leave the process -- a worker dispatch or a worker
+        result -- never on a write. A node's own dicts keep the real object, so reading one back
+        in-process gives what was put there, and a graph that never crosses a process boundary never parks
+        anything at all.
 
         Runs wherever the value was produced, so an object built in a worker stays in that worker and only
-        its key crosses the wire. A value that is already one of this library's keys is passed through, so
-        a node that changes an object in place and outputs it again keeps one entry for it; None passes
-        through too, so a consumer is told nothing is connected rather than resolving to None. Either way
-        the node produced no fresh object, so whatever it parked in that slot last run is released now.
+        its key crosses. A value that is already a key is passed through: it came from an upstream that
+        parked it, and parking it again would wrap the string as though it were the object. None passes
+        through so a consumer is told nothing is connected rather than resolving to None.
         """
         scope = self.local_objects
-        # A parameter's input value and its output value are two independent values -- the save path says
-        # so -- and each gets its own slot. Sharing one would make an input write release the object the
-        # node is publishing from the same parameter.
+        # A parameter's input value and its output value are two independent values, and each dict egresses
+        # separately, so they get separate slots. Sharing one would make sending an input release the
+        # object the node published from the same parameter.
         slot = f"{parameter.name}#output" if is_output else f"{parameter.name}#input"
-        # Never park a key, whoever owns it: parking one wraps the string as though it were the object, so
-        # the consumer reads a `str` and a release hook runs against a key. Another library's key must
-        # survive unchanged so the read can refuse it by name, and `names_a_parked_object` also catches one
-        # whose entry lives in a worker, where this process has nothing to look up.
-        if value is None or scope.names_any_stored_key(value) or scope.names_a_parked_object(value):
+        if sendable:
             scope.vacate_slot(slot, keeping=value if isinstance(value, str) else None)
             return value
+        # Egress can happen more than once for one object, so reuse the key this slot already holds it
+        # under rather than minting a second one for the same thing.
+        existing = scope.key_held_in_slot(slot, value)
+        if existing is not None:
+            return existing
         return scope.park(value, parameter_name=parameter.name, slot=slot, on_drop=parameter.on_local_object_drop)
 
     def clear_node(self) -> None:
@@ -1486,17 +1481,6 @@ class BaseNode(ABC):
 
     def append_value_to_parameter(self, parameter_name: str, value: Any) -> None:
         from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        # A held value travels as a key, and concatenating a chunk onto it makes a string that still looks
-        # like this library's key -- so the write below would pass it through and vacate the slot,
-        # releasing the object under everyone holding the real key. Failing loudly beats failing quietly.
-        parameter = self.get_parameter_by_name(parameter_name)
-        if parameter is not None and parameter.is_process_local:
-            msg = (
-                f"Attempted to append to parameter '{parameter_name}' on node '{self.name}'. Failed "
-                f"because a held value cannot be streamed into: assign the finished object once."
-            )
-            raise RuntimeError(msg)
 
         # Add the value to the node
         if parameter_name in self.parameter_output_values:
@@ -2067,8 +2051,6 @@ class TrackedParameterOutputValues(dict[str, Any]):
         # handles structured types (JSON Input dicts, list outputs, etc.).
         if _in_aprocess.get() and (parameter is None or parameter.allow_variable_substitution):
             value = self._node._resolve_variables_in_value(value)
-        if parameter is not None and parameter.is_process_local:
-            value = self._park_local_object(parameter, value)
         super().__setitem__(key, value)
 
         # Emit if the key is newly added, or if its value actually changed.
@@ -2078,9 +2060,6 @@ class TrackedParameterOutputValues(dict[str, Any]):
         # would keep showing the stale prior value.
         if not had_key or old_value != value:
             self._emit_parameter_change_event(key, value)
-
-    def _park_local_object(self, parameter: Parameter, value: Any) -> Any:
-        return self._node.park_process_local_value(parameter, value, is_output=True)
 
     def __delitem__(self, key: str) -> None:
         if key in self:

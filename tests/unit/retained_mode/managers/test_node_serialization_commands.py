@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from griptape_nodes.common.parameter_hydration import dehydrate_parameter_values
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
 from griptape_nodes.exe_types.node_groups.subflow_node_group import SubflowNodeGroup
@@ -656,9 +657,10 @@ class TestLocalObjectIdentityIsNeverCopied:
                 )
             )
         original.parameter_output_values["pipe"] = object()
-        key = original.parameter_output_values["pipe"]
+        key = dehydrate_parameter_values(original.parameter_output_values, node=original, are_outputs=True)["pipe"]
 
         clone.parameter_output_values["pipe"] = object()
+        dehydrate_parameter_values(clone.parameter_output_values, node=clone, are_outputs=True)
 
         assert released == []
         assert engine.resource_manager.get_local_object(key, owner=original.local_objects.owner) is not None

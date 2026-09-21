@@ -14,6 +14,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from griptape_nodes.common.parameter_hydration import dehydrate_parameter_values
 from griptape_nodes.exe_types.core_types import Parameter, ParameterList, ParameterMode
 from griptape_nodes.exe_types.node_types import BaseNode, NodeResolutionState
 from griptape_nodes.retained_mode.engine import Engine
@@ -145,13 +146,19 @@ def graph(engine: Engine, flow_name: str) -> tuple[_Producer, _Consumer]:
     return producer, consumer  # type: ignore[return-value]
 
 
+def _egress(node: BaseNode) -> dict:
+    """The payload leaving the process, which is where a value that cannot travel becomes a key."""
+    return dehydrate_parameter_values(node.parameter_output_values, node=node, are_outputs=True)
+
+
 def _produce(producer: _Producer, consumer: _Consumer, label: str) -> str:
-    """Run the producer once and deliver both values to the consumer, as resolution would."""
+    """Run the producer once and deliver both values to the consumer across a process boundary."""
     producer.parameter_output_values["latent"] = Held(label)
     producer.parameter_output_values["steps"] = _STEPS
-    key = producer.parameter_output_values["latent"]
+    sent = _egress(producer)
+    key = sent["latent"]
     consumer.set_parameter_value("latent", key)
-    consumer.set_parameter_value("steps", producer.parameter_output_values["steps"])
+    consumer.set_parameter_value("steps", sent["steps"])
     return key
 
 
@@ -230,7 +237,7 @@ class TestTheProducerIsDeleted:
         )
         consumer.add_parameter(keeper)
         producer.parameter_output_values["latent"] = Held("latent")
-        key = producer.parameter_output_values["latent"]
+        key = _egress(producer)["latent"]
         consumer.set_parameter_value("kept", key)
 
         engine.handle_request(DeleteNodeRequest(node_name="Producer"))
@@ -242,7 +249,7 @@ class TestTheProducerIsDeleted:
     def test_the_object_goes_when_nothing_refers_to_the_key(self, engine: Engine, flow_name: str) -> None:
         producer = _add(engine, _Producer(name="Producer"), flow_name)
         producer.parameter_output_values["latent"] = Held("latent")
-        key = producer.parameter_output_values["latent"]
+        key = _egress(producer)["latent"]
 
         result = engine.handle_request(DeleteNodeRequest(node_name="Producer"))
 
@@ -279,7 +286,7 @@ class TestTheConsumerIsDeleted:
 
         assert producer.released == []
         assert _is_held(engine, key)
-        resolved = producer.local_objects.get(producer.parameter_output_values["latent"])
+        resolved = producer.local_objects.get(_egress(producer)["latent"])
         assert resolved is not None
         assert resolved.label == "latent"
 
@@ -363,6 +370,7 @@ class TestSaving:
         """
         producer = _Producer(name="Producer")
         producer.parameter_output_values["latent"] = Held("latent")
+        _egress(producer)
         parameter = producer.get_parameter_by_name("latent")
         assert parameter is not None
         # The author never set it: declaring the type handle[...] is what forced it off, which is why
@@ -442,11 +450,13 @@ class TestTheRealRunPathReleases:
         """
         first_run = _Producer(name="Producer")
         first_run.parameter_output_values["latent"] = Held("first")
+        _egress(first_run)
 
         # ExecuteNodeRequest carries dict(node.metadata), which is what makes the identity stable
         # across transient instances; a node with different metadata is a different node.
         second_run = _Producer(name="Producer", metadata=dict(first_run.metadata))
         second_run.parameter_output_values["latent"] = Held("second")
+        _egress(second_run)
 
         # The hook captured at park time belongs to the first instance, and it is the displaced one.
         assert first_run.released == ["first"]
@@ -464,11 +474,13 @@ class TestARelayDoesNotReleaseItsUpstream:
         producer = _add(engine, _Producer(name="Producer"), flow_name)
         relay = _add(engine, _Producer(name="Relay"), flow_name)
         producer.parameter_output_values["latent"] = Held("upstream")
-        upstream_key = producer.parameter_output_values["latent"]
+        upstream_key = _egress(producer)["latent"]
 
         relay.parameter_output_values["latent"] = upstream_key
+        _egress(relay)
         relay.parameter_output_values.silent_clear()
         relay.parameter_output_values["latent"] = Held("relay-made")
+        _egress(relay)
 
         assert producer.released == []
         assert _is_held(engine, upstream_key)
@@ -490,6 +502,7 @@ class TestReferencesTheScanMustSee:
         bystander.add_parameter(Parameter(name="tags", input_types=["list"], tooltip=""))
         bystander.set_parameter_value("tags", ["a", "b"])
         producer.parameter_output_values["latent"] = Held("latent")
+        _egress(producer)
 
         result = engine.handle_request(DeleteNodeRequest(node_name="Producer"))
 
@@ -502,7 +515,7 @@ class TestReferencesTheScanMustSee:
         consumer = _add(engine, _Consumer(name="Consumer"), flow_name)
         consumer.add_parameter(Parameter(name="latents", input_types=["list"], tooltip=""))
         producer.parameter_output_values["latent"] = Held("latent")
-        key = producer.parameter_output_values["latent"]
+        key = _egress(producer)["latent"]
         consumer.set_parameter_value("latents", [key])
 
         engine.handle_request(DeleteNodeRequest(node_name="Producer"))
@@ -515,7 +528,7 @@ class TestReferencesTheScanMustSee:
         consumer = _add(engine, _Consumer(name="Consumer"), flow_name)
         consumer.add_parameter(Parameter(name="bundle", input_types=["dict"], tooltip=""))
         producer.parameter_output_values["latent"] = Held("latent")
-        key = producer.parameter_output_values["latent"]
+        key = _egress(producer)["latent"]
         consumer.set_parameter_value("bundle", {"latent": key})
 
         engine.handle_request(DeleteNodeRequest(node_name="Producer"))
@@ -542,7 +555,7 @@ class TestReferencesTheScanMustSee:
             )
         )
         producer.parameter_output_values["latent"] = Held("latent")
-        key = producer.parameter_output_values["latent"]
+        key = _egress(producer)["latent"]
         consumer.set_parameter_value("kept", key)
         engine.handle_request(DeleteNodeRequest(node_name="Producer"))
         assert _is_held(engine, key)
@@ -570,6 +583,7 @@ class TestALibraryKeyIsNotTheEnginesToRelease:
         )
 
         builder.parameter_output_values["latent"] = resource_key
+        _egress(builder)
         builder.parameter_output_values["latent"] = builder.local_objects.put(Held("pipe-v2"), key="cfg-2")
 
         assert released == []
@@ -599,6 +613,7 @@ class TestALibraryKeyIsNotTheEnginesToRelease:
             Held("pipe"), key="cfg-1", on_drop=lambda value: released.append(value.label)
         )
         builder.parameter_output_values["latent"] = resource_key
+        _egress(builder)
 
         engine.handle_request(DeleteNodeRequest(node_name="Producer"))
 
@@ -611,9 +626,11 @@ class TestAssigningNothing:
         """A run that produces nothing releases what the last run produced, and the consumer reads None."""
         producer = _Producer(name="Producer")
         producer.parameter_output_values["latent"] = Held("only-run")
+        _egress(producer)
 
         producer.parameter_output_values.silent_clear()
         producer.parameter_output_values["latent"] = None
+        _egress(producer)
 
         assert producer.released == ["only-run"]
         assert producer.parameter_output_values["latent"] is None
@@ -637,10 +654,12 @@ class TestOneObjectInSeveralEntries:
         shared = Held("shared")
         producer.parameter_output_values["latent"] = shared
         producer.parameter_output_values["latent_also"] = shared
-        second_key = producer.parameter_output_values["latent_also"]
+        _egress(producer)
+        second_key = _egress(producer)["latent_also"]
 
         producer.parameter_output_values.silent_clear()
         producer.parameter_output_values["latent"] = Held("fresh")
+        _egress(producer)
 
         assert producer.released == []
         assert engine.resource_manager.get_local_object(second_key, owner=OWNER) is shared
@@ -659,6 +678,7 @@ class TestOneObjectInSeveralEntries:
 
         producer.parameter_output_values.silent_clear()
         producer.parameter_output_values["latent"] = Held("pipe-v2")
+        _egress(producer)
 
         assert released == []
         assert producer.released == []
@@ -687,6 +707,7 @@ class TestAHookRunsOncePerObject:
         shared = Held("shared")
         producer.parameter_output_values["latent"] = shared
         producer.parameter_output_values["latent_also"] = shared
+        _egress(producer)
 
         engine.handle_request(DeleteNodeRequest(node_name="Producer"))
 
@@ -698,6 +719,7 @@ class TestAHookRunsOncePerObject:
         shared = Held("shared")
         producer.parameter_output_values["latent"] = shared
         producer.parameter_output_values["latent_also"] = shared
+        _egress(producer)
 
         engine.clear_current_workflow_data()
 
@@ -731,7 +753,7 @@ class TestAnOrphanedEntryIsStillCollected:
         """
         producer = _add(engine, _Producer(name="Producer"), flow_name)
         producer.parameter_output_values["latent"] = Held("orphaned")
-        key = producer.parameter_output_values["latent"]
+        key = _egress(producer)["latent"]
         producer.remove_parameter_element_by_name("latent")
 
         engine.handle_request(DeleteNodeRequest(node_name="Producer"))
@@ -744,7 +766,7 @@ class TestAnOrphanedEntryIsStillCollected:
     ) -> None:
         producer = _add(engine, _Producer(name="Producer"), flow_name)
         producer.parameter_output_values["latent"] = Held("stranded")
-        key = producer.parameter_output_values["latent"]
+        key = _egress(producer)["latent"]
         producer.parameter_output_values.silent_clear()
 
         engine.handle_request(DeleteNodeRequest(node_name="Producer"))
@@ -770,24 +792,6 @@ class TestAnUnhookedEntryDoesNotSuppressAHookedOne:
         manager.drop_all_local_objects()
 
         assert released == ["shared"]
-
-
-class TestStreamingIntoAHandleIsRefused:
-    def test_append_raises_and_the_object_survives(self, engine: Engine, graph: tuple) -> None:
-        """Concatenating a chunk onto a key makes a string that still looks like this library's key.
-
-        The write path would pass it through and vacate the slot, releasing the object under everyone
-        holding the real key -- on the first chunk, silently. Same rule as containers: fail loudly.
-        """
-        producer, _consumer = graph
-        producer.parameter_output_values["latent"] = Held("streamed")
-        key = producer.parameter_output_values["latent"]
-
-        with pytest.raises(RuntimeError, match="cannot be streamed into"):
-            producer.append_value_to_parameter("latent", "chunk")
-
-        assert producer.released == []
-        assert _is_held(engine, key)
 
 
 class TestBatchTeardownIsOncePerObject:
@@ -817,7 +821,7 @@ class TestTheEnginesOwnReadsNeverSeeTheObject:
         """Parameter.to_event builds what the editor receives, and it is json-serialized on the way."""
         producer = _add(engine, _Producer(name="Producer"), flow_name)
         producer.parameter_output_values["latent"] = Held("pipeline")
-        key = producer.parameter_output_values["latent"]
+        key = _egress(producer)["latent"]
 
         parameter = producer.get_parameter_by_name("latent")
         assert parameter is not None
@@ -839,6 +843,7 @@ class TestTheEnginesOwnReadsNeverSeeTheObject:
         """clear() emits a change event per key, and those events reach the editor too."""
         producer = _add(engine, _Producer(name="Producer"), flow_name)
         producer.parameter_output_values["latent"] = Held("pipeline")
+        _egress(producer)
 
         producer.parameter_output_values.clear()
 
@@ -856,6 +861,7 @@ class TestSavingAndPublishing:
     def test_a_held_value_is_never_written_out(self, engine: Engine, publishing: bool) -> None:  # noqa: FBT001
         producer = _Producer(name="Producer")
         producer.parameter_output_values["latent"] = Held("pipeline")
+        _egress(producer)
         parameter = producer.get_parameter_by_name("latent")
         assert parameter is not None
         captured: dict = {}
@@ -889,7 +895,7 @@ class TestAKeyThatReachedASerializableParameter:
     def test_it_is_not_written_into_the_saved_workflow(self, engine: Engine, flow_name: str) -> None:
         producer = _add(engine, _Producer(name="Producer"), flow_name)
         producer.parameter_output_values["latent"] = Held("pipeline")
-        key = producer.parameter_output_values["latent"]
+        key = _egress(producer)["latent"]
 
         passthrough = _add(engine, _Consumer(name="Passthrough"), flow_name)
         ordinary = Parameter(name="anything", input_types=["any"], tooltip="")
@@ -922,7 +928,7 @@ class TestAKeyThatReachedASerializableParameter:
         """
         producer = _add(engine, _Producer(name="Producer"), flow_name)
         producer.parameter_output_values["latent"] = Held("pipeline")
-        key = producer.parameter_output_values["latent"]
+        key = _egress(producer)["latent"]
         consumer = _add(engine, _Consumer(name="Consumer"), flow_name)
         consumer.set_parameter_value("latent", key)
 
@@ -941,7 +947,7 @@ class TestDeliveringAValueToTheNextNode:
         producer = _add(engine, _Producer(name="Producer"), flow_name)
         consumer = _add(engine, _Consumer(name="Consumer"), flow_name)
         producer.parameter_output_values["latent"] = Held("pipeline")
-        key = producer.parameter_output_values["latent"]
+        key = _egress(producer)["latent"]
 
         result = engine.handle_request(
             SetParameterValueRequest(parameter_name="latent", node_name="Consumer", value=key)

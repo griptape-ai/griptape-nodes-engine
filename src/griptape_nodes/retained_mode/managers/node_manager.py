@@ -10,7 +10,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 from uuid import uuid4
 
-from griptape_nodes.common.parameter_hydration import hydrate_parameter_values
+from griptape_nodes.common.parameter_hydration import dehydrate_parameter_values, hydrate_parameter_values
 from griptape_nodes.common.strict_mode import (
     STRICT_MODE,
     StrictModeScopeKind,
@@ -3212,6 +3212,18 @@ class NodeManager(EngineScoped):
         )
         if not candidates:
             return []
+        # An object's owner is the store's record, never a parameter value. Parking happens on the way out
+        # of the process, so the producing node's own dict still holds the object rather than its key, and
+        # the value sweep below cannot see that the object is still owned. Deleting a consumer that kept a
+        # copy of the key would otherwise free what its producer made.
+        live_sources = {
+            str(other.metadata["local_object_source"])
+            for name, other in self.engine.object_manager.get_filtered_subset(type=BaseNode).items()
+            if name != node.name and "local_object_source" in other.metadata
+        }
+        candidates = {key for key in candidates if self.engine.resource_manager.source_of(key) not in live_sources}
+        if not candidates:
+            return []
         for name, other in self.engine.object_manager.get_filtered_subset(type=BaseNode).items():
             if name == node.name:
                 continue
@@ -3455,6 +3467,14 @@ class NodeManager(EngineScoped):
         (NodeExecutor.execute) so the write path is identical for local and
         worker routes.
         """
+        # The one route where inputs actually cross. The request carries a copy of the node's values, so
+        # substituting here leaves the live node holding its objects.
+        node = self.engine.object_manager.attempt_get_object_by_name_as_type(request.node_name, BaseNode)
+        if node is not None:
+            request.parameter_values = dehydrate_parameter_values(
+                request.parameter_values, node=node, are_outputs=False
+            )
+
         worker_engine_id, worker_request_topic = worker
         # Assign the request_id on the payload itself so the worker handler can
         # read it from request.request_id. WorkerManager.route_to_worker will
@@ -3627,8 +3647,15 @@ class NodeManager(EngineScoped):
                     result_details=f"Attempted to execute node '{node_name}'. Failed with error: {e}",
                     exception=e,
                 )
+        # Only a worker's result leaves the process. In-process this is handed straight back to
+        # NodeExecutor, which copies it onto this very node, so parking here would put a key in the dict
+        # the node just wrote its object into.
+        if self.engine.library_manager.is_worker:
+            output_values = dehydrate_parameter_values(node.parameter_output_values, node=node, are_outputs=True)
+        else:
+            output_values = dict(node.parameter_output_values)
         return ExecuteNodeResultSuccess(
-            parameter_output_values=dict(node.parameter_output_values),
+            parameter_output_values=output_values,
             result_details=f"Node '{node_name}' executed successfully.",
         )
 

@@ -434,6 +434,34 @@ class ResourceManager(EngineScoped):
                 if entry.owner == owner and entry.source == source and entry.slot is not None
             ]
 
+    def source_of(self, key: Any) -> str | None:
+        """Which source parked `key`, or None if nothing here holds it.
+
+        Ownership of a held object sits in this record rather than in any parameter value: since parking
+        happens on the way out of the process, the producing node's own dicts still hold the object, so
+        scanning parameter values cannot tell that it is still owned.
+        """
+        if not isinstance(key, str):
+            return None
+        with self._local_objects_lock:
+            entry = self._local_objects.get(key)
+        if entry is None:
+            return None
+        return entry.source
+
+    def key_held_in_slot(self, *, owner: str, source: str, slot: str, value: Any) -> str | None:
+        """The key this slot already holds `value` under, or None.
+
+        Egress parks the same object every time a node's values are sent, so without this a node whose
+        output is read twice would mint a second key for one object. Identity, not equality: two equal
+        tensors are still two objects, and re-keying one of them would strand the other's entry.
+        """
+        with self._local_objects_lock:
+            for key, entry in self._local_objects.items():
+                if entry.owner == owner and entry.source == source and entry.slot == slot and entry.value is value:
+                    return key
+        return None
+
     def names_a_parked_object(self, value: Any) -> bool:
         """Whether `value` is a key the engine minted, whether or not THIS process holds the entry.
 
