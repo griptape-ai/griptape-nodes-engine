@@ -121,6 +121,15 @@ class ProjectFileDestination(FileDestination):
         # File.resolve() agree about what a `file://` string means.
         # https://github.com/griptape-ai/griptape-nodes-engine/issues/5360
         local_path_from_uri = parse_file_uri(filename)
+        if local_path_from_uri is not None and not Path(local_path_from_uri).name:
+            # `file://`, `file://localhost` and `file:///` parse to "" and "/", naming no
+            # file. Refused here rather than below, where an empty filename would take the
+            # bypass and build a destination pointing at nothing.
+            msg = (
+                f"Attempted to save to '{filename}'. Failed because that address does not name a file. "
+                f"Add the file name you want, for example 'file:///renders/output.png'."
+            )
+            raise ValueError(msg)
         if local_path_from_uri is None and is_url(filename):
             msg = (
                 f"Attempted to save to '{filename}'. Failed because that is a web address rather than a "

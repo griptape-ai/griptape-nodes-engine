@@ -677,6 +677,33 @@ class TestProjectFileDestinationInit:
         ):
             ProjectFileDestination.from_situation("file://remote-server/renders/out.png", "save_node_output")
 
+    @pytest.mark.parametrize("uri", ["file://", "file://localhost", "file:///", "file://localhost/"])
+    def test_from_situation_rejects_file_uri_naming_no_file(self, uri: str) -> None:
+        """A file:// URI with no filename component is refused, not turned into an empty destination."""
+        from griptape_nodes.common.project_templates.situation import (
+            SituationFilePolicy,
+            SituationPolicy,
+            SituationTemplate,
+        )
+        from griptape_nodes.retained_mode.events.project_events import GetSituationResultSuccess
+
+        situation = SituationTemplate(
+            name="save_node_output",
+            macro="{outputs}/{sub_dirs?:/}{file_name_base}.{file_extension}",
+            policy=SituationPolicy(on_collision=SituationFilePolicy.OVERWRITE, create_dirs=True),
+        )
+
+        # parse_file_uri returns "" for the host-only forms and "/" for the root ones. Both
+        # are non-None, so the `is not None` bypass check alone would accept them as a
+        # location and build a destination naming no file.
+        with (
+            patch(
+                HANDLE_REQUEST_PATH, return_value=GetSituationResultSuccess(situation=situation, result_details="ok")
+            ),
+            pytest.raises(ValueError, match="does not name a file"),
+        ):
+            ProjectFileDestination.from_situation(uri, "save_node_output")
+
     def test_from_situation_windows_drive_path_is_not_a_url(self) -> None:
         """A drive-letter path spelled `C://...` stays a path -- a drive letter is not a URL scheme."""
         from griptape_nodes.common.project_templates.situation import (
@@ -697,12 +724,18 @@ class TestProjectFileDestinationInit:
         ):
             dest = ProjectFileDestination.from_situation("C://renders/out.png", "save_node_output")
 
-        # Not raised as a URL. On POSIX this is a relative path, so it routes through the
-        # macro with sub_dirs; the point of the test is that it is not refused.
-        assert dest._file._file_metadata is not None
-        assert dest._file._file_metadata.situation is not None
-        assert dest._file._file_metadata.situation.variables is not None
-        assert dest._file._file_metadata.situation.variables["file_name_base"] == "out"
+        # The claim is only that a drive letter is not read as a URL scheme, so this is not
+        # refused. Which route it then takes is a pathlib property of the host: the drive
+        # path is absolute on Windows (verbatim bypass) and relative on POSIX (macro route,
+        # drive letter in sub_dirs).
+        if Path("C://renders").is_absolute():
+            assert dest._file.location == "C://renders/out.png"
+            assert dest._file._file_metadata is None
+        else:
+            assert dest._file._file_metadata is not None
+            assert dest._file._file_metadata.situation is not None
+            assert dest._file._file_metadata.situation.variables is not None
+            assert dest._file._file_metadata.situation.variables["file_name_base"] == "out"
 
     def test_file_metadata_policy_matches_situation(self) -> None:
         """SidecarContent.situation.policy mirrors the situation's policy."""
