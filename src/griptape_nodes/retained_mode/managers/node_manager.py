@@ -331,37 +331,6 @@ class _NodeInstantiationDeniedError(Exception):
     """
 
 
-def _keys_referenced_by(node: BaseNode, candidates: set[str]) -> set[str]:
-    """Which of `candidates` appear anywhere in this node's parameter values.
-
-    Walks into lists, dicts and tuples: a ParameterList consumer holds `[key]`, not `key`, and a value of
-    that shape is unhashable, so comparing sets of values raises instead of missing the reference quietly.
-    """
-    found: set[str] = set()
-    seen: set[int] = set()
-    # Snapshot with list(): node bodies write outputs from worker threads, and a dict that changes size
-    # mid-iteration raises, which would abort the delete.
-    for source in (node.parameter_values, node.parameter_output_values):
-        for value in list(source.values()):
-            _collect_keys(value, candidates, found, seen)
-    return found
-
-
-def _collect_keys(value: Any, candidates: set[str], found: set[str], seen: set[int]) -> None:
-    """Add any candidate key reachable inside `value` to `found`. `seen` breaks reference cycles."""
-    if isinstance(value, str):
-        if value in candidates:
-            found.add(value)
-        return
-    if isinstance(value, (dict, list, tuple, set)):
-        if id(value) in seen:
-            return
-        seen.add(id(value))
-        items = value.values() if isinstance(value, dict) else value
-        for item in list(items):
-            _collect_keys(item, candidates, found, seen)
-
-
 class NodeManager(EngineScoped):
     _name_to_parent_flow_name: dict[str, str]
 
@@ -1448,10 +1417,9 @@ class NodeManager(EngineScoped):
             details = f"Attempted to delete a Node '{node_name}', but no such Node was found."
             return DeleteNodeResultFailure(result_details=details)
 
-        # Which of this node's held objects nothing else refers to, decided now rather than after the
-        # connections come down: deleting a connection clears an INPUT-only consumer's copy of the key, so
-        # by then every one of them would look unreferenced.
-        releasable_handle_keys = self._unreferenced_handle_keys(node)
+        # What this node owns, collected before the connections come down so a mid-teardown state cannot
+        # affect it.
+        releasable_handle_keys = self._cached_objects_owned_by(node)
 
         with self.engine.context_manager.node(node=node):
             parent_flow_name = self._name_to_parent_flow_name[node_name]
@@ -3185,43 +3153,37 @@ class NodeManager(EngineScoped):
             valid_parameters_by_node=valid_parameters_by_node, result_details=details
         )
 
-    def _unreferenced_handle_keys(self, node: BaseNode) -> list[str]:
-        """The keys of `node`'s held objects that no other node's parameter values carry.
+    def _cached_objects_owned_by(self, node: BaseNode) -> list[str]:
+        """The cache references for objects this node owns, which are the ones it produced.
 
-        A key is a value, not an edge: a consumer keeps its copy when the connection goes away, and while it
-        does the object behind that key is still reachable and still usable, so deleting the node that made
-        it must leave it alone. Unlike an overwrite there is no fresher value to take its place.
+        A cached object belongs to the output parameter that produced it. A consumer holds a reference and
+        borrows the object; it never owns it and is never responsible for its life. So deleting a node
+        releases what that node made and nothing else, and a consumer left holding a reference to it finds
+        it stale and is told to re-run the producer -- which is the same answer it already gets when the
+        producer re-runs and displaces what it made.
+
+        The alternative, keeping an object alive while any node still carries its reference, made the rules
+        disagree with each other: a producer re-running freed it out from under a consumer, while a producer
+        being deleted did not.
         """
-        candidates: set[str] = set()
-        # Asked of the values, not of any declaration. Only a producer declares `serializable=False`, so a
-        # consumer holds the key on a parameter declaring nothing, and gating on the flag meant deleting
-        # the last holder released nothing at all. The same walk the save guard uses, so a key nested in a
-        # container's list is collected rather than missed.
+        owned: set[str] = set()
+        # Its own outputs, which is what "produced" means. A consumer's inputs are deliberately not
+        # collected: the consumer borrows and owns nothing.
         #
-        # Over-collecting is safe: `_keys_referenced_by` below drops anything another node still carries,
-        # and on the orchestrator -- the only process that deletes nodes -- a producer's own dict holds the
-        # key it was handed back, so it protects its own objects the same way a consumer does.
-        for source in (node.parameter_output_values, node.parameter_values):
-            # Snapshot: node bodies write outputs from worker threads.
-            for value in list(source.values()):
-                candidates |= node.local_objects.parked_keys_within(value)
-        # The store's own record too, not just live parameter names: a parameter renamed or removed after
-        # parking, or a run cancelled between the clear and the park, leaves an entry no current name can
-        # reach, and this is the last chance to run its release hook.
-        candidates.update(
+        # Read from the values rather than from this process's store, because the object is cached in the
+        # worker that ran the node while deletion happens on the orchestrator -- so the orchestrator holds
+        # no entry for it and has only the reference to go on. Snapshot: node bodies write outputs from
+        # worker threads.
+        for value in list(node.parameter_output_values.values()):
+            owned |= node.local_objects.parked_keys_within(value)
+        # Plus anything this process does hold for the node, which covers an in-process library and an entry
+        # whose parameter was renamed or removed after it was cached.
+        owned.update(
             self.engine.resource_manager.parked_keys_for(
                 owner=node.local_objects.owner, source=node.local_object_source
             )
         )
-        if not candidates:
-            return []
-        for name, other in self.engine.object_manager.get_filtered_subset(type=BaseNode).items():
-            if name == node.name:
-                continue
-            candidates -= _keys_referenced_by(other, candidates)
-            if not candidates:
-                return []
-        return sorted(candidates)
+        return sorted(owned)
 
     def get_node_by_name(self, name: str) -> BaseNode:
         obj_mgr = self.engine.object_manager

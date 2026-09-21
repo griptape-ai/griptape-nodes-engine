@@ -208,19 +208,15 @@ class TestTheProducerRunsAgain:
 
 
 class TestTheProducerIsDeleted:
-    def test_the_object_is_not_released_while_the_consumer_takes_it_as_an_input(
-        self, engine: Engine, graph: tuple
-    ) -> None:
-        """Deleting the producer must not free what a consumer refers to.
+    def test_what_it_made_is_released_even_though_a_consumer_refers_to_it(self, engine: Engine, graph: tuple) -> None:
+        """A cached object belongs to the output that produced it, and goes when that node goes.
 
-        The case this design exists for.
+        A consumer borrows; it never owns. Keeping the object alive because a consumer still carried its
+        reference made the rules contradict each other -- a producer re-running freed the object out from
+        under that same consumer, while a producer being deleted did not.
 
-        Reachability is judged before the connections come down, because deleting one clears an INPUT-only
-        consumer's copy of the key and every key would then look unreferenced.
-
-        The consumer's own value follows the ordinary INPUT-only rule and is cleared with the connection --
-        handles are not special-cased there -- so nothing can resolve this object afterwards and it goes at
-        the next workflow clear. What matters is that it was not freed underneath a live reference.
+        The consumer is not left guessing: its reference is now stale, and reading it says to re-run the
+        producer, which is exactly what it is told when the producer re-runs and displaces what it made.
         """
         producer, consumer = graph
         key = _produce(producer, consumer, "latent")
@@ -228,36 +224,37 @@ class TestTheProducerIsDeleted:
         result = engine.handle_request(DeleteNodeRequest(node_name="Producer"))
 
         assert isinstance(result, DeleteNodeResultSuccess)
-        assert producer.released == []
-        assert _is_held(engine, key)
-        assert consumer.parameter_values.get("latent") != key
+        assert producer.released == ["latent"]
+        assert not _is_held(engine, key)
 
-    def test_a_property_consumer_can_still_resolve_it_after_the_producer_goes(
+    def test_a_property_consumer_is_told_to_re_run_rather_than_handed_a_dead_reference(
         self, engine: Engine, flow_name: str
     ) -> None:
-        """A PROPERTY consumer keeps its value on disconnect, so it can still run with the last object.
+        """A PROPERTY consumer keeps its value on disconnect, so it keeps a reference to something gone.
 
-        Exactly as any parameter allowing PROPERTY behaves; handles are not special-cased.
+        The reference resolving to nothing is the honest outcome, and the message names the remedy.
         """
         producer = _add(engine, _Producer(name="Producer"), flow_name)
         consumer = _add(engine, _Consumer(name="Consumer"), flow_name)
-        keeper = Parameter(
-            name="kept",
-            input_types=["Latent"],
-            serializable=False,
-            tooltip="",
-            allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+        consumer.add_parameter(
+            Parameter(
+                name="kept",
+                input_types=["Latent"],
+                serializable=False,
+                tooltip="",
+                allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+            )
         )
-        consumer.add_parameter(keeper)
         producer.parameter_output_values["latent"] = Held("latent")
         key = _egress(producer)["latent"]
         consumer.set_parameter_value("kept", key)
 
         engine.handle_request(DeleteNodeRequest(node_name="Producer"))
 
-        assert producer.released == []
+        assert producer.released == ["latent"]
         assert consumer.parameter_values["kept"] == key
-        assert consumer.get_parameter_value("kept").label == "latent"
+        with pytest.raises(RuntimeError, match="no longer available"):
+            consumer.get_parameter_value("kept")
 
     def test_the_object_goes_when_nothing_refers_to_the_key(self, engine: Engine, flow_name: str) -> None:
         producer = _add(engine, _Producer(name="Producer"), flow_name)
@@ -270,13 +267,16 @@ class TestTheProducerIsDeleted:
         assert producer.released == ["latent"]
         assert not _is_held(engine, key)
 
-    def test_the_object_goes_once_the_last_consumer_has_gone_too(self, engine: Engine, graph: tuple) -> None:
+    def test_deleting_the_consumer_first_changes_nothing_about_the_object(self, engine: Engine, graph: tuple) -> None:
+        """A consumer owns nothing, so its deletion releases nothing; the producer's deletion does."""
         producer, consumer = graph
-        _produce(producer, consumer, "latent")
+        key = _produce(producer, consumer, "latent")
 
         engine.handle_request(DeleteNodeRequest(node_name="Consumer"))
-        engine.handle_request(DeleteNodeRequest(node_name="Producer"))
+        assert producer.released == []
+        assert _is_held(engine, key)
 
+        engine.handle_request(DeleteNodeRequest(node_name="Producer"))
         assert producer.released == ["latent"]
 
     def test_deleting_a_node_holding_nothing_releases_nothing(self, engine: Engine, flow_name: str) -> None:
@@ -501,123 +501,6 @@ class TestARelayDoesNotReleaseItsUpstream:
         still_held = producer.local_objects.get(upstream_key)
         assert still_held is not None
         assert still_held.label == "upstream"
-
-
-class TestReferencesTheScanMustSee:
-    """What counts as "something still refers to this key", beyond a bare value on another node."""
-
-    def test_a_bystander_holding_a_list_value_does_not_break_the_delete(self, engine: Engine, flow_name: str) -> None:
-        """List and dict parameter values are everywhere, and comparing sets of them raises.
-
-        Without this the artist cannot delete any node in a graph that has one.
-        """
-        producer = _add(engine, _Producer(name="Producer"), flow_name)
-        bystander = _add(engine, _Consumer(name="Bystander"), flow_name)
-        bystander.add_parameter(Parameter(name="tags", input_types=["list"], tooltip=""))
-        bystander.set_parameter_value("tags", ["a", "b"])
-        producer.parameter_output_values["latent"] = Held("latent")
-        _egress(producer)
-
-        result = engine.handle_request(DeleteNodeRequest(node_name="Producer"))
-
-        assert isinstance(result, DeleteNodeResultSuccess)
-        assert producer.released == ["latent"]
-
-    def test_a_key_inside_a_list_value_still_counts_as_a_reference(self, engine: Engine, flow_name: str) -> None:
-        """A ParameterList consumer holds `[key]`, not `key`, and that object is just as live."""
-        producer = _add(engine, _Producer(name="Producer"), flow_name)
-        consumer = _add(engine, _Consumer(name="Consumer"), flow_name)
-        consumer.add_parameter(Parameter(name="latents", input_types=["list"], tooltip=""))
-        producer.parameter_output_values["latent"] = Held("latent")
-        key = _egress(producer)["latent"]
-        consumer.set_parameter_value("latents", [key])
-
-        engine.handle_request(DeleteNodeRequest(node_name="Producer"))
-
-        assert producer.released == []
-        assert _is_held(engine, key)
-
-    def test_a_key_inside_a_dict_value_still_counts_as_a_reference(self, engine: Engine, flow_name: str) -> None:
-        producer = _add(engine, _Producer(name="Producer"), flow_name)
-        consumer = _add(engine, _Consumer(name="Consumer"), flow_name)
-        consumer.add_parameter(Parameter(name="bundle", input_types=["dict"], tooltip=""))
-        producer.parameter_output_values["latent"] = Held("latent")
-        key = _egress(producer)["latent"]
-        consumer.set_parameter_value("bundle", {"latent": key})
-
-        engine.handle_request(DeleteNodeRequest(node_name="Producer"))
-
-        assert producer.released == []
-        assert _is_held(engine, key)
-
-    def test_an_undeclared_consumer_is_still_the_last_reference(self, engine: Engine, flow_name: str) -> None:
-        """The normal consumer shape: only the producer declares the flag, so the consumer declares nothing.
-
-        Gating candidate collection on the consumer's own declaration meant deleting the last thing
-        referring to an object released nothing, and it waited for workflow teardown.
-        """
-        producer = _add(engine, _Producer(name="Producer"), flow_name)
-        consumer = _add(engine, _Consumer(name="Consumer"), flow_name)
-        consumer.add_parameter(
-            Parameter(
-                name="plain",
-                input_types=["Latent"],
-                tooltip="",
-                allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
-            )
-        )
-        producer.parameter_output_values["latent"] = Held("latent")
-        key = _egress(producer)["latent"]
-        consumer.set_parameter_value("plain", key)
-        engine.handle_request(DeleteNodeRequest(node_name="Producer"))
-        assert _is_held(engine, key)
-
-        engine.handle_request(DeleteNodeRequest(node_name="Consumer"))
-
-        assert not _is_held(engine, key)
-
-    def test_a_key_nested_in_a_consumers_list_value_is_still_collected(self, engine: Engine, flow_name: str) -> None:
-        """A ParameterList consumer holds `[key]`, so a scan that only looks at the value itself misses it."""
-        producer = _add(engine, _Producer(name="Producer"), flow_name)
-        consumer = _add(engine, _Consumer(name="Consumer"), flow_name)
-        consumer.add_parameter(Parameter(name="rows", input_types=["list"], tooltip=""))
-        producer.parameter_output_values["latent"] = Held("latent")
-        key = _egress(producer)["latent"]
-        consumer.set_parameter_value("rows", [key])
-        engine.handle_request(DeleteNodeRequest(node_name="Producer"))
-        assert _is_held(engine, key)
-
-        engine.handle_request(DeleteNodeRequest(node_name="Consumer"))
-
-        assert not _is_held(engine, key)
-
-    def test_deleting_the_last_consumer_releases_what_only_it_held(self, engine: Engine, flow_name: str) -> None:
-        """A PROPERTY consumer keeps its copy after its producer goes, and is then the only reference.
-
-        Harvesting only outputs would leave a multi-gigabyte object resident with nothing able to name it.
-        """
-        producer = _add(engine, _Producer(name="Producer"), flow_name)
-        consumer = _add(engine, _Consumer(name="Consumer"), flow_name)
-        released: list[str] = []
-        consumer.add_parameter(
-            Parameter(
-                name="kept",
-                input_types=["Latent"],
-                serializable=False,
-                tooltip="",
-                allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
-                on_local_object_drop=lambda value: released.append(value.label),
-            )
-        )
-        producer.parameter_output_values["latent"] = Held("latent")
-        key = _egress(producer)["latent"]
-        consumer.set_parameter_value("kept", key)
-        engine.handle_request(DeleteNodeRequest(node_name="Producer"))
-        assert _is_held(engine, key)
-
-        engine.handle_request(DeleteNodeRequest(node_name="Consumer"))
-
-        assert not _is_held(engine, key)
 
 
 class TestALibraryKeyIsNotTheEnginesToRelease:
@@ -1036,4 +919,4 @@ class TestANonSerializableContainer:
         node.parameter_output_values["latents"] = batch
 
         assert node.parameter_output_values["latents"] is batch
-        assert engine.node_manager._unreferenced_handle_keys(node) == []
+        assert engine.node_manager._cached_objects_owned_by(node) == []
