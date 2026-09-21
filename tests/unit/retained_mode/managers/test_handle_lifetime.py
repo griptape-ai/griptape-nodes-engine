@@ -156,11 +156,20 @@ def _egress(node: BaseNode) -> dict:
 
 
 def _produce(producer: _Producer, consumer: _Consumer, label: str) -> str:
-    """Run the producer once and deliver both values to the consumer across a process boundary."""
+    """Run the producer in its worker and land the result on the orchestrator, as NodeExecutor does.
+
+    Node deletion only ever happens on the orchestrator, and there the producer's own dict holds the key
+    its worker sent back -- `NodeExecutor.execute` copies the result onto the live node. Leaving the object
+    in the producer's dict here would model a process that does not exist, and the release scan would need
+    extra machinery to compensate for it.
+    """
     producer.parameter_output_values["latent"] = Held(label)
     producer.parameter_output_values["steps"] = _STEPS
     sent = _egress(producer)
     key = sent["latent"]
+    producer.parameter_output_values.silent_clear()
+    for name, value in sent.items():
+        producer.parameter_output_values[name] = value
     consumer.set_parameter_value("latent", key)
     consumer.set_parameter_value("steps", sent["steps"])
     return key
@@ -851,10 +860,15 @@ class TestBatchTeardownIsOncePerObject:
         shared = Held("shared")
         for key in ("a", "b"):
             manager.put_local_object(
-                shared, owner=_owner(engine), source="S", key=key, on_drop=lambda value: released.append(value.label)
+                shared,
+                owner=_owner(engine),
+                source="S",
+                key=key,
+                library="Lib",
+                on_drop=lambda value: released.append(value.label),
             )
 
-        manager.drop_objects_for_owner(_owner(engine))
+        manager.drop_objects_for_library("Lib")
 
         assert released == ["shared"]
 

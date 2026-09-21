@@ -439,21 +439,6 @@ class ResourceManager(EngineScoped):
                 if entry.owner == owner and entry.source == source and entry.slot is not None
             ]
 
-    def source_of(self, key: Any) -> str | None:
-        """Which source parked `key`, or None if nothing here holds it.
-
-        Ownership of a held object sits in this record rather than in any parameter value: since parking
-        happens on the way out of the process, the producing node's own dicts still hold the object, so
-        scanning parameter values cannot tell that it is still owned.
-        """
-        if not isinstance(key, str):
-            return None
-        with self._local_objects_lock:
-            entry = self._local_objects.get(key)
-        if entry is None:
-            return None
-        return entry.source
-
     def key_held_in_slot(self, *, owner: str, source: str, slot: str, value: Any) -> str | None:
         """The key this slot already holds `value` under, or None.
 
@@ -678,28 +663,12 @@ class ResourceManager(EngineScoped):
             doomed = {key: entry for key, entry in self._local_objects.items() if entry.library == library}
             for key in doomed:
                 del self._local_objects[key]
-
-        self._invoke_hooks_once_per_object(doomed)
-        return len(doomed)
-
-    def drop_objects_for_owner(self, owner: str) -> int:
-        """Release everything one owner is holding, returning how many entries went.
-
-        For an owner clearing its own cache, and for library reload, where code that built an object is
-        being replaced.
-        """
-        with self._local_objects_lock:
-            doomed = {key: entry for key, entry in self._local_objects.items() if entry.owner == owner}
-            for key in doomed:
-                del self._local_objects[key]
-            # Another owner's entry may hold the same object -- two libraries sharing a namespace-adjacent
-            # cache -- and this sweep must not tear down what it left behind.
+            # A co-tenant may hold the same object: they share this worker's cache deliberately, so a
+            # library unloading must not tear down what another one is still handing out.
             to_release = {key: entry for key, entry in doomed.items() if not self._value_still_held_locked(entry.value)}
 
         self._invoke_hooks_once_per_object(to_release)
         return len(doomed)
-
-    # Private Implementation Methods
 
     def _value_still_held(self, value: Any) -> bool:
         """Whether any current entry holds this very object."""

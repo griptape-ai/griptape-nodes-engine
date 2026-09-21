@@ -3206,8 +3206,9 @@ class NodeManager(EngineScoped):
         # the last holder released nothing at all. The same walk the save guard uses, so a key nested in a
         # container's list is collected rather than missed.
         #
-        # Over-collecting is safe and deliberate: `live_sources` below drops anything a surviving node
-        # still owns, and `_keys_referenced_by` drops anything another node still carries.
+        # Over-collecting is safe: `_keys_referenced_by` below drops anything another node still carries,
+        # and on the orchestrator -- the only process that deletes nodes -- a producer's own dict holds the
+        # key it was handed back, so it protects its own objects the same way a consumer does.
         for source in (node.parameter_output_values, node.parameter_values):
             # Snapshot: node bodies write outputs from worker threads.
             for value in list(source.values()):
@@ -3220,18 +3221,6 @@ class NodeManager(EngineScoped):
                 owner=node.local_objects.owner, source=node.metadata["local_object_source"]
             )
         )
-        if not candidates:
-            return []
-        # An object's owner is the store's record, never a parameter value. Parking happens on the way out
-        # of the process, so the producing node's own dict still holds the object rather than its key, and
-        # the value sweep below cannot see that the object is still owned. Deleting a consumer that kept a
-        # copy of the key would otherwise free what its producer made.
-        live_sources = {
-            str(other.metadata["local_object_source"])
-            for name, other in self.engine.object_manager.get_filtered_subset(type=BaseNode).items()
-            if name != node.name and "local_object_source" in other.metadata
-        }
-        candidates = {key for key in candidates if self.engine.resource_manager.source_of(key) not in live_sources}
         if not candidates:
             return []
         for name, other in self.engine.object_manager.get_filtered_subset(type=BaseNode).items():

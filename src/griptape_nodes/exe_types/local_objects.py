@@ -236,10 +236,6 @@ class LocalObjectScope:
         """
         return self._resolve_within(value, parameter_name=parameter_name, node_name=node_name, memo={})
 
-    def source_of(self, key: Any) -> str | None:
-        """Which node parked `key`, or None if nothing here holds it."""
-        return self._manager().source_of(key)
-
     def key_held_in_slot(self, slot: str, value: Any) -> str | None:
         """The key this node already holds `value` under in `slot`, or None."""
         return self._manager().key_held_in_slot(owner=self.owner, source=self._source, slot=slot, value=value)

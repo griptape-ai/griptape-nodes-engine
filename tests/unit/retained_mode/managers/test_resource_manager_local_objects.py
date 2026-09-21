@@ -65,7 +65,7 @@ class TestPutAndGet:
         manager = engine.resource_manager
         held = Held("pipeline")
 
-        key = manager.put_local_object(held, owner="Lib A", source="Builder", key="Builder-slot")
+        key = manager.put_local_object(held, owner="Lib A", library="Lib A", source="Builder", key="Builder-slot")
 
         assert manager.get_local_object(key, owner="Lib A") is held
 
@@ -78,8 +78,8 @@ class TestPutAndGet:
         a = Held("a")
         b = Held("b")
 
-        key_a = manager.put_local_object(a, owner="Lib A", source="N", key="same-hash")
-        key_b = manager.put_local_object(b, owner="Lib B", source="N", key="same-hash")
+        key_a = manager.put_local_object(a, owner="Lib A", library="Lib A", source="N", key="same-hash")
+        key_b = manager.put_local_object(b, owner="Lib B", library="Lib B", source="N", key="same-hash")
 
         assert key_a != key_b
         assert manager.get_local_object(key_a, owner="Lib A") is a
@@ -88,7 +88,7 @@ class TestPutAndGet:
     def test_reading_another_library_s_key_misses(self, engine: Engine) -> None:
         """An unscoped read here would work only while both libraries happened to share a process."""
         manager = engine.resource_manager
-        key = manager.put_local_object(Held("theirs"), owner="Lib A", source="N", key="N-slot")
+        key = manager.put_local_object(Held("theirs"), owner="Lib A", library="Lib A", source="N", key="N-slot")
 
         assert manager.get_local_object(key, owner="Lib B") is None
         assert manager.get_local_object(key, owner="Lib A") is not None
@@ -99,8 +99,8 @@ class TestPutAndGet:
         first = Held("first")
         second = Held("second")
 
-        key = manager.put_local_object(first, owner="Lib A", source="N", key="cfg")
-        again = manager.put_local_object(second, owner="Lib A", source="N", key="cfg")
+        key = manager.put_local_object(first, owner="Lib A", library="Lib A", source="N", key="cfg")
+        again = manager.put_local_object(second, owner="Lib A", library="Lib A", source="N", key="cfg")
 
         assert again == key
         assert manager.get_local_object(key, owner="Lib A") is second
@@ -113,11 +113,12 @@ class TestPutAndGet:
         manager.put_local_object(
             Held("first"),
             owner="Lib A",
+            library="Lib A",
             source="N",
             key="cfg",
             on_drop=lambda value: released.append(value.label),
         )
-        manager.put_local_object(Held("second"), owner="Lib A", source="N", key="cfg")
+        manager.put_local_object(Held("second"), owner="Lib A", library="Lib A", source="N", key="cfg")
 
         assert released == ["first"]
 
@@ -130,6 +131,7 @@ class TestPutAndGet:
         key = manager.put_local_object(
             held,
             owner="Lib A",
+            library="Lib A",
             source="N",
             key="cfg",
             on_drop=lambda value: released.append(value.label),
@@ -137,6 +139,7 @@ class TestPutAndGet:
         manager.put_local_object(
             held,
             owner="Lib A",
+            library="Lib A",
             source="N",
             key="cfg",
             on_drop=lambda value: released.append(value.label),
@@ -152,6 +155,7 @@ class TestPutAndGet:
         manager.put_local_object(
             Held("only"),
             owner="Lib A",
+            library="Lib A",
             source="N",
             key="cfg",
             on_drop=lambda value: released.append(value.label),
@@ -163,8 +167,8 @@ class TestPutAndGet:
         """Residency scales with producing nodes, not with runs: two nodes coexist, one node twice does not."""
         manager = engine.resource_manager
 
-        first = manager.put_local_object(Held("a"), owner="Lib A", source="Node A", key="Node A-slot")
-        second = manager.put_local_object(Held("b"), owner="Lib A", source="Node B", key="Node B-slot")
+        first = manager.put_local_object(Held("a"), owner="Lib A", library="Lib A", source="Node A", key="Node A-slot")
+        second = manager.put_local_object(Held("b"), owner="Lib A", library="Lib A", source="Node B", key="Node B-slot")
 
         assert first != second
         assert manager.get_local_object(first, owner="Lib A") is not None
@@ -174,7 +178,7 @@ class TestPutAndGet:
 class TestDrop:
     def test_drop_removes_and_reports(self, engine: Engine) -> None:
         manager = engine.resource_manager
-        key = manager.put_local_object(Held("x"), owner="Lib A", source="N", key="N-slot")
+        key = manager.put_local_object(Held("x"), owner="Lib A", library="Lib A", source="N", key="N-slot")
 
         assert manager.drop_local_object(key) is True
         assert manager.get_local_object(key, owner="Lib A") is None
@@ -189,6 +193,7 @@ class TestDrop:
         key = manager.put_local_object(
             held,
             owner="Lib A",
+            library="Lib A",
             source="N",
             key="N-slot",
             on_drop=lambda value: released.append(value.label),
@@ -204,6 +209,7 @@ class TestDrop:
         key = manager.put_local_object(
             Held("theirs"),
             owner="Lib A",
+            library="Lib A",
             source="N",
             key="N-slot",
             on_drop=lambda value: released.append(value.label),
@@ -215,7 +221,7 @@ class TestDrop:
 
     def test_owner_may_drop_its_own(self, engine: Engine) -> None:
         manager = engine.resource_manager
-        key = manager.put_local_object(Held("mine"), owner="Lib A", source="N", key="N-slot")
+        key = manager.put_local_object(Held("mine"), owner="Lib A", library="Lib A", source="N", key="N-slot")
 
         assert manager.drop_local_object(key, owner="Lib A") is True
 
@@ -231,7 +237,9 @@ class TestDrop:
             error = "teardown failed"
             raise RuntimeError(error)
 
-        key = manager.put_local_object(Held("x"), owner="Lib A", source="N", key="N-slot", on_drop=explode)
+        key = manager.put_local_object(
+            Held("x"), owner="Lib A", library="Lib A", source="N", key="N-slot", on_drop=explode
+        )
 
         assert manager.drop_local_object(key) is True
         assert manager.get_local_object(key, owner="Lib A") is None
@@ -240,10 +248,10 @@ class TestDrop:
 class TestDropForLibrary:
     def test_drops_only_that_library(self, engine: Engine) -> None:
         manager = engine.resource_manager
-        mine = manager.put_local_object(Held("mine"), owner="Lib A", source="N", key="N-slot")
-        theirs = manager.put_local_object(Held("theirs"), owner="Lib B", source="N", key="N-slot")
+        mine = manager.put_local_object(Held("mine"), owner="Lib A", library="Lib A", source="N", key="N-slot")
+        theirs = manager.put_local_object(Held("theirs"), owner="Lib B", library="Lib B", source="N", key="N-slot")
 
-        dropped = manager.drop_objects_for_owner("Lib A")
+        dropped = manager.drop_objects_for_library("Lib A")
 
         assert dropped == 1
         assert manager.get_local_object(mine, owner="Lib A") is None
@@ -256,14 +264,36 @@ class TestDropForLibrary:
             manager.put_local_object(
                 Held(label),
                 owner="Lib A",
+                library="Lib A",
                 source="N",
                 key="N-slot",
                 on_drop=lambda value: released.append(value.label),
             )
 
-        manager.drop_objects_for_owner("Lib A")
+        manager.drop_objects_for_library("Lib A")
 
         assert sorted(released) == ["one", "two"]
+
+    def test_a_co_tenants_copy_of_the_same_object_survives(self, engine: Engine) -> None:
+        """Libraries share this worker's cache on purpose, so two of them can hold one object.
+
+        Unloading one must not run the teardown on something the other is still handing out -- the hook is
+        how a library frees GPU memory, and doing it early hands the survivor a released object.
+        """
+        manager = engine.resource_manager
+        released: list[str] = []
+        shared = Held("shared")
+        mine = manager.put_local_object(
+            shared, owner="W", library="Lib A", source="N", key="a", on_drop=lambda value: released.append(value.label)
+        )
+        theirs = manager.put_local_object(shared, owner="W", library="Lib B", source="N", key="b")
+
+        dropped = manager.drop_objects_for_library("Lib A")
+
+        assert dropped == 1
+        assert manager.get_local_object(mine, owner="W") is None
+        assert manager.get_local_object(theirs, owner="W") is shared
+        assert released == []
 
     def test_one_raising_hook_does_not_strand_the_rest(self, engine: Engine) -> None:
         """A library reload clears many entries at once; one bad teardown must not abort the sweep."""
@@ -274,17 +304,20 @@ class TestDropForLibrary:
             error = "teardown failed"
             raise RuntimeError(error)
 
-        manager.put_local_object(Held("bad"), owner="Lib A", source="Node A", key="Node A-slot", on_drop=explode)
+        manager.put_local_object(
+            Held("bad"), owner="Lib A", library="Lib A", source="Node A", key="Node A-slot", on_drop=explode
+        )
         manager.put_local_object(
             Held("good"),
             owner="Lib A",
+            library="Lib A",
             source="Node B",
             key="Node B-slot",
             on_drop=lambda value: released.append(value.label),
         )
         entries_put = 2
 
-        dropped = manager.drop_objects_for_owner("Lib A")
+        dropped = manager.drop_objects_for_library("Lib A")
 
         assert dropped == entries_put
         assert released == ["good"]
@@ -295,7 +328,7 @@ class TestPresence:
         """One sentinel lookup leaves no window for a drop between a presence check and a read."""
         manager = engine.resource_manager
         missing = object()
-        key = manager.put_local_object(None, owner="Lib A", source="N", key="N-slot")
+        key = manager.put_local_object(None, owner="Lib A", library="Lib A", source="N", key="N-slot")
 
         assert manager.get_local_object(key, owner="Lib A", default=missing) is None
         assert manager.get_local_object("Lib A:gone", owner="Lib A", default=missing) is missing
@@ -312,7 +345,7 @@ class TestKeyDerivation:
         its own entry and rebuilds the model every execution.
         """
         manager = engine.resource_manager
-        put_key = manager.put_local_object(Held("x"), owner="Lib A", source="N", key="cfg")
+        put_key = manager.put_local_object(Held("x"), owner="Lib A", library="Lib A", source="N", key="cfg")
 
         assert manager.local_object_key("cfg", owner="Lib A") == put_key
 
@@ -325,6 +358,7 @@ class TestKeyDerivation:
             manager.put_local_object(
                 Held(label),
                 owner="Lib A",
+                library="Lib A",
                 source="Loader",
                 key="Loader-slot",
                 on_drop=lambda value: released.append(value.label),
@@ -342,7 +376,7 @@ class TestCapabilityMapIsSeparate:
         manager = engine.resource_manager
         before = len(manager._capability_instances)
 
-        manager.put_local_object(Held("x"), owner="Lib A", source="N", key="N-slot")
+        manager.put_local_object(Held("x"), owner="Lib A", library="Lib A", source="N", key="N-slot")
 
         assert len(manager._capability_instances) == before
 
@@ -481,6 +515,7 @@ class TestWorkflowStateClearReleasesObjects:
         manager.put_local_object(
             Held("x"),
             owner="Lib A",
+            library="Lib A",
             source="N",
             key="N-slot",
             on_drop=lambda value: released.append(value.label),
@@ -494,7 +529,7 @@ class TestWorkflowStateClearReleasesObjects:
     def test_a_refused_clear_releases_nothing(self, engine: Engine) -> None:
         """The guard rejects the request before any teardown, so objects must survive it."""
         manager = engine.resource_manager
-        key = manager.put_local_object(Held("x"), owner="Lib A", source="N", key="N-slot")
+        key = manager.put_local_object(Held("x"), owner="Lib A", library="Lib A", source="N", key="N-slot")
 
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=False))
 
@@ -529,7 +564,7 @@ class TestConcurrentAccess:
                 index = 0
                 while not stop.is_set():
                     manager.put_local_object(
-                        Held(str(index)), owner="Lib A", source=f"N{index % 20}", key=f"N{index % 20}"
+                        Held(str(index)), owner="Lib A", library="Lib A", source=f"N{index % 20}", key=f"N{index % 20}"
                     )
                     index += 1
             except Exception as exc:
@@ -538,7 +573,7 @@ class TestConcurrentAccess:
         def keep_clearing() -> None:
             try:
                 while not stop.is_set():
-                    manager.drop_objects_for_owner("Lib A")
+                    manager.drop_objects_for_library("Lib A")
             except Exception as exc:
                 errors.append(exc)
 
@@ -562,7 +597,9 @@ class TestConcurrentAccess:
             with release_lock:
                 released.append(value.label)
 
-        key = manager.put_local_object(Held("once"), owner="Lib A", source="N", key="N-slot", on_drop=record)
+        key = manager.put_local_object(
+            Held("once"), owner="Lib A", library="Lib A", source="N", key="N-slot", on_drop=record
+        )
         # The lookup and the delete are adjacent bytecodes, so no switch interval preempts between them
         # and an unsynchronized drop passes. Ordering the delete after a second read is what forces the
         # interleaving this test is about.
@@ -616,6 +653,7 @@ class TestReleaseKeyEverywhere:
         key = manager.put_local_object(
             Held("pipeline"),
             owner="Lib A",
+            library="Lib A",
             source="N",
             key="cfg",
             on_drop=lambda value: released.append(value.label),
