@@ -61,6 +61,9 @@ profiling = ["austin-dist>=3.7.0"]
 [dependency-groups]
 dev = [
   "griptape-cloud-client",
+  # Markdown: the toc extension's slugify, so scripts/generate_settings_reference.py anchors
+  # match the heading ids mkdocs renders.
+  "markdown>=3.5",
   "mdformat>=0.7.22",
   "mdformat-gfm>=0.4.1",
   "mdformat-frontmatter>=2.0.8",

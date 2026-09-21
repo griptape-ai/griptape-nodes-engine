@@ -21,12 +21,12 @@ dotted key of its own, so it gets a table under Entry Types, linked from the set
 """
 
 import json
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 import mdformat
+from markdown.extensions.toc import slugify
 
 from griptape_nodes.retained_mode.managers.settings import Settings
 
@@ -297,12 +297,9 @@ def _ref_type_label(ref: str, defs: dict) -> str:
 
 def _entry_type_link(ref: str, defs: dict) -> str:
     title = _entry_type_title(ref, defs)
-    return f"[{title}](#{_slugify(title)})"
-
-
-def _slugify(title: str) -> str:
-    """The heading anchor mkdocs derives from a title: lowercased, non-word runs hyphenated."""
-    return re.sub(r"[^\w]+", "-", title.lower()).strip("-")
+    # The same slugify markdown's toc extension uses for heading ids, so the anchor cannot drift
+    # from the heading it points at.
+    return f"[{title}](#{slugify(title, '-')})"
 
 
 def _entry_type_title(ref: str, defs: dict) -> str:
@@ -391,14 +388,13 @@ def _enum_label(values: list) -> str:
 
 
 def _any_of_label(any_of: list, defs: dict) -> str:
-    labels = []
-    for option in any_of:
-        if option.get("type") == "null":
-            continue
-        labels.append(_grouped_type_label(option, defs))
-    if not labels:
+    options = [option for option in any_of if option.get("type") != "null"]
+    if not options:
         return "any"
-    return " or ".join(labels)
+    # One member needs no grouping: there is nothing for its label to run together with.
+    if len(options) == 1:
+        return _resolve_type_label(options[0], defs)
+    return " or ".join(_grouped_type_label(option, defs) for option in options)
 
 
 def _grouped_type_label(prop: dict, defs: dict) -> str:
@@ -414,9 +410,16 @@ def _grouped_type_label(prop: dict, defs: dict) -> str:
 
 
 def _is_composite(prop: dict, defs: dict) -> bool:
-    """True when a property's label reads as more than one word, i.e. a union or an array."""
+    """True when a property's label reads as more than one token: a union, array, enum, or const."""
+    if "enum" in prop or "const" in prop:
+        return True
     if prop.get("type") == "array":
         return True
+
+    ref = _extract_ref(prop)
+    if ref is not None:
+        return "enum" in defs.get(ref, {})
+
     options = [option for option in prop.get("anyOf", []) if option.get("type") != "null"]
     if len(options) > 1:
         return True

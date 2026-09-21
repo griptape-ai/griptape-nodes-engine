@@ -627,6 +627,7 @@ profiling = [
 [package.dev-dependencies]
 dev = [
     { name = "griptape-cloud-client" },
+    { name = "markdown" },
     { name = "mdformat" },
     { name = "mdformat-footnote" },
     { name = "mdformat-frontmatter" },
@@ -696,6 +697,7 @@ provides-extras = ["profiling"]
 [package.metadata.requires-dev]
 dev = [
     { name = "griptape-cloud-client", git = "https://github.com/griptape-ai/griptape-cloud-python-client?rev=main" },
+    { name = "markdown", specifier = ">=3.5" },
     { name = "mdformat", specifier = ">=0.7.22" },
     { name = "mdformat-footnote", specifier = ">=0.1.1" },
     { name = "mdformat-frontmatter", specifier = ">=2.0.8" },
