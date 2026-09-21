@@ -767,6 +767,31 @@ class TestParseFileUri:
         result = parse_file_uri(uri)
         assert result == "//server/share/file with spaces.txt"
 
+    def test_parses_unc_host_only_no_path(self) -> None:
+        """A UNC host with no path component still parses (no trailing slash)."""
+        uri = "file://server"
+        result = parse_file_uri(uri)
+        assert result == "//server"
+
+    def test_parses_unc_host_with_trailing_slash(self) -> None:
+        """A UNC host with a trailing slash and no share still parses."""
+        uri = "file://server/"
+        result = parse_file_uri(uri)
+        assert result == "//server/"
+
+    def test_parses_unc_host_preserves_case(self) -> None:
+        """UNC host and path casing is preserved, unlike the localhost check."""
+        uri = "file://Server/Share/File.txt"
+        result = parse_file_uri(uri)
+        assert result == "//Server/Share/File.txt"
+
+    def test_unc_result_is_not_classified_as_url(self) -> None:
+        """A parsed UNC path must not be re-classified as a URL by is_url()."""
+        uri = "file://server/share/render.exr"
+        result = parse_file_uri(uri)
+        assert result is not None
+        assert is_url(result) is False
+
     def test_rejects_non_file_scheme(self) -> None:
         """Test that non-file:// URIs are rejected."""
         uri = "http://example.com/file.txt"
