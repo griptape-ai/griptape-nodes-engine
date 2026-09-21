@@ -3543,6 +3543,24 @@ class NodeManager(EngineScoped):
             if dropped:
                 logger.debug("Released %d held object(s) deferred while '%s' was running.", dropped, node.name)
 
+    @staticmethod
+    def _resolve_cached_inputs_in_place(node: BaseNode) -> None:
+        """Swap each reference in the node's input values for the object it stands for, where held here.
+
+        So a node body reading `self.parameter_values[name]` directly gets what `get_parameter_value` would
+        give it. Authors do read that dict -- hydration already materialises defaults into it for the same
+        reason -- and a reference sitting there hands them something that is not their object.
+
+        Written straight into the dict rather than through `set_parameter_value`: nothing changed as far as
+        the graph is concerned, and the setter would emit a lifecycle event carrying the live object where
+        the reference is what the editor should see. A reference this process cannot resolve is left as it
+        is, which is both what has to travel onward and what keeps the orchestrator-local path unaffected.
+        """
+        for param_name, stored in list(node.parameter_values.items()):
+            resolved = node.local_objects.resolve_what_is_here(stored)
+            if resolved is not stored:
+                node.parameter_values[param_name] = resolved
+
     async def _hydrate_and_run_node_inner(self, node: BaseNode, request: ExecuteNodeRequest) -> ResultPayload:
         node_name = request.node_name
         # The node-execution scope only has meaning on a worker: it is what
@@ -3586,6 +3604,7 @@ class NodeManager(EngineScoped):
                 if param.default_value is None:
                     continue
                 node.parameter_values[param.name] = param.default_value
+            self._resolve_cached_inputs_in_place(node)
             try:
                 with aprocess_scope(request.variables):
                     await node.aprocess()

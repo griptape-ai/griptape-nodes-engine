@@ -11,7 +11,12 @@ from griptape.artifacts import TextArtifact
 from griptape.drivers.prompt.openai import OpenAiChatPromptDriver
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterList, ParameterMode
-from griptape_nodes.exe_types.local_objects import cache_outputs_for_egress, caches_its_values, is_reference
+from griptape_nodes.exe_types.local_objects import (
+    cache_outputs_for_egress,
+    caches_its_values,
+    is_reference,
+    make_reference,
+)
 from griptape_nodes.exe_types.node_types import BaseNode
 
 _STEPS = 30
@@ -414,3 +419,37 @@ class TestReleasingWhileANodeRuns:
         node.local_objects.put(Pipeline("second"), key="cfg")
 
         assert released == ["first"]
+
+
+class TestReadingTheDictDirectly:
+    """A node body that indexes `parameter_values` gets the object, not the reference standing for it.
+
+    Authors do read that dict directly -- hydration already materialises defaults into it for exactly that
+    reason -- so a reference sitting there would hand them something that is not their object.
+    """
+
+    def test_a_held_reference_becomes_the_object(self) -> None:
+        producer = _node()
+        pipeline = Pipeline("flux")
+        producer.parameter_output_values["pipeline"] = pipeline
+        reference = _send(producer)["pipeline"]
+
+        consumer = _node(name="Generate")
+        consumer.parameter_values["steps"] = reference
+
+        resolved = consumer.local_objects.resolve_what_is_here(consumer.parameter_values["steps"])
+
+        assert resolved is pipeline
+
+    def test_a_reference_from_another_process_is_left_alone(self) -> None:
+        """The orchestrator cannot resolve one and still has to send it onward, so it must survive."""
+        node = _node()
+        elsewhere = make_reference(worker="another-worker", key="P@abc12345.pipe#deadbeef")
+
+        assert node.local_objects.resolve_what_is_here(elsewhere) is elsewhere
+
+    def test_nothing_else_is_disturbed(self) -> None:
+        node = _node()
+        stored = ["a", 1, {"b": None}]
+
+        assert node.local_objects.resolve_what_is_here(stored) is stored

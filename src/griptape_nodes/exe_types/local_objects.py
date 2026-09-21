@@ -295,6 +295,23 @@ class LocalObjectScope:
 
         return substitute_leaves(value, resolve)
 
+    def resolve_what_is_here(self, value: Any) -> Any:
+        """`value` with every reference this process holds replaced by its object, leaving the rest alone.
+
+        The lenient counterpart to `resolve_if_held`, which raises for a reference it cannot honour. For
+        filling a node's own `parameter_values` so a body reading that dict directly sees what
+        `get_parameter_value` would give it. A reference held in another process stays a reference, because
+        it is still what has to travel onward.
+        """
+
+        def resolve(leaf: Any) -> Any:
+            lookup = self.look_up(leaf)
+            if lookup.verdict is KeyVerdict.HELD:
+                return lookup.value
+            return leaf
+
+        return substitute_leaves(value, resolve)
+
     def key_held_in_slot(self, slot: str, value: Any) -> str | None:
         """The key this node already holds `value` under in `slot`, or None."""
         return self._manager().key_held_in_slot(owner=self.owner, source=self._source, slot=slot, value=value)
