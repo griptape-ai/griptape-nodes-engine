@@ -3,14 +3,11 @@
 Holds no state: the project chain is read from the project manager per request, so a project
 switch between two calls shows up on the second. No network call, no credential, no enforcement.
 
-**Nothing here judges a value.** Ids travel exactly as stored and the far end decides what to
-do with them, because the Cloud reports every degradation it applies, where a value the engine
-rewrote would arrive looking intact.
+Project ids travel exactly as stored -- unstripped, uncut, never repaired.
 
-Keeping the header out of logs and broadcasts is a convention, not an invariant:
-`broadcast_result` is a field any caller can flip, post-dispatch hooks see the full result, and
-worker forwarding puts the Success payload on the response topic by construction. What this
-module can do it does -- `header_value` never reaches `result_details`, which is logged.
+The header value stays out of `result_details`, which is logged. That is all this module can do
+about disclosure: `broadcast_result` is a field any caller can flip, post-dispatch hooks see the
+full result, and worker forwarding puts the Success payload on the response topic.
 """
 
 from __future__ import annotations
@@ -40,11 +37,7 @@ logger = logging.getLogger("griptape_nodes")
 def _build_attribution_payload(project_chain: list[str]) -> dict[str, Any]:
     """Build the decoded payload for a project chain, which may be empty.
 
-    `project` is the only key the Cloud matches budgets against, and `tags` the only namespace
-    its parser reads, so nothing else is sent.
-
-    An empty chain omits `tags`, and the bare `{"v": 1}` still goes out. The far end cannot tell
-    that from no header at all, so it travels for forward-compatibility, not as a signal.
+    An empty chain omits `tags` and the bare `{"v": 1}` still goes out, for forward-compatibility.
     """
     if not project_chain:
         return {"v": ATTRIBUTION_SCHEMA_VERSION}
@@ -52,14 +45,11 @@ def _build_attribution_payload(project_chain: list[str]) -> dict[str, Any]:
 
 
 def _encode_attribution_payload(payload: dict[str, Any]) -> str | None:
-    """Encode a payload as base64url, or None when it cannot be encoded at all.
+    """Encode a payload as base64url with padding kept, or None when it cannot be encoded.
 
-    Size is not judged: an oversized header is discarded *and reported* by the Cloud, which beats
-    shrinking it here and having it arrive looking complete. Padding is kept; the parser re-pads.
-
-    A legacy project's id is the path to its file, and a path whose bytes are not valid UTF-8
-    carries lone surrogates from `surrogateescape` that `str.encode` refuses. That costs the whole
-    header: the wire cannot carry them, so there is no honest partial form.
+    A project id derived from a filesystem path whose bytes are not valid UTF-8 holds lone
+    surrogates that `str.encode` refuses. There is no partial form to fall back to, so the whole
+    header is given up.
 
     Returns None rather than raising, because a handler exception becomes a `GenericResultFailure`,
     which ignores `failure_log_level`. The traceback stays: `UnicodeEncodeError` names the
@@ -97,16 +87,13 @@ class BudgetManager(EngineScoped):
     ) -> GetAttributionContextResultSuccess | GetAttributionContextResultFailure:
         """Describe the current project as an encoded attribution header.
 
-        Both failures send no header at all rather than a bare `{"v": 1}`. The far end
-        cannot tell those apart, so this buys nothing on the wire: it is about the engine not
-        asserting a project state it does not know, and about the caller getting a Failure it can
-        act on instead of a Success carrying an empty chain. Neither blocks the call -- it is
+        Both failures send no header rather than a bare `{"v": 1}`, so the caller gets a Failure
+        it can act on instead of a Success carrying an empty chain. Neither blocks the call: it is
         about to spend money, and an unattributed call beats a blocked one.
 
         Both log at WARNING rather than the ERROR a bare `result_details` string would default to.
-        Neither condition clears on its own -- a legacy project keeps its unencodable id -- so an
-        ERROR would repeat once per metered call for something the artist cannot act on and that
-        did not stop the work.
+        Neither condition clears on its own, so an ERROR would repeat once per metered call for
+        something the artist cannot act on and that did not stop the work.
         """
         project_chain = self._resolve_project_chain()
         if project_chain is None:
@@ -146,18 +133,12 @@ class BudgetManager(EngineScoped):
     def _resolve_project_chain(self) -> list[str] | None:
         """Resolve the current project's ancestry as ids, leaf-first.
 
-        Returns None when the chain cannot be read and `[]` when no project is open. The two are
+        Returns None when the chain cannot be read and `[]` when no project is open; the two are
         different answers and must not collapse, for the reason the handler above gives.
 
-        Ids rather than names: an id survives a rename, where a name would re-point that project's
-        spend the moment a user edited it. It is not opaque, though -- usually a slug of the
-        project name, and the path to its file on a legacy project -- so this discloses roughly
-        what a name would, plus directory layout, in a header egress proxies log.
-
-        The `<system-defaults>` sentinel is skipped, matched on the stripped id because that is the
-        form the far end matches on. An id long enough that the far end's own cut leaves exactly
-        the reserved string is not caught here: that would mean mirroring a far-end constant, which
-        is the coupling this module deleted on purpose.
+        Ids rather than names, because an id survives a rename where a name would re-point that
+        project's spend. The `<system-defaults>` sentinel is not a project and is skipped, matched
+        on the stripped id.
         """
         try:
             chain = self.engine.project_manager.get_project_chain()

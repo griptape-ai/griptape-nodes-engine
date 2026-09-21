@@ -1,8 +1,8 @@
 """Events for budget attribution.
 
-Griptape Cloud holds no project model, so the engine is the only party that can say which
-project a credit-consuming call belongs to. These events hand a caller one ready-to-send header
-value. No network call, no credential, no enforcement.
+The engine is the only party that knows which project a credit-consuming call belongs to. These
+events hand a caller one ready-to-send header value. No network call, no credential, no
+enforcement.
 """
 
 from dataclasses import dataclass, field
@@ -24,14 +24,13 @@ ATTRIBUTION_SCHEMA_VERSION = 1
 class GetAttributionContextRequest(RequestPayload):
     """Describe the current project so an outbound call can be attributed to it.
 
-    The result carries project ids and no credential. Ids are still user-influenced -- usually a
-    slug of the project name, replaceable with any string, and a filesystem path on a project
-    created before ids existed -- and all of it is visible to an SSL-inspecting egress proxy.
+    The result carries project ids and no credential. Ids are user-influenced -- usually a slug
+    of the project name, replaceable with any string, and a filesystem path on a project created
+    before ids existed -- and all of it is visible to an SSL-inspecting egress proxy.
 
     Best-effort: nothing here raises, because the caller is about to spend money and an
     unattributed call beats a blocked one. A chain that cannot be read yields a Failure rather
-    than an empty chain -- an empty one would assert that no project is open, which is not
-    something the engine knows at that point.
+    than an empty chain, which would assert that no project is open.
 
     Use when: A node or driver is about to make a credit-consuming call and wants the spend
     attributed to the project the user is working in.
@@ -56,12 +55,8 @@ class GetAttributionContextResultSuccess(WorkflowNotAlteredMixin, ResultPayloadS
     """An attribution header value is available; attach it to the outbound request.
 
     `header_value` is `base64url(utf-8 JSON)` with padding kept, decoding to `{"v": 1}` when no
-    project is open and `{"v": 1, "tags": {"project": [...]}}` otherwise. `project` is the only
-    key the Cloud matches budgets against, and `tags` the only namespace its parser reads.
-
-    A missing `tags` reads at the far end exactly as no header at all, so the bare envelope is
-    sent for forward-compatibility rather than as a signal. `<system-defaults>` never travels, in
-    any padding: the Cloud reserves that string.
+    project is open and `{"v": 1, "tags": {"project": [...]}}` otherwise. The bare envelope is
+    sent for forward-compatibility rather than as a signal. `<system-defaults>` never travels.
 
     Args:
         header_value: The encoded header value to send
@@ -86,11 +81,9 @@ class GetAttributionContextResultFailure(WorkflowNotAlteredMixin, ResultPayloadF
     """No attribution header value could be produced; send no header and make the call anyway.
 
     Two causes, and both mean the engine cannot describe the spend truthfully. The project chain
-    could not be read, so whether a project is open is unknown. Or a project id cannot be encoded
-    at all: an id derived from a filesystem path whose bytes are not valid UTF-8 arrives holding
-    lone surrogates that the wire cannot carry.
+    could not be read, so whether a project is open is unknown. Or a project id derived from a
+    filesystem path whose bytes are not valid UTF-8 holds lone surrogates that cannot be encoded.
 
-    Sending nothing rather than `{"v": 1}` is about the engine not asserting a fact it does not
-    have; the far end reads the two identically, so it changes nothing there. Either way the
-    spend lands in the default budget, and the loss is visible only in the engine's log.
+    Sending nothing rather than `{"v": 1}` keeps the engine from asserting a fact it does not
+    have. The loss is visible only in the engine's log.
     """

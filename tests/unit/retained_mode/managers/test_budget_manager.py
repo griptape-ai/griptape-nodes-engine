@@ -1,8 +1,8 @@
 """Tests for BudgetManager.on_get_attribution_context_request.
 
 The attribution header is the one thing E1 produces, so most of these assert on the
-*decoded* payload rather than on the manager's internals: that dict is the contract the
-Cloud reads, and the Success payload's `project_chain` has to agree with it.
+*decoded* payload rather than on the manager's internals: that dict is the contract, and
+the Success payload's `project_chain` has to agree with it.
 """
 
 from __future__ import annotations
@@ -40,19 +40,19 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
 
 # The complete set of keys allowed on the wire. A new field must consciously update these,
-# which is the point: `project` is the only dimension Griptape Cloud matches budgets against,
-# so it is the only one the engine sends, and `BaseNode.name` must never appear under any key.
+# which is the point: `project` is the only dimension the engine sends, and `BaseNode.name`
+# must never appear under any key.
 ALLOWED_ENVELOPE_KEYS = {"v", "tags"}
 ALLOWED_TAG_KEYS = {"project"}
 
 
 def _decode(result: GetAttributionContextResultSuccess) -> dict[str, Any]:
-    """Decode a Success payload's header value back into the dict the Cloud will read."""
+    """Decode a Success payload's header value back into the dict that goes on the wire."""
     return json.loads(base64.urlsafe_b64decode(result.header_value))
 
 
 def _tags(result: GetAttributionContextResultSuccess) -> dict[str, Any]:
-    """The `tags` object the Cloud reads the project chain out of, or {} when none was sent."""
+    """The `tags` object carrying the project chain, or {} when none was sent."""
     return _decode(result).get("tags", {})
 
 
@@ -152,7 +152,7 @@ class TestAttributionPayloadShape:
         assert _tags(result).get("project", []) == result.project_chain
 
     def test_padding_round_trips(self, engine: Engine) -> None:
-        """Padding is kept so the Cloud can decode without re-padding."""
+        """Padding is kept so a decoder never has to re-pad."""
         result = engine.handle_request(GetAttributionContextRequest())
         assert isinstance(result, GetAttributionContextResultSuccess)
 
@@ -192,9 +192,9 @@ class TestAttributionPayloadShape:
     def test_a_chainless_envelope_is_still_sent(self, budget_manager: BudgetManager) -> None:
         """An empty chain is never a reason to withhold the header.
 
-        The envelope says nothing the far end can read today -- a bare `{"v": 1}` and an absent
-        header parse to equal objects -- so this pins the shape, not a signal. It is sent for
-        forward-compatibility: a `client_attributed` flag would make it one without a release.
+        A bare `{"v": 1}` carries nothing a reader can act on today, so this pins the shape,
+        not a signal. It is sent for forward-compatibility: a `client_attributed` flag would
+        make it one without a release.
         """
         result = _succeed(budget_manager)
 
@@ -219,12 +219,10 @@ class TestProjectChain:
         ["  <system-defaults>  ", "\t<system-defaults>", "<system-defaults>\n", " <system-defaults>"],
     )
     def test_a_padded_sentinel_copy_never_reaches_the_wire(self, padded: str) -> None:
-        """The far end strips before testing the reserved value, so a padded copy is the same claim.
+        """A padded copy of the sentinel is the same claim, so it is filtered on the stripped id.
 
-        Left whole it is dropped there rather than here, and a dropped entry promotes its parent
-        to leaf while `ENTRY_DROPPED` stays out of `mangled` -- so the short chain still matches
-        a budget and bills a real ancestor. The exact string cannot get this far (it is the
-        registry key for the rest state), but a padded one loads fine.
+        The exact string cannot get this far -- it is the registry key for the rest state -- but
+        a padded one loads fine.
         """
         mock_engine = _mock_engine()
         mock_engine.project_manager.get_project_chain.return_value = [
@@ -237,7 +235,7 @@ class TestProjectChain:
         assert result.project_chain == ["acme-studios-0b12d8"]
 
     def test_system_defaults_never_reaches_the_wire(self) -> None:
-        """The Cloud reserves `<system-defaults>` and counts a client copy as degraded."""
+        """`<system-defaults>` is the rest-state sentinel, not a project, and never travels."""
         project_manager = ProjectManager(Mock(), Mock(), Mock())
         result = _succeed(self._manager_on(project_manager))
 
@@ -288,12 +286,11 @@ class TestProjectChain:
             assert name not in result.header_value
 
     def test_a_chain_deeper_than_the_cloud_keeps_still_travels_whole(self) -> None:
-        """Depth is the Cloud's to judge, not ours -- and judging it here is what hides it.
+        """Depth is not the engine's to judge, and judging it here is what hides it.
 
-        Forty entries is past the parser's MAX_CHAIN_LENGTH of 32, so the Cloud truncates,
-        records CHAIN_TRUNCATED, and marks the chain mangled, which takes it out of budget
-        matching entirely. Cutting to 32 before sending would suppress all three: the chain
-        arrives looking intact and matches a budget written against the wrong root.
+        A chain long enough to be cut downstream is reported as cut. Cutting it here instead
+        would send a shortened chain that arrives looking intact, matching against the wrong
+        root with nothing recorded.
         """
         project_manager = ProjectManager(Mock(), Mock(), Mock())
         ids = [f"p{index:02d}" for index in range(40)]
@@ -313,9 +310,8 @@ class TestProjectChain:
 
         A project created before ids existed has the canonical path to its file written in as
         its id, so a deep chain of legacy projects is the longest header the engine can
-        plausibly produce. Thirty-two of them encode to roughly 4 KB -- inside the Cloud's own
-        raw-header cap and half of a default nginx header buffer -- so there is nothing here
-        worth shortening, and shortening it would arrive looking intact anyway.
+        plausibly produce. Thirty-two of them encode to roughly 4 KB -- half of a default nginx
+        header buffer -- so there is nothing here worth shortening.
         """
         project_manager = ProjectManager(Mock(), Mock(), Mock())
         ids = [f"/Users/alice/Documents/projects/acme/season-02/shot-{index:03d}/project.yml" for index in range(32)]
@@ -327,7 +323,7 @@ class TestProjectChain:
         result = _succeed(self._manager_on(project_manager))
 
         assert _tags(result)["project"] == ids
-        assert len(result.header_value) < 5632  # noqa: PLR2004 -- the Cloud's MAX_RAW_HEADER_LENGTH
+        assert len(result.header_value) < 4096  # noqa: PLR2004 -- half a default nginx header buffer
 
     def test_an_unregistered_parent_still_contributes_its_id(self) -> None:
         """The walk ends at an unregistered ancestor, but its id is a fact and travels.
@@ -335,7 +331,7 @@ class TestProjectChain:
         `get_project_chain` surfaces the id it could not resolve a template for and stops
         there. That id is what the parent is called everywhere else in the engine, so sending
         it is honest; deciding it is unmatchable and dropping the chain over it would be the
-        engine judging on the Cloud's behalf.
+        engine judging a value it does not own.
         """
         project_manager = ProjectManager(Mock(), Mock(), Mock())
         _register_project(project_manager, "shot-6", name="Shot 6", parent_id="swx")
@@ -375,13 +371,12 @@ class TestProjectChain:
 
 
 class TestValuesTravelVerbatim:
-    """Nothing here repairs an id. The Cloud reports what it had to repair; the engine does not.
+    """Nothing here repairs an id.
 
     An id has no enforced shape -- no pattern, no length cap -- so it can carry anything a user
-    typed or a filesystem produced. Every shape below is one the Cloud would strip, cut, or
-    refuse to store, and every one of them still goes out exactly as the project stores it:
-    a value repaired here arrives looking intact, which is the one thing the far end cannot
-    detect and the one outcome worse than no attribution.
+    typed or a filesystem produced. Every shape below goes out exactly as the project stores it.
+    A value repaired here arrives looking intact, which is the one degradation a reader cannot
+    detect, and the one outcome worse than no attribution.
     """
 
     def _manager_with(self, *ids: str) -> BudgetManager:
@@ -392,10 +387,10 @@ class TestValuesTravelVerbatim:
         return BudgetManager(MagicMock(), engine=mock_engine)
 
     def test_a_control_character_travels_unfiltered(self) -> None:
-        """The Cloud drops an entry it cannot store, promotes its parent to leaf, and reports it.
+        """An unstorable id is the reader's to reject, and the rejection is reported there.
 
-        Withholding the chain here would trade that reported drop for a silent absence, and
-        the engine cannot tell an id a user meant to type from one they pasted a newline into.
+        Withholding the chain here would trade a reported drop for a silent absence, and the
+        engine cannot tell an id a user meant to type from one they pasted a newline into.
         """
         result = _succeed(self._manager_with("acme\nstudios", "root"))
 
@@ -412,13 +407,12 @@ class TestValuesTravelVerbatim:
         assert _tags(result)["project"] == ["  season-02-a3f9c1  "]
         assert result.project_chain == ["  season-02-a3f9c1  "]
 
-    def test_an_id_past_the_clouds_value_cap_travels_uncut(self) -> None:
-        """Cutting is the far end's job, and doing it here would hide that it happened.
+    def test_a_very_long_id_travels_uncut(self) -> None:
+        """Cutting is not the engine's job, and doing it here would hide that it happened.
 
-        The Cloud truncates a value past its 256-character cap, marks the chain mangled, and
-        stops matching it against admin-authored paths. Pre-cutting hands it a prefix that
-        looks intact, so it matches -- and two sibling projects sharing their first 256
-        characters silently collapse onto one budget with nothing recorded.
+        A value cut downstream is reported as cut. Pre-cutting hands over a prefix that looks
+        intact, so two sibling projects sharing a long common prefix silently collapse onto one
+        budget with nothing recorded.
         """
         long_id = "s" * 300
         result = _succeed(self._manager_with(long_id, "root"))
@@ -468,9 +462,8 @@ class TestDegradation:
         """An unreadable chain is not the same fact as an empty one, and must not borrow it.
 
         `{"v": 1}` asserts that no project is open. A project manager that raised knows nothing
-        about whether one is. The far end reads the envelope and an absent header identically,
-        so nothing downstream moves either way -- what this pins is that the engine stops short
-        of the claim, and that the caller gets a Failure rather than an empty-chain Success.
+        about whether one is. What this pins is that the engine stops short of the claim, and
+        that the caller gets a Failure rather than an empty-chain Success.
         """
         mock_engine = _mock_engine()
         mock_engine.project_manager.get_project_chain.side_effect = RuntimeError("peer exploded")
