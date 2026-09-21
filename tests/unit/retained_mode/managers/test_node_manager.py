@@ -5,7 +5,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from griptape_nodes.exe_types.core_types import Parameter
+from griptape_nodes.exe_types.core_types import (
+    ControlParameter,
+    ControlParameterInput,
+    ControlParameterOutput,
+    Parameter,
+    ParameterMode,
+    ParameterTypeBuiltin,
+)
 from griptape_nodes.exe_types.node_types import BaseNode, NodeResolutionState
 from griptape_nodes.node_library.library_registry import LibraryRegistryError
 from griptape_nodes.retained_mode.engine import Engine
@@ -17,7 +24,11 @@ from griptape_nodes.retained_mode.events.node_events import (
     UnresolveNodeResultFailure,
     UnresolveNodeResultSuccess,
 )
-from griptape_nodes.retained_mode.events.parameter_events import AlterParameterDetailsRequest
+from griptape_nodes.retained_mode.events.parameter_events import (
+    AddParameterToNodeRequest,
+    AddParameterToNodeResultSuccess,
+    AlterParameterDetailsRequest,
+)
 
 
 class TestNodeManagerBatchSetNodeMetadata:
@@ -56,6 +67,41 @@ class TestNodeManagerBatchSetNodeMetadata:
         assert "Failed to update any nodes" in result_str
         assert "nonexistent_node1" in result_str
         assert "nonexistent_node2" in result_str
+
+
+class TestNodeManagerAddControlParameter:
+    """Control parameter requests must preserve the generic control shape and request options."""
+
+    def test_recreates_generic_control_parameter_with_request_options(self, engine: Engine) -> None:
+        """A two-way control request uses ControlParameter and keeps its serialized options."""
+        node = BaseNode(name="ControlParameterNode")
+        engine.object_manager.add_object_by_name(node.name, node)
+
+        result = engine.node_manager.on_add_parameter_to_node_request(
+            AddParameterToNodeRequest(
+                node_name=node.name,
+                parameter_name="bridge",
+                tooltip="A control bridge",
+                type=ParameterTypeBuiltin.CONTROL_TYPE.value,
+                ui_options={"display_name": "Bridge", "custom_option": "kept"},
+                mode_allowed_input=True,
+                mode_allowed_property=True,
+                mode_allowed_output=True,
+                settable=False,
+                allow_variable_substitution=False,
+            )
+        )
+
+        assert isinstance(result, AddParameterToNodeResultSuccess)
+        parameter = node.get_parameter_by_name("bridge")
+        assert isinstance(parameter, ControlParameter)
+        assert not isinstance(parameter, (ControlParameterInput, ControlParameterOutput))
+        assert parameter.allowed_modes == {ParameterMode.INPUT, ParameterMode.PROPERTY, ParameterMode.OUTPUT}
+        assert parameter.ui_options["display_name"] == "Bridge"
+        assert parameter.ui_options["custom_option"] == "kept"
+        assert parameter.ui_options["parameter_render_location"] == "top"
+        assert parameter.settable is False
+        assert parameter.allow_variable_substitution is False
 
 
 class TestNodeManagerResolutionStateSerialization:
