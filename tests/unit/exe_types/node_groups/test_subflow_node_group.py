@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 from unittest.mock import create_autospec
 
+from griptape_nodes.exe_types.core_types import ControlParameterInput, ControlParameterOutput, ParameterMode
 from griptape_nodes.exe_types.node_groups.subflow_node_group import SubflowNodeGroup
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
 
@@ -52,6 +53,15 @@ class TestSubflowNodeGroupCreateSubflow:
         # ...but the group must record the flow it ACTUALLY got back, not the requested name.
         assert group.metadata["subflow_name"] == "G_subflow_1"
 
+    def test_preserves_saved_proxy_side_metadata(self, engine: Engine) -> None:  # noqa: ARG002
+        group = _MiniSubflowGroup(
+            name="G",
+            metadata={"left_parameters": ["exec_in"], "right_parameters": ["exec_out"]},
+        )
+
+        assert group.metadata["left_parameters"] == ["group_exec_in", "exec_in"]
+        assert group.metadata["right_parameters"] == ["group_exec_out", "exec_out"]
+
 
 class TestGetAllNodes:
     """get_all_nodes has to reach the whole body, not just the first level down.
@@ -85,6 +95,50 @@ class TestGetAllNodes:
         group.nodes = {"only": _MiniSubflowGroup(name="only")}
 
         assert set(group.get_all_nodes()) == {"only"}
+
+
+class TestSubflowNodeGroupProxyParameters:
+    """Boundary proxies must remain control ports after request-handler reconstruction."""
+
+    def test_control_proxy_preserves_port_shape_and_bridge_modes(self, engine: Engine) -> None:
+        group = _MiniSubflowGroup(name="group")
+        engine.object_manager.add_object_by_name(group.name, group)
+
+        incoming_proxy = group._create_proxy_parameter_for_connection(
+            ControlParameterInput(name="upstream_exec"), is_incoming=True
+        )
+        outgoing_proxy = group._create_proxy_parameter_for_connection(
+            ControlParameterOutput(name="downstream_exec"), is_incoming=False
+        )
+
+        assert isinstance(incoming_proxy, ControlParameterInput)
+        assert isinstance(outgoing_proxy, ControlParameterOutput)
+        assert incoming_proxy.allowed_modes == {ParameterMode.INPUT, ParameterMode.OUTPUT}
+        assert outgoing_proxy.allowed_modes == {ParameterMode.INPUT, ParameterMode.OUTPUT}
+        assert ParameterMode.PROPERTY not in incoming_proxy.allowed_modes
+        assert ParameterMode.PROPERTY not in outgoing_proxy.allowed_modes
+
+    def test_control_port_serialization_preserves_directional_shape(self) -> None:
+        incoming = ControlParameterInput(name="exec_in")
+        outgoing = ControlParameterOutput(name="exec_out")
+
+        incoming_dict = incoming.to_dict()
+        outgoing_dict = outgoing.to_dict()
+
+        assert incoming_dict["input_types"] == ["parametercontroltype"]
+        assert incoming_dict["output_type"] is None
+        assert outgoing_dict["input_types"] is None
+        assert outgoing_dict["output_type"] == "parametercontroltype"
+
+    def test_proxy_accepts_control_parameters_without_a_tooltip(self, engine: Engine) -> None:
+        group = _MiniSubflowGroup(name="group")
+        engine.object_manager.add_object_by_name(group.name, group)
+
+        incoming = ControlParameterInput(name="exec_in", tooltip="")
+        proxy = group._create_proxy_parameter_for_connection(incoming, is_incoming=True)
+
+        assert isinstance(proxy, ControlParameterInput)
+        assert proxy.tooltip
 
 
 class _MiniSubflowGroup(SubflowNodeGroup):
