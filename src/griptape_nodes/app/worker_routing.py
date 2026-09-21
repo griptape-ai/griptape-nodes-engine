@@ -483,7 +483,7 @@ def register_broadcast_handlers(
     # await, not of who sent it. The staleness check must not be hoisted out of the lock: it reads
     # the generation the previous holder records.
     #
-    # TODO(https://github.com/griptape-ai/internal/issues/266): replace this and the generations
+    # TODO(griptape-ai/internal#266): replace this and the generations
     # with a single-consumer queue, which makes the ordering structural rather than a rule every
     # future caller has to remember.
     adoption_lock = asyncio.Lock()
