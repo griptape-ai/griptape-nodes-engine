@@ -47,13 +47,15 @@ LIBRARY_MANAGER_MODULE = "griptape_nodes.retained_mode.managers.library_manager"
 LIBRARY_NAME = "TestLib"
 
 
-def _library_info(library_path: Path) -> LibraryManager.LibraryInfo:
+def _library_info(
+    library_path: Path, *, is_sandbox: bool = False, library_name: str = LIBRARY_NAME
+) -> LibraryManager.LibraryInfo:
     return LibraryManager.LibraryInfo(
         lifecycle_state=LibraryManager.LibraryLifecycleState.LOADED,
         fitness=LibraryManager.LibraryFitness.GOOD,
         library_path=str(library_path),
-        is_sandbox=False,
-        library_name=LIBRARY_NAME,
+        is_sandbox=is_sandbox,
+        library_name=library_name,
         library_version="1.0.0",
     )
 
@@ -76,12 +78,12 @@ def _library(workflows: list[str] | None) -> Library:
     return Library(library_data=schema)
 
 
-def _workflow_header() -> str:
+def _workflow_header(name: str = "example") -> str:
     """The metadata header a workflow file needs before the engine will register it."""
     lines = [
         "# /// script",
         "# [tool.griptape-nodes]",
-        '# name = "example"',
+        f'# name = "{name}"',
         f'# schema_version = "{WorkflowMetadata.LATEST_SCHEMA_VERSION}"',
         '# engine_version_created_with = "0.0.0"',
         "# node_libraries_referenced = []",
@@ -715,6 +717,29 @@ class TestEveryMultiLibraryLoadIsBracketed:
         }
         assert library_manager._libraries_loading_complete.is_set()
 
+    @pytest.mark.asyncio
+    async def test_a_nested_bracket_keeps_the_gate_callers_are_already_waiting_on(self, engine: Engine) -> None:
+        """Brackets nest: `_run_reload_libraries` closes the gate, then boot's bracket sits inside it.
+
+        A gated query suspended before the inner bracket opened is waiting on that specific Event
+        object. Swapping in a fresh one on the inner close would leave it blocked for the life of
+        the process, because the matching `set()` would fire on a different object.
+        """
+        library_manager = engine.library_manager
+        library_manager._close_libraries_loading_gate()
+        gate_the_waiter_holds = library_manager._libraries_loading_complete
+
+        waiter = asyncio.create_task(gate_the_waiter_holds.wait())
+        await asyncio.sleep(0)
+        assert not waiter.done(), "the gate is closed, so the query should still be suspended"
+
+        with patch.object(library_manager, "register_workflows_for_all_libraries", AsyncMock()):
+            async with library_manager._loading_multiple_libraries():
+                assert library_manager._libraries_loading_complete is gate_the_waiter_holds
+
+        await asyncio.wait_for(waiter, timeout=1)
+        assert library_manager._libraries_loading_complete.is_set()
+
 
 class TestLibraryWorkflowsSurviveAWorkspaceRescan:
     """End to end against the real WorkflowRegistry, no registration mocks."""
@@ -797,6 +822,82 @@ class TestLibraryWorkflowsSurviveAWorkspaceRescan:
             await workflow_manager.refresh_workflow_registry(workflows_to_register=[])
 
             assert list(WorkflowRegistry._workflows) == [registry_key]
+
+    @pytest.mark.asyncio
+    async def test_the_scan_skips_installed_library_roots_but_still_walks_sandbox_ones(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
+        """Libraries live under the workspace by default, so the scan walks straight into them.
+
+        Claiming an installed library's files would register them a second time as the workspace's,
+        and that copy would outlive the library. Sandbox libraries are the deliberate exception:
+        they are the directory an author is actively editing, so their workflows have to appear
+        from the scan rather than waiting on a library reload to publish them.
+        """
+        workflow_manager = engine.workflow_manager
+        config_manager = engine.config_manager
+        workspace = tmp_path / "workspace"
+
+        installed_dir = workspace / "libraries" / "installed_lib"
+        installed_dir.mkdir(parents=True)
+        (installed_dir / "shipped.py").write_text(_workflow_header("shipped"), encoding="utf-8")
+        installed_info = _library_info(installed_dir / "griptape_nodes_library.json", library_name="InstalledLib")
+
+        sandbox_dir = workspace / "libraries" / "sandbox_lib"
+        sandbox_dir.mkdir(parents=True)
+        (sandbox_dir / "in_development.py").write_text(_workflow_header("in_development"), encoding="utf-8")
+        sandbox_info = _library_info(
+            sandbox_dir / "griptape_nodes_library.json", is_sandbox=True, library_name="SandboxLib"
+        )
+
+        with (
+            patch.dict(
+                engine.library_manager._library_file_path_to_info,
+                {installed_info.library_path: installed_info, sandbox_info.library_path: sandbox_info},
+                clear=True,
+            ),
+            patch.dict(WorkflowRegistry._workflows, {}, clear=True),
+            patch.object(type(config_manager), "workspace_path", workspace),
+        ):
+            await workflow_manager.refresh_workflow_registry(workflows_to_register=[str(workspace)])
+            registered = sorted(WorkflowRegistry._workflows)
+
+        assert registered == ["libraries/sandbox_lib/in_development"]
+
+    @pytest.mark.asyncio
+    async def test_a_library_registering_a_directory_still_claims_its_own_files(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
+        """Skipping library roots is the workspace scan's business, not every caller's.
+
+        A library hands over explicit file paths today, and those never reach the directory walk
+        that consults the exclusion roots. Handing over its own directory is the case that would:
+        the library's own root is an exclusion candidate, so without the source check a library
+        would exclude its own files and registering its workflows would silently do nothing.
+        """
+        workflow_manager = engine.workflow_manager
+        config_manager = engine.config_manager
+        workspace = tmp_path / "workspace"
+        library_dir = workspace / "libraries" / "test_lib"
+        library_dir.mkdir(parents=True)
+        (library_dir / "example.py").write_text(_workflow_header(), encoding="utf-8")
+        library_info = _library_info(library_dir / "griptape_nodes_library.json")
+
+        with (
+            patch.dict(
+                engine.library_manager._library_file_path_to_info,
+                {library_info.library_path: library_info},
+                clear=True,
+            ),
+            patch.dict(WorkflowRegistry._workflows, {}, clear=True),
+            patch.object(type(config_manager), "workspace_path", workspace),
+        ):
+            await workflow_manager._process_workflows_for_registration(
+                [str(library_dir)], source=WorkflowSource.for_library(LIBRARY_NAME)
+            )
+            registered = list(WorkflowRegistry._workflows)
+
+        assert registered == ["libraries/test_lib/example"]
 
 
 class TestRekeyWorkflowsForAllLibraries:

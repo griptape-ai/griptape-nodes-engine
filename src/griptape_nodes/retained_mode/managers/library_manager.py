@@ -2136,10 +2136,14 @@ class LibraryManager(EngineScoped):
     ) -> RegisterLibraryFromFileResultSuccess:
         """Register the workflows the library declares, then build the success result.
 
-        Every path that brings a library into the engine funnels through
-        `register_library_from_file_request` -- engine start, installing from a file, installing
-        from a requirement specifier, and reloading after a git update -- so this is the one
-        place that has to know a library can ship workflows.
+        Six paths bring a library into the engine, and all of them funnel through
+        `register_library_from_file_request`: boot (`_load_and_track_library`),
+        `load_libraries_request` (`_load_every_discovered_library`), installing from a
+        requirement specifier, downloading a library, reloading after a git update
+        (`_reload_library_after_git_operation`, reached from both `update_library_request` and
+        `switch_library_ref_request`), and opening a workflow that names a library which is not
+        registered yet (`WorkflowManager._ensure_libraries_for_workflow`). Hooking the shared
+        callee is what keeps a new seventh path from having to remember this.
 
         Skipped while the library loading gate is closed, which is how a load of more than one
         library defers this. Registering a workflow resolves its `node_libraries_referenced`
@@ -2149,6 +2153,13 @@ class LibraryManager(EngineScoped):
         `WorkflowManager.on_load_workflow_metadata_request`, which waits on that same gate.
         `_loading_multiple_libraries` closes the gate and registers the whole set once it
         reopens it.
+
+        Reading the gate, rather than letting each caller say which it is: `update_library_request`
+        is a registered handler any client can send on its own, and `sync_libraries_request` also
+        drives it from inside a bracketed batch. So one caller is both cases, and which one it is
+        is only knowable at runtime. Passing that down instead would mean a field on
+        `RegisterLibraryFromFileRequest` -- public API surface describing an internal batching
+        concern -- which this PR carried as an explicit bulk flag and removed.
         """
         if self._libraries_loading_complete.is_set():
             await self.register_workflows_for_library(library_info)
@@ -7362,8 +7373,8 @@ class LibraryManager(EngineScoped):
                 result=update_result,
             )
 
-        # One batch, because each update reloads its library. The check pass above stays outside
-        # it: check_library_update_request waits on the loading gate.
+        # The check pass above has to stay outside this: check_library_update_request waits on
+        # the loading gate, so widening the bracket to cover it deadlocks the sync against itself.
         async with self._loading_multiple_libraries(), asyncio.TaskGroup() as tg:
             update_tasks = [
                 tg.create_task(update_library(info.library_name, info.old_version, info.new_version))
