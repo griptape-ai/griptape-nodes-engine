@@ -97,7 +97,7 @@ class BudgetManager(EngineScoped):
     ) -> GetAttributionContextResultSuccess | GetAttributionContextResultFailure:
         """Describe the current project as an encoded attribution header.
 
-        Both failures send no header at all rather than the `{"v": 1}` they used to. The far end
+        Both failures send no header at all rather than a bare `{"v": 1}`. The far end
         cannot tell those apart, so this buys nothing on the wire: it is about the engine not
         asserting a project state it does not know, and about the caller getting a Failure it can
         act on instead of a Success carrying an empty chain. Neither blocks the call -- it is
