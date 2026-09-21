@@ -130,6 +130,16 @@ class TestSubflowNodeGroupProxyParameters:
         assert outgoing_dict["input_types"] is None
         assert outgoing_dict["output_type"] == "parametercontroltype"
 
+    def test_proxy_accepts_control_parameters_without_a_tooltip(self, engine: Engine) -> None:
+        group = _MiniSubflowGroup(name="group")
+        engine.object_manager.add_object_by_name(group.name, group)
+
+        incoming = ControlParameterInput(name="exec_in", tooltip="")
+        proxy = group._create_proxy_parameter_for_connection(incoming, is_incoming=True)
+
+        assert isinstance(proxy, ControlParameterInput)
+        assert proxy.tooltip
+
 
 class _MiniSubflowGroup(SubflowNodeGroup):
     """Minimal concrete SubflowNodeGroup exercising only _create_subflow."""

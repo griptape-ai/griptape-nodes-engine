@@ -348,7 +348,10 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             type=original_param.type,
             input_types=input_types,
             output_type=output_type,
-            tooltip=original_param.tooltip,
+            # AddParameterToNodeRequest requires a concrete tooltip. Some dynamically
+            # created parameters leave it unset, so preserve the request round-trip with
+            # the same empty-tooltip semantics used by the parameter manager.
+            tooltip=original_param.tooltip or "",
             # A boundary proxy bridges an external edge and an internal edge. It therefore
             # intentionally exposes both modes even though its concrete control-port shape is
             # directional, and must not expose PROPERTY mode.
