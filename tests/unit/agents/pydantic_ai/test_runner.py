@@ -25,6 +25,7 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models import Model
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
+from pydantic_ai.toolsets import FunctionToolset
 
 from griptape_nodes.agents.pydantic_ai.runner import (
     PydanticAgentRunner,
@@ -58,6 +59,13 @@ def _model_settings_of(runner: PydanticAgentRunner) -> ModelSettings:
     model = runner.agent.model
     assert isinstance(model, Model)
     return model.settings or {}
+
+
+def _first_request(messages: list[ModelMessage]) -> ModelRequest:
+    """The first message, narrowed off the request/response union."""
+    first = messages[0]
+    assert isinstance(first, ModelRequest)
+    return first
 
 
 def _runner_with_function_model(
@@ -603,3 +611,62 @@ def test_runner_explicit_settings_override_the_catalog(tmp_path: Path) -> None:
     )
 
     assert _model_settings_of(runner).get("max_tokens") == 1234  # noqa: PLR2004
+
+
+@pytest.mark.asyncio
+async def test_run_level_toolsets_and_instructions_are_additive(tmp_path: Path) -> None:
+    """Per-run toolsets and instructions add to the agent's, they don't replace them.
+
+    This is what lets an MCP server the user just edited be attached to the next
+    run without rebuilding the agent: the agent keeps its own tools and base
+    instructions, and the run adds the server's tools and rules on top.
+    """
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    threads_dir = tmp_path / "threads"
+
+    seen: dict[str, Any] = {}
+
+    async def stream(messages: list[ModelMessage], info: AgentInfo) -> AsyncIterator[str]:
+        seen["tools"] = sorted(tool.name for tool in info.function_tools)
+        seen["instructions"] = _first_request(messages).instructions
+        yield "ok"
+
+    def baked_tool() -> str:
+        """A tool the agent was built with."""
+        return "baked"
+
+    def per_run_tool() -> str:
+        """A tool attached for this run only."""
+        return "per-run"
+
+    runner = _runner_with_function_model(workspace, threads_dir, stream, extra_tools=[baked_tool])
+
+    await runner.run(
+        "Go.",
+        extra_toolsets=[FunctionToolset(tools=[per_run_tool])],
+        extra_instructions="Rules for MCP server 'svc':\nbe terse",
+    )
+
+    assert seen["tools"] == ["baked_tool", "per_run_tool"]
+    assert seen["instructions"] == "Be concise.\n\nRules for MCP server 'svc':\nbe terse"
+
+
+@pytest.mark.asyncio
+async def test_run_without_extras_leaves_the_agent_untouched(tmp_path: Path) -> None:
+    """Passing no per-run extras must not blank the agent's own instructions."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    threads_dir = tmp_path / "threads"
+
+    seen: dict[str, Any] = {}
+
+    async def stream(messages: list[ModelMessage], _info: AgentInfo) -> AsyncIterator[str]:
+        seen["instructions"] = _first_request(messages).instructions
+        yield "ok"
+
+    runner = _runner_with_function_model(workspace, threads_dir, stream)
+
+    await runner.run("Go.")
+
+    assert seen["instructions"] == "Be concise."
