@@ -625,33 +625,22 @@ class TestCurrentWorkflowChangedNotification:
         context_manager.pop_workflow()
         context_manager.pop_workflow()
 
-    def test_set_current_workflow_name_notifies(self, engine: Engine) -> None:
-        """Renaming the open workflow through this primitive reports its new registry key.
+    def test_rekeying_to_the_key_clients_already_have_does_not_notify(self, engine: Engine) -> None:
+        """A rename whose new name sanitizes back to the current key is not a switch.
 
-        This is the name-only primitive; every handler that renames a workflow also moves the
-        file behind it and so goes through `rekey_workflow` instead (pinned below, and at the
-        handler level in test_workflow_manager.py). It notifies anyway, because a name change on
-        its own is still a change clients have to hear about.
+        The bookkeeping still runs -- the retained path is repointed -- but the key clients address
+        the workflow by has not moved, so nothing needs to wake up.
         """
-        context_manager = engine.context_manager
-        context_manager.push_workflow(workflow_name="before_rename")
-
-        with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
-            context_manager.set_current_workflow_name("after_rename")
-
-        assert _notified_workflow_names(put_event) == ["after_rename"]
-
-        context_manager.pop_workflow()
-
-    def test_set_current_workflow_name_to_the_same_name_does_not_notify(self, engine: Engine) -> None:
-        """Saving over a workflow under its existing key changes nothing clients need to hear about."""
         context_manager = engine.context_manager
         context_manager.push_workflow(workflow_name="unchanged_name")
 
         with patch.object(engine.event_manager, "put_event", Mock()) as put_event:
-            context_manager.set_current_workflow_name("unchanged_name")
+            context_manager.rekey_workflow(
+                old_name="unchanged_name", new_name="unchanged_name", new_file_path="/workspace/unchanged_name.py"
+            )
 
         assert _notified_workflow_names(put_event) == []
+        assert context_manager.get_current_workflow_file_path() == "/workspace/unchanged_name.py"
 
         context_manager.pop_workflow()
 
@@ -712,9 +701,13 @@ class TestCurrentWorkflowChangedNotification:
 
         state_when_sent: dict[str, str | None] = {}
 
-        def capture_state_at_send(_event: object) -> None:
+        # Answers True the way the real `put_event` does once the event is on the queue. Returning
+        # None would read as a dropped event and send this through the owed-switch branch, leaving
+        # the manager in a state no client ever reaches.
+        def capture_state_at_send(_event: object) -> bool:
             state_when_sent["name"] = context_manager.get_current_workflow_name()
             state_when_sent["file_path"] = context_manager.get_current_workflow_file_path()
+            return True
 
         with patch.object(engine.event_manager, "put_event", Mock(side_effect=capture_state_at_send)) as put_event:
             context_manager.rekey_workflow(
