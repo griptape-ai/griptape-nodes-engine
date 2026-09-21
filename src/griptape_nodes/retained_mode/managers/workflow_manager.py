@@ -6500,7 +6500,7 @@ class WorkflowManager(EngineScoped):
         if branch_registry_key is None:
             branch_counter = 1
             branch_registry_key = f"{request.workflow_name}_branch_{branch_counter}"
-            while WorkflowRegistry.has_workflow_with_name(branch_registry_key):
+            while self._branch_name_taken(branch_registry_key):
                 branch_counter += 1
                 branch_registry_key = f"{request.workflow_name}_branch_{branch_counter}"
 
@@ -6515,6 +6515,19 @@ class WorkflowManager(EngineScoped):
             branch_counter=branch_counter,
         )
         return self._BranchNaming(registry_key=branch_registry_key, display_name=derived_display_name)
+
+    def _branch_name_taken(self, branch_registry_key: str) -> bool:
+        """Whether a candidate branch name is unavailable, in either namespace that can claim it.
+
+        A branch is registered under the path ``save_workflow`` wrote it to, so a name can be
+        free as a registry key and still resolve onto a file that is already there -- the two
+        never meet when the source is keyed workspace-relative and the destination is outside
+        the workspace. Walking the counter on the registry alone would keep offering the same
+        name, and the situation's overwrite policy would replace the earlier branch with it.
+        """
+        if WorkflowRegistry.has_workflow_with_name(branch_registry_key):
+            return True
+        return self._workflow_destination_exists(branch_registry_key)
 
     def _derive_branch_display_name(
         self,

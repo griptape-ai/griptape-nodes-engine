@@ -3531,25 +3531,63 @@ class TestWorkflowCreationHonorsSaveSituation:
         workspace-relative registry key, so the branch stayed in the workspace no matter
         where the project said workflows go.
         """
-        source_key = self._save_new_workflow(engine, "shot_lighting")
-        source_metadata = WorkflowRegistry.get_workflow_by_name(source_key).metadata
+        source_key = self._workspace_resident_source(engine, context_dir, temp_dir)
+
+        branched = engine.handle_request(BranchWorkflowRequest(workflow_name=source_key))
+
+        assert isinstance(branched, BranchWorkflowResultSuccess), branched.result_details
+        branch_path = self._registered_path(branched.branched_workflow_name)
+        assert branch_path.parent == context_dir
+        assert branch_path.exists()
+
+    def _workspace_resident_source(self, engine: Engine, context_dir: Path, temp_dir: Path) -> str:
+        """Register a source workflow that lives in the workspace, keyed relative to it.
+
+        This is the shape the fix exists to unblock: the workflow is stranded in the
+        workspace while the project points ``save_workflow`` elsewhere, so the source's
+        registry key and its branch's destination sit in two different namespaces.
+        """
+        saved_key = self._save_new_workflow(engine, "shot_lighting")
+        source_metadata = WorkflowRegistry.get_workflow_by_name(saved_key).metadata
         content = (context_dir / "shot_lighting.py").read_text(encoding="utf-8")
 
-        # Re-home the source inside the workspace, keyed relative to it. The file has to exist
-        # before it can be registered.
+        # The file has to exist before it can be registered.
         (temp_dir / "workspace" / "shot_lighting_ws.py").write_text(content, encoding="utf-8")
         WorkflowRegistry.generate_new_workflow(
             registry_key="shot_lighting_ws",
             metadata=source_metadata.model_copy(),
             file_path="shot_lighting_ws.py",
         )
+        return "shot_lighting_ws"
 
-        branched = engine.handle_request(BranchWorkflowRequest(workflow_name="shot_lighting_ws"))
+    def test_second_branch_does_not_overwrite_the_first(
+        self, engine: Engine, context_dir: Path, temp_dir: Path
+    ) -> None:
+        """Branching the same workflow twice produces two files, not one written twice.
 
-        assert isinstance(branched, BranchWorkflowResultSuccess), branched.result_details
-        branch_path = self._registered_path(branched.branched_workflow_name)
-        assert branch_path.parent == context_dir
-        assert branch_path.exists()
+        The branch counter walks ``<source key>_branch_<n>`` until the registry clears it, but
+        the key registered is derived from the path the situation wrote to. When the source is
+        keyed workspace-relative and the destination is outside the workspace those namespaces
+        never meet, so the counter keeps offering ``_branch_1``: the second branch resolved to
+        the first branch's path and overwrote it under the situation's OVERWRITE policy.
+        """
+        source_key = self._workspace_resident_source(engine, context_dir, temp_dir)
+
+        first = engine.handle_request(BranchWorkflowRequest(workflow_name=source_key))
+        assert isinstance(first, BranchWorkflowResultSuccess), first.result_details
+        first_path = self._registered_path(first.branched_workflow_name)
+        first_bytes = first_path.read_bytes()
+
+        second = engine.handle_request(BranchWorkflowRequest(workflow_name=source_key))
+
+        assert isinstance(second, BranchWorkflowResultSuccess), second.result_details
+        second_path = self._registered_path(second.branched_workflow_name)
+        assert second_path != first_path
+        assert first_path.read_bytes() == first_bytes, "the first branch's file was rewritten"
+        assert sorted(p.name for p in context_dir.glob("shot_lighting_ws_branch_*.py")) == [
+            "shot_lighting_ws_branch_1.py",
+            "shot_lighting_ws_branch_2.py",
+        ]
 
     @staticmethod
     def _registered_path(registry_key: str) -> Path:
