@@ -6405,9 +6405,16 @@ class WorkflowManager(EngineScoped):
         branch_name = branch_naming.registry_key
         branch_display_name = branch_naming.display_name
 
-        # Check if branch name already exists
-        if WorkflowRegistry.has_workflow_with_name(branch_name):
-            details = f"Failed to branch workflow '{request.workflow_name}' because branch name '{branch_name}' already exists"
+        # Refuse a name that is already taken, in either namespace that can claim it. This is the
+        # only collision guard a caller-supplied `branched_workflow_name` passes through -- the
+        # counter walk inside _resolve_branch_naming runs only when the caller named nothing --
+        # so it has to be the same predicate, or a supplied name lands on an existing branch and
+        # the situation's overwrite policy replaces it.
+        if self._branch_name_taken(branch_name):
+            details = (
+                f"Attempted to branch workflow '{request.workflow_name}' as '{branch_name}'. "
+                "Failed because a workflow is already saved under that name."
+            )
             return BranchWorkflowResultFailure(result_details=details)
 
         try:

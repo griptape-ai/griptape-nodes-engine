@@ -3589,6 +3589,47 @@ class TestWorkflowCreationHonorsSaveSituation:
             "shot_lighting_ws_branch_2.py",
         ]
 
+    def test_reused_explicit_branch_name_is_refused_before_it_writes(
+        self, engine: Engine, context_dir: Path, temp_dir: Path
+    ) -> None:
+        """A caller-supplied branch name that is taken fails, leaving the earlier branch intact.
+
+        The counter walk never runs for a supplied name, so the guard on the way in is the only
+        thing standing between it and the destination. Checking the registry alone missed the
+        collision -- the earlier branch is keyed by the path it was written to, not by the name
+        it was asked for -- and the write went ahead and replaced it.
+        """
+        source_key = self._workspace_resident_source(engine, context_dir, temp_dir)
+
+        first = engine.handle_request(
+            BranchWorkflowRequest(workflow_name=source_key, branched_workflow_name="lighting_fix")
+        )
+        assert isinstance(first, BranchWorkflowResultSuccess), first.result_details
+        first_path = self._registered_path(first.branched_workflow_name)
+        first_bytes = first_path.read_bytes()
+
+        second = engine.handle_request(
+            BranchWorkflowRequest(workflow_name=source_key, branched_workflow_name="lighting_fix")
+        )
+
+        assert isinstance(second, BranchWorkflowResultFailure)
+        assert "already saved under that name" in str(second.result_details)
+        assert first_path.read_bytes() == first_bytes, "the first branch's file was rewritten"
+        assert [p.name for p in context_dir.glob("lighting_fix*.py")] == ["lighting_fix.py"]
+
+    def test_explicit_branch_name_still_works_when_free(
+        self, engine: Engine, context_dir: Path, temp_dir: Path
+    ) -> None:
+        """The stricter guard must not refuse a supplied name whose destination is free."""
+        source_key = self._workspace_resident_source(engine, context_dir, temp_dir)
+
+        branched = engine.handle_request(
+            BranchWorkflowRequest(workflow_name=source_key, branched_workflow_name="lighting_fix")
+        )
+
+        assert isinstance(branched, BranchWorkflowResultSuccess), branched.result_details
+        assert self._registered_path(branched.branched_workflow_name) == context_dir / "lighting_fix.py"
+
     @staticmethod
     def _registered_path(registry_key: str) -> Path:
         """The on-disk path the registry holds for a workflow."""
