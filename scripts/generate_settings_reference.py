@@ -93,7 +93,7 @@ class FieldRow:
 
 @dataclass
 class EntryType:
-    title: str
+    ref: str
     description: str
     field_rows: list[FieldRow]
 
@@ -291,19 +291,15 @@ def _ref_type_label(ref: str, defs: dict) -> str:
     if "enum" in target:
         return _enum_label(target["enum"])
     if "properties" in target:
-        return _entry_type_link(ref, defs)
+        return _entry_type_link(ref)
     return ref
 
 
-def _entry_type_link(ref: str, defs: dict) -> str:
-    title = _entry_type_title(ref, defs)
-    # The same slugify markdown's toc extension uses for heading ids, so the anchor cannot drift
-    # from the heading it points at.
-    return f"[{title}](#{slugify(title, '-')})"
-
-
-def _entry_type_title(ref: str, defs: dict) -> str:
-    return defs.get(ref, {}).get("title", ref)
+def _entry_type_link(ref: str) -> str:
+    # Both the link and the heading it points at come from the ref, which is unique per model in
+    # $defs. A title is not: two same-named classes share one, and their tables would collide.
+    # slugify is markdown's own toc slugify, so the anchor matches the id it renders.
+    return f"[{ref}](#{slugify(ref, '-')})"
 
 
 def _ordered_entry_refs(rows: list[SettingRow], defs: dict) -> list[str]:
@@ -358,7 +354,7 @@ def _build_entry_type(ref: str, defs: dict) -> EntryType:
         for name, prop in target.get("properties", {}).items()
     ]
     return EntryType(
-        title=_entry_type_title(ref, defs),
+        ref=ref,
         description=_normalize_cell(_first_paragraph(target.get("description", ""))),
         field_rows=field_rows,
     )
@@ -524,7 +520,7 @@ def _render_entry_types(entry_types: list[EntryType]) -> list[str]:
     lines.append("")
 
     for entry_type in entry_types:
-        lines.append(f"### {entry_type.title}")
+        lines.append(f"### {entry_type.ref}")
         lines.append("")
         if entry_type.description:
             lines.append(entry_type.description)
