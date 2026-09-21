@@ -1764,16 +1764,12 @@ class TestWorkerManagerDomainEventListeners:
     ) -> None:
         """Production path: sync request handler -> sync broadcast_app_event -> ThreadRunner side loop.
 
-        ``EventManager.broadcast_app_event`` detects a running loop and
-        runs the listener fan-out on a transient ``ThreadRunner`` side
-        loop. If the listener schedules its fan-out via
-        ``asyncio.create_task`` and returns, the side loop is torn down
-        before the orphan task ever runs and no broadcast actually goes
-        out. The listener now awaits the broadcast inline; this test
-        confirms the broadcast lands by the time
-        ``broadcast_app_event`` returns control to the caller, even
-        when the underlying transport ``await`` does not resolve
-        synchronously (the production shape -- a real WebSocket send
+        ``EventManager.broadcast_app_event`` runs the listener fan-out on a transient
+        ``ThreadRunner`` side loop, which is torn down as soon as the listener returns -- so a
+        listener that schedules its fan-out with ``asyncio.create_task`` leaves an orphan that
+        never runs. The listener awaits inline instead, and this confirms the broadcast has landed
+        by the time ``broadcast_app_event`` returns, even when the transport ``await`` does not
+        resolve synchronously (the production shape -- a real WebSocket send
         yields back to the loop).
         """
         from griptape_nodes.retained_mode.events.app_events import ConfigChanged

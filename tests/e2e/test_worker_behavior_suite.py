@@ -444,17 +444,14 @@ class TestSecretsFromAWorker:
 class TestProjectReadsStayLocalInAWorker:
     """A worker answers project questions itself rather than forwarding them.
 
-    Two reasons, and the second is why this is pinned. A worker already adopts the
-    orchestrator's project and a project's base directory is shared on-disk state, so the
-    local answer is correct and a round trip buys nothing on a path as hot as writing sidecar
-    metadata for every saved file.
+    A worker already adopts the orchestrator's project and a project's base directory is shared
+    on-disk state, so the local answer is correct and a round trip buys nothing on a path as hot
+    as writing sidecar metadata for every saved file.
 
-    The round trip also corrupted the answer. Forwarded results are rebuilt with cattrs, and
-    GetCurrentProjectResultSuccess annotates `project_info: ProjectInfo` under TYPE_CHECKING to
-    break an import cycle; cattrs cannot resolve that name, so the converter's NameError
-    fallback hands the raw dict to the constructor. isinstance() then passes while
-    `.project_info` is a dict, and every sidecar write in a worker failed with
-    "'dict' object has no attribute 'project_base_dir'" and silently wrote nothing.
+    Forwarding also corrupts the answer: GetCurrentProjectResultSuccess annotates
+    `project_info: ProjectInfo` under TYPE_CHECKING to break an import cycle, and cattrs cannot
+    resolve that name, so its NameError fallback hands the raw dict to the constructor.
+    isinstance() passes while `.project_info` is a dict.
 
     This asserts the routing decision, which is what an in-process test can reach. That the
     sidecar file actually lands is checked by the real two-process verification, since the

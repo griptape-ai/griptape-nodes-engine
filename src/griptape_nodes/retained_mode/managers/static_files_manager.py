@@ -578,11 +578,10 @@ class StaticFilesManager(EngineScoped):
             return
 
         # The env var outranks the payload: a parent that set it serves the shared workspace on a
-        # port outliving this process, a stronger signal than "some process serves it". Gated on
-        # being a worker, because anywhere else the variable is a leaked shell export and adopting
-        # it would point every asset URL at an address nothing here controls. Read from the payload
-        # rather than the engine-level worker flag, which LibraryManager sets from a concurrent
-        # listener for this same event.
+        # port outliving this process. Gated on being a worker, because anywhere else the variable is
+        # a leaked shell export and adopting it would point every asset URL at an address nothing
+        # here controls. Read from the payload, not the engine-level worker flag, which another
+        # listener for this same event sets concurrently.
         if payload.is_worker and os.getenv(ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV):
             adopted = os.environ[ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV].rstrip("/")
             self._static_server_base_url = adopted

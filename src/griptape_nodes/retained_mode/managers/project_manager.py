@@ -3089,12 +3089,10 @@ class ProjectManager(EngineScoped):
         if outcome.workspace_changed and self._initialization_complete:
             result.altered_workflow_state = True
 
-        # Push the switch to running workers so they adopt the orchestrator's project
-        # even on a shallow switch (same workspace + library config) that would not
-        # restart them. Emitted on every actual change, including during boot: boot
-        # activations all precede worker spawn, so those emissions reach zero workers
-        # and are inert. Gating on initialization instead left a switch that landed after
-        # a worker registered but before init finished un-fanned-out for the session.
+        # Push the switch to running workers so they adopt it even on a shallow switch (same
+        # workspace and library config) that would not restart them. Emitted on every change,
+        # including during boot, where it reaches zero workers and is inert -- gating on
+        # initialization instead missed a switch landing after a worker registered.
         if previous_project_id != resolved_project_id:
             changed = CurrentProjectChanged(project_id=resolved_project_id)
             # The wire copy goes up first, still synchronous with the commit, so GUI clients
