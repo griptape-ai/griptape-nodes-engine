@@ -207,15 +207,20 @@ class FilenameParts(NamedTuple):
 
 
 def parse_file_uri(location: str) -> str | None:
-    """Parse file:// URI and return local path, or None if not a valid file URI.
+    r"""Parse file:// URI and return local path, or None if not a valid file URI.
 
     Supports:
     - file:///path/to/file (Unix absolute path)
     - file://localhost/path/to/file (localhost)
     - file:///C:/path/to/file (Windows absolute path)
+    - file://server/share/path (UNC network path)
 
-    Rejects:
-    - file://hostname/path (non-localhost network paths)
+    An empty netloc and ``localhost`` (case-insensitive) both mean "this
+    machine" and collapse to the same local-path result. Any other netloc is
+    treated as the host of a UNC path (``\\server\share\...``) and returned in
+    its forward-slash form (``//server/share/...``), matching
+    ``_WINDOWS_UNC_MATCH_PATTERN`` and the UNC handling already used elsewhere
+    in this module (e.g. ``normalize_path_for_comparison``).
 
     Args:
         location: Location string to parse
@@ -236,8 +241,8 @@ def parse_file_uri(location: str) -> str | None:
         parse_file_uri("file:///path/with%20spaces.txt")
         -> "/path/with spaces.txt"
 
-        parse_file_uri("file://remote-server/path")
-        -> None
+        parse_file_uri("file://server/share/render.exr")
+        -> "//server/share/render.exr"
     """
     if not location.startswith("file://"):
         return None
@@ -247,21 +252,26 @@ def parse_file_uri(location: str) -> str | None:
     if parsed.scheme != "file":
         return None
 
-    # Reject non-localhost network paths
-    if parsed.netloc and parsed.netloc.lower() not in ("", "localhost"):
-        return None
-
     # Get the path component and decode percent-encoding
     path = unquote(parsed.path)
 
-    # Windows paths in file:// URIs have format file:///C:/path
-    # Unix paths have format file:///path
-    # The path component includes the leading slash, so we need to handle Windows specially
-    if path.startswith("/") and len(path) > 2 and path[2] == ":":  # noqa: PLR2004
-        # Windows path like /C:/Users/... -> C:/Users/...
-        path = path[1:]
+    # An empty netloc or "localhost" both mean "this machine". Collapse them
+    # to the same local-path branch before any UNC handling, so
+    # file://localhost/path is never mistaken for a UNC share named
+    # "localhost".
+    if not parsed.netloc or parsed.netloc.lower() == "localhost":
+        # Windows paths in file:// URIs have format file:///C:/path
+        # Unix paths have format file:///path
+        # The path component includes the leading slash, so we need to handle Windows specially
+        if path.startswith("/") and len(path) > 2 and path[2] == ":":  # noqa: PLR2004
+            # Windows path like /C:/Users/... -> C:/Users/...
+            path = path[1:]
 
-    return path
+        return path
+
+    # Any other netloc is the host of a UNC network path.
+    host = unquote(parsed.netloc)
+    return f"//{host}{path}"
 
 
 def is_url(location: str) -> bool:
