@@ -19,7 +19,13 @@ import pytest
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
 from griptape_nodes.exe_types.node_groups.subflow_node_group import SubflowNodeGroup
-from griptape_nodes.exe_types.node_types import LOCAL_EXECUTION, BaseNode, DataNode, NodeDependencies
+from griptape_nodes.exe_types.node_types import (
+    LOCAL_EXECUTION,
+    BaseNode,
+    DataNode,
+    NodeDependencies,
+    aprocess_scope,
+)
 from griptape_nodes.node_library.library_registry import (
     LibraryMetadata,
     LibraryRegistry,
@@ -95,6 +101,46 @@ class _MetadataDrivenNode(DataNode):
                     allowed_modes={ParameterMode.PROPERTY},
                 )
             )
+
+    def process(self) -> None:
+        pass
+
+
+class _HookBuiltNode(DataNode):
+    """A node that builds parameters from ``after_value_set`` as an input arrives.
+
+    The dynamic-pipeline diffuser nodes follow this pattern. The parameters are not declared by the
+    class, so ``__init__`` will not rebuild them, and the value replay will not either because
+    ``initial_setup`` suppresses the hooks — serialization has to recreate them itself.
+    """
+
+    def __init__(self, name: str, metadata: dict | None = None) -> None:
+        super().__init__(name, metadata=metadata)
+        self.add_parameter(
+            Parameter(
+                name="count",
+                tooltip="How many slots to build",
+                type="int",
+                default_value=0,
+                allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+            )
+        )
+
+    def after_value_set(self, parameter: Parameter, value: Any) -> None:
+        if parameter.name != "count":
+            return
+        for index in range(int(value)):
+            slot_name = f"slot_{index}"
+            if not self.does_name_exist(slot_name):
+                self.add_parameter(
+                    Parameter(
+                        name=slot_name,
+                        tooltip="Slot",
+                        type="str",
+                        default_value="",
+                        allowed_modes={ParameterMode.PROPERTY},
+                    )
+                )
 
     def process(self) -> None:
         pass
@@ -193,6 +239,9 @@ def library_name(engine: Engine) -> Generator[str, None, None]:
     )
     library.register_new_node_type(
         _MetadataDrivenNode, NodeMetadata(category="test", description="d", display_name="Metadata Driven")
+    )
+    library.register_new_node_type(
+        _HookBuiltNode, NodeMetadata(category="test", description="d", display_name="Hook Built")
     )
     library.register_new_node_type(_GroupNode, NodeMetadata(category="test", description="d", display_name="Group"))
     engine.handle_request(
@@ -349,24 +398,26 @@ class TestElementModificationCommands:
         assert alter_commands[0].tooltip == "Changed tooltip"
         assert alter_commands[0].default_value == "changed default"
 
-    def test_parameter_added_after_construction_is_left_out(self, engine: Engine, library_name: str) -> None:
-        """A parameter the node grew mid-run produces no command and no value, and still round trips.
+    def test_parameter_added_during_execution_is_left_out(self, engine: Engine, library_name: str) -> None:
+        """A scratch parameter the node grew mid-run produces no command and no value.
 
-        Nodes add such parameters transiently while they run — a scratch parameter feeding a media
-        upload, removed once the run ends. ``__init__`` will not rebuild it, so a command targeting
-        it finds no element on the recreated node and fails the whole deserialize.
+        This is the reported case: resolving a reference image adds a uniquely-named parameter to
+        feed the upload helper and removes it in the run's ``finally``. Duplicating while the run is
+        in flight used to emit an alter against it, which finds no element on the recreated node and
+        fails the whole deserialize. The copy should not carry the parameter at all.
         """
         node_name = _create_text_node(engine, library_name, "N1")
         node = engine.object_manager.get_object_by_name(node_name)
         assert isinstance(node, BaseNode)
-        node.add_parameter(
-            Parameter(
-                name="_scratch_upload",
-                tooltip="Transient",
-                type="str",
-                allowed_modes={ParameterMode.PROPERTY},
+        with aprocess_scope():
+            node.add_parameter(
+                Parameter(
+                    name="_scratch_upload",
+                    tooltip="Transient",
+                    type="str",
+                    allowed_modes={ParameterMode.PROPERTY},
+                )
             )
-        )
         set_result = engine.handle_request(
             SetParameterValueRequest(node_name=node_name, parameter_name="_scratch_upload", value="scratch")
         )
@@ -427,6 +478,35 @@ class TestElementModificationCommands:
         new_node = _round_trip(engine, node_name)
 
         assert new_node.get_parameter_value("prompt_1") == "a typed prompt"
+
+    def test_hook_built_parameter_and_its_value_survive_the_round_trip(self, engine: Engine, library_name: str) -> None:
+        """A parameter built from a value hook is recreated by an add, carrying its value.
+
+        Neither ``__init__`` nor the value replay rebuilds it — the replay sets values with
+        ``initial_setup``, which suppresses the very hook that would have built it — so leaving it
+        out would drop both the parameter and whatever the artist typed into it.
+        """
+        create = engine.handle_request(
+            CreateNodeRequest(node_type="_HookBuiltNode", specific_library_name=library_name, node_name="H1")
+        )
+        assert isinstance(create, CreateNodeResultSuccess), create
+        node_name = create.node_name
+        for parameter_name, value in (("count", 2), ("slot_0", "typed A")):
+            set_result = engine.handle_request(
+                SetParameterValueRequest(node_name=node_name, parameter_name=parameter_name, value=value)
+            )
+            assert isinstance(set_result, SetParameterValueResultSuccess), set_result
+
+        new_node = _round_trip(engine, node_name)
+
+        assert [parameter.name for parameter in new_node.parameters] == [
+            "exec_in",
+            "exec_out",
+            "count",
+            "slot_0",
+            "slot_1",
+        ]
+        assert new_node.get_parameter_value("slot_0") == "typed A"
 
     def test_metadata_driven_parameter_alteration_survives_the_round_trip(
         self, engine: Engine, library_name: str

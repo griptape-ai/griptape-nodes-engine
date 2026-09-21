@@ -3868,15 +3868,30 @@ class NodeManager(EngineScoped):
                     add_param_request = AddParameterToNodeRequest.create(**param_dict)
                     element_modification_commands.append(add_param_request)
                 elif (
+                    parameter.name in node.parameters_added_during_execution
+                    and reference_node.get_parameter_by_name(parameter.name) is None
+                ):
+                    # Scratch state the run owns and tears down, so the copy should not have it at
+                    # all. An alter would find no element on the recreated node and fail the whole
+                    # deserialize, and an add would leave the artist a phantom property.
+                    omitted_parameter_names.add(parameter.name)
+                elif (
                     parameter.name in node.parameters_added_after_construction
                     and reference_node.get_parameter_by_name(parameter.name) is None
                 ):
-                    # ``__init__`` will not rebuild this one, so an alter finds no element on the
-                    # recreated node and fails the whole deserialize, while an add would collide on
-                    # a node that does rebuild it and land as ``<name>_1``. Reference absence cannot
-                    # decide this alone: the reference's metadata is narrowed to library and
-                    # node_type, so it also lacks parameters derived from other metadata keys.
-                    omitted_parameter_names.add(parameter.name)
+                    # Added outside ``__init__`` but meant to last — typically built from a value
+                    # hook as an input arrived. The recreated node has no such parameter when the
+                    # element commands replay, and the value replay will not rebuild it either
+                    # because ``initial_setup`` suppresses the hooks, so recreate it outright.
+                    #
+                    # Reference absence cannot pick these out on its own: the reference's metadata is
+                    # narrowed to library and node_type, so it also lacks parameters ``__init__``
+                    # derives from any other metadata key, and adding those would collide with the
+                    # copy's own and land as ``<name>_1``.
+                    param_dict = parameter.to_dict()
+                    param_dict["initial_setup"] = True
+                    add_param_request = AddParameterToNodeRequest.create(**param_dict)
+                    element_modification_commands.append(add_param_request)
                 else:
                     # Normal node - compare against reference node
                     diff = NodeManager._manage_alter_details(parameter, reference_node)

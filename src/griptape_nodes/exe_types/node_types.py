@@ -322,6 +322,7 @@ class BaseNode(ABC):
     _inputs_to_reset_after_execution: set[str]  # Input values a connection teardown deferred until this node finishes
     _deferred_inputs_were_reset: bool  # Whether one of those deferred resets actually fired
     _parameters_added_after_construction: set[str]
+    _parameters_added_during_execution: set[str]
 
     @property
     def parameters(self) -> list[Parameter]:
@@ -333,10 +334,20 @@ class BaseNode(ABC):
 
         A parameter declared in ``__init__`` reappears whenever the node is recreated from its
         create command, even one built from the node's own metadata rather than hardcoded. One
-        added mid-run does not. Serialization consults this to tell those two apart, since the
-        commands it emits are replayed against a freshly created node.
+        added later does not, so serialization has to recreate it by hand.
         """
         return self._parameters_added_after_construction
+
+    @property
+    def parameters_added_during_execution(self) -> set[str]:
+        """Names of parameters the node grew while running, a subset of the set above.
+
+        These are scratch state rather than node shape: a node adds one to feed a helper and drops
+        it when the run ends, so serialization leaves it out entirely. Parameters a node builds from
+        its value hooks are excluded, because those arrive during input hydration and are meant to
+        last, which is why this is narrower than ``parameters_added_after_construction``.
+        """
+        return self._parameters_added_during_execution
 
     def __hash__(self) -> int:
         return hash(self.name)
@@ -364,6 +375,7 @@ class BaseNode(ABC):
         self._inputs_to_reset_after_execution = set()
         self._deferred_inputs_were_reset = False
         self._parameters_added_after_construction = set()
+        self._parameters_added_during_execution = set()
         self._parent_group = None
         self.set_entry_control_parameter(None)
 
@@ -749,7 +761,7 @@ class BaseNode(ABC):
             parameter_group.add_child(param)
         else:
             self.add_node_element(param)
-        self._record_if_added_after_construction(param.name)
+        self._record_parameter_add_scope(param.name)
         self._emit_parameter_lifecycle_event(param)
 
     def remove_parameter_element_by_name(self, element_name: str) -> None:
@@ -760,6 +772,7 @@ class BaseNode(ABC):
     def remove_parameter_element(self, param: BaseNodeElement) -> None:
         self._report_parameter_mutation_if_in_aprocess(parameter_name=param.name, mutation="remove_parameter_element")
         self._parameters_added_after_construction.discard(param.name)
+        self._parameters_added_during_execution.discard(param.name)
         # Emit event before removal if it's a Parameter
         if isinstance(param, Parameter):
             self._emit_parameter_lifecycle_event(param)
@@ -1805,8 +1818,8 @@ class BaseNode(ABC):
             ),
         )
 
-    def _record_if_added_after_construction(self, parameter_name: str) -> None:
-        """Populate ``parameters_added_after_construction``, off the same flag as the detector above."""
+    def _record_parameter_add_scope(self, parameter_name: str) -> None:
+        """Populate the two parameter-origin sets, off the same flags as the detector above."""
         # Lazy import: library_registry imports BaseNode from this module,
         # so importing at module load creates a cycle.
         from griptape_nodes.node_library.library_registry import LibraryRegistry
@@ -1814,6 +1827,8 @@ class BaseNode(ABC):
         if LibraryRegistry.is_constructing_node():
             return
         self._parameters_added_after_construction.add(parameter_name)
+        if _in_aprocess.get():
+            self._parameters_added_during_execution.add(parameter_name)
 
     def _emit_parameter_lifecycle_event(self, parameter: BaseNodeElement, *, remove: bool = False) -> None:
         """Emit an AlterElementEvent for parameter add/remove operations."""
