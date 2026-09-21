@@ -319,9 +319,10 @@ class CurrentProjectChanged(AppPayload):
     orchestrator's project even on a "shallow" switch (same workspace and
     library config) that would not otherwise restart them.
 
-    Boot-time activation is handled separately: a worker boots like any engine
-    and re-derives the orchestrator's project from shared on-disk config, so
-    ProjectManager only emits this after _initialization_complete.
+    Emitted on every successful activation that changed the project, including
+    during boot: boot activations precede worker spawn, so those emissions fan
+    out to zero workers, and a worker registering into that window is sent its
+    first activation by the registration handler.
 
     Args:
         project_id: The opaque id of the new current project (SYSTEM_DEFAULTS_KEY

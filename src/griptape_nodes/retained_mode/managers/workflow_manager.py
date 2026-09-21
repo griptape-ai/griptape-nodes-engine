@@ -2496,6 +2496,60 @@ class WorkflowManager(EngineScoped):
             file_name=parts.stem, destination=destination, relative_file_path=relative_file_path
         )
 
+    class CreatedWorkflowFile(NamedTuple):
+        """Where a newly created workflow file landed, or why it could not be written.
+
+        ``relative_file_path`` is the registry's form of ``absolute_path`` (workspace-relative
+        while the situation keeps the file inside the workspace, absolute otherwise), so the
+        registry key always names the file that is actually on disk.
+        """
+
+        success: bool
+        error_details: str
+        absolute_path: str = ""
+        relative_file_path: str = ""
+
+    def _create_workflow_file(self, file_name: str, content: str) -> CreatedWorkflowFile:
+        """Write ready-made content as a NEW workflow file, wherever ``save_workflow`` says.
+
+        Creating a workflow is a workflow save like any other, so it resolves through the same
+        situation: a project that redirects ``save_workflow`` would otherwise be honored when
+        the user saves and ignored when the engine creates the file on their behalf (branching,
+        or copying a template), leaving those workflows stranded in the workspace root with no
+        way to migrate -- every later save overwrites them in place.
+
+        Callers hold content they generated themselves (a rewritten metadata header over a
+        source file's body), which is why this writes verbatim rather than going through
+        ``_save_workflow_file_inline``'s serialize-and-generate path.
+        """
+        destination, _relative = self._build_workflow_save_path(f"{file_name}.py")
+        write_result = self._write_workflow_file(destination, content, file_name)
+        if not write_result.success:
+            return WorkflowManager.CreatedWorkflowFile(success=False, error_details=write_result.error_details)
+
+        # The written location, not the requested one: the situation's macro decides the
+        # directory, and a CREATE_NEW policy may have walked the filename past a collision.
+        written_file = write_result.written_file
+        if written_file is None:
+            return WorkflowManager.CreatedWorkflowFile(
+                success=False,
+                error_details=f"Attempted to create workflow file '{file_name}'. Failed because the write reported no location.",
+            )
+        try:
+            absolute_path = written_file.resolve()
+        except FileLoadError as err:
+            return WorkflowManager.CreatedWorkflowFile(
+                success=False,
+                error_details=f"Attempted to create workflow file '{file_name}'. Failed resolving the written location: {err}",
+            )
+
+        return WorkflowManager.CreatedWorkflowFile(
+            success=True,
+            error_details="",
+            absolute_path=str(absolute_path),
+            relative_file_path=self._workspace_relative_path(str(absolute_path), self.engine),
+        )
+
     def _write_workflow_file(
         self, destination: ProjectFileDestination, content: str, file_name: str
     ) -> WriteWorkflowFileResult:
@@ -2827,15 +2881,19 @@ class WorkflowManager(EngineScoped):
         2. If collision exists and name ends in a number, find first free prefix + integer
         3. If collision exists and name doesn't end in a number, append _1, _2, etc.
 
+        Candidates are probed where the ``save_workflow`` situation actually puts them rather
+        than at ``<workspace>/<name>.py``: a project that redirects workflow saves would
+        otherwise judge uniqueness against a directory it never writes to, and a creation
+        carrying the situation's overwrite policy would then clobber whatever already sits at
+        the real destination.
+
         Args:
             base_name: The desired base name for the workflow
 
         Returns:
-            A unique filename that doesn't exist in the workspace
+            A unique filename whose save destination is free
         """
-        workspace_path = self.engine.config_manager.workspace_path
-        base_path = workspace_path.joinpath(f"{base_name}.py")
-        if not base_path.exists():
+        if not self._workflow_destination_exists(base_name):
             return base_name
 
         pattern_match = re.search(r"\d+$", base_name)
@@ -2849,10 +2907,23 @@ class WorkflowManager(EngineScoped):
         curr_idx = 1
         while True:
             candidate_name = f"{incremental_prefix}{curr_idx}"
-            candidate_path = workspace_path.joinpath(f"{candidate_name}.py")
-            if not candidate_path.exists():
+            if not self._workflow_destination_exists(candidate_name):
                 return candidate_name
             curr_idx += 1
+
+    def _workflow_destination_exists(self, file_name: str) -> bool:
+        """Whether the ``save_workflow`` destination for ``file_name`` is already occupied.
+
+        A macro that cannot resolve yet answers False: the only reason it can't is an
+        unresolved required ``{x:NN}`` slot, which OSManager seeds to a free value during the
+        write, so there is no single path to probe.
+        """
+        destination, _relative = self._build_workflow_save_path(f"{file_name}.py")
+        try:
+            resolved = destination.resolve()
+        except FileLoadError:
+            return False
+        return Path(resolved).exists()
 
     def _determine_save_target(  # noqa: C901, PLR0912, PLR0915
         self,
@@ -6337,9 +6408,16 @@ class WorkflowManager(EngineScoped):
         branch_name = branch_naming.registry_key
         branch_display_name = branch_naming.display_name
 
-        # Check if branch name already exists
-        if WorkflowRegistry.has_workflow_with_name(branch_name):
-            details = f"Failed to branch workflow '{request.workflow_name}' because branch name '{branch_name}' already exists"
+        # Refuse a name that is already taken, in either namespace that can claim it. This is the
+        # only collision guard a caller-supplied `branched_workflow_name` passes through -- the
+        # counter walk inside _resolve_branch_naming runs only when the caller named nothing --
+        # so it has to be the same predicate, or a supplied name lands on an existing branch and
+        # the situation's overwrite policy replaces it.
+        if self._branch_name_taken(branch_name):
+            details = (
+                f"Attempted to branch workflow '{request.workflow_name}' as '{branch_name}'. "
+                "Failed because a workflow is already saved under that name."
+            )
             return BranchWorkflowResultFailure(result_details=details)
 
         try:
@@ -6363,9 +6441,6 @@ class WorkflowManager(EngineScoped):
                 branched_from=request.workflow_name,
             )
 
-            # Prepare branch file path
-            branch_file_path = f"{branch_name}.py"
-
             # Read source workflow content and replace metadata header
             source_file_path = WorkflowRegistry.get_complete_file_path(source_file_path_rel)
             if not Path(source_file_path).exists():
@@ -6380,20 +6455,26 @@ class WorkflowManager(EngineScoped):
                 details = f"Failed to replace metadata header for branch workflow '{branch_name}'"
                 return BranchWorkflowResultFailure(result_details=details)
 
-            # Write branch workflow file to disk BEFORE registering in registry
-            branch_full_path = WorkflowRegistry.get_complete_file_path(branch_file_path)
-            Path(branch_full_path).write_text(branch_content, encoding="utf-8")
+            # Write the branch file to disk BEFORE registering it (the registry requires the
+            # file to exist), through the save_workflow situation so a branch lands where the
+            # project puts workflows rather than at the workspace root.
+            created = self._create_workflow_file(branch_name, branch_content)
+            if not created.success:
+                details = f"Failed to branch workflow '{request.workflow_name}': {created.error_details}"
+                return BranchWorkflowResultFailure(result_details=details)
 
-            # Now create the branch workflow in registry (file must exist on disk first)
+            # Key by the path actually written, and report that key: callers open the branch by
+            # the name they get back.
+            branch_registry_key = derive_registry_key(created.relative_file_path)
             WorkflowRegistry.generate_new_workflow(
-                registry_key=derive_registry_key(branch_file_path),
+                registry_key=branch_registry_key,
                 metadata=branch_metadata,
-                file_path=branch_file_path,
+                file_path=created.relative_file_path,
             )
 
             details = f"Successfully branched workflow '{request.workflow_name}' as '{branch_name}'"
             return BranchWorkflowResultSuccess(
-                branched_workflow_name=branch_name,
+                branched_workflow_name=branch_registry_key,
                 original_workflow_name=request.workflow_name,
                 result_details=ResultDetails(message=details, level=logging.INFO),
             )
@@ -6429,7 +6510,7 @@ class WorkflowManager(EngineScoped):
         if branch_registry_key is None:
             branch_counter = 1
             branch_registry_key = f"{request.workflow_name}_branch_{branch_counter}"
-            while WorkflowRegistry.has_workflow_with_name(branch_registry_key):
+            while self._branch_name_taken(branch_registry_key):
                 branch_counter += 1
                 branch_registry_key = f"{request.workflow_name}_branch_{branch_counter}"
 
@@ -6444,6 +6525,19 @@ class WorkflowManager(EngineScoped):
             branch_counter=branch_counter,
         )
         return self._BranchNaming(registry_key=branch_registry_key, display_name=derived_display_name)
+
+    def _branch_name_taken(self, branch_registry_key: str) -> bool:
+        """Whether a candidate branch name is unavailable, in either namespace that can claim it.
+
+        A branch is registered under the path ``save_workflow`` wrote it to, so a name can be
+        free as a registry key and still resolve onto a file that is already there -- the two
+        never meet when the source is keyed workspace-relative and the destination is outside
+        the workspace. Walking the counter on the registry alone would keep offering the same
+        name, and the situation's overwrite policy would replace the earlier branch with it.
+        """
+        if WorkflowRegistry.has_workflow_with_name(branch_registry_key):
+            return True
+        return self._workflow_destination_exists(branch_registry_key)
 
     def _derive_branch_display_name(
         self,
@@ -6480,7 +6574,7 @@ class WorkflowManager(EngineScoped):
             source_label = PurePosixPath(source_registry_key).name
         return f"{source_label} (branch {branch_counter})"
 
-    def on_create_workflow_from_template_request(self, request: CreateWorkflowFromTemplateRequest) -> ResultPayload:
+    def on_create_workflow_from_template_request(self, request: CreateWorkflowFromTemplateRequest) -> ResultPayload:  # noqa: PLR0911
         """Create a new workflow file from a template (Griptape-provided or user-provided)."""
         try:
             template_workflow = WorkflowRegistry.get_workflow_by_name(request.template_name)
@@ -6516,7 +6610,6 @@ class WorkflowManager(EngineScoped):
 
         base_name = request.file_name or Path(template_file_path_rel).stem
         new_file_name = self._generate_unique_filename(base_name)
-        relative_file_path = f"{new_file_name}.py"
 
         new_metadata = WorkflowMetadata(
             name=new_file_name,
@@ -6545,18 +6638,24 @@ class WorkflowManager(EngineScoped):
             )
             return CreateWorkflowFromTemplateResultFailure(result_details=details)
 
-        new_full_path = WorkflowRegistry.get_complete_file_path(relative_file_path)
-        Path(new_full_path).write_text(new_content, encoding="utf-8")
+        created = self._create_workflow_file(new_file_name, new_content)
+        if not created.success:
+            details = f"Attempted to create workflow from template '{request.template_name}'. {created.error_details}"
+            return CreateWorkflowFromTemplateResultFailure(result_details=details)
+
+        # Key by the path actually written, and hand that key back: the caller puts the new
+        # workflow into context by this name, so it has to be the name the registry holds.
+        registry_key = derive_registry_key(created.relative_file_path)
         WorkflowRegistry.generate_new_workflow(
-            registry_key=derive_registry_key(relative_file_path),
+            registry_key=registry_key,
             metadata=new_metadata,
-            file_path=relative_file_path,
+            file_path=created.relative_file_path,
         )
 
         details = f"Successfully created workflow '{new_file_name}' from template '{request.template_name}'"
         return CreateWorkflowFromTemplateResultSuccess(
-            workflow_name=new_file_name,
-            file_path=new_full_path,
+            workflow_name=registry_key,
+            file_path=created.absolute_path,
             result_details=ResultDetails(message=details, level=logging.INFO),
         )
 

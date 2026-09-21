@@ -12,7 +12,7 @@ import anyio
 
 from griptape_nodes.files.base_file_driver import BaseFileDriver
 from griptape_nodes.files.path_utils import parse_static_server_url
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.retained_mode.engine import current_engine
 
 
 class StaticServerFileDriver(BaseFileDriver):
@@ -57,7 +57,7 @@ class StaticServerFileDriver(BaseFileDriver):
         Raises:
             ValueError: If URL format is invalid
         """
-        workspace_path = GriptapeNodes.ConfigManager().workspace_path
+        workspace_path = current_engine().config_manager.workspace_path
         local_path = parse_static_server_url(location, workspace_path)
 
         if local_path is None:

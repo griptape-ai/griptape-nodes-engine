@@ -4,6 +4,7 @@ import asyncio
 import functools
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -11,7 +12,10 @@ import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import anyio
+
 from griptape_nodes.bootstrap.utils.subprocess_websocket_base import WebSocketMessage
+from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events import worker_events
 from griptape_nodes.retained_mode.events.app_events import ConfigChanged, CurrentProjectChanged, SecretChanged
@@ -21,6 +25,7 @@ from griptape_nodes.retained_mode.managers.settings import (
     WORKER_HEARTBEAT_STARTUP_GRACE_KEY,
     WORKER_HEARTBEAT_TIMEOUT_KEY,
 )
+from griptape_nodes.servers.static import ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV
 from griptape_nodes.utils.version_utils import engine_version
 
 if TYPE_CHECKING:
@@ -32,6 +37,12 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
 
 logger = logging.getLogger("griptape_nodes_app")
+
+# How long a spawn waits for initialization to decide the static server URL. Resolution is a socket
+# bind, so seconds -- not the startup grace, whose 10 minutes is sized for dependency installs. On a
+# restart into an existing session it resolves in the same event fan-out that triggers the spawn; on
+# a fresh boot the spawn comes later, off AppSessionStartedEvent, by which point it is long settled.
+_STATIC_URL_SETTLE_TIMEOUT_S = 30.0
 
 
 @dataclass
@@ -113,6 +124,11 @@ class WorkerManager(EngineScoped):
         # Subprocesses spawned by this orchestrator (library_name → process)
         self._managed_worker_processes: dict[str, asyncio.subprocess.Process] = {}
 
+        # Worker keys whose spawn has been claimed but has not yet reached the registry above,
+        # each mapped to a token identifying the attempt that holds it. Keyed by attempt rather
+        # than by name alone so a spawn can only ever release its own claim.
+        self._spawns_in_flight: dict[str, object] = {}
+
         # The event loop that spawned the worker subprocesses. asyncio.subprocess.Process
         # binds its exit Future to its creating loop, so proc.wait() is only legal on this
         # loop. Eviction can run on a different loop (the websocket-tasks loop), which is
@@ -134,6 +150,12 @@ class WorkerManager(EngineScoped):
 
         # Set when an active session becomes available; gates worker spawning.
         self._session_ready_event: asyncio.Event = asyncio.Event()
+
+        # Whether a library's execution is available yet, and why not, keyed by library name.
+        # Held here rather than on LibraryInfo because they answer questions about a PROCESS: is one
+        # coming, has it loaded the library, did it die. One owner, so one writer.
+        self._execution_ready: dict[str, asyncio.Event] = {}
+        self._worker_unavailable: dict[str, str] = {}
 
         config = engine.config_manager
         self.heartbeat_interval_s: float = config.get_config_value(
@@ -225,8 +247,36 @@ class WorkerManager(EngineScoped):
 
         response_topic = f"sessions/{session_id}/workers/{wid}/response"
         await self._tx.subscribe_to_topic(response_topic)
+        # Put the worker on this orchestrator's project rather than answering with it. One sender
+        # and one adoption path, so a switch landing mid-registration is a second message on the
+        # same channel instead of a reply racing a fan-out.
+        await self._activate_project_on_worker(wid, request_topic)
         return worker_events.RegisterWorkerResultSuccess(
-            worker_engine_id=wid, result_details="Worker registered successfully."
+            worker_engine_id=wid,
+            result_details="Worker registered successfully.",
+        )
+
+    async def _activate_project_on_worker(self, worker_engine_id: str, worker_request_topic: str) -> None:
+        """Tell one worker which project to be on, as of the last activation that committed.
+
+        Sent without awaiting a reply: registration must not depend on a round trip back into the
+        worker, which would make answering it hostage to a worker that is merely slow. The worker
+        blocks on having applied an activation before it loads a library instead, which is a wait it
+        can bound locally.
+
+        The COMMITTED pair rather than the live id: `_current_project_id` is assigned before
+        activation's fallible steps, so reading it mid-switch could name a project about to be
+        rolled back. Both halves come from one read, so the generation always describes the id it
+        was committed with. Sent for system defaults too -- a worker has to be told what it is on
+        even when that is the rest state, or nothing distinguishes "told" from "not yet told".
+        """
+        from griptape_nodes.app.worker_routing import ActivateProjectRequest
+
+        project_id, generation = self.engine.project_manager.committed_project()
+        await self.forward_event_to_worker(
+            EventRequest(request=ActivateProjectRequest(project_id=project_id, generation=generation)),
+            worker_engine_id=worker_engine_id,
+            worker_request_topic=worker_request_topic,
         )
 
     def handle_worker_heartbeat_request(
@@ -333,41 +383,86 @@ class WorkerManager(EngineScoped):
         worker_key is an opaque identifier used to track the process and prevent
         duplicate spawns. Callers are responsible for constructing the args list.
         """
-        if worker_key in self._managed_worker_processes:
+        if worker_key in self._managed_worker_processes or worker_key in self._spawns_in_flight:
             logger.error("Worker for key '%s' already spawned; refusing duplicate spawn.", worker_key)
             return
-        # Spawn with the orchestrator's PRE-project environ so the worker boots with the
-        # same clean env baseline a fresh engine would have. Inheriting the live os.environ
-        # would bake the orchestrator's current-project env vars into the worker's restore
-        # baseline, leaving the worker unable to unset them on a later project switch.
-        base_environ = self.engine.project_manager.get_pre_project_environ()
-        worker_environ = {**base_environ, "GTN_ENGINE_ID": str(uuid.uuid4())}
-        # Stamp the spawning orchestrator's id so the worker can report it in its discovery
-        # heartbeat (orchestrator_engine_id), letting clients identify and nest worker engines.
-        # The orchestrator always has an id by the time it spawns a worker; guard the None
-        # case anyway so a subprocess env value is never None.
-        orchestrator_engine_id = self.engine.engine_identity_manager.active_engine_id
-        if orchestrator_engine_id is not None:
-            worker_environ["GTN_ORCHESTRATOR_ENGINE_ID"] = orchestrator_engine_id
-        # Worker stdout is a pipe when the orchestrator is hosted by a GUI app (e.g. the
-        # desktop app); unbuffered output keeps worker log lines from stalling in Python's
-        # block buffer and from being lost on a crash.
-        worker_environ["PYTHONUNBUFFERED"] = "1"
-        # Hand the orchestrator's own stdout/stderr to the worker explicitly so worker log
-        # lines land in the same stream as orchestrator logs. Implicit inheritance is
-        # POSIX-only: on Windows, redirected std handles (e.g. the desktop app's pipes) are
-        # not passed to a child unless subprocess sends them via STARTF_USESTDHANDLES, so
-        # the worker would log to an invisible console instead.
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            env=worker_environ,
-            stdout=sys.stdout,
-            stderr=sys.stderr,
-        )
-        # Record the loop that owns this subprocess so termination can hop back to it.
-        # All spawns run on the engine event-queue loop, so this is idempotent.
-        self._spawn_loop = asyncio.get_running_loop()
-        self._managed_worker_processes[worker_key] = proc
+        # Claimed in the same step as the check above, so no await separates them. The registry
+        # entry cannot serve as this guard: it is written only once the subprocess exists, and the
+        # work in between suspends. A second fork for one library leaves one of the two processes
+        # untracked, holding that library's dependencies until its own heartbeat lapses.
+        claim = object()
+        self._spawns_in_flight[worker_key] = claim
+        try:
+            # Spawn with the orchestrator's PRE-project environ so the worker boots with the
+            # same clean env baseline a fresh engine would have. Inheriting the live os.environ
+            # would bake the orchestrator's current-project env vars into the worker's restore
+            # baseline, leaving the worker unable to unset them on a later project switch.
+            base_environ = self.engine.project_manager.get_pre_project_environ()
+            worker_environ = {**base_environ, "GTN_ENGINE_ID": str(uuid.uuid4())}
+            # Stamp the spawning orchestrator's id so the worker can report it in its discovery
+            # heartbeat (orchestrator_engine_id), letting clients identify and nest worker engines.
+            # The orchestrator always has an id by the time it spawns a worker; guard the None
+            # case anyway so a subprocess env value is never None.
+            orchestrator_engine_id = self.engine.engine_identity_manager.active_engine_id
+            if orchestrator_engine_id is not None:
+                worker_environ["GTN_ORCHESTRATOR_ENGINE_ID"] = orchestrator_engine_id
+            # Worker stdout is a pipe when the orchestrator is hosted by a GUI app (e.g. the
+            # desktop app); unbuffered output keeps worker log lines from stalling in Python's
+            # block buffer and from being lost on a crash.
+            worker_environ["PYTHONUNBUFFERED"] = "1"
+
+            # PYTHONPATH precedes site-packages, making this library-first with the engine's own
+            # environment as the fallback. It must be the environment rather than a later sys.path
+            # splice: sys.modules never reconsiders a module this process has already imported.
+            execution_site_packages = self.engine.library_manager.execution_site_packages(worker_key)
+            if execution_site_packages is not None:
+                # Prepended, not assigned: a launcher-set PYTHONPATH (embedding hosts, source checkouts)
+                # is part of the environment the engine itself booted with, and dropping it only in
+                # exec-deps workers would lose those modules in exactly one process kind.
+                inherited_pythonpath = worker_environ.get("PYTHONPATH")
+                worker_environ["PYTHONPATH"] = (
+                    execution_site_packages + os.pathsep + inherited_pythonpath
+                    if inherited_pythonpath
+                    else execution_site_packages
+                )
+                logger.debug(
+                    "Worker for library '%s' will resolve imports from %s first",
+                    worker_key,
+                    execution_site_packages,
+                )
+
+            # No workspace variable here: GTN_CONFIG_ outranks the runtime project override, so a worker
+            # handed one could never follow its orchestrator onto a project's workspace again. The
+            # workspace arrives with the project the orchestrator activates on it.
+
+            # Both processes share the workspace on disk, so the orchestrator's long-lived server
+            # is the one that must serve it: a worker serving its own wins an arbitrary port, and
+            # every asset URL on it is dead by the time a saved workflow is reopened.
+            static_base_url = await self._orchestrator_static_server_base_url()
+            if static_base_url is not None:
+                worker_environ[ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV] = static_base_url
+            # Hand the orchestrator's own stdout/stderr to the worker explicitly so worker log
+            # lines land in the same stream as orchestrator logs. Implicit inheritance is
+            # POSIX-only: on Windows, redirected std handles (e.g. the desktop app's pipes) are
+            # not passed to a child unless subprocess sends them via STARTF_USESTDHANDLES, so
+            # the worker would log to an invisible console instead.
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                env=worker_environ,
+                stdout=sys.stdout,
+                stderr=sys.stderr,
+            )
+            # Record the loop that owns this subprocess so termination can hop back to it.
+            # All spawns run on the engine event-queue loop, so this is idempotent.
+            self._spawn_loop = asyncio.get_running_loop()
+            self._managed_worker_processes[worker_key] = proc
+        finally:
+            # Released even when the fork raises, or the claim would silently refuse every later
+            # attempt for this library -- but only while this attempt still holds it. A reset drops
+            # the claims so a reload can spawn again, so a spawn suspended across one resumes to
+            # find the key belonging to the reload's spawn, and freeing that admits a third fork.
+            if self._spawns_in_flight.get(worker_key) is claim:
+                del self._spawns_in_flight[worker_key]
         logger.info("Spawned worker for key '%s' (pid %s)", worker_key, proc.pid)
 
     async def reset_workers(self) -> None:
@@ -389,6 +484,22 @@ class WorkerManager(EngineScoped):
                 for library_name, proc in list(self._managed_worker_processes.items())
             )
         )
+        # Settle anything still awaiting one of these workers, BEFORE the registry is cleared.
+        # Clearing it is what makes this the last chance: the heartbeat loop can only evict ids it
+        # can still see, so after this nothing reaches these requests at all. route_to_worker has no
+        # wall-clock ceiling, so a node dispatched into a worker this call terminates would await a
+        # future that never settles.
+        if self._transport is not None:
+            for wid in list(self._workers):
+                registration = self._workers[wid]
+                await self._tx.request_client.fail_requests_by_tag(
+                    wid,
+                    worker_events.WorkerGoneError(
+                        f"worker '{wid}' was shut down to reload library '{registration.worker_key}'"
+                        if registration.worker_key
+                        else f"worker '{wid}' was shut down to reload libraries"
+                    ),
+                )
         session_id = self.engine.get_session_id()
         if session_id and self._transport is not None:
             for wid in list(self._workers):
@@ -398,6 +509,9 @@ class WorkerManager(EngineScoped):
                 except Exception as e:
                     logger.debug("Failed to unsubscribe from '%s' during reset: %s", response_topic, e)
         self._managed_worker_processes.clear()
+        # Cleared with the registry, not left behind: a spawn still inside its awaits holds this
+        # library's claim, and a claim surviving the reset refuses the reload's own spawn for it.
+        self._spawns_in_flight.clear()
         self._workers.clear()
         self._worker_last_seen.clear()
 
@@ -425,18 +539,75 @@ class WorkerManager(EngineScoped):
             request_id, tag=worker_engine_id, resolve_failures_as_payload=True
         )
 
-        await self.forward_event_to_worker(
-            event_request.model_copy(update={"request_id": request_id}),
-            worker_engine_id=worker_engine_id,
-            worker_request_topic=worker_request_topic,
-        )
-        # No wall-clock timeout here: long-running AI workloads (diffusion,
-        # multi-pass refinement) routinely exceed any sensible default. Worker
-        # liveness is enforced by the heartbeat loop, which evicts silent
-        # workers and cancels their in-flight requests via
-        # RequestClient.cancel_requests_by_tag, so a dead worker still surfaces
-        # to the caller without a per-request ceiling.
-        return await future
+        # Both awaits belong inside the `try`: either can unwind and leave the entry tracked with
+        # nobody to settle it. No wall-clock timeout on the response, because long-running AI
+        # workloads exceed any sensible default and the heartbeat loop already fails a silent
+        # worker's requests with WorkerGoneError. That is also why a CancelledError here means only
+        # that the caller was cancelled. wrap_future adapts a future the transport loop settles.
+        try:
+            await self.forward_event_to_worker(
+                event_request.model_copy(update={"request_id": request_id}),
+                worker_engine_id=worker_engine_id,
+                worker_request_topic=worker_request_topic,
+            )
+            return await asyncio.wrap_future(future)
+        except BaseException:
+            # BaseException, not Exception: cancellation is the common case and it is not an
+            # Exception. The other ways out remove the request themselves -- a response pops it in
+            # _try_match, eviction in fail_requests_by_tag -- so this is the one exit that has to
+            # clean up after itself. Without it the entry outlives the run, one per cancelled node
+            # execution, each still carrying its worker's tag for fail_requests_by_tag to walk.
+            self._tx.request_client.discard_request(request_id)
+            raise
+
+    async def _orchestrator_static_server_base_url(self) -> str | None:
+        """The base URL this engine serves the workspace on, awaited until initialization decides it.
+
+        On a restart into an existing session, spawning and URL resolution are both reactions to
+        AppInitializationComplete, whose listeners fan out as unordered concurrent tasks -- so this
+        waits for the decision rather than sampling mid-fan-out. Returns None when this engine serves
+        nothing itself (cloud storage), in which case the worker's URLs come from the same bucket as
+        the orchestrator's and outlive it regardless.
+        """
+        static_files_manager = self.engine.static_files_manager
+        # Normally the decision is already in, so read it without an executor hop. The hop below is
+        # the one with a cost: a blocking wait handed to a thread cannot be cancelled, so if nothing
+        # ever settles it parks a default-executor thread that shutdown_default_executor() joins at
+        # teardown. Unreachable in any ordering found so far -- the resolving listener is synchronous
+        # and finishes at the library listener's first await -- so this path is what runs.
+        if static_files_manager.static_server_base_url_settled:
+            base_url = static_files_manager.wait_for_static_server_base_url(0)
+        else:
+            base_url = await asyncio.to_thread(
+                static_files_manager.wait_for_static_server_base_url, _STATIC_URL_SETTLE_TIMEOUT_S
+            )
+        if base_url is not None:
+            return base_url
+
+        # Only for local storage: there, no URL means the worker serves assets on its own ephemeral
+        # port and every URL it produces dies with it -- the dead-links bug this handover exists to
+        # prevent. Loud, because it is invisible otherwise. On a cloud backend a worker's URLs come
+        # from the same bucket as the orchestrator's and outlive it, so there is nothing to say.
+        if isinstance(static_files_manager.storage_driver, LocalStorageDriver):
+            # Two different failures, and pointing an operator at the wrong one costs real time:
+            # initialization can DECIDE there is no server, which settles in microseconds and has
+            # nothing to do with the timeout. That means a resolution that raised -- binding even the
+            # fallback port 0 failed, or the server thread would not start -- since every branch that
+            # returns normally under local storage sets a URL.
+            if static_files_manager.static_server_base_url_settled:
+                logger.warning(
+                    "Initialization resolved no static server, so a spawned worker will serve assets "
+                    "on its own port. URLs it produces will stop working when it exits. Check for an "
+                    "earlier failure resolving the static server."
+                )
+            else:
+                logger.warning(
+                    "Worker startup waited %.0fs for the static server URL and it was never decided, "
+                    "so the worker is being spawned without one and will serve assets on its own "
+                    "port. URLs it produces will stop working when it exits.",
+                    _STATIC_URL_SETTLE_TIMEOUT_S,
+                )
+        return None
 
     async def evict_worker(self, worker_engine_id: str) -> None:
         """Remove a worker from the registry and unsubscribe from its response topic."""
@@ -452,8 +623,19 @@ class WorkerManager(EngineScoped):
             proc = self._managed_worker_processes.pop(lib_name, None)
             if proc is not None:
                 await self._terminate_via_spawn_loop(lib_name, proc)
-        # Cancel any requests that were awaiting a result from this worker.
-        await self._tx.request_client.cancel_requests_by_tag(worker_engine_id)
+        # Fail anything awaiting this worker, with the reason, so the awaiter reports why rather
+        # than inferring it from a bare cancellation.
+        await self._tx.request_client.fail_requests_by_tag(
+            worker_engine_id,
+            worker_events.WorkerGoneError(f"worker '{worker_engine_id}' stopped responding and was shut down"),
+        )
+        # Eviction is terminal -- nothing respawns the worker -- so anything still waiting on this
+        # library would wait forever, and the next run would report a worker that "may still be
+        # starting up" for the rest of the session.
+        if lib_name:
+            self.note_worker_unavailable(
+                lib_name, "the worker process that runs it stopped responding and was shut down."
+            )
 
         # Notify registered callbacks that this worker has been evicted.
         for cb in self._worker_evicted_callbacks:
@@ -621,7 +803,12 @@ class WorkerManager(EngineScoped):
         session_id = self.engine.get_session_id()
         if not session_id:
             logger.error("Session event set but no session ID available for library '%s'.", library_name)
+            self.note_worker_unavailable(library_name, "no session was available to start its worker process.")
             return
+        # The worker is handed its library's execution environment as PYTHONPATH, so that directory
+        # has to exist before the process starts. It does: the orchestrator builds it while
+        # registering the library, and a library whose build failed is never asked for a worker --
+        # LibraryManager knows its own build result and does not request one.
         args = [
             sys.executable,
             "-m",
@@ -634,11 +821,116 @@ class WorkerManager(EngineScoped):
         ]
         await self.spawn_worker(args, library_name)
 
-    @staticmethod
-    def _log_spawn_error(task: asyncio.Task, library_name: str) -> None:
+    def _log_spawn_error(self, task: asyncio.Task, library_name: str) -> None:
+        """Record a spawn that raised before producing a worker.
+
+        `handle_start_worker_request` schedules the spawn and returns Success immediately, so its
+        caller cannot tell that a bad interpreter or an OSError stopped the worker ever existing.
+        Refusals that return rather than raise are invisible here and record themselves.
+        """
+        # Asked before `task.exception()`, which raises on a cancelled task. From a done-callback
+        # that surfaces as loop-level "Exception in callback" noise and skips the refusal below.
+        # Cancellation reaches here at loop teardown, where no run is waiting on a worker.
+        if task.cancelled():
+            return
         exc = task.exception()
-        if exc is not None:
-            logger.error("Failed to spawn worker for library '%s': %s", library_name, exc)
+        if exc is None:
+            return
+        logger.error("Failed to spawn worker for library '%s': %s", library_name, exc)
+        self.note_worker_unavailable(library_name, f"the worker process that runs it could not be started ({exc}).")
+
+    def expect_worker(self, library_name: str) -> None:
+        """Declare that a worker is coming for `library_name`, so callers can wait for it.
+
+        Called before the spawn is requested. Installs a fresh readiness gate and drops any account
+        of a previous attempt, which no longer describes the situation. Every attempt gets one: a
+        worker registers BEFORE it loads libraries, so execution routing has to wait for the load
+        rather than for the registration.
+        """
+        self._execution_ready[library_name] = asyncio.Event()
+        self._worker_unavailable.pop(library_name, None)
+
+    def note_library_loaded(self, library_name: str) -> None:
+        """Release anything waiting on `library_name`, now that its worker has loaded it."""
+        ready = self._execution_ready.get(library_name)
+        if ready is not None:
+            ready.set()
+
+    def note_worker_unavailable(self, library_name: str, reason: str) -> None:
+        """Record why no worker will run `library_name`, and release anything waiting on one.
+
+        Recording without releasing leaves the next run waiting out the whole startup grace before
+        blaming a library load that never began; releasing without recording leaves it blaming a
+        worker that "may still be starting up" for the rest of the session.
+        """
+        self._worker_unavailable[library_name] = reason
+        self.note_library_loaded(library_name)
+
+    def forget_library(self, library_name: str) -> None:
+        """Drop everything this manager records about `library_name`.
+
+        Called when a library leaves the registry. These are keyed by a bare name, so without this
+        they outlive the record they describe: the reason from an evicted worker would still be
+        reported after the library came back declaring no execution dependencies at all, for a
+        library that now runs in this process.
+        """
+        self._execution_ready.pop(library_name, None)
+        self._worker_unavailable.pop(library_name, None)
+
+    def worker_unavailable_reason(self, library_name: str) -> str | None:
+        """Why no worker is available to run `library_name`, or None if that is not the problem."""
+        return self._worker_unavailable.get(library_name)
+
+    def has_settled(self, library_name: str) -> bool:
+        """Whether `library_name` has settled -- loaded, refused, or died -- rather than pending.
+
+        Settled is not available: a refused spawn settles, and `worker_unavailable_reason` then
+        says why. This is a wait predicate, not an answer about whether execution can proceed.
+        """
+        ready = self._execution_ready.get(library_name)
+        return ready is None or ready.is_set()
+
+    async def wait_until_executable(self, library_name: str) -> None:
+        """Block until `library_name` can be executed, or until it is settled that it cannot.
+
+        A worker registers BEFORE it loads libraries -- registration is what carries the
+        orchestrator's project to it, and the project decides how libraries load -- so routing would
+        otherwise see somewhere to send execution whose library is not loaded yet, and forwarding
+        into that window fails node creation there.
+
+        Cannot hang: every terminal outcome releases the gate (loaded, spawn refused, spawn died,
+        worker evicted). Bounded anyway, because "every" is a claim about code that will keep
+        changing and the cost of it being wrong once is a node that hangs with no diagnosis. A named
+        timeout is a bug report; an unbounded wait is a mystery.
+        """
+        if self.has_settled(library_name):
+            return
+        logger.info("Waiting for library '%s''s worker to finish loading before executing", library_name)
+        try:
+            with anyio.fail_after(self.heartbeat_startup_grace_s):
+                await self._execution_ready[library_name].wait()
+        except TimeoutError:
+            msg = (
+                f"Attempted to run a node from library '{library_name}'. Failed because its worker "
+                f"process did not finish loading the library within {self.heartbeat_startup_grace_s:.0f} seconds."
+            )
+            raise RuntimeError(msg) from None
+
+    async def wait_for_libraries(self, library_names: list[str], timeout_s: float) -> list[str]:
+        """Wait for several libraries at once. Returns the names that did not settle in time.
+
+        Boot uses this rather than `wait_until_executable` per library: one collective ceiling, and
+        the caller decides what an unsettled library means for the rest of initialization.
+        """
+        pending = [name for name in library_names if not self.has_settled(name)]
+        if not pending:
+            return []
+        try:
+            with anyio.fail_after(timeout_s):
+                await asyncio.gather(*[self._execution_ready[name].wait() for name in pending])
+        except TimeoutError:
+            return [name for name in pending if not self.has_settled(name)]
+        return []
 
     def get_topics_to_subscribe(self, *, is_worker: bool) -> list[str]:
         """Build the list of topics to subscribe to at connection start.
@@ -848,21 +1140,79 @@ class WorkerManager(EngineScoped):
             return
         await self.broadcast_to_workers(EventRequest(request=RefreshSecretsRequest()))
 
-    async def _on_current_project_changed(self, event: CurrentProjectChanged) -> None:
+    async def _on_current_project_changed(self, _event: CurrentProjectChanged) -> None:
         """Fan out an ActivateProjectRequest after the orchestrator switched projects.
 
-        ProjectManager only emits ``CurrentProjectChanged`` from a successful
-        post-init activation, so receiving it means workers should adopt the new
-        project. Carries the new project's id; a worker boots like an engine, so
-        the same id is already loaded in its registry. Awaited inline for the same
-        side-loop reason documented on ``_on_config_changed``; lazy import for
-        the same circular-dependency reason.
+        Reads the committed pair rather than taking the id off the event, so the id and the
+        generation describing it come from one read. Two switches in quick succession therefore
+        both fan out the newest committed state, and a worker cannot be told to go backwards.
+        Awaited inline for the same side-loop reason documented on ``_on_config_changed``; lazy
+        import for the same circular-dependency reason.
         """
         from griptape_nodes.app.worker_routing import ActivateProjectRequest
 
         if self._transport is None or not self._workers:
             return
-        await self.broadcast_to_workers(EventRequest(request=ActivateProjectRequest(project_id=event.project_id)))
+        project_id, generation = self.engine.project_manager.committed_project()
+        failures = await self.broadcast_to_workers_awaiting_replies(
+            EventRequest(request=ActivateProjectRequest(project_id=project_id, generation=generation))
+        )
+        # A worker left on the old project resolves workspace-relative paths against the old
+        # workspace, so it writes where this engine does not read. Loud here beats silent there.
+        for failure in failures:
+            logger.error(
+                "Worker did not adopt project '%s' after the switch; its file paths will not match "
+                "this engine's. Details: %s",
+                project_id,
+                failure,
+            )
+
+    async def broadcast_to_workers_awaiting_replies(self, event: EventRequest) -> list[str]:
+        """Fan out to every worker and WAIT for each to answer. Returns the failures, named.
+
+        The fire-and-forget variant is wrong for anything that changes where paths resolve. A
+        project switch moves the workspace, and `broadcast_to_workers` returns as soon as the
+        messages are sent -- so `SetCurrentProjectRequest` reports success while a worker may still
+        be on the old workspace. Execution dispatched in that window writes files where nothing
+        looks, with no error. Awaiting closes the window by construction instead of hoping the
+        fan-out wins the race against the next dispatch.
+
+        Concurrent, and bounded per worker. Serially, a worker that is merely SLOW -- adoption runs a
+        full library reload, which can include installs -- kept every worker behind it from even
+        receiving the request, so the caller waited out the sum rather than the slowest. And
+        `route_to_worker` has no ceiling of its own: it argues liveness from the heartbeat, which
+        evicts a SILENT worker and says nothing about a busy one, so a user-facing switch could wait
+        forever. The bound is the startup grace, the same budget a worker's own slow startup gets.
+
+        Each worker gets its own request id so replies cannot be confused. One worker's failure does
+        not affect the others; the caller decides what a failure means.
+        """
+        if not self._workers:
+            return []
+
+        async def ask(worker_engine_id: str, request_topic: str) -> str | None:
+            per_worker = EventRequest(request=event.request)
+            per_worker.request_id = str(uuid.uuid4())
+            try:
+                raw = await asyncio.wait_for(
+                    self.route_to_worker(per_worker, worker_engine_id, request_topic),
+                    timeout=self.heartbeat_startup_grace_s,
+                )
+            except TimeoutError:
+                return f"{worker_engine_id}: no reply within {self.heartbeat_startup_grace_s:g} seconds"
+            except Exception as e:
+                return f"{worker_engine_id}: {type(e).__name__}: {e}"
+            # endswith, not a substring test: that would read any type merely CONTAINING "Success".
+            if not str(raw.get("result_type", "")).endswith("ResultSuccess"):
+                result = raw.get("result")
+                details = result.get("result_details", raw) if isinstance(result, dict) else raw
+                return f"{worker_engine_id}: {details}"
+            return None
+
+        outcomes = await asyncio.gather(
+            *(ask(wid, registration.request_topic) for wid, registration in list(self._workers.items()))
+        )
+        return [failure for failure in outcomes if failure is not None]
 
     def schedule_broadcast(self, request_type: type[RequestPayload]) -> None:
         """Tell every registered worker to handle ``request_type`` locally.

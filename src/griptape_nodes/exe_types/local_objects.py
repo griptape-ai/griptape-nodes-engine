@@ -81,7 +81,8 @@ class LocalObjectScope:
     process resolves to nothing, because there is nothing here to resolve it to.
     """
 
-    def __init__(self, *, library: str | None, source: str) -> None:
+    def __init__(self, *, node: BaseNode, library: str | None, source: str) -> None:
+        self._node = node
         self._library = library
         self._source = source
 
@@ -390,13 +391,19 @@ class LocalObjectScope:
             return f"the value for parameter '{parameter_name}' on node '{node_name}'"
         return f"a value that node '{node_name}' needs"
 
-    @staticmethod
-    def _manager() -> ResourceManager:
-        # Lazy: exe_types cannot import the retained_mode package at module scope. One place, rather than
-        # once per call site, because BaseNode has no engine reference to hand down.
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+    def _manager(self) -> ResourceManager:
+        """The store, reached through the node's own engine rather than the process-wide facade.
 
-        return GriptapeNodes.ResourceManager()
+        Node machinery is what this is, so it goes through `BaseNode.engine` -- the facade is the surface
+        for separately-versioned library code and saved workflow files. Read per call rather than captured,
+        so it follows the node's own deferred resolution instead of pinning whichever engine was ambient
+        when the scope was built.
+
+        Reaching the facade here raised during worker execution, and correctly so: the guard on those
+        accessors cannot tell engine plumbing from library code, so engine-internal code that goes through
+        it trips a rule aimed at node authors. That was this cache's version of a documented failure.
+        """
+        return self._node.engine.resource_manager
 
 
 # --- walking a parameter value -------------------------------------------------------------------
