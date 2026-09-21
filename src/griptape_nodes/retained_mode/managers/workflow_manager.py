@@ -217,6 +217,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.workflows import (
     MissingCreationDateProblem,
     MissingLastModifiedDateProblem,
     MissingTomlSectionProblem,
+    ReferencedWorkflowUnresolvableProblem,
     WorkflowNotFoundProblem,
 )
 from griptape_nodes.retained_mode.managers.os_manager import OSManager
@@ -452,6 +453,17 @@ class WorkflowManager(EngineScoped):
         execution_details: str
         status: WorkflowStatus = WorkflowStatus.GOOD
         problems: tuple[WorkflowProblem, ...] = ()
+
+    class ReferencedWorkflowDependencies(NamedTuple):
+        """What a walk of a workflow's referenced sub-workflows found.
+
+        `libraries` are the libraries those sub-workflows declare, deduplicated by name.
+        `problems` name the referenced workflows the walk could not read, so a caller can say which
+        part of the picture is missing instead of presenting a partial one as complete.
+        """
+
+        libraries: list[LibraryNameAndVersion]
+        problems: list[WorkflowProblem]
 
     class SaveWorkflowScenario(StrEnum):
         """Scenarios for saving workflows."""
@@ -1047,7 +1059,21 @@ class WorkflowManager(EngineScoped):
             # behavior where a missing prereq block was survivable.
             return []
         problems: list[WorkflowProblem] = []
-        for lib_ref in load_metadata_result.metadata.node_libraries_referenced:
+
+        # Referenced sub-workflows are imported from inside this file's exec(), and that import
+        # needs their libraries registered as much as this file needs its own. Registering them here
+        # keeps the whole tree's libraries resolved before exec begins, which is the one point where
+        # a worker-backed library can start its subprocess safely (see the note above).
+        referenced_dependencies = self.collect_referenced_workflow_dependencies(load_metadata_result.metadata)
+        problems.extend(referenced_dependencies.problems)
+
+        libraries_to_register = list(load_metadata_result.metadata.node_libraries_referenced)
+        directly_referenced_names = {lib.library_name for lib in libraries_to_register}
+        libraries_to_register.extend(
+            lib for lib in referenced_dependencies.libraries if lib.library_name not in directly_referenced_names
+        )
+
+        for lib_ref in libraries_to_register:
             register_result = await self.engine.ahandle_request(
                 RegisterLibraryFromFileRequest(
                     library_name=lib_ref.library_name,
@@ -1072,6 +1098,84 @@ class WorkflowManager(EngineScoped):
                     )
                 )
         return problems
+
+    def collect_referenced_workflow_dependencies(
+        self, workflow_metadata: WorkflowMetadata
+    ) -> ReferencedWorkflowDependencies:
+        """Walk the workflows `workflow_metadata` references and collect the libraries they declare.
+
+        A workflow's own header records only the libraries its own nodes need, so the libraries
+        behind a referenced sub-workflow have to be gathered from that sub-workflow's header at the
+        moment they are needed. Reading them here rather than trusting a copy taken when the
+        referencing workflow was saved is the point: the sub-workflow can be edited afterwards, and
+        a copy would still describe the libraries it used to need.
+
+        The walk is recursive (a referenced workflow may reference others) and cycle-safe: a
+        workflow that references one already visited contributes nothing further. Cycles are
+        reachable in ordinary use -- two workflows that each carry a node backed by the other --
+        and are not themselves a problem to report, since the check only needs each workflow's
+        libraries once.
+
+        A referenced workflow that cannot be read yields a ReferencedWorkflowUnresolvableProblem
+        rather than stopping the walk, so one unreadable sub-workflow does not cost the caller the
+        libraries of its siblings. Returns the libraries found and those problems; the caller
+        decides what they mean for fitness.
+        """
+        libraries: dict[str, LibraryNameAndVersion] = {}
+        problems: list[WorkflowProblem] = []
+        visited: set[str] = set()
+        queue: list[str] = list(workflow_metadata.workflows_referenced or [])
+
+        while queue:
+            workflow_name = queue.pop(0)
+            if workflow_name in visited:
+                continue
+            visited.add(workflow_name)
+
+            referenced_metadata = self._read_referenced_workflow_metadata(workflow_name, problems)
+            if referenced_metadata is None:
+                continue
+
+            for lib_ref in referenced_metadata.node_libraries_referenced:
+                # First spelling of a library name wins. Two sub-workflows can name the same library
+                # at different versions, and choosing between them is the version check's job, not
+                # this walk's -- it reports on what the workflow closest to the root asked for.
+                if lib_ref.library_name not in libraries:
+                    libraries[lib_ref.library_name] = lib_ref
+            queue.extend(referenced_metadata.workflows_referenced or [])
+
+        return WorkflowManager.ReferencedWorkflowDependencies(libraries=list(libraries.values()), problems=problems)
+
+    def _read_referenced_workflow_metadata(
+        self, workflow_name: str, problems: list[WorkflowProblem]
+    ) -> WorkflowMetadata | None:
+        """Read one referenced workflow's metadata header, recording a problem if it cannot be read.
+
+        Goes to the file rather than to the registry entry's cached metadata, because that entry is
+        only as current as the last time it was registered and this walk exists to see the header as
+        it is now. The registry is still what maps the referenced name to a path.
+        """
+        if not WorkflowRegistry.has_workflow_with_name(workflow_name):
+            problems.append(
+                ReferencedWorkflowUnresolvableProblem(
+                    workflow_name=workflow_name, reason="not registered in this workspace"
+                )
+            )
+            return None
+
+        referenced_workflow = WorkflowRegistry.get_workflow_by_name(workflow_name)
+        if referenced_workflow.file_path is None:
+            problems.append(
+                ReferencedWorkflowUnresolvableProblem(workflow_name=workflow_name, reason="has never been saved")
+            )
+            return None
+
+        complete_path = Path(WorkflowRegistry.get_complete_file_path(referenced_workflow.file_path))
+        try:
+            return read_workflow_metadata(complete_path)
+        except WorkflowMetadataError as err:
+            problems.append(ReferencedWorkflowUnresolvableProblem(workflow_name=workflow_name, reason=str(err)))
+            return None
 
     @staticmethod
     def collate_problems_by_type(problems: Iterable[WorkflowProblem]) -> list[str]:
@@ -2107,8 +2211,21 @@ class WorkflowManager(EngineScoped):
         else:
             registered_libraries = list_libraries_result.libraries
 
+        # A workflow's header names only the libraries its own nodes need. The libraries behind a
+        # referenced sub-workflow live in that sub-workflow's header, so check them too -- otherwise
+        # a sub-workflow that has since changed which libraries it needs leaves this check reporting
+        # on the wrong set, and silent about a library the load is about to require.
+        referenced_dependencies = self.collect_referenced_workflow_dependencies(workflow_metadata)
+        problems.extend(referenced_dependencies.problems)
+
+        libraries_to_check = list(workflow_metadata.node_libraries_referenced)
+        directly_referenced_names = {lib.library_name for lib in libraries_to_check}
+        libraries_to_check.extend(
+            lib for lib in referenced_dependencies.libraries if lib.library_name not in directly_referenced_names
+        )
+
         dependency_infos = []
-        for node_library_referenced in workflow_metadata.node_libraries_referenced:
+        for node_library_referenced in libraries_to_check:
             library_name = node_library_referenced.library_name
             desired_version_str = node_library_referenced.library_version
             try:
@@ -3451,6 +3568,11 @@ class WorkflowManager(EngineScoped):
         # display_name is the human-readable label (metadata.name); falls back to file_name if not provided.
         metadata_name = display_name if display_name is not None else str(file_name)
 
+        # Libraries this workflow's own nodes need, expanded to the libraries those libraries
+        # declare. A referenced sub-workflow's libraries are deliberately not folded in: it owns its
+        # own header, and it can be edited after this save, so a copy taken here would describe it
+        # as it was rather than as it is at load. Callers that need the full picture walk
+        # `workflows_referenced` for it (see `collect_referenced_workflow_dependencies`).
         direct_libs: list[LibraryNameAndVersion] = list(serialized_flow_commands.node_dependencies.libraries)
         all_libs = self.engine.library_manager.resolve_transitive_library_deps(direct_libs)
 
