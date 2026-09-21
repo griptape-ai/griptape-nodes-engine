@@ -157,11 +157,11 @@ class TestLocalFileDriverFileURI:
         result = parse_file_uri(uri)
         assert result == "/path/to/file with spaces.txt"
 
-    def test_parse_file_uri_rejects_remote_host(self, driver: LocalFileDriver) -> None:  # noqa: ARG002
-        """Test that file URIs with non-localhost hosts are rejected."""
+    def test_parse_file_uri_remote_host_as_unc(self, driver: LocalFileDriver) -> None:  # noqa: ARG002
+        """Test that file URIs with non-localhost hosts parse as UNC paths."""
         uri = "file://remote-server/path/to/file.txt"
         result = parse_file_uri(uri)
-        assert result is None
+        assert result == "//remote-server/path/to/file.txt"
 
     def test_parse_file_uri_rejects_non_file_scheme(self, driver: LocalFileDriver) -> None:  # noqa: ARG002
         """Test that non-file:// URIs are rejected."""
@@ -229,12 +229,16 @@ class TestLocalFileDriverFileURI:
         assert "File not found" in str(exc_info.value)
 
     @pytest.mark.asyncio
-    async def test_read_invalid_file_uri(self, driver: LocalFileDriver) -> None:
-        """Test reading file with invalid file:// URI raises ValueError."""
-        invalid_uri = "file://remote-server/path/to/file.txt"
+    async def test_read_unc_file_uri_not_found(self, driver: LocalFileDriver) -> None:
+        """Test reading a UNC file:// URI for a non-existent share raises FileNotFoundError.
 
-        with pytest.raises(ValueError, match="Invalid file:// URI"):
-            await driver.read(invalid_uri, timeout=10.0)
+        The URI now parses to a UNC path rather than being rejected outright; it fails
+        at read time because the share doesn't exist, not because parsing was invalid.
+        """
+        unc_uri = "file://remote-server/path/to/file.txt"
+
+        with pytest.raises(FileNotFoundError):
+            await driver.read(unc_uri, timeout=10.0)
 
     @pytest.mark.asyncio
     async def test_exists_file_uri(self, driver: LocalFileDriver, temp_file: Path) -> None:
@@ -250,10 +254,10 @@ class TestLocalFileDriverFileURI:
         assert await driver.exists(file_uri) is False
 
     @pytest.mark.asyncio
-    async def test_exists_invalid_file_uri(self, driver: LocalFileDriver) -> None:
-        """Test exists with invalid file:// URI returns False."""
-        invalid_uri = "file://remote-server/path/to/file.txt"
-        assert await driver.exists(invalid_uri) is False
+    async def test_exists_unc_file_uri_not_found(self, driver: LocalFileDriver) -> None:
+        """Test exists with a UNC file:// URI for a non-existent share returns False."""
+        unc_uri = "file://remote-server/path/to/file.txt"
+        assert await driver.exists(unc_uri) is False
 
     def test_get_size_file_uri(self, driver: LocalFileDriver, temp_file: Path) -> None:
         """Test get_size with file:// URI."""
@@ -270,12 +274,12 @@ class TestLocalFileDriverFileURI:
             driver.get_size(file_uri)
         assert "File not found" in str(exc_info.value)
 
-    def test_get_size_invalid_file_uri(self, driver: LocalFileDriver) -> None:
-        """Test get_size with invalid file:// URI raises ValueError."""
-        invalid_uri = "file://remote-server/path/to/file.txt"
+    def test_get_size_unc_file_uri_not_found(self, driver: LocalFileDriver) -> None:
+        """Test get_size with a UNC file:// URI for a non-existent share raises FileNotFoundError."""
+        unc_uri = "file://remote-server/path/to/file.txt"
 
-        with pytest.raises(ValueError, match="Invalid file:// URI"):
-            driver.get_size(invalid_uri)
+        with pytest.raises(FileNotFoundError):
+            driver.get_size(unc_uri)
 
 
 class TestLocalFileDriverRelativePaths:

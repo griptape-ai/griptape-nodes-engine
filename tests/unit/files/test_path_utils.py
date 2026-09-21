@@ -749,11 +749,23 @@ class TestParseFileUri:
         result = parse_file_uri(uri)
         assert result == "/path/to/file!@#.txt"
 
-    def test_rejects_remote_host(self) -> None:
-        """Test that file URIs with non-localhost hosts are rejected."""
+    def test_parses_remote_host_as_unc(self) -> None:
+        """Test that file URIs with non-localhost hosts parse as UNC paths."""
         uri = "file://remote-server/path/to/file.txt"
         result = parse_file_uri(uri)
-        assert result is None
+        assert result == "//remote-server/path/to/file.txt"
+
+    def test_parses_unc_share(self) -> None:
+        """Test parsing a UNC network share file URI."""
+        uri = "file://server/share/render.exr"
+        result = parse_file_uri(uri)
+        assert result == "//server/share/render.exr"
+
+    def test_parses_unc_share_with_percent_encoding(self) -> None:
+        """Test parsing a UNC network share file URI with percent-encoded characters."""
+        uri = "file://server/share/file%20with%20spaces.txt"
+        result = parse_file_uri(uri)
+        assert result == "//server/share/file with spaces.txt"
 
     def test_rejects_non_file_scheme(self) -> None:
         """Test that non-file:// URIs are rejected."""
