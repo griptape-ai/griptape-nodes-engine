@@ -5,8 +5,10 @@ Values a library passes between nodes are held by their parameter: assigning an 
 replaced or the node goes away. This module is for the other case -- a *resource* the library reuses
 across runs, like a pipeline whose load takes 30 seconds -- which needs a key the library can name again.
 
-The scope binds the two things a node knows and the store does not: which library owns the object, and
-which node produced it.
+The cache belongs to the worker, not to a library. One worker may host several libraries and they can
+hand objects to each other, because they genuinely share a process; what an object cannot do is leave the
+process that built it. The scope binds what a node knows and the store does not: which worker it is in,
+which library it came from, and which node produced it.
 """
 
 from __future__ import annotations
@@ -19,32 +21,35 @@ if TYPE_CHECKING:
 
     from griptape_nodes.retained_mode.managers.resource_manager import ResourceManager
 
-# The owner recorded for a node no library registered, so its keys cannot land in a real library's
-# namespace. Not a valid library name, deliberately.
-UNREGISTERED_OWNER = "<unregistered>"
-
 _MISSING = object()
 
 
 class LocalObjectScope:
     """Reads and writes the local object store on behalf of one node.
 
-    Everything here is scoped to the node's library. A handle from another library resolves to nothing
-    rather than to its object: allowing it would work for as long as both libraries happened to share a
-    process, and stop the moment either moved to a worker.
+    The namespace is the worker this node runs in, which is what physically holds the object. Libraries
+    sharing that worker share the cache and can pass objects to each other. A key from a different
+    process resolves to nothing, because there is nothing here to resolve it to.
     """
 
-    def __init__(self, *, owner: str, source: str) -> None:
-        self._owner = owner
+    def __init__(self, *, library: str | None, source: str) -> None:
+        self._library = library
         self._source = source
 
     @property
     def owner(self) -> str:
-        """The library these objects belong to.
+        """The worker these objects live in.
 
-        A namespace, not an identity: two libraries that both name the same owner share what is under it.
+        Every worker is spawned with its own `GTN_ENGINE_ID`, so this is the identity of the process
+        holding the object, and a key minted anywhere else is recognisably from somewhere else. Read
+        rather than stored: a scope outlives nothing, but the engine reference is fetched lazily anyway.
         """
-        return self._owner
+        return self._manager().engine.engine_identity_manager.engine_id
+
+    @property
+    def library(self) -> str | None:
+        """Which library this node came from, recorded on what it parks so it can release its own."""
+        return self._library
 
     def put(self, value: Any, *, key: str, on_drop: Callable[[Any], None] | None = None) -> str:
         """Hold `value` for this library under `key`, returning the full key to look it up with.
@@ -58,7 +63,14 @@ class LocalObjectScope:
         rebuilding under an unchanged hash does not strand the old one. Pass `on_drop` when releasing
         takes more than dropping the reference, which is true of anything holding GPU memory.
         """
-        return self._manager().put_local_object(value, owner=self._owner, source=self._source, key=key, on_drop=on_drop)
+        return self._manager().put_local_object(
+            value,
+            owner=self.owner,
+            source=self._source,
+            key=self._namespaced(key),
+            library=self._library,
+            on_drop=on_drop,
+        )
 
     def park(
         self, value: Any, *, parameter_name: str, slot: str | None = None, on_drop: Callable[[Any], None] | None = None
@@ -82,10 +94,11 @@ class LocalObjectScope:
         # and it stays off the library-facing `put` on purpose.
         return self._manager().put_local_object(
             value,
-            owner=self._owner,
+            owner=self.owner,
             source=self._source,
             key=f"{self._source}.{parameter_name}#{uuid.uuid4().hex[:8]}",
             slot=slot if slot is not None else parameter_name,
+            library=self._library,
             on_drop=on_drop,
         )
 
@@ -96,27 +109,6 @@ class LocalObjectScope:
         including exactly like a minted one (`sd-xl-1.0#a1b2c3d4`).
         """
         return self._manager().is_parked_key(key)
-
-    def holds(self, value: Any) -> bool:
-        """Whether `value` is a key this library is holding something under, right now.
-
-        Exact, and covers both kinds of entry: one the engine parked for a parameter and one the library
-        named itself through `put`. Shape tests cannot do this -- a library key looks like whatever the
-        library chose -- and getting it wrong on the write path parks the key string as though it were the
-        object.
-        """
-        if not self._is_own_key(value):
-            return False
-        return self._manager().get_local_object(value, owner=self._owner, default=_MISSING) is not _MISSING
-
-    def names_any_stored_key(self, value: Any) -> bool:
-        """Whether `value` is a key the store currently holds anything under, for any owner.
-
-        The write path asks this because parking a key wraps the string as though it were the object: the
-        consumer reads a `str`, and a release hook runs against the key. Ownership is irrelevant to that
-        question -- another library's key must survive unchanged so the read can refuse it by name.
-        """
-        return self._manager().holds_any_key(value)
 
     def parked_keys_within(self, value: Any) -> set[str]:
         """Every parked key reachable inside `value`, `value` itself included.
@@ -173,7 +165,17 @@ class LocalObjectScope:
         # otherwise be put on the wire verbatim to libraries that never saw it.
         if not self._manager().names_a_parked_object(key):
             return False
-        return self._manager().release_parked_key(key, owner=self._owner)
+        return self._manager().release_parked_key(key, owner=self.owner)
+
+    def _namespaced(self, suffix: str) -> str:
+        """A library-chosen suffix, namespaced within the worker by the library that chose it.
+
+        The worker decides who can resolve a key; the library keeps two co-tenants from colliding. Without
+        this, two libraries sharing a worker that both `put` under "config-hash" would silently displace
+        each other and hand one the other's object. Sharing on purpose still works -- a library that is
+        given the full key can resolve it, because the worker matches.
+        """
+        return f"{self._library}/{suffix}"
 
     def key_for(self, suffix: str) -> str:
         """The full key for a suffix this library chose, without putting anything.
@@ -187,13 +189,13 @@ class LocalObjectScope:
                 pipe = build()
                 self.local_objects.put(pipe, key=config_hash, on_drop=release)
         """
-        return self._manager().local_object_key(suffix, owner=self._owner)
+        return self._manager().local_object_key(self._namespaced(suffix), owner=self.owner)
 
     def get(self, key: str) -> Any | None:
         """The object behind `key`, or None if this library is not holding it in this process."""
         if not self._is_own_key(key):
             return None
-        return self._manager().get_local_object(key, owner=self._owner)
+        return self._manager().get_local_object(key, owner=self.owner)
 
     def require(self, key: str, *, parameter_name: str | None = None, node_name: str | None = None) -> Any:
         """The object behind `key`, raising if this process is not holding it.
@@ -214,7 +216,7 @@ class LocalObjectScope:
         # One lookup against a sentinel, rather than asking whether it is held and then reading it: a
         # concurrent drop between those two calls would make this return None from a method contracted to
         # raise, and the caller would fail somewhere deeper with no useful message.
-        value = self._manager().get_local_object(key, owner=self._owner, default=_MISSING)
+        value = self._manager().get_local_object(key, owner=self.owner, default=_MISSING)
         if value is _MISSING:
             raise RuntimeError(self._gone_message(parameter_name=parameter_name, node_name=where_node))
         return value
@@ -240,7 +242,7 @@ class LocalObjectScope:
 
     def key_held_in_slot(self, slot: str, value: Any) -> str | None:
         """The key this node already holds `value` under in `slot`, or None."""
-        return self._manager().key_held_in_slot(owner=self._owner, source=self._source, slot=slot, value=value)
+        return self._manager().key_held_in_slot(owner=self.owner, source=self._source, slot=slot, value=value)
 
     def drop(self, key: str) -> bool:
         """Release one object this library is holding. Returns whether it was released."""
@@ -248,7 +250,7 @@ class LocalObjectScope:
         # map lookup. Nothing was released either way, which is what False already means.
         if not isinstance(key, str):
             return False
-        return self._manager().drop_local_object(key, owner=self._owner)
+        return self._manager().drop_local_object(key, owner=self.owner)
 
     def vacate_slot(self, slot: str, *, keeping: str | None = None) -> None:
         """Release whatever this node parked in `slot`, except the entry behind `keeping`.
@@ -257,14 +259,17 @@ class LocalObjectScope:
         park: an upstream's key passed through, or None. The upstream's own entry cannot be caught here,
         because it sits under the upstream's source.
         """
-        self._manager().vacate_slot(owner=self._owner, source=self._source, slot=slot, keeping=keeping)
+        self._manager().vacate_slot(owner=self.owner, source=self._source, slot=slot, keeping=keeping)
 
     def drop_all(self) -> int:
-        """Release everything THIS library is holding in this process, returning how many went.
+        """Release everything THIS library is holding in this worker, returning how many went.
 
-        What a "clear cache" node calls.
+        What a "clear cache" node calls. Scoped to the library rather than the worker: the cache is shared
+        with whatever else lives here, and emptying a co-tenant's objects is not this node's business.
         """
-        return self._manager().drop_objects_for_owner(self._owner)
+        # No library is its own bucket rather than a no-op, so a node outside any library can still clear
+        # what it put. Only reachable from tests and embedders; every registered node has a library.
+        return self._manager().drop_objects_for_library(self._library)
 
     def _resolve_within(self, value: Any, *, parameter_name: str, node_name: str, memo: dict[int, Any]) -> Any:
         if isinstance(value, str):
@@ -320,7 +325,8 @@ class LocalObjectScope:
         return manager.holds_any_key(value) or manager.names_a_parked_object(value)
 
     def _is_own_key(self, key: Any) -> bool:
-        return isinstance(key, str) and key.startswith(f"{self._owner}:")
+        """Whether this worker minted `key`, which is the same question as whether it can resolve it."""
+        return isinstance(key, str) and key.startswith(f"{self.owner}:")
 
     def _unusable_key_message(self, key: Any, *, parameter_name: str | None, node_name: str) -> str:
         # A key arrives as a parameter value, so it can be any type or missing entirely, and each way of
@@ -337,11 +343,22 @@ class LocalObjectScope:
             cause = "nothing is connected to it"
             remedy = "Connect a node that produces one."
         else:
-            cause = "it was produced by a different node library, and values of this kind cannot be passed between libraries"
-            remedy = "Connect a node from the same library, or one that outputs a saved file instead."
+            # Minted somewhere else: another worker, or the orchestrator reading what a worker made. The
+            # object may be perfectly alive over there, so this must not send anyone off to re-run a
+            # producer that already succeeded.
+            cause = "it is held in another process, and an object cannot leave the process that built it"
+            remedy = (
+                "Read it from a node that runs in the same place as the one that made it, or have that node "
+                "output a saved file instead."
+            )
         return f"Attempted to read {self._where(parameter_name, node_name)}. Failed due to: {cause}. {remedy}"
 
     def _gone_message(self, *, parameter_name: str | None, node_name: str) -> str:
+        """Why a key minted in THIS worker no longer resolves: whatever it named has been released.
+
+        A key from anywhere else never reaches here -- it is not this worker's to look up, and
+        `_unusable_key_message` says so instead.
+        """
         if parameter_name is not None:
             remedy = f"Re-run whatever is connected to '{parameter_name}'."
         else:
@@ -365,14 +382,3 @@ class LocalObjectScope:
         from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         return GriptapeNodes.ResourceManager()
-
-
-def owner_for_library(library_name: str | None) -> str:
-    """The store owner for a library, or the shared unregistered namespace when there is none.
-
-    A node built outside library registration (a test, a sandbox script) still needs somewhere to put
-    things, and one namespace for all of them lets them pass handles to each other.
-    """
-    if not library_name:
-        return UNREGISTERED_OWNER
-    return str(library_name)

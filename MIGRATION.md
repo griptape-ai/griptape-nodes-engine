@@ -13,25 +13,18 @@ Nothing changes for a graph that stays in one process, and nothing changes for v
 data: a string, a number or a dict of them on a declared parameter still travels as itself, because a key
 would be unresolvable on the far side.
 
-Two things do change, and both replace silence with an error.
+The cache belongs to the **worker**, not to a library. One worker can host several libraries, and they
+share it: a co-hosted library handed a key can resolve it, because they genuinely share a process. Keys a
+library chooses through `local_objects.put` are namespaced by that library inside the worker, so
+co-tenants cannot collide. What an object cannot do is leave the process that built it.
 
-**A list or dictionary parameter can no longer declare it.** A container builds its value from its
-children, so there is no single object to hold and nowhere to attach a release hook. The declaration was
-previously accepted and ignored; it now raises when the parameter is added:
+Nothing else changes for existing libraries. A value the transport could only manage by stringifying it
+is still stringified, exactly as before; the cache is opt-in and does not police what it was not asked to
+hold.
 
-```
-Attempted to add parameter 'latents' to node 'Batch'. Failed due to: a list or dictionary parameter
-cannot hold a value that stays in this process. Put the value on an ordinary parameter marked
-serializable=False instead.
-```
-
-Put the batch on an ordinary `Parameter` marked `serializable=False` — a list of tensors is one object as
-far as holding is concerned. A `ParameterList` *consuming* held values is unaffected.
-
-**An unserializable value on an undeclared output raises instead of arriving as a repr.** Crossing a
-worker boundary, such a value used to be coerced by `str()` and the receiver silently got
-`"<Pipeline object at 0x10…>"`. It now fails, naming the parameter and the remedy. If you see this, either
-declare the parameter or send something that is data — a saved file's path or URL.
+A list or dictionary parameter is unaffected: declaring `serializable=False` on one still keeps it out of
+saved workflows exactly as before. It adds no holding, because a container builds its value from its
+children, and unsendable values inside one reaching a boundary get an error naming the remedy.
 
 ## Branched workflows show a title instead of a file path
 

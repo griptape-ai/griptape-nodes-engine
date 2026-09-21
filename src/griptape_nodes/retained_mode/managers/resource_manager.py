@@ -65,6 +65,9 @@ class LocalObjectEntry:
     value: Any
     owner: str
     source: str
+    # Which library parked this. Not part of the namespace -- the worker is -- but a library unloading or
+    # clearing its own cache has to find its objects among its co-tenants'.
+    library: str | None = None
     # Which slot of `source` the engine parked this for, or None when the owner named the key itself.
     # Provenance lives here rather than in the key's shape, because the engine may only ever release
     # what it parked, and an owner-chosen key can look like anything.
@@ -78,7 +81,7 @@ _SAME_VALUE_UNSET = object()
 # random tail. Only for recognising a key whose entry lives in another process.
 # The owner must not be followed by a slash, or a URL is a match ("https://host/a@deadbeef.png#a1b2c3d4"),
 # and the parameter segment is greedy because a parameter may be named with a dot or a hash.
-_MINTED_KEY = re.compile(r"^[^:/]+:[^/].*@[0-9a-f]{8}\..+#[0-9a-f]{8}$")
+_MINTED_KEY = re.compile(r"^[^\s:/]+:[^/].*@[0-9a-f]{8}\..+#[0-9a-f]{8}$")
 
 
 class ResourceManager(EngineScoped):
@@ -369,6 +372,7 @@ class ResourceManager(EngineScoped):
         source: str,
         key: str,
         slot: str | None = None,
+        library: str | None = None,
         on_drop: Callable[[Any], None] | None = None,
     ) -> str:
         """Hold `value` in this process and return the key that refers to it.
@@ -387,6 +391,7 @@ class ResourceManager(EngineScoped):
             owner=owner,
             source=source,
             slot=slot,
+            library=library,
             on_drop=on_drop,
         )
         with self._local_objects_lock:
@@ -658,6 +663,21 @@ class ResourceManager(EngineScoped):
         with self._local_objects_lock:
             doomed = dict(self._local_objects)
             self._local_objects.clear()
+
+        self._invoke_hooks_once_per_object(doomed)
+        return len(doomed)
+
+    def drop_objects_for_library(self, library: str | None) -> int:
+        """Release everything one library parked in this process, leaving its co-tenants' objects alone.
+
+        The namespace is the worker, so a library sharing a worker with others cannot be found by owner.
+        What a library unloading needs, and what a "clear cache" node should do rather than emptying the
+        whole worker.
+        """
+        with self._local_objects_lock:
+            doomed = {key: entry for key, entry in self._local_objects.items() if entry.library == library}
+            for key in doomed:
+                del self._local_objects[key]
 
         self._invoke_hooks_once_per_object(doomed)
         return len(doomed)

@@ -608,6 +608,22 @@ class TestLocalObjectIdentityIsNeverCopied:
     deserialized node mints its own.
     """
 
+    def test_creating_a_node_with_a_supplied_identity_mints_a_fresh_one(
+        self, engine: Engine, library_name: str
+    ) -> None:
+        """Serialization is one way in; a client replaying metadata through CreateNode is the other.
+
+        Node metadata is readable over the bus, so a client duplicating a node by handing its metadata
+        straight back would otherwise get two live nodes sharing one cache identity.
+        """
+        original_name = _create_text_node(engine, library_name, "Original")
+        original = engine.node_manager.get_node_by_name(original_name)
+
+        clone_name = _create_text_node(engine, library_name, "Clone", metadata=dict(original.metadata))
+        clone = engine.node_manager.get_node_by_name(clone_name)
+
+        assert clone.metadata["local_object_source"] != original.metadata["local_object_source"]
+
     def test_a_pasted_node_gets_its_own_identity(self, engine: Engine, library_name: str) -> None:
         node_name = _create_text_node(engine, library_name, "Original")
         original = engine.node_manager.get_node_by_name(node_name)

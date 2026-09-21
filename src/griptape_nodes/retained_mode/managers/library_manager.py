@@ -3047,7 +3047,7 @@ class LibraryManager(EngineScoped):
         #
         # This process only. Reloading every library restarts the workers, which takes their copies with
         # them, but updating or switching the ref of a single library does not.
-        dropped = self.engine.resource_manager.drop_objects_for_owner(request.library_name)
+        dropped = self.engine.resource_manager.drop_objects_for_library(request.library_name)
         if dropped:
             logger.debug(
                 "Released %d held object(s) belonging to library '%s' as it unloaded.",

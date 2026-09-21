@@ -28,7 +28,7 @@ from griptape_nodes.exe_types.core_types import (
     ParameterMode,
     ParameterTypeBuiltin,
 )
-from griptape_nodes.exe_types.local_objects import LocalObjectScope, owner_for_library
+from griptape_nodes.exe_types.local_objects import LocalObjectScope
 from griptape_nodes.exe_types.param_components.execution_status_component import ExecutionStatusComponent
 from griptape_nodes.exe_types.variable_resolver import VariableResolver
 from griptape_nodes.retained_mode.events.base_events import (
@@ -343,7 +343,9 @@ class BaseNode(ABC):
         if metadata is None:
             self.metadata = {}
         else:
-            self.metadata = metadata
+            # Copied: the identity minted below is written in, and a caller reusing one dict
+            # across two nodes would otherwise give the second the first one's identity.
+            self.metadata = dict(metadata)
         # The identity held objects are parked under. Display names are recycled -- delete Producer_1 and
         # the next node created gets Producer_1 back -- so parking under the name would let a new node
         # displace and free a dead node's object while a consumer still holds its key. Minted once here
@@ -740,16 +742,6 @@ class BaseNode(ABC):
             raise ValueError(msg)
         if self.does_name_exist(param.name):
             msg = f"Cannot have duplicate names on parameters. Encountered two instances of '{param.name}'."
-            raise ValueError(msg)
-        # Said here rather than swallowed. A container answers `is_process_local` False -- the container is
-        # not itself the thing held, its children carry the values -- so the declaration would otherwise do
-        # nothing at all, and the author would find out only when a run reached a process boundary.
-        if isinstance(param, ParameterContainer) and not param.serializable:
-            msg = (
-                f"Attempted to add parameter '{param.name}' to node '{self.name}'. Failed due to: a list or "
-                f"dictionary parameter cannot hold a value that stays in this process. Put the value on an "
-                f"ordinary parameter marked serializable=False instead."
-            )
             raise ValueError(msg)
         parameter_group = (
             self.get_group_by_name_or_element_id(param.parent_element_name) if param.parent_element_name else None
@@ -1373,7 +1365,7 @@ class BaseNode(ABC):
         """
         if self._local_objects is None:
             self._local_objects = LocalObjectScope(
-                owner=owner_for_library(self.metadata.get("library")),
+                library=self.metadata.get("library"),
                 source=str(self.metadata["local_object_source"]),
             )
         return self._local_objects

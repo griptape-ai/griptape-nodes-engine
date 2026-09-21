@@ -39,8 +39,12 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueResultFailure,
 )
 
+
 # A node built outside library registration shares this namespace.
-OWNER = "<unregistered>"
+# The cache belongs to the worker, so the namespace is this engine's id, not any library name.
+def _owner(engine: Engine) -> str:
+    return engine.engine_identity_manager.engine_id
+
 
 # The ordinary output value carried alongside each handle, for contrast.
 _STEPS = 20
@@ -133,7 +137,7 @@ def _disconnect(engine: Engine, parameter_name: str) -> None:
 
 
 def _is_held(engine: Engine, key: str) -> bool:
-    return engine.resource_manager.get_local_object(key, owner=OWNER) is not None
+    return engine.resource_manager.get_local_object(key, owner=_owner(engine)) is not None
 
 
 @pytest.fixture
@@ -703,7 +707,7 @@ class TestOneObjectInSeveralEntries:
         _egress(producer)
 
         assert producer.released == []
-        assert engine.resource_manager.get_local_object(second_key, owner=OWNER) is shared
+        assert engine.resource_manager.get_local_object(second_key, owner=_owner(engine)) is shared
 
     def test_reparking_leaves_the_library_cached_copy_alone(self, engine: Engine, flow_name: str) -> None:
         """A library caches the pipeline under a config hash AND assigns it to a handle output.
@@ -781,7 +785,7 @@ class TestAHookRunsOncePerObject:
 
         assert producer.released == []
         assert released == []
-        assert engine.resource_manager.get_local_object(cache_key, owner=OWNER) is pipe
+        assert engine.resource_manager.get_local_object(cache_key, owner=_owner(engine)) is pipe
 
 
 class TestAnOrphanedEntryIsStillCollected:
@@ -825,9 +829,13 @@ class TestAnUnhookedEntryDoesNotSuppressAHookedOne:
         manager = engine.resource_manager
         released: list[str] = []
         shared = Held("shared")
-        manager.put_local_object(shared, owner=OWNER, source="S", key="first-no-hook")
+        manager.put_local_object(shared, owner=_owner(engine), source="S", key="first-no-hook")
         manager.put_local_object(
-            shared, owner=OWNER, source="S", key="second-hooked", on_drop=lambda value: released.append(value.label)
+            shared,
+            owner=_owner(engine),
+            source="S",
+            key="second-hooked",
+            on_drop=lambda value: released.append(value.label),
         )
 
         manager.drop_all_local_objects()
@@ -843,10 +851,10 @@ class TestBatchTeardownIsOncePerObject:
         shared = Held("shared")
         for key in ("a", "b"):
             manager.put_local_object(
-                shared, owner=OWNER, source="S", key=key, on_drop=lambda value: released.append(value.label)
+                shared, owner=_owner(engine), source="S", key=key, on_drop=lambda value: released.append(value.label)
             )
 
-        manager.drop_objects_for_owner(OWNER)
+        manager.drop_objects_for_owner(_owner(engine))
 
         assert released == ["shared"]
 
@@ -873,12 +881,13 @@ class TestTheEnginesOwnReadsNeverSeeTheObject:
     def test_a_value_query_answers_with_the_key(self, engine: Engine, flow_name: str) -> None:
         """GetParameterValueRequest serves the editor and is forwarded from workers mid-execution."""
         consumer = _add(engine, _Consumer(name="Consumer"), flow_name)
-        consumer.set_parameter_value("latent", f"{OWNER}:Producer@abc12345.latent#deadbeef")
+        held_key = f"{_owner(engine)}:Producer@abc12345.latent#deadbeef"
+        consumer.set_parameter_value("latent", held_key)
 
         result = engine.handle_request(GetParameterValueRequest(parameter_name="latent", node_name="Consumer"))
 
         assert isinstance(result, GetParameterValueResultSuccess)
-        assert result.value == f"{OWNER}:Producer@abc12345.latent#deadbeef"
+        assert result.value == held_key
 
     def test_clearing_outputs_reports_keys_not_objects(self, engine: Engine, flow_name: str) -> None:
         """clear() emits a change event per key, and those events reach the editor too."""
@@ -1002,19 +1011,6 @@ class TestDeliveringAValueToTheNextNode:
 
 
 class TestANonSerializableContainer:
-    def test_it_cannot_be_declared_at_all(self, engine: Engine, flow_name: str) -> None:
-        """A container cannot hold a value, so the declaration is refused where it is made.
-
-        It used to be accepted and silently ignored, which meant the author found out at a process
-        boundary, after a node had already produced something.
-        """
-        node = _add(engine, _Producer(name="Producer"), flow_name)
-        latents = ParameterList(name="latents", output_type="Latent", tooltip="")
-        latents.serializable = False
-
-        with pytest.raises(ValueError, match="cannot hold a value that stays in this process"):
-            node.add_parameter(latents)
-
     def test_an_ordinary_container_holding_objects_is_collected_by_nothing(
         self, engine: Engine, flow_name: str
     ) -> None:

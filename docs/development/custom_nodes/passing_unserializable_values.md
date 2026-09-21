@@ -126,62 +126,74 @@ Parameter(
 )
 ```
 
-It runs when:
+The hook belongs to the cache, so it runs when the cache lets an object go:
 
-- **your node runs again** and publishes a new object on that parameter — the
-    previous one is released;
+- **your node runs again** and the cache takes a new object for that parameter —
+    the one it was holding is released;
 - **your node is deleted** and nothing else still refers to the object;
-- **your library unloads**, updates, or switches ref;
+- **your library is unloaded**, or every library is reloaded;
 - **the workflow is closed or cleared.**
 
 It runs once per object, even when one object sits on two outputs.
+
+What it does *not* cover is an object that never reached the cache. If your library
+runs in Shared mode there is no process boundary, so nothing is ever cached and the
+value simply passes by reference the way it always has — there is nothing for the
+cache to release, and freeing it is yours to do as it was before. The same is true
+of an object you overwrite mid-run: only what the parameter holds when the node
+finishes goes in. Two other cases where the hook will not have run: updating a
+single library or switching its git ref does not restart its worker today, so
+objects that worker holds survive into the new code.
 
 ## What you cannot do
 
 **A list or dictionary parameter cannot hold a value.** `ParameterList` and
 `ParameterDictionary` build their value from their children, so there is no single
 object to hold and nowhere to put a release hook. Declaring `serializable=False` on
-one raises when you add the parameter:
-
-> Attempted to add parameter 'latents' to node 'Batch'. Failed due to: a list or
-> dictionary parameter cannot hold a value that stays in this process. Put the
-> value on an ordinary parameter marked serializable=False instead.
+one still does what it always did — keeps the list out of saved workflows — but it
+adds no caching.
 
 Output the whole batch on an ordinary `Parameter` marked `serializable=False` — a
-list of tensors is one object as far as holding is concerned, and that works. Note
-that a `ParameterList` *consuming* held values is fine: each row carries its own
-key, and `get_parameter_list_value` gives you the objects.
+list of tensors is one object as far as holding is concerned, and that works. A
+`ParameterList` *consuming* held values is fine: each row carries its own key, and
+`get_parameter_value` on the container gives you the objects. Prefer that over
+`get_parameter_list_value` for held values, because the latter flattens anything
+iterable and takes a list of tensors apart into their rows.
 
-**An object cannot reach another library.** A key only resolves inside the library
-that made it, whatever process the two happen to share. Reading a key produced by
-a different library tells you so:
+**An object cannot leave the process that built it.** The cache belongs to the
+worker, not to your library: one worker can host several libraries and they share
+it, so a co-hosted library handed a key resolves it fine. What does not work is
+reading a key from a *different* process — another worker, or the orchestrator:
 
 > Attempted to read the value for parameter 'pipeline' on node 'Generate'. Failed
-> due to: it was produced by a different node library, and values of this kind
-> cannot be passed between libraries. Connect a node from the same library, or one
-> that outputs a saved file instead.
+> due to: it is held in another process, and an object cannot leave the process
+> that built it. Read it from a node that runs in the same place as the one that
+> made it, or have that node output a saved file instead.
 
-To hand something to another library, write a file and pass its path or URL.
+Two libraries share a worker only when neither declares its own execution venv, and
+that is not something a graph author can see. So if you ship a library that hands
+objects to a *different* library's nodes, do not rely on co-hosting — write a file
+and pass its path or URL. Within your own library you are always in one worker.
 
-**An input cannot be held.** If an unsendable object reaches a worker-bound node as
-an *input* value, the object is in the orchestrator while the node runs elsewhere,
-so no arrangement gets it there. You will see:
+Keys you choose through `put` are namespaced by your library inside the worker, so a
+co-tenant using the same string for its own cache cannot collide with yours.
 
-> ...Failed due to: a 'StableDiffusionPipeline' cannot be converted to data. It was
-> built in this process while the node runs in another, so it cannot be passed by
-> reference either. Have the node that produces it run in the same library as this
-> one, or output a saved file instead.
+**An input is never cached.** Caching one would mint a key the far side has nothing
+to resolve against: the object is in the sending process while the node runs
+elsewhere. Only outputs go in the cache, so an object handed to a worker-bound node
+as an input value gets whatever the transport makes of it, exactly as before. If you
+need it over there, have the node that produces it run in the same library, or write
+a file.
 
 **Nothing is held across a reload.** Keys refer to memory in a running process.
 
 ## Errors you may see, and what they mean
 
-| Message contains                                                                                             | Means                                                                                                           |
-| ------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------- |
-| `cannot be converted to data. Mark that parameter serializable=False`                                        | your node produced an object on an undeclared output, and it would have been mangled into a repr on the way out |
-| `it is no longer available, which happens after the workflow is reloaded or the node that made it is re-run` | the key your node read is stale. Re-run the producer; this is working as intended, not a lost object            |
-| `produced by a different node library`                                                                       | cross-library wire; see above                                                                                   |
-| `nothing is connected to it`                                                                                 | the input is unwired                                                                                            |
+| Message contains                                                                                             | Means                                                                                                                                                                         |
+| ------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `it is no longer available, which happens after the workflow is reloaded or the node that made it is re-run` | the key was minted in this process and what it named has since been released. Re-run the producer; this is working as intended, not a lost object                             |
+| `held in another process`                                                                                    | you are reading it from somewhere other than the process that built it — most often from validation or a value hook, which run in the orchestrator rather than in your worker |
+| `nothing is connected to it`                                                                                 | the input is unwired                                                                                                                                                          |
 
 That second one is a feature. Keys are unique per assignment, so a consumer
 holding one from a previous run finds it dangling rather than silently resolving to
@@ -199,7 +211,9 @@ not have to do anything for this; it is the same declaration doing the work.
 - Producing output declared `serializable=False`, with `on_local_object_drop` if
     releasing it takes more than dropping a reference.
 - Consuming parameter declares nothing.
-- Producer and consumer are in the same library.
+- Producer and consumer run in the same worker, which is automatic within one library.
 - Anything with a URL in it (`ImageUrlArtifact` and friends) is left undeclared so
     it travels as data.
+- If your nodes can run in Shared mode, do not rely on the release hook: nothing is
+    cached there, so nothing is released.
 - Batches go on an ordinary parameter, not a `ParameterList` output.

@@ -131,7 +131,8 @@ class TestHandingAnObjectToTheNextNode:
         raw = consumer.get_raw_parameter_value("pipeline")
 
         assert isinstance(raw, str)
-        assert raw.startswith("Diffusers:")
+        # Namespaced by the worker holding it, not by the library: the cache belongs to the process.
+        assert raw.startswith(f"{consumer.local_objects.owner}:")
         assert consumer.get_parameter_value("pipeline") is not raw
 
 
@@ -167,9 +168,12 @@ class TestWhatTheAuthorSeesWhenSomethingIsWrong:
     """Each way of being wrong needs a different fix, so each gets its own answer."""
 
     def test_the_object_is_gone(self) -> None:
-        """A reopened workflow holds keys into a process that no longer exists."""
-        consumer = _consumer()
-        consumer.set_parameter_value("pipeline", "Diffusers:LoadPipeline@abc12345.pipeline#deadbeef")
+        """A key this worker minted whose object has since been released: re-running the producer is the fix."""
+        producer, consumer = _producer(), _consumer()
+        producer.parameter_output_values["pipeline"] = Pipeline("flux")
+        key = _egress(producer)["pipeline"]
+        consumer.set_parameter_value("pipeline", key)
+        assert producer.local_objects.drop(key) is True
 
         with pytest.raises(RuntimeError) as caught:
             consumer.get_parameter_value("pipeline")
@@ -178,6 +182,22 @@ class TestWhatTheAuthorSeesWhenSomethingIsWrong:
         assert "no longer available" in message
         assert "parameter 'pipeline'" in message
         assert "Re-run whatever is connected to 'pipeline'." in message
+
+    def test_a_key_from_another_process_does_not_say_re_run(self) -> None:
+        """The object may be alive in the worker that made it, so this must not send anyone re-running.
+
+        The orchestrator reading a worker's key is the everyday case: it instantiates the node classes
+        too, so anything a library does outside `process` lands here.
+        """
+        consumer = _consumer()
+        consumer.set_parameter_value("pipeline", "some-other-worker:LoadPipeline@abc12345.pipeline#deadbeef")
+
+        with pytest.raises(RuntimeError) as caught:
+            consumer.get_parameter_value("pipeline")
+
+        message = str(caught.value)
+        assert "held in another process" in message
+        assert "Re-run" not in message
 
     def test_nothing_is_connected(self) -> None:
         consumer = _consumer()
@@ -196,21 +216,20 @@ class TestWhatTheAuthorSeesWhenSomethingIsWrong:
 
         assert consumer.get_parameter_value("pipeline") is wrong_value
 
-    def test_a_key_from_another_library_says_so(self) -> None:
-        """A key never resolves outside the library that made it, whatever process they share."""
+    def test_two_libraries_sharing_a_worker_share_its_objects(self) -> None:
+        """The cache belongs to the worker, and libraries co-hosted in it genuinely share a process.
+
+        Refusing this would only hold while they happened to be co-hosted, and the object is right there.
+        """
         other_library = _LibraryNode(name="TheirLoader", metadata={"library": "SomeoneElse"})
         other_library.add_parameter(Parameter(name="pipeline", output_type="Pipeline", tooltip="", serializable=False))
-        other_library.parameter_output_values["pipeline"] = Pipeline("theirs")
+        theirs = Pipeline("theirs")
+        other_library.parameter_output_values["pipeline"] = theirs
 
         consumer = _consumer()
         consumer.set_parameter_value("pipeline", _egress(other_library)["pipeline"])
 
-        with pytest.raises(RuntimeError) as caught:
-            consumer.get_parameter_value("pipeline")
-
-        message = str(caught.value)
-        assert "different node library" in message
-        assert "Re-run" not in message
+        assert consumer.get_parameter_value("pipeline") is theirs
 
     def test_a_serializable_parameter_keeps_its_value(self) -> None:
         node = _LibraryNode(name="Settings")
@@ -221,21 +240,26 @@ class TestWhatTheAuthorSeesWhenSomethingIsWrong:
 
         assert node.parameter_output_values["steps"] == steps
 
-    def test_declaring_it_on_a_container_is_refused_when_the_parameter_is_added(self) -> None:
-        """The declaration cannot be honoured on a container, so it is refused where it is made.
+    def test_a_container_is_not_held(self) -> None:
+        """A container is never itself held, whatever it declares.
 
         Holding a whole list as one object would hand a downstream list one opaque key, and a container has
-        nowhere to put a release hook -- its elements are ordinary parameters. Saying so when the parameter
-        is added beats saying it once a run has reached a process boundary.
+        nowhere to put a release hook -- its elements are ordinary parameters. The declaration still means
+        what it always meant here, "do not persist this", so it is accepted; what it cannot add is holding,
+        and the boundary says so if unsendable values in a container ever try to cross.
         """
         node = _LibraryNode(name="Batch")
         latents = ParameterList(name="latents", output_type="Latent", tooltip="")
         # ParameterList does not accept `serializable` through __init__; setting it directly is the only
         # way to reach the case.
         latents.serializable = False
+        node.add_parameter(latents)
+        batch = [Pipeline("a"), Pipeline("b")]
 
-        with pytest.raises(ValueError, match="cannot hold a value that stays in this process"):
-            node.add_parameter(latents)
+        node.parameter_output_values["latents"] = batch
+
+        assert latents.is_process_local is False
+        assert node.parameter_output_values["latents"] is batch
 
 
 class TestCachingAnExpensiveResourceAcrossRuns:
@@ -295,20 +319,18 @@ class TestBothDictsCross:
         assert node.parameter_values["incoming"] is pipeline
         assert node.get_parameter_value("incoming") is pipeline
 
-    def test_an_unsendable_input_is_refused_rather_than_held(self) -> None:
-        """Holding an input would mint a key the far side has nothing to resolve against.
+    def test_an_input_is_never_cached(self) -> None:
+        """Caching an input would mint a key the far side has nothing to resolve against.
 
-        The object is in this process and the node runs in another, so there is no arrangement under
-        which it arrives. Saying so now beats a key that fails forever with "re-run the producer".
+        The object is in this process and the node runs in another, so no arrangement gets it there. The
+        value is passed through as it always was rather than being turned into an unusable key.
         """
         node = _producer()
         node.add_parameter(Parameter(name="incoming", input_types=["Pipeline"], tooltip="", serializable=False))
-        node.set_parameter_value("incoming", Pipeline("flux"))
+        pipeline = Pipeline("flux")
+        node.set_parameter_value("incoming", pipeline)
 
-        with pytest.raises(TypeError) as caught:
-            _egress(node, are_outputs=False)
-
-        assert "cannot be passed by reference either" in str(caught.value)
+        assert _egress(node, are_outputs=False)["incoming"] is pipeline
 
     def test_a_key_arriving_on_an_input_is_not_parked_again(self) -> None:
         """A consumer receives keys, and re-parking one would wrap the string as though it were an object."""
@@ -397,8 +419,7 @@ class TestAParameterWithAnInputAndAnOutputValue:
         assert node.local_objects.get(out_key) is outgoing
         # The input value is still the object the node was handed; nothing minted a key for it.
         assert node.get_parameter_value("pipeline") is incoming
-        with pytest.raises(TypeError):
-            _egress(node, are_outputs=False)
+        assert _egress(node, are_outputs=False)["pipeline"] is incoming
 
 
 class TestAConsumerThatDeclaresNothing:

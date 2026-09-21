@@ -354,16 +354,21 @@ class TestLibraryUnloadClears:
     """
 
     def test_unload_releases_only_the_unloaded_library(self, engine: Engine) -> None:
+        """Two libraries sharing this worker share its cache, so unload has to pick out its own entries."""
         manager = engine.resource_manager
+        worker = engine.engine_identity_manager.engine_id
         released: list[str] = []
         mine = manager.put_local_object(
             Held("mine"),
-            owner="MyLib",
+            owner=worker,
             source="N",
             key="N-slot",
+            library="MyLib",
             on_drop=lambda value: released.append(value.label),
         )
-        theirs = manager.put_local_object(Held("theirs"), owner="OtherLib", source="N", key="N-slot")
+        theirs = manager.put_local_object(
+            Held("theirs"), owner=worker, source="Other", key="Other-slot", library="OtherLib"
+        )
 
         with (
             patch.object(LibraryRegistry, "unregister_library"),
@@ -374,9 +379,9 @@ class TestLibraryUnloadClears:
             )
 
         assert isinstance(result, UnloadLibraryFromRegistryResultSuccess)
-        assert manager.get_local_object(mine, owner="MyLib") is None
+        assert manager.get_local_object(mine, owner=worker) is None
         assert released == ["mine"]
-        assert manager.get_local_object(theirs, owner="OtherLib") is not None
+        assert manager.get_local_object(theirs, owner=worker) is not None
 
 
 class TestWorkflowStateClearReleasesObjects:

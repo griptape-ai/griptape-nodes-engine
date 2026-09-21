@@ -830,11 +830,20 @@ class NodeManager(EngineScoped):
                 specific_library_name=request.specific_library_name,
                 event_manager=self.engine.event_manager,
             )
+            # The identity held objects are cached under belongs to one live node and is minted in
+            # BaseNode.__init__. It travels in metadata so a worker's transient node keeps it, and metadata
+            # is readable by clients (GetNodeMetadata, GetAllNodeInfo), so a client duplicating a node by
+            # replaying it would otherwise get two live nodes sharing one identity -- and the second one's
+            # first cached object would displace and free the first's while a consumer still names its key.
+            # Serialization strips it for the same reason; this is the other way in.
+            requested_metadata = request.metadata
+            if requested_metadata is not None and "local_object_source" in requested_metadata:
+                requested_metadata = {k: v for k, v in requested_metadata.items() if k != "local_object_source"}
             node = LibraryRegistry.create_node(
                 name=final_node_name,
                 node_type=request.node_type,
                 specific_library_name=request.specific_library_name,
-                metadata=request.metadata,
+                metadata=requested_metadata,
             )
         # modifying to exception to try to catch all possible issues with node creation.
         except Exception as err:

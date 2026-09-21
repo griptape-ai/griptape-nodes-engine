@@ -4,9 +4,9 @@ Parking lives here rather than on the write path: a node's own dicts keep the re
 back what you just assigned works, and a graph that never crosses a boundary never parks anything.
 """
 
+import uuid
 from typing import Any
 
-import pytest
 from griptape.artifacts import TextArtifact
 from griptape.drivers.prompt.openai import OpenAiChatPromptDriver
 
@@ -96,18 +96,28 @@ class TestWhatCrosses:
         assert _send(node)["pipeline"] == "sk-secret-123"
 
 
-class TestWhenTheAuthorDidNotSaySo:
-    def test_an_unsendable_value_on_an_ordinary_parameter_raises(self) -> None:
-        """The transport coerces with str(), so silence here ships a repr to the other side."""
+class TestWhatTheFeatureDoesNotTouch:
+    """Anything not declared is passed through exactly as before, whatever the transport makes of it.
+
+    The cache is opt-in. Policing values the transport stringifies is a separate, pre-existing concern and
+    not this feature's to enforce -- refusing them here broke graphs that worked, for values like UUID and
+    Decimal that cross perfectly well.
+    """
+
+    def test_an_undeclared_unsendable_value_is_passed_through(self) -> None:
         node = _node()
-        node.parameter_output_values["steps"] = Pipeline("flux")
+        driver = OpenAiChatPromptDriver(model="gpt-4o", api_key="sk-test")
+        node.parameter_output_values["steps"] = driver
 
-        with pytest.raises(TypeError) as caught:
-            _send(node)
+        assert _send(node)["steps"] is driver
 
-        message = str(caught.value)
-        assert "'steps'" in message
-        assert "serializable=False" in message
+    def test_a_uuid_still_crosses(self) -> None:
+        """The transport ships it as a string; refusing it was a regression this feature caused."""
+        node = _node()
+        identifier = uuid.uuid4()
+        node.parameter_output_values["steps"] = identifier
+
+        assert _send(node)["steps"] is identifier
 
 
 class TestSendingTwice:
@@ -162,19 +172,15 @@ class TestAListOfHeldValues:
         assert read["base"].label == "flux"
         assert read["count"] == _STEPS
 
-    def test_a_container_output_of_unsendable_values_says_what_to_do(self) -> None:
-        """The container is never itself held, so the ordinary remedy would send the author in a circle."""
+    def test_a_container_output_is_not_cached(self) -> None:
+        """A container is never itself held: its children carry the values and it has no release hook."""
         node = _LibraryNode(name="Batch", metadata={"library": "Diffusers"})
         latents = ParameterList(name="latents", output_type="Latent", tooltip="")
         node.add_parameter(latents)
-        node.parameter_output_values["latents"] = [Pipeline("a"), Pipeline("b")]
+        batch = [Pipeline("a"), Pipeline("b")]
+        node.parameter_output_values["latents"] = batch
 
-        with pytest.raises(TypeError) as caught:
-            _send(node)
-
-        message = str(caught.value)
-        assert "cannot be kept here as a whole" in message
-        assert "ordinary parameter marked serializable=False" in message
+        assert _send(node)["latents"] is batch
 
 
 class TestReadingAnOrdinaryContainer:
@@ -356,15 +362,20 @@ class TestDeclaringItOnAContainer:
     the author learned that only when a node had already produced something at a process boundary.
     """
 
-    def test_adding_a_declared_container_is_refused(self) -> None:
+    def test_a_declared_container_keeps_its_persistence_meaning_but_is_not_held(self) -> None:
+        """The flag still means "do not save this list", which is what it meant before any of this.
+
+        What it cannot add on a container is holding, because a container builds its value from children
+        and has nowhere to attach a release hook. An unsendable value in one is caught at the boundary
+        with a message saying what to do instead.
+        """
         node = _LibraryNode(name="Batch", metadata={"library": "Diffusers"})
         latents = ParameterList(name="latents", output_type="Latent", tooltip="")
         latents.serializable = False
+        node.add_parameter(latents)
 
-        with pytest.raises(ValueError, match="cannot hold a value that stays in this process") as caught:
-            node.add_parameter(latents)
-
-        assert "ordinary parameter marked serializable=False" in str(caught.value)
+        assert latents.serializable is False
+        assert latents.is_process_local is False
 
     def test_an_ordinary_container_is_fine(self) -> None:
         node = _LibraryNode(name="Batch", metadata={"library": "Diffusers"})
