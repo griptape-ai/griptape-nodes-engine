@@ -21,6 +21,7 @@ dotted key of its own, so it gets a table under Entry Types, linked from the set
 """
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -177,7 +178,9 @@ def _rows_for_property(
                 env_var_label="n/a (see sub-keys)",
                 description=description,
                 category=category,
-                schema=prop,
+                # The model is flattened into the rows below, not an entry type, so this row
+                # must not feed its ref to _ordered_entry_refs.
+                schema={},
             )
         )
     rows.extend(
@@ -294,8 +297,12 @@ def _ref_type_label(ref: str, defs: dict) -> str:
 
 def _entry_type_link(ref: str, defs: dict) -> str:
     title = _entry_type_title(ref, defs)
-    anchor = title.lower()
-    return f"[{title}](#{anchor})"
+    return f"[{title}](#{_slugify(title)})"
+
+
+def _slugify(title: str) -> str:
+    """The heading anchor mkdocs derives from a title: lowercased, non-word runs hyphenated."""
+    return re.sub(r"[^\w]+", "-", title.lower()).strip("-")
 
 
 def _entry_type_title(ref: str, defs: dict) -> str:
@@ -388,10 +395,34 @@ def _any_of_label(any_of: list, defs: dict) -> str:
     for option in any_of:
         if option.get("type") == "null":
             continue
-        labels.append(_resolve_type_label(option, defs))
+        labels.append(_grouped_type_label(option, defs))
     if not labels:
         return "any"
     return " or ".join(labels)
+
+
+def _grouped_type_label(prop: dict, defs: dict) -> str:
+    """A type label parenthesized when it is composite, so nesting one in another stays readable.
+
+    Without it, `list[str] | dict[str, str]` and `list[str | SomeModel]` both render as
+    `array of string or object`, and only one of them means that.
+    """
+    label = _resolve_type_label(prop, defs)
+    if _is_composite(prop, defs):
+        return f"({label})"
+    return label
+
+
+def _is_composite(prop: dict, defs: dict) -> bool:
+    """True when a property's label reads as more than one word, i.e. a union or an array."""
+    if prop.get("type") == "array":
+        return True
+    options = [option for option in prop.get("anyOf", []) if option.get("type") != "null"]
+    if len(options) > 1:
+        return True
+    if len(options) == 1:
+        return _is_composite(options[0], defs)
+    return False
 
 
 def _array_label(prop: dict, defs: dict) -> str:
@@ -399,10 +430,7 @@ def _array_label(prop: dict, defs: dict) -> str:
     items = prop.get("items")
     if not isinstance(items, dict):
         return "array"
-    item_label = _resolve_type_label(items, defs)
-    if " or " in item_label:
-        return f"array of ({item_label})"
-    return f"array of {item_label}"
+    return f"array of {_grouped_type_label(items, defs)}"
 
 
 def _resolve_default_label(path: tuple[str, ...], defaults: dict) -> str:
@@ -413,7 +441,7 @@ def _resolve_default_label(path: tuple[str, ...], defaults: dict) -> str:
     default_value = _lookup_default(path, defaults)
 
     if isinstance(default_value, list) and len(default_value) > MAX_DEFAULT_LIST_ITEMS:
-        head = ", ".join(json.dumps(item) for item in default_value[:MAX_DEFAULT_LIST_ITEMS])
+        head = ", ".join(_normalize_cell(json.dumps(item)) for item in default_value[:MAX_DEFAULT_LIST_ITEMS])
         return f"`[{head}, ...]` ({len(default_value)} items)"
 
     return f"`{_normalize_cell(json.dumps(default_value))}`"
