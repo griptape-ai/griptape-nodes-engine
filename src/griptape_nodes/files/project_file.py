@@ -1,7 +1,7 @@
 """ProjectFileDestination - project-aware FileDestination built from a situation template."""
 
 import logging
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from griptape_nodes.common.macro_parser import ParsedMacro
 from griptape_nodes.common.project_templates.situation import SituationFilePolicy
@@ -130,12 +130,18 @@ class ProjectFileDestination(FileDestination):
                 f"Add the file name you want, for example 'file:///renders/output.png'."
             )
             raise ValueError(msg)
-        if local_path_from_uri is not None and not Path(local_path_from_uri).is_absolute():
-            # Only honored when the path the URI names is absolute on THIS host.
-            # `file:///C:/renders/out.png` yields `C:/renders/out.png`, which POSIX reads as
-            # relative, so the bypass below would hand a relative string to File.resolve()
-            # and land at `{workspace}/C:/renders/out.png` -- a directory named `C:` inside
-            # the workspace. Refuse instead of anchoring it somewhere nobody asked for.
+        if (
+            local_path_from_uri is not None
+            and PureWindowsPath(local_path_from_uri).is_absolute()
+            and not Path(local_path_from_uri).is_absolute()
+        ):
+            # A drive-anchored path on a host that has no drives. `file:///C:/renders/out.png`
+            # yields `C:/renders/out.png`, which POSIX reads as relative, so the bypass below
+            # would hand a relative string to File.resolve() and land at
+            # `{workspace}/C:/renders/out.png` -- a directory named `C:` inside the workspace.
+            # Tested against PureWindowsPath rather than the host's own is_absolute() so a
+            # leading-slash path, which Windows resolves against the current drive, still
+            # reaches the bypass on Windows.
             msg = (
                 f"Attempted to save to '{filename}'. Failed because that address does not name a location "
                 f"on this computer. A path from another operating system, such as a 'C:' drive on macOS or "
@@ -180,12 +186,15 @@ class ProjectFileDestination(FileDestination):
 
         # An explicit on-disk location bypasses the situation macro: the caller is
         # declaring where the file goes, so honor it verbatim rather than treating the
-        # leading-slash directory as sub_dirs within {outputs}/etc. A file:// URI arrives
-        # here as the absolute path it named, so this one condition covers both shapes.
+        # leading-slash directory as sub_dirs within {outputs}/etc. Two shapes qualify --
+        # an absolute filename, and a file:// URI, whose local path we substituted above.
+        # The URI keeps its own flag because `file:///renders/out.png` is not is_absolute()
+        # on Windows, where a driveless path is current-drive-relative; without it that URI
+        # would fall into sub_dirs on Windows only.
         # No sidecar metadata: the situation macro + variables won't re-resolve to the
         # actual on-disk location, so recording them would produce a dishonest
         # provenance trail.
-        if parts.directory.is_absolute():
+        if local_path_from_uri is not None or parts.directory.is_absolute():
             return cls(
                 filename,
                 existing_file_policy=existing_file_policy,

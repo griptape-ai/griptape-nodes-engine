@@ -552,7 +552,9 @@ class TestProjectFileDestinationInit:
             HANDLE_REQUEST_PATH,
             return_value=GetSituationResultSuccess(situation=save_node_output_situation, result_details="ok"),
         ):
-            dest = ProjectFileDestination.from_situation(f"file://{tmp_path}/out.png", "save_node_output")
+            # as_uri() spells the host's own absolute path correctly -- plain concatenation
+            # yields `file://C:\...` on Windows, whose `C:` parses as the URI's host.
+            dest = ProjectFileDestination.from_situation((tmp_path / "out.png").as_uri(), "save_node_output")
 
         # `location` is only the stored string, so it passes whether or not the path is
         # honored. Resolving is what distinguishes the two.
