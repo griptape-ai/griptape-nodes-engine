@@ -163,6 +163,17 @@ orchestrator at that point. Bus calls from `__init__` reentrantly
 hit the worker's own event loop, which is why `__init__` has its own
 strict-mode rule (next section).
 
+## Passing values that cannot be serialized
+
+A pipeline, a latent tensor or a live driver has no data form, so it cannot travel
+between your worker and the orchestrator as a parameter value. Mark the producing
+output `serializable=False` and the engine holds the object in the process that
+built it, sending only a key; the consuming node declares nothing and reads the
+object normally. See
+[Passing Values That Cannot Be Serialized](passing_unserializable_values.md) for
+the full picture, including release hooks for anything holding GPU memory and the
+restrictions on containers and cross-library wires.
+
 ## Lifecycle changes you need to know
 
 ### `__init__` runs during library load

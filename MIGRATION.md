@@ -1,5 +1,38 @@
 # Unreleased
 
+## `serializable=False` outputs are held in their own process across a worker boundary
+
+`Parameter(serializable=False)` has always kept a value out of saved workflow files. On an **output** it
+now also means "hold this object in the process that produced it": when the value would cross a worker
+process boundary, the engine keeps the object where it is and sends an opaque key in its place, and the
+consuming node's read turns the key back into the object. This is how a library isolated in a worker hands
+a pipeline or a latent tensor to its next node. See
+[Passing Values That Cannot Be Serialized](docs/development/custom_nodes/passing_unserializable_values.md).
+
+Nothing changes for a graph that stays in one process, and nothing changes for values that are already
+data: a string, a number or a dict of them on a declared parameter still travels as itself, because a key
+would be unresolvable on the far side.
+
+Two things do change, and both replace silence with an error.
+
+**A list or dictionary parameter can no longer declare it.** A container builds its value from its
+children, so there is no single object to hold and nowhere to attach a release hook. The declaration was
+previously accepted and ignored; it now raises when the parameter is added:
+
+```
+Attempted to add parameter 'latents' to node 'Batch'. Failed due to: a list or dictionary parameter
+cannot hold a value that stays in this process. Put the value on an ordinary parameter marked
+serializable=False instead.
+```
+
+Put the batch on an ordinary `Parameter` marked `serializable=False` — a list of tensors is one object as
+far as holding is concerned. A `ParameterList` *consuming* held values is unaffected.
+
+**An unserializable value on an undeclared output raises instead of arriving as a repr.** Crossing a
+worker boundary, such a value used to be coerced by `str()` and the receiver silently got
+`"<Pipeline object at 0x10…>"`. It now fails, naming the parameter and the remedy. If you see this, either
+declare the parameter or send something that is data — a saved file's path or URL.
+
 ## Branched workflows show a title instead of a file path
 
 Branching a workflow used to set the new workflow's `metadata.name` — the human-readable display
