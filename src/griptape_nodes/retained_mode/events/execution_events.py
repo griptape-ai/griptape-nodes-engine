@@ -116,7 +116,9 @@ class StartLocalSubflowRequest(RequestPayload):
     Args:
         flow_name: Name of the flow to start as a subflow
         start_node: The node to start execution from (None to auto-detect start node)
-        pickle_control_flow_result: Whether to pickle the result for subprocess retrieval
+        pickle_control_flow_result: Ignored. Pickling happens while broadcasting
+            ControlFlowResolvedEvent, and a local subflow always runs isolated, which does not
+            broadcast that event -- so there is no result to pickle for this request.
 
     Results: StartLocalSubflowResultSuccess | StartLocalSubflowResultFailure
     """

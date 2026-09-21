@@ -139,15 +139,12 @@ class CompleteState(State):
     async def on_enter(context: ControlFlowContext) -> type[State] | None:
         context.end_node = None
 
-        # Isolated flows are packaged copies of a loop body, so this state is entered once per
-        # iteration. ControlFlowResolvedEvent means "the run is over" to everything that listens:
-        # the editor clears its running-node sets on it, and LocalWorkflowExecutor treats the first
-        # one it sees as the workflow finishing. It carries no flow identity to say *which* run
-        # ended, so announcing an iteration's completion told the editor the whole run was over
-        # while the group was still going -- which dropped the running group out of resolvingNodes
-        # from iteration 1 onward and left its status pill reading "Unresolved" (issue #5486).
-        # Nothing needs the announcement: a subflow's completion is detected by
-        # `await subflow_machine.start_flow(...)` returning, never by this event.
+        # An isolated flow is a packaged copy of a loop body, entered once per iteration, and it is
+        # not the run anyone is watching. ControlFlowResolvedEvent means "the run is over" to every
+        # listener -- the editor clears its running-node sets on it, LocalWorkflowExecutor treats
+        # the first one as the workflow finishing -- and it carries no flow identity to say which
+        # run ended, so an isolated flow must not send it (issue #5486). Nothing needs it either:
+        # a subflow's completion is detected by `await subflow_machine.start_flow(...)` returning.
         if context.is_isolated:
             logger.debug("Isolated subflow '%s' is complete.", context.flow_name)
             return None
@@ -229,11 +226,11 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
         if start_node != end_node and not self._context.is_isolated:
             # This blocks all nodes in the entire flow from running. If we're just resolving one node, we don't want to block that.
             #
-            # Isolated flows are excluded because they are packaged copies of a loop body: their
-            # node names exist only inside the engine, and InvolvedNodesEvent carries no flow
-            # identity, so the editor -- which keeps one involved-node set and replaces it
-            # wholesale -- had its set overwritten with names it cannot draw. That took down the
-            # status pill of the very group that was running (issue #5486).
+            # An isolated flow is excluded because it is a packaged copy of a loop body, whose node
+            # names exist only inside the engine. InvolvedNodesEvent carries no flow identity and
+            # the editor keeps one involved-node set that it replaces wholesale, so an isolated
+            # flow announcing itself overwrites that set with names the canvas cannot draw --
+            # including the group that is running the iteration (issue #5486).
             involved_nodes = flow_manager.get_involved_node_names(flow)
             self._context.engine.event_manager.put_event(
                 ExecutionGriptapeNodeEvent(

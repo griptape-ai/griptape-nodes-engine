@@ -737,6 +737,25 @@ class TestGetInvolvedNodeNames:
 
         assert sorted(involved) == ["child", "deep_child", "inner_group", "loose", "outer_group"]
 
+    def test_a_child_the_flow_still_holds_is_named_once(self, engine: Engine) -> None:
+        """A plain group leaves its children in the flow's ``nodes`` too, so the walk meets them twice.
+
+        Only a SubflowNodeGroup relocates its children into a subflow; a plain BaseNodeGroup takes a
+        node into its own dict and the flow goes on holding it. That is the ordinary, well-formed
+        shape for such a group, and the announcement must not name the child twice because of it.
+        """
+        child = MagicMock(spec=BaseNode)
+        child.name = "child"
+        group = MagicMock(spec=BaseNodeGroup)
+        group.name = "group"
+        group.nodes = {"child": child}
+        flow = MagicMock(spec=ControlFlow)
+        flow.nodes = {"group": group, "child": child}
+
+        involved = engine.flow_manager.get_involved_node_names(flow)
+
+        assert sorted(involved) == ["child", "group"]
+
     def test_group_cycle_terminates(self, engine: Engine) -> None:
         """A malformed group that contains itself must not hang the walk."""
         cyclic_group = MagicMock(spec=BaseNodeGroup)

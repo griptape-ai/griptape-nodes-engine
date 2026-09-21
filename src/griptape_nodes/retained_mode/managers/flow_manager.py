@@ -5048,8 +5048,11 @@ class FlowManager(EngineScoped):
         """
         involved_node_names: list[str] = []
         nodes_to_visit = list(flow.nodes.values())
-        # Guard against a malformed group cycle rather than looping forever, the same way
-        # BaseNodeGroup.get_enclosing_groups does.
+        # Deduplicates. A plain BaseNodeGroup takes a node into its own `nodes` dict without
+        # removing it from the flow's -- only a SubflowNodeGroup relocates its children -- so on a
+        # well-formed graph the walk reaches such a child twice, once from the flow and once from
+        # the group. Without this set the name would be announced twice. (Cycles cannot happen:
+        # BaseNodeGroup._validate_nodes_can_be_nested rejects them when the node is added.)
         visited_node_ids: set[int] = set()
         while nodes_to_visit:
             node = nodes_to_visit.pop()

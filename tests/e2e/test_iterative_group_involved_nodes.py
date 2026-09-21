@@ -1,22 +1,14 @@
-"""Regression test for issue #5486: a running group must stay in the editor's involved nodes.
+"""A running group must stay in the editor's involved nodes for the whole run (issue #5486).
 
-The editor keeps ONE involved-node set and replaces it wholesale on every `InvolvedNodesEvent`,
-and it draws a group's "Running" pill only while the group is in that set. Each iteration of a
-group body runs as its own isolated `ControlFlowMachine`, and `start_flow` used to announce that
-transient flow's nodes unconditionally -- so iteration 1 replaced the set with packaged copies
-(`Body_1`, `Start_Package_MultiNode`) that the canvas has never heard of, and the group fell out
-of it for the rest of the run. The pill went dark in both execution modes; it was only *reported*
-against "Run Group Items All at Once" because in sequential mode the real child node keeps
-lighting up, so the group still reads as busy.
+The invariant under test: an isolated flow is a packaged copy of a loop body, so it describes no
+run the canvas is watching and must broadcast neither of the two whole-flow lifecycle events. Both
+are unqualified -- `InvolvedNodesEvent` replaces the editor's single involved-node set wholesale,
+`ControlFlowResolvedEvent` reads as "the run is over" -- and neither carries a flow name, so
+either one sent per iteration is attributed to the run the artist started.
 
-A second, closely related leak from the same isolated flows: they also announced their own
-completion. `ControlFlowResolvedEvent` reads as "the run is over" to every listener -- the editor
-clears its running-node sets on it -- so a per-iteration announcement extinguished the running
-group from iteration 1 onward.
-
-Asserted here, over both execution modes, by draining the same queue the websocket serializes
-from: every involvement announcement names the group and the group's real child, none of them ever
-names a packaged copy, and no flow announces itself as finished while the group is still running.
+Asserted over both execution modes by draining the same queue the websocket serializes from: every
+involvement announcement names the group and the group's real child, none ever names a packaged
+copy, and no flow announces itself as finished while the group is still running.
 """
 
 from __future__ import annotations
@@ -65,6 +57,10 @@ GROUP_NODE_NAME = "ForEachGroup"
 CHILD_NODE_NAME = "Body"
 # Names the packager generates. None of these exist on the canvas, so none may be announced.
 PACKAGED_NAME_MARKERS = ("_Package", "Package_", f"{CHILD_NODE_NAME}_")
+
+# A run announces involvement at least twice: once when it starts, and once with an empty list when
+# it ends. Anything less means the mid-run announcement never arrived.
+MINIMUM_ANNOUNCEMENTS = 2
 
 
 def _drain_execution_payloads(queue: asyncio.Queue) -> list[Any]:
@@ -191,7 +187,10 @@ async def test_running_group_stays_involved(
     )
 
     announcements = _involved_node_announcements(payloads)
-    assert announcements, "the run announced no involved nodes at all"
+    # A floor on the count, not just "any": a run that announced only the final clearing `[]` would
+    # leave every check below with nothing to iterate over, so dropping the mid-run announcement
+    # entirely -- the regression this test exists to catch -- would pass.
+    assert len(announcements) >= MINIMUM_ANNOUNCEMENTS, f"no mid-run involvement announcement to check: {announcements}"
 
     # The final announcement is the engine telling the editor the run is over. Everything before it
     # describes a run in progress, and the group is running for all of it.
