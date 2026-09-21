@@ -221,23 +221,21 @@ class TestWhatTheAuthorSeesWhenSomethingIsWrong:
 
         assert node.parameter_output_values["steps"] == steps
 
-    def test_a_container_is_not_parked(self) -> None:
-        """Holding a whole list as one object would hand a downstream list one opaque key.
+    def test_declaring_it_on_a_container_is_refused_when_the_parameter_is_added(self) -> None:
+        """The declaration cannot be honoured on a container, so it is refused where it is made.
 
-        A container has nowhere to put a release hook either; its elements are ordinary parameters.
+        Holding a whole list as one object would hand a downstream list one opaque key, and a container has
+        nowhere to put a release hook -- its elements are ordinary parameters. Saying so when the parameter
+        is added beats saying it once a run has reached a process boundary.
         """
         node = _LibraryNode(name="Batch")
         latents = ParameterList(name="latents", output_type="Latent", tooltip="")
         # ParameterList does not accept `serializable` through __init__; setting it directly is the only
-        # way to reach the case, and is_process_local must still answer False for a container.
+        # way to reach the case.
         latents.serializable = False
-        node.add_parameter(latents)
-        assert latents.is_process_local is False
-        batch = [Pipeline("a"), Pipeline("b")]
 
-        node.parameter_output_values["latents"] = batch
-
-        assert node.parameter_output_values["latents"] is batch
+        with pytest.raises(ValueError, match="cannot hold a value that stays in this process"):
+            node.add_parameter(latents)
 
 
 class TestCachingAnExpensiveResourceAcrossRuns:
@@ -297,12 +295,20 @@ class TestBothDictsCross:
         assert node.parameter_values["incoming"] is pipeline
         assert node.get_parameter_value("incoming") is pipeline
 
-    def test_an_input_becomes_a_key_on_the_way_out(self) -> None:
+    def test_an_unsendable_input_is_refused_rather_than_held(self) -> None:
+        """Holding an input would mint a key the far side has nothing to resolve against.
+
+        The object is in this process and the node runs in another, so there is no arrangement under
+        which it arrives. Saying so now beats a key that fails forever with "re-run the producer".
+        """
         node = _producer()
         node.add_parameter(Parameter(name="incoming", input_types=["Pipeline"], tooltip="", serializable=False))
         node.set_parameter_value("incoming", Pipeline("flux"))
 
-        assert isinstance(_egress(node, are_outputs=False)["incoming"], str)
+        with pytest.raises(TypeError) as caught:
+            _egress(node, are_outputs=False)
+
+        assert "cannot be passed by reference either" in str(caught.value)
 
     def test_a_key_arriving_on_an_input_is_not_parked_again(self) -> None:
         """A consumer receives keys, and re-parking one would wrap the string as though it were an object."""
@@ -351,11 +357,10 @@ class TestOutputtingACachedResourceKey:
 
 
 class TestAParameterWithAnInputAndAnOutputValue:
-    """A parameter's input value and its output value are two independent values.
+    """A parameter can carry both, and only the output side is ever held.
 
-    The save path treats them separately, so the store must too. Sharing one slot makes an input write
-    release the object the node is publishing from the same parameter -- and the engine resets input values
-    after a run when a connection was torn down mid-execution.
+    The engine resets input values after a run whose connection was torn down mid-execution, so that
+    write must not disturb the object the node published from the same parameter.
     """
 
     def test_clearing_the_input_leaves_the_output_object_alone(self) -> None:
@@ -381,18 +386,19 @@ class TestAParameterWithAnInputAndAnOutputValue:
         assert released == []
         assert node.local_objects.get(key) is published
 
-    def test_each_side_holds_its_own_object(self) -> None:
+    def test_only_the_output_side_is_held(self) -> None:
         node = _producer()
         incoming, outgoing = Pipeline("incoming"), Pipeline("outgoing")
 
         node.set_parameter_value("pipeline", incoming)
         node.parameter_output_values["pipeline"] = outgoing
         out_key = _egress(node)["pipeline"]
-        in_key = _egress(node, are_outputs=False)["pipeline"]
 
-        assert in_key != out_key
-        assert node.local_objects.get(in_key) is incoming
         assert node.local_objects.get(out_key) is outgoing
+        # The input value is still the object the node was handed; nothing minted a key for it.
+        assert node.get_parameter_value("pipeline") is incoming
+        with pytest.raises(TypeError):
+            _egress(node, are_outputs=False)
 
 
 class TestAConsumerThatDeclaresNothing:
@@ -434,3 +440,26 @@ class TestAConsumerThatDeclaresNothing:
         consumer.set_parameter_value("model", "gpt-4o")
 
         assert consumer.get_parameter_value("model") == "gpt-4o"
+
+
+class TestRemovingARowFromAContainer:
+    """Deleting a connection into a ParameterList row copies the remaining rows along.
+
+    Those rows can hold keys whose objects sit in a worker, where this process has nothing to resolve
+    against. Resolving them here would raise out of a connection delete, and out of the finally that
+    resets input values after a run.
+    """
+
+    def test_a_row_holding_a_worker_held_key_does_not_raise(self) -> None:
+        consumer = _LibraryNode(name="Generate", metadata={"library": "Diffusers"})
+        rows = ParameterList(name="pipelines", input_types=["Pipeline"], tooltip="")
+        consumer.add_parameter(rows)
+        first, second = rows.add_child_parameter(), rows.add_child_parameter()
+        # Minted shape, but parked in another process: exactly what a worker-produced value looks like here.
+        elsewhere = "Diffusers:LoadPipeline@aabbccdd.pipeline#11223344"
+        consumer.set_parameter_value(first.name, elsewhere)
+        consumer.set_parameter_value(second.name, elsewhere)
+
+        consumer.remove_parameter_value(first.name)
+
+        assert isinstance(consumer.get_raw_parameter_value("pipelines"), list)

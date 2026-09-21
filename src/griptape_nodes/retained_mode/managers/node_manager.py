@@ -3192,16 +3192,17 @@ class NodeManager(EngineScoped):
         it must leave it alone. Unlike an overwrite there is no fresher value to take its place.
         """
         candidates: set[str] = set()
-        for parameter in node.parameters:
-            # The same predicate the write path uses, not `serializable` directly: a container declaring
-            # serializable=False is never held, so it never has a key to collect.
-            if not parameter.is_process_local:
-                continue
-            # Both maps: this node may be the producer holding it as an output, or the last consumer
-            # holding the only remaining copy of someone else's key.
-            for source in (node.parameter_output_values, node.parameter_values):
-                if isinstance(key := source.get(parameter.name), str):
-                    candidates.add(key)
+        # Asked of the values, not of any declaration. Only a producer declares `serializable=False`, so a
+        # consumer holds the key on a parameter declaring nothing, and gating on the flag meant deleting
+        # the last holder released nothing at all. The same walk the save guard uses, so a key nested in a
+        # container's list is collected rather than missed.
+        #
+        # Over-collecting is safe and deliberate: `live_sources` below drops anything a surviving node
+        # still owns, and `_keys_referenced_by` drops anything another node still carries.
+        for source in (node.parameter_output_values, node.parameter_values):
+            # Snapshot: node bodies write outputs from worker threads.
+            for value in list(source.values()):
+                candidates |= node.local_objects.parked_keys_within(value)
         # The store's own record too, not just live parameter names: a parameter renamed or removed after
         # parking, or a run cancelled between the clear and the park, leaves an entry no current name can
         # reach, and this is the last chance to run its release hook.
@@ -4792,7 +4793,7 @@ class NodeManager(EngineScoped):
         # Publishing (serialize_all_parameter_values) does not change this: a held value is already skipped
         # by its parameter's own flag today, so nothing regresses, and a key would be useless in the
         # published copy either way. The node comes back UNRESOLVED and its producer re-runs.
-        if node.local_objects.names_a_parked_object(value):
+        if node.local_objects.contains_a_parked_object(value):
             if isinstance(create_node_request, CreateNodeRequest):
                 create_node_request.resolution = NodeResolutionState.UNRESOLVED.value
             return None

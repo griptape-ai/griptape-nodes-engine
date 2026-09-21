@@ -118,6 +118,41 @@ class LocalObjectScope:
         """
         return self._manager().holds_any_key(value)
 
+    def parked_keys_within(self, value: Any) -> set[str]:
+        """Every parked key reachable inside `value`, `value` itself included.
+
+        One walk answers both questions the engine asks of a stored value: whether it carries a key at all,
+        which the save and metadata guards need, and which keys those are, which the release scan needs when
+        a node is deleted. They were two walks asking nearly the same thing, and that is exactly how one of
+        them came to recurse while the other did not.
+
+        A key reaches a parameter bare or nested, because a container carries its children's values, so
+        asking only about the value itself misses one a level down.
+        """
+        found: set[str] = set()
+        self._collect_parked(value, found=found, seen=set())
+        return found
+
+    def contains_a_parked_object(self, value: Any) -> bool:
+        """Whether a parked key is anywhere in `value`, including nested inside it."""
+        return bool(self.parked_keys_within(value))
+
+    def _collect_parked(self, value: Any, *, found: set[str], seen: set[int]) -> None:
+        # `seen` does two jobs, and both are load-bearing on the save path: a self-referential value would
+        # recurse forever, and one whose substructure is shared rather than cyclic would be visited
+        # exponentially. Either takes out the save of a workflow that saved perfectly well before.
+        if self.names_a_parked_object(value):
+            found.add(value)
+            return
+        if not isinstance(value, (dict, list, tuple, set)):
+            return
+        if id(value) in seen:
+            return
+        seen.add(id(value))
+        items = value.values() if isinstance(value, dict) else value
+        for item in items:
+            self._collect_parked(item, found=found, seen=seen)
+
     def names_a_parked_object(self, value: Any) -> bool:
         """Whether `value` is an engine-minted key, including one whose object lives in another process.
 
@@ -132,7 +167,11 @@ class LocalObjectScope:
         library's to release, and stable by construction, so releasing it would drop that resource in
         every process holding it.
         """
-        if not isinstance(key, str):
+        # Shape-checked before it goes anywhere: the orchestrator holds no entries at all, so a key with
+        # no local record is broadcast to every worker on the assumption one of them parked it. An
+        # ordinary string on an unpersistable parameter -- an API token is the documented example -- would
+        # otherwise be put on the wire verbatim to libraries that never saw it.
+        if not self._manager().names_a_parked_object(key):
             return False
         return self._manager().release_parked_key(key, owner=self._owner)
 
@@ -193,13 +232,7 @@ class LocalObjectScope:
         Raises:
             RuntimeError: if a key names an object this process cannot hand over.
         """
-        if not self._names_a_held_object(value):
-            return value
-        if not self._is_own_key(value):
-            # A key another library parked is refused rather than handed over as a string: it can never
-            # resolve here, and saying so beats the node failing on a str it expected an object to be.
-            raise RuntimeError(self._unusable_key_message(value, parameter_name=parameter_name, node_name=node_name))
-        return self.require(value, parameter_name=parameter_name, node_name=node_name)
+        return self._resolve_within(value, parameter_name=parameter_name, node_name=node_name, memo={})
 
     def source_of(self, key: Any) -> str | None:
         """Which node parked `key`, or None if nothing here holds it."""
@@ -220,12 +253,9 @@ class LocalObjectScope:
     def vacate_slot(self, slot: str, *, keeping: str | None = None) -> None:
         """Release whatever this node parked in `slot`, except the entry behind `keeping`.
 
-        For the engine's write path, when a run ends with the parameter carrying something other than a
-        fresh park: an upstream's key passed through, or None. The upstream's own entry cannot be caught
-        here, because it sits under the upstream's source.
-
-        A slot is not a parameter name -- a parameter's input value and its output value are separate
-        values and hold separate slots, so the caller composes it.
+        For the egress path, when a run ends with the parameter carrying something other than a fresh
+        park: an upstream's key passed through, or None. The upstream's own entry cannot be caught here,
+        because it sits under the upstream's source.
         """
         self._manager().vacate_slot(owner=self._owner, source=self._source, slot=slot, keeping=keeping)
 
@@ -235,6 +265,49 @@ class LocalObjectScope:
         What a "clear cache" node calls.
         """
         return self._manager().drop_objects_for_owner(self._owner)
+
+    def _resolve_within(self, value: Any, *, parameter_name: str, node_name: str, memo: dict[int, Any]) -> Any:
+        if isinstance(value, str):
+            if not self._names_a_held_object(value):
+                return value
+            if not self._is_own_key(value):
+                # A key another library parked is refused rather than handed over as a string: it can
+                # never resolve here, and saying so beats the node failing on a str it expected an object
+                # to be.
+                raise RuntimeError(
+                    self._unusable_key_message(value, parameter_name=parameter_name, node_name=node_name)
+                )
+            return self.require(value, parameter_name=parameter_name, node_name=node_name)
+        # Lists and dicts are walked because a container parameter carries its children's values, so a
+        # ParameterList fed by three producers holds three keys and `get_parameter_list_value` is what the
+        # node reads. Sets and tuples are not: resolving into a set would re-hash objects that are
+        # routinely unhashable, and into a tuple subclass would lose what it was. The release scan walks
+        # those too, and that asymmetry is safe in the direction it runs -- it counts a key as referenced
+        # rather than freeing one still in use.
+        if not isinstance(value, (list, dict)):
+            return value
+        if id(value) in memo:
+            return memo[id(value)]
+        # Seeded with the original before recursing, so a container reaching itself terminates, and so two
+        # rows carrying the same list get the same resolved list rather than the second one coming back
+        # with its keys intact.
+        memo[id(value)] = value
+        originals = list(value.values()) if isinstance(value, dict) else list(value)
+        resolved = [
+            self._resolve_within(item, parameter_name=parameter_name, node_name=node_name, memo=memo)
+            for item in originals
+        ]
+        # Nothing in here was a key, so hand back the object that was stored. Rebuilding unconditionally
+        # would make every read of an ordinary list or dict parameter a copy, and a node that mutates what
+        # it read in place would silently stop persisting the change.
+        if all(new is old for new, old in zip(resolved, originals, strict=True)):
+            return value
+        if isinstance(value, dict):
+            rebuilt: Any = dict(zip(value.keys(), resolved, strict=True))
+        else:
+            rebuilt = resolved
+        memo[id(value)] = rebuilt
+        return rebuilt
 
     def _names_a_held_object(self, value: Any) -> bool:
         """Whether `value` names an object held here or in another process.

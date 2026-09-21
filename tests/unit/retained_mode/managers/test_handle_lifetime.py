@@ -536,6 +536,47 @@ class TestReferencesTheScanMustSee:
         assert producer.released == []
         assert _is_held(engine, key)
 
+    def test_an_undeclared_consumer_is_still_the_last_reference(self, engine: Engine, flow_name: str) -> None:
+        """The normal consumer shape: only the producer declares the flag, so the consumer declares nothing.
+
+        Gating candidate collection on the consumer's own declaration meant deleting the last thing
+        referring to an object released nothing, and it waited for workflow teardown.
+        """
+        producer = _add(engine, _Producer(name="Producer"), flow_name)
+        consumer = _add(engine, _Consumer(name="Consumer"), flow_name)
+        consumer.add_parameter(
+            Parameter(
+                name="plain",
+                input_types=["Latent"],
+                tooltip="",
+                allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+            )
+        )
+        producer.parameter_output_values["latent"] = Held("latent")
+        key = _egress(producer)["latent"]
+        consumer.set_parameter_value("plain", key)
+        engine.handle_request(DeleteNodeRequest(node_name="Producer"))
+        assert _is_held(engine, key)
+
+        engine.handle_request(DeleteNodeRequest(node_name="Consumer"))
+
+        assert not _is_held(engine, key)
+
+    def test_a_key_nested_in_a_consumers_list_value_is_still_collected(self, engine: Engine, flow_name: str) -> None:
+        """A ParameterList consumer holds `[key]`, so a scan that only looks at the value itself misses it."""
+        producer = _add(engine, _Producer(name="Producer"), flow_name)
+        consumer = _add(engine, _Consumer(name="Consumer"), flow_name)
+        consumer.add_parameter(Parameter(name="rows", input_types=["list"], tooltip=""))
+        producer.parameter_output_values["latent"] = Held("latent")
+        key = _egress(producer)["latent"]
+        consumer.set_parameter_value("rows", [key])
+        engine.handle_request(DeleteNodeRequest(node_name="Producer"))
+        assert _is_held(engine, key)
+
+        engine.handle_request(DeleteNodeRequest(node_name="Consumer"))
+
+        assert not _is_held(engine, key)
+
     def test_deleting_the_last_consumer_releases_what_only_it_held(self, engine: Engine, flow_name: str) -> None:
         """A PROPERTY consumer keeps its copy after its producer goes, and is then the only reference.
 
@@ -961,17 +1002,25 @@ class TestDeliveringAValueToTheNextNode:
 
 
 class TestANonSerializableContainer:
-    def test_it_is_neither_held_nor_collected(self, engine: Engine, flow_name: str) -> None:
-        """Holding a container would hand a downstream list one opaque key, so it is never held.
+    def test_it_cannot_be_declared_at_all(self, engine: Engine, flow_name: str) -> None:
+        """A container cannot hold a value, so the declaration is refused where it is made.
 
-        The delete scan finds nothing for it either. Both sites ask `is_process_local` rather than
-        `serializable` so they cannot answer differently about a container later; today the two are
-        equivalent here, since a list is not a key whichever predicate is used.
+        It used to be accepted and silently ignored, which meant the author found out at a process
+        boundary, after a node had already produced something.
         """
         node = _add(engine, _Producer(name="Producer"), flow_name)
         latents = ParameterList(name="latents", output_type="Latent", tooltip="")
         latents.serializable = False
-        node.add_parameter(latents)
+
+        with pytest.raises(ValueError, match="cannot hold a value that stays in this process"):
+            node.add_parameter(latents)
+
+    def test_an_ordinary_container_holding_objects_is_collected_by_nothing(
+        self, engine: Engine, flow_name: str
+    ) -> None:
+        """Undeclared, a list of objects is nobody's to hold, and the delete scan finds no key in it."""
+        node = _add(engine, _Producer(name="Producer"), flow_name)
+        node.add_parameter(ParameterList(name="latents", output_type="Latent", tooltip=""))
         batch = [Held("a"), Held("b")]
 
         node.parameter_output_values["latents"] = batch

@@ -124,7 +124,7 @@ class TestCollectParameterValues:
         values = {"prompt": "hello", "model": "gpt-4"}
         node = Mock()
         # A Mock answers truthy to everything; these values are not parked keys.
-        node.local_objects.names_a_parked_object.return_value = False
+        node.local_objects.contains_a_parked_object.return_value = False
         node.parameters = [p1, p2]
         node.get_raw_parameter_value.side_effect = values.get
 
@@ -144,7 +144,7 @@ class TestCollectParameterValues:
         values = {"prompt": "hello", "password": "secret"}
         node = Mock()
         # A Mock answers truthy to everything; these values are not parked keys.
-        node.local_objects.names_a_parked_object.return_value = False
+        node.local_objects.contains_a_parked_object.return_value = False
         node.parameters = [pub, priv]
         node.get_raw_parameter_value.side_effect = values.get
 
@@ -163,7 +163,7 @@ class TestCollectParameterValues:
 
         node = Mock()
         # A Mock answers truthy to everything; these values are not parked keys.
-        node.local_objects.names_a_parked_object.return_value = False
+        node.local_objects.contains_a_parked_object.return_value = False
         node.parameters = [p]
         node.get_raw_parameter_value.return_value = None
 
@@ -181,7 +181,7 @@ class TestCollectParameterValues:
 
         node = Mock()
         # A Mock answers truthy to everything; these values are not parked keys.
-        node.local_objects.names_a_parked_object.return_value = False
+        node.local_objects.contains_a_parked_object.return_value = False
         node.parameters = [p]
         node.get_raw_parameter_value.return_value = "some_value"
 
@@ -201,7 +201,7 @@ class TestCollectParameterValues:
         values = {"api_password": "s3cr3t", "db_password": "hunter2", "prompt": "hello"}
         node = Mock()
         # A Mock answers truthy to everything; these values are not parked keys.
-        node.local_objects.names_a_parked_object.return_value = False
+        node.local_objects.contains_a_parked_object.return_value = False
         node.parameters = [p1, p2, p3]
         node.get_raw_parameter_value.side_effect = values.get
 
@@ -255,7 +255,7 @@ class TestCollectRawProvenance:
         param_values = {"password": "secret", "prompt": "hi"}
         node = Mock()
         # A Mock answers truthy to everything; these values are not parked keys.
-        node.local_objects.names_a_parked_object.return_value = False
+        node.local_objects.contains_a_parked_object.return_value = False
         node.parameters = [priv, pub]
         node.get_raw_parameter_value.side_effect = param_values.get
 
@@ -312,7 +312,7 @@ class TestCollectSidecarProvenance:
         param_values = {"password": "s3cr3t", "prompt": "hi"}
         node = Mock()
         # A Mock answers truthy to everything; these values are not parked keys.
-        node.local_objects.names_a_parked_object.return_value = False
+        node.local_objects.contains_a_parked_object.return_value = False
         node.parameters = [priv, pub]
         node.get_raw_parameter_value.side_effect = param_values.get
 
@@ -333,7 +333,7 @@ class TestCollectSidecarProvenance:
 
         node = Mock()
         # A Mock answers truthy to everything; these values are not parked keys.
-        node.local_objects.names_a_parked_object.return_value = False
+        node.local_objects.contains_a_parked_object.return_value = False
         node.parameters = [pub]
         node.get_raw_parameter_value.return_value = "hello"
 
@@ -378,7 +378,7 @@ class TestCollectWorkflowMetadata:
         param_values = {"password": "s3cr3t", "prompt": "hello"}
         node = Mock()
         # A Mock answers truthy to everything; these values are not parked keys.
-        node.local_objects.names_a_parked_object.return_value = False
+        node.local_objects.contains_a_parked_object.return_value = False
         node.parameters = [priv, pub]
         node.get_raw_parameter_value.side_effect = param_values.get
 

@@ -649,8 +649,11 @@ class ResourceManager(EngineScoped):
     def drop_all_local_objects(self) -> int:
         """Release everything held in this process, returning how many went.
 
-        For clearing workflow state: every key lived in a parameter value, so deleting the nodes makes
-        all of them unreachable at once, whoever put them.
+        For clearing workflow state. A parked entry is unreachable once its nodes are gone, so taking it is
+        forced. A library-named entry is not -- its key is a hash the library re-derives, so it would still
+        be findable -- and it goes anyway: objects are not kept across workflows, and a cache surviving
+        into a different graph would hand out something built for the previous one. The cost is a rebuild
+        on the next run, which is the intended trade.
         """
         with self._local_objects_lock:
             doomed = dict(self._local_objects)

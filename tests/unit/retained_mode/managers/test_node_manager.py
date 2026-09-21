@@ -115,7 +115,7 @@ class TestNodeManagerResolutionStateSerialization:
         mock_node = MagicMock(spec=BaseNode)
         mock_node.name = "test_node"
         # A MagicMock answers truthy to everything; this value is not a parked key.
-        mock_node.local_objects.names_a_parked_object.return_value = False
+        mock_node.local_objects.contains_a_parked_object.return_value = False
         mock_node.parameter_values = {"test_param": "has_value"}
         mock_node.parameter_output_values = {}
         mock_node.get_parameter_value.return_value = "some_value"
@@ -166,6 +166,9 @@ class TestNodeManagerResolutionStateSerialization:
         mock_node.parameter_values = {}
         mock_node.parameter_output_values = {"session": object()}
         mock_node.get_parameter_value.return_value = None
+        # Nothing here is held. Without this the mock answers truthy, the parked-key guard returns early,
+        # and the opt-out branch this test is named for never runs.
+        mock_node.local_objects.contains_a_parked_object.return_value = False
 
         create_node_request = CreateNodeRequest(
             node_type="TestNode", node_name="test_node", resolution=NodeResolutionState.RESOLVED.value
@@ -206,7 +209,7 @@ class TestNodeManagerResolutionStateSerialization:
         mock_node = MagicMock(spec=BaseNode)
         mock_node.name = "test_node"
         # A MagicMock answers truthy to everything; this value is not a parked key.
-        mock_node.local_objects.names_a_parked_object.return_value = False
+        mock_node.local_objects.contains_a_parked_object.return_value = False
         mock_node.parameter_values = {"test_param": "has_value"}
         mock_node.parameter_output_values = {}
         mock_node.get_parameter_value.return_value = "some_value"

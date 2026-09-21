@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 
 from griptape.artifacts import BaseArtifact
 
+from griptape_nodes.exe_types.elements.containers import ParameterContainer
 from griptape_nodes.retained_mode.events.event_converter import safe_unstructure
 
 if TYPE_CHECKING:
@@ -72,38 +73,76 @@ def dehydrate_parameter_values(values: Mapping[str, Any], *, node: BaseNode, are
     dispatch or a worker result -- and nowhere else, so a node's own dicts keep the real objects and a
     graph that never crosses a boundary never parks anything.
 
-    Sendability decides, and the parameter's declaration only authorizes: a value that survives JSON is
-    sent as-is even on a `serializable=False` parameter, because a key would be unresolvable on the far
-    side. Only a value that cannot survive is held, and only where its author said it is unpersistable.
+    An output whose author declared it unpersistable is held unless the value is already plain data -- a
+    key for an API token would only be unresolvable on the far side, while anything richer is held rather
+    than unstructured, because cattrs turns any attrs class into a dict of its fields and the inbound
+    mirror cannot put it back. Everything else is sent, and refused only if the transport could not encode
+    it at all.
 
     Raises:
         TypeError: if an unsendable value sits on a parameter that did not declare `serializable=False`.
             The transport coerces with `str()`, so without this the receiver silently gets a repr.
     """
     dehydrated: dict[str, Any] = {}
-    for name, value in values.items():
+    # A copy, because node bodies write their outputs from worker threads and a dict that changes size
+    # mid-iteration raises. `_keys_referenced_by` snapshots for the same reason.
+    for name, value in dict(values).items():
         parameter = node.get_parameter_by_name(name)
-        sendable = _is_sendable(value)
-        if parameter is not None and parameter.is_process_local:
-            dehydrated[name] = node.park_for_egress(parameter, value, is_output=are_outputs, sendable=sendable)
+        if are_outputs and parameter is not None and parameter.is_process_local:
+            dehydrated[name] = node.park_for_egress(parameter, value, travels_as_data=_is_json_safe(value))
             continue
-        if not sendable:
-            msg = (
-                f"Attempted to send the value of parameter '{name}' on node '{node.name}' to another "
-                f"process. Failed due to: a '{type(value).__name__}' cannot be converted to data. Mark "
-                f"that parameter serializable=False so the value is kept here and passed by reference."
+        if not _is_sendable(value):
+            raise TypeError(
+                _unsendable_message(
+                    name,
+                    value,
+                    node_name=node.name,
+                    is_output=are_outputs,
+                    is_container=isinstance(parameter, ParameterContainer),
+                )
             )
-            raise TypeError(msg)
         dehydrated[name] = value
     return dehydrated
 
 
-def _is_sendable(value: Any) -> bool:
-    """Whether `value` survives the trip as data.
+def _unsendable_message(name: str, value: Any, *, node_name: str, is_output: bool, is_container: bool) -> str:
+    """Why this value cannot travel, and what the author can actually do about it.
 
-    The raw check first, because most parameter values are already plain data and the unstructure pass is
-    not free. Artifacts only look unsendable until cattrs turns them into dicts, so a failure there is
-    retried against the unstructured form rather than believed.
+    The two directions have different remedies, and offering the wrong one is worse than offering none.
+    An output can be held, because the node that produced it runs in the process holding it. An input
+    cannot: the object is here and the node is elsewhere, so there is nothing to hold it for and a key
+    would name an entry the far side has no way to look up.
+    """
+    where = f"the value of parameter '{name}' on node '{node_name}'"
+    cause = f"a '{type(value).__name__}' cannot be converted to data"
+    if is_output and is_container:
+        # ParameterContainer.is_process_local is always False -- the container is not itself the thing
+        # held -- so telling the author to mark it would send them round the same loop.
+        remedy = (
+            "A list or dictionary parameter cannot be kept here as a whole. Output the value on an "
+            "ordinary parameter marked serializable=False instead."
+        )
+    elif is_output:
+        remedy = "Mark that parameter serializable=False so the value is kept here and passed by reference."
+    else:
+        remedy = (
+            "It was built in this process while the node runs in another, so it cannot be passed by "
+            "reference either. Have the node that produces it run in the same library as this one, or "
+            "output a saved file instead."
+        )
+    return f"Attempted to send {where} to another process. Failed due to: {cause}. {remedy}"
+
+
+def _is_sendable(value: Any) -> bool:
+    """Whether `value` can be put on the wire at all, as the transport would.
+
+    Deliberately looser than what parking asks. Parking is decided by `_is_json_safe`, which is "this is
+    already data"; an author who declared the parameter unpersistable gets their object held rather than
+    unstructured, because cattrs will happily turn any attrs class into a dict of its fields and an
+    artifact a library defines itself comes out of that without its payload.
+
+    This one is the transport's own question: `json.dumps` with `default=str`, so anything it can encode
+    is sent rather than rejected, and only a value it would mangle into a repr earns the raise.
     """
     if _is_json_safe(value):
         return True
@@ -116,5 +155,9 @@ def _is_json_safe(value: Any) -> bool:
     if isinstance(value, (list, tuple)):
         return all(_is_json_safe(item) for item in value)
     if isinstance(value, dict):
-        return all(isinstance(k, str) and _is_json_safe(v) for k, v in value.items())
+        # json.dumps coerces int/float/bool/None keys rather than refusing them, so a dict keyed by frame
+        # number travels fine and must not be reported as unsendable.
+        return all(isinstance(k, (str, int, float, bool)) or k is None for k in value) and all(
+            _is_json_safe(v) for v in value.values()
+        )
     return False

@@ -741,6 +741,16 @@ class BaseNode(ABC):
         if self.does_name_exist(param.name):
             msg = f"Cannot have duplicate names on parameters. Encountered two instances of '{param.name}'."
             raise ValueError(msg)
+        # Said here rather than swallowed. A container answers `is_process_local` False -- the container is
+        # not itself the thing held, its children carry the values -- so the declaration would otherwise do
+        # nothing at all, and the author would find out only when a run reached a process boundary.
+        if isinstance(param, ParameterContainer) and not param.serializable:
+            msg = (
+                f"Attempted to add parameter '{param.name}' to node '{self.name}'. Failed due to: a list or "
+                f"dictionary parameter cannot hold a value that stays in this process. Put the value on an "
+                f"ordinary parameter marked serializable=False instead."
+            )
+            raise ValueError(msg)
         parameter_group = (
             self.get_group_by_name_or_element_id(param.parent_element_name) if param.parent_element_name else None
         )
@@ -1176,7 +1186,10 @@ class BaseNode(ABC):
             # special handling if it's in a container.
             if parameter.parent_container_name and parameter.parent_container_name in self.parameter_values:
                 del self.parameter_values[parameter.parent_container_name]
-                new_val = self.get_parameter_value(parameter.parent_container_name)
+                # Raw: this copies the remaining rows along rather than reading them for use. Resolving
+                # here would raise on a key whose object sits in a worker, out of a connection delete and
+                # out of the run's finally, and would write live objects back into parameter_values.
+                new_val = self.get_raw_parameter_value(parameter.parent_container_name)
                 if new_val is not None:
                     # Don't set the container to None (that would make it empty)
                     self.set_parameter_value(parameter.parent_container_name, new_val)
@@ -1365,7 +1378,7 @@ class BaseNode(ABC):
             )
         return self._local_objects
 
-    def park_for_egress(self, parameter: Parameter, value: Any, *, is_output: bool, sendable: bool) -> Any:
+    def park_for_egress(self, parameter: Parameter, value: Any, *, travels_as_data: bool) -> Any:
         """Hold `value` in this process and return the key to send in its place.
 
         Called only where a parameter value is about to leave the process -- a worker dispatch or a worker
@@ -1379,11 +1392,8 @@ class BaseNode(ABC):
         through so a consumer is told nothing is connected rather than resolving to None.
         """
         scope = self.local_objects
-        # A parameter's input value and its output value are two independent values, and each dict egresses
-        # separately, so they get separate slots. Sharing one would make sending an input release the
-        # object the node published from the same parameter.
-        slot = f"{parameter.name}#output" if is_output else f"{parameter.name}#input"
-        if sendable:
+        slot = parameter.name
+        if travels_as_data:
             scope.vacate_slot(slot, keeping=value if isinstance(value, str) else None)
             return value
         # Egress can happen more than once for one object, so reuse the key this slot already holds it
@@ -2044,13 +2054,14 @@ class TrackedParameterOutputValues(dict[str, Any]):
     def __setitem__(self, key: str, value: Any) -> None:
         had_key = key in self
         old_value = self.get(key)
-        parameter = self._node.get_parameter_by_name(key)
         # Substitute variables in dict/list output values so downstream nodes
         # receive resolved values without the node needing to know about variables.
         # String values are already substituted in get_parameter_value(); this
         # handles structured types (JSON Input dicts, list outputs, etc.).
-        if _in_aprocess.get() and (parameter is None or parameter.allow_variable_substitution):
-            value = self._node._resolve_variables_in_value(value)
+        if _in_aprocess.get():
+            parameter = self._node.get_parameter_by_name(key)
+            if parameter is None or parameter.allow_variable_substitution:
+                value = self._node._resolve_variables_in_value(value)
         super().__setitem__(key, value)
 
         # Emit if the key is newly added, or if its value actually changed.
