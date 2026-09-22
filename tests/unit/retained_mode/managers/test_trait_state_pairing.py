@@ -88,10 +88,6 @@ class Threshold(Trait):
         super().__init__()
         self.level = threshold
 
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return []
-
     def to_state(self) -> dict[str, int]:
         return {"level": self.level}
 

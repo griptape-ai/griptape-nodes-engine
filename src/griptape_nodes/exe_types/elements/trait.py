@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from abc import ABC
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Self
 
@@ -18,7 +17,7 @@ if TYPE_CHECKING:
 
 
 @dataclass(eq=False)
-class Trait(ABC, BaseNodeElement):
+class Trait(BaseNodeElement):
     def __hash__(self) -> int:
         # Use a unique, immutable attribute for hashing
         return hash(self.element_id)
