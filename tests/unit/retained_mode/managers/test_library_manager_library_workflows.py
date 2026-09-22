@@ -241,6 +241,27 @@ class TestRegisterWorkflowsForLibrary:
         register.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_refuses_while_the_loading_gate_is_closed(self, engine: Engine, tmp_path: Path) -> None:
+        """The interlock: nothing may register through a gate a whole-set load is holding closed.
+
+        Registering reads each workflow's metadata header through
+        `WorkflowManager.on_load_workflow_metadata_request`, which waits on that same gate. So a
+        library arriving mid-load and registering here would hang the load that closed it, and the
+        load is what reopens it. The pass afterwards registers whatever arrived.
+        """
+        library_manager = engine.library_manager
+        library_manager._close_libraries_loading_gate()
+        register = AsyncMock(return_value=WorkflowRegistrationResult(succeeded=["example"], failed=[]))
+
+        with (
+            patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.get_library", return_value=_library(["example.py"])),
+            patch.object(engine.workflow_manager, "register_list_of_workflows", register),
+        ):
+            await library_manager.register_workflows_for_library(_library_info(tmp_path / "lib.json"))
+
+        register.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_does_nothing_for_a_library_with_no_name(self, engine: Engine, tmp_path: Path) -> None:
         register = AsyncMock(return_value=WorkflowRegistrationResult(succeeded=["example"], failed=[]))
         library_info = _library_info(tmp_path / "lib.json")
@@ -853,6 +874,44 @@ class TestEachMidSessionArrivalGoesThroughTheRegisteringDoor:
 
         assert result.succeeded(), result.result_details
         register_one.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_an_arrival_mid_load_does_not_hang_the_load(self, engine: Engine, tmp_path: Path) -> None:
+        """The one arrival that cannot choose its door, run for real against a closed gate.
+
+        A declared library dependency that is missing from disk is downloaded and registered from
+        inside another library's lifecycle, so it reaches this handler even when that lifecycle is
+        running inside a whole-set load. Registering here reads the workflow's metadata header
+        through `on_load_workflow_metadata_request`, which waits on the gate the load is holding
+        closed, so without the interlock this hangs for the life of the process rather than failing.
+
+        The real registration path runs, against a real workflow file: a simulated gate wait would
+        keep passing if registering ever stopped going through the gated handler.
+        """
+        library_manager = engine.library_manager
+        library_json = tmp_path / "griptape_nodes_library.json"
+        (tmp_path / "example.py").write_text(_workflow_header(), encoding="utf-8")
+        arrival = RegisterLibraryFromFileResultSuccess(library_name=LIBRARY_NAME, result_details="registered")
+        library_manager._close_libraries_loading_gate()
+
+        with (
+            patch.object(library_manager, "_register_library_from_file", AsyncMock(return_value=arrival)),
+            patch.dict(
+                library_manager._library_file_path_to_info, {str(library_json): _library_info(library_json)}, clear=True
+            ),
+            patch(f"{LIBRARY_MANAGER_MODULE}.LibraryRegistry.get_library", return_value=_library(["example.py"])),
+            patch.dict(WorkflowRegistry._workflows, {}, clear=True),
+        ):
+            result = await asyncio.wait_for(
+                library_manager.register_library_from_file_request(
+                    RegisterLibraryFromFileRequest(file_path=str(library_json))
+                ),
+                timeout=10,
+            )
+            registered = list(WorkflowRegistry._workflows)
+
+        assert result.succeeded(), result.result_details
+        assert registered == []
 
 
 class TestTheConcurrentSyncBatch:

@@ -2400,6 +2400,11 @@ class LibraryManager(EngineScoped):
         request handler and the batch loop on separate doors is what lets each say plainly which
         it is, instead of this having to work it out from shared state.
 
+        One arrival cannot choose its door: a declared library dependency missing from disk
+        downloads and registers from inside another library's lifecycle, so it reaches here even
+        when that lifecycle is running in a batch. `register_workflows_for_library` refuses while
+        the loading gate is closed for exactly that case, and the pass after the load covers it.
+
         Args:
             request: RegisterLibraryFromFileRequest containing library_name OR file_path,
                     perform_discovery_if_not_found, and load_as_default_library
@@ -4927,6 +4932,26 @@ class LibraryManager(EngineScoped):
         """
         library_name = library_info.library_name
         if library_name is None or self._is_worker:
+            return
+
+        if not self._libraries_loading_complete.is_set():
+            # A load of the whole set is in flight and holding this gate closed. Registering reads
+            # each workflow's metadata header through
+            # `WorkflowManager.on_load_workflow_metadata_request`, which waits on the same gate, so
+            # registering now would hang the load that closed it -- forever, since the load is what
+            # reopens it.
+            #
+            # An interlock at the one place that touches the gated API, not a decision about which
+            # caller may register: a library can arrive partway through a batch without the batch
+            # asking for it (a declared library dependency absent from disk downloads and registers
+            # from inside `_progress_library_through_lifecycle`), and every such arrival is covered
+            # by the single pass `load_all_libraries_from_config` runs once the gate is open. That
+            # pass is also the only point where a workflow can resolve its
+            # `node_libraries_referenced` against the complete set.
+            logger.debug(
+                "Libraries are still loading; leaving library '%s' workflows to the pass that follows the load.",
+                library_name,
+            )
             return
 
         workflow_files = self._collect_workflow_files_for_library(library_info)
