@@ -625,6 +625,31 @@ class TestAtomicWriteBytes:
         atomic_write_bytes(target, b"payload")
         assert [p.name for p in temp_dir.iterdir()] == ["data.bin"]
 
+    def test_overwrite_rides_out_transient_rename_denial(self, temp_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The headline behavior: a full overwrite survives Windows-style transient denials.
+
+        End-to-end through atomic_write_bytes, not the promote helper directly —
+        two denials on the rename (a reader holding the destination) and the
+        write still lands, with no scratch debris.
+        """
+        target = temp_dir / "served.bin"
+        target.write_bytes(b"old")
+
+        real_replace = Path.replace
+        denials = [PermissionError("held"), PermissionError("held")]
+
+        def transiently_denied(self: Path, other: str | Path) -> Path:
+            if denials:
+                raise denials.pop()
+            return real_replace(self, other)
+
+        monkeypatch.setattr(Path, "replace", transiently_denied)
+
+        atomic_write_bytes(target, b"new")
+
+        assert target.read_bytes() == b"new"
+        assert sorted(p.name for p in temp_dir.iterdir()) == ["served.bin"]
+
     def test_failed_rename_removes_temp_and_preserves_original(self, temp_dir: Path) -> None:
         """A rename failure cleans up the temp file and leaves the original intact."""
         target = temp_dir / "data.bin"
