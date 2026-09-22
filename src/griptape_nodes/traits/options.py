@@ -64,10 +64,6 @@ class Options(Trait):
                 break
         return state
 
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["options", "models"]
-
     def converters_for_trait(self) -> list[Callable]:
         if self.allow_custom:
             return []

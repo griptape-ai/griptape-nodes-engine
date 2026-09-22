@@ -20,10 +20,6 @@ class Widget(Trait):
         self.name = name
         self.library = library
 
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["widget"]
-
     def to_state(self) -> dict[str, Any]:
         return {"name": self.name, "library": self.library}
 

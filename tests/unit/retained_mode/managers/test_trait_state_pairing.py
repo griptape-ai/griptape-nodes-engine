@@ -19,10 +19,6 @@ class Twin(Trait):
         super().__init__()
         self.tag = tag
 
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return []
-
     def to_state(self) -> dict[str, str]:
         return {"tag": self.tag}
 
@@ -44,10 +40,6 @@ class Ranged(Trait):
         super().__init__()
         self._validate_level(level)
         self.level = level
-
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return []
 
     def to_state(self) -> dict[str, int]:
         return {"level": self.level}

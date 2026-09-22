@@ -282,10 +282,6 @@ class _UnsaveableValueTrait(Trait):
         super().__init__()
         self.items = items
 
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return []
-
     def to_state(self) -> dict[str, Any]:
         return {"items": self.items}
 
@@ -358,10 +354,6 @@ class _RequiredCallbackTrait(Trait):
         super().__init__()
         self.on_ping = on_ping
         self.label = label
-
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return []
 
     def to_state(self) -> dict[str, Any]:
         return {"label": self.label}
