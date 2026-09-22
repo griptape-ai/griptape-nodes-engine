@@ -23,10 +23,6 @@ class Slider(Trait):
         self.max = max_val
         self.soft_limits = soft_limits
 
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["slider"]
-
     def to_state(self) -> dict[str, Any]:
         return {"min_val": self.min, "max_val": self.max, "soft_limits": self.soft_limits}
 

@@ -75,10 +75,6 @@ class FileSystemPicker(Trait):
         self.allow_create = allow_create
         self.allow_rename = allow_rename
 
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["fileSystemPicker", "file_picker", "folder_picker"]
-
     def to_state(self) -> dict[str, Any]:
         return {
             "allow_files": self.allow_files,
