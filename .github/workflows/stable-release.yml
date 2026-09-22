@@ -13,10 +13,24 @@ jobs:
     name: Release pushed tag
     runs-on: ubuntu-22.04
     steps:
+      - name: Checkout tag
+        uses: actions/checkout@v7
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      # The version's CHANGELOG.md section leads the release body, above GitHub's generated
+      # list of merged PRs. A tag without a section still gets the generated list.
+      - name: Extract release notes from CHANGELOG.md
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if ! uv run --no-project scripts/changelog.py extract "$VERSION" > RELEASE_NOTES.md; then
+            echo "::warning::CHANGELOG.md has no section for ${VERSION}, so the release only lists merged PRs."
+            : > RELEASE_NOTES.md
+          fi
       - name: Create release
         uses: softprops/action-gh-release@v3
         with:
           token: ${{ secrets.RELEASE_PAT }}
+          body_path: RELEASE_NOTES.md
           generate_release_notes: true
           make_latest: true
           prerelease: false

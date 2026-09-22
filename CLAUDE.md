@@ -77,6 +77,62 @@ Instance methods come first because they can call anything. Class methods come n
 
 **Write for artists** - Docs follow the same rule as error messages: understandable by artists, not just engineers. Use exact UI labels, menu paths, and shortcuts. Match the voice of existing pages such as `docs/guides/libraries.md`.
 
+## Changelog
+
+`CHANGELOG.md` follows [Keep a Changelog 2.0.0](https://keepachangelog.com/en/2.0.0/). It is the record people read to learn what changed between versions, and each version's section leads its GitHub release. Its readers are artists using the editor, node library authors, and clients of the request API.
+
+**Add an entry for every user-facing change** - In the same PR, add a bullet under `## [Unreleased]`. User-facing means anything a user notices after upgrading: node behavior, editor-visible behavior, saved workflow files, the node library API (`exe_types/core_types.py`, `GriptapeNodes`), request/response events, settings, CLI commands, and supported platforms or Python versions. After adding one, tell the user so they can review the wording. Machines draft, humans curate.
+
+**Skip what users never see** - Refactors, tests, CI, comments, docs-only changes, and dev dependency bumps get no entry. Neither does a fix for a bug that never shipped in a release: edit or delete the entry that introduced it. A runtime dependency bump gets an entry only if users feel it, and the entry describes that effect, not the bump.
+
+**Pick one of the six types** - Use `### Added`, `### Changed`, `### Deprecated`, `### Removed`, `### Fixed`, or `### Security`, in that order, adding the heading if the section lacks it. No other headings; `make check/changelog` rejects them.
+
+- `Added`: a new capability.
+- `Changed`: the old behavior was intentional and now differs. Performance work goes here.
+- `Fixed`: the old behavior was a bug. Unsure between `Fixed` and `Changed`? Ask whether the old behavior was a bug.
+- `Deprecated`: still works, will be removed. Name the replacement and the version that removes it.
+- `Removed`: gone. Name the replacement.
+- `Security`: fixes a vulnerability. Lead with the CVE ID if there is one.
+
+`feat:` is usually `Added` or `Changed`, `fix:` is `Fixed`, `perf:` is `Changed`.
+
+**Describe the result, not the code** - Write what the user sees after upgrading, for a reader with zero context about the PR:
+
+- Say where and when: the node, panel, request, setting, or situation it affects.
+- Present tense, subject first: "X now ...", "X no longer ...".
+- Use exact names in backticks for nodes, parameters, settings, requests, and CLI flags, and exact UI labels in quotes. Internal classes and functions only if the reader calls them.
+- Explain why when it is not obvious.
+- One or two sentences. Longer explanations go in docs or `MIGRATION.md`, linked from the entry.
+- Plain words. No "improved", "enhanced", or "better"; say what changed.
+- One entry per change. When a later PR extends an unreleased change, edit its entry instead of adding another.
+- No PR numbers, commit hashes, or `@handles`. The GitHub release already lists merged PRs.
+- Wrap lines at about 100 characters and indent continuation lines two spaces. mdformat skips this file.
+
+```markdown
+<!-- Bad: the code change, no context -->
+- Route model access queries through `node_access_request`.
+
+<!-- Good: what the user sees, and when -->
+- Model dropdowns no longer mark every model "Not permitted by your license" when two installed
+  libraries provide a node with the same name.
+
+<!-- Bad: vague -->
+- Fix group node ports.
+
+<!-- Good -->
+- Group nodes in a reopened workflow now show the ports and connections of parameters added to
+  the group.
+```
+
+**Mark breaking changes** - A change that makes a saved workflow, node library, or request API client stop working without edits starts with `**Breaking:**`, stays under its type (usually `Changed` or `Removed`), and comes first in that list. Say what breaks and what to do. Long upgrade steps go in `MIGRATION.md`; link the section.
+
+```markdown
+- **Breaking:** `AgentStreamEvent` and the other agent streaming events now require a `thread_id`.
+  See [MIGRATION.md](MIGRATION.md#agent-streaming-payloads-carry-thread_id).
+```
+
+**Leave released sections alone** - Do not add, rename, or reorder version headings or the link definitions at the bottom. `make version/publish` rolls `[Unreleased]` into the released version. Fixing a mistake in a released entry is fine.
+
 ## Architecture
 
 **Engine owns the managers** - `Engine` (`retained_mode/engine.py`) holds ~28 managers (e.g. `FlowManager`, `NodeManager`) and injects itself into each one. Managers extend `EngineScoped` and reach peers via `self.engine.flow_manager`, not through process-wide state. `Engine` is a plain class, so tests and embedders can construct as many as they need.
