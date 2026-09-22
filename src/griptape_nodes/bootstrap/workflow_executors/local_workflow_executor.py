@@ -409,11 +409,14 @@ class LocalWorkflowExecutor(WorkflowExecutor):
             **kwargs,
         )
 
-        # Now send the run command to actually execute it
+        # Wait for the run rather than its kickoff: this executor reports a failed run from the
+        # start result, and drains the event queue below once the run is over.
         effective_pickle = (
             pickle_control_flow_result if pickle_control_flow_result is not None else self._pickle_control_flow_result
         )
-        start_flow_request = StartFlowRequest(flow_name=flow_name, pickle_control_flow_result=effective_pickle)
+        start_flow_request = StartFlowRequest(
+            flow_name=flow_name, pickle_control_flow_result=effective_pickle, wait_for_completion=True
+        )
         start_flow_result = await GriptapeNodes.ahandle_request(start_flow_request)
 
         if start_flow_result.failed():

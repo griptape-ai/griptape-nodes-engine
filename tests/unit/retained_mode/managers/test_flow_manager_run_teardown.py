@@ -42,6 +42,9 @@ def _doomed_run(monkeypatch: pytest.MonkeyPatch, *, cancel_also_fails: bool = Fa
     machine.current_state = MagicMock()  # Truthy and not CompleteState: a run in progress.
     machine.resolution_machine.is_complete.return_value = False
     machine.resolution_machine.is_started.return_value = True
+    machine.resolution_machine.is_errored.return_value = False
+    machine.prepare_flow = AsyncMock()
+    machine.drive_flow = AsyncMock(side_effect=RuntimeError(_RUN_FAILURE))
     machine.start_flow = AsyncMock(side_effect=RuntimeError(_RUN_FAILURE))
 
     def reset_machine(*, cancel: bool = False) -> None:  # noqa: ARG001

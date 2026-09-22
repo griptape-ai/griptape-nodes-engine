@@ -66,11 +66,17 @@ class StartFlowRequest(RequestPayload):
         flow_name: Name of the flow to start (deprecated, use flow_node_name)
         flow_node_name: Name of the flow node to start
         debug_mode: Whether to run in debug mode (default: False)
-        wait_for_completion: When True, the handler polls until the flow resolves before
-            returning. Converts the fire-and-forget kickoff into a synchronous run so callers
-            can read output values immediately afterwards without polling node state themselves.
+        wait_for_completion: When True, the result reports how the run ended rather than that it
+            began, so callers can read output values straight afterwards without inventing their
+            own polling loop. When False, the result is a kickoff acknowledgement: the run carries
+            on in the background and is followed through execution events.
         completion_timeout_ms: Only meaningful when wait_for_completion=True. Maximum time to
-            wait for the flow to resolve. None means wait indefinitely.
+            wait for the flow to resolve. None means wait indefinitely. On timeout the run is
+            cancelled and the result is a failure.
+
+    A caller dispatching synchronously (`GriptapeNodes.handle_request`, `cmd.run_flow`) has no
+    event loop left to run a backgrounded flow once the call returns, so it gets the run inline
+    whatever `wait_for_completion` says.
 
     Results: StartFlowResultSuccess | StartFlowResultFailure (with validation exceptions)
     """
@@ -88,7 +94,10 @@ class StartFlowRequest(RequestPayload):
 @dataclass
 @PayloadRegistry.register
 class StartFlowResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
-    """Flow started successfully. Execution is now running."""
+    """Flow started successfully.
+
+    The run is still going unless `wait_for_completion` was set, in which case it finished cleanly.
+    """
 
 
 @dataclass
@@ -151,6 +160,10 @@ class StartFlowFromNodeRequest(RequestPayload):
         node_name: Name of the node to start execution from
         debug_mode: Whether to run in debug mode (default: False)
         pickle_control_flow_result: If this is true, the final ControlFLowResolvedEvent will be pickled to be picked up from inside a subprocess
+        wait_for_completion: When True, the result reports how the run ended rather than that it
+            began. See StartFlowRequest for what that costs and when it is ignored.
+        completion_timeout_ms: Only meaningful when wait_for_completion=True. Maximum time to
+            wait for the flow to resolve. None means wait indefinitely.
 
     Results: StartFlowFromNodeResultSuccess | StartFlowFromNodeResultFailure (with validation exceptions)
     """
@@ -159,12 +172,17 @@ class StartFlowFromNodeRequest(RequestPayload):
     node_name: str | None = None
     debug_mode: bool = False
     pickle_control_flow_result: bool = False
+    wait_for_completion: bool = False
+    completion_timeout_ms: int | None = None
 
 
 @dataclass
 @PayloadRegistry.register
 class StartFlowFromNodeResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
-    """Flow started from node successfully. Execution is now running from the specified node."""
+    """Flow started from the specified node.
+
+    The run is still going unless `wait_for_completion` was set, in which case it finished cleanly.
+    """
 
 
 @dataclass

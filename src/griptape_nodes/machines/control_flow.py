@@ -201,6 +201,24 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
     async def start_flow(
         self, start_node: BaseNode, end_node: BaseNode | None = None, *, debug_mode: bool = False
     ) -> None:
+        """Seed the run and drive it to completion.
+
+        For callers that own the run from start to finish. A caller that has to answer someone
+        else before the run is over (`FlowManager.start_flow`, which answers a StartFlowRequest)
+        seeds with `prepare_flow` and drives separately instead.
+        """
+        await self.prepare_flow(start_node, end_node, debug_mode=debug_mode)
+        await self.drive_flow()
+
+    async def prepare_flow(
+        self, start_node: BaseNode, end_node: BaseNode | None = None, *, debug_mode: bool = False
+    ) -> None:
+        """Build the DAG and announce the run, without advancing it.
+
+        Split from the drive so a caller can report seeding problems -- a DAG that cannot be
+        built, a node that cannot be added -- to whoever asked for the run, while the run itself
+        proceeds on its own.
+        """
         # If using DAG resolution, process data_nodes from queue first
         current_nodes = await self._process_nodes_for_dag(start_node)
         self._context.current_nodes = current_nodes
@@ -220,6 +238,9 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
                     wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=involved_nodes))
                 )
             )
+
+    async def drive_flow(self) -> None:
+        """Advance the prepared run until it finishes, errors, or parks in debug mode."""
         await self.start(ResolveNodeState)  # Begins the flow
 
     async def update(self) -> None:
