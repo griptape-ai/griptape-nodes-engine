@@ -102,17 +102,51 @@ class VariableResolver:
         )
 
     @staticmethod
-    def resolve_value(value: Any, variables: dict[str, str | int], node_name: str | None = None) -> Any:
-        """Recursively substitute {VAR} references in any str/dict/list value."""
+    def resolve_value(
+        value: Any,
+        variables: dict[str, str | int],
+        node_name: str | None = None,
+        _active: set[int] | None = None,
+    ) -> Any:
+        """Recursively substitute {VAR} references in any str/dict/list value.
+
+        Returns `value` itself when nothing inside it was rewritten, so a node that writes a
+        container to an output and reads it straight back gets the container it wrote. Output
+        writes run through here, so rebuilding unconditionally would also copy every dict and
+        list on that path.
+
+        `_active` is the containers currently being walked, so a value that reaches itself
+        terminates rather than recursing.
+        """
         if isinstance(value, str):
             if VariableResolver._HAS_VARIABLE_MACRO.search(value):
                 return VariableResolver.resolve_string(value, variables, node_name)
             return value
-        if isinstance(value, dict):
-            return {k: VariableResolver.resolve_value(v, variables, node_name) for k, v in value.items()}
-        if isinstance(value, list):
-            return [VariableResolver.resolve_value(item, variables, node_name) for item in value]
-        return value
+
+        if not isinstance(value, (dict, list)):
+            return value
+
+        if _active is None:
+            _active = set()
+        if id(value) in _active:
+            return value
+
+        _active.add(id(value))
+        try:
+            if isinstance(value, dict):
+                resolved_dict = {
+                    k: VariableResolver.resolve_value(v, variables, node_name, _active) for k, v in value.items()
+                }
+                if all(resolved_dict[k] is v for k, v in value.items()):
+                    return value
+                return resolved_dict
+
+            resolved_list = [VariableResolver.resolve_value(item, variables, node_name, _active) for item in value]
+            if all(new is old for new, old in zip(resolved_list, value, strict=True)):
+                return value
+            return resolved_list
+        finally:
+            _active.discard(id(value))
 
     @staticmethod
     def seed_cache(variables: dict[str, str | int] | None) -> object:
