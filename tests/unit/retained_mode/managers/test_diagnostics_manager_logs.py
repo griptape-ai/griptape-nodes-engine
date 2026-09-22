@@ -158,6 +158,58 @@ class TestStageLogs:
         assert bundle.add_session_log.call_args.args[0] == ["a line worth keeping"]
 
 
+class TestOneLogRatherThanTwo:
+    """Both sinks hold the same lines, so a bundle carries whichever one covers the session."""
+
+    def test_the_session_log_is_left_out_when_this_session_wrote_a_file(self, tmp_path: Path) -> None:
+        active = _write_log(tmp_path)
+        manager = _manager(tmp_path)
+        bundle = Mock()
+
+        with (
+            patch(f"{_MODULE}.active_log_file", return_value=active),
+            patch(f"{_MODULE}.session_log_lines", return_value=["a line"]),
+        ):
+            manager._stage_logs(bundle, [])
+
+        assert bundle.add_log_files.call_args.args[0] == [active]
+        bundle.add_session_log.assert_not_called()
+
+    def test_left_out_on_purpose_is_not_reported_as_missing(self, tmp_path: Path) -> None:
+        """The buffer being empty only matters when nothing else recorded the session."""
+        active = _write_log(tmp_path)
+        manager = _manager(tmp_path)
+        warnings: list[str] = []
+
+        with (
+            patch(f"{_MODULE}.active_log_file", return_value=active),
+            patch(f"{_MODULE}.session_log_lines", return_value=[]),
+        ):
+            manager._stage_logs(Mock(), warnings)
+
+        assert warnings == []
+
+    def test_files_from_earlier_runs_do_not_stand_in_for_this_one(self, tmp_path: Path) -> None:
+        """File logging switched off after earlier runs had already left files behind.
+
+        Those files are still worth carrying, but they say nothing about the run being
+        reported. Asking "are there any log files" rather than "did this session write one"
+        would drop the only record of it.
+        """
+        earlier = _write_log(tmp_path)
+        manager = _manager(tmp_path, log_to_file=False)
+        bundle = Mock()
+
+        with (
+            patch(f"{_MODULE}.active_log_file", return_value=None),
+            patch(f"{_MODULE}.session_log_lines", return_value=["what just happened"]),
+        ):
+            manager._stage_logs(bundle, [])
+
+        assert bundle.add_log_files.call_args.args[0] == [earlier]
+        assert bundle.add_session_log.call_args.args[0] == ["what just happened"]
+
+
 class TestWhyThereIsNoSessionLog:
     """Absent because it was switched off, or absent because nothing has happened yet."""
 

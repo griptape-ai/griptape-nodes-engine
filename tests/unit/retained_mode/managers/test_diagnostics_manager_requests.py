@@ -319,10 +319,12 @@ class TestBundle:
         assert README_FILE_NAME in members
         assert MANIFEST_FILE_NAME in members
         assert REPORT_FILE_NAME in members
-        assert something_in_the_log in members[f"{LOGS_DIRECTORY_NAME}/{SESSION_LOG_FILE_NAME}"]
-        # The files on disk as well as the session buffer: they are separate sources, and
-        # they are what covers the sessions before the one being collected from.
-        assert [name for name in members if name.startswith(f"{LOGS_DIRECTORY_NAME}/engine-")] != []
+        # This engine writes a log file, so the file is the one log the bundle carries and
+        # the session buffer's copy of the same lines is left out.
+        engine_logs = [name for name in members if name.startswith(f"{LOGS_DIRECTORY_NAME}/engine-")]
+        assert engine_logs != []
+        assert any(something_in_the_log in members[name] for name in engine_logs)
+        assert f"{LOGS_DIRECTORY_NAME}/{SESSION_LOG_FILE_NAME}" not in members
 
     @pytest.mark.asyncio
     async def test_the_reported_size_is_the_size_of_the_file_on_disk(self, engine: Engine, tmp_path: Path) -> None:
@@ -480,9 +482,10 @@ class TestBundle:
         result = await _collect(engine, tmp_path)
 
         members = _members(result)
-        session_log = members[f"{LOGS_DIRECTORY_NAME}/{SESSION_LOG_FILE_NAME}"]
-        assert "authenticating with" in session_log, "the line was never captured, so nothing was redacted"
-        assert REDACTED in session_log
+        logs = [text for name, text in members.items() if name.startswith(f"{LOGS_DIRECTORY_NAME}/")]
+        captured = [text for text in logs if "authenticating with" in text]
+        assert captured != [], "the line was never captured, so nothing was redacted"
+        assert all(REDACTED in text for text in captured)
         assert [name for name, text in members.items() if declared_canary in text] == []
         assert result.manifest.redaction.counts[RedactionReason.KNOWN_SECRET_VALUE] >= 1
 

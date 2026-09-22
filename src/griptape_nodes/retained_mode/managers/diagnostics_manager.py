@@ -521,19 +521,38 @@ class DiagnosticsManager(EngineScoped):
             return None
 
     def _stage_logs(self, bundle: DiagnosticsBundle, warnings: list[str]) -> None:
-        """Add this session's log and the log files on disk to a bundle."""
-        session_lines = session_log_lines()
-        if session_lines:
-            bundle.add_session_log(session_lines)
-        else:
-            warnings.append(self._missing_session_log_warning())
-
+        """Add the log files on disk, and this session's log only when it is not already in one."""
         log_files = [path for directory in self._log_directories() for path in find_log_files(directory)]
         if not log_files:
             warnings.append(self._missing_log_files_warning())
+        else:
+            bundle.add_log_files(log_files, warnings)
+
+        self._stage_session_log(bundle, warnings)
+
+    def _stage_session_log(self, bundle: DiagnosticsBundle, warnings: list[str]) -> None:
+        """Add the in-memory log, unless this session already reached a log file on disk.
+
+        Both sinks are on the same logger at the same level, so a session that wrote a file
+        put the same lines in both places -- the buffer holding its last few thousand and the
+        file holding all of them. Shipping the pair meant two logs to read, one a subset of
+        the other, and no way to tell from the outside which was which.
+
+        Asks what was written rather than what ``log_to_file`` says, because the setting can
+        be on while the file never opened: an unwritable directory leaves the buffer as the
+        only record of the session, and that is the session someone is asking about. It also
+        keeps the buffer when file logging was switched off but earlier runs left files
+        behind, since those files say nothing about this run.
+        """
+        if active_log_file() is not None:
             return
 
-        bundle.add_log_files(log_files, warnings)
+        session_lines = session_log_lines()
+        if not session_lines:
+            warnings.append(self._missing_session_log_warning())
+            return
+
+        bundle.add_session_log(session_lines)
 
     def _log_directories(self) -> list[Path]:
         """Return every directory holding this engine's logs, the configured one first.
