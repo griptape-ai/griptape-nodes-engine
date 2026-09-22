@@ -14,9 +14,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from griptape_nodes.exe_types.core_types import Parameter
 from griptape_nodes.exe_types.param_components.model_policy import (
+    CHECK_FAILED_DECORATION,
     DEFERRED_SNAPSHOT,
+    DENIED_DECORATION,
     ModelPolicySnapshot,
+    apply_denial_badge,
     node_access_request,
     query_model_policy,
 )
@@ -348,7 +352,14 @@ class TestQueryModelPolicy:
         assert detail is not None
         for jargon in ("model_usage", "manifest", "griptape_nodes_library.json", "SomeNode", "not registered"):
             assert jargon not in detail
-        assert "Contact whoever maintains this node library." in detail
+        # The artist's license decided nothing here -- the query never ran -- so the word must not
+        # appear at all. "plan" does, but only in the sentence denying that this is one.
+        assert "license" not in detail.lower()
+        assert "This is a bug" in detail
+        assert "not a limit on your plan" in detail
+        # Reportable by a route an artist actually has. Named rather than assumed, because this
+        # string also arrives as a run error in a headless run, where there is no menu to point at.
+        assert "File > Report Issue" in detail
         # The author-facing diagnostic is not lost -- it moved to the log.
         assert "model_usage block" in caplog.text
         assert "SomeNode" in caplog.text
@@ -437,6 +448,67 @@ class TestDenialFor:
         assert snapshot.denial_for(DENIED, refuse_unrecognized=True) is _DENIAL
 
 
+class TestTheDecorationTellsTheTwoRefusalsApart:
+    """A check that could not run must not wear the wording of a check that ran and said no.
+
+    Both components decorate from ``ModelPolicySnapshot.decoration``, so this is the only place the
+    two states are told apart. Getting it wrong is what made a broken registration read as a plan
+    limitation on every row of a dropdown at once, sending artists to compare pricing tiers.
+    """
+
+    def test_a_license_denial_keeps_the_license_wording(self) -> None:
+        """Nothing changes for a real denial: policy answered, and the answer was no."""
+        snapshot = ModelPolicySnapshot(
+            denial_by_provider_id={DENIED: _DENIAL}, catalog_ids_by_provider_id={DENIED: ("x",)}
+        )
+        assert snapshot.decoration is DENIED_DECORATION
+        assert "license" in snapshot.decoration.row_subtitle.lower()
+
+    def test_an_unanswerable_query_does_not(self) -> None:
+        snapshot = query_model_policy(_node(QueryModelAccessForNodeResultFailure(result_details="not registered")))
+        assert snapshot.decoration is CHECK_FAILED_DECORATION
+
+    def test_no_check_failed_surface_mentions_a_license(self) -> None:
+        """Every surface, not just the detail -- one that says "license" undoes the rest."""
+        for text in (
+            CHECK_FAILED_DECORATION.row_subtitle,
+            CHECK_FAILED_DECORATION.badge_title,
+            CHECK_FAILED_DECORATION.badge_lead,
+        ):
+            assert "license" not in text.lower()
+
+    def test_the_two_differ_on_every_surface(self) -> None:
+        """Pinned field by field: sharing any one of them re-merges the states on that surface."""
+        assert CHECK_FAILED_DECORATION.icon != DENIED_DECORATION.icon
+        assert CHECK_FAILED_DECORATION.row_subtitle != DENIED_DECORATION.row_subtitle
+        assert CHECK_FAILED_DECORATION.badge_title != DENIED_DECORATION.badge_title
+        assert CHECK_FAILED_DECORATION.badge_lead != DENIED_DECORATION.badge_lead
+
+    def test_an_unattributable_denial_still_reads_as_a_denial(self) -> None:
+        """The one refusal that looks like a fault but is not: policy really did deny a model.
+
+        Only the handle to hang it on is missing. Decorating it "couldn't be checked" would tell an
+        artist their license permits something it does not.
+        """
+        snapshot = query_model_policy(_node(_success([ModelAccessVerdict("md_flux_dev", None, _DENIAL)])))
+        assert snapshot.decoration is DENIED_DECORATION
+
+    def test_the_badge_carries_the_snapshots_wording(self) -> None:
+        """The badge is the surface an artist sees first, and it takes its title from the snapshot."""
+        snapshot = query_model_policy(_node(QueryModelAccessForNodeResultFailure(result_details="not registered")))
+        parameter = Parameter(name="model", type="str", default_value=ALLOWED, tooltip="m")
+
+        apply_denial_badge(parameter, ALLOWED, snapshot.denial_for(ALLOWED), decoration=snapshot.decoration)
+
+        badge = parameter.get_badge()
+        assert badge is not None
+        assert badge.title == CHECK_FAILED_DECORATION.badge_title
+        assert badge.message is not None
+        assert "license" not in badge.message.lower()
+        # The model id still appears verbatim: the artist has to know which selection is stuck.
+        assert ALLOWED in badge.message
+
+
 class TestAnUnattributableDenialIsNotDropped:
     """A denial policy handed us must be honored even when no row can carry it.
 
@@ -455,6 +527,11 @@ class TestAnUnattributableDenialIsNotDropped:
         # catalog id and the fix belong in the log warning instead.
         assert "provider_model_id" not in denial.reason()
         assert "md_flux_dev" not in denial.reason()
+        # A real license denial, so it keeps saying so. Only who to tell splits: the library at
+        # fault is often one of ours, and nothing on the node tells an artist which case they are in.
+        assert "license" in denial.reason()
+        assert "File > Report Issue" in denial.reason()
+        assert "maintains this node library" in denial.reason()
 
     def test_a_permitted_handleless_entry_does_not_refuse_anything(self) -> None:
         """Only a DENIED unmatchable entry escalates; a permitted one is merely unmatchable."""

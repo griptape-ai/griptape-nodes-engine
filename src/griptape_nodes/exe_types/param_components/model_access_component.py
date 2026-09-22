@@ -108,8 +108,6 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from griptape_nodes.exe_types.param_components.model_policy import (
-    DENIED_ROW_ICON,
-    DENIED_ROW_SUBTITLE,
     ModelPolicySnapshot,
     apply_denial_badge,
     node_access_request,
@@ -317,7 +315,7 @@ class ModelAccessComponent:
         if not isinstance(value, str):
             parameter.clear_badge()
             return
-        apply_denial_badge(parameter, value, self._cached_denial(value))
+        apply_denial_badge(parameter, value, self._cached_denial(value), decoration=self._snapshot.decoration)
 
     def on_value_set(self, parameter: Parameter, value: Any) -> None:
         """Forward from ``BaseNode.after_value_set``, ignoring every other parameter.
@@ -617,6 +615,7 @@ class ModelAccessComponent:
         "GPT-5.5" costs every row twice the height to say nothing.
         """
         data: list[dict[str, str]] = []
+        decoration = self._snapshot.decoration
         for choice in self._model_choices:
             row: dict[str, str] = {"name": choice}
             display_name = self._snapshot.display_name_for(choice)
@@ -625,10 +624,10 @@ class ModelAccessComponent:
                 if _id_adds_detail(display_name, choice):
                     row["subtitle"] = choice
             if self._cached_denial(choice) is not None:
-                row["icon"] = DENIED_ROW_ICON
+                row["icon"] = decoration.icon
                 # Outranks the id: it is the actionable line, and it keeps a denied row
                 # identical to HuggingFace's. The badge still quotes the id verbatim.
-                row["subtitle"] = DENIED_ROW_SUBTITLE
+                row["subtitle"] = decoration.row_subtitle
             data.append(row)
         return {
             "data": data,

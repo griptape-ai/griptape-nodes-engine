@@ -131,7 +131,7 @@ class TestFailClosed:
             param = _param(gated=True)
         denial = param.query_for_denial(ALLOWED_REPO)
         assert denial is not None
-        assert "could not be checked against your license" in denial.reason()
+        assert "couldn't check which models this node is allowed to use" in denial.reason()
 
     def test_raise_if_denied_raises_for_denied_and_passes_for_allowed(self) -> None:
         param = _param(gated=True)
@@ -180,7 +180,7 @@ class TestTheEmptyCachePlaceholderIsNotBadgedAsUnlicensed:
         errors = param.validate_before_node_run()
         assert errors is not None
         message = str(errors[0])
-        assert "could not be checked against your license" not in message
+        assert "couldn't check which models this node is allowed to use" not in message
         assert "not found in available models" in message
 
 
