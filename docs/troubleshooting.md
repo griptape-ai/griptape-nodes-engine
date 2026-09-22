@@ -230,8 +230,8 @@ A **diagnostics bundle** is one zip file holding:
 
 | Inside the bundle  | What it tells whoever reads it                                                                                                 |
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------------ |
-| `logs/session.log` | Everything the engine logged from the moment it started until you made the bundle                                              |
-| `logs/*.log`       | The log files kept on disk, newest first, for problems that happened in an earlier session                                     |
+| `logs/*.log`       | The log files kept on disk, newest first. The top one covers the session you made the bundle in                                |
+| `logs/session.log` | Everything the engine logged this session, from memory. Only when none of it reached a log file                                |
 | `report.json`      | Which engine version was running, on what machine, with which settings, and how every library and project fared when it loaded |
 | `doctor.json`      | The [`doctor`](reference/command_line_interface.md#doctor) health checks: what is wrong and what to do about each one          |
 | `workflow/`        | The workflow that was open, as it was last saved. Only when the editor made the bundle                                         |
@@ -254,9 +254,11 @@ gtn diagnostics collect --output ~/Desktop
 
 Attach the file to your bug report. Nothing is uploaded anywhere — the bundle is written to your machine, and sharing it is your call.
 
-!!! note "Is it safe to share?"
+!!! note "What is taken out, and what to check before you share it"
 
-    Yes. The bundle is written by the engine, which knows its own API keys, so it searches every file it collects and takes them out — along with anything else shaped like a credential. Home directory paths become `~` and your username becomes `<user>`; pass `--show-identity` if you would rather keep them. Anything removed shows up as `<redacted>`, and `manifest.json` counts every removal, so a setting that looks empty can be told apart from one that was hidden.
+    The bundle is written by the engine, which knows its own API keys, so it searches every file it collects and takes them out — along with anything else shaped like a credential. Home directory paths become `~` and your username becomes `<user>`; pass `--show-identity` if you would rather keep them. Anything removed shows up as `<redacted>`, and `manifest.json` counts every removal, so a setting that looks empty can be told apart from one that was hidden.
+
+    What it cannot find is a secret it was never told about that is not shaped like one — a password typed into a node's text field, or a token a library wrote to its own log in its own format. Skim the files under `logs/` and the workflow file before attaching the bundle to anything public, because what is left depends on what was on your machine.
 
 If you only want the health checks and not a file to send, run:
 
@@ -296,4 +298,4 @@ GTN_CONFIG_LOG_LEVEL=DEBUG gtn
 
 !!! tip
 
-    The engine keeps the most recent 5,000 log lines in memory, and a diagnostics bundle includes them as `logs/session.log`. So if a problem just happened, making a bundle now captures it even if log files are turned off. Those lines carry whatever the log level allows, so set the log level to `DEBUG` before reproducing the problem if you need debug detail in the bundle. `logging.session_log_buffer_lines` controls how many lines are kept.
+    The engine keeps the most recent 5,000 log lines in memory, so making a bundle right after a problem captures it even if log files are turned off — they arrive as `logs/session.log`. When the engine did write a log file, that file already holds the same lines and more, so the bundle ships the file instead and leaves `session.log` out. Either way the lines carry whatever the log level allows, so set the log level to `DEBUG` before reproducing the problem if you need debug detail. `logging.session_log_buffer_lines` controls how many lines are kept.
