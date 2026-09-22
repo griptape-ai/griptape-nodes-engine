@@ -452,8 +452,8 @@ class TestTheDecorationTellsTheTwoRefusalsApart:
     """A check that could not run must not wear the wording of a check that ran and said no.
 
     Both components decorate from ``ModelPolicySnapshot.decoration``, so this is the only place the
-    two states are told apart. Getting it wrong is what made a broken registration read as a plan
-    limitation on every row of a dropdown at once, sending artists to compare pricing tiers.
+    two states are told apart, and a merge here would tell an artist their plan forbids a model
+    when the engine simply never asked.
     """
 
     def test_a_license_denial_keeps_the_license_wording(self) -> None:
@@ -507,6 +507,25 @@ class TestTheDecorationTellsTheTwoRefusalsApart:
         assert "license" not in badge.message.lower()
         # The model id still appears verbatim: the artist has to know which selection is stuck.
         assert ALLOWED in badge.message
+
+    def test_the_badge_explains_the_state_once(self) -> None:
+        """The lead carries the consequence, the reason carries the explanation.
+
+        `apply_denial_badge` puts the lead ahead of `failure_detail`, so a lead that also explained
+        the state would open with two sentences on the same subject and push the line that helps --
+        that this is a bug, and where to report it -- to the end of the badge.
+        """
+        snapshot = query_model_policy(_node(QueryModelAccessForNodeResultFailure(result_details="not registered")))
+        parameter = Parameter(name="model", type="str", default_value=ALLOWED, tooltip="m")
+
+        apply_denial_badge(parameter, ALLOWED, snapshot.denial_for(ALLOWED), decoration=snapshot.decoration)
+
+        badge = parameter.get_badge()
+        assert badge is not None
+        assert badge.message is not None
+        assert badge.message.lower().count("couldn't check") == 1
+        lead = CHECK_FAILED_DECORATION.badge_lead.format(value=ALLOWED)
+        assert badge.message.startswith(lead)
 
 
 class TestAnUnattributableDenialIsNotDropped:

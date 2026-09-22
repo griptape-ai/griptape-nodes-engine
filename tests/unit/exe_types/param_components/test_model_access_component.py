@@ -588,10 +588,10 @@ class TestEngineFailureIsFailClosedAtRuntime:
     def test_no_surface_blames_the_artists_license(self, caplog) -> None:  # noqa: ANN001
         """Fail-closed denies every choice, so every row and the badge carry this state at once.
 
-        That breadth is what sold the misread: a dropdown where all rows read "Not permitted by
-        your license" looks exactly like a plan that does not cover this node, and an artist has no
-        way to tell it apart from one. The wording is not enough on its own -- the row subtitle and
-        the badge title have to say "couldn't be checked" too.
+        That breadth is what makes the wording matter: a dropdown where every row reads "Not
+        permitted by your license" is indistinguishable from a plan that does not cover this node.
+        So the detail string is not enough on its own -- the row subtitle and the badge title have
+        to say "couldn't be checked" too.
         """
         import logging
 

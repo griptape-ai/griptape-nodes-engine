@@ -49,10 +49,10 @@ class DenialDecoration:
     There are two instances, and which one a parameter wears is the difference between an answer
     and a missing answer. ``DENIED_DECORATION`` is for a check that ran and said no: the artist's
     license does not cover the model, and nothing about that is a fault. ``CHECK_FAILED_DECORATION``
-    is for a check that could not run at all, which is the engine's fault and not theirs. Wearing
-    the denied icon and "Not permitted by your license" for that state sent artists to compare
-    pricing tiers over what was really a broken registration, so the two states say different
-    things on every surface: the row, the badge title, and the badge's opening line.
+    is for a check that could not run at all, which is the engine's fault and not theirs. The two
+    differ on every surface -- the row, the badge title, and the badge's opening line -- because a
+    surface still saying "not permitted by your license" would blame the artist's plan for an
+    engine-side fault, and they have no way to tell the two apart.
 
     ``badge_lead`` is that opening line and carries a ``{value}`` placeholder for the model id;
     ``apply_denial_badge`` fills it in and appends the consequence and the reason.
@@ -77,7 +77,9 @@ CHECK_FAILED_DECORATION = DenialDecoration(
     icon="alert-triangle",
     row_subtitle="Couldn't be checked",
     badge_title="Model Check Failed",
-    badge_lead="Griptape Nodes couldn't check whether `{value}` is permitted.",
+    # Only the consequence: `apply_denial_badge` appends `failure_detail`, which is what explains
+    # this state, and a lead that explained it too would say it twice before the part that helps.
+    badge_lead="`{value}` can't be used right now.",
 )
 
 
@@ -330,18 +332,11 @@ def query_model_policy(node: BaseNode, *, fail_closed: bool = True) -> ModelPoli
             request.node_type,
             details,
         )
-        # Artist-facing, like the `unmatchable_denials` wording in `denial_for`: state the effect
-        # and who to tell. The node type, the engine's reason, and the manifest instruction stay in
-        # the warning above -- an artist cannot edit a library manifest, and naming one reads as a
-        # licensing problem when the actual fault is a broken registration.
-        #
-        # Which is why the message says outright that this is a bug and names where to report it.
-        # This path fires on a resolution fault the artist had no part in and cannot fix, and the
-        # library it would have named is usually one of ours; pointing them at a maintainer, in
-        # wording built around their license, sent them comparing plan tiers for an engine bug.
-        # The menu path stays useful when this string arrives as a run error in a headless `gtn
-        # run` or a published workflow, because it says where the menu is rather than assuming
-        # they are looking at it.
+        # Artist-facing, so it states the effect and where to report it, and nothing they cannot
+        # act on: the node type, the engine's reason, and the manifest instruction stay in the
+        # warning above. It names the menu rather than an action ("File > Report Issue" over "use
+        # Report Issue") because the same string surfaces as a run error under `gtn run` and in
+        # published workflows, where there is no menu in front of them.
         return ModelPolicySnapshot(
             failure_detail=(
                 "Griptape Nodes couldn't check which models this node is allowed to use, so nothing "
