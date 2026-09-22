@@ -112,12 +112,10 @@ from griptape_nodes.exe_types.param_components.model_policy import (
     DENIED_ROW_SUBTITLE,
     ModelPolicySnapshot,
     apply_denial_badge,
+    node_access_request,
     query_model_policy,
 )
-from griptape_nodes.retained_mode.events.access_events import (
-    QueryModelAccessForNodeRequest,
-    QueryModelAccessForNodeResultSuccess,
-)
+from griptape_nodes.retained_mode.events.access_events import QueryModelAccessForNodeResultSuccess
 from griptape_nodes.traits.button import Button
 from griptape_nodes.traits.options import Options
 
@@ -418,12 +416,7 @@ class ModelAccessComponent:
         # refresh is honored at run time in BOTH directions -- a newly granted permission unblocks
         # the artist without waiting for a refresh, and a newly revoked one still denies. Returning
         # a cached denial early would make grants invisible.
-        result = self._node.engine.handle_request(
-            QueryModelAccessForNodeRequest(
-                node_type=type(self._node).__name__,
-                candidate_model_ids=list(catalog_ids),
-            )
-        )
+        result = self._node.engine.handle_request(node_access_request(self._node, list(catalog_ids)))
         if not isinstance(result, QueryModelAccessForNodeResultSuccess) or not result.verdicts:
             # Unanswerable now (library reloaded or unregistered mid-session). Fall back to the
             # cached verdict rather than to None: forgetting a denial we already hold would run a
@@ -600,7 +593,7 @@ class ModelAccessComponent:
         ``DEFERRED_SNAPSHOT`` comes back instead (see ``query_model_policy``);
         ``query_for_denial`` re-fetches it before its first real verdict.
         """
-        return query_model_policy(self._node.engine, type(self._node).__name__)
+        return query_model_policy(self._node)
 
     def _build_ui_options(self) -> dict[str, Any]:
         """Build the ``ui_options`` dict that decorates the dropdown row-by-row.

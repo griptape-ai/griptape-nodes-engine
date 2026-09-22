@@ -10,6 +10,11 @@ the policy layer once, hold the verdicts in an immutable snapshot, and answer lo
 components delegate here so a policy change lands in one place and the two surfaces cannot drift
 into giving opposite answers for the same model.
 
+Every node-attributed query is built by ``node_access_request``, including the live per-value
+re-asks a component makes at run time. Asking about a node means naming both the node type and the
+library it came from -- see that function -- and one construction point is what keeps the second
+half from being forgotten.
+
 What stays with each component: installing traits, writing ``ui_options``, deciding when to
 refresh, and choosing how a denial reaches the artist (row icon, badge, raised error).
 """
@@ -29,7 +34,7 @@ from griptape_nodes.retained_mode.managers.event_manager import reentrant_bus_in
 
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.core_types import Parameter
-    from griptape_nodes.retained_mode.engine import Engine
+    from griptape_nodes.exe_types.node_types import BaseNode
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -196,8 +201,42 @@ class ModelPolicySnapshot:
 DEFERRED_SNAPSHOT = ModelPolicySnapshot(deferred=True)
 
 
-def query_model_policy(engine: Engine, node_type: str, *, fail_closed: bool = True) -> ModelPolicySnapshot:
-    """Ask the engine which of ``node_type``'s declared models are permitted.
+def node_access_request(node: BaseNode, candidate_model_ids: list[str] | None = None) -> QueryModelAccessForNodeRequest:
+    """Build the node-attributed access query for ``node``, naming the library it came from.
+
+    Both fields come off ``node.metadata``, where ``Library.create_node`` recorded them, because
+    neither is reliably derivable from the class. A class name is not unique across libraries --
+    two installed libraries may each register ``Flux2ImageGeneration`` -- and a library keys its
+    node types by the name its JSON declared, which ``register_lazy_node_type`` never compares to
+    ``__name__``. So a query built from ``type(node).__name__`` can resolve to no library or to no
+    type at all, and an unresolved query fails closed: every model on the node is denied, which
+    reads to an artist as a licensing problem when the check never ran. ``get_declared_models``,
+    which fills the same dropdown's choices, reads the same two fields.
+
+    A node built outside the library path -- a transient probe, a test fixture -- recorded neither,
+    so the type falls back to ``type(node).__name__`` and the library to ``None``, leaving the
+    engine's lookup-by-name that is correct whenever exactly one library declares the type.
+
+    Args:
+        node: The node the query is attributed to. Supplies both the node type and the library.
+        candidate_model_ids: Narrow the query to these catalog ids. ``None`` (default) lets the
+            engine derive the candidates from the node's declarations.
+    """
+    library_name = node.metadata.get("library")
+    if not isinstance(library_name, str):
+        library_name = None
+    node_type = node.metadata.get("node_type")
+    if not isinstance(node_type, str):
+        node_type = type(node).__name__
+    return QueryModelAccessForNodeRequest(
+        node_type=node_type,
+        specific_library_name=library_name,
+        candidate_model_ids=candidate_model_ids,
+    )
+
+
+def query_model_policy(node: BaseNode, *, fail_closed: bool = True) -> ModelPolicySnapshot:
+    """Ask the engine which of ``node``'s declared models are permitted.
 
     Returns ``DEFERRED_SNAPSHOT`` without querying when the request would trip
     reentrant-bus-in-init: a node ``__init__`` on the stack inside a strict-mode scope, which
@@ -211,30 +250,31 @@ def query_model_policy(engine: Engine, node_type: str, *, fail_closed: bool = Tr
     only after it runs.
 
     Args:
-        engine: Engine to ask about model access.
-        node_type: The node class name the manifest declares ``model_usage`` against.
+        node: The node whose declared models to check. Supplies the engine to ask, plus the
+            registered node type and library that ``node_access_request`` derives the query from.
         fail_closed: What an unanswerable query means. When True, the returned snapshot carries a
             ``failure_detail`` so every subsequent lookup denies -- a broken library registration
             must not silently open the gate. When False, the failure is treated as "this library
             has not adopted declarations", which is the pre-adoption status quo rather than an
             error, and the snapshot is empty.
     """
+    request = node_access_request(node)
     if reentrant_bus_in_init_would_report():
         logger.debug(
             "Deferring model-policy query for node type '%s': node __init__ in progress under a strict-mode scope.",
-            node_type,
+            request.node_type,
         )
         return DEFERRED_SNAPSHOT
-    result = engine.handle_request(QueryModelAccessForNodeRequest(node_type=node_type))
+    result = node.engine.handle_request(request)
     if not isinstance(result, QueryModelAccessForNodeResultSuccess):
         details = getattr(result, "result_details", None) or type(result).__name__
         if not fail_closed:
-            logger.debug("Model policy unavailable for node type '%s' (%s); not enforcing.", node_type, details)
+            logger.debug("Model policy unavailable for node type '%s' (%s); not enforcing.", request.node_type, details)
             return ModelPolicySnapshot()
         logger.warning(
             "Could not resolve model access for node type '%s' (%s). Selections will be refused until this "
             "resolves. Verify the node's griptape_nodes_library.json entry declares a model_usage block.",
-            node_type,
+            request.node_type,
             details,
         )
         # Artist-facing, like the `unmatchable_denials` wording in `denial_for`: state the effect
@@ -276,7 +316,7 @@ def query_model_policy(engine: Engine, node_type: str, *, fail_closed: bool = Tr
             "Node type '%s' declares model(s) %s that license policy DENIES, but they carry no "
             "provider_model_id, so the denial cannot be matched to a dropdown row. Refusing the whole "
             "parameter instead. Add provider_model_id to those catalog entries.",
-            node_type,
+            request.node_type,
             unmatchable_denials,
         )
 
