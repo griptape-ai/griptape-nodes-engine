@@ -258,31 +258,36 @@ def query_model_policy(node: BaseNode, *, fail_closed: bool = True) -> ModelPoli
     only after it runs.
 
     Args:
-        node: The node whose declared models to check. Supplies the engine to ask, the node class
-            name the manifest declares ``model_usage`` against, and the library that registered it.
+        node: The node whose declared models to check. Supplies the engine to ask, plus the
+            registered node type and library that ``node_access_request`` derives the query from.
         fail_closed: What an unanswerable query means. When True, the returned snapshot carries a
             ``failure_detail`` so every subsequent lookup denies -- a broken library registration
             must not silently open the gate. When False, the failure is treated as "this library
             has not adopted declarations", which is the pre-adoption status quo rather than an
             error, and the snapshot is empty.
     """
-    node_type = type(node).__name__
+    # Built before the deferral guard, which is safe because a request is a plain dataclass and
+    # constructing one touches no bus. Every log line below names the type this request carries
+    # rather than deriving its own: a library that declares an aliased class registers under a name
+    # its class does not report, and a warning naming the name the engine was never asked about
+    # sends its reader after a registration that was never the problem.
+    request = node_access_request(node)
     if reentrant_bus_in_init_would_report():
         logger.debug(
             "Deferring model-policy query for node type '%s': node __init__ in progress under a strict-mode scope.",
-            node_type,
+            request.node_type,
         )
         return DEFERRED_SNAPSHOT
-    result = node.engine.handle_request(node_access_request(node))
+    result = node.engine.handle_request(request)
     if not isinstance(result, QueryModelAccessForNodeResultSuccess):
         details = getattr(result, "result_details", None) or type(result).__name__
         if not fail_closed:
-            logger.debug("Model policy unavailable for node type '%s' (%s); not enforcing.", node_type, details)
+            logger.debug("Model policy unavailable for node type '%s' (%s); not enforcing.", request.node_type, details)
             return ModelPolicySnapshot()
         logger.warning(
             "Could not resolve model access for node type '%s' (%s). Selections will be refused until this "
             "resolves. Verify the node's griptape_nodes_library.json entry declares a model_usage block.",
-            node_type,
+            request.node_type,
             details,
         )
         # Artist-facing, like the `unmatchable_denials` wording in `denial_for`: state the effect
@@ -324,7 +329,7 @@ def query_model_policy(node: BaseNode, *, fail_closed: bool = True) -> ModelPoli
             "Node type '%s' declares model(s) %s that license policy DENIES, but they carry no "
             "provider_model_id, so the denial cannot be matched to a dropdown row. Refusing the whole "
             "parameter instead. Add provider_model_id to those catalog entries.",
-            node_type,
+            request.node_type,
             unmatchable_denials,
         )
 

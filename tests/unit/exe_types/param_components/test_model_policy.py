@@ -226,6 +226,33 @@ class TestALibraryThatDeclaresAnAliasedClass:
         assert snapshot.failure_detail is None
         assert snapshot.catalog_ids_for(f"{self._MODEL_ID}-handle") == (self._MODEL_ID,)
 
+    def test_the_fail_closed_warning_names_the_type_the_engine_was_asked_about(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The warning must not name a type nobody queried.
+
+        It is what a library author reads when every model on a node locks, and `RealClassName` sends
+        them after a registration that was never the problem.
+
+        No registration here: the engine is stubbed to fail, because what is under test is which name
+        the log carries, not whether the lookup could have succeeded.
+        """
+        engine = MagicMock()
+        engine.handle_request.return_value = QueryModelAccessForNodeResultFailure(result_details="not registered")
+        node_class = type("RealClassName", (MockNode,), {})
+        node = node_class(
+            name="flux",
+            metadata={"library": self._LIBRARY, "node_type": self._REGISTERED_AS},
+            engine=engine,
+        )
+
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            snapshot = query_model_policy(node)
+
+        assert snapshot.failure_detail is not None
+        assert self._REGISTERED_AS in caplog.text
+        assert "RealClassName" not in caplog.text
+
 
 class TestTwoLibrariesRegisteringOneNodeType:
     """A node class name two installed libraries share must still resolve to one library.
@@ -280,8 +307,10 @@ class TestTwoLibrariesRegisteringOneNodeType:
 
     def _register(self, library_name: str, model_id: str) -> type[MockNode]:
         """Register ``_NODE_TYPE`` in ``library_name`` over a one-model catalog; return its class."""
-        # Registration is keyed by class name, so the collision needs two distinct classes that
-        # share one name -- exactly what two libraries each shipping `Flux2ImageGeneration` is.
+        # What collides is the declared name both libraries register under, which is what
+        # `registered_as` carries on each call. The two classes are distinct objects that also share
+        # a `__name__`; that part is not load-bearing here, and is kept only because it is what the
+        # real libraries look like -- each ships its own `class Flux2ImageGeneration`.
         node_class = type(self._NODE_TYPE, (MockNode,), {})
         _register_node_type(library_name, model_id, node_class, registered_as=self._NODE_TYPE)
         return node_class
