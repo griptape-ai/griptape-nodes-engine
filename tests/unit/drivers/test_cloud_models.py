@@ -51,7 +51,7 @@ class TestModelChoices:
 class TestModelSettings:
     def test_claude_models_carry_the_catalog_max_tokens(self) -> None:
         """Regression: the sidebar sent no max_tokens, so a 4096 provider default applied."""
-        for model in ("claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"):
+        for model in ("claude-opus-5-5", "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"):
             assert MODEL_SETTINGS[model]["max_tokens"] == 64000  # noqa: PLR2004
 
     def test_settings_are_derived_from_the_presets(self) -> None:
