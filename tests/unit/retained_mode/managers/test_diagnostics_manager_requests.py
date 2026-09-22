@@ -392,7 +392,21 @@ class TestBundle:
         assert "Attempted to write the diagnostics bundle" in caplog.text
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("file_name", ["../escaped.zip", "sub/bundle.zip", "/absolute.zip"])
+    @pytest.mark.parametrize(
+        "file_name",
+        [
+            "../escaped.zip",
+            "sub/bundle.zip",
+            "/absolute.zip",
+            # A bare `..`, which `Path(name).name` hands back unchanged, so it read as a
+            # plain file name and `output_path / ".."` then named the parent directory.
+            "..",
+            # The same two written for the other platform. Refused everywhere rather than
+            # only on the machine where the separator and the drive letter mean something.
+            "..\\escaped.zip",
+            "C:\\absolute.zip",
+        ],
+    )
     async def test_a_file_name_that_is_really_a_path_is_refused(
         self, engine: Engine, tmp_path: Path, file_name: str
     ) -> None:
@@ -413,6 +427,31 @@ class TestBundle:
 
         assert isinstance(result, CollectDiagnosticsResultFailure)
         assert "is a path rather than a file name" in str(result.result_details)
+        assert _zips_written_under(tmp_path) == []
+
+    @pytest.mark.asyncio
+    async def test_a_bare_dot_dot_does_not_write_above_the_output_directory(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
+        """The escape the last test names, asserted where it would have landed.
+
+        `output_path` is the promise, so the directory above it is the thing to check. Written
+        as its own test rather than folded into the parametrized one because that one asserts
+        on `tmp_path`, which is the one place this particular name never touches.
+        """
+        promised = tmp_path / "bundles"
+        promised.mkdir()
+
+        result = await engine.ahandle_request(
+            CollectDiagnosticsRequest(
+                output_path=str(promised),
+                file_name="..",
+                include_health_checks=False,
+                include_current_workflow=False,
+            )
+        )
+
+        assert isinstance(result, CollectDiagnosticsResultFailure)
         assert _zips_written_under(tmp_path) == []
 
     @pytest.mark.asyncio

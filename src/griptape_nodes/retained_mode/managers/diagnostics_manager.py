@@ -7,7 +7,7 @@ import os
 import platform
 import sys
 from datetime import UTC, datetime
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, NamedTuple
 from urllib.parse import unquote, urlparse
 
@@ -110,6 +110,28 @@ _BYTES_PER_GB = 1024 * 1024 * 1024
 # setting that ignores the config file has a visible cause; their values are not,
 # because any of them can carry a credential.
 CONFIG_ENV_VAR_PREFIX = "GTN_CONFIG_"
+
+
+def _is_a_plain_file_name(file_name: str) -> bool:
+    r"""Whether a name is one file, in whatever directory the caller was told it would go in.
+
+    ``Path(file_name).name == file_name`` was the whole test, and it lets ``..`` through:
+    ``Path("..").name`` is ``".."``, so the name comes back from the comparison unchanged and
+    ``destination / ".."`` is then the parent of the directory the bundle was promised in --
+    one level up, through the guard that exists to stop exactly that. Asking for the path's
+    components instead answers the question that was being asked.
+
+    Read as a Windows path on every platform, because that is the stricter of the two
+    flavors: it treats ``\`` as a separator as well as ``/``, and it reads a drive letter, so
+    ``..\escaped.zip`` and ``C:\absolute.zip`` are refused here rather than only on the one
+    machine where they would have meant something. The cost is a POSIX name that really does
+    contain a backslash, which is legal and which nobody names a bundle.
+    """
+    parts = PureWindowsPath(file_name).parts
+    if len(parts) != 1:
+        return False
+
+    return parts[0] not in {".", ".."}
 
 
 class SecretLayers(NamedTuple):
@@ -228,9 +250,10 @@ class DiagnosticsManager(EngineScoped):
         """Build a diagnostics bundle and return a link to download it."""
         # A file name is joined onto the requested output directory, and onto the static
         # files directory when there is no output path. Anything with a directory in it --
-        # `../../.ssh/config`, or an absolute path -- would be written somewhere the caller
-        # was never told about, so it is refused before any of the bundle is assembled.
-        if request.file_name is not None and Path(request.file_name).name != request.file_name:
+        # `../../.ssh/config`, or an absolute path, or a bare `..` -- would be written
+        # somewhere the caller was never told about, so it is refused before any of the
+        # bundle is assembled.
+        if request.file_name is not None and not _is_a_plain_file_name(request.file_name):
             details = (
                 f"Attempted to collect a diagnostics bundle named '{request.file_name}'. "
                 "Failed because that is a path rather than a file name. Give a name with no folders in "
