@@ -192,11 +192,16 @@ class LocalStorageDriver(BaseStorageDriver):
 
         # Version the URL by the served file's identity rather than by mint time:
         # unchanged content yields the same URL on every mint, so the browser's
-        # cache HITS instead of refetching, and any rewrite changes st_mtime_ns
-        # and therefore the URL, so a cached bad response can never outlive the
-        # bytes that produced it.
+        # cache HITS instead of refetching, and a rewrite changes st_mtime_ns and
+        # therefore the URL. The guarantee is bounded by filesystem timestamp
+        # resolution: a same-size rewrite landing within one tick of the prior
+        # mtime fingerprints identically. Negligible on NTFS/APFS/ext4 (<=100ns
+        # ticks); real on FAT/exFAT (2s) external drives. True content identity
+        # is the #5607 design's job.
+        # Stat the pre-strip path: on Windows, a >MAX_PATH file can only be
+        # stat'ed with the \\?\ prefix that the URL branches above had to drop.
         try:
-            stat_result = absolute_path.stat()
+            stat_result = resolved_path.stat()
         except OSError:
             # Nothing to fingerprint yet (file still being staged, unreachable
             # mount): fall back to mint time so the URL still busts caches.

@@ -1,3 +1,4 @@
+import os
 import platform
 from pathlib import Path
 from typing import Any
@@ -197,6 +198,9 @@ class TestLocalStorageDriverCreateSignedDownloadUrl:
                 # but .as_posix() = "C:/Users/foo/image.png"
                 mock_path = Mock()
                 mock_path.relative_to.side_effect = ValueError("not relative")
+                # The simulated Windows path doesn't exist here, so the version
+                # fingerprint falls back to mint time.
+                mock_path.stat.side_effect = OSError("no such file")
                 mock_path.as_posix.return_value = "C:/Users/foo/image.png"
                 mock_path.__str__ = lambda _self: "C:\\Users\\foo\\image.png"
                 mock_resolve.return_value = mock_path
@@ -408,18 +412,39 @@ class TestDeterministicUrlVersioning:
         assert "?v=" in first
 
     def test_rewritten_file_mints_a_different_url(self, driver: LocalStorageDriver, workspace: Path) -> None:
-        """Any rewrite moves st_mtime_ns, so a cached response can't outlive its bytes."""
-        import os
+        """A real rewrite changes the fingerprint through size alone.
 
+        No artificial mtime bump: different-size content must change the URL
+        even when the rewrite lands within the filesystem's timestamp tick.
+        """
         served = workspace / "photo.png"
         served.write_bytes(b"content")
         before = driver.create_signed_download_url(served)
 
-        served.write_bytes(b"CONTENT")
-        stat_result = served.stat()
-        # A full second: NTFS stores 100ns ticks and FAT whole seconds, so a
-        # sub-resolution bump would round away and defeat the test.
-        os.utime(served, ns=(stat_result.st_atime_ns, stat_result.st_mtime_ns + 1_000_000_000))
+        served.write_bytes(b"rewritten with different length")
         after = driver.create_signed_download_url(served)
 
         assert before != after
+
+    def test_same_size_rewrite_within_one_tick_is_a_known_collision(
+        self, driver: LocalStorageDriver, workspace: Path
+    ) -> None:
+        """KNOWN LIMITATION: same size + same filesystem-tick mtime → same URL.
+
+        The fingerprint is (size, mtime_ns), not content. On FAT/exFAT (2s
+        ticks) a same-size rewrite inside one tick mints the identical URL and
+        a cached response can outlive its bytes; NTFS/APFS/ext4 ticks are
+        <=100ns so the window is negligible there. Content identity is #5607's
+        job — this test documents the bound so a future fix flips it knowingly.
+        """
+        served = workspace / "photo.png"
+        served.write_bytes(b"content")
+        stat_result = served.stat()
+        before = driver.create_signed_download_url(served)
+
+        served.write_bytes(b"CONTENT")  # same byte count
+        # Pin mtime back to the original to simulate a rewrite inside one tick.
+        os.utime(served, ns=(stat_result.st_atime_ns, stat_result.st_mtime_ns))
+        after = driver.create_signed_download_url(served)
+
+        assert before == after
