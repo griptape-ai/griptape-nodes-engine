@@ -393,9 +393,7 @@ class HuggingFaceModelParameter(ABC):
         ambiguous across two libraries, or mid-reload), and treating that as "allow everything"
         would let an admin's deny be bypassed by a lookup error.
         """
-        self._policy = query_model_policy(
-            self._node.engine, type(self._node).__name__, fail_closed=self._gate_mode is not False
-        )
+        self._policy = query_model_policy(self._node, fail_closed=self._gate_mode is not False)
 
     def _apply_denial_badge(self, parameter: Parameter, value: str | None = None) -> None:
         """Set or clear the parameter's badge for the current selection.

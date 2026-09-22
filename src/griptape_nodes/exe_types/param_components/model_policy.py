@@ -10,6 +10,11 @@ the policy layer once, hold the verdicts in an immutable snapshot, and answer lo
 components delegate here so a policy change lands in one place and the two surfaces cannot drift
 into giving opposite answers for the same model.
 
+Every node-attributed query is built by ``node_access_request``, including the live per-value
+re-asks a component makes at run time. Asking about a node means naming both the node type and the
+library it came from -- see that function -- and one construction point is what keeps the second
+half from being forgotten.
+
 What stays with each component: installing traits, writing ``ui_options``, deciding when to
 refresh, and choosing how a denial reaches the artist (row icon, badge, raised error).
 """
@@ -29,7 +34,7 @@ from griptape_nodes.retained_mode.managers.event_manager import reentrant_bus_in
 
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.core_types import Parameter
-    from griptape_nodes.retained_mode.engine import Engine
+    from griptape_nodes.exe_types.node_types import BaseNode
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -196,8 +201,38 @@ class ModelPolicySnapshot:
 DEFERRED_SNAPSHOT = ModelPolicySnapshot(deferred=True)
 
 
-def query_model_policy(engine: Engine, node_type: str, *, fail_closed: bool = True) -> ModelPolicySnapshot:
-    """Ask the engine which of ``node_type``'s declared models are permitted.
+def node_access_request(node: BaseNode, candidate_model_ids: list[str] | None = None) -> QueryModelAccessForNodeRequest:
+    """Build the node-attributed access query for ``node``, naming the library it came from.
+
+    A node class name is not unique across libraries: two installed libraries may each register
+    ``Flux2ImageGeneration``, and installing both is supported. The engine cannot resolve an
+    ambiguous name to a library on its own, so a query that names only the type resolves to no
+    library at all -- which fails closed and denies *every* model on the node, reading to an artist
+    as a licensing problem when the access check never ran. ``Library.create_node`` records the
+    registering library in ``node.metadata["library"]``, and that is the only thing on hand that
+    says which of the two this instance came from.
+
+    ``specific_library_name`` is ``None`` for a node built outside the library path -- a transient
+    probe, a test fixture -- which leaves the engine's lookup-by-name, correct whenever exactly one
+    library declares the type.
+
+    Args:
+        node: The node the query is attributed to. Supplies both the node type and the library.
+        candidate_model_ids: Narrow the query to these catalog ids. ``None`` (default) lets the
+            engine derive the candidates from the node's declarations.
+    """
+    library_name = node.metadata.get("library")
+    if not isinstance(library_name, str):
+        library_name = None
+    return QueryModelAccessForNodeRequest(
+        node_type=type(node).__name__,
+        specific_library_name=library_name,
+        candidate_model_ids=candidate_model_ids,
+    )
+
+
+def query_model_policy(node: BaseNode, *, fail_closed: bool = True) -> ModelPolicySnapshot:
+    """Ask the engine which of ``node``'s declared models are permitted.
 
     Returns ``DEFERRED_SNAPSHOT`` without querying when the request would trip
     reentrant-bus-in-init: a node ``__init__`` on the stack inside a strict-mode scope, which
@@ -211,21 +246,22 @@ def query_model_policy(engine: Engine, node_type: str, *, fail_closed: bool = Tr
     only after it runs.
 
     Args:
-        engine: Engine to ask about model access.
-        node_type: The node class name the manifest declares ``model_usage`` against.
+        node: The node whose declared models to check. Supplies the engine to ask, the node class
+            name the manifest declares ``model_usage`` against, and the library that registered it.
         fail_closed: What an unanswerable query means. When True, the returned snapshot carries a
             ``failure_detail`` so every subsequent lookup denies -- a broken library registration
             must not silently open the gate. When False, the failure is treated as "this library
             has not adopted declarations", which is the pre-adoption status quo rather than an
             error, and the snapshot is empty.
     """
+    node_type = type(node).__name__
     if reentrant_bus_in_init_would_report():
         logger.debug(
             "Deferring model-policy query for node type '%s': node __init__ in progress under a strict-mode scope.",
             node_type,
         )
         return DEFERRED_SNAPSHOT
-    result = engine.handle_request(QueryModelAccessForNodeRequest(node_type=node_type))
+    result = node.engine.handle_request(node_access_request(node))
     if not isinstance(result, QueryModelAccessForNodeResultSuccess):
         details = getattr(result, "result_details", None) or type(result).__name__
         if not fail_closed:

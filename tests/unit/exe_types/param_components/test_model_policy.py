@@ -7,7 +7,7 @@ in particular the one axis on which the two are ALLOWED to differ: `refuse_unrec
 """
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Generator
 from dataclasses import FrozenInstanceError
 from unittest.mock import MagicMock, patch
 
@@ -16,30 +16,58 @@ import pytest
 from griptape_nodes.exe_types.param_components.model_policy import (
     DEFERRED_SNAPSHOT,
     ModelPolicySnapshot,
+    node_access_request,
     query_model_policy,
 )
-from griptape_nodes.node_library.library_registry import LibraryRegistry
+from griptape_nodes.node_library.library_declarations import (
+    KeySupport,
+    Model,
+    ModelCatalogLibraryProperty,
+    ModelProvider,
+    ModelUsageNodeProperty,
+)
+from griptape_nodes.node_library.library_registry import (
+    LibraryMetadata,
+    LibraryRegistry,
+    LibrarySchema,
+    NodeMetadata,
+)
+from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.access_events import (
     ModelAccessVerdict,
     QueryModelAccessForNodeResultFailure,
     QueryModelAccessForNodeResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+from tests.unit.exe_types.mocks import MockNode
 from tests.unit.exe_types.param_components.probe_scope import constructing_under_probe
 
 
-def _engine(result: object | None = None, *, side_effect: Callable[[object], object] | None = None) -> MagicMock:
-    """A stand-in engine whose ``handle_request`` answers with a canned result.
+class SomeNode(MockNode):
+    """The node under query. Its class name is the node type the policy layer asks about."""
 
-    ``query_model_policy`` takes the engine to ask, so these tests hand it one rather than
-    patching a process-wide accessor.
+
+def _node(
+    result: object | None = None,
+    *,
+    side_effect: Callable[[object], object] | None = None,
+    library_name: str | None = None,
+) -> SomeNode:
+    """A stand-in node whose engine answers ``handle_request`` with a canned result.
+
+    ``query_model_policy`` reads everything it needs off the node -- the engine to ask, the class
+    name to query as, and the registering library in ``metadata`` -- so these tests hand it one
+    rather than patching a process-wide accessor.
     """
     engine = MagicMock()
     if side_effect is not None:
         engine.handle_request.side_effect = side_effect
     else:
         engine.handle_request.return_value = result
-    return engine
+    metadata: dict[str, str] = {}
+    if library_name is not None:
+        metadata["library"] = library_name
+    return SomeNode(name="some_node", metadata=metadata, engine=engine)
 
 
 DENIED = "owner/denied"
@@ -53,22 +81,150 @@ def _success(verdicts: list[ModelAccessVerdict]) -> QueryModelAccessForNodeResul
     return QueryModelAccessForNodeResultSuccess(verdicts=verdicts, result_details="ok")
 
 
+class TestNodeAccessRequest:
+    """Naming the node type is only half a query; the other half is which library it came from."""
+
+    def test_it_carries_both_the_node_type_and_the_library(self) -> None:
+        request = node_access_request(_node(library_name="library-standard"))
+        assert request.node_type == "SomeNode"
+        assert request.specific_library_name == "library-standard"
+        # No narrowing, so the engine derives candidates from the node's declarations.
+        assert request.candidate_model_ids is None
+
+    def test_a_narrowed_candidate_list_is_forwarded(self) -> None:
+        """The live per-value re-ask a component makes at run time narrows to one handle's ids."""
+        request = node_access_request(_node(library_name="library-standard"), ["md_a", "md_b"])
+        assert request.candidate_model_ids == ["md_a", "md_b"]
+
+    def test_a_node_built_outside_the_library_path_names_no_library(self) -> None:
+        """A transient probe or a test fixture has no ``library`` metadata.
+
+        Lookup by name alone is the right fallback there: it resolves correctly whenever exactly
+        one library declares the type, which is every case except a collision.
+        """
+        assert node_access_request(_node()).specific_library_name is None
+
+    def test_the_policy_query_carries_it(self) -> None:
+        """Pinned on the request the bus actually saw, not just on the builder in isolation."""
+        engine = MagicMock()
+        engine.handle_request.return_value = _success([])
+        query_model_policy(SomeNode(name="some_node", metadata={"library": "library-standard"}, engine=engine))
+        request = engine.handle_request.call_args.args[0]
+        assert request.node_type == "SomeNode"
+        assert request.specific_library_name == "library-standard"
+
+
+class TestTwoLibrariesRegisteringOneNodeType:
+    """A node class name two installed libraries share must still resolve to one library.
+
+    Installing the standard library beside an extension library that reuses a node class name is
+    supported -- `Flux2ImageGeneration` ships in both the standard and the Black Forest Labs
+    library. The engine cannot resolve that name to a library on its own, so a query naming only
+    the type resolved to none of them, failed closed, and locked every model on the node. To an
+    artist that reads as a licensing problem, when in fact the access check never ran.
+    """
+
+    _STANDARD = "library-standard"
+    _EXTENSION = "library-extension"
+    _NODE_TYPE = "Flux2ImageGeneration"
+
+    @pytest.fixture(autouse=True)
+    def _clean_registry(self) -> Generator[None, None, None]:
+        LibraryRegistry._clear()
+        yield
+        LibraryRegistry._clear()
+
+    def test_the_nodes_own_library_answers(self, engine: Engine) -> None:
+        standard_node_class = self._register(self._STANDARD, "md_standard_flux")
+        self._register(self._EXTENSION, "md_extension_flux")
+
+        node = standard_node_class(
+            name="flux",
+            metadata={"library": self._STANDARD, "node_type": self._NODE_TYPE},
+            engine=engine,
+        )
+        snapshot = query_model_policy(node)
+
+        assert snapshot.failure_detail is None
+        # The standard library's catalog, not the extension's, and nothing denied.
+        assert snapshot.catalog_ids_for("md_standard_flux-handle") == ("md_standard_flux",)
+        assert snapshot.catalog_ids_for("md_extension_flux-handle") == ()
+        assert snapshot.denial_for("md_standard_flux-handle") is None
+
+    def test_a_node_with_no_library_metadata_still_fails_closed(self, engine: Engine) -> None:
+        """The fallback's limit, stated: by-name lookup cannot pick between two libraries.
+
+        This is the reported failure, and it remains the answer for a node that never recorded
+        which library built it. Failing closed is correct here -- the access check genuinely did
+        not run, and an unresolvable node must not open the gate.
+        """
+        standard_node_class = self._register(self._STANDARD, "md_standard_flux")
+        self._register(self._EXTENSION, "md_extension_flux")
+
+        node = standard_node_class(name="flux", metadata={}, engine=engine)
+
+        assert query_model_policy(node).failure_detail is not None
+
+    def _register(self, library_name: str, model_id: str) -> type[MockNode]:
+        """Register ``_NODE_TYPE`` in ``library_name`` over a one-model catalog; return its class."""
+        catalog = ModelCatalogLibraryProperty(
+            providers={
+                "bfl": ModelProvider(
+                    display_name="Black Forest Labs",
+                    models={
+                        model_id: Model(
+                            display_name="FLUX.2",
+                            provider_model_id=f"{model_id}-handle",
+                            key_support=KeySupport.REQUIRES_GRIPTAPE_KEY,
+                        )
+                    },
+                )
+            }
+        )
+        schema = LibrarySchema(
+            name=library_name,
+            library_schema_version=LibrarySchema.LATEST_SCHEMA_VERSION,
+            metadata=LibraryMetadata(
+                author="t",
+                description="d",
+                library_version="1.0.0",
+                engine_version="1.0.0",
+                tags=[],
+                declarations=[catalog],
+            ),
+            categories=[],
+            nodes=[],
+        )
+        library = LibraryRegistry.generate_new_library(library_data=schema)
+        # Registration is keyed by class name, so the collision needs two distinct classes that
+        # share one name -- exactly what two libraries each shipping `Flux2ImageGeneration` is.
+        node_class = type(self._NODE_TYPE, (MockNode,), {})
+        library.register_new_node_type(
+            node_class,
+            NodeMetadata(
+                category="t",
+                description="d",
+                display_name="FLUX.2 Image Generation",
+                declarations=[ModelUsageNodeProperty(model_ids=[model_id])],
+            ),
+        )
+        return node_class
+
+
 class TestQueryModelPolicy:
     def test_builds_both_tables_from_one_query(self) -> None:
         verdicts = [
             ModelAccessVerdict(model_id="md_denied", provider_model_id=DENIED, denial=_DENIAL),
             ModelAccessVerdict(model_id="md_allowed", provider_model_id=ALLOWED, denial=None),
         ]
-        snapshot = query_model_policy(_engine(_success(verdicts)), "SomeNode")
+        snapshot = query_model_policy(_node(_success(verdicts)))
         assert snapshot.denial_by_provider_id == {DENIED: _DENIAL}
         assert snapshot.catalog_ids_by_provider_id == {DENIED: ("md_denied",), ALLOWED: ("md_allowed",)}
         assert snapshot.failure_detail is None
         assert snapshot.has_unmatchable_entries is False
 
     def test_fail_closed_records_a_failure_detail(self) -> None:
-        snapshot = query_model_policy(
-            _engine(QueryModelAccessForNodeResultFailure(result_details="not found")), "SomeNode"
-        )
+        snapshot = query_model_policy(_node(QueryModelAccessForNodeResultFailure(result_details="not found")))
         assert snapshot.failure_detail is not None
         assert snapshot.denial_for(ALLOWED) is not None
 
@@ -81,9 +237,7 @@ class TestQueryModelPolicy:
         place entirely.
         """
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
-            snapshot = query_model_policy(
-                _engine(QueryModelAccessForNodeResultFailure(result_details="not registered")), "SomeNode"
-            )
+            snapshot = query_model_policy(_node(QueryModelAccessForNodeResultFailure(result_details="not registered")))
 
         detail = snapshot.failure_detail
         assert detail is not None
@@ -98,7 +252,7 @@ class TestQueryModelPolicy:
     def test_fail_open_records_nothing(self) -> None:
         """Auto-detect uses this: an unresolvable node means "has not adopted declarations"."""
         snapshot = query_model_policy(
-            _engine(QueryModelAccessForNodeResultFailure(result_details="not found")), "SomeNode", fail_closed=False
+            _node(QueryModelAccessForNodeResultFailure(result_details="not found")), fail_closed=False
         )
         assert snapshot.failure_detail is None
         assert snapshot.declares_models is False
@@ -106,7 +260,7 @@ class TestQueryModelPolicy:
     def test_a_model_without_a_provider_handle_is_declared_but_unmatchable(self) -> None:
         """`provider_model_id` is optional, and absence is NOT "unresolved"."""
         verdicts = [ModelAccessVerdict(model_id="md_no_handle", provider_model_id=None, denial=None)]
-        snapshot = query_model_policy(_engine(_success(verdicts)), "SomeNode")
+        snapshot = query_model_policy(_node(_success(verdicts)))
         assert snapshot.has_unmatchable_entries is True
         assert snapshot.catalog_ids_by_provider_id == {}
         # Still counts as declaring models -- otherwise enforcement would silently switch off.
@@ -188,7 +342,7 @@ class TestAnUnattributableDenialIsNotDropped:
     """
 
     def test_the_whole_parameter_is_refused(self) -> None:
-        snapshot = query_model_policy(_engine(_success([ModelAccessVerdict("md_flux_dev", None, _DENIAL)])), "SomeNode")
+        snapshot = query_model_policy(_node(_success([ModelAccessVerdict("md_flux_dev", None, _DENIAL)])))
         assert snapshot.unmatchable_denials == ("md_flux_dev",)
         denial = snapshot.denial_for(ALLOWED, refuse_unrecognized=True)
         assert denial is not None
@@ -199,14 +353,14 @@ class TestAnUnattributableDenialIsNotDropped:
 
     def test_a_permitted_handleless_entry_does_not_refuse_anything(self) -> None:
         """Only a DENIED unmatchable entry escalates; a permitted one is merely unmatchable."""
-        snapshot = query_model_policy(_engine(_success([ModelAccessVerdict("md_no_handle", None, None)])), "SomeNode")
+        snapshot = query_model_policy(_node(_success([ModelAccessVerdict("md_no_handle", None, None)])))
         assert snapshot.unmatchable_denials == ()
         assert snapshot.has_unmatchable_entries is True
         assert snapshot.denial_for(ALLOWED, refuse_unrecognized=True) is None
 
     def test_it_applies_even_with_refuse_unrecognized_off(self) -> None:
         """A static dropdown must not run a model policy explicitly forbade either."""
-        snapshot = query_model_policy(_engine(_success([ModelAccessVerdict("md_flux_dev", None, _DENIAL)])), "SomeNode")
+        snapshot = query_model_policy(_node(_success([ModelAccessVerdict("md_flux_dev", None, _DENIAL)])))
         assert snapshot.denial_for(ALLOWED) is not None
 
 
@@ -224,7 +378,7 @@ class TestASharedProviderModelIdIsNotLastWriteWins:
             ModelAccessVerdict(model_id="md_flux_byok", provider_model_id=shared, denial=_DENIAL),
             ModelAccessVerdict(model_id="md_flux_gtc", provider_model_id=shared, denial=None),
         ]
-        snapshot = query_model_policy(_engine(_success(verdicts)), "SomeNode")
+        snapshot = query_model_policy(_node(_success(verdicts)))
         assert snapshot.denial_for(shared) is _DENIAL
 
     def test_every_catalog_id_behind_a_handle_is_retained(self) -> None:
@@ -234,7 +388,7 @@ class TestASharedProviderModelIdIsNotLastWriteWins:
             ModelAccessVerdict(model_id="md_flux_byok", provider_model_id=shared, denial=None),
             ModelAccessVerdict(model_id="md_flux_gtc", provider_model_id=shared, denial=None),
         ]
-        snapshot = query_model_policy(_engine(_success(verdicts)), "SomeNode")
+        snapshot = query_model_policy(_node(_success(verdicts)))
         assert snapshot.catalog_ids_for(shared) == ("md_flux_byok", "md_flux_gtc")
 
     def test_an_unknown_handle_has_no_catalog_ids(self) -> None:
@@ -253,7 +407,6 @@ class TestBothComponentsAgreeOnAnUnattributableDenial:
     def test_the_static_component_run_path_honors_it(self) -> None:
         from griptape_nodes.exe_types.core_types import Parameter
         from griptape_nodes.exe_types.param_components.model_access_component import ModelAccessComponent
-        from tests.unit.exe_types.mocks import MockNode
 
         verdicts = [
             ModelAccessVerdict(model_id="md_unattributable", provider_model_id=None, denial=_DENIAL),
@@ -294,9 +447,10 @@ class TestConstructionDeferral:
     """
 
     def test_no_bus_request_while_constructing_under_a_probe_scope(self) -> None:
-        engine = _engine()
+        # The engine is held separately from the node so the mock's call record stays reachable.
+        engine = MagicMock()
         with constructing_under_probe():
-            snapshot = query_model_policy(engine, "SomeNode")
+            snapshot = query_model_policy(SomeNode(name="some_node", engine=engine))
         engine.handle_request.assert_not_called()
         assert snapshot.deferred is True
 
@@ -309,7 +463,7 @@ class TestConstructionDeferral:
         """
         verdicts = [ModelAccessVerdict(model_id="md_denied", provider_model_id=DENIED, denial=_DENIAL)]
         with LibraryRegistry.constructing_node():
-            snapshot = query_model_policy(_engine(_success(verdicts)), "SomeNode")
+            snapshot = query_model_policy(_node(_success(verdicts)))
         assert snapshot.deferred is False
         assert snapshot.denial_for(DENIED) is _DENIAL
 
@@ -330,10 +484,10 @@ class TestConstructionDeferral:
 
     def test_the_query_goes_through_once_construction_ends(self) -> None:
         verdicts = [ModelAccessVerdict(model_id="md_denied", provider_model_id=DENIED, denial=_DENIAL)]
-        engine = _engine(_success(verdicts))
+        node = _node(_success(verdicts))
         with constructing_under_probe():
-            assert query_model_policy(engine, "SomeNode").deferred is True
-        snapshot = query_model_policy(engine, "SomeNode")
+            assert query_model_policy(node).deferred is True
+        snapshot = query_model_policy(node)
         assert snapshot.deferred is False
         assert snapshot.denial_for(DENIED) is _DENIAL
 
