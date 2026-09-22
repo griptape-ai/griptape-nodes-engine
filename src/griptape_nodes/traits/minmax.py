@@ -27,9 +27,6 @@ class MinMax(Trait):
         if "max_val" in state:
             self.max = state["max_val"]
 
-    def ui_options_for_trait(self) -> dict:
-        return {"multiline": True}
-
     def display_options_for_trait(self) -> dict:
         return {}
 
