@@ -204,26 +204,18 @@ DEFERRED_SNAPSHOT = ModelPolicySnapshot(deferred=True)
 def node_access_request(node: BaseNode, candidate_model_ids: list[str] | None = None) -> QueryModelAccessForNodeRequest:
     """Build the node-attributed access query for ``node``, naming the library it came from.
 
-    A node class name is not unique across libraries: two installed libraries may each register
-    ``Flux2ImageGeneration``, and installing both is supported. The engine cannot resolve an
-    ambiguous name to a library on its own, so a query that names only the type resolves to no
-    library at all -- which fails closed and denies *every* model on the node, reading to an artist
-    as a licensing problem when the access check never ran. ``Library.create_node`` records the
-    registering library in ``node.metadata["library"]``, and that is the only thing on hand that
-    says which of the two this instance came from.
+    Both fields come off ``node.metadata``, where ``Library.create_node`` recorded them, because
+    neither is reliably derivable from the class. A class name is not unique across libraries --
+    two installed libraries may each register ``Flux2ImageGeneration`` -- and a library keys its
+    node types by the name its JSON declared, which ``register_lazy_node_type`` never compares to
+    ``__name__``. So a query built from ``type(node).__name__`` can resolve to no library or to no
+    type at all, and an unresolved query fails closed: every model on the node is denied, which
+    reads to an artist as a licensing problem when the check never ran. ``get_declared_models``,
+    which fills the same dropdown's choices, reads the same two fields.
 
-    The node type comes off ``metadata`` too, and has to: a library keys its node types by the
-    class name its JSON declared, and ``register_lazy_node_type`` does not import the class to
-    check that name against ``__name__``. A module that aliases its class (``AliasKey =
-    RealClass``) is therefore registered under one name while ``__name__`` reports the other, and
-    the engine resolves the type by the registry key -- so querying as ``__name__`` would fail
-    closed on a node whose library resolves fine. ``get_declared_models``, which fills the same
-    dropdown's choices out of the same library, already reads both fields this way.
-
-    Each field falls back for a node built outside the library path -- a transient probe, a test
-    fixture -- where nothing recorded either one: the type to ``type(node).__name__``, and the
-    library to ``None``, which leaves the engine's lookup-by-name, correct whenever exactly one
-    library declares the type.
+    A node built outside the library path -- a transient probe, a test fixture -- recorded neither,
+    so the type falls back to ``type(node).__name__`` and the library to ``None``, leaving the
+    engine's lookup-by-name that is correct whenever exactly one library declares the type.
 
     Args:
         node: The node the query is attributed to. Supplies both the node type and the library.
@@ -266,11 +258,6 @@ def query_model_policy(node: BaseNode, *, fail_closed: bool = True) -> ModelPoli
             has not adopted declarations", which is the pre-adoption status quo rather than an
             error, and the snapshot is empty.
     """
-    # Built before the deferral guard, which is safe because a request is a plain dataclass and
-    # constructing one touches no bus. Every log line below names the type this request carries
-    # rather than deriving its own: a library that declares an aliased class registers under a name
-    # its class does not report, and a warning naming the name the engine was never asked about
-    # sends its reader after a registration that was never the problem.
     request = node_access_request(node)
     if reentrant_bus_in_init_would_report():
         logger.debug(
