@@ -188,7 +188,7 @@ def _resolve_plain_path(path_str: str) -> str:
 
     1. A ``file://`` URI is converted to the local path it names, then absolutized.
     2. A localhost static file server URL
-       (``http://localhost:8124/workspace/staticfiles/clip.mp4?t=...``) is mapped
+       (``http://localhost:8124/workspace/staticfiles/clip.mp4?v=...``) is mapped
        back to the workspace file it serves. The engine passes node outputs
        between nodes in this form, and the file is already on disk, so a caller
        that needs a real path gets one without an HTTP round-trip.
