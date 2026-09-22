@@ -20,7 +20,6 @@ For a tour of the regions these shortcuts act on, see
 | ---------------------------------------------------------- | ------------------- | ------------------- |
 | Add a node at the cursor (canvas only)                     | Tab                 | Tab                 |
 | Add a node at the cursor, or select all if not over canvas | Shift+A             | Shift+A             |
-| Open the Add Node menu at the cursor                       | Double-click canvas | Double-click canvas |
 | Create a Note node at the cursor                           | N                   | N                   |
 | Rename the selected node(s)                                | R                   | R                   |
 | Duplicate the selected node(s)                             | Cmd+D               | Ctrl+D              |
