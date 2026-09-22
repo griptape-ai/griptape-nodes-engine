@@ -2849,6 +2849,15 @@ class FlowManager(EngineScoped):
             details = f"Failed to kick off flow with name {flow_name}. Exception occurred: {e} "
             return StartFlowResultFailure(validation_exceptions=[e], result_details=details)
 
+        # A caller that could not background the run got it inline, so its verdict is already in
+        # and a failed run must not be acknowledged as started.
+        error_message = self._error_from_finished_run(run_drive)
+        if error_message is not None:
+            result_details = f"Failed to kick off flow with name {flow_name}. Exception occurred: {error_message} "
+            return StartFlowResultFailure(
+                validation_exceptions=[RuntimeError(error_message)], result_details=result_details
+            )
+
         if not request.wait_for_completion:
             details = f"Successfully kicked off flow with name {flow_name}"
             return StartFlowResultSuccess(result_details=details)
@@ -2926,6 +2935,11 @@ class FlowManager(EngineScoped):
         except Exception as e:
             details = f"Failed to kick off flow with name {flow_name}. Exception occurred: {e} "
             return StartFlowFromNodeResultFailure(validation_exceptions=[e], result_details=details)
+
+        # See on_start_flow_request: an inline run's verdict is already in.
+        error_message = self._error_from_finished_run(run_drive)
+        if error_message is not None:
+            return StartFlowFromNodeResultFailure(validation_exceptions=[], result_details=error_message)
 
         if not request.wait_for_completion:
             details = f"Successfully kicked off flow with name {flow_name}"
@@ -4565,7 +4579,10 @@ class FlowManager(EngineScoped):
             await machine.drive_flow()
         except Exception:
             logger.exception("Run of workflow '%s' ended because of an error.", flow_name)
-            await self._abandon_running_flow()
+            # Only the live run's drive may tear down the live run. A retired drive's run was
+            # already torn down, and the live run by now may be a different one.
+            if self._flow_run_drive is asyncio.current_task():
+                await self._abandon_running_flow()
             raise
 
         if self._flow_run_drive is not asyncio.current_task():
@@ -4584,6 +4601,15 @@ class FlowManager(EngineScoped):
         self.engine.event_manager.put_event(
             ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=[])))
         )
+
+    def _error_from_finished_run(self, run_drive: asyncio.Task[None]) -> str | None:
+        """Why a run that has already finished failed. None if it has not finished or did not fail."""
+        if not run_drive.done():
+            return None
+        machine = self._global_control_flow_machine
+        if machine is None or not machine.resolution_machine.is_errored():
+            return None
+        return machine.resolution_machine.get_error_message() or "Flow execution failed"
 
     def _on_flow_run_drive_done(self, run_drive: asyncio.Task[None]) -> None:
         """Release the drive, reading its exception so an unwaited run does not look unhandled."""

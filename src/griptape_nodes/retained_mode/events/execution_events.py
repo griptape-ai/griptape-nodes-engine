@@ -76,7 +76,7 @@ class StartFlowRequest(RequestPayload):
 
     A caller dispatching synchronously (`GriptapeNodes.handle_request`, `cmd.run_flow`) has no
     event loop left to run a backgrounded flow once the call returns, so it gets the run inline
-    whatever `wait_for_completion` says.
+    whatever `wait_for_completion` says, and a run that failed comes back as a failure.
 
     Results: StartFlowResultSuccess | StartFlowResultFailure (with validation exceptions)
     """

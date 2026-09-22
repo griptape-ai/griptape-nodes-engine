@@ -231,3 +231,33 @@ def test_a_synchronous_caller_gets_the_run_inline(
     assert engine.node_manager.get_node_by_name("Runner").state is NodeResolutionState.RESOLVED, (
         "The run was backgrounded onto a loop that does not outlive the call, so it never happened."
     )
+
+
+@requires_fixture_library
+@pytest.mark.usefixtures("registered_library")
+def test_a_synchronous_caller_is_told_its_run_failed(
+    engine: Engine,
+    create_node: Callable[..., str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The run already ended by the time a sync caller's result is written, so the result says how.
+
+    A script driving `cmd.run_flow` has nothing else to learn a failure from.
+    """
+    flow_name = _new_flow(engine, "start_flow_sync_failure_wf")
+
+    create_node(NODE_TYPE, "Runner", flow_name, library_name=LIBRARY_NAME)
+    _configure(engine, "Runner", text="never echoed")
+
+    async def _fail() -> None:
+        msg = "Runner could not finish"
+        raise ValueError(msg)
+
+    monkeypatch.setattr(engine.node_manager.get_node_by_name("Runner"), "aprocess", _fail)
+
+    start_result = engine.handle_request(StartFlowRequest(flow_name=flow_name))
+
+    assert isinstance(start_result, StartFlowResultFailure), (
+        f"A run that failed was reported to a synchronous caller as started: {start_result}"
+    )
+    assert "Runner could not finish" in str(start_result.result_details), start_result.result_details
