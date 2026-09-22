@@ -16,15 +16,15 @@ For a tour of the regions these shortcuts act on, see
 
 ## Adding & editing nodes
 
-| Action                                                     | macOS               | Windows / Linux     |
-| ---------------------------------------------------------- | ------------------- | ------------------- |
-| Add a node at the cursor (canvas only)                     | Tab                 | Tab                 |
-| Add a node at the cursor, or select all if not over canvas | Shift+A             | Shift+A             |
-| Create a Note node at the cursor                           | N                   | N                   |
-| Rename the selected node(s)                                | R                   | R                   |
-| Duplicate the selected node(s)                             | Cmd+D               | Ctrl+D              |
-| Lock / unlock the selected node(s)                         | L                   | L                   |
-| Delete the selected node(s) or connection                  | Delete / Backspace  | Delete / Backspace  |
+| Action                                                     | macOS              | Windows / Linux    |
+| ---------------------------------------------------------- | ------------------ | ------------------ |
+| Add a node at the cursor (canvas only)                     | Tab                | Tab                |
+| Add a node at the cursor, or select all if not over canvas | Shift+A            | Shift+A            |
+| Create a Note node at the cursor                           | N                  | N                  |
+| Rename the selected node(s)                                | R                  | R                  |
+| Duplicate the selected node(s)                             | Cmd+D              | Ctrl+D             |
+| Lock / unlock the selected node(s)                         | L                  | L                  |
+| Delete the selected node(s) or connection                  | Delete / Backspace | Delete / Backspace |
 
 ## Selection
 
