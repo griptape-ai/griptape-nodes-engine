@@ -238,9 +238,20 @@ class FFmpegPreviewGenerator(BaseArtifactPreviewGenerator):
                 raise OSError(msg)
 
             # Same directory keeps the rename on one filesystem, so it is atomic: a reader sees
-            # either the previous preview or this finished one. Serving the destination can hold it
-            # open on Windows, so this can fail and must not orphan the scratch file.
-            await anyio.Path(temp_path).replace(destination_path)
+            # either the previous preview or this finished one. On Windows the rename can be
+            # transiently denied — by a competing generation promoting its own scratch file onto
+            # the same destination (clears in microseconds), or by a reader serving the old file.
+            # Retry briefly so the promote race resolves itself; a persistent denial (long-lived
+            # reader) still raises, and must not orphan the scratch file.
+            replace_attempts = 3
+            for attempt in range(1, replace_attempts + 1):
+                try:
+                    await anyio.Path(temp_path).replace(destination_path)
+                    break
+                except PermissionError:
+                    if attempt == replace_attempts:
+                        raise
+                    await anyio.sleep(0.05)
         finally:
             await self._discard_partial_preview(temp_path)
 

@@ -1,5 +1,8 @@
 """Tests for inter-library dependency resolution (GH#4740)."""
 
+import sys
+import sysconfig
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -20,13 +23,21 @@ from griptape_nodes.retained_mode.events.library_events import (
     DownloadLibraryRequest,
     DownloadLibraryResultFailure,
     DownloadLibraryResultSuccess,
+    InstallLibraryDependenciesRequest,
     InstallLibraryDependenciesResultFailure,
     LoadLibraryMetadataFromFileResultSuccess,
     RegisterLibraryFromFileRequest,
     RegisterLibraryFromFileResultFailure,
 )
-from griptape_nodes.retained_mode.managers.fitness_problems.libraries import LibraryDependencyProblem
-from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
+from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
+    DependencyInstallationFailedProblem,
+    LibraryDependencyProblem,
+)
+from griptape_nodes.retained_mode.managers.library_manager import (
+    DependencyInstallCounts,
+    DependencyInstallError,
+    LibraryManager,
+)
 from griptape_nodes.retained_mode.managers.settings import LibraryDependencyInstallBehavior
 
 
@@ -69,7 +80,7 @@ class TestLibraryDependencyDeclaration:
         assert not hasattr(deps, "library_dependencies")
 
     def test_schema_version_bumped(self) -> None:
-        assert LibrarySchema.LATEST_SCHEMA_VERSION == "0.11.0"
+        assert LibrarySchema.LATEST_SCHEMA_VERSION == "0.13.0"
 
 
 class TestLibraryDependencyProblem:
@@ -899,3 +910,312 @@ class TestRequiresWorkerResolvedOnFilePathRegistration:
 
         assert isinstance(result, LibraryManager.RegisterLibraryPrerequisites)
         assert result.library_info.requires_worker is False
+
+
+class TestPipInstallFailureIsRecordedOnTheLibrary:
+    """A failed dependency install must leave an account of itself on the LibraryInfo.
+
+    Until this was wired, a pip failure recorded nothing: the resolver's complaint went to a log
+    line and the library itself reported no problem at all. Anything that later asked the
+    library what was wrong with it -- the settings panel, or a worker explaining why it cannot
+    run a node -- had nothing to report.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_failed_install_records_a_dependency_installation_problem(self, engine: Engine) -> None:
+        mgr = engine.library_manager
+        lib_info = _make_lib_info()
+        schema = _make_schema_mock([])
+
+        failure = InstallLibraryDependenciesResultFailure(
+            result_details="No solution found when resolving dependencies: nonexistent-package"
+        )
+        with (
+            patch.object(mgr, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)),
+            patch.object(mgr, "install_library_dependencies_request", return_value=failure),
+            patch.object(mgr, "_library_file_path_to_info", {"/mock.json": lib_info}),
+        ):
+            await mgr._progress_library_through_lifecycle(
+                library_info=lib_info,
+                file_path="/mock.json",
+                request=RegisterLibraryFromFileRequest(file_path="/mock.json"),
+            )
+
+        install_problems = [p for p in lib_info.problems if isinstance(p, DependencyInstallationFailedProblem)]
+        assert len(install_problems) == 1
+        assert "nonexistent-package" in install_problems[0].error_details
+        # Readable by the collator the settings panel and the worker both go through.
+        collated = mgr.collate_problems_for_lib_info(lib_info)
+        assert collated is not None
+        assert "nonexistent-package" in collated
+
+    @pytest.mark.asyncio
+    async def test_a_failed_install_is_not_reported_as_a_missing_library_dependency(self, engine: Engine) -> None:
+        """The two are different failures and must not be conflated.
+
+        LibraryDependencyProblem means another griptape LIBRARY could not be fetched. Reusing it
+        for a pip failure would misreport the cause, and would silently change what the existing
+        dependency tests observe, since they filter problems by exactly that type.
+        """
+        mgr = engine.library_manager
+        lib_info = _make_lib_info()
+        schema = _make_schema_mock([])
+
+        with (
+            patch.object(mgr, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)),
+            patch.object(mgr, "install_library_dependencies_request", return_value=_INSTALL_STOP),
+            patch.object(mgr, "_library_file_path_to_info", {"/mock.json": lib_info}),
+        ):
+            await mgr._progress_library_through_lifecycle(
+                library_info=lib_info,
+                file_path="/mock.json",
+                request=RegisterLibraryFromFileRequest(file_path="/mock.json"),
+            )
+
+        assert not [p for p in lib_info.problems if isinstance(p, LibraryDependencyProblem)]
+
+
+class TestExecutionEnvironmentResolvesBothSets:
+    """`.venv-exec` is resolved over the edit-time set AND the heavy one, in one resolution.
+
+    Resolved apart, uv can pick a different version of anything the two share -- numpy declared as
+    an edit-time dependency and numpy pulled in by torch -- and the worker would then run against
+    one version while the orchestrator built the node against another.
+    """
+
+    def _orchestrator_schema(self, mgr: LibraryManager, exec_deps: list[str]) -> MagicMock:
+        """An orchestrator registering `test_lib`, which declares `exec_deps` as its heavy set."""
+        schema = MagicMock()
+        schema.name = "test_lib"
+        schema.metadata.library_version = "1.0.0"
+        schema.metadata.dependencies.pip_dependencies = ["fakeedit", "numpy"]
+        schema.metadata.dependencies.pip_install_flags = ["--no-index"]
+        schema.metadata.dependencies.pip_dependencies_exec = exec_deps
+        schema.metadata.declarations = []
+        mgr._is_worker = False
+        mgr._library_file_path_to_info["/mock.json"] = _make_lib_info()
+        return schema
+
+    def _metadata_result(self, schema: MagicMock) -> LoadLibraryMetadataFromFileResultSuccess:
+        return LoadLibraryMetadataFromFileResultSuccess(
+            library_schema=schema,
+            file_path="/mock.json",
+            git_remote=None,
+            git_ref=None,
+            enabled=True,
+            is_registered=False,
+            result_details=ResultDetails(message="OK", level=20),
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_execution_install_receives_the_union_of_both_sets(self, engine: Engine) -> None:
+        mgr = engine.library_manager
+        schema = self._orchestrator_schema(mgr, ["faketorch"])
+
+        with (
+            patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
+            patch.object(mgr, "_this_process_owns_the_edit_venv", return_value=False),
+            patch.object(mgr, "_install_dependency_set", new=AsyncMock(return_value=None)) as install,
+        ):
+            await mgr.install_library_dependencies_request(
+                InstallLibraryDependenciesRequest(library_file_path="/mock.json")
+            )
+
+        assert install.await_args is not None
+        kwargs = install.await_args.kwargs
+        assert kwargs["pip_dependencies"] == ["fakeedit", "numpy", "faketorch"]
+        # Targets the execution venv, not the edit-time one the orchestrator imports from.
+        assert kwargs["execution"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_failed_build_records_the_reason(self, engine: Engine) -> None:
+        """The build is awaited now, so a failure is recorded before registration returns.
+
+        Nothing waits on an event any more; the spawn refusal reads the recorded reason instead.
+        """
+        mgr = engine.library_manager
+        schema = self._orchestrator_schema(mgr, ["faketorch"])
+
+        with (
+            patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
+            patch.object(mgr, "_this_process_owns_the_edit_venv", return_value=False),
+            patch.object(
+                mgr,
+                "_install_dependency_set",
+                new=AsyncMock(side_effect=DependencyInstallError("no solution found")),
+            ),
+        ):
+            await mgr.install_library_dependencies_request(
+                InstallLibraryDependenciesRequest(library_file_path="/mock.json")
+            )
+
+        # Read by the spawn refusal, and deliberately not execution_unavailable_reason, which
+        # _start_workers clears before every attempt.
+        reason = mgr.execution_env_failure_reason("test_lib")
+        assert reason is not None
+        assert "no solution found" in reason
+
+
+def _metadata_for_mock(schema: MagicMock) -> LoadLibraryMetadataFromFileResultSuccess:
+    return LoadLibraryMetadataFromFileResultSuccess(
+        library_schema=schema,
+        file_path="/mock.json",
+        git_remote=None,
+        git_ref=None,
+        enabled=True,
+        is_registered=False,
+        result_details=ResultDetails(message="OK", level=20),
+    )
+
+
+class TestWorkerModeLibraryStillGetsAnExecutionEnvironment:
+    """A manifest can declare worker mode AND execution dependencies; nothing rejects the pair.
+
+    The orchestrator skips LOADING such a library, which is not the same as skipping its execution
+    environment: the worker receives `.venv-exec` as PYTHONPATH and so cannot be the process that
+    creates it. When the orchestrator skipped the install outright, neither process built it, the
+    spawn was not refused (no failure was recorded), and the worker started with no PYTHONPATH --
+    reaching the raw ModuleNotFoundError that the refusal exists to prevent.
+    """
+
+    def _worker_mode_info(self) -> LibraryManager.LibraryInfo:
+        info = _make_lib_info()
+        info.requires_worker = True
+        return info
+
+    def _schema(self, mgr: LibraryManager) -> MagicMock:
+        schema = MagicMock()
+        schema.name = "test_lib"
+        schema.metadata.library_version = "1.0.0"
+        schema.metadata.dependencies.pip_dependencies = ["fakeedit"]
+        schema.metadata.dependencies.pip_install_flags = []
+        schema.metadata.dependencies.pip_dependencies_exec = ["faketorch"]
+        schema.metadata.declarations = []
+        mgr._is_worker = False
+        mgr._library_file_path_to_info["/mock.json"] = self._worker_mode_info()
+        return schema
+
+    def test_the_orchestrator_does_not_own_the_edit_venv_for_it(self, engine: Engine) -> None:
+        """The worker builds `<library>/.venv`, because only the worker loads the library."""
+        mgr = engine.library_manager
+        mgr._is_worker = False
+        mgr._library_file_path_to_info["/mock.json"] = self._worker_mode_info()
+
+        assert mgr._this_process_owns_the_edit_venv("/mock.json") is False
+
+    def test_the_orchestrator_still_owns_the_edit_venv_for_an_exec_deps_library(self, engine: Engine) -> None:
+        """Guards the guard: the change above must not stop the ordinary case building."""
+        mgr = engine.library_manager
+        mgr._is_worker = False
+        mgr._library_file_path_to_info["/mock.json"] = _make_lib_info()
+
+        assert mgr._this_process_owns_the_edit_venv("/mock.json") is True
+
+    @pytest.mark.asyncio
+    async def test_the_orchestrator_builds_its_execution_environment(self, engine: Engine) -> None:
+        mgr = engine.library_manager
+        schema = self._schema(mgr)
+
+        with (
+            patch.object(mgr, "load_library_metadata_from_file_request", return_value=_metadata_for_mock(schema)),
+            patch.object(mgr, "_install_dependency_set", new=AsyncMock(return_value=None)) as install,
+        ):
+            await mgr.install_library_dependencies_request(
+                InstallLibraryDependenciesRequest(library_file_path="/mock.json")
+            )
+
+        targets = [call.kwargs["execution"] for call in install.await_args_list]
+        # Exactly one install, and it is the execution one: the edit-time venv is the worker's.
+        assert targets == [True]
+
+
+class TestTheInstallMessageDescribesWhatHappened:
+    """The execution build is awaited, so the message can report an outcome rather than a plan."""
+
+    def test_a_finished_build_is_reported_as_installed(self) -> None:
+        details = LibraryManager._describe_dependency_install(
+            "test_lib",
+            DependencyInstallCounts(declared_edit=1, declared_exec=2, installed_edit=1, installed_exec=2),
+            None,
+        )
+
+        assert "Installed 1 edit-time and 2 execution dependencies" in details
+        assert "background" not in details
+
+    def test_a_failed_build_reports_the_failure(self) -> None:
+        """Without this the message fell through and promised the heavy set was still coming."""
+        details = LibraryManager._describe_dependency_install(
+            "test_lib",
+            DependencyInstallCounts(declared_edit=1, declared_exec=2, installed_edit=1, installed_exec=0),
+            "its execution dependencies could not be installed (no solution found).",
+        )
+
+        assert "could not be installed" in details
+        assert "belong to the execution environment" not in details
+
+    def test_an_environment_someone_else_builds_says_so(self) -> None:
+        details = LibraryManager._describe_dependency_install(
+            "test_lib",
+            DependencyInstallCounts(declared_edit=1, declared_exec=2, installed_edit=1, installed_exec=0),
+            None,
+        )
+
+        assert "belong to the execution environment the orchestrator builds" in details
+
+
+class TestTheExecutionEnvironmentKeepsPrecedenceInAWorker:
+    """`.venv-exec` arrives as PYTHONPATH, which any later `sys.path.insert(0, ...)` overtakes.
+
+    It is the environment resolved over BOTH dependency sets, so for a package in both it holds the
+    only version one resolver agreed on -- the edit-time install resolved `pip_dependencies` alone,
+    and adding a heavy pin is exactly what makes the combined resolver choose differently. Splicing
+    the edit-time directory in front of it would run `process()` against the version the execution
+    resolver rejected.
+    """
+
+    def _library_with_both_venvs(self, mgr: LibraryManager, tmp_path: Path) -> str:
+        """Build `.venv` and `.venv-exec` on disk for a library, and return the exec site-packages."""
+        library_json = tmp_path / "lib" / "library.json"
+        library_json.parent.mkdir(parents=True)
+        library_json.write_text("{}")
+        info = _make_lib_info()
+        info.library_path = str(library_json)
+        mgr._library_file_path_to_info[str(library_json)] = info
+        for execution in (False, True):
+            venv = mgr._get_library_venv_path("test_lib", str(library_json), execution=execution)
+            site_packages = Path(sysconfig.get_path("purelib", vars={"base": str(venv), "platbase": str(venv)}))
+            site_packages.mkdir(parents=True, exist_ok=True)
+        exec_site_packages = mgr.execution_site_packages("test_lib")
+        assert exec_site_packages is not None, "guard: the fixture must build a usable .venv-exec"
+        return exec_site_packages
+
+    @pytest.mark.asyncio
+    async def test_the_edit_venv_is_not_spliced_ahead_of_it(
+        self, engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mgr = engine.library_manager
+        exec_site_packages = self._library_with_both_venvs(mgr, tmp_path)
+        info = mgr.get_library_info_by_library_name("test_lib")
+        assert info is not None
+        # Stands in for PYTHONPATH, which the engine sets before the worker imports anything.
+        monkeypatch.setattr(sys, "path", [exec_site_packages, *sys.path])
+
+        await mgr._add_library_edit_venv_to_sys_path("test_lib", info.library_path)
+
+        assert sys.path[0] == exec_site_packages
+
+    @pytest.mark.asyncio
+    async def test_the_edit_venv_is_spliced_when_the_execution_one_is_not_on_the_path(
+        self, engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A library this worker was not spawned for, and every in-process library, still needs it."""
+        mgr = engine.library_manager
+        self._library_with_both_venvs(mgr, tmp_path)
+        info = mgr.get_library_info_by_library_name("test_lib")
+        assert info is not None
+        monkeypatch.setattr(sys, "path", list(sys.path))
+
+        await mgr._add_library_edit_venv_to_sys_path("test_lib", info.library_path)
+
+        assert "\\.venv-exec" not in sys.path[0]
+        assert ".venv" in sys.path[0]

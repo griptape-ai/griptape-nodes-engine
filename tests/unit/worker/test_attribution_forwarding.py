@@ -1,8 +1,8 @@
 """Worker-side attribution is answered by the orchestrator, not locally.
 
 A worker's project manager is a replica populated by broadcast, so it can serve a stale
-chain; the orchestrator holds the authoritative one. So `GetAttributionContextRequest`
-joins `FORWARDED_REQUEST_TYPES` and a worker-side `RemoteHandler` forwards it -- but only
+chain; the orchestrator holds the authoritative one. So `GetAttributionContextRequest` stays
+out of `LOCAL_ONLY_REQUEST_TYPES` and a worker-side `RemoteHandler` forwards it -- but only
 inside a `worker_node_execution_scope`, which is the only time a node spends credits.
 
 No shipping library runs worker-hosted today; a `worker_mode_override` config entry can
@@ -17,7 +17,7 @@ from typing import Any
 import pytest
 
 from griptape_nodes.app.worker_routing import (
-    FORWARDED_REQUEST_TYPES,
+    LOCAL_ONLY_REQUEST_TYPES,
     RemoteHandler,
     register_remote_handlers,
 )
@@ -87,13 +87,14 @@ class TestAttributionIsForwardedFromWorkers:
 
 
 class TestAttributionForwardingIsWired:
-    """The one-line wiring, and the bootstrap invariant it depends on."""
+    """The wiring, and the bootstrap invariant it depends on."""
 
-    def test_attribution_is_a_forwarded_request_type(self) -> None:
-        assert GetAttributionContextRequest in FORWARDED_REQUEST_TYPES
+    def test_attribution_is_not_answered_locally(self) -> None:
+        """Forwarding is the default, so this pins that nothing has excluded it."""
+        assert GetAttributionContextRequest not in LOCAL_ONLY_REQUEST_TYPES
 
     def test_register_remote_handlers_finds_a_budget_manager_owner(self) -> None:
-        """`register_remote_handlers` raises for a forwarded type with no registered owner.
+        """`register_remote_handlers` needs a registered owner for every forwarded type.
 
         BudgetManager is therefore constructed unconditionally, including on workers -- a
         bootstrap-order bug here would surface as a worker that cannot start at all.

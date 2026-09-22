@@ -21,6 +21,7 @@ Focused on:
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
@@ -28,6 +29,10 @@ import pytest
 from griptape_nodes.exe_types.core_types import Parameter
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.exe_types.param_components.model_access_component import ModelAccessComponent
+from griptape_nodes.retained_mode.engine import current_engine
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.access_events import QueryModelAccessForNodeResultFailure
 from griptape_nodes.traits.button import Button
 from griptape_nodes.traits.options import Options
@@ -111,6 +116,14 @@ def _catalog():  # noqa: ANN202
                         provider_model_id="beta",
                         key_support=KeySupport.REQUIRES_GRIPTAPE_KEY,
                     ),
+                    # Mirrors the real shape a readable name hides: a vendor prefix
+                    # and a build date the display name drops.
+                    "gtc_test_dated": Model(
+                        display_name="Dated Pro",
+                        family="TestFam",
+                        provider_model_id="vendor-dated-pro-260101",
+                        key_support=KeySupport.REQUIRES_GRIPTAPE_KEY,
+                    ),
                 },
             ),
         }
@@ -139,7 +152,7 @@ def _build_probe_node_with_component(
     from griptape_nodes.node_library.library_declarations import ModelUsageNodeProperty
 
     _register_probe_node(
-        node_declarations=[ModelUsageNodeProperty(model_ids=["gtc_test_alpha", "gtc_test_beta"])],
+        node_declarations=[ModelUsageNodeProperty(model_ids=["gtc_test_alpha", "gtc_test_beta", "gtc_test_dated"])],
         library_declarations=[_catalog()],
     )
 
@@ -185,7 +198,7 @@ class TestPickPermittedDefault:
         )
         assert helper.pick_permitted_default() == "alpha"
 
-    def test_falls_back_to_first_allowed_when_default_denied(self, engine) -> None:  # noqa: ANN001
+    def test_falls_back_to_first_allowed_when_default_denied(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
 
         def deny_alpha(checkpoint: object) -> CheckpointDenial | None:
@@ -204,7 +217,7 @@ class TestPickPermittedDefault:
         finally:
             engine.event_manager.remove_authorization_hook(deny_alpha)
 
-    def test_returns_none_when_every_choice_is_denied(self, engine) -> None:  # noqa: ANN001
+    def test_returns_none_when_every_choice_is_denied(self, engine: Engine) -> None:
         """Every declared choice denied -> None. Caller decides what to do next.
 
         The helper does not silently return a denied model as the default -- that
@@ -237,7 +250,7 @@ class TestInstall:
         assert len(param.find_elements_by_type(Options)) == 1
         assert len(param.find_elements_by_type(Button)) == 1
 
-    def test_install_populates_ui_options_with_dropdown_data(self, engine) -> None:  # noqa: ANN001
+    def test_install_populates_ui_options_with_dropdown_data(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
 
         def deny_alpha(checkpoint: object) -> CheckpointDenial | None:
@@ -254,14 +267,89 @@ class TestInstall:
             ui = param.ui_options
             assert ui["dropdown_row_icons"] is True
             assert ui["dropdown_row_subtitles"] is True
-            # Alpha row carries the denial decoration; beta is bare.
+            # Both rows keep the provider id as `name` and gain the catalog name as `label`.
+            # Alpha carries the denial decoration; neither id earns a subtitle, since
+            # "Alpha"/"Beta" spell their ids.
             data_by_name = {row["name"]: row for row in ui["data"]}
+            assert data_by_name["alpha"]["label"] == "Alpha"
             assert data_by_name["alpha"]["icon"] == "shield-off"
             assert data_by_name["alpha"]["subtitle"] == "Not permitted by your license"
+            assert data_by_name["beta"]["label"] == "Beta"
             assert "icon" not in data_by_name["beta"]
             assert "subtitle" not in data_by_name["beta"]
         finally:
             engine.event_manager.remove_authorization_hook(deny_alpha)
+
+    def test_id_is_shown_as_a_subtitle_only_when_the_label_drops_detail(self) -> None:
+        """A dated id earns a second line; an id its label already spells does not.
+
+        Two thirds of the real catalog names a model the way its id spells it
+        ("GPT-5.5" / ``gpt-5.5``), and ``o3``'s display name IS ``o3``, so an
+        unconditional subtitle would double every such row's height to repeat the
+        text above it.
+        """
+        node, _helper = _install_probe_node_with_helper(
+            model_choices=["beta", "vendor-dated-pro-260101"],
+            default_model="beta",
+        )
+
+        param = node.get_parameter_by_name("model")
+        assert param is not None
+        data_by_name = {row["name"]: row for row in param.ui_options["data"]}
+        # "Dated Pro" drops the prefix and the build date, so the id is worth showing.
+        assert data_by_name["vendor-dated-pro-260101"]["label"] == "Dated Pro"
+        assert data_by_name["vendor-dated-pro-260101"]["subtitle"] == "vendor-dated-pro-260101"
+        # "Beta" differs from `beta` only in case.
+        assert "subtitle" not in data_by_name["beta"]
+
+    def test_denial_subtitle_outranks_the_id_subtitle(self, engine) -> None:  # noqa: ANN001
+        """A gated row says why it is gated, even when its id would earn a subtitle.
+
+        The two subtitle writers meet only here: a dated id claims the subtitle,
+        and a denial then replaces it. Writing them in the other order would leave
+        a gated row showing its build id where the reason should be, and the artist
+        would see no explanation for a model they cannot use.
+        """
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+
+        def deny_dated(checkpoint: object) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("id") == "gtc_test_dated":  # type: ignore[attr-defined]
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Dated Pro not enabled."),))
+            return None
+
+        engine.event_manager.add_authorization_hook(deny_dated)
+        try:
+            node, _helper = _install_probe_node_with_helper(
+                model_choices=["beta", "vendor-dated-pro-260101"],
+                default_model="beta",
+            )
+
+            param = node.get_parameter_by_name("model")
+            assert param is not None
+            data_by_name = {row["name"]: row for row in param.ui_options["data"]}
+            dated = data_by_name["vendor-dated-pro-260101"]
+            assert dated["label"] == "Dated Pro"
+            assert dated["icon"] == "shield-off"
+            assert dated["subtitle"] == "Not permitted by your license"
+        finally:
+            engine.event_manager.remove_authorization_hook(deny_dated)
+
+    def test_choice_the_catalog_does_not_describe_carries_no_label(self) -> None:
+        """An undeclared choice renders as its own id rather than an invented name.
+
+        The component does not synthesize a label, and it omits the id subtitle
+        too: with no label the id is already the row's visible text, so repeating
+        it would print the same string twice.
+        """
+        node, _helper = _install_probe_node_with_helper(
+            model_choices=["alpha", "gamma"],
+            default_model="alpha",
+        )
+
+        param = node.get_parameter_by_name("model")
+        assert param is not None
+        data_by_name = {row["name"]: row for row in param.ui_options["data"]}
+        assert data_by_name["gamma"] == {"name": "gamma"}
 
     def test_install_preserves_parameter_identity(self) -> None:
         """Install must not change parameter name / type / tooltip / stored value."""
@@ -280,7 +368,7 @@ class TestInstall:
         # update_ui_options merges; display_name set by the node must survive.
         assert post_param.ui_options.get("display_name") == pre_display_name
 
-    def test_install_applies_initial_badge_when_stored_value_denied(self, engine) -> None:  # noqa: ANN001
+    def test_install_applies_initial_badge_when_stored_value_denied(self, engine: Engine) -> None:
         """A node born with a denied stored value shows the badge immediately.
 
         Setup: every choice is denied so ``pick_permitted_default()`` returns
@@ -308,7 +396,7 @@ class TestInstall:
         finally:
             engine.event_manager.remove_authorization_hook(deny_everything)
 
-    def test_constructor_relocates_stored_value_off_denied_default(self, engine) -> None:  # noqa: ANN001
+    def test_constructor_relocates_stored_value_off_denied_default(self, engine: Engine) -> None:
         """Constructor moves the stored value off a denied default to a permitted alternative.
 
         The parameter's declarative default_value is preserved (unchanged); only
@@ -532,7 +620,7 @@ class TestEngineFailureIsFailClosedAtRuntime:
 
 
 class TestOnValueChanged:
-    def test_sets_badge_when_switching_to_denied_value(self, engine) -> None:  # noqa: ANN001
+    def test_sets_badge_when_switching_to_denied_value(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
 
         def deny_alpha(checkpoint: object) -> CheckpointDenial | None:
@@ -556,7 +644,7 @@ class TestOnValueChanged:
         finally:
             engine.event_manager.remove_authorization_hook(deny_alpha)
 
-    def test_clears_badge_when_switching_to_allowed_value(self, engine) -> None:  # noqa: ANN001
+    def test_clears_badge_when_switching_to_allowed_value(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
 
         def deny_alpha(checkpoint: object) -> CheckpointDenial | None:
@@ -596,7 +684,7 @@ class TestOnValueChanged:
 
 
 class TestRefreshAndQueryForDenial:
-    def test_query_for_denial_returns_denial_for_denied_model(self, engine) -> None:  # noqa: ANN001
+    def test_query_for_denial_returns_denial_for_denied_model(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
 
         def deny_alpha(checkpoint: object) -> CheckpointDenial | None:
@@ -616,7 +704,7 @@ class TestRefreshAndQueryForDenial:
         finally:
             engine.event_manager.remove_authorization_hook(deny_alpha)
 
-    def test_query_for_denial_honors_a_grant_made_since_the_last_refresh(self, engine) -> None:  # noqa: ANN001
+    def test_query_for_denial_honors_a_grant_made_since_the_last_refresh(self, engine: Engine) -> None:
         """The run-path re-query must work in BOTH directions, not just allow -> deny.
 
         The snapshot is captured at construction/refresh time. If a cached denial short-circuited
@@ -641,7 +729,7 @@ class TestRefreshAndQueryForDenial:
 
         assert helper.query_for_denial("alpha") is None
 
-    def test_an_unanswerable_live_requery_falls_back_to_the_cached_denial(self, engine) -> None:  # noqa: ANN001
+    def test_an_unanswerable_live_requery_falls_back_to_the_cached_denial(self, engine: Engine) -> None:  # noqa: ARG002 - boots the ambient engine
         """A transient lookup failure must not forget a denial we already hold.
 
         The run path re-asks policy live so grants are honored. If that query cannot be answered
@@ -655,20 +743,19 @@ class TestRefreshAndQueryForDenial:
                 return CheckpointDenial(failures=(CheckpointFailure(detail="Alpha not enabled."),))
             return None
 
-        engine.event_manager.add_authorization_hook(deny_alpha)
+        current_engine().event_manager.add_authorization_hook(deny_alpha)
         try:
             _, helper = _install_probe_node_with_helper(model_choices=["alpha", "beta"], default_model="beta")
             assert helper.query_for_denial("alpha") is not None
 
             # The live re-query now comes back unanswerable.
-            with patch.object(
-                engine,
-                "handle_request",
+            with patch(
+                "griptape_nodes.retained_mode.engine.Engine.handle_request",
                 return_value=QueryModelAccessForNodeResultFailure(result_details="library unregistered"),
             ):
                 assert helper.query_for_denial("alpha") is not None
         finally:
-            engine.event_manager.remove_authorization_hook(deny_alpha)
+            current_engine().event_manager.remove_authorization_hook(deny_alpha)
 
     def test_query_for_denial_ignores_non_string_values(self) -> None:
         _, helper = _install_probe_node_with_helper(model_choices=["alpha", "beta"], default_model="alpha")
@@ -688,7 +775,7 @@ class TestRefreshAndQueryForDenial:
 
         assert helper.query_for_denial("never-heard-of-this-model") is None
 
-    def test_refresh_picks_up_hook_change(self, engine) -> None:  # noqa: ANN001
+    def test_refresh_picks_up_hook_change(self, engine: Engine) -> None:
         """refresh() re-fetches the denial map so a policy change becomes visible."""
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
 
@@ -722,7 +809,7 @@ class TestRefreshAndQueryForDenial:
 
 
 class TestRaiseIfDenied:
-    def test_raises_runtimeerror_with_denial_reason(self, engine) -> None:  # noqa: ANN001
+    def test_raises_runtimeerror_with_denial_reason(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
 
         def deny_alpha(checkpoint: object) -> CheckpointDenial | None:
@@ -753,7 +840,7 @@ class TestRaiseIfDenied:
 
 
 class TestRefreshButton:
-    def test_refresh_button_click_rebuilds_state(self, engine) -> None:  # noqa: ANN001
+    def test_refresh_button_click_rebuilds_state(self, engine: Engine) -> None:
         """The inline Button trait's on_click hook invokes refresh()."""
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
 
@@ -788,7 +875,7 @@ class TestRefreshButton:
 
 
 class TestSuccessFailureUsagePattern:
-    def test_query_for_denial_supports_early_return_without_raising(self, engine) -> None:  # noqa: ANN001
+    def test_query_for_denial_supports_early_return_without_raising(self, engine: Engine) -> None:
         """A SuccessFailure-style caller can inspect the denial and route without an exception.
 
         Verifies that the helper never raises on its own -- the caller decides
@@ -835,7 +922,7 @@ class TestModelChoicesProperty:
 
 
 class TestReinstallOptions:
-    def test_reinstall_puts_options_and_decoration_back(self, engine) -> None:  # noqa: ANN001
+    def test_reinstall_puts_options_and_decoration_back(self, engine: Engine) -> None:
         """After remove_trait(Options), reinstall_options() re-adds it with decoration + badge."""
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
 
@@ -1064,7 +1151,7 @@ class TestSelectionReadingApi:
         node.set_parameter_value(param.name, "beta")
         assert helper.selected_value == "beta"
 
-    def test_selection_denial_gates_the_current_selection(self, engine) -> None:  # noqa: ANN001
+    def test_selection_denial_gates_the_current_selection(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
 
         def deny_alpha(checkpoint: object) -> CheckpointDenial | None:
@@ -1086,7 +1173,7 @@ class TestSelectionReadingApi:
         finally:
             engine.event_manager.remove_authorization_hook(deny_alpha)
 
-    def test_raise_if_selection_denied_raises_for_the_current_selection(self, engine) -> None:  # noqa: ANN001
+    def test_raise_if_selection_denied_raises_for_the_current_selection(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
 
         def deny_alpha(checkpoint: object) -> CheckpointDenial | None:
@@ -1107,7 +1194,7 @@ class TestSelectionReadingApi:
         finally:
             engine.event_manager.remove_authorization_hook(deny_alpha)
 
-    def test_on_value_set_ignores_other_parameters(self, engine) -> None:  # noqa: ANN001
+    def test_on_value_set_ignores_other_parameters(self, engine: Engine) -> None:
         """The component filters for its own parameter so nodes can forward unconditionally."""
         from griptape_nodes.exe_types.core_types import Parameter
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
@@ -1145,7 +1232,7 @@ class TestConstructionDeferral:
     ``TestConstructionWithoutAScopeStillQueries``.
     """
 
-    def test_construction_defers_the_query_and_keeps_the_default(self, engine) -> None:  # noqa: ANN001
+    def test_construction_defers_the_query_and_keeps_the_default(self, engine: Engine) -> None:
         from unittest.mock import MagicMock
 
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
@@ -1158,7 +1245,7 @@ class TestConstructionDeferral:
         try:
             with (
                 patch(
-                    "griptape_nodes.exe_types.param_components.model_policy.GriptapeNodes.handle_request",
+                    "griptape_nodes.retained_mode.engine.Engine.handle_request",
                     handle,
                 ),
                 constructing_under_probe(),
@@ -1176,7 +1263,7 @@ class TestConstructionDeferral:
         finally:
             engine.event_manager.remove_authorization_hook(deny_all)
 
-    def test_query_for_denial_heals_a_deferred_snapshot(self, engine) -> None:  # noqa: ANN001
+    def test_query_for_denial_heals_a_deferred_snapshot(self, engine: Engine) -> None:
         """The enforcement-gap regression: run-time gating must not stay bypassed until a refresh.
 
         This component has no validate_before_node_run equivalent, so if query_for_denial
@@ -1203,7 +1290,7 @@ class TestConstructionDeferral:
         finally:
             engine.event_manager.remove_authorization_hook(deny_alpha)
 
-    def test_refresh_heals_decoration(self, engine) -> None:  # noqa: ANN001
+    def test_refresh_heals_decoration(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
 
         def deny_alpha(checkpoint: object) -> CheckpointDenial | None:
@@ -1236,7 +1323,7 @@ class TestConstructionWithoutAScopeStillQueries:
     artist clicks refresh.
     """
 
-    def test_denial_decoration_and_default_relocation_happen_at_construction(self, engine) -> None:  # noqa: ANN001
+    def test_denial_decoration_and_default_relocation_happen_at_construction(self, engine: Engine) -> None:
         from griptape_nodes.node_library.library_registry import LibraryRegistry
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
 

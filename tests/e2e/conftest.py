@@ -157,13 +157,16 @@ def write_isolated_config() -> Callable[..., None]:
 def create_node(engine: Engine) -> Callable[..., str]:
     """Return a helper that creates a node from the given library and asserts success."""
 
-    def _create(node_type: str, node_name: str, flow_name: str, *, library_name: str) -> str:
+    def _create(
+        node_type: str, node_name: str, flow_name: str, *, library_name: str, metadata: dict | None = None
+    ) -> str:
         result = engine.handle_request(
             CreateNodeRequest(
                 node_type=node_type,
                 specific_library_name=library_name,
                 node_name=node_name,
                 override_parent_flow_name=flow_name,
+                metadata=metadata,
             )
         )
         assert isinstance(result, CreateNodeResultSuccess), result

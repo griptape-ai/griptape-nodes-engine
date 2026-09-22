@@ -1,0 +1,62 @@
+{
+  "name": "Loose Sink Library",
+  "library_schema_version": "0.7.0",
+  "metadata": {
+    "author": "Test Fixture",
+    "description": "Control chain plus a loose data sink, for DAG seeding tests",
+    "library_version": "0.1.0",
+    "engine_version": "0.0.0",
+    "tags": ["test"],
+    "dependencies": {
+      "pip_dependencies": []
+    }
+  },
+  "categories": [
+    {
+      "test": {
+        "title": "test",
+        "description": "Test nodes",
+        "color": "border-gray-500",
+        "icon": "Folder"
+      }
+    }
+  ],
+  "nodes": [
+    {
+      "class_name": "ChainNode",
+      "file_path": "loose_sink_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "control chain node",
+        "display_name": "Chain"
+      }
+    },
+    {
+      "class_name": "SinkNode",
+      "file_path": "loose_sink_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "loose data sink",
+        "display_name": "Sink"
+      }
+    },
+    {
+      "class_name": "ListSinkNode",
+      "file_path": "loose_sink_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "loose data sink taking a list",
+        "display_name": "List Sink"
+      }
+    },
+    {
+      "class_name": "BranchNode",
+      "file_path": "loose_sink_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "two control outputs, picks one at runtime",
+        "display_name": "Branch"
+      }
+    }
+  ]
+}

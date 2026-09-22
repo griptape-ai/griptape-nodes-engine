@@ -1,6 +1,7 @@
 import base64
 import binascii
 import logging
+import os
 import threading
 from pathlib import Path
 from typing import NamedTuple
@@ -19,6 +20,7 @@ from griptape_nodes.retained_mode.engine import Engine, EngineScoped
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.artifact_events import (
     GetPreviewForArtifactRequest,
+    GetPreviewForArtifactResultFailure,
     GetPreviewForArtifactResultSuccess,
     PreviewGenerationPolicy,
 )
@@ -52,7 +54,13 @@ from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
 from griptape_nodes.servers import bind_free_socket
-from griptape_nodes.servers.static import STATIC_SERVER_HOST, STATIC_SERVER_PORT, STATIC_SERVER_URL, start_static_server
+from griptape_nodes.servers.static import (
+    ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV,
+    STATIC_SERVER_HOST,
+    STATIC_SERVER_PORT,
+    STATIC_SERVER_URL,
+    start_static_server,
+)
 from griptape_nodes.utils.url_utils import uri_to_path
 
 logger = logging.getLogger("griptape_nodes")
@@ -72,6 +80,23 @@ class ResolvedStaticFilePath(NamedTuple):
     path: Path
     policy: ExistingFilePolicy
     file_metadata: SidecarContent | None = None
+
+
+class PreviewResolution(NamedTuple):
+    """Outcome of resolving which file to serve for a preview-eligible request.
+
+    Attributes:
+        path_to_serve: The preview file when one was available or generated,
+            otherwise the original file.
+        artifact_metadata: Properties extracted from the source file header, when known.
+        preview_failure_reason: Why the preview could not be served, when
+            path_to_serve fell back to the original file despite a preview being
+            requested. None when the preview was served or none was requested.
+    """
+
+    path_to_serve: Path
+    artifact_metadata: dict | None = None
+    preview_failure_reason: str | None = None
 
 
 class StaticFilesManager(EngineScoped):
@@ -103,6 +128,11 @@ class StaticFilesManager(EngineScoped):
         # until then is also what tells that handler it has not settled this yet, so a second
         # initialization pass in the same process doesn't start a second server.
         self._static_server_base_url: str | None = None
+        # Set once on_app_initialization_complete has decided the URL -- including deciding there
+        # is none (cloud storage). App-event listeners fan out as unordered concurrent tasks, so a
+        # consumer that needs the answer waits on this instead of sampling mid-race. A
+        # threading.Event because waiters and the resolver can sit on different event loops.
+        self._base_url_settled = threading.Event()
 
         # Seed the driver with any configured override so URLs built before initialization
         # completes still point at the tunnel or proxy fronting the server. The handler re-reads
@@ -179,46 +209,103 @@ class StaticFilesManager(EngineScoped):
             raise RuntimeError(msg)
         return self._static_server_base_url
 
-    async def _generate_preview_if_needed(self, file_path: Path) -> tuple[Path, dict | None]:
+    @property
+    def static_server_base_url_settled(self) -> bool:
+        """Whether initialization has decided the URL yet, including deciding there is none.
+
+        Lets a caller skip the wait when the answer is already in, and tell "decided: no server"
+        apart from "never decided" afterwards -- two states that want different diagnostics.
+
+        Pair it with ``wait_for_static_server_base_url(0)``, NOT with ``static_server_base_url``:
+        that property raises when the decision was "no server", which is the very case this
+        distinguishes.
+        """
+        return self._base_url_settled.is_set()
+
+    def wait_for_static_server_base_url(self, timeout_s: float) -> str | None:
+        """Block until initialization has decided the URL, then return it (None means "no server").
+
+        The deciding listener and a consumer needing its answer run as unordered sibling tasks in
+        the AppInitializationComplete fan-out, so sampling the property from another listener's
+        call chain is a race. Waiting on the decision makes the ordering structural. Blocking by
+        design: call it off-loop (``asyncio.to_thread``) from async code.
+
+        Returns None when initialization decided no server will exist here -- cloud storage serves
+        assets itself, or resolution raised -- and also when nothing decided within the bound. Both
+        mean "spawn without a URL", but they are different failures: read
+        ``static_server_base_url_settled`` to tell them apart, as the spawn path does to pick which
+        of two warnings to emit.
+        """
+        self._base_url_settled.wait(timeout_s)
+        return self._static_server_base_url
+
+    async def _generate_preview_if_needed(
+        self, file_path: Path, source_macro_path: MacroPath | None = None
+    ) -> PreviewResolution:
         """Generate preview for a file if needed.
 
-        Returns (path, artifact_metadata) where path is the preview if generated/cached,
-        or the original file path if no provider supports the format or preview generation fails.
+        Serves the preview when one is available or can be generated; otherwise falls
+        back to the original file and says why in preview_failure_reason.
 
         Args:
             file_path: Path to the original file
+            source_macro_path: The original macro form of file_path, when known. Used
+                for the preview request so the generated metadata records the portable
+                macro template; without it the resolved absolute path is wrapped as a
+                degenerate single-segment macro.
 
         Returns:
-            Tuple of (path to serve, original source metadata or None)
+            PreviewResolution naming the file to serve, any extracted source metadata,
+            and the failure reason when the preview could not be served.
         """
         extension = file_path.suffix.lstrip(".").lower()
         if not extension:
-            return file_path, None
+            return PreviewResolution(path_to_serve=file_path)
 
         registry = self.engine.artifact_manager._registry
         provider_classes = registry.get_provider_classes_by_format(extension)
         if not provider_classes:
+            # Not a failure: formats without a provider (e.g. text) have no previews.
             logger.debug("Skipping preview for unsupported file format: %s", file_path)
-            return file_path, None
+            return PreviewResolution(path_to_serve=file_path)
 
         provider_name = provider_classes[0].get_friendly_name()
 
+        if source_macro_path is not None:
+            macro_path = source_macro_path
+        else:
+            macro_path = MacroPath(ParsedMacro(str(file_path)), {})
+
         result = await self.engine.ahandle_request(
             GetPreviewForArtifactRequest(
-                macro_path=MacroPath(ParsedMacro(str(file_path)), {}),
+                macro_path=macro_path,
                 artifact_provider_name=provider_name,
                 preview_generation_policy=PreviewGenerationPolicy.ONLY_IF_STALE,
+                # DEBUG on the inner request so the failure logs once, here, at the
+                # layer that knows it is falling back to the original file.
                 failure_log_level=logging.DEBUG,
             )
         )
 
         if not isinstance(result, GetPreviewForArtifactResultSuccess) or not isinstance(result.paths_to_preview, str):
-            logger.debug("Preview generation failed for %s: %s", file_path, result.result_details)
-            return file_path, None
+            failure_reason = str(result.result_details)
+            # A vanished source is routine (outputs cleaned up between runs) and
+            # fires once per component displaying the artifact — nobody can act
+            # on it, so it stays at DEBUG. Everything else (provider error,
+            # failed write) is worth an operator's attention.
+            source_file_missing = isinstance(result, GetPreviewForArtifactResultFailure) and result.source_file_missing
+            fallback_log_level = logging.DEBUG if source_file_missing else logging.WARNING
+            logger.log(
+                fallback_log_level,
+                "Preview unavailable for %s; serving the original file instead. Reason: %s",
+                file_path,
+                failure_reason,
+            )
+            return PreviewResolution(path_to_serve=file_path, preview_failure_reason=failure_reason)
 
         preview_path = Path(result.paths_to_preview)
         logger.debug("Serving preview for %s -> %s", file_path, preview_path)
-        return preview_path, result.artifact_metadata
+        return PreviewResolution(path_to_serve=preview_path, artifact_metadata=result.artifact_metadata)
 
     def on_handle_create_static_file_request(
         self,
@@ -358,8 +445,13 @@ class StaticFilesManager(EngineScoped):
             return None
 
     async def _resolve_preview_path(
-        self, file_path: Path, *, preview: bool, metadata_only: bool = False
-    ) -> tuple[Path, dict | None]:
+        self,
+        file_path: Path,
+        *,
+        preview: bool,
+        metadata_only: bool = False,
+        source_macro_path: MacroPath | None = None,
+    ) -> PreviewResolution:
         """Return the path to serve and any source metadata, generating a preview when requested.
 
         Args:
@@ -367,24 +459,28 @@ class StaticFilesManager(EngineScoped):
             preview: Whether to generate and serve a preview.
             metadata_only: When True, extract metadata without generating a preview. The
                 returned path is always the original file. Takes precedence over preview.
+            source_macro_path: The original macro form of file_path, when the request
+                supplied one. Passed through so preview metadata records the portable
+                template instead of this machine's resolved absolute path.
 
         Returns:
-            Tuple of (path to serve, artifact metadata or None).
+            PreviewResolution naming the file to serve, any extracted source metadata,
+            and the failure reason when a requested preview could not be served.
         """
         if metadata_only:
             artifact_metadata = await self._extract_metadata_only(file_path)
-            return file_path, artifact_metadata
+            return PreviewResolution(path_to_serve=file_path, artifact_metadata=artifact_metadata)
         if not preview:
             logger.debug("Serving full image for %s", file_path)
-            return file_path, None
+            return PreviewResolution(path_to_serve=file_path)
         try:
-            preview_path, artifact_metadata = await self._generate_preview_if_needed(file_path)
+            resolution = await self._generate_preview_if_needed(file_path, source_macro_path=source_macro_path)
         except Exception as e:
             logger.warning("Preview generation failed for %s, using original: %s", file_path, e)
-            return file_path, None
-        if preview_path == file_path:
+            return PreviewResolution(path_to_serve=file_path, preview_failure_reason=str(e))
+        if resolution.path_to_serve == file_path and resolution.preview_failure_reason is None:
             logger.debug("Serving full image (no thumbnail available) for %s", file_path)
-        return preview_path, artifact_metadata
+        return resolution
 
     async def on_handle_create_static_file_download_url_from_path_request(
         self,
@@ -414,6 +510,10 @@ class StaticFilesManager(EngineScoped):
             logger.warning(msg)
             return CreateStaticFileDownloadUrlResultFailure(error=msg, result_details=msg)
 
+        # Keep the original macro form alongside the resolved path: preview metadata
+        # records the macro template, and handing it a resolved absolute path bakes a
+        # machine-specific path into a file that lives inside the project.
+        source_macro_path: MacroPath | None = None
         if parsed.get_variables():
             resolve_result = self.engine.handle_request(
                 GetPathForMacroRequest(parsed_macro=parsed, variables=request.macro_variables)
@@ -421,6 +521,7 @@ class StaticFilesManager(EngineScoped):
             if not isinstance(resolve_result, GetPathForMacroResultSuccess):
                 msg = f"Attempted to create download URL. Failed with file_path='{file_path}' because macro resolution failed: {resolve_result.result_details}"
                 return CreateStaticFileDownloadUrlResultFailure(error=msg, result_details=msg)
+            source_macro_path = MacroPath(parsed, request.macro_variables)
             file_path = str(resolve_result.absolute_path)
 
         # Detect if this is a Griptape Cloud URL and extract bucket_id
@@ -441,12 +542,15 @@ class StaticFilesManager(EngineScoped):
 
         # If preview requested, generate preview and get preview path + artifact metadata.
         # If metadata_only requested, extract metadata without generating a preview.
-        file_path_to_use, artifact_metadata = await self._resolve_preview_path(
-            file_path_for_driver, preview=request.preview, metadata_only=request.metadata_only
+        resolution = await self._resolve_preview_path(
+            file_path_for_driver,
+            preview=request.preview,
+            metadata_only=request.metadata_only,
+            source_macro_path=source_macro_path,
         )
 
         try:
-            url = driver.create_signed_download_url(file_path_to_use)
+            url = driver.create_signed_download_url(resolution.path_to_serve)
         except Exception as e:
             msg = f"Failed to create presigned URL for file {file_path}: {e}"
             return CreateStaticFileDownloadUrlResultFailure(error=msg, result_details=msg)
@@ -454,15 +558,35 @@ class StaticFilesManager(EngineScoped):
         return CreateStaticFileDownloadUrlFromPathResultSuccess(
             url=url,
             file_url=driver.get_asset_url(file_path_for_driver),
-            artifact_metadata=artifact_metadata,
+            artifact_metadata=resolution.artifact_metadata,
+            preview_failure_reason=resolution.preview_failure_reason,
             result_details="Successfully created static file download URL",
         )
 
     def on_app_initialization_complete(self, payload: AppInitializationComplete) -> None:
+        # try/finally rather than settling per branch: whatever resolution reached before raising
+        # is what there is going to be, so waking waiters immediately beats making them sit out a
+        # full timeout on an initialization that already failed. Usually that means no URL, though a
+        # raise from starting the server thread leaves one already assigned.
+        try:
+            self._resolve_static_server(payload)
+        finally:
+            self._base_url_settled.set()
+
+    def _resolve_static_server(self, payload: AppInitializationComplete) -> None:
         if not isinstance(self.storage_driver, LocalStorageDriver):
             return
 
-        if payload.static_server_base_url is not None:
+        # The env var outranks the payload: a parent that set it serves the shared workspace on a
+        # port outliving this process. Gated on being a worker, because anywhere else the variable is
+        # a leaked shell export and adopting it would point every asset URL at an address nothing
+        # here controls. Read from the payload, not the engine-level worker flag, which another
+        # listener for this same event sets concurrently.
+        if payload.is_worker and os.getenv(ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV):
+            adopted = os.environ[ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV].rstrip("/")
+            self._static_server_base_url = adopted
+            logger.debug("Adopted the orchestrator's static server at %s", adopted)
+        elif payload.static_server_base_url is not None:
             # The host process serves this workspace and told us where. Pointing at its server
             # keeps asset URLs valid for as long as the host runs, rather than only as long as
             # this engine does.

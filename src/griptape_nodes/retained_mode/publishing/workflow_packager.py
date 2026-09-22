@@ -12,13 +12,15 @@ import importlib.metadata
 import json
 import logging
 import os
+import posixpath
 import re
 import shutil
 import subprocess
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
 from fnmatch import fnmatch
-from pathlib import Path
+from pathlib import Path, PurePath, PurePosixPath
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, NoReturn
 from urllib.parse import urlparse
 from urllib.request import url2pathname
@@ -75,7 +77,7 @@ from griptape_nodes.retained_mode.events.workflow_events import PublishWorkflowP
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Iterable, Iterator, Sequence
 
     from griptape_nodes.exe_types.node_types import BaseNode
     from griptape_nodes.node_library.workflow_registry import Workflow
@@ -94,6 +96,20 @@ DOWNLOAD_MODELS_TEMPLATE_NAME = "download_models_script.py"
 # Resolved to locate the workflow's own directory, one of the anchors a static file reference
 # can be rooted at.
 WORKFLOW_DIR_MACRO = "{workflow_dir}"
+
+# Reserved paths the packager itself writes into `destination`.
+#
+# Publishers that write their own files into the same destination after
+# `package_to_folder` returns (e.g. `LocalPublisher` writing `run.py`/`README.md`,
+# `NukeGizmoPublisher` writing its companion scripts and version directories) must
+# declare those paths via `package_to_folder`'s `additional_reserved_paths` parameter.
+RESERVED_BUNDLE_PATHS: tuple[Path, ...] = (
+    Path("download_models.py"),
+    Path("griptape_nodes_config.json"),
+    Path("pyproject.toml"),
+    Path(".env"),
+    Path("project.yml"),
+)
 
 # TODO: Read and write operations should all be using ReadtoFile and WriteToFile.  https://github.com/griptape-ai/griptape-nodes/issues/4397
 
@@ -124,6 +140,22 @@ class FileReferenceOutcome(NamedTuple):
 
     reference: ResolvedFileReference | None
     failure: str | None
+
+
+@dataclass(frozen=True)
+class PackagedBundle:
+    """What a packaging run put into the bundle folder.
+
+    All paths are relative to the bundle root the caller supplied as `destination`.
+
+    Attributes:
+        entrypoint_workflow_path: Where the workflow a publisher points its generated
+            launcher at landed.
+        library_paths: The definition file of each copied library.
+    """
+
+    entrypoint_workflow_path: Path
+    library_paths: tuple[Path, ...]
 
 
 class WorkflowPackager:
@@ -177,7 +209,7 @@ class WorkflowPackager:
         default exclusions.
         """
         if ignore_patterns is None:
-            ignore_patterns = [".venv", "__pycache__", ".git"]
+            ignore_patterns = [".venv", ".venv-exec", "__pycache__", ".git"]
         result = GriptapeNodes.handle_request(
             CopyTreeRequest(
                 source_path=str(source_path),
@@ -836,8 +868,22 @@ dependencies = [
 
         return anchors
 
-    def copy_static_files(self, file_param_values: list[tuple[str, str]], destination: Path) -> None:
-        """Resolve file references and copy them to the destination."""
+    def copy_static_files(
+        self,
+        file_param_values: list[tuple[str, str]],
+        destination: Path,
+        reserved_paths: Sequence[Path] | None = None,
+    ) -> None:
+        """Resolve file references and copy them to the destination.
+
+        A reference that cannot be bundled is warned about and skipped, but one that
+        belongs on a path the bundle itself needs (``reserved_paths``) raises, since
+        copying it would corrupt the bundle. ``reserved_paths`` defaults to
+        ``RESERVED_BUNDLE_PATHS``.
+        """
+        if reserved_paths is None:
+            reserved_paths = RESERVED_BUNDLE_PATHS
+
         # Keyed on where a file lands in the bundle rather than where it came from: one source
         # can legitimately need two destinations (one reference resolving relatively, another
         # anchor-stripped), and keying on the source would bundle only the first of them.
@@ -868,6 +914,9 @@ dependencies = [
                 continue
 
             bundle_relative_path = outcome.reference.bundle_relative_path
+
+            self._validate_static_file_destination(bundle_relative_path, node_name, value_str, reserved_paths)
+
             previous_source = claimed_destinations.get(bundle_relative_path)
             if previous_source == identity:
                 logger.debug("Static file for node '%s' was already bundled: %s", node_name, absolute_path)
@@ -1161,18 +1210,27 @@ dependencies = [
 
     # -- Convenience: full standard bundle --
 
-    def package_to_folder(self, destination: Path, workflow: Workflow) -> list[str]:
+    def package_to_folder(
+        self,
+        destination: Path,
+        workflow: Workflow,
+        additional_reserved_paths: Iterable[Path] | None = None,
+    ) -> PackagedBundle:
         """Bundle a workflow into a self-contained folder.
 
         Copies the workflow file, referenced libraries, config, .env, static
         assets, project template, and pyproject.toml into the destination.
+
+        ``additional_reserved_paths`` lets a publisher extend the collision guard with
+        paths it writes into ``destination`` itself.
 
         Writes into ``destination`` as given. Callers wanting a re-publish to be a clean
         rewrite should wrap their whole publish in ``staged_publish`` and pass the staging
         directory here.
 
         Returns:
-            List of relative library paths (for config or further use).
+            The bundle's contents: where the entrypoint workflow landed inside
+            ``destination``, and the bundle-relative library paths.
         """
         try:
             destination.mkdir(parents=True, exist_ok=True)
@@ -1180,6 +1238,8 @@ dependencies = [
             msg = f"Failed to package to folder. Failed to create destination directory: {err}"
             logger.error(msg)
             raise TypeError(msg) from err
+
+        reserved_paths = [*RESERVED_BUNDLE_PATHS, *(additional_reserved_paths or [])]
 
         # Copy workflow file
         self.emit_progress(10.0, "Copying workflow file...")
@@ -1189,7 +1249,13 @@ dependencies = [
             logger.error(msg)
             raise TypeError(msg)
         full_path = WorkflowRegistry.get_complete_file_path(workflow_file_path)
-        self.copy_file(full_path, destination / Path(full_path).name)
+        entrypoint_workflow_path = Path(Path(full_path).name)
+        self.validate_entrypoint_bundle_destination(entrypoint_workflow_path, workflow.metadata.name, reserved_paths)
+        self.copy_file(full_path, destination / entrypoint_workflow_path)
+
+        # Add the workflow itself to reserved paths, before attempting to copy static
+        # files.
+        reserved_paths_after_workflow = [*reserved_paths, entrypoint_workflow_path]
 
         # Copy libraries (including transitive library dependencies)
         self.emit_progress(15.0, "Copying libraries...")
@@ -1213,7 +1279,7 @@ dependencies = [
         all_nodes = self.collect_all_nodes()
         file_refs = self.gather_static_file_references(all_nodes)
         if file_refs:
-            self.copy_static_files(file_refs, destination)
+            self.copy_static_files(file_refs, destination, reserved_paths=reserved_paths_after_workflow)
 
         # Write HuggingFace model download script if needed
         self.emit_progress(3.0, "Checking for HuggingFace model dependencies...")
@@ -1227,4 +1293,144 @@ dependencies = [
         self.emit_progress(5.0, "Writing pyproject.toml...")
         self.write_pyproject_toml(destination, workflow)
 
-        return library_paths
+        return PackagedBundle(
+            entrypoint_workflow_path=entrypoint_workflow_path,
+            library_paths=tuple(Path(library_path) for library_path in library_paths),
+        )
+
+    # -- Reserved bundle path collisions --
+
+    def _validate_static_file_destination(
+        self,
+        relative_path: Path,
+        node_name: str,
+        value_str: str,
+        reserved_paths: Sequence[Path],
+    ) -> None:
+        """Raise an artist-readable error if a bundled static file lands on a reserved path.
+
+        See `_find_reserved_collision` for the matching rules.
+        """
+        collision = self._find_reserved_collision(relative_path, reserved_paths)
+        if collision is not None:
+            destination_for_display = self._bundle_path_for_display(relative_path)
+            collision_for_display = self._bundle_path_for_display(collision)
+            msg = (
+                f"Attempted to bundle the file '{value_str}' used by node '{node_name}' in workflow "
+                f"'{self._workflow_name}'. Failed because it belongs at '{destination_for_display}' inside the "
+                f"published bundle, which collides with '{collision_for_display}', a file the bundle needs. "
+                "Move or rename the file, then publish again."
+            )
+            logger.error(msg)
+            raise TypeError(msg)
+
+    @classmethod
+    def validate_entrypoint_bundle_destination(
+        cls,
+        relative_path: Path,
+        workflow_name: str,
+        reserved_paths: Sequence[Path],
+    ) -> None:
+        """Raise an artist-readable error if the entrypoint workflow's own copy collides.
+
+        `package_to_folder` flattens the entrypoint workflow to `destination / relative_path`, so
+        a workflow named e.g. `download_models` lands on scaffolding the bundle needs. See
+        `_find_reserved_collision` for the matching rules.
+        """
+        collision = cls._find_reserved_collision(relative_path, reserved_paths)
+        if collision is not None:
+            destination_for_display = cls._bundle_path_for_display(relative_path)
+            collision_for_display = cls._bundle_path_for_display(collision)
+            msg = (
+                f"Attempted to publish workflow '{workflow_name}'. Failed because it would be copied to "
+                f"'{destination_for_display}' inside the published bundle, which collides with "
+                f"'{collision_for_display}', a file the bundle needs. Rename the workflow, then publish again."
+            )
+            logger.error(msg)
+            raise TypeError(msg)
+
+    @classmethod
+    def _find_reserved_collision(cls, relative_path: Path, reserved_paths: Sequence[Path]) -> Path | None:
+        """Return the first reserved path `relative_path` collides with, or `None`.
+
+        `reserved_paths` may be files or directories.
+
+        A collision occurs when `relative_path` is equal to a reserved path, is nested
+        under a reserved directory, or is an ancestor of a reserved entry. Both sides are
+        compared as `_fold_path_parts` renders them, so two spellings of one bundle entry match.
+        """
+        folded_relative_parts = cls._fold_path_parts(relative_path)
+        if not folded_relative_parts:
+            # Nothing sensible to compare, and the prefix test below would read it as
+            # colliding with whichever reserved entry comes first.
+            logger.warning("Ignoring an empty bundle destination while checking reserved bundle paths.")
+            return None
+        if cls._escapes_bundle_root(folded_relative_parts):
+            # Nothing inside the bundle can be reached from outside it, so there is no reserved
+            # entry this could collide with. Refusing such a destination outright belongs to the
+            # code that produced it, which knows what the artist asked for.
+            logger.warning(
+                "Ignoring the bundle destination '%s' while checking reserved bundle paths because it "
+                "points outside the bundle root.",
+                cls._bundle_path_for_display(relative_path),
+            )
+            return None
+
+        for reserved in reserved_paths:
+            reserved_path = Path(reserved)
+            unusable_reason = cls._unusable_reserved_entry_reason(reserved_path)
+            if unusable_reason is not None:
+                logger.warning("Reserved bundle path '%s' is ignored because %s.", reserved, unusable_reason)
+                continue
+            folded_reserved_parts = cls._fold_path_parts(reserved_path)
+            is_exact_match = folded_relative_parts == folded_reserved_parts
+            is_nested_under_reserved_dir = (
+                len(folded_relative_parts) > len(folded_reserved_parts)
+                and folded_relative_parts[: len(folded_reserved_parts)] == folded_reserved_parts
+            )
+            is_ancestor_of_reserved_entry = (
+                len(folded_relative_parts) < len(folded_reserved_parts)
+                and folded_reserved_parts[: len(folded_relative_parts)] == folded_relative_parts
+            )
+            if is_exact_match or is_nested_under_reserved_dir or is_ancestor_of_reserved_entry:
+                return reserved
+        return None
+
+    @staticmethod
+    def _bundle_path_for_display(path: PurePath) -> str:
+        """Spell a bundle-relative path the way the bundle itself spells it, with forward slashes."""
+        return path.as_posix()
+
+    @classmethod
+    def _unusable_reserved_entry_reason(cls, reserved_path: Path) -> str | None:
+        """Say why a reserved entry cannot name a place inside the bundle, or `None` if it can.
+
+        Each cause gets its own wording: a publisher reading the warning is debugging their own
+        declaration, and which of the three mistakes they made is the whole content of the fix.
+        """
+        if reserved_path.is_absolute():
+            # An absolute entry can never equal a bundle-relative destination, so it would
+            # silently protect nothing.
+            return "it is absolute; reserved paths must be relative to the bundle root"
+        folded_parts = cls._fold_path_parts(reserved_path)
+        if not folded_parts:
+            return "it names the bundle root rather than a file or directory inside it"
+        if cls._escapes_bundle_root(folded_parts):
+            return "it points outside the bundle root rather than naming a file or directory inside it"
+        return None
+
+    @staticmethod
+    def _escapes_bundle_root(folded_parts: tuple[str, ...]) -> bool:
+        """Whether folded parts name somewhere outside the bundle."""
+        return bool(folded_parts) and folded_parts[0] == ".."
+
+    @staticmethod
+    def _fold_path_parts(path: Path) -> tuple[str, ...]:
+        """Return `path`'s parts, POSIX-normalized and case-folded, for comparison.
+
+        Publishing runs on artists' machines, which are often Windows or macOS -- both
+        case-insensitive by default -- so any bundle-path comparison guarding against a
+        silent overwrite must fold case.
+        """
+        normalized = posixpath.normpath(path.as_posix())
+        return tuple(part.casefold() for part in PurePosixPath(normalized).parts)
