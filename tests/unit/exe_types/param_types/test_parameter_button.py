@@ -1,8 +1,15 @@
-"""ParameterButton's href routes to Button.button_link instead of a second, unsaveable callback."""
-
-import pytest
+"""ParameterButton's href is stored as the Button trait's ``button_link``."""
 
 from griptape_nodes.exe_types.param_types.parameter_button import ParameterButton
+from griptape_nodes.traits.button import Button
+
+
+def _click(trait: Button) -> str | None:
+    callback = trait.on_click_callback
+    assert callback is not None
+    result = callback(trait, trait.get_button_details())
+    assert result is not None
+    return getattr(result.response, "href", None)
 
 
 class TestHrefRoutesToTheLink:
@@ -18,11 +25,13 @@ class TestHrefRoutesToTheLink:
 
         assert state["button_link"] == "https://docs.example.test"
 
-    def test_href_needs_no_callback(self) -> None:
-        """An href is the Button's own link feature, not a second handler-producing path."""
+    def test_a_click_follows_a_restored_link(self) -> None:
         parameter = ParameterButton(name="docs", href="https://docs.example.test")
+        trait = parameter._get_button_trait()
 
-        assert parameter._get_button_trait()._on_click_handler is None
+        trait.apply_state({"button_link": "https://restored.example.test"})
+
+        assert _click(trait) == "https://restored.example.test"
 
     def test_clearing_href_removes_the_link(self) -> None:
         parameter = ParameterButton(name="docs", href="https://docs.example.test")
@@ -33,19 +42,24 @@ class TestHrefRoutesToTheLink:
 
     def test_a_click_opens_the_href(self) -> None:
         parameter = ParameterButton(name="docs", href="https://docs.example.test")
+
+        assert _click(parameter._get_button_trait()) == "https://docs.example.test"
+
+    def test_on_click_wins_over_href(self) -> None:
+        clicks: list[str] = []
+        parameter = ParameterButton(
+            name="both",
+            href="https://docs.example.test",
+            on_click=lambda button, details: clicks.append("handler"),  # noqa: ARG005
+        )
         trait = parameter._get_button_trait()
+
         callback = trait.on_click_callback
-
         assert callback is not None
-        result = callback(trait, trait.get_button_details())
-        assert result is not None
-        href = getattr(result.response, "href", None)
-        assert href == "https://docs.example.test"
+        callback(trait, trait.get_button_details())
 
-    def test_href_and_on_click_together_are_rejected(self) -> None:
-        """Both name one click action; Button's own constructor enforces there is only one."""
-        with pytest.raises(ValueError, match="Cannot specify both"):
-            ParameterButton(name="bad", href="https://docs.example.test", on_click=lambda button, details: None)  # noqa: ARG005
+        assert clicks == ["handler"]
+        assert parameter.href == "https://docs.example.test"
 
     def test_href_replaces_an_on_click_set_after_construction(self) -> None:
         """Setting href is how a button already wired to ``on_click`` switches to a link."""
@@ -54,9 +68,4 @@ class TestHrefRoutesToTheLink:
         parameter.href = "https://docs.example.test"
 
         assert parameter.href == "https://docs.example.test"
-        trait = parameter._get_button_trait()
-        callback = parameter.on_click_callback
-        assert callback is not None
-        result = callback(trait, trait.get_button_details())
-        assert result is not None
-        assert getattr(result.response, "href", None) == "https://docs.example.test"
+        assert _click(parameter._get_button_trait()) == "https://docs.example.test"

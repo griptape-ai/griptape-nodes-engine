@@ -162,8 +162,6 @@ class ParameterButton(Parameter):
         else:
             ui_options = ui_options.copy()
 
-        # button_link is Button's own href feature; route ours to it instead of duplicating
-        # it as a second callback-producing path.
         button_trait = Button(
             label=label,
             variant=variant,
@@ -178,9 +176,10 @@ class ParameterButton(Parameter):
             loading_icon_class=loading_icon_class,
             tooltip=tooltip,
             button_link=href,
-            on_click=on_click,
             get_button_state=get_button_state,
         )
+        # A handler wins over href. Button's constructor rejects the pair, so attach it after.
+        button_trait.on_click_callback = on_click
 
         # Add button trait to traits set
         # Button is a Trait, so it can be added to the traits set
@@ -387,10 +386,7 @@ class ParameterButton(Parameter):
     def href(self, value: str | None) -> None:
         """Set the href URL to open when button is clicked.
 
-        A button holds one click action: reading the trait always prefers a handler over a
-        link (see ``Button.on_click_callback``), so setting href would do nothing while a
-        handler from ``on_click`` is still attached. Clearing the handler here makes href
-        replace it, matching a button built with ``href`` and no ``on_click`` from the start.
+        Clears any ``on_click`` handler, since a handler wins over a link.
         """
         trait = self._get_button_trait()
         trait.on_click_callback = None
