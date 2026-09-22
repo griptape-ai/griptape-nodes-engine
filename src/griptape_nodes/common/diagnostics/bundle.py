@@ -201,7 +201,12 @@ class DiagnosticsBundle:
         for path in log_files:
             staged_path = f"{LOGS_DIRECTORY_NAME}/{path.name}"
 
-            if any(entry.path == staged_path for entry in self._entries):
+            # Compared case-insensitively, because the staging directory is on whatever
+            # filesystem `tempfile` gave us and the default one on macOS and Windows treats
+            # `Engine.log` and `engine.log` as the same file. Comparing the strings exactly
+            # let the second one past this guard and the write then overwrote the first
+            # one's bytes, while the manifest went on listing both at their own sizes.
+            if any(entry.path.casefold() == staged_path.casefold() for entry in self._entries):
                 # Two log files from different directories can share a name. Staging both
                 # under one name would keep whichever was written last while the manifest
                 # claimed both were here.
@@ -212,9 +217,16 @@ class DiagnosticsBundle:
                 continue
 
             if remaining <= 0:
+                # What was actually copied rather than the budget it was measured against.
+                # The two are the same number today, because the budget is only ever charged
+                # for bytes that reached the staging directory and is only ever charged for
+                # as many as were left -- so reaching here means it was spent exactly. Saying
+                # so in terms of the spend keeps the sentence true of whatever the accounting
+                # becomes, and a message that reads back the configured constant is one that
+                # cannot be wrong and cannot be checked either.
                 warnings.append(
                     f"Log file '{path.name}' was left out because the bundle already holds "
-                    f"{_format_size(self._max_log_bytes)} of logs."
+                    f"{_format_size(self._max_log_bytes - remaining)} of logs."
                 )
                 continue
 

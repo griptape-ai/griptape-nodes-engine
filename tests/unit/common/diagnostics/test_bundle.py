@@ -278,6 +278,36 @@ class TestLogFiles:
         assert contents == "from the current directory\n"
         assert any("same name" in warning for warning in warnings)
 
+    def test_two_names_differing_only_in_case_are_treated_as_the_same_name(self, tmp_path: Path) -> None:
+        """The staging directory is on whatever filesystem `tempfile` gave us.
+
+        The default one on macOS and Windows treats `Engine-1.log` and `engine-1.log` as one
+        file. Comparing the staged paths exactly let the second past the duplicate guard, and
+        the write then replaced the first one's bytes while the manifest went on listing both
+        at their own sizes -- a bundle whose own index is wrong about what is in it.
+
+        The two source files are in separate directories so they can coexist wherever this
+        runs, and the guard now fires on every platform rather than only where the collision
+        would have happened.
+        """
+        first_dir = tmp_path / "current"
+        second_dir = tmp_path / "older"
+        first_dir.mkdir()
+        second_dir.mkdir()
+        first = _write_source_log(first_dir / "engine-1.log", "from the current directory\n")
+        second = _write_source_log(second_dir / "Engine-1.log", "from the older directory\n")
+        warnings: list[str] = []
+
+        with DiagnosticsBundle(_redactor()) as bundle:
+            bundle.add_log_files([first, second], warnings)
+
+            staged = _entry_paths(bundle)
+            contents = _read(bundle, f"{LOGS_DIRECTORY_NAME}/engine-1.log")
+
+        assert staged == [f"{LOGS_DIRECTORY_NAME}/engine-1.log"]
+        assert contents == "from the current directory\n"
+        assert any("Engine-1.log" in warning for warning in warnings)
+
     def test_a_log_written_with_windows_line_endings_is_copied_byte_for_byte(self, tmp_path: Path) -> None:
         r"""A bundle is evidence, so a copied log has to match the file it came from.
 
