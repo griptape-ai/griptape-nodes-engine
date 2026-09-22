@@ -16,6 +16,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
+from unittest.mock import patch
 
 import pytest
 from xdg_base_dirs import xdg_data_home
@@ -523,6 +524,97 @@ class TestWhetherTheSinksWereInstalled:
             read_only.chmod(0o700)
 
         assert installed is False
+
+
+@pytest.mark.usefixtures("isolated_capture")
+class TestWhatARetriedFailureCosts:
+    """A destination that stays unwritable is asked for again on every config load.
+
+    ``ConfigManager`` deliberately does not remember a failed attempt, because the reasons
+    this fails are the temporary kind and the next call is the only chance to pick the
+    setting back up. That makes the cost of the failing call the thing that matters: it runs
+    for the rest of the process's life, once per config write.
+    """
+
+    @_needs_posix_permissions
+    def test_nothing_in_the_directory_is_scanned_when_the_file_cannot_be_opened(self, tmp_path: Path) -> None:
+        """Pruning is the expensive half, and there is nothing to keep until the file is open.
+
+        Patched rather than asserted through surviving files: a read-only directory refuses
+        the unlink as well, so an unpruned directory and a pruned-but-undeletable one look
+        identical from outside.
+        """
+        read_only = tmp_path / "read-only"
+        read_only.mkdir(mode=0o500)
+
+        try:
+            with patch.object(log_capture, "prune_log_files") as prune:
+                configure_diagnostic_logging(log_directory=read_only, retention_days=7)
+        finally:
+            read_only.chmod(0o700)
+
+        prune.assert_not_called()
+
+    def test_nothing_is_scanned_when_the_directory_cannot_be_created(self, tmp_path: Path) -> None:
+        blocked = tmp_path / "blocked"
+        blocked.write_text("not a directory", encoding="utf-8")
+
+        with patch.object(log_capture, "prune_log_files") as prune:
+            configure_diagnostic_logging(log_directory=blocked / "logs", retention_days=7)
+
+        prune.assert_not_called()
+
+    def test_the_directory_is_still_pruned_once_the_file_opens(self, tmp_path: Path) -> None:
+        """The success path has to keep aging files out, or retention never happens."""
+        stale = _write_log(tmp_path, f"{LOG_FILE_PREFIX}stale.log", age_days=30)
+
+        configure_diagnostic_logging(log_directory=tmp_path, retention_days=7)
+
+        assert not stale.exists()
+
+    @_needs_posix_permissions
+    def test_an_unwritable_destination_is_reported_once_rather_than_once_per_attempt(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Repeating it every load buries the console log the engine is still writing."""
+        read_only = tmp_path / "read-only"
+        read_only.mkdir(mode=0o500)
+
+        try:
+            with caplog.at_level(logging.WARNING, logger=log_capture.logger.name):
+                for _ in range(3):
+                    configure_diagnostic_logging(log_directory=read_only, retention_days=0)
+        finally:
+            read_only.chmod(0o700)
+
+        warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+        assert len(warnings) == 1
+
+    @_needs_posix_permissions
+    def test_a_second_destination_that_fails_is_still_reported(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Suppression is per destination, not a one-warning-per-process budget.
+
+        Two unwritable directories are two separate things for a user to fix, and the second
+        one is not mentioned anywhere else.
+        """
+        first = tmp_path / "first"
+        second = tmp_path / "second"
+        for directory in (first, second):
+            directory.mkdir(mode=0o500)
+
+        try:
+            with caplog.at_level(logging.WARNING, logger=log_capture.logger.name):
+                configure_diagnostic_logging(log_directory=first, retention_days=0)
+                configure_diagnostic_logging(log_directory=second, retention_days=0)
+        finally:
+            for directory in (first, second):
+                directory.chmod(0o700)
+
+        reported = " ".join(record.getMessage() for record in caplog.records if record.levelno == logging.WARNING)
+        assert str(first) in reported
+        assert str(second) in reported
 
 
 class TestFindLogFiles:

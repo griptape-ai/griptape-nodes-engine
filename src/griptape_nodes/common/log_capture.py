@@ -145,6 +145,9 @@ class _CaptureState:
         self.file_handler: RotatingFileHandler | None = None
         self.file_path: Path | None = None
         self.file_name: str | None = None
+        # The destination already reported as unwritable, so the report is not repeated on
+        # every config load while it stays that way. See `_warn_once_per_destination`.
+        self.unwritable_path: Path | None = None
 
 
 _state = _CaptureState()
@@ -401,6 +404,12 @@ def _configure_file_handler(directory: Path, retention_days: int) -> bool:
 
     Returns whether the sink is now writing into ``directory``. A failure leaves any
     handler already installed alone, so logging keeps working, just somewhere else.
+
+    Nothing in the directory is scanned or deleted until the file is open. A caller that
+    remembers what it applied must not remember a failure, so it asks again on every config
+    load while the destination stays unwritable -- and pruning first meant that directory was
+    re-scanned on each of those loads, which is the work the caller's own guard exists to
+    avoid.
     """
     file_name = _log_file_name()
     target_path = directory / file_name
@@ -413,14 +422,12 @@ def _configure_file_handler(directory: Path, retention_days: int) -> bool:
     try:
         directory.mkdir(parents=True, exist_ok=True)
     except OSError:
-        logger.warning(
+        _warn_once_per_destination(
+            target_path,
             "Could not create the engine log directory '%s'. Engine logs will not be written to file.",
             directory,
-            exc_info=True,
         )
         return False
-
-    prune_log_files(directory, retention_days, protected_name=file_name)
 
     try:
         # Opened now rather than on the first record (`delay=True`). A directory that
@@ -436,10 +443,10 @@ def _configure_file_handler(directory: Path, retention_days: int) -> bool:
             encoding="utf-8",
         )
     except OSError:
-        logger.warning(
+        _warn_once_per_destination(
+            target_path,
             "Could not open the engine log file '%s'. Engine logs will not be written to file.",
             target_path,
-            exc_info=True,
         )
         return False
 
@@ -450,11 +457,39 @@ def _configure_file_handler(directory: Path, retention_days: int) -> bool:
     logger.addHandler(handler)
     _state.file_handler = handler
     _state.file_path = target_path
+
+    # Pruned only now that there is a file to keep. Which side of the open this happens is
+    # otherwise immaterial -- the new file is excluded by name either way -- and doing it
+    # here is what keeps a failed open costing a failed `open()` rather than a full scan of
+    # a directory that is going to be scanned again on the next config load.
+    prune_log_files(directory, retention_days, protected_name=file_name)
     return True
 
 
+def _warn_once_per_destination(target_path: Path, message: str, *args: object) -> None:
+    """Report that file logging is unavailable, once per destination rather than per attempt.
+
+    `configure_diagnostic_logging` is asked again on every config load while it is failing,
+    because the reason is usually temporary -- a volume not mounted yet, a permission fix on
+    its way -- and the next call is the only chance to pick the setting back up. Saying so
+    every time would bury the console log the engine is still writing under a warning whose
+    answer has not changed since the last one.
+    """
+    if _state.unwritable_path == target_path:
+        return
+
+    _state.unwritable_path = target_path
+    logger.warning(message, *args)
+
+
 def _remove_file_handler() -> None:
-    """Detach and close the rotating file sink, if one is installed."""
+    """Detach and close the rotating file sink, if one is installed.
+
+    Clears the destination `_warn_once_per_destination` is holding either way: a sink being
+    replaced or switched off ends the run of attempts that warning was suppressing, so the
+    next destination to fail -- including this one, if it is asked for again -- is reported.
+    """
+    _state.unwritable_path = None
     if _state.file_handler is None:
         return
     logger.removeHandler(_state.file_handler)

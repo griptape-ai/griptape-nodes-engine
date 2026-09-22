@@ -2344,6 +2344,11 @@ class ConfigManager(EngineScoped):
         # permission fix is coming for -- and remembering the attempt as done would short-
         # circuit every later load, so the engine would never write a log file again for the
         # rest of its life. Assigned after the call rather than before for the same reason.
+        #
+        # So a persistently unwritable directory is retried on every load, by design. What
+        # that retry costs is `configure_diagnostic_logging`'s to keep small: it prunes only
+        # after the file is open, and reports an unwritable destination once rather than once
+        # per attempt, so the repeated call is a failed `open()` and nothing else.
         if installed:
             self._applied_logging_settings = settings
 
