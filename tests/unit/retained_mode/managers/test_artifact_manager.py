@@ -1344,6 +1344,164 @@ class TestGetDisplayableImageBytesHandler:
         assert result.format == "webp"
 
 
+class TestColorManagementInDisplayableImagePipeline:
+    """Colour-management provider is invoked between decode and encode, if registered."""
+
+    @pytest.fixture
+    def test_image_path(self, tmp_path: Path) -> Path:
+        image_path = tmp_path / "test_source.jpg"
+        img = Image.new("RGB", (100, 100), color="red")
+        img.save(str(image_path), format="JPEG")
+        return image_path
+
+    @pytest.fixture
+    def artifact_manager(self) -> ArtifactManager:
+        manager = ArtifactManager()
+        manager.on_handle_register_artifact_provider_request(
+            RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider)
+        )
+        return manager
+
+    @pytest.mark.asyncio
+    async def test_no_provider_registered_leaves_pixels_untransformed(
+        self, artifact_manager: ArtifactManager, test_image_path: Path
+    ) -> None:
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            GetDisplayableImageBytesRequest,
+            GetDisplayableImageBytesResultSuccess,
+        )
+
+        request = GetDisplayableImageBytesRequest(
+            source_path=str(test_image_path), situation=ImageArtifactSituation.VIEWER
+        )
+        result = await artifact_manager.on_get_displayable_image_bytes_request(request)
+
+        assert isinstance(result, GetDisplayableImageBytesResultSuccess)
+        assert len(result.image_bytes) > 0
+
+    @pytest.mark.asyncio
+    async def test_registered_provider_transform_is_applied(
+        self, artifact_manager: ArtifactManager, test_image_path: Path
+    ) -> None:
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            GetDisplayableImageBytesRequest,
+            GetDisplayableImageBytesResultSuccess,
+            TransformImageColorResultSuccess,
+        )
+
+        recorded_calls: list[tuple[str, ImageArtifactSituation]] = []
+
+        class _TransformRequest(RequestPayload):
+            pass
+
+        class _RecordingColorManagementProvider(BaseColorManagementProvider):
+            @classmethod
+            def get_friendly_name(cls) -> str:
+                return "RecordingProvider"
+
+            @classmethod
+            def build_transform_request(
+                cls,
+                _pixels: np.ndarray,
+                source_colorspace: str,
+                situation: ImageArtifactSituation,
+                *,
+                provider_data: dict[str, Any] | None = None,  # noqa: ARG003
+            ) -> RequestPayload:
+                recorded_calls.append((source_colorspace, situation))
+                # Return an all-zero array of the same shape, tagged with a new colourspace,
+                # so the encoded output can be distinguished from the untransformed source.
+                return _TransformRequest()
+
+            @classmethod
+            def list_colorspaces(cls, _provider_data: dict[str, Any] | None = None) -> list[str]:
+                return []
+
+            @classmethod
+            def list_transform_targets(cls, _provider_data: dict[str, Any] | None = None) -> list[ColorTransformTarget]:
+                return []
+
+        original_handle_request = Engine.handle_request
+
+        def fake_handle_request(self: Engine, request: RequestPayload) -> ResultPayload:
+            if isinstance(request, _TransformRequest):
+                return TransformImageColorResultSuccess(
+                    result_details="ok", pixels=np.zeros((1, 1, 3), dtype=np.uint8), color_space="ACEScg"
+                )
+            return original_handle_request(self, request)
+
+        artifact_manager.on_handle_register_color_management_provider_request(
+            RegisterColorManagementProviderRequest(provider_class=_RecordingColorManagementProvider)
+        )
+
+        with patch.object(Engine, "handle_request", fake_handle_request):
+            request = GetDisplayableImageBytesRequest(
+                source_path=str(test_image_path), situation=ImageArtifactSituation.VIEWER
+            )
+            result = await artifact_manager.on_get_displayable_image_bytes_request(request)
+
+        assert isinstance(result, GetDisplayableImageBytesResultSuccess)
+        assert len(recorded_calls) == 1
+        assert recorded_calls[0][1] is ImageArtifactSituation.VIEWER
+
+    @pytest.mark.asyncio
+    async def test_transform_failure_falls_back_to_untransformed_decode(
+        self, artifact_manager: ArtifactManager, test_image_path: Path
+    ) -> None:
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            GetDisplayableImageBytesRequest,
+            GetDisplayableImageBytesResultSuccess,
+            TransformImageColorResultFailure,
+        )
+
+        class _TransformRequest(RequestPayload):
+            pass
+
+        class _FailingColorManagementProvider(BaseColorManagementProvider):
+            @classmethod
+            def get_friendly_name(cls) -> str:
+                return "FailingProvider"
+
+            @classmethod
+            def build_transform_request(
+                cls,
+                pixels: np.ndarray,  # noqa: ARG003
+                source_colorspace: str,  # noqa: ARG003
+                situation: ImageArtifactSituation,  # noqa: ARG003
+                *,
+                provider_data: dict[str, Any] | None = None,  # noqa: ARG003
+            ) -> RequestPayload:
+                return _TransformRequest()
+
+            @classmethod
+            def list_colorspaces(cls, _provider_data: dict[str, Any] | None = None) -> list[str]:
+                return []
+
+            @classmethod
+            def list_transform_targets(cls, _provider_data: dict[str, Any] | None = None) -> list[ColorTransformTarget]:
+                return []
+
+        original_handle_request = Engine.handle_request
+
+        def fake_handle_request(self: Engine, request: RequestPayload) -> ResultPayload:
+            if isinstance(request, _TransformRequest):
+                return TransformImageColorResultFailure(result_details="transform blew up")
+            return original_handle_request(self, request)
+
+        artifact_manager.on_handle_register_color_management_provider_request(
+            RegisterColorManagementProviderRequest(provider_class=_FailingColorManagementProvider)
+        )
+
+        with patch.object(Engine, "handle_request", fake_handle_request):
+            request = GetDisplayableImageBytesRequest(
+                source_path=str(test_image_path), situation=ImageArtifactSituation.VIEWER
+            )
+            result = await artifact_manager.on_get_displayable_image_bytes_request(request)
+
+        assert isinstance(result, GetDisplayableImageBytesResultSuccess)
+        assert len(result.image_bytes) > 0
+
+
 class TestGeneratePreview:
     """Tests for preview generation functionality."""
 

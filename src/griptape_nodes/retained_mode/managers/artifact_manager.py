@@ -1,5 +1,6 @@
 """Manager for artifact operations."""
 
+import dataclasses
 import json
 import logging
 from copy import deepcopy
@@ -58,6 +59,7 @@ from griptape_nodes.retained_mode.events.artifact_events import (
     RegisterPreviewGeneratorRequest,
     RegisterPreviewGeneratorResultFailure,
     RegisterPreviewGeneratorResultSuccess,
+    TransformImageColorResultFailure,
 )
 from griptape_nodes.retained_mode.events.config_events import (
     GetConfigCategoryRequest,
@@ -116,7 +118,10 @@ from griptape_nodes.retained_mode.managers.artifact_providers.color_management_r
     ColorManagementRegistry,
 )
 from griptape_nodes.retained_mode.managers.artifact_providers.family_registry import FamilyRegistry
-from griptape_nodes.retained_mode.managers.artifact_providers.image_decoder_mixin import ImageArtifactDecoderMixin
+from griptape_nodes.retained_mode.managers.artifact_providers.image_decoder_mixin import (
+    DecodedImageArtifact,
+    ImageArtifactDecoderMixin,
+)
 from griptape_nodes.retained_mode.managers.artifact_providers.image_encoder_mixin import ImageArtifactEncoderMixin
 from griptape_nodes.retained_mode.managers.artifact_providers.image_situation import (
     IMAGE_ARTIFACT_SITUATION_FALLBACKS,
@@ -487,7 +492,45 @@ class ArtifactManager(EngineScoped):
             Encoded raster bytes.
         """
         decoded = await to_thread(decoder.decode, source_path, situation)
+        decoded = await self._apply_color_management(decoded, situation)
         return await to_thread(encoder.encode, decoded, situation, format)
+
+    async def _apply_color_management(
+        self, decoded: DecodedImageArtifact, situation: ImageArtifactSituation
+    ) -> DecodedImageArtifact:
+        """Route decoded pixels through the registered colour-management provider, if any.
+
+        No-op passthrough when no provider is registered, preserving today's
+        identity behaviour. A transform failure is logged and also falls back to the
+        untransformed decode -- a broken colour-management provider shouldn't break
+        every image preview in the app.
+
+        Args:
+            decoded: The freshly decoded image artifact.
+            situation: The display context this decode is being requested for.
+
+        Returns:
+            ``decoded`` with ``pixel_data``/``source_color_space`` replaced by the
+            colour-managed result, or ``decoded`` unchanged if no provider is
+            registered or the transform failed.
+        """
+        provider_class = self._color_management_registry.get_registered_provider()
+        if provider_class is None:
+            return decoded
+
+        transform_request = provider_class.build_transform_request(
+            decoded.pixel_data, decoded.source_color_space, situation
+        )
+        result = await to_thread(self.engine.handle_request, transform_request)
+        if isinstance(result, TransformImageColorResultFailure):
+            logger.warning(
+                "Colour management transform via '%s' failed: %s",
+                provider_class.get_friendly_name(),
+                result.result_details,
+            )
+            return decoded
+
+        return dataclasses.replace(decoded, pixel_data=result.pixels, source_color_space=result.color_space)
 
     def _provider_for_format(self, fmt: str) -> BaseArtifactProvider | None:
         """Resolve the registered provider that handles ``fmt`` (empty → None).

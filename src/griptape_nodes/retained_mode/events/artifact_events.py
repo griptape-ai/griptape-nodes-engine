@@ -274,6 +274,33 @@ class GetColorManagementProviderResultFailure(WorkflowNotAlteredMixin, ResultPay
 
 @dataclass
 @PayloadRegistry.register
+class TransformImageColorResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The result contract every colour-management provider's transform request must resolve to.
+
+    ``BaseColorManagementProvider.build_transform_request`` returns a provider-specific
+    ``RequestPayload`` (routed to whatever handler that provider registers for it), but
+    callers that only know the base contract -- notably ``ArtifactManager`` -- need a
+    stable result shape to pull transformed pixels back out of regardless of which
+    provider produced them. Every provider's transform request must resolve to this
+    (or ``TransformImageColorResultFailure``).
+
+    Args:
+        pixels: The transformed pixel data.
+        color_space: The colour space ``pixels`` is now in.
+    """
+
+    pixels: Any
+    color_space: str
+
+
+@dataclass
+@PayloadRegistry.register
+class TransformImageColorResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """A colour-management provider's transform request failed."""
+
+
+@dataclass
+@PayloadRegistry.register
 class ListArtifactProvidersRequest(RequestPayload):
     """List all registered artifact providers.
 
