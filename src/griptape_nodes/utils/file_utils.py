@@ -14,6 +14,14 @@ from pathlib import Path
 
 import anyio
 import anyio.to_thread
+from tenacity import (
+    AsyncRetrying,
+    Retrying,
+    before_sleep_log,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_fixed,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +54,51 @@ def mtimes_match(mtime_a: float, mtime_b: float) -> bool:
         True when the two times are within the tolerance window.
     """
     return abs(mtime_a - mtime_b) <= MTIME_MATCH_TOLERANCE_SECONDS
+
+
+# Windows denies a rename while another handle holds the destination open: a
+# competing promote clears in microseconds, a reader serving the old file clears
+# when its response completes. Ride out the transient cases; a persistent holder
+# still raises. POSIX renames never take this path.
+PROMOTE_MAX_ATTEMPTS = 3
+PROMOTE_RETRY_WAIT_SECONDS = 0.05
+
+
+def promote_scratch_file(scratch: Path, destination: Path) -> None:
+    """Rename a finished scratch file onto the destination it was staged for.
+
+    Same-directory rename, so it is atomic: a reader sees either the previous
+    destination content or the complete new content. Retries transiently denied
+    renames per the module constants; re-raises ``PermissionError`` when the
+    denial persists. The scratch file is left in place on failure — its
+    disposal policy belongs to the caller that created it.
+
+    Args:
+        scratch: The completed scratch file, in the destination's directory.
+        destination: The served path to promote onto.
+    """
+    for attempt in Retrying(
+        retry=retry_if_exception_type(PermissionError),
+        stop=stop_after_attempt(PROMOTE_MAX_ATTEMPTS),
+        wait=wait_fixed(PROMOTE_RETRY_WAIT_SECONDS),
+        before_sleep=before_sleep_log(logger, logging.DEBUG),
+        reraise=True,
+    ):
+        with attempt:
+            scratch.replace(destination)
+
+
+async def promote_scratch_file_async(scratch: Path, destination: Path) -> None:
+    """Async form of :func:`promote_scratch_file`; same contract."""
+    async for attempt in AsyncRetrying(
+        retry=retry_if_exception_type(PermissionError),
+        stop=stop_after_attempt(PROMOTE_MAX_ATTEMPTS),
+        wait=wait_fixed(PROMOTE_RETRY_WAIT_SECONDS),
+        before_sleep=before_sleep_log(logger, logging.DEBUG),
+        reraise=True,
+    ):
+        with attempt:
+            await anyio.Path(scratch).replace(destination)
 
 
 def atomic_write_bytes(path: Path, data: bytes) -> None:
@@ -110,7 +163,7 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
             # rename can promote the temp file into the destination name.
             tmp_file.flush()
             os.fsync(tmp_file.fileno())
-        tmp_path.replace(path)
+        promote_scratch_file(tmp_path, path)
     except OSError:
         tmp_path.unlink(missing_ok=True)
         raise
