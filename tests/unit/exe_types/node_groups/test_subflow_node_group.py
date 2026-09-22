@@ -115,6 +115,8 @@ class TestSubflowNodeGroupProxyParameters:
         assert isinstance(outgoing_proxy, ControlParameterOutput)
         assert incoming_proxy.name == "upstream_exec"
         assert outgoing_proxy.name == "downstream_exec"
+        assert incoming_proxy.display_name == "Flow In"
+        assert outgoing_proxy.display_name == "Flow Out"
         assert incoming_proxy.allowed_modes == {ParameterMode.INPUT, ParameterMode.OUTPUT}
         assert outgoing_proxy.allowed_modes == {ParameterMode.INPUT, ParameterMode.OUTPUT}
         assert ParameterMode.PROPERTY not in incoming_proxy.allowed_modes

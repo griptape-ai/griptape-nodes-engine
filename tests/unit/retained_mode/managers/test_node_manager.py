@@ -140,6 +140,63 @@ class TestNodeManagerAddControlParameter:
         parameter = node.get_parameter_by_name("legacy_control")
         assert isinstance(parameter, expected_type)
 
+    @pytest.mark.parametrize(
+        ("input_types", "output_type", "mode_allowed_input", "mode_allowed_output", "expected_type", "display_name"),
+        [
+            (
+                [ParameterTypeBuiltin.CONTROL_TYPE.value],
+                None,
+                True,
+                False,
+                ControlParameterInput,
+                "Flow In",
+            ),
+            (
+                None,
+                ParameterTypeBuiltin.CONTROL_TYPE.value,
+                False,
+                True,
+                ControlParameterOutput,
+                "Flow Out",
+            ),
+        ],
+    )
+    def test_reconstructs_directional_control_parameter_with_serialized_ui_options(  # noqa: PLR0913
+        self,
+        engine: Engine,
+        *,
+        input_types: list[str] | None,
+        output_type: str | None,
+        mode_allowed_input: bool,
+        mode_allowed_output: bool,
+        expected_type: type[ControlParameterInput] | type[ControlParameterOutput],
+        display_name: str,
+    ) -> None:
+        """Current directional saves retain both the control shape and UI display name."""
+        node = BaseNode(name="DirectionalControlParameterNode")
+        engine.object_manager.add_object_by_name(node.name, node)
+
+        result = engine.node_manager.on_add_parameter_to_node_request(
+            AddParameterToNodeRequest(
+                node_name=node.name,
+                parameter_name="directional_control",
+                tooltip="Directional control",
+                type=ParameterTypeBuiltin.CONTROL_TYPE.value,
+                input_types=input_types,
+                output_type=output_type,
+                ui_options={"display_name": display_name, "custom_option": "kept"},
+                mode_allowed_input=mode_allowed_input,
+                mode_allowed_property=False,
+                mode_allowed_output=mode_allowed_output,
+            )
+        )
+
+        assert isinstance(result, AddParameterToNodeResultSuccess)
+        parameter = node.get_parameter_by_name("directional_control")
+        assert isinstance(parameter, expected_type)
+        assert parameter.display_name == display_name
+        assert parameter.ui_options["custom_option"] == "kept"
+
 
 class TestNodeManagerResolutionStateSerialization:
     """Test that node resolution states are preserved correctly during serialization."""

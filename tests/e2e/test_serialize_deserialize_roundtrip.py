@@ -22,7 +22,12 @@ import pytest
 
 from griptape_nodes.exe_types.core_types import ControlParameterInput, ControlParameterOutput
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
-from griptape_nodes.retained_mode.events.connection_events import CreateConnectionRequest, CreateConnectionResultSuccess
+from griptape_nodes.retained_mode.events.connection_events import (
+    CreateConnectionRequest,
+    CreateConnectionResultSuccess,
+    ListConnectionsForNodeRequest,
+    ListConnectionsForNodeResultSuccess,
+)
 from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowRequest,
     CreateFlowResultSuccess,
@@ -195,8 +200,12 @@ class TestNodeGroupRoundTrip:
             assert isinstance(add_result, AddNodesToNodeGroupResultSuccess), add_result
 
         original_group = _get_group(engine, group)
-        assert isinstance(original_group.get_parameter_by_name("exec_in"), ControlParameterInput)
-        assert isinstance(original_group.get_parameter_by_name("exec_out"), ControlParameterOutput)
+        original_exec_in = original_group.get_parameter_by_name("exec_in")
+        original_exec_out = original_group.get_parameter_by_name("exec_out")
+        assert isinstance(original_exec_in, ControlParameterInput)
+        assert isinstance(original_exec_out, ControlParameterOutput)
+        assert original_exec_in.display_name == "Flow In"
+        assert original_exec_out.display_name == "Flow Out"
         assert not any(parameter.name.startswith("exec_out_") for parameter in original_group.parameters)
 
         commands = _serialize(engine, flow.flow_name)
@@ -208,8 +217,12 @@ class TestNodeGroupRoundTrip:
         restored_source = result.node_name_mappings["Source"]
         restored_middle = result.node_name_mappings["Middle"]
         restored_sink = result.node_name_mappings["Sink"]
-        assert isinstance(restored_group.get_parameter_by_name("exec_in"), ControlParameterInput)
-        assert isinstance(restored_group.get_parameter_by_name("exec_out"), ControlParameterOutput)
+        restored_exec_in = restored_group.get_parameter_by_name("exec_in")
+        restored_exec_out = restored_group.get_parameter_by_name("exec_out")
+        assert isinstance(restored_exec_in, ControlParameterInput)
+        assert isinstance(restored_exec_out, ControlParameterOutput)
+        assert restored_exec_in.display_name == "Flow In"
+        assert restored_exec_out.display_name == "Flow Out"
 
         edges = {
             f"{connection.source_node.name}.{connection.source_parameter.name}"
@@ -264,8 +277,12 @@ class TestNodeGroupRoundTrip:
 
         assert restored_group.metadata["left_parameters"] == ["group_exec_in", "exec_in"]
         assert restored_group.metadata["right_parameters"] == ["group_exec_out", "exec_out"]
-        assert isinstance(restored_group.get_parameter_by_name("exec_in"), ControlParameterInput)
-        assert isinstance(restored_group.get_parameter_by_name("exec_out"), ControlParameterOutput)
+        restored_exec_in = restored_group.get_parameter_by_name("exec_in")
+        restored_exec_out = restored_group.get_parameter_by_name("exec_out")
+        assert isinstance(restored_exec_in, ControlParameterInput)
+        assert isinstance(restored_exec_out, ControlParameterOutput)
+        assert restored_exec_in.display_name == "Flow In"
+        assert restored_exec_out.display_name == "Flow Out"
 
         connections = engine.flow_manager.get_connections()
         edges = {
@@ -279,6 +296,23 @@ class TestNodeGroupRoundTrip:
             f"{restored_leaf}.exec_out->{restored_group.name}.exec_out",
             f"{restored_group.name}.exec_out->{restored_sink}.exec_in",
         } <= edges
+
+        group_connections = engine.handle_request(ListConnectionsForNodeRequest(node_name=restored_group.name))
+        assert isinstance(group_connections, ListConnectionsForNodeResultSuccess), group_connections
+        assert {
+            (connection.source_node_name, connection.source_parameter_name, connection.target_parameter_name)
+            for connection in group_connections.incoming_connections
+        } == {
+            (restored_source, "exec_out", "exec_in"),
+            (restored_leaf, "exec_out", "exec_out"),
+        }
+        assert {
+            (connection.source_parameter_name, connection.target_node_name, connection.target_parameter_name)
+            for connection in group_connections.outgoing_connections
+        } == {
+            ("exec_in", restored_leaf, "exec_in"),
+            ("exec_out", restored_sink, "exec_in"),
+        }
 
     def test_restores_a_single_level_group(self, engine: Engine, library_name: str) -> None:
         """A group's wall connections cross its boundary, so this failed for every group."""
