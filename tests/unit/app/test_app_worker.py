@@ -500,6 +500,112 @@ class TestHandleUnregisterWorkerRequest:
         assert "My Library" not in worker_manager._managed_worker_processes
 
 
+class TestEvictionCountsUnansweredChallenges:
+    """A worker is evicted for not answering, never for time passing.
+
+    The sweep shares a loop with library load, so a wall-clock timeout charges the orchestrator's
+    own latency to the worker: an 18s boot evicted a healthy worker that had never been challenged.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_worker_it_has_not_challenged_enough_survives(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`_worker_last_seen` is ancient here, which is exactly what used to evict it."""
+        monkeypatch.setattr(worker_manager, "heartbeat_interval_s", 0.01)
+        monkeypatch.setattr(worker_manager, "heartbeat_timeout_s", 0.05)
+        worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
+        worker_manager._worker_last_seen[_ENGINE] = 0.0
+
+        task = asyncio.create_task(worker_manager.orchestrator_heartbeat_loop())
+        await asyncio.sleep(0.025)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+        assert _ENGINE in worker_manager._workers
+        assert worker_manager._workers[_ENGINE].unanswered_challenges > 0, "guard: it must have been challenged"
+
+    @pytest.mark.asyncio
+    async def test_a_worker_that_stops_answering_is_evicted(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(worker_manager, "heartbeat_interval_s", 0.01)
+        monkeypatch.setattr(worker_manager, "heartbeat_timeout_s", 0.01)
+        worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
+        worker_manager._worker_last_seen[_ENGINE] = time.monotonic()
+
+        task = asyncio.create_task(worker_manager.orchestrator_heartbeat_loop())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+        assert _ENGINE not in worker_manager._workers
+
+    @pytest.mark.asyncio
+    async def test_a_heartbeat_reply_clears_the_count(self, worker_manager: WorkerManager) -> None:
+        worker_manager._workers[_ENGINE] = WorkerRegistration(
+            request_topic=_WORKER_REQUEST_TOPIC, worker_key=None, unanswered_challenges=2
+        )
+        payload = {
+            "event_type": "EventResultSuccess",
+            "result_type": worker_events.WorkerHeartbeatResultSuccess.__name__,
+            "result": {"heartbeat_id": "hb-1"},
+            "response_topic": _WORKER_RESPONSE_TOPIC,
+        }
+
+        await worker_manager.relay_worker_result(payload)
+
+        assert worker_manager._workers[_ENGINE].unanswered_challenges == 0
+
+    def test_the_allowance_tracks_the_configured_values(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Derived on read, so tuning either value takes effect without a restart."""
+        challenges_in_fifteen_seconds = 3
+        monkeypatch.setattr(worker_manager, "heartbeat_interval_s", 5.0)
+        monkeypatch.setattr(worker_manager, "heartbeat_timeout_s", 15.0)
+        assert worker_manager.unanswered_challenges_allowed == challenges_in_fifteen_seconds
+
+        monkeypatch.setattr(worker_manager, "heartbeat_timeout_s", 0.0)
+        assert worker_manager.unanswered_challenges_allowed == 1, "never evict on the first challenge"
+
+
+class TestGetMessageFilters:
+    """Role-keyed alongside `get_topics_to_subscribe`, so neither role can be left without one."""
+
+    @pytest.mark.asyncio
+    async def test_a_worker_claims_and_drops_a_result_it_never_asked_for(self, worker_manager: WorkerManager) -> None:
+        """Unclaimed, these reach a dispatcher that only understands requests and raise there."""
+        message_filter = worker_manager.get_message_filters(is_worker=True)[0]
+        message = {"payload": {"event_type": "EventResultSuccess", "response_topic": "sessions/abc/response"}}
+
+        assert await message_filter(message) is True
+        worker_manager._tx.send_message.assert_not_called()  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_an_orchestrator_relays_it(self, worker_manager: WorkerManager) -> None:
+        message_filter = worker_manager.get_message_filters(is_worker=False)[0]
+        message = {
+            "payload": {
+                "event_type": "EventResultSuccess",
+                "result_type": "SomeOtherResultSuccess",
+                "result": {},
+                "response_topic": _WORKER_RESPONSE_TOPIC,
+            }
+        }
+
+        assert await message_filter(message) is True
+        worker_manager._tx.send_message.assert_called_once()  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_neither_role_claims_a_request(self, worker_manager: WorkerManager) -> None:
+        message = {"payload": {"event_type": "EventRequest", "request": {}}}
+
+        for is_worker in (True, False):
+            message_filter = worker_manager.get_message_filters(is_worker=is_worker)[0]
+            assert await message_filter(message) is False
+
+
 class TestRelayWorkerResult:
     @pytest.mark.asyncio
     async def test_heartbeat_success_updates_last_seen(self, worker_manager: WorkerManager) -> None:
