@@ -61,6 +61,29 @@ class FileSystemPicker(Trait):
     def get_trait_keys(cls) -> list[str]:
         return ["fileSystemPicker", "file_picker", "folder_picker"]
 
+    def to_state(self) -> dict[str, Any]:
+        return {
+            "allow_files": self.allow_files,
+            "allow_directories": self.allow_directories,
+            "allow_sequences": self.allow_sequences,
+            "multiple": self.multiple,
+            "file_types": self.file_types,
+            "file_extensions": self.file_extensions,
+            "exclude_patterns": self.exclude_patterns,
+            "include_patterns": self.include_patterns,
+            "max_file_size": self.max_file_size,
+            "min_file_size": self.min_file_size,
+            "workspace_only": self.workspace_only,
+            "initial_path": self.initial_path,
+            "allow_create": self.allow_create,
+            "allow_rename": self.allow_rename,
+        }
+
+    def apply_state(self, state: dict[str, Any]) -> None:
+        for name in self.to_state():
+            if name in state:
+                setattr(self, name, state[name])
+
     def ui_options_for_trait(self) -> dict[str, Any]:
         """Generate the fileSystemPicker UI options dictionary."""
         options: dict[str, Any] = {

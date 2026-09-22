@@ -32,6 +32,19 @@ class NumbersSelector(Trait):
     def get_trait_keys(cls) -> list[str]:
         return ["numbers_selector"]
 
+    def to_state(self) -> dict[str, Any]:
+        return {
+            "defaults": self.defaults,
+            "step": self.step,
+            "overall_min": self.overall_min,
+            "overall_max": self.overall_max,
+        }
+
+    def apply_state(self, state: dict[str, Any]) -> None:
+        for name in ("defaults", "step", "overall_min", "overall_max"):
+            if name in state:
+                setattr(self, name, state[name])
+
     def ui_options_for_trait(self) -> dict:
         return {
             "numbers_selector": {
