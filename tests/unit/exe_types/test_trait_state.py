@@ -64,25 +64,33 @@ class TestTheSavedShape:
     def test_a_full_entry_round_trips(self) -> None:
         entry = TraitStateEntry(
             trait_name="Button",
+            trait_module="griptape_nodes.traits.button",
             trait_state={"label": "Refresh"},
         )
 
         assert TraitStateEntry.from_dict(entry.to_dict()) == entry
 
     def test_an_entry_with_no_state_still_names_its_trait(self) -> None:
-        entry = TraitStateEntry(trait_name="Options")
+        entry = TraitStateEntry(trait_name="Options", trait_module="griptape_nodes.traits.options")
 
         assert entry.to_dict() == {
             "trait_name": "Options",
+            "trait_module": "griptape_nodes.traits.options",
             "trait_state": {},
         }
 
     def test_an_entry_naming_no_trait_reads_as_nothing(self) -> None:
         assert TraitStateEntry.from_dict({"trait_state": {"label": "Refresh"}}) is None
 
+    def test_a_missing_module_reads_as_absent_rather_than_guessed(self) -> None:
+        entry = TraitStateEntry.from_dict({"trait_name": "Options"})
+
+        assert entry is not None
+        assert entry.trait_module is None
+
     def test_a_missing_state_reads_as_empty(self) -> None:
         """An entry that says nothing about state asks for whatever the node's code builds."""
-        entry = TraitStateEntry.from_dict({"trait_name": "Options"})
+        entry = TraitStateEntry.from_dict({"trait_name": "Options", "trait_module": "m"})
 
         assert entry is not None
         assert entry.trait_state == {}

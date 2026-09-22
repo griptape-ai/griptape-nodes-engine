@@ -295,7 +295,10 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         return our_dict
 
     def trait_states(self) -> list[dict[str, Any]]:
-        """Return save-only trait identity and plain-data state."""
+        """Return save-only trait identity and plain-data state.
+
+        ``NodeManager`` stabilizes dynamic library module names before saving.
+        """
         states: list[dict[str, Any]] = []
         for trait in self.find_elements_by_type(Trait):
             trait_state: dict[str, Any] = {}
@@ -311,7 +314,11 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
                     )
                     continue
                 trait_state[key] = saved.value
-            entry = TraitStateEntry(trait_name=type(trait).__name__, trait_state=trait_state)
+            entry = TraitStateEntry(
+                trait_name=type(trait).__name__,
+                trait_module=type(trait).__module__,
+                trait_state=trait_state,
+            )
             states.append(entry.to_dict())
         return states
 
