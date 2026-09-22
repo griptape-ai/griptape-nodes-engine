@@ -326,8 +326,12 @@ class TestWorkflowManager:
         assert isinstance(result, SetWorkflowMetadataResultSuccess)
         write_mock.assert_called_once()
 
-    def test_on_create_workflow_from_template_request_success(self, engine: Engine) -> None:
-        """Test successful create workflow from template (Griptape or user-provided)."""
+    def test_on_create_workflow_from_template_request_success(self, engine: Engine, tmp_path: Path) -> None:
+        """Test successful create workflow from template (Griptape or user-provided).
+
+        The new file is written through the ``save_workflow`` situation, so the assertion is
+        the location that situation resolves to -- here the default ``{workspace_dir}/...``.
+        """
         workflow_manager = engine.workflow_manager
         request = CreateWorkflowFromTemplateRequest(template_name="my_template")
 
@@ -345,44 +349,43 @@ class TestWorkflowManager:
         mock_template.metadata.last_modified_date = None
 
         template_content = "# /// script\n# [tool]\n# ///\nprint('body')\n"
-        new_full_path = "/workspace/my_template_1.py"
 
-        def get_complete_file_path(relative_path: str) -> str:
-            if "templates" in relative_path:
-                return "/lib/path/my_template.py"
-            return new_full_path
-
-        with (
-            patch.object(
-                WorkflowRegistry,
-                "get_workflow_by_name",
-                return_value=mock_template,
-            ),
-            patch.object(
-                WorkflowRegistry,
-                "get_complete_file_path",
-                side_effect=get_complete_file_path,
-            ),
-            patch.object(Path, "is_file", return_value=True),
-            patch.object(Path, "read_text", return_value=template_content),
-            patch.object(
-                workflow_manager,
-                "_generate_unique_filename",
-                return_value="my_template_1",
-            ),
-            patch.object(
-                workflow_manager,
-                "_replace_workflow_metadata_header",
-                return_value="updated_content",
-            ),
-            patch.object(Path, "write_text"),
-            patch.object(WorkflowRegistry, "generate_new_workflow"),
-        ):
-            result = workflow_manager.on_create_workflow_from_template_request(request)
+        original_workspace = engine.config_manager.workspace_path
+        engine.config_manager.workspace_path = tmp_path
+        try:
+            with (
+                patch.object(
+                    WorkflowRegistry,
+                    "get_workflow_by_name",
+                    return_value=mock_template,
+                ),
+                patch.object(
+                    WorkflowRegistry,
+                    "get_complete_file_path",
+                    return_value="/lib/path/my_template.py",
+                ),
+                patch.object(Path, "is_file", return_value=True),
+                patch.object(Path, "read_text", return_value=template_content),
+                patch.object(
+                    workflow_manager,
+                    "_generate_unique_filename",
+                    return_value="my_template_1",
+                ),
+                patch.object(
+                    workflow_manager,
+                    "_replace_workflow_metadata_header",
+                    return_value="updated_content",
+                ),
+                patch.object(WorkflowRegistry, "generate_new_workflow"),
+            ):
+                result = workflow_manager.on_create_workflow_from_template_request(request)
+        finally:
+            engine.config_manager.workspace_path = original_workspace
 
         assert isinstance(result, CreateWorkflowFromTemplateResultSuccess)
         assert result.workflow_name == "my_template_1"
-        assert result.file_path == new_full_path
+        assert Path(result.file_path) == tmp_path / "my_template_1.py"
+        assert (tmp_path / "my_template_1.py").read_text(encoding="utf-8") == "updated_content"
 
     def test_on_create_workflow_from_template_request_absolute_file_path(self, engine: Engine) -> None:
         """Test that templates with absolute file paths save the new workflow in the workspace, not at the template path."""
@@ -442,8 +445,9 @@ class TestWorkflowManager:
             result = workflow_manager.on_create_workflow_from_template_request(request)
 
         assert isinstance(result, CreateWorkflowFromTemplateResultSuccess)
-        # The base name passed to _generate_unique_filename must be just the stem,
-        # not the full absolute path, so the file is saved in the workspace.
+        # The base name passed to _generate_unique_filename must be just the stem, not the
+        # full absolute path, so the new workflow is named after the template rather than
+        # inheriting the library path the template happens to live at.
         assert generate_unique_filename_calls == ["my_template"]
 
     def test_on_create_workflow_from_template_request_template_not_found(self, engine: Engine) -> None:
@@ -3326,6 +3330,504 @@ class TestWorkflowSaveSituationMacro:
         assert isinstance(result, SaveWorkflowFileFromSerializedFlowResultSuccess)
         assert Path(result.file_path) == temp_dir / "episode" / "my_workflow_v001.py"
         assert (temp_dir / "episode" / "my_workflow_v001.py").exists()
+
+    def test_unique_filename_defers_to_the_seed_when_the_macro_cannot_resolve(
+        self, engine: Engine, temp_dir: Path
+    ) -> None:
+        """A required `{_index:03}` slot has no single destination to probe, so the name stands.
+
+        The uniqueness probe resolves the situation's destination. With an unseeded required
+        slot there is no such path -- OSManager picks the free index during the write -- so the
+        probe must abstain rather than treat the unresolvable macro as a collision and walk the
+        name forward on top of the slot that is already doing that job.
+        """
+        self._save(engine, "my_workflow")
+        assert (temp_dir / "my_workflow_v001.py").exists()
+
+        assert engine.workflow_manager._generate_unique_filename("my_workflow") == "my_workflow"
+
+    def test_creation_under_a_seeded_slot_situation_writes_the_next_version(
+        self, engine: Engine, temp_dir: Path
+    ) -> None:
+        """Creating a workflow file through a CREATE_NEW + `{_index:03}` situation still works.
+
+        Creation goes through the same destination as a save, so the seed-and-retry contract
+        has to survive the trip: the new file takes the next free index instead of failing on
+        the unresolved slot.
+        """
+        self._save(engine, "my_workflow")
+
+        created = engine.workflow_manager._create_workflow_file("my_workflow", "# created\n")
+
+        assert created.success, created.error_details
+        assert Path(created.absolute_path) == temp_dir / "my_workflow_v002.py"
+        assert (temp_dir / "my_workflow_v002.py").read_text(encoding="utf-8") == "# created\n"
+
+
+class TestWorkflowCreationHonorsSaveSituation:
+    """Regression coverage for griptape-ai/internal#278: creating a workflow is a save.
+
+    A project can point ``save_workflow`` outside the workspace -- the reporter's child
+    project routes it at a per-shot ``{context_dir}``. Saving honored that; *creating* did
+    not. Branching and copying a template each wrote the new file at
+    ``<workspace>/<name>.py`` directly, so a workflow the engine created on the user's
+    behalf was born in the workspace root, and because it was registered there every
+    later save overwrote it in place -- the workflow could never migrate to where the
+    project said workflows go, and nothing reported a problem.
+
+    The workspace here is deliberately a different directory than the situation's
+    destination; that difference is what the bug hid in.
+    """
+
+    CONTEXT_MACRO = "{context_dir}/{file_name_base}.{file_extension}"
+
+    @pytest.fixture
+    def temp_dir(self, tmp_path: Path) -> Path:
+        return tmp_path.resolve()
+
+    @pytest.fixture
+    def context_dir(self, temp_dir: Path) -> Path:
+        return temp_dir / "shows" / "pwt" / "dev" / "shot0001" / "genai" / "gtn"
+
+    @pytest.fixture(autouse=True)
+    def setup_redirected_save_workflow_project(
+        self, temp_dir: Path, context_dir: Path, engine: Engine
+    ) -> "Generator[None, None, None]":
+        """Load a project whose save_workflow points at a directory outside the workspace.
+
+        Same fixture ordering as TestWorkflowSaveSituationMacro: load and activate before
+        forcing workspace_path, so activation does not re-derive it from the project's
+        config layers.
+        """
+        from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
+        from griptape_nodes.common.project_templates.directory import DirectoryDefinition
+        from griptape_nodes.common.project_templates.situation import (
+            SituationFilePolicy,
+            SituationPolicy,
+            SituationTemplate,
+        )
+        from griptape_nodes.retained_mode.events.project_events import (
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+            SetCurrentProjectRequest,
+        )
+
+        original_workspace = engine.config_manager.workspace_path
+
+        redirected_save_workflow = SituationTemplate(
+            name="save_workflow",
+            description="Workflow saves land in the shot's context directory.",
+            macro=self.CONTEXT_MACRO,
+            policy=SituationPolicy(on_collision=SituationFilePolicy.OVERWRITE, create_dirs=True),
+            fallback="save_file",
+        )
+        custom_template = DEFAULT_PROJECT_TEMPLATE.model_copy(
+            update={
+                "situations": {**DEFAULT_PROJECT_TEMPLATE.situations, "save_workflow": redirected_save_workflow},
+                "directories": {
+                    **DEFAULT_PROJECT_TEMPLATE.directories,
+                    "context_dir": DirectoryDefinition(name="context_dir", path_macro=str(context_dir)),
+                },
+            }
+        )
+
+        workspace = temp_dir / "workspace"
+        workspace.mkdir()
+
+        project_yml = temp_dir / "project_template.yml"
+        project_yml.write_text(custom_template.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
+        load_result = engine.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+        engine.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+
+        engine.config_manager.workspace_path = workspace
+
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            yield
+
+        engine.handle_request(SetCurrentProjectRequest(project_id=None))
+        engine.config_manager.workspace_path = original_workspace
+
+    @staticmethod
+    def _save_new_workflow(engine: Engine, display_name: str) -> str:
+        """Create and save a workflow the ordinary way; return its registry key."""
+        from griptape_nodes.retained_mode.events.workflow_events import (
+            SaveWorkflowRequest,
+            SaveWorkflowResultSuccess,
+        )
+        from griptape_nodes.retained_mode.managers.context_manager import (
+            EnsureWorkflowAndFlowRequest,
+            EnsureWorkflowAndFlowResultSuccess,
+        )
+
+        ensure_result = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name=display_name))
+        assert isinstance(ensure_result, EnsureWorkflowAndFlowResultSuccess)
+        save_result = asyncio.run(engine.ahandle_request(SaveWorkflowRequest()))
+        assert isinstance(save_result, SaveWorkflowResultSuccess), save_result.result_details
+        return save_result.workflow_name
+
+    def _make_template(self, engine: Engine, display_name: str) -> str:
+        """Save a workflow and mark it as a user template; return its registry key."""
+        from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
+
+        registry_key = self._save_new_workflow(engine, display_name)
+        WorkflowRegistry.get_workflow_by_name(registry_key).metadata.is_template = True
+        engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        return registry_key
+
+    def test_create_from_template_lands_at_the_situation_destination(self, engine: Engine, context_dir: Path) -> None:
+        """A workflow copied from a template is written where save_workflow points."""
+        template_key = self._make_template(engine, "show_template")
+
+        created = engine.handle_request(CreateWorkflowFromTemplateRequest(template_name=template_key))
+
+        assert isinstance(created, CreateWorkflowFromTemplateResultSuccess), created.result_details
+        assert Path(created.file_path).parent == context_dir
+        assert Path(created.file_path).exists()
+
+    def test_create_from_template_does_not_overwrite_the_template(self, engine: Engine, context_dir: Path) -> None:
+        """The copy takes a free name at the real destination, not the template's own file.
+
+        Uniqueness used to be probed at ``<workspace>/<name>.py`` while the write went
+        through the macro, so once creation followed the macro the two disagreed -- and with
+        an OVERWRITE policy the "copy" would land on the template it was copied from.
+        """
+        template_key = self._make_template(engine, "show_template")
+        template_path = context_dir / "show_template.py"
+        template_content = template_path.read_text(encoding="utf-8")
+
+        created = engine.handle_request(CreateWorkflowFromTemplateRequest(template_name=template_key))
+
+        assert isinstance(created, CreateWorkflowFromTemplateResultSuccess), created.result_details
+        assert Path(created.file_path) != template_path
+        assert template_path.read_text(encoding="utf-8") == template_content
+
+    def test_first_save_after_create_from_template_stays_put(self, engine: Engine, context_dir: Path) -> None:
+        """The created workflow's first save overwrites it in place, at the right location."""
+        from griptape_nodes.retained_mode.events.workflow_events import (
+            SaveWorkflowRequest,
+            SaveWorkflowResultSuccess,
+        )
+        from griptape_nodes.retained_mode.managers.context_manager import (
+            EnsureWorkflowAndFlowRequest,
+            EnsureWorkflowAndFlowResultSuccess,
+        )
+
+        template_key = self._make_template(engine, "show_template")
+        created = engine.handle_request(CreateWorkflowFromTemplateRequest(template_name=template_key))
+        assert isinstance(created, CreateWorkflowFromTemplateResultSuccess), created.result_details
+
+        opened = engine.handle_request(EnsureWorkflowAndFlowRequest(workflow_name=created.workflow_name))
+        assert isinstance(opened, EnsureWorkflowAndFlowResultSuccess), opened.result_details
+        saved = asyncio.run(engine.ahandle_request(SaveWorkflowRequest(file_name=created.workflow_name)))
+
+        assert isinstance(saved, SaveWorkflowResultSuccess), saved.result_details
+        assert Path(saved.file_path) == Path(created.file_path)
+        assert Path(saved.file_path).parent == context_dir
+
+    def test_branch_lands_at_the_situation_destination(self, engine: Engine, context_dir: Path, temp_dir: Path) -> None:
+        """A branch is a new workflow file too, so it follows save_workflow as well.
+
+        The source here is a workspace-resident workflow, which is what makes the assertion
+        discriminating: branching used to derive the branch's path from the source's own
+        workspace-relative registry key, so the branch stayed in the workspace no matter
+        where the project said workflows go.
+        """
+        source_key = self._workspace_resident_source(engine, context_dir, temp_dir)
+
+        branched = engine.handle_request(BranchWorkflowRequest(workflow_name=source_key))
+
+        assert isinstance(branched, BranchWorkflowResultSuccess), branched.result_details
+        branch_path = self._registered_path(branched.branched_workflow_name)
+        assert branch_path.parent == context_dir
+        assert branch_path.exists()
+
+    def _workspace_resident_source(self, engine: Engine, context_dir: Path, temp_dir: Path) -> str:
+        """Register a source workflow that lives in the workspace, keyed relative to it.
+
+        This is the shape the fix exists to unblock: the workflow is stranded in the
+        workspace while the project points ``save_workflow`` elsewhere, so the source's
+        registry key and its branch's destination sit in two different namespaces.
+        """
+        saved_key = self._save_new_workflow(engine, "shot_lighting")
+        source_metadata = WorkflowRegistry.get_workflow_by_name(saved_key).metadata
+        content = (context_dir / "shot_lighting.py").read_text(encoding="utf-8")
+
+        # The file has to exist before it can be registered.
+        (temp_dir / "workspace" / "shot_lighting_ws.py").write_text(content, encoding="utf-8")
+        WorkflowRegistry.generate_new_workflow(
+            registry_key="shot_lighting_ws",
+            metadata=source_metadata.model_copy(),
+            file_path="shot_lighting_ws.py",
+        )
+        return "shot_lighting_ws"
+
+    def test_second_branch_does_not_overwrite_the_first(
+        self, engine: Engine, context_dir: Path, temp_dir: Path
+    ) -> None:
+        """Branching the same workflow twice produces two files, not one written twice.
+
+        The branch counter walks ``<source key>_branch_<n>`` until the registry clears it, but
+        the key registered is derived from the path the situation wrote to. When the source is
+        keyed workspace-relative and the destination is outside the workspace those namespaces
+        never meet, so the counter keeps offering ``_branch_1``: the second branch resolved to
+        the first branch's path and overwrote it under the situation's OVERWRITE policy.
+        """
+        source_key = self._workspace_resident_source(engine, context_dir, temp_dir)
+
+        first = engine.handle_request(BranchWorkflowRequest(workflow_name=source_key))
+        assert isinstance(first, BranchWorkflowResultSuccess), first.result_details
+        first_path = self._registered_path(first.branched_workflow_name)
+        first_bytes = first_path.read_bytes()
+
+        second = engine.handle_request(BranchWorkflowRequest(workflow_name=source_key))
+
+        assert isinstance(second, BranchWorkflowResultSuccess), second.result_details
+        second_path = self._registered_path(second.branched_workflow_name)
+        assert second_path != first_path
+        assert first_path.read_bytes() == first_bytes, "the first branch's file was rewritten"
+        assert sorted(p.name for p in context_dir.glob("shot_lighting_ws_branch_*.py")) == [
+            "shot_lighting_ws_branch_1.py",
+            "shot_lighting_ws_branch_2.py",
+        ]
+
+    def test_reused_explicit_branch_name_is_refused_before_it_writes(
+        self, engine: Engine, context_dir: Path, temp_dir: Path
+    ) -> None:
+        """A caller-supplied branch name that is taken fails, leaving the earlier branch intact.
+
+        The counter walk never runs for a supplied name, so the guard on the way in is the only
+        thing standing between it and the destination. Checking the registry alone missed the
+        collision -- the earlier branch is keyed by the path it was written to, not by the name
+        it was asked for -- and the write went ahead and replaced it.
+        """
+        source_key = self._workspace_resident_source(engine, context_dir, temp_dir)
+
+        first = engine.handle_request(
+            BranchWorkflowRequest(workflow_name=source_key, branched_workflow_name="lighting_fix")
+        )
+        assert isinstance(first, BranchWorkflowResultSuccess), first.result_details
+        first_path = self._registered_path(first.branched_workflow_name)
+        first_bytes = first_path.read_bytes()
+
+        second = engine.handle_request(
+            BranchWorkflowRequest(workflow_name=source_key, branched_workflow_name="lighting_fix")
+        )
+
+        assert isinstance(second, BranchWorkflowResultFailure)
+        assert "already saved under that name" in str(second.result_details)
+        assert first_path.read_bytes() == first_bytes, "the first branch's file was rewritten"
+        assert [p.name for p in context_dir.glob("lighting_fix*.py")] == ["lighting_fix.py"]
+
+    def test_explicit_branch_name_still_works_when_free(
+        self, engine: Engine, context_dir: Path, temp_dir: Path
+    ) -> None:
+        """The stricter guard must not refuse a supplied name whose destination is free."""
+        source_key = self._workspace_resident_source(engine, context_dir, temp_dir)
+
+        branched = engine.handle_request(
+            BranchWorkflowRequest(workflow_name=source_key, branched_workflow_name="lighting_fix")
+        )
+
+        assert isinstance(branched, BranchWorkflowResultSuccess), branched.result_details
+        assert self._registered_path(branched.branched_workflow_name) == context_dir / "lighting_fix.py"
+
+    @staticmethod
+    def _registered_path(registry_key: str) -> Path:
+        """The on-disk path the registry holds for a workflow."""
+        assert WorkflowRegistry.has_workflow_with_name(registry_key), f"'{registry_key}' is not registered"
+        file_path = WorkflowRegistry.get_workflow_by_name(registry_key).file_path
+        assert file_path is not None
+        return Path(WorkflowRegistry.get_complete_file_path(file_path))
+
+    def test_created_workflow_is_registered_at_the_file_it_wrote(self, engine: Engine) -> None:
+        """The returned name is registered, and its registered path is the file on disk.
+
+        The caller opens the new workflow by the name it gets back, so a key that names a
+        location the file is not at leaves the editor unable to find what it just created.
+        """
+        template_key = self._make_template(engine, "show_template")
+
+        created = engine.handle_request(CreateWorkflowFromTemplateRequest(template_name=template_key))
+
+        assert isinstance(created, CreateWorkflowFromTemplateResultSuccess), created.result_details
+        assert self._registered_path(created.workflow_name) == Path(created.file_path)
+
+    def test_created_workflow_keeps_a_human_display_name(self, engine: Engine) -> None:
+        """Keying by the written path must not leak that path into the name the user sees."""
+        template_key = self._make_template(engine, "show_template")
+
+        created = engine.handle_request(CreateWorkflowFromTemplateRequest(template_name=template_key))
+
+        assert isinstance(created, CreateWorkflowFromTemplateResultSuccess), created.result_details
+        metadata = WorkflowRegistry.get_workflow_by_name(created.workflow_name).metadata
+        assert metadata.name == "show_template_1"
+
+    def test_repeated_creation_from_one_template_makes_distinct_files(self, engine: Engine, context_dir: Path) -> None:
+        """Each copy takes the next free name at the destination; none replaces another."""
+        template_key = self._make_template(engine, "show_template")
+
+        first = engine.handle_request(CreateWorkflowFromTemplateRequest(template_name=template_key))
+        second = engine.handle_request(CreateWorkflowFromTemplateRequest(template_name=template_key))
+
+        assert isinstance(first, CreateWorkflowFromTemplateResultSuccess), first.result_details
+        assert isinstance(second, CreateWorkflowFromTemplateResultSuccess), second.result_details
+        assert Path(first.file_path) != Path(second.file_path)
+        assert {Path(first.file_path).name, Path(second.file_path).name} == {
+            "show_template_1.py",
+            "show_template_2.py",
+        }
+        assert (context_dir / "show_template.py").exists()
+
+    def test_create_from_template_reports_a_failed_write(self, engine: Engine) -> None:
+        """A write that fails is a failed creation, not a success naming a file that is not there."""
+        template_key = self._make_template(engine, "show_template")
+        workflow_manager = engine.workflow_manager
+
+        with patch.object(
+            workflow_manager,
+            "_write_workflow_file",
+            return_value=WorkflowManager.WriteWorkflowFileResult(
+                success=False, error_details="Attempted to write. Failed because the volume is read-only."
+            ),
+        ):
+            created = engine.handle_request(CreateWorkflowFromTemplateRequest(template_name=template_key))
+
+        assert isinstance(created, CreateWorkflowFromTemplateResultFailure)
+        assert "read-only" in str(created.result_details)
+
+    def test_branch_leaves_the_source_untouched(self, engine: Engine, context_dir: Path) -> None:
+        """Branching copies the source; it must not rewrite or relocate the original."""
+        source_key = self._save_new_workflow(engine, "shot_lighting")
+        source_path = context_dir / "shot_lighting.py"
+        source_content = source_path.read_text(encoding="utf-8")
+
+        branched = engine.handle_request(BranchWorkflowRequest(workflow_name=source_key))
+
+        assert isinstance(branched, BranchWorkflowResultSuccess), branched.result_details
+        assert source_path.read_text(encoding="utf-8") == source_content
+        assert self._registered_path(branched.branched_workflow_name) != source_path
+
+    def test_branch_reports_a_failed_write(self, engine: Engine) -> None:
+        """Same contract on the branch path: a failed write surfaces as a failed branch."""
+        source_key = self._save_new_workflow(engine, "shot_lighting")
+        workflow_manager = engine.workflow_manager
+
+        with patch.object(
+            workflow_manager,
+            "_write_workflow_file",
+            return_value=WorkflowManager.WriteWorkflowFileResult(
+                success=False, error_details="Attempted to write. Failed because the volume is read-only."
+            ),
+        ):
+            branched = engine.handle_request(BranchWorkflowRequest(workflow_name=source_key))
+
+        assert isinstance(branched, BranchWorkflowResultFailure)
+        assert "read-only" in str(branched.result_details)
+
+    def test_unique_filename_probes_the_situation_destination(self, engine: Engine, context_dir: Path) -> None:
+        """A name free in the workspace but taken at the real destination is still bumped.
+
+        This is the half of the bug that only bites once creation follows the macro: the probe
+        used to ask ``<workspace>/<name>.py``, so with an overwrite policy a "new" workflow
+        would land on top of the file already sitting at the destination.
+        """
+        context_dir.mkdir(parents=True, exist_ok=True)
+        (context_dir / "taken.py").write_text("# occupied\n", encoding="utf-8")
+        assert not (engine.config_manager.workspace_path / "taken.py").exists()
+
+        assert engine.workflow_manager._generate_unique_filename("taken") == "taken_1"
+
+
+class TestWorkflowCreationOnTheDefaultProject:
+    """The same creation paths on an unmodified project must not move anything.
+
+    Routing creation through ``save_workflow`` is only safe if the default situation still
+    puts workflows where they have always gone -- the workspace root. This is the
+    backward-compatibility half of griptape-ai/internal#278's fix.
+    """
+
+    @pytest.fixture
+    def temp_dir(self, tmp_path: Path) -> Path:
+        return tmp_path.resolve()
+
+    @pytest.fixture(autouse=True)
+    def setup_default_project(self, temp_dir: Path, engine: Engine) -> "Generator[None, None, None]":
+        from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
+        from griptape_nodes.retained_mode.events.project_events import (
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+            SetCurrentProjectRequest,
+        )
+
+        original_workspace = engine.config_manager.workspace_path
+
+        project_yml = temp_dir / "project_template.yml"
+        project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
+        load_result = engine.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+        engine.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+
+        engine.config_manager.workspace_path = temp_dir
+
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            yield
+
+        engine.handle_request(SetCurrentProjectRequest(project_id=None))
+        engine.config_manager.workspace_path = original_workspace
+
+    def _make_template(self, engine: Engine, display_name: str) -> str:
+        from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
+        from griptape_nodes.retained_mode.events.workflow_events import (
+            SaveWorkflowRequest,
+            SaveWorkflowResultSuccess,
+        )
+        from griptape_nodes.retained_mode.managers.context_manager import (
+            EnsureWorkflowAndFlowRequest,
+            EnsureWorkflowAndFlowResultSuccess,
+        )
+
+        ensure_result = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name=display_name))
+        assert isinstance(ensure_result, EnsureWorkflowAndFlowResultSuccess)
+        save_result = asyncio.run(engine.ahandle_request(SaveWorkflowRequest()))
+        assert isinstance(save_result, SaveWorkflowResultSuccess), save_result.result_details
+        WorkflowRegistry.get_workflow_by_name(save_result.workflow_name).metadata.is_template = True
+        engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        return save_result.workflow_name
+
+    def test_create_from_template_still_lands_in_the_workspace_root(self, engine: Engine, temp_dir: Path) -> None:
+        """The default macro is workspace-rooted, so a copy goes where it always did."""
+        template_key = self._make_template(engine, "blank_template")
+
+        created = engine.handle_request(CreateWorkflowFromTemplateRequest(template_name=template_key))
+
+        assert isinstance(created, CreateWorkflowFromTemplateResultSuccess), created.result_details
+        assert Path(created.file_path) == temp_dir / "blank_template_1.py"
+        # A workspace-resident file keeps its workspace-relative registry key.
+        assert created.workflow_name == "blank_template_1"
+
+    def test_branch_still_lands_in_the_workspace_root(self, engine: Engine, temp_dir: Path) -> None:
+        """Branch names stay workspace-relative on an unmodified project."""
+        from griptape_nodes.retained_mode.events.workflow_events import (
+            SaveWorkflowRequest,
+            SaveWorkflowResultSuccess,
+        )
+        from griptape_nodes.retained_mode.managers.context_manager import (
+            EnsureWorkflowAndFlowRequest,
+            EnsureWorkflowAndFlowResultSuccess,
+        )
+
+        ensure_result = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="shot_lighting"))
+        assert isinstance(ensure_result, EnsureWorkflowAndFlowResultSuccess)
+        save_result = asyncio.run(engine.ahandle_request(SaveWorkflowRequest()))
+        assert isinstance(save_result, SaveWorkflowResultSuccess), save_result.result_details
+
+        branched = engine.handle_request(BranchWorkflowRequest(workflow_name=save_result.workflow_name))
+
+        assert isinstance(branched, BranchWorkflowResultSuccess), branched.result_details
+        branch_file_path = WorkflowRegistry.get_workflow_by_name(branched.branched_workflow_name).file_path
+        assert branch_file_path is not None
+        assert Path(WorkflowRegistry.get_complete_file_path(branch_file_path)).parent == temp_dir
 
 
 class TestCreateVersionedWorkflow:
