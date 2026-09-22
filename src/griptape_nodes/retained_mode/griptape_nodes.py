@@ -332,6 +332,7 @@ class GriptapeNodes(metaclass=_EngineRootMeta):
 
     @classmethod
     def BudgetManager(cls) -> BudgetManager:
+        _forbid_manager_during_worker_execution("BudgetManager", "GetAttributionContextRequest(...)")
         return current_engine().budget_manager
 
     @classmethod
