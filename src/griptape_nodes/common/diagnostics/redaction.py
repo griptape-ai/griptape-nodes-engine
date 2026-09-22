@@ -120,14 +120,26 @@ _BEARER_PATTERN = TextPattern(
 #
 # A name pattern rather than a fixed list of names, so it stays in step with
 # SENSITIVE_KEY_PATTERN and covers a vendor parameter nobody thought to enumerate:
-# `X-Amz-Signature`, `x-goog-credential`, `AWSAccessKeyId`, and `client_secret` all match.
-# `sig` and `auth` are included as their own words because the URL spellings are
-# abbreviated where config keys are not.
-_SIGNED_URL_PARAMETER_WORDS = "key|token|secret|password|credential|auth|sig|code"
+# `X-Amz-Signature`, `x-goog-credential`, `AWSAccessKeyId`, and `client_secret` all match
+# because each of these words appears somewhere inside the name.
+_SIGNED_URL_PARAMETER_WORDS = "key|token|secret|password|credential|signature|authorization"
+
+# The abbreviated spellings, which are matched only as the whole parameter name. These are
+# short enough that looking for them anywhere inside a name hides values that are not
+# credentials and are the whole reason someone opened the report: `code` is inside
+# `errorcode`, `sig` is inside `assignee` and `design`, `auth` is inside `author`. Kept at
+# all because the abbreviation is the real spelling of a real credential -- Azure's SAS
+# signature is `sig`, and an OAuth authorization code is `code` -- and in that spelling it is
+# the entire name, never part of a longer one.
+_SIGNED_URL_PARAMETER_ABBREVIATIONS = "auth|sig|code"
+
+_SIGNED_URL_PARAMETER_NAME = (
+    rf"(?:[^=&\s]*(?:{_SIGNED_URL_PARAMETER_WORDS})[^=&\s]*|(?:{_SIGNED_URL_PARAMETER_ABBREVIATIONS}))"
+)
 
 _SIGNED_URL_PATTERN = TextPattern(
     RedactionReason.SIGNED_URL_PARAMETER,
-    re.compile(rf"(?i)([?&][^=&\s]*(?:{_SIGNED_URL_PARAMETER_WORDS})[^=&\s]*=)[^&\s\"'<>]+"),
+    re.compile(rf"(?i)([?&]{_SIGNED_URL_PARAMETER_NAME}=)[^&\s\"'<>]+"),
     rf"\1{REDACTED}",
 )
 
@@ -164,9 +176,16 @@ DELIMITED_VALUE_PATTERNS = [_BEARER_PATTERN, _SIGNED_URL_PATTERN, _URL_CREDENTIA
 
 # What may follow a home directory for it to really be one. Without this, a home of
 # `/Users/sam` rewrites a sibling's `/Users/samantha/x` to `~antha/x`: nothing leaks, but
-# the result reads as this user's home when it is somebody else's. `_` is allowed because
-# a config key can be built by appending to a path (`/Users/sam_api_key`).
-_HOME_DIRECTORY_BOUNDARY = r"""(?=[/\\_.,;:!?*|'")\]}>\s]|$)"""
+# the result reads as this user's home when it is somebody else's.
+#
+# What the set holds is punctuation, and every kind of it: a letter or a digit after the home
+# path continues an identifier, so the path was never this home to begin with, while
+# punctuation ends one. `_`, `.`, and `-` are the three that look like exceptions and are
+# not -- a config key or a suffix is routinely appended to a path with each of them
+# (`/Users/sam_api_key`, `/Users/sam.old`, `/Users/sam-2`). Leaving `-` out of the set meant
+# only that spelling was left in the report verbatim, which in a file whose whole purpose is
+# to err toward hiding too much is the wrong way to be wrong.
+_HOME_DIRECTORY_BOUNDARY = r"""(?=[/\\_.\-,;:!?*|'")\]}>\s]|$)"""
 
 
 class Redactor:

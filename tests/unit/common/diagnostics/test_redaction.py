@@ -352,6 +352,44 @@ class TestCredentialPatterns:
         assert redactor.redact_text(text) == text
         assert redactor.total_redactions() == 0
 
+    @pytest.mark.parametrize("parameter", ["sig", "code", "auth"])
+    def test_removes_a_value_under_an_abbreviated_parameter_name(self, parameter: str) -> None:
+        """Azure spells a SAS signature `sig`, and an OAuth authorization code is `code`."""
+        redactor = Redactor(normalize_identity=False)
+
+        redacted = redactor.redact_text(f"https://acct.blob.core.windows.net/c/f?{parameter}=deadbeefcafe")
+
+        assert "deadbeefcafe" not in redacted
+        assert f"?{parameter}=" in redacted
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://vendor.example.com/callback?errorcode=500",
+            "https://vendor.example.com/callback?error-code=500",
+            "https://git.example.com/issues?assignee=sam",
+            "https://blog.example.com/posts?author=sam",
+        ],
+    )
+    def test_keeps_a_parameter_that_merely_contains_an_abbreviation(self, url: str) -> None:
+        """An abbreviation is only a credential when it is the whole name.
+
+        Looked for anywhere inside a name, `code` hides `errorcode=500` and `sig` hides
+        `assignee` -- values holding nothing secret and carrying the answer somebody opened
+        the report to find.
+        """
+        redactor = Redactor(normalize_identity=False)
+
+        assert redactor.redact_text(url) == url
+        assert redactor.total_redactions() == 0
+
+    @pytest.mark.parametrize("parameter", ["authorization", "X-Amz-Signature", "client_secret", "AWSAccessKeyId"])
+    def test_still_matches_a_full_word_anywhere_inside_a_parameter_name(self, parameter: str) -> None:
+        """The unabbreviated words stay substring matches, so a vendor prefix cannot hide one."""
+        redactor = Redactor(normalize_identity=False)
+
+        assert "deadbeefcafe" not in redactor.redact_text(f"https://api.example.com/x?{parameter}=deadbeefcafe")
+
 
 class TestPasswordsInUrls:
     """`scheme://user:password@host` is how a private git remote or MCP server is addressed.
@@ -460,6 +498,26 @@ class TestIdentityNormalization:
         assert str(neighbor_file) in redacted
         assert f"~{os.sep}notes.txt" in redacted
         assert redactor.counts() == {RedactionReason.HOME_DIRECTORY: 1}
+
+    @pytest.mark.parametrize("suffix", ["-2", "_api_key", ".old"])
+    def test_replaces_a_home_directory_a_suffix_was_appended_to(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, suffix: str
+    ) -> None:
+        """A suffix is punctuation away from the home path, and punctuation ends it.
+
+        `-` was missing from the set that `_` and `.` were already in, so `/Users/sam-2` was
+        the one spelling written into a report verbatim. Over-redacting a sibling directory is
+        the safe way to be wrong here; leaving the home path readable is not.
+        """
+        home = tmp_path / "sam"
+        monkeypatch.setattr(Path, "home", lambda: home)
+        monkeypatch.setattr("getpass.getuser", lambda: "unrelated-name")
+        redactor = Redactor()
+
+        redacted = redactor.redact_text(f"read {home}{suffix}/thing.py")
+
+        assert str(home) not in redacted
+        assert redacted == f"read ~{suffix}/thing.py"
 
     def test_redact_path_accepts_a_path_object(self) -> None:
         redacted = Redactor().redact_path(Path.home() / "workspace")
