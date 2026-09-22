@@ -453,3 +453,32 @@ class TestReadingTheDictDirectly:
         stored = ["a", 1, {"b": None}]
 
         assert node.local_objects.resolve_what_is_here(stored) is stored
+
+
+class TestReleasingWhileAnotherNodeRuns:
+    """The flag the deferral tests is a process-wide count, so the drain has to respect it too.
+
+    Parallel resolution runs several nodes at once in one worker. Draining when the first of them exits
+    frees an object a sibling may still be holding -- the failure the deferral exists to prevent, reached
+    by a different door.
+    """
+
+    def test_the_drain_waits_for_the_last_node(self) -> None:
+        node = _node()
+        released: list[str] = []
+        node.local_objects.put(Pipeline("first"), key="cfg", on_drop=lambda value: released.append(value.label))
+        manager = node.local_objects._manager()
+        events = manager.engine.event_manager
+
+        with events.worker_node_execution_scope():  # node A
+            with events.worker_node_execution_scope():  # node B, concurrent
+                node.local_objects.put(Pipeline("second"), key="cfg")
+                assert released == []
+            # B has exited, A is still running: the drain refuses rather than freeing what A may hold.
+            assert events.in_node_execution() is True
+            assert manager.drain_deferred_releases() == 0
+            assert released == []
+
+        # A has finished too, so now it goes.
+        assert manager.drain_deferred_releases() == 1
+        assert released == ["first"]

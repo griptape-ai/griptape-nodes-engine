@@ -119,8 +119,6 @@ class ResourceManager(EngineScoped):
         self._capability_instances: dict[str, ResourceInstance] = {}
         # Maps an engine-minted key to a live object a library parked in THIS process.
         self._local_objects: dict[str, LocalObjectEntry] = {}
-        # Latched on the first entry and never cleared: see could_hold_a_key.
-        self._has_ever_cached = False
         # Release hooks held back because a node was executing: see drain_deferred_releases.
         self._deferred_releases: dict[str, LocalObjectEntry] = {}
         # Node bodies that yield a callable run on real threads (`async_utils.to_thread`), and parallel
@@ -464,7 +462,6 @@ class ResourceManager(EngineScoped):
                     owner=owner, source=source, slot=slot, keep_key=full_key, keep_value=value
                 )
             self._local_objects[full_key] = entry
-            self._has_ever_cached = True
             displaced_value_survives = displaced is not None and self._value_still_held_locked(displaced.value)
             if displaced_slot_entries:
                 self._pending_worker_releases.extend(displaced_slot_entries)
@@ -514,16 +511,6 @@ class ResourceManager(EngineScoped):
                 if entry.owner == owner and entry.source == source and entry.slot == slot and entry.value is value:
                     return key
         return None
-
-    def could_hold_a_key(self) -> bool:
-        """Whether a key could plausibly appear in this process at all.
-
-        Asked before walking a parameter value, because a node read is the hottest path this touches and
-        most engines never spawn a worker at all. Both halves are latched rather than current: a key this
-        process minted and has since released still deserves "re-run the producer" instead of being handed
-        back as a string, and so does one from a worker that has since died.
-        """
-        return self._has_ever_cached or self.engine.worker_manager.has_ever_had_a_worker()
 
     def entry_for(self, key: str) -> LocalObjectEntry | None:
         """The entry this process holds under `key`, or None. The cache's only exact lookup."""
@@ -613,11 +600,13 @@ class ResourceManager(EngineScoped):
             del self._local_objects[key]
             survives = self._value_still_held_locked(entry.value)
         if not survives:
-            # Immediately, not deferred like a release this process decided on its own. The orchestrator
-            # replaced or deleted this value before sending the message, so a node running here now was
-            # handed the new one and cannot be holding this object. Waiting would pin the memory for the
-            # length of a render.
-            self._invoke_hooks_once_per_object({key: entry}, defer_during_execution=False)
+            # Deferred like any other release, despite arriving from the orchestrator. The exemption used to
+            # rest on "the value was already replaced there, so a node running here was handed the new one"
+            # -- true of displacement, which never reaches a worker this way: both displacement fillers run
+            # inside park_for_egress, which is worker-only. What does arrive is node deletion, where the
+            # premise inverts. The object is being destroyed while a consumer may be mid-forward-pass
+            # holding it, so freeing now is the CUDA fault the deferral exists to prevent.
+            self._invoke_hooks_once_per_object({key: entry})
         return True
 
     def vacate_slot(self, *, owner: str, source: str, slot: str, keeping: str | None = None) -> None:
@@ -735,11 +724,18 @@ class ResourceManager(EngineScoped):
     def drain_deferred_releases(self) -> int:
         """Run the release hooks held back during node execution. Returns how many objects went.
 
-        Called once a node has finished, which is the only point at which it is safe: a hook frees what the
-        object holds -- GPU memory, a file handle -- and a consumer that read the object is using it for as
-        long as it runs. The map's lock cannot help there, because the consumer stopped consulting the map
-        the moment it had the object in hand.
+        Safe only once nothing is executing: a hook frees what the object holds -- GPU memory, a file
+        handle -- and a node that read the object is using it for as long as it runs. The map's lock cannot
+        help there, because the reader stopped consulting the map the moment it had the object in hand.
+
+        Returns 0 and keeps the queue while any node is still running, so calling this is always safe.
         """
+        if self.engine.event_manager.in_node_execution():
+            # Still something running. The flag the deferral tests is a process-wide count and parallel
+            # resolution has several nodes in flight at once, so releasing when the first of them finishes
+            # frees an object a sibling may still be holding. The condition lives here rather than at the
+            # call site so a later caller cannot forget it.
+            return 0
         with self._local_objects_lock:
             deferred = self._deferred_releases
             self._deferred_releases = {}

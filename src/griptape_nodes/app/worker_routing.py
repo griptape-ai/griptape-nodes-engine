@@ -349,6 +349,12 @@ LOCAL_ONLY_REQUEST_TYPES: frozenset[type[RequestPayload]] = frozenset(
         # worker that asked, mid-node. Reachable because in_node_execution() is a process-wide
         # refcount, so a broadcast handler forwards whenever any node happens to be running.
         ReloadAllLibrariesRequest,
+        # Addressed to this worker: release objects ITS cache is holding. The orchestrator's store never
+        # held them, so a forwarded drop succeeds having freed nothing and the worker keeps a pipeline
+        # that may be gigabytes. Both skip the line, so they arrive mid-execution, which is exactly when
+        # a RemoteHandler forwards.
+        DropAllLocalObjectsRequest,
+        DropLocalObjectsRequest,
         #
         # --- 2. The worker's own answer is the correct one ---------------------------------------
         #
@@ -516,9 +522,10 @@ async def _handle_drop_local_objects(
 ) -> ResultPayload:
     """Release the named objects, whichever of them this process is holding.
 
-    Unlike its drop-all sibling this does not decline mid-execution: the keys named here were already
-    replaced or deleted on the orchestrator, so a node executing now cannot be using them -- it was given
-    the new value. Waiting would keep the memory for the length of a render.
+    Accepted mid-execution rather than declined like its drop-all sibling, but the release itself still
+    waits for the running node: the only thing that reaches a worker this way is node deletion, and a
+    consumer can be mid-forward-pass holding the very object being destroyed. The store holds the hook back
+    and runs it when nothing is executing, so the pin is one node rather than a whole render.
 
     Drops parked entries only. The orchestrator broadcasts keys it cannot check locally -- the entry lives
     here -- so the never-release-a-library-named-key rule is enforced on this side.

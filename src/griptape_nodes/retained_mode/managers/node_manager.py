@@ -3623,12 +3623,11 @@ class NodeManager(EngineScoped):
         finally:
             if tracked_request_id:
                 self._worker_inflight_aprocesses.pop(tracked_request_id, None)
-            # Release hooks held back while this node ran. A hook frees what the object holds, and a node
-            # that read the object is using it for as long as it runs -- the store's lock cannot help,
-            # because the reader stopped consulting the store the moment it had the object.
+            # Release hooks held back while nodes ran. A no-op while any node is still executing, which
+            # parallel resolution makes routine -- the drain enforces that itself.
             dropped = self.engine.resource_manager.drain_deferred_releases()
             if dropped:
-                logger.debug("Released %d held object(s) deferred while '%s' was running.", dropped, node.name)
+                logger.debug("Released %d held object(s) deferred while nodes were running.", dropped)
 
     @staticmethod
     def _resolve_cached_inputs_in_place(node: BaseNode) -> None:
@@ -3640,8 +3639,12 @@ class NodeManager(EngineScoped):
 
         Written straight into the dict rather than through `set_parameter_value`: nothing changed as far as
         the graph is concerned, and the setter would emit a lifecycle event carrying the live object where
-        the reference is what the editor should see. A reference this process cannot resolve is left as it
-        is, which is both what has to travel onward and what keeps the orchestrator-local path unaffected.
+        the reference is what the editor should see.
+
+        Worker-side only. In-process a node's dict already holds the object it was handed, so there is
+        nothing to swap -- except a reference a library made itself through `reference_for`, and replacing
+        that one would blind the save and metadata guards, which look for a reference and would find an
+        object they cannot write out.
         """
         for param_name, stored in list(node.parameter_values.items()):
             resolved = node.local_objects.resolve_what_is_here(stored)
@@ -3676,7 +3679,8 @@ class NodeManager(EngineScoped):
                 if param.default_value is None:
                     continue
                 node.parameter_values[param.name] = param.default_value
-            self._resolve_cached_inputs_in_place(node)
+            if self.engine.library_manager.is_worker:
+                self._resolve_cached_inputs_in_place(node)
             try:
                 with aprocess_scope(request.variables):
                     await node.aprocess()

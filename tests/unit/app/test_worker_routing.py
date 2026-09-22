@@ -19,7 +19,7 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -36,6 +36,7 @@ from griptape_nodes.app.worker_routing import (
     RemoteHandler,
     _handle_drop_all_local_objects,
     _handle_drop_local_objects,
+    register_broadcast_handlers,
     register_remote_handlers,
 )
 from griptape_nodes.retained_mode.events.base_events import (
@@ -209,6 +210,29 @@ class TestInstallRemoteHandlersSwap:
         assert ActivateProjectRequest in LOCAL_ONLY_REQUEST_TYPES
         assert ReloadAllLibrariesRequest in LOCAL_ONLY_REQUEST_TYPES
 
+    def test_every_broadcast_a_worker_answers_itself_is_local(self) -> None:
+        """Whatever `register_broadcast_handlers` installs is addressed to THIS worker, so none of it forwards.
+
+        Derived rather than listed by name, because the cost of forgetting is invisible: the wrapping pass
+        skips a type that has no handler yet, and broadcast handlers are registered after it runs. So a
+        missing entry works by call order alone, and swapping those two calls -- or registering one of these
+        earlier -- would start forwarding them. For the drop requests that means the orchestrator answering
+        success having freed nothing, while the worker keeps a pipeline that may be gigabytes.
+        """
+        probe = EventManager()
+        before = set(probe.registered_request_types())
+        register_broadcast_handlers(
+            probe,
+            config_manager=MagicMock(),
+            secrets_manager=MagicMock(),
+            project_manager=MagicMock(),
+        )
+        installed = set(probe.registered_request_types()) - before
+
+        assert installed, "expected register_broadcast_handlers to install something"
+        forwarded = sorted(t.__name__ for t in installed - LOCAL_ONLY_REQUEST_TYPES)
+        assert forwarded == [], f"broadcast handlers that would be forwarded to the orchestrator: {forwarded}"
+
     def test_per_file_project_reads_stay_local(self) -> None:
         """Three project-template reads on the per-saved-file path must not forward.
 
@@ -360,12 +384,13 @@ class TestDropLocalObjectsHandler:
         assert isinstance(result, DropLocalObjectsResultSuccess)
 
     @pytest.mark.asyncio
-    async def test_releases_while_executing_a_node(self, engine: Engine) -> None:
-        """Unlike the drop-all sibling this does not decline.
+    async def test_it_accepts_mid_execution_but_the_hook_waits(self, engine: Engine) -> None:
+        """Accepted rather than declined, yet the object is not freed under a running node.
 
-        These keys were replaced or deleted on the orchestrator before the message was sent, so a node
-        executing now was handed the new value and cannot be using them. Declining would hold the memory
-        for the length of a render.
+        The exemption used to rest on the keys having been replaced on the orchestrator before the message
+        was sent, so nothing running here could hold them. That is true of displacement, which never travels
+        this way -- it happens inside the worker. What arrives is node deletion, and there a consumer can be
+        mid-forward-pass on the very object being destroyed.
         """
         released: list[str] = []
         key = engine.resource_manager.put_local_object(
@@ -376,8 +401,12 @@ class TestDropLocalObjectsHandler:
             result = await _handle_drop_local_objects(
                 DropLocalObjectsRequest(keys=[key]), event_manager=engine.event_manager
             )
+            assert isinstance(result, DropLocalObjectsResultSuccess)
+            # Entry gone from the map, so nothing resolves it again -- but the hook has not run.
+            assert engine.resource_manager.entry_for(key) is None
+            assert released == []
 
-        assert isinstance(result, DropLocalObjectsResultSuccess)
+        assert engine.resource_manager.drain_deferred_releases() == 1
         assert released == ["gone"]
 
     @pytest.mark.asyncio
