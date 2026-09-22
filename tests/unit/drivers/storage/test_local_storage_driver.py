@@ -164,7 +164,7 @@ class TestLocalStorageDriverCreateSignedDownloadUrl:
             mock_time.time_ns.return_value = 1_000_000_000
             url = local_storage_driver.create_signed_download_url(Path("/workspace/images/photo.png"))
 
-        assert url == "http://localhost:8124/workspace/images/photo.png?t=1000"
+        assert url == "http://localhost:8124/workspace/images/photo.png?v=1000"
 
     def test_external_unix_file_uses_external_url(
         self,
@@ -180,7 +180,7 @@ class TestLocalStorageDriverCreateSignedDownloadUrl:
             mock_resolve.return_value = external_path
             url = local_storage_driver.create_signed_download_url(external_path)
 
-        assert url == "http://localhost:8124/external/external/video.mp4?t=1000"
+        assert url == "http://localhost:8124/external/external/video.mp4?v=1000"
 
     def test_external_windows_file_uses_forward_slashes_in_url(
         self,
@@ -205,7 +205,7 @@ class TestLocalStorageDriverCreateSignedDownloadUrl:
         # The URL must use forward slashes and not have backslashes
         assert "\\" not in url
         assert "C:/Users/foo/image.png" in url
-        assert url == "http://localhost:8124/external/C:/Users/foo/image.png?t=1000"
+        assert url == "http://localhost:8124/external/C:/Users/foo/image.png?v=1000"
 
     def test_external_long_path_prefixed_file_matches_clean_spelling(
         self,
@@ -227,9 +227,9 @@ class TestLocalStorageDriverCreateSignedDownloadUrl:
             mock_resolve.return_value = Path("//?/C:/Users/foo/image.png")
             url = local_storage_driver.create_signed_download_url(Path("C:/Users/foo/image.png"))
 
-        assert "?/" not in url.removesuffix("?t=1000")
+        assert "?/" not in url.removesuffix("?v=1000")
         assert "\\" not in url
-        assert url == "http://localhost:8124/external/C:/Users/foo/image.png?t=1000"
+        assert url == "http://localhost:8124/external/C:/Users/foo/image.png?v=1000"
 
     @pytest.mark.skipif(platform.system() != "Windows", reason="Only Windows pathlib parses a drive-letter anchor")
     def test_long_path_prefixed_workspace_file_uses_workspace_relative_url(self) -> None:
@@ -249,7 +249,7 @@ class TestLocalStorageDriverCreateSignedDownloadUrl:
             mock_resolve.return_value = Path(r"\\?\C:\ws\images\photo.png")
             url = driver.create_signed_download_url(Path(r"C:\ws\images\photo.png"))
 
-        assert url == "http://localhost:8124/workspace/images/photo.png?t=1000"
+        assert url == "http://localhost:8124/workspace/images/photo.png?v=1000"
 
 
 class TestSignedDownloadUrlRoundTrip:
@@ -287,7 +287,7 @@ class TestSignedDownloadUrlRoundTrip:
         assert parse_static_server_url(url, Path("/workspace")) == original
 
     def test_cachebuster_does_not_reach_the_filename(self) -> None:
-        """The ``?t=`` the builder appends must not survive into the resolved path.
+        """The ``?v=`` the builder appends must not survive into the resolved path.
 
         It rode along into the filename in the original bug, so no such file existed.
         """
@@ -297,8 +297,8 @@ class TestSignedDownloadUrlRoundTrip:
             mock_time.time_ns.return_value = 1_000_000_000
             url = driver.create_signed_download_url(Path("/workspace/staticfiles/clip.mp4"))
 
-        assert "?t=1000" in url
-        assert "?t=" not in str(parse_static_server_url(url, Path("/workspace")))
+        assert "?v=1000" in url
+        assert "?v=" not in str(parse_static_server_url(url, Path("/workspace")))
 
 
 class TestLocalStorageDriverGetAssetUrl:
@@ -383,3 +383,41 @@ class TestLocalStorageDriverDeleteFile:
             pytest.raises(RuntimeError, match="Failed to delete file"),
         ):
             driver.delete_file(TEST_FILE_PATH)
+
+
+class TestDeterministicUrlVersioning:
+    """URLs are versioned by the served file's identity, not by mint time."""
+
+    @pytest.fixture
+    def workspace(self, tmp_path: Path) -> Path:
+        return tmp_path
+
+    @pytest.fixture
+    def driver(self, workspace: Path) -> LocalStorageDriver:
+        return LocalStorageDriver(Mock(workspace_path=workspace), Mock(), base_url="http://localhost:8124/workspace")
+
+    def test_unchanged_file_mints_identical_urls(self, driver: LocalStorageDriver, workspace: Path) -> None:
+        """Same bytes → same URL across mints, so browser caches HIT instead of busting."""
+        served = workspace / "photo.png"
+        served.write_bytes(b"content")
+
+        first = driver.create_signed_download_url(served)
+        second = driver.create_signed_download_url(served)
+
+        assert first == second
+        assert "?v=" in first
+
+    def test_rewritten_file_mints_a_different_url(self, driver: LocalStorageDriver, workspace: Path) -> None:
+        """Any rewrite moves st_mtime_ns, so a cached response can't outlive its bytes."""
+        import os
+
+        served = workspace / "photo.png"
+        served.write_bytes(b"content")
+        before = driver.create_signed_download_url(served)
+
+        served.write_bytes(b"CONTENT")
+        stat_result = served.stat()
+        os.utime(served, ns=(stat_result.st_atime_ns, stat_result.st_mtime_ns + 1))
+        after = driver.create_signed_download_url(served)
+
+        assert before != after

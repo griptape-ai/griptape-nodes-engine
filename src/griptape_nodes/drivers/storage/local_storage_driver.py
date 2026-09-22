@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from hashlib import blake2b
 from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -189,13 +190,19 @@ class LocalStorageDriver(BaseStorageDriver):
             base_without_workspace = self.base_url.rsplit("/workspace", 1)[0]
             url = f"{base_without_workspace}/external/{path_str}"
 
-        # Add a cache-busting query parameter to the URL so that the browser always reloads
-        # the file. Millisecond resolution: with whole seconds, two URLs minted in the same
-        # second are identical strings, so the browser serves one cached response for both —
-        # and if that response was bad (e.g. a failed load), every same-second consumer
-        # inherits it.
-        cache_busted_url = f"{url}?t={time.time_ns() // 1_000_000}"
-        return cache_busted_url
+        # Version the URL by the served file's identity rather than by mint time:
+        # unchanged content yields the same URL on every mint, so the browser's
+        # cache HITS instead of refetching, and any rewrite changes st_mtime_ns
+        # and therefore the URL, so a cached bad response can never outlive the
+        # bytes that produced it.
+        try:
+            stat_result = absolute_path.stat()
+        except OSError:
+            # Nothing to fingerprint yet (file still being staged, unreachable
+            # mount): fall back to mint time so the URL still busts caches.
+            return f"{url}?v={time.time_ns() // 1_000_000}"
+        version = blake2b(f"{stat_result.st_size}:{stat_result.st_mtime_ns}".encode(), digest_size=8).hexdigest()
+        return f"{url}?v={version}"
 
     def delete_file(self, path: Path) -> None:
         """Delete a file from local storage.
