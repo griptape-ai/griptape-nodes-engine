@@ -751,7 +751,8 @@ class TestEachMidSessionArrivalGoesThroughTheRegisteringDoor:
     wait for. Two handlers bring one library in mid-session and both reach it the same way: they
     dispatch `RegisterLibraryFromFileRequest`, and registering the templates is what that handler
     does. So neither registers anything itself, and neither may take the inner
-    `_register_library_from_file` shortcut the batch loops use.
+    `_register_library_from_file` shortcut the batch loops use. `TestTheConcurrentSyncBatch` below
+    covers the one caller that drives these doors several at a time.
 
     These tests run the real handler behind the mocked dispatch for exactly that reason -- asserting
     only that some request went out would pass just as happily if the path called the inner one.
@@ -853,6 +854,15 @@ class TestEachMidSessionArrivalGoesThroughTheRegisteringDoor:
         assert result.succeeded(), result.result_details
         register_one.assert_awaited_once()
 
+
+class TestTheConcurrentSyncBatch:
+    """Sync is the one batch built out of mid-session doors: it drives `UpdateLibraryRequest`.
+
+    Each update reloads one library and registers its workflows itself, which is right for a
+    library arriving alone and wrong for several at once -- so this batch cannot use the gate to
+    hold them back (it would deadlock), and has to repair the result afterwards instead.
+    """
+
     @pytest.mark.asyncio
     async def test_sync_leaves_the_gate_open_for_the_updates_it_drives(self, engine: Engine) -> None:
         """Sync drives `UpdateLibraryRequest` per library, and each one registers its own.
@@ -901,8 +911,110 @@ class TestEachMidSessionArrivalGoesThroughTheRegisteringDoor:
         assert isinstance(result, SyncLibrariesResultSuccess)
         assert result.libraries_updated == 1
         assert observed == {"gate_open_during_the_check_pass": True, "gate_open_during_the_update_pass": True}
-        # Sync registers nothing itself: each update it drives registers the one library it reloaded.
+        # Sync does not touch the whole set: the updates it drives each reload one library, and
+        # the pass afterwards rebuilds exactly those. See the test below.
         register_all.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_sync_rebuilds_the_updated_libraries_workflows_after_the_batch(self, engine: Engine) -> None:
+        """The updates run concurrently, so each one registers while siblings are mid-unload.
+
+        A workflow naming a sibling that is between its own unload and reload is recorded as
+        depending on a library that is not installed, and nothing recomputes that. So sync takes
+        the updated libraries' entries out and puts them back once every update has finished --
+        out and back in, because re-registering skips a key already in the registry.
+        """
+        library_manager = engine.library_manager
+        other_library = "OtherLib"
+        updating = [LIBRARY_NAME, other_library]
+        sequence: list[str] = []
+
+        async def dispatch(request: object) -> object:
+            if isinstance(request, LoadLibrariesRequest):
+                return LoadLibrariesResultSuccess(result_details="loaded")
+            if isinstance(request, ListRegisteredLibrariesRequest):
+                return ListRegisteredLibrariesResultSuccess(libraries=updating, result_details="two libraries")
+            if isinstance(request, CheckLibraryUpdateRequest):
+                return CheckLibraryUpdateResultSuccess(
+                    has_update=True,
+                    current_version="1.0.0",
+                    latest_version="2.0.0",
+                    git_remote="https://example.invalid/lib.git",
+                    git_ref="main",
+                    local_commit="aaaaaaa",
+                    remote_commit="bbbbbbb",
+                    result_details="update available",
+                )
+            if isinstance(request, UpdateLibraryRequest):
+                sequence.append(f"update:{request.library_name}")
+                return UpdateLibraryResultSuccess(old_version="1.0.0", new_version="2.0.0", result_details="updated")
+            msg = f"Unexpected request: {type(request).__name__}"
+            raise AssertionError(msg)
+
+        def unregister(library_name: str) -> None:
+            sequence.append(f"out:{library_name}")
+
+        async def register(library_name: str) -> None:
+            sequence.append(f"in:{library_name}")
+
+        with (
+            patch.object(engine.config_manager, "get_config_value", MagicMock(return_value=[])),
+            patch.object(engine, "ahandle_request", AsyncMock(side_effect=dispatch)),
+            patch.object(library_manager, "_unregister_workflows_for_library", MagicMock(side_effect=unregister)),
+            patch.object(library_manager, "register_workflows_for_registered_library", AsyncMock(side_effect=register)),
+        ):
+            result = await library_manager.sync_libraries_request(SyncLibrariesRequest())
+
+        assert isinstance(result, SyncLibrariesResultSuccess)
+        assert result.libraries_updated == len(updating)
+        # The updates go first, in whichever order the task group finishes them. Every rebuild
+        # lands after all of them, which is the point: no library is mid-unload by then.
+        updates, rebuilds = sequence[: len(updating)], sequence[len(updating) :]
+        assert sorted(updates) == sorted(f"update:{name}" for name in updating)
+        assert rebuilds == [f"out:{LIBRARY_NAME}", f"in:{LIBRARY_NAME}", f"out:{other_library}", f"in:{other_library}"]
+
+    @pytest.mark.asyncio
+    async def test_sync_rebuilds_nothing_when_no_library_updated(self, engine: Engine) -> None:
+        """Nothing registered during the batch, so there is no mid-batch verdict to redo.
+
+        Rebuilding anyway would take every library's workflows out of the picker and put them back
+        on every sync, announcing a removal and a re-add to clients for no change.
+        """
+        library_manager = engine.library_manager
+        unregister = MagicMock(return_value=None)
+        register = AsyncMock(return_value=None)
+
+        async def dispatch(request: object) -> object:
+            if isinstance(request, LoadLibrariesRequest):
+                return LoadLibrariesResultSuccess(result_details="loaded")
+            if isinstance(request, ListRegisteredLibrariesRequest):
+                return ListRegisteredLibrariesResultSuccess(libraries=[LIBRARY_NAME], result_details="one library")
+            if isinstance(request, CheckLibraryUpdateRequest):
+                return CheckLibraryUpdateResultSuccess(
+                    has_update=False,
+                    current_version="1.0.0",
+                    latest_version="1.0.0",
+                    git_remote="https://example.invalid/lib.git",
+                    git_ref="main",
+                    local_commit="aaaaaaa",
+                    remote_commit="aaaaaaa",
+                    result_details="up to date",
+                )
+            msg = f"Unexpected request: {type(request).__name__}"
+            raise AssertionError(msg)
+
+        with (
+            patch.object(engine.config_manager, "get_config_value", MagicMock(return_value=[])),
+            patch.object(engine, "ahandle_request", AsyncMock(side_effect=dispatch)),
+            patch.object(library_manager, "_unregister_workflows_for_library", unregister),
+            patch.object(library_manager, "register_workflows_for_registered_library", register),
+        ):
+            result = await library_manager.sync_libraries_request(SyncLibrariesRequest())
+
+        assert isinstance(result, SyncLibrariesResultSuccess)
+        assert result.libraries_updated == 0
+        unregister.assert_not_called()
+        register.assert_not_awaited()
 
 
 class TestLibraryWorkflowsSurviveAWorkspaceRescan:

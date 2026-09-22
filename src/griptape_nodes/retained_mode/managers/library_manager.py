@@ -7317,6 +7317,7 @@ class LibraryManager(EngineScoped):
         libraries_updated = 0
         libraries_deferred = 0
         libraries_to_update: list[LibraryUpdateInfo] = []
+        updated_library_names: list[str] = []
 
         for library_name, check_result in check_results.items():
             if not isinstance(check_result, CheckLibraryUpdateResultSuccess):
@@ -7420,6 +7421,7 @@ class LibraryManager(EngineScoped):
                 continue
 
             libraries_updated += 1
+            updated_library_names.append(library_name)
             update_summary[library_name] = {
                 "old_version": update_result.old_version,
                 "new_version": update_result.new_version,
@@ -7431,6 +7433,8 @@ class LibraryManager(EngineScoped):
                 update_result.old_version,
                 update_result.new_version,
             )
+
+        await self._rebuild_workflows_for_updated_libraries(updated_library_names)
 
         # Build result details
         details = f"Downloaded {libraries_downloaded} libraries. Checked {libraries_checked} libraries. {libraries_updated} updated."
@@ -7445,6 +7449,29 @@ class LibraryManager(EngineScoped):
             update_summary=update_summary,
             result_details=details,
         )
+
+    async def _rebuild_workflows_for_updated_libraries(self, library_names: list[str]) -> None:
+        """Take the updated libraries' workflows out and put them back, after every update is done.
+
+        The updates above run concurrently, and each one unloads its library and registers it
+        again. Registering resolves a workflow's `node_libraries_referenced` against
+        `LibraryRegistry` as it stands right then -- which, mid-batch, is missing whichever
+        siblings are between their own unload and reload. So a workflow that names a sibling is
+        recorded as depending on a library that is not installed, when it is merely not installed
+        for another moment, and nothing recomputes that afterwards.
+
+        Out and back in, rather than registering again: a key already in the registry is skipped,
+        so a second registration would leave the mid-batch verdict exactly where it is.
+
+        Only the libraries that updated. Every other library's workflows were registered before
+        this sync began, against a set that was complete at the time.
+        """
+        if not library_names:
+            return
+
+        for library_name in library_names:
+            self._unregister_workflows_for_library(library_name)
+            await self.register_workflows_for_registered_library(library_name)
 
     async def inspect_library_repo_request(self, request: InspectLibraryRepoRequest) -> ResultPayload:
         """Inspect a library's metadata from a git repository without downloading the full repository."""
