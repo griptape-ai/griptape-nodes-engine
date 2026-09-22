@@ -98,9 +98,14 @@ def _trait_identity(entry: dict[str, Any]) -> dict[str, Any]:
 
 @dataclass(frozen=True)
 class TraitStateEntry:
-    """Saved trait identity and state."""
+    """Saved trait identity and state.
+
+    ``trait_module`` distinguishes same-named traits from different libraries, and is what
+    finds the class when no instance is attached to carry the state.
+    """
 
     trait_name: str
+    trait_module: str | None = None
     trait_state: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -108,10 +113,13 @@ class TraitStateEntry:
         trait_name = entry.get("trait_name")
         if not isinstance(trait_name, str):
             return None
+        trait_module = entry.get("trait_module")
+        if not isinstance(trait_module, str):
+            trait_module = None
         trait_state = entry.get("trait_state")
         if not isinstance(trait_state, dict):
             trait_state = {}
-        return cls(trait_name=trait_name, trait_state=trait_state)
+        return cls(trait_name=trait_name, trait_module=trait_module, trait_state=trait_state)
 
     def to_dict(self) -> dict[str, Any]:
-        return {"trait_name": self.trait_name, "trait_state": self.trait_state}
+        return {"trait_name": self.trait_name, "trait_module": self.trait_module, "trait_state": self.trait_state}
