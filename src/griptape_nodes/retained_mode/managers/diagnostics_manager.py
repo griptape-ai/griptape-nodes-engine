@@ -856,9 +856,9 @@ class DiagnosticsManager(EngineScoped):
                     enabled=lib_info.enabled,
                     is_sandbox=lib_info.is_sandbox,
                     requires_worker=lib_info.requires_worker,
-                    # None means "no worker was ever started for this library", which is
-                    # different from "a worker was started and has not come up".
-                    worker_ready=lib_info.worker_ready.is_set() if lib_info.worker_ready is not None else None,
+                    executes_in_worker=lib_info.executes_in_worker,
+                    worker_ready=self._worker_ready(lib_info),
+                    worker_unavailable_reason=self._worker_unavailable_reason(lib_info, redactor),
                     registered_path=(
                         redactor.redact_path(lib_info.registered_path) if lib_info.registered_path else None
                     ),
@@ -1116,6 +1116,41 @@ class DiagnosticsManager(EngineScoped):
         if collated is None:
             return None
         return redactor.redact_text(collated)
+
+    def _worker_ready(self, lib_info: LibraryManager.LibraryInfo) -> bool | None:
+        """Whether a worker is serving this library, or None when none is meant to.
+
+        Asks whether a worker is registered rather than whether its readiness gate has
+        settled. A gate exists only once a spawn has been requested, and `has_settled`
+        answers True when there is no gate at all -- so every library whose spawn was never
+        requested would be reported as having a worker up. That is the ordinary case for a
+        bundle collected from the CLI, where workers start with a session that never begins.
+        """
+        if not lib_info.executes_in_worker or lib_info.library_name is None:
+            return None
+        return self.engine.worker_manager.get_worker_for_key(lib_info.library_name) is not None
+
+    def _worker_unavailable_reason(self, lib_info: LibraryManager.LibraryInfo, redactor: Redactor) -> str | None:
+        """Why no worker is serving this library, or None when one is or none is needed.
+
+        Composed from both owners in the order `get_worker_for_library` composes it, so the
+        report names the same cause as the error the user was shown. The library knows the
+        reasons that apply wherever its nodes run -- a declared resource the machine lacks --
+        and the worker manager knows the process-level ones. The failed execution environment
+        build comes last: the spawn path hands that reason to the worker manager, but only
+        once it has run, and the build failing is often why it never did.
+        """
+        if not lib_info.executes_in_worker or lib_info.library_name is None:
+            return None
+
+        reason = (
+            lib_info.execution_unavailable_reason
+            or self.engine.worker_manager.worker_unavailable_reason(lib_info.library_name)
+            or lib_info.execution_env_failure
+        )
+        if reason is None:
+            return None
+        return redactor.redact_text(reason)
 
     def _workspace_path(self) -> Path | None:
         """Return the workspace directory, or None when it cannot be resolved."""

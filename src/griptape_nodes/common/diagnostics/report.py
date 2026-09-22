@@ -167,6 +167,14 @@ class LibraryDiagnostics(BaseModel):
 
     Attributes:
         name: Registered library name, or the path when the name could not be read.
+        requires_worker: Whether the library declares legacy worker mode, which also keeps
+            its nodes from loading in this process at all.
+        executes_in_worker: Whether its nodes run in a separate worker process, for either
+            reason -- legacy worker mode, or execution dependencies.
+        worker_ready: Whether a worker is registered and serving the library, when one runs
+            it at all. None when nothing about this library needs a worker.
+        worker_unavailable_reason: Why no worker is serving it, when none is. Says the same
+            thing the error a user sees says.
         registered_path: The path as written in the user's ``libraries_to_register`` setting,
             before it was resolved, so a problem traces back to the config line behind it.
         problems: Everything that went wrong while loading, as the engine already reports it
@@ -181,7 +189,9 @@ class LibraryDiagnostics(BaseModel):
     enabled: bool = True
     is_sandbox: bool = False
     requires_worker: bool = False
+    executes_in_worker: bool = False
     worker_ready: bool | None = None
+    worker_unavailable_reason: str | None = None
     registered_path: str | None = None
     problems: str | None = None
 
