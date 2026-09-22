@@ -20,6 +20,13 @@ class ColorPicker(Trait):
     def get_trait_keys(cls) -> list[str]:
         return ["color_picker"]
 
+    def to_state(self) -> dict[str, Any]:
+        return {"format": self.format}
+
+    def apply_state(self, state: dict[str, Any]) -> None:
+        if "format" in state:
+            self.format = state["format"]
+
     def ui_options_for_trait(self) -> dict:
         return {"color_picker": {"format": self.format}}
 

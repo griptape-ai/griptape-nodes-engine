@@ -1,6 +1,6 @@
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal, get_args
+from typing import TYPE_CHECKING, Any, Literal, get_args
 
 from griptape_nodes.exe_types.core_types import NodeMessagePayload, NodeMessageResult, Trait
 
@@ -158,6 +158,28 @@ class Button(Trait):
         else:
             self.on_click_callback = on_click
         self.get_button_state_callback = get_button_state
+
+    def to_state(self) -> dict[str, Any]:
+        return {
+            "label": self.label,
+            "variant": self.variant,
+            "size": self.size,
+            "state": self.state,
+            "icon": self.icon,
+            "icon_class": self.icon_class,
+            "icon_position": self.icon_position,
+            "full_width": self.full_width,
+            "loading_label": self.loading_label,
+            "loading_icon": self.loading_icon,
+            "loading_icon_class": self.loading_icon_class,
+            "tooltip": self.tooltip,
+            "button_link": self.button_link,
+        }
+
+    def apply_state(self, state: dict[str, Any]) -> None:
+        for name in self.to_state():
+            if name in state:
+                setattr(self, name, state[name])
 
     def _create_button_link_handler(self, url: str) -> OnClickCallback:
         """Create a default handler for button_link URLs."""

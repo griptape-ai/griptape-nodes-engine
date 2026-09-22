@@ -40,6 +40,21 @@ class Trait(ABC, BaseNodeElement):
     def get_trait_keys(cls) -> list[str]:
         """This will return keys that trigger this trait."""
 
+    def to_state(self) -> dict[str, Any]:
+        """Return state that must survive a workflow save."""
+        return {}
+
+    def apply_state(self, state: dict[str, Any]) -> None:
+        """Apply state from a saved workflow."""
+        if state:
+            msg = f"Trait '{type(self).__name__}' does not accept saved state."
+            raise ValueError(msg)
+
+    @classmethod
+    def state_from_ui_options(cls, _ui_options: dict[str, Any]) -> dict[str, Any]:
+        """Return trait state represented by an inbound UI option write."""
+        return {}
+
     def ui_options_for_trait(self) -> dict:
         """Returns a list of UI options for the parameter as a list of strings or dictionaries."""
         return {}
