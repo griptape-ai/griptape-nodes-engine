@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
+import anyio
 import pytest
 
 from griptape_nodes.utils.file_utils import (
@@ -854,21 +855,19 @@ class TestPromoteScratchFile:
         assert not destination.exists()
 
     def test_async_form_promotes_and_retries(self, temp_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        import anyio as anyio_module
-
         scratch = temp_dir / ".scratch.partial"
         scratch.write_bytes(b"new")
         destination = temp_dir / "served.bin"
 
-        real_replace = anyio_module.Path.replace
+        real_replace = anyio.Path.replace
         denials = [PermissionError("held")]
 
-        async def transiently_denied(self: anyio_module.Path, target: str | Path) -> object:
+        async def transiently_denied(self: anyio.Path, target: str | Path) -> object:
             if denials:
                 raise denials.pop()
             return await real_replace(self, target)
 
-        monkeypatch.setattr(anyio_module.Path, "replace", transiently_denied)
+        monkeypatch.setattr(anyio.Path, "replace", transiently_denied)
 
         asyncio.run(promote_scratch_file_async(scratch, destination))
 
