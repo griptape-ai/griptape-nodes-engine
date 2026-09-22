@@ -93,7 +93,14 @@ class BaseColorManagementProvider(EngineScoped, ABC):
                 must tolerate unknown keys.
 
         Returns:
-            A RequestPayload the caller dispatches to perform the transform.
+            A RequestPayload the caller dispatches via ``GriptapeNodes.handle_request()``
+            (or ``Engine.handle_request()``). Whatever handler the provider registers for
+            this request type must resolve it to
+            ``griptape_nodes.retained_mode.events.artifact_events.TransformImageColorResultSuccess``
+            (carrying the transformed ``pixels`` and resulting ``color_space``) or
+            ``TransformImageColorResultFailure`` -- this is the one part of the contract
+            that isn't provider-opaque, since generic callers like ``ArtifactManager``
+            need a stable shape to pull transformed pixels back out of.
         """
         ...
 
