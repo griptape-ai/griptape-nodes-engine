@@ -426,7 +426,7 @@ class DiagnosticsBundle:
         return f"""# Griptape Nodes diagnostics bundle
 
 This folder holds everything needed to work out why Griptape Nodes behaved the way it
-did on one machine. It was created by the engine itself, and it is safe to share.
+did on one machine. It was created by the engine itself.
 
 ## What is in here
 
@@ -434,12 +434,20 @@ did on one machine. It was created by the engine itself, and it is safe to share
 
 ## What was taken out
 
-No API keys, passwords, or other secrets are in here. The engine knows its own secrets,
-so it searched every file above and removed them. It also removed anything shaped like a
-credential, and replaced the home directory with `~` and the username with `<user>`.
+The engine knows its own secrets, so it searched every file above and removed them. It
+also removed anything shaped like a credential, and replaced the home directory with `~`
+and the username with `<user>`.
 
 Anything removed shows up as `<redacted>`. `{MANIFEST_FILE_NAME}` counts every removal,
 so a setting that looks empty can be told apart from one that was hidden.
+
+## Before you share it
+
+What is left depends on what was on this machine. A secret the engine was never told
+about, in a shape nothing matches -- a password typed into a node's text field, a token a
+library wrote to its own log in its own format -- is not something it can find. The logs
+and the workflow file are where to look. Anything posted somewhere public stays public,
+so read those two first.
 
 ## What might be missing
 
@@ -481,16 +489,16 @@ the log level to `DEBUG`, reproduce the problem, and make a new bundle.
         session_log_path = f"{LOGS_DIRECTORY_NAME}/{SESSION_LOG_FILE_NAME}"
         if self._has_entry(session_log_path):
             lines += [
-                f"- `{session_log_path}` -- everything the engine logged from",
-                "  the moment it started until this bundle was made.",
+                f"- `{session_log_path}` -- everything the engine logged from the moment it started",
+                "  until this bundle was made. Here because none of it reached a log file on disk.",
             ]
 
         # The session log lives in the same directory, so this asks whether anything else
         # does: the files rotation left on disk from earlier runs.
         if self._has_entry_in(LOGS_DIRECTORY_NAME, excluding=session_log_path):
             lines += [
-                f"- `{LOGS_DIRECTORY_NAME}/` -- the log files kept on disk, newest first. Useful when the",
-                "  problem happened in an earlier session.",
+                f"- `{LOGS_DIRECTORY_NAME}/` -- the log files kept on disk, newest first. Start at the top;",
+                "  the ones below it are there for a problem that happened in an earlier session.",
             ]
 
         if self._has_entry_in(WORKFLOW_DIRECTORY_NAME):
