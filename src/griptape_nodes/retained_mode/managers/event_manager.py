@@ -215,6 +215,9 @@ class EventManager(EngineScoped):
         self._request_type_to_manager: dict[type[RequestPayload], Callable] = defaultdict(list)  # pyright: ignore[reportAttributeAccessIssue]
         # Dictionary to store ALL SUBSCRIBERS to app events.
         self._app_event_listeners: dict[type[AppPayload], set[Callable]] = {}
+        # Listeners that opted into app events another process raised. Kept apart from the set
+        # above so an adopted event cannot reach a listener that assumed it describes this process.
+        self._peer_app_event_listeners: dict[type[AppPayload], set[Callable]] = {}
         # Dictionary to store ALL SUBSCRIBERS to execution events (the live feed of
         # ExecutionPayloads emitted during a run, e.g. AgentStreamEvent). Lets a node
         # tap the feed while it runs and react (e.g. stream tokens to a parameter).
@@ -1311,10 +1314,33 @@ class EventManager(EngineScoped):
     def add_listener_to_app_event(
         self, app_event_type: type[AP], callback: Callable[[AP], None] | Callable[[AP], Awaitable[None]]
     ) -> None:
+        """Subscribe to an app event raised by THIS process.
+
+        A listener here never sees another process's copy. Almost every app-event listener
+        configures the process it lives in, and a peer's payload describes the peer, so acting on
+        it would corrupt the receiver. Use ``add_listener_to_peer_app_event`` to react to what
+        another process did.
+        """
         listener_set = self._app_event_listeners.get(app_event_type)
         if listener_set is None:
             listener_set = set()
             self._app_event_listeners[app_event_type] = listener_set
+
+        listener_set.add(callback)
+
+    def add_listener_to_peer_app_event(
+        self, app_event_type: type[AP], callback: Callable[[AP], None] | Callable[[AP], Awaitable[None]]
+    ) -> None:
+        """Subscribe to an app event another process raised and this one received.
+
+        Separate registration so the safe behaviour is the default: forgetting this means a
+        listener does not see peer events, rather than applying a peer's state to this process.
+        Register a callback on both sets when it should handle either origin.
+        """
+        listener_set = self._peer_app_event_listeners.get(app_event_type)
+        if listener_set is None:
+            listener_set = set()
+            self._peer_app_event_listeners[app_event_type] = listener_set
 
         listener_set.add(callback)
 
@@ -1439,14 +1465,26 @@ class EventManager(EngineScoped):
                 asyncio.run(_broadcast_async())
 
     async def abroadcast_app_event(self, app_event: AP) -> None:
-        """Broadcast an app event to all registered listeners (async version).
+        """Broadcast an app event this process raised, to its local listeners (async version).
 
         Args:
             app_event: The app event to broadcast
         """
+        await self._abroadcast_to(self._app_event_listeners, app_event)
+
+    async def abroadcast_peer_app_event(self, app_event: AP) -> None:
+        """Broadcast an app event received from another process, to peer-aware listeners only.
+
+        Args:
+            app_event: The app event another process raised
+        """
+        await self._abroadcast_to(self._peer_app_event_listeners, app_event)
+
+    async def _abroadcast_to(self, listeners: dict[type[AppPayload], set[Callable]], app_event: AP) -> None:
+        """Dispatch `app_event` to the callbacks registered for its type in `listeners`."""
         app_event_type = type(app_event)
-        if app_event_type in self._app_event_listeners:
-            listener_set = self._app_event_listeners[app_event_type]
+        if app_event_type in listeners:
+            listener_set = listeners[app_event_type]
 
             async with asyncio.TaskGroup() as tg:
                 for listener_callback in listener_set:

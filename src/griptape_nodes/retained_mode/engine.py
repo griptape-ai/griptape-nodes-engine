@@ -511,6 +511,9 @@ class Engine:
     async def abroadcast_app_event(self, app_event: AppPayload) -> None:
         await self._event_manager.abroadcast_app_event(app_event)
 
+    async def abroadcast_peer_app_event(self, app_event: AppPayload) -> None:
+        await self._event_manager.abroadcast_peer_app_event(app_event)
+
     def get_session_id(self) -> str | None:
         return self._session_manager.active_session_id
 
