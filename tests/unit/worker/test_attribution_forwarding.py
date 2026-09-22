@@ -93,11 +93,13 @@ class TestAttributionForwardingIsWired:
         """Forwarding is the default, so this pins that nothing has excluded it."""
         assert GetAttributionContextRequest not in LOCAL_ONLY_REQUEST_TYPES
 
-    def test_register_remote_handlers_finds_a_budget_manager_owner(self) -> None:
-        """`register_remote_handlers` needs a registered owner for every forwarded type.
+    def test_register_remote_handlers_installs_a_remote_handler(self) -> None:
+        """A type with no registered owner is skipped, so the handler is the only proof.
 
-        BudgetManager is therefore constructed unconditionally, including on workers -- a
-        bootstrap-order bug here would surface as a worker that cannot start at all.
+        `register_remote_handlers` walks the types the event manager knows about and passes
+        over any without an owner, silently. BudgetManager is constructed on every engine,
+        including a worker's, and this pins that its request comes out forwarded rather than
+        answered against the worker's own replica.
         """
         worker_engine = Engine()
 
