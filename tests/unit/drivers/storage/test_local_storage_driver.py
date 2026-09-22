@@ -417,7 +417,9 @@ class TestDeterministicUrlVersioning:
 
         served.write_bytes(b"CONTENT")
         stat_result = served.stat()
-        os.utime(served, ns=(stat_result.st_atime_ns, stat_result.st_mtime_ns + 1))
+        # A full second: NTFS stores 100ns ticks and FAT whole seconds, so a
+        # sub-resolution bump would round away and defeat the test.
+        os.utime(served, ns=(stat_result.st_atime_ns, stat_result.st_mtime_ns + 1_000_000_000))
         after = driver.create_signed_download_url(served)
 
         assert before != after
