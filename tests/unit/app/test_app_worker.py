@@ -1700,7 +1700,9 @@ class TestOrchestratorHeartbeatLoop:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 
-        assert not worker_manager._tx.ws_outgoing_queue.empty()
+        # Sent directly rather than queued: a challenge left in a queue another task drains
+        # cannot be counted against the worker that never received it.
+        worker_manager._tx.send_message.assert_called()  # type: ignore[union-attr]
 
     @pytest.mark.asyncio
     async def test_does_not_evict_fresh_worker(

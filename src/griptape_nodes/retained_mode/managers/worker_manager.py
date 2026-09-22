@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING, Any
 
 import anyio
 
-from griptape_nodes.bootstrap.utils.subprocess_websocket_base import WebSocketMessage
 from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events import worker_events
@@ -345,10 +344,18 @@ class WorkerManager(EngineScoped):
                     request=worker_events.WorkerHeartbeatRequest(heartbeat_id=str(uuid.uuid4())),
                     response_topic=f"sessions/{session_id}/workers/{wid}/response",
                 )
-                await self._tx.ws_outgoing_queue.put(
-                    WebSocketMessage("EventRequest", hb.json(), registration.request_topic)
-                )
+                # Sent, not enqueued: the queue is drained by another task, so counting the
+                # `put` charges a worker for challenges that may still be sitting in it. An
+                # orchestrator too busy to drain must not read as a worker too dead to answer.
+                await self._tx.send_message("EventRequest", hb.json(), registration.request_topic)
                 registration.unanswered_challenges += 1
+                logger.debug(
+                    "Challenged worker %s on '%s'; %d unanswered of %d allowed.",
+                    wid,
+                    registration.request_topic,
+                    registration.unanswered_challenges,
+                    self.unanswered_challenges_allowed,
+                )
 
     async def worker_heartbeat_monitor(self) -> None:
         """Shut down the worker if orchestrator heartbeats stop arriving.
