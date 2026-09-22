@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from fnmatch import fnmatch
 from functools import partial
 from pathlib import Path
+from typing import Any
 
 import anyio
 import anyio.to_thread
@@ -63,6 +64,15 @@ def mtimes_match(mtime_a: float, mtime_b: float) -> bool:
 PROMOTE_MAX_ATTEMPTS = 3
 PROMOTE_RETRY_WAIT_SECONDS = 0.05
 
+# One policy for both promote forms, so tuning cannot drift between them.
+_PROMOTE_RETRY_KWARGS: dict[str, Any] = {
+    "retry": retry_if_exception_type(PermissionError),
+    "stop": stop_after_attempt(PROMOTE_MAX_ATTEMPTS),
+    "wait": wait_fixed(PROMOTE_RETRY_WAIT_SECONDS),
+    "before_sleep": before_sleep_log(logger, logging.DEBUG),
+    "reraise": True,
+}
+
 
 def promote_scratch_file(scratch: Path, destination: Path) -> None:
     """Rename a finished scratch file onto the destination it was staged for.
@@ -73,30 +83,23 @@ def promote_scratch_file(scratch: Path, destination: Path) -> None:
     denial persists. The scratch file is left in place on failure — its
     disposal policy belongs to the caller that created it.
 
+    Under contention this form sleeps up to
+    ``(PROMOTE_MAX_ATTEMPTS - 1) * PROMOTE_RETRY_WAIT_SECONDS`` on the calling
+    thread; a caller on an event loop should offload it (or the whole write)
+    to a worker thread, as with any blocking filesystem call.
+
     Args:
         scratch: The completed scratch file, in the destination's directory.
         destination: The served path to promote onto.
     """
-    for attempt in Retrying(
-        retry=retry_if_exception_type(PermissionError),
-        stop=stop_after_attempt(PROMOTE_MAX_ATTEMPTS),
-        wait=wait_fixed(PROMOTE_RETRY_WAIT_SECONDS),
-        before_sleep=before_sleep_log(logger, logging.DEBUG),
-        reraise=True,
-    ):
+    for attempt in Retrying(**_PROMOTE_RETRY_KWARGS):
         with attempt:
             scratch.replace(destination)
 
 
 async def promote_scratch_file_async(scratch: Path, destination: Path) -> None:
-    """Async form of :func:`promote_scratch_file`; same contract."""
-    async for attempt in AsyncRetrying(
-        retry=retry_if_exception_type(PermissionError),
-        stop=stop_after_attempt(PROMOTE_MAX_ATTEMPTS),
-        wait=wait_fixed(PROMOTE_RETRY_WAIT_SECONDS),
-        before_sleep=before_sleep_log(logger, logging.DEBUG),
-        reraise=True,
-    ):
+    """Async form of :func:`promote_scratch_file`; same contract, loop-safe waits."""
+    async for attempt in AsyncRetrying(**_PROMOTE_RETRY_KWARGS):
         with attempt:
             await anyio.Path(scratch).replace(destination)
 
