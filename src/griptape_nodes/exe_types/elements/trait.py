@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Self
 
 from griptape_nodes.exe_types.elements.base import BaseNodeElement
 
@@ -49,6 +49,15 @@ class Trait(ABC, BaseNodeElement):
         if state:
             msg = f"Trait '{type(self).__name__}' does not accept saved state."
             raise ValueError(msg)
+
+    @classmethod
+    def from_state(cls, state: dict[str, Any]) -> Self:
+        """Build a trait from saved state when the node did not build one.
+
+        Passes the state to the constructor. Override when ``to_state`` keys are not
+        constructor arguments.
+        """
+        return cls(**state)
 
     @classmethod
     def state_from_ui_options(cls, _ui_options: dict[str, Any]) -> dict[str, Any]:

@@ -4669,7 +4669,12 @@ class NodeManager(EngineScoped):
             try:
                 existing.apply_state(entry.trait_state)
             except (TypeError, ValueError):
-                NodeManager._warn_unsatisfiable_trait_state(parameter, entry.trait_name)
+                logger.warning(
+                    "Parameter '%s' was saved with state for its '%s' control, but the control did not "
+                    "accept it. The parameter keeps the state its node supplied.",
+                    parameter.name,
+                    entry.trait_name,
+                )
 
     @staticmethod
     def _parse_trait_entries(parameter: Parameter, trait_states: list[dict[str, Any]]) -> list[TraitStateEntry]:
@@ -4688,15 +4693,15 @@ class NodeManager(EngineScoped):
 
     @staticmethod
     def _pair_saved_traits(parameter: Parameter, entries: list[TraitStateEntry]) -> list[Trait | None]:
-        """Match by resolved class, consuming each attached trait at most once."""
+        """Match by resolved class, or by name when the class cannot be resolved.
+
+        The name fallback covers a library moving a trait to another module while the node
+        still builds it. Each attached trait is consumed at most once.
+        """
         unmatched = parameter.find_elements_by_type(Trait)
         paired: list[Trait | None] = []
         for entry in entries:
             trait_class = NodeManager._resolve_saved_trait(entry)
-            if trait_class is None and entry.trait_module is not None:
-                paired.append(None)
-                continue
-
             match = None
             for candidate in unmatched:
                 matches_resolved_class = trait_class is not None and type(candidate) is trait_class
@@ -4732,9 +4737,14 @@ class NodeManager(EngineScoped):
             )
             return None
         try:
-            trait = trait_class(**entry.trait_state)
+            trait = trait_class.from_state(entry.trait_state)
         except (TypeError, ValueError):
-            NodeManager._warn_unsatisfiable_trait_state(parameter, entry.trait_name)
+            logger.warning(
+                "Parameter '%s' was saved with the '%s' trait, but its saved state could not build that "
+                "control. The parameter loads without it. Check that the library providing it is up to date.",
+                parameter.name,
+                entry.trait_name,
+            )
             return None
         parameter.add_trait(trait)
         return trait
@@ -4744,15 +4754,6 @@ class NodeManager(EngineScoped):
         if entry.trait_module is None:
             return None
         return resolve_trait(entry.trait_name, entry.trait_module)
-
-    @staticmethod
-    def _warn_unsatisfiable_trait_state(parameter: Parameter, trait_name: str) -> None:
-        logger.warning(
-            "Parameter '%s' was saved with the '%s' trait, but its saved state could not build that control. "
-            "The parameter loads without it. Check that the library providing it is up to date.",
-            parameter.name,
-            trait_name,
-        )
 
     @staticmethod
     def _manage_alter_details(parameter: Parameter, base_node_obj: BaseNode) -> dict:

@@ -88,6 +88,31 @@ class Ranged(Trait):
         return {}
 
 
+class Threshold(Trait):
+    """Saves ``level`` while its constructor takes ``threshold``."""
+
+    def __init__(self, threshold: int = 1) -> None:
+        super().__init__()
+        self.level = threshold
+
+    @classmethod
+    def get_trait_keys(cls) -> list[str]:
+        return []
+
+    def to_state(self) -> dict[str, int]:
+        return {"level": self.level}
+
+    @classmethod
+    def from_state(cls, state: dict) -> "Threshold":
+        return cls(threshold=state["level"])
+
+    def ui_options_for_trait(self) -> dict:
+        return {}
+
+
+_SAVED_THRESHOLD = 7
+
+
 @pytest.fixture
 def foreign_twin() -> Generator[ModuleType, None, None]:
     """A second Trait class named Twin, importable from its own module.
@@ -137,6 +162,18 @@ class TestPairingByClass:
         )
 
         assert (slider.min, slider.max) == (2, 8)
+
+    def test_an_entry_whose_module_moved_still_reaches_an_attached_trait(self) -> None:
+        slider = Slider(min_val=0, max_val=1)
+        parameter = Parameter(name="p", tooltip="t", traits={slider})
+
+        NodeManager._apply_trait_states(
+            parameter,
+            [{"trait_name": "Slider", "trait_module": "moved_away.slider", "trait_state": {"min_val": 2}}],
+        )
+
+        assert slider.min == 2  # noqa: PLR2004
+        assert len(parameter.find_elements_by_type(Slider)) == 1
 
     def test_a_same_named_trait_from_another_library_is_not_mistaken_for_it(self, foreign_twin: ModuleType) -> None:
         local = Twin(tag="local")
@@ -256,6 +293,19 @@ class TestAValidatorRejectingSavedState:
 
         assert any("Ranged" in record.getMessage() for record in caplog.records)
 
+    def test_the_warning_says_the_attached_trait_stays(self, caplog: pytest.LogCaptureFixture) -> None:
+        parameter = Parameter(name="p", tooltip="t", traits={Ranged(level=_ALLOWED_LEVEL)})
+        caplog.set_level("WARNING", logger="griptape_nodes")
+
+        NodeManager._apply_trait_states(
+            parameter,
+            [{"trait_name": "Ranged", "trait_module": __name__, "trait_state": {"level": 99}}],
+        )
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert any("keeps the state its node supplied" in message for message in messages)
+        assert not any("loads without" in message for message in messages)
+
     def test_no_trait_is_built_when_none_is_already_attached(self) -> None:
         parameter = Parameter(name="p", tooltip="t", traits=set())
 
@@ -276,3 +326,16 @@ class TestAValidatorRejectingSavedState:
         )
 
         assert any("Ranged" in record.getMessage() for record in caplog.records)
+
+
+class TestBuildingFromState:
+    def test_a_trait_can_build_itself_from_state_its_constructor_does_not_take(self) -> None:
+        parameter = Parameter(name="p", tooltip="t", traits=set())
+
+        NodeManager._apply_trait_states(
+            parameter,
+            [{"trait_name": "Threshold", "trait_module": __name__, "trait_state": {"level": _SAVED_THRESHOLD}}],
+        )
+
+        built = parameter.find_elements_by_type(Threshold)
+        assert [trait.level for trait in built] == [_SAVED_THRESHOLD]

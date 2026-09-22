@@ -461,7 +461,13 @@ class TestOnlyChangedTraitStateIsSaved:
 
         traits = _altered_trait_states(engine, node, "width")
 
-        assert traits == [{"trait_name": "Slider", "trait_state": {"max_val": NARROWED_MAX}}]
+        assert traits == [
+            {
+                "trait_name": "Slider",
+                "trait_module": "griptape_nodes.traits.slider",
+                "trait_state": {"max_val": NARROWED_MAX},
+            }
+        ]
 
     def test_changed_choices_leave_constructor_config_out(self, engine: Engine) -> None:
         node = _add_declared_node(engine, "source")
@@ -469,7 +475,13 @@ class TestOnlyChangedTraitStateIsSaved:
 
         traits = _altered_trait_states(engine, node, "model")
 
-        assert traits == [{"trait_name": "Options", "trait_state": {"choices": ["x", "y"]}}]
+        assert traits == [
+            {
+                "trait_name": "Options",
+                "trait_module": "griptape_nodes.traits.options",
+                "trait_state": {"choices": ["x", "y"]},
+            }
+        ]
 
 
 class TestRunTimeStateReachesTheTrait:
