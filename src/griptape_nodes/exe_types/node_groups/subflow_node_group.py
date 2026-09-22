@@ -49,6 +49,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger("griptape_nodes")
 
 NODE_GROUP_FLOW = "NodeGroupFlow"
+# Name which of the group's parameters sit on its left and right rail. Semantically
+# these are sets, not lists (list only for serialization): the editor only ever tests
+# parameter membership.
+# NOTE: excluding a parameter from both lists effectively hides it in the UI.
 LEFT_PARAMETERS_KEY = "left_parameters"
 RIGHT_PARAMETERS_KEY = "right_parameters"
 
@@ -86,12 +90,13 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         metadata: dict[Any, Any] | None = None,
     ) -> None:
         super().__init__(name, metadata)
+        self._dedupe_side_parameter_metadata()
         self.control_in = ControlParameterInput(name="group_exec_in")
         self.add_parameter(self.control_in)
-        self.metadata[LEFT_PARAMETERS_KEY] = [self.control_in.name]
+        self._register_side_parameter(LEFT_PARAMETERS_KEY, self.control_in.name)
         self.control_out = ControlParameterOutput(name="group_exec_out")
         self.add_parameter(self.control_out)
-        self.metadata[RIGHT_PARAMETERS_KEY] = [self.control_out.name]
+        self._register_side_parameter(RIGHT_PARAMETERS_KEY, self.control_out.name)
         self.execution_environment = Parameter(
             name="execution_environment",
             tooltip="Environment that the group should execute in",
@@ -285,6 +290,37 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             "parameter_names": parameter_names,
         }
 
+    def _dedupe_side_parameter_metadata(self) -> None:
+        """Drop duplicate rail entries carried by a workflow saved by an older engine.
+
+        This is cleanup for workflows created before #5236; or after #5564 yet prior
+        to libraries adopting it (in particular, griptape-nodes-library-standard#628).
+
+        Older engines and node libraries appended their built-in names on every
+        construction and the repeats were saved in the workflow metadata, growing
+        indefinitely.
+        """
+        for metadata_key in (LEFT_PARAMETERS_KEY, RIGHT_PARAMETERS_KEY):
+            side_parameters: list[str] | None = self.metadata.get(metadata_key)
+            if side_parameters is None:
+                continue
+            side_parameters[:] = dict.fromkeys(side_parameters)
+
+    def _register_side_parameter(self, metadata_key: str, parameter_name: str) -> None:
+        """Record that a parameter belongs on the group's left or right rail.
+
+        Membership is all that is recorded; where the name lands in the list means nothing (see the
+        comment on LEFT_PARAMETERS_KEY / RIGHT_PARAMETERS_KEY).
+
+        Args:
+            metadata_key: LEFT_PARAMETERS_KEY or RIGHT_PARAMETERS_KEY
+            parameter_name: The parameter to record on that side
+        """
+        side_parameters = self.metadata.setdefault(metadata_key, [])
+        if parameter_name in side_parameters:
+            return
+        side_parameters.append(parameter_name)
+
     def _clone_and_add_parameter(self, param: Parameter, new_name: str) -> None:
         """Clone a parameter with a new name and add it to this node.
 
@@ -353,14 +389,10 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             msg = f"{self.name} failed to create proxy parameter '{result.parameter_name}'"
             raise RuntimeError(msg)
         if is_incoming:
-            if LEFT_PARAMETERS_KEY in self.metadata:
-                self.metadata[LEFT_PARAMETERS_KEY].append(proxy_param.name)
-            else:
-                self.metadata[LEFT_PARAMETERS_KEY] = [proxy_param.name]
-        elif RIGHT_PARAMETERS_KEY in self.metadata:
-            self.metadata[RIGHT_PARAMETERS_KEY].append(proxy_param.name)
+            side_key = LEFT_PARAMETERS_KEY
         else:
-            self.metadata[RIGHT_PARAMETERS_KEY] = [proxy_param.name]
+            side_key = RIGHT_PARAMETERS_KEY
+        self._register_side_parameter(side_key, proxy_param.name)
 
         return proxy_param
 
