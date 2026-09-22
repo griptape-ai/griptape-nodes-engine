@@ -212,8 +212,17 @@ def node_access_request(node: BaseNode, candidate_model_ids: list[str] | None = 
     registering library in ``node.metadata["library"]``, and that is the only thing on hand that
     says which of the two this instance came from.
 
-    ``specific_library_name`` is ``None`` for a node built outside the library path -- a transient
-    probe, a test fixture -- which leaves the engine's lookup-by-name, correct whenever exactly one
+    The node type comes off ``metadata`` too, and has to: a library keys its node types by the
+    class name its JSON declared, and ``register_lazy_node_type`` does not import the class to
+    check that name against ``__name__``. A module that aliases its class (``AliasKey =
+    RealClass``) is therefore registered under one name while ``__name__`` reports the other, and
+    the engine resolves the type by the registry key -- so querying as ``__name__`` would fail
+    closed on a node whose library resolves fine. ``get_declared_models``, which fills the same
+    dropdown's choices out of the same library, already reads both fields this way.
+
+    Each field falls back for a node built outside the library path -- a transient probe, a test
+    fixture -- where nothing recorded either one: the type to ``type(node).__name__``, and the
+    library to ``None``, which leaves the engine's lookup-by-name, correct whenever exactly one
     library declares the type.
 
     Args:
@@ -224,8 +233,11 @@ def node_access_request(node: BaseNode, candidate_model_ids: list[str] | None = 
     library_name = node.metadata.get("library")
     if not isinstance(library_name, str):
         library_name = None
+    node_type = node.metadata.get("node_type")
+    if not isinstance(node_type, str):
+        node_type = type(node).__name__
     return QueryModelAccessForNodeRequest(
-        node_type=type(node).__name__,
+        node_type=node_type,
         specific_library_name=library_name,
         candidate_model_ids=candidate_model_ids,
     )

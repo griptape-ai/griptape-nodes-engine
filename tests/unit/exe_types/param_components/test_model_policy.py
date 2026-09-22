@@ -9,6 +9,7 @@ in particular the one axis on which the two are ALLOWED to differ: `refuse_unrec
 import logging
 from collections.abc import Callable, Generator
 from dataclasses import FrozenInstanceError
+from typing import cast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -52,12 +53,14 @@ def _node(
     *,
     side_effect: Callable[[object], object] | None = None,
     library_name: str | None = None,
+    node_type: str | None = None,
 ) -> SomeNode:
     """A stand-in node whose engine answers ``handle_request`` with a canned result.
 
-    ``query_model_policy`` reads everything it needs off the node -- the engine to ask, the class
-    name to query as, and the registering library in ``metadata`` -- so these tests hand it one
-    rather than patching a process-wide accessor.
+    ``query_model_policy`` reads everything it needs off the node -- the engine to ask, and the
+    registering library and node type in ``metadata`` -- so these tests hand it one rather than
+    patching a process-wide accessor. Omitting ``library_name`` or ``node_type`` models a node built
+    outside the library path, which recorded neither.
     """
     engine = MagicMock()
     if side_effect is not None:
@@ -67,7 +70,19 @@ def _node(
     metadata: dict[str, str] = {}
     if library_name is not None:
         metadata["library"] = library_name
+    if node_type is not None:
+        metadata["node_type"] = node_type
     return SomeNode(name="some_node", metadata=metadata, engine=engine)
+
+
+def _engine_of(node: SomeNode) -> MagicMock:
+    """The mock behind ``node.engine``, for asserting on the requests it did or did not receive.
+
+    ``BaseNode.engine`` is typed ``Engine``, so reaching the mock's call record through it is a type
+    error even though the object IS the mock ``_node`` installed. The cast lives here so the tests
+    that need the call record still build their node with ``_node``.
+    """
+    return cast("MagicMock", node.engine)
 
 
 DENIED = "owner/denied"
@@ -96,6 +111,20 @@ class TestNodeAccessRequest:
         request = node_access_request(_node(library_name="library-standard"), ["md_a", "md_b"])
         assert request.candidate_model_ids == ["md_a", "md_b"]
 
+    def test_the_node_type_is_the_name_the_library_registered(self) -> None:
+        """Not ``__name__``: the registry keys a node type by the name its library JSON declared.
+
+        ``register_lazy_node_type`` never imports the class to compare the two, so a module that
+        aliases its class registers under one name and reports the other. The engine resolves by the
+        registry key, which is what ``Library.create_node`` records in ``metadata["node_type"]``.
+        """
+        request = node_access_request(_node(library_name="library-standard", node_type="AliasKey"))
+        assert request.node_type == "AliasKey"
+
+    def test_a_node_that_recorded_no_type_falls_back_to_its_class_name(self) -> None:
+        """The probe / fixture case: nothing registered it, so the class name is all there is."""
+        assert node_access_request(_node()).node_type == "SomeNode"
+
     def test_a_node_built_outside_the_library_path_names_no_library(self) -> None:
         """A transient probe or a test fixture has no ``library`` metadata.
 
@@ -106,12 +135,96 @@ class TestNodeAccessRequest:
 
     def test_the_policy_query_carries_it(self) -> None:
         """Pinned on the request the bus actually saw, not just on the builder in isolation."""
-        engine = MagicMock()
-        engine.handle_request.return_value = _success([])
-        query_model_policy(SomeNode(name="some_node", metadata={"library": "library-standard"}, engine=engine))
-        request = engine.handle_request.call_args.args[0]
+        node = _node(_success([]), library_name="library-standard")
+        query_model_policy(node)
+        request = _engine_of(node).handle_request.call_args.args[0]
         assert request.node_type == "SomeNode"
         assert request.specific_library_name == "library-standard"
+
+
+def _register_node_type(library_name: str, model_id: str, node_class: type[MockNode], *, registered_as: str) -> None:
+    """Register ``node_class`` in a fresh ``library_name`` over a one-model catalog.
+
+    ``registered_as`` is the registry key -- the class name the library's JSON declares -- and is
+    passed separately from ``node_class`` because the two need not agree: ``register_lazy_node_type``
+    stores the declared name without importing the class to compare it against ``__name__``.
+    Registering lazily is also how a real library, loaded from its JSON, arrives.
+    """
+    catalog = ModelCatalogLibraryProperty(
+        providers={
+            "bfl": ModelProvider(
+                display_name="Black Forest Labs",
+                models={
+                    model_id: Model(
+                        display_name="FLUX.2",
+                        provider_model_id=f"{model_id}-handle",
+                        key_support=KeySupport.REQUIRES_GRIPTAPE_KEY,
+                    )
+                },
+            )
+        }
+    )
+    schema = LibrarySchema(
+        name=library_name,
+        library_schema_version=LibrarySchema.LATEST_SCHEMA_VERSION,
+        metadata=LibraryMetadata(
+            author="t",
+            description="d",
+            library_version="1.0.0",
+            engine_version="1.0.0",
+            tags=[],
+            declarations=[catalog],
+        ),
+        categories=[],
+        nodes=[],
+    )
+    library = LibraryRegistry.generate_new_library(library_data=schema)
+    library.register_lazy_node_type(
+        registered_as,
+        NodeMetadata(
+            category="t",
+            description="d",
+            display_name="FLUX.2 Image Generation",
+            declarations=[ModelUsageNodeProperty(model_ids=[model_id])],
+        ),
+        lambda: node_class,
+    )
+
+
+class TestALibraryThatDeclaresAnAliasedClass:
+    """A node type is registered under the name its library declared, not the class's ``__name__``.
+
+    `register_lazy_node_type` stores that declared name without importing the class to compare, so a
+    module that aliases its class (`AliasKey = RealClass`) registers under one name and reports the
+    other. `Library.create_node` records the declared name in `metadata["node_type"]` and the engine
+    resolves by it, so a query naming `__name__` finds no such type and fails closed on a node whose
+    library resolves perfectly well. `get_declared_models` -- which fills the same dropdown's choices
+    -- reads the declared name, so querying policy by `__name__` would gate choices it cannot judge.
+    """
+
+    _LIBRARY = "library-standard"
+    _REGISTERED_AS = "AliasKey"
+    _MODEL_ID = "md_aliased_flux"
+
+    @pytest.fixture(autouse=True)
+    def _clean_registry(self) -> Generator[None, None, None]:
+        LibraryRegistry._clear()
+        yield
+        LibraryRegistry._clear()
+
+    def test_the_query_resolves_through_the_registered_name(self, engine: Engine) -> None:
+        node_class = type("RealClassName", (MockNode,), {})
+        _register_node_type(self._LIBRARY, self._MODEL_ID, node_class, registered_as=self._REGISTERED_AS)
+
+        node = node_class(
+            name="flux",
+            metadata={"library": self._LIBRARY, "node_type": self._REGISTERED_AS},
+            engine=engine,
+        )
+        snapshot = query_model_policy(node)
+
+        assert snapshot.failure_detail is None
+        assert snapshot.catalog_ids_for(f"{self._MODEL_ID}-handle") == (self._MODEL_ID,)
 
 
 class TestTwoLibrariesRegisteringOneNodeType:
@@ -167,47 +280,10 @@ class TestTwoLibrariesRegisteringOneNodeType:
 
     def _register(self, library_name: str, model_id: str) -> type[MockNode]:
         """Register ``_NODE_TYPE`` in ``library_name`` over a one-model catalog; return its class."""
-        catalog = ModelCatalogLibraryProperty(
-            providers={
-                "bfl": ModelProvider(
-                    display_name="Black Forest Labs",
-                    models={
-                        model_id: Model(
-                            display_name="FLUX.2",
-                            provider_model_id=f"{model_id}-handle",
-                            key_support=KeySupport.REQUIRES_GRIPTAPE_KEY,
-                        )
-                    },
-                )
-            }
-        )
-        schema = LibrarySchema(
-            name=library_name,
-            library_schema_version=LibrarySchema.LATEST_SCHEMA_VERSION,
-            metadata=LibraryMetadata(
-                author="t",
-                description="d",
-                library_version="1.0.0",
-                engine_version="1.0.0",
-                tags=[],
-                declarations=[catalog],
-            ),
-            categories=[],
-            nodes=[],
-        )
-        library = LibraryRegistry.generate_new_library(library_data=schema)
         # Registration is keyed by class name, so the collision needs two distinct classes that
         # share one name -- exactly what two libraries each shipping `Flux2ImageGeneration` is.
         node_class = type(self._NODE_TYPE, (MockNode,), {})
-        library.register_new_node_type(
-            node_class,
-            NodeMetadata(
-                category="t",
-                description="d",
-                display_name="FLUX.2 Image Generation",
-                declarations=[ModelUsageNodeProperty(model_ids=[model_id])],
-            ),
-        )
+        _register_node_type(library_name, model_id, node_class, registered_as=self._NODE_TYPE)
         return node_class
 
 
@@ -447,11 +523,10 @@ class TestConstructionDeferral:
     """
 
     def test_no_bus_request_while_constructing_under_a_probe_scope(self) -> None:
-        # The engine is held separately from the node so the mock's call record stays reachable.
-        engine = MagicMock()
+        node = _node()
         with constructing_under_probe():
-            snapshot = query_model_policy(SomeNode(name="some_node", engine=engine))
-        engine.handle_request.assert_not_called()
+            snapshot = query_model_policy(node)
+        _engine_of(node).handle_request.assert_not_called()
         assert snapshot.deferred is True
 
     def test_construction_outside_a_strict_mode_scope_queries_normally(self) -> None:
