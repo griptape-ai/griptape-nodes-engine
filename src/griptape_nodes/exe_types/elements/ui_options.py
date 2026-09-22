@@ -61,26 +61,17 @@ class UIOptionsMixin:
         """Update stored options without copying derived options into them."""
         authored = self.authored_ui_options()
         authored.update(updates)
-        self._store_ui_options(authored)
+        self.ui_options = authored  # type: ignore[attr-defined]
 
     def remove_ui_options_key(self, key: str) -> None:
         """Remove a stored option without copying derived options into storage."""
         authored = self.authored_ui_options()
         authored.pop(key, None)
-        self._store_ui_options(authored)
+        self.ui_options = authored  # type: ignore[attr-defined]
 
     def report_ui_options_change(self) -> None:
         """Report derived UI options without storing them."""
         self.track_change("ui_options", self.ui_options)  # type: ignore[attr-defined]
-
-    def _store_ui_options(self, value: dict[str, Any]) -> None:
-        """Write updated options, whatever the caller: node code, the editor, or a saved file.
-
-        Plain storage here. ``Parameter`` overrides this to route a trait-owned key to the
-        trait that renders it, so a runtime write through this mixin and an inbound write
-        through ``adopt_ui_options`` resolve the same way.
-        """
-        self.ui_options = value  # type: ignore[attr-defined]
 
 
 def seed_ui_options(element: UIOptionsMixin, ui_options: dict, values: dict[str, Any]) -> None:

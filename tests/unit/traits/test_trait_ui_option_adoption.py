@@ -6,14 +6,19 @@ shadowed at read time and dropped at save time, so the write has to be routed to
 """
 
 import logging
+from typing import Any
 
 import pytest
 
 from griptape_nodes.exe_types.core_types import Parameter, Trait
 from griptape_nodes.traits.button import Button
+from griptape_nodes.traits.color_picker import ColorPicker
+from griptape_nodes.traits.file_system_picker import FileSystemPicker
 from griptape_nodes.traits.multi_options import MultiOptions
+from griptape_nodes.traits.numbers_selector import NumbersSelector
 from griptape_nodes.traits.options import Options
 from griptape_nodes.traits.slider import Slider
+from griptape_nodes.traits.widget import Widget
 
 
 class TestAdoptingADropdown:
@@ -21,21 +26,21 @@ class TestAdoptingADropdown:
         trait = Options(choices=["base-1"])
         parameter = Parameter(name="model", type="str", tooltip="t", traits={trait})
 
-        parameter.adopt_ui_options({"simple_dropdown": ["base-1", "runtime-a"]})
+        parameter.ui_options = {"simple_dropdown": ["base-1", "runtime-a"]}
 
         assert trait.choices == ["base-1", "runtime-a"]
 
     def test_the_written_choices_are_reported_back(self) -> None:
         parameter = Parameter(name="model", type="str", tooltip="t", traits={Options(choices=["base-1"])})
 
-        parameter.adopt_ui_options({"simple_dropdown": ["base-1", "runtime-a"]})
+        parameter.ui_options = {"simple_dropdown": ["base-1", "runtime-a"]}
 
         assert parameter.ui_options["simple_dropdown"] == ["base-1", "runtime-a"]
 
     def test_the_written_choices_are_saved_as_trait_state(self) -> None:
         parameter = Parameter(name="model", type="str", tooltip="t", traits={Options(choices=["base-1"])})
 
-        parameter.adopt_ui_options({"simple_dropdown": ["base-1", "runtime-a"]})
+        parameter.ui_options = {"simple_dropdown": ["base-1", "runtime-a"]}
 
         assert parameter.trait_states()[0]["trait_state"]["choices"] == ["base-1", "runtime-a"]
 
@@ -43,14 +48,14 @@ class TestAdoptingADropdown:
         trait = Options(choices=["a"])
         parameter = Parameter(name="model", type="str", tooltip="t", traits={trait})
 
-        parameter.adopt_ui_options({"show_search": False, "search_filter": "gpt"})
+        parameter.ui_options = {"show_search": False, "search_filter": "gpt"}
 
         assert (trait.show_search, trait.search_filter) == (False, "gpt")
 
     def test_an_authored_option_alongside_it_is_still_stored(self) -> None:
         parameter = Parameter(name="model", type="str", tooltip="t", traits={Options(choices=["a"])})
 
-        parameter.adopt_ui_options({"simple_dropdown": ["a", "b"], "hide": True})
+        parameter.ui_options = {"simple_dropdown": ["a", "b"], "hide": True}
 
         assert parameter.authored_ui_options() == {"hide": True}
 
@@ -58,7 +63,7 @@ class TestAdoptingADropdown:
         # The point of adopting: the converter reads trait.choices, so a value the write made
         # legal has to stay legal rather than being rewritten to the first original choice.
         parameter = Parameter(name="model", type="str", tooltip="t", traits={Options(choices=["base-1"])})
-        parameter.adopt_ui_options({"simple_dropdown": ["base-1", "runtime-a"]})
+        parameter.ui_options = {"simple_dropdown": ["base-1", "runtime-a"]}
 
         converted = parameter.converters[0]("runtime-a")
 
@@ -70,14 +75,14 @@ class TestAdoptingSliderBounds:
         trait = Slider(min_val=1, max_val=50)
         parameter = Parameter(name="steps", type="int", tooltip="t", traits={trait})
 
-        parameter.adopt_ui_options({"slider": {"min_val": 0, "max_val": 10}})
+        parameter.ui_options = {"slider": {"min_val": 0, "max_val": 10}}
 
         assert (trait.min, trait.max) == (0, 10)
 
     def test_the_validator_moves_with_the_written_bounds(self) -> None:
         parameter = Parameter(name="steps", type="int", tooltip="t", traits={Slider(min_val=1, max_val=50)})
 
-        parameter.adopt_ui_options({"slider": {"min_val": 0, "max_val": 10}})
+        parameter.ui_options = {"slider": {"min_val": 0, "max_val": 10}}
 
         with pytest.raises(ValueError, match="out of range"):
             parameter.validators[0](parameter, 40)
@@ -88,7 +93,7 @@ class TestAdoptingSliderBounds:
         trait = Slider(min_val=1, max_val=50)
         parameter = Parameter(name="steps", type="int", tooltip="t", traits={trait})
 
-        parameter.adopt_ui_options({"slider": {"max_val": 10}})
+        parameter.ui_options = {"slider": {"max_val": 10}}
 
         assert (trait.min, trait.max) == (1, 10)
 
@@ -96,7 +101,7 @@ class TestAdoptingSliderBounds:
         trait = Slider(min_val=1, max_val=50)
         parameter = Parameter(name="steps", type="int", tooltip="t", traits={trait})
 
-        parameter.adopt_ui_options({"slider": True})
+        parameter.ui_options = {"slider": True}
 
         assert (trait.min, trait.max) == (1, 50)
 
@@ -106,7 +111,7 @@ class TestAdoptingAMultiSelect:
         trait = MultiOptions(choices=["base-1"])
         parameter = Parameter(name="tags", type="list", tooltip="t", traits={trait})
 
-        parameter.adopt_ui_options({"multi_options": {"choices": ["base-1", "runtime-a"]}})
+        parameter.ui_options = {"multi_options": {"choices": ["base-1", "runtime-a"]}}
 
         assert trait.choices == ["base-1", "runtime-a"]
 
@@ -114,7 +119,7 @@ class TestAdoptingAMultiSelect:
         trait = MultiOptions(choices=["a"])
         parameter = Parameter(name="tags", type="list", tooltip="t", traits={trait})
 
-        parameter.adopt_ui_options({"multi_options": {"placeholder": "Pick tags", "icon_size": "large"}})
+        parameter.ui_options = {"multi_options": {"placeholder": "Pick tags", "icon_size": "large"}}
 
         assert (trait.placeholder, trait.icon_size) == ("Pick tags", "large")
 
@@ -124,59 +129,105 @@ class TestAdoptingAMultiSelect:
         trait = MultiOptions(choices=["a"])
         parameter = Parameter(name="tags", type="list", tooltip="t", traits={trait})
 
-        parameter.adopt_ui_options({"multi_options": {"icon_size": "enormous"}})
+        parameter.ui_options = {"multi_options": {"icon_size": "enormous"}}
 
         assert trait.icon_size == "small"
 
 
+class TestAdoptingKeysAnOlderSaveStored:
+    """A workflow saved before trait state was its own field stored these keys raw."""
+
+    @pytest.mark.parametrize(
+        ("trait", "written", "attribute", "expected"),
+        [
+            (Button(label="Go"), {"button_label": "Stop"}, "label", "Stop"),
+            (Button(label="Go", icon="play"), {"iconPosition": "right"}, "icon_position", "right"),
+            (FileSystemPicker(), {"fileSystemPicker": {"allowFiles": True}}, "allow_files", True),
+            (ColorPicker(format="hex"), {"color_picker": {"format": "rgb"}}, "format", "rgb"),
+            (NumbersSelector({"x": 1}), {"numbers_selector": {"step": 5}}, "step", 5),
+            (Widget("editor", "widgets"), {"widget": "viewer"}, "name", "viewer"),
+        ],
+    )
+    def test_the_stored_value_lands_on_the_trait(
+        self, trait: Trait, written: dict[str, Any], attribute: str, expected: Any
+    ) -> None:
+        parameter = Parameter(name="p", type="str", tooltip="t", traits={trait})
+
+        parameter.ui_options = written
+
+        assert getattr(trait, attribute) == expected
+
+    def test_a_button_label_is_reported_back(self) -> None:
+        parameter = Parameter(name="go", type="str", tooltip="t", traits={Button(label="Go")})
+
+        parameter.ui_options = {"button_label": "Stop"}
+
+        assert parameter.ui_options["button_label"] == "Stop"
+
+
+class _RenderOnlyTrait(Trait):
+    """Renders a key with no way to read it back, as a third-party trait might."""
+
+    def __init__(self, label: str) -> None:
+        super().__init__()
+        self.label = label
+
+    @classmethod
+    def get_trait_keys(cls) -> list[str]:
+        return []
+
+    def ui_options_for_trait(self) -> dict:
+        return {"badge_label": self.label}
+
+
 class TestATraitWithNothingToAdopt:
     def test_a_write_to_its_key_changes_nothing(self) -> None:
-        trait = Button(label="Go")
+        trait = _RenderOnlyTrait(label="Go")
         parameter = Parameter(name="go", type="str", tooltip="t", traits={trait})
 
-        parameter.adopt_ui_options({"button_label": "Written"})
+        parameter.ui_options = {"badge_label": "Written"}
 
         assert trait.label == "Go"
 
     def test_the_trait_still_owns_the_reported_value(self) -> None:
-        parameter = Parameter(name="go", type="str", tooltip="t", traits={Button(label="Go")})
+        parameter = Parameter(name="go", type="str", tooltip="t", traits={_RenderOnlyTrait(label="Go")})
 
-        parameter.adopt_ui_options({"button_label": "Written"})
+        parameter.ui_options = {"badge_label": "Written"}
 
-        assert parameter.ui_options["button_label"] == "Go"
+        assert parameter.ui_options["badge_label"] == "Go"
 
     def test_the_dropped_write_is_reported(self, caplog: pytest.LogCaptureFixture) -> None:
         """The write is neither applied nor saved, so silence loses it without a trace."""
-        parameter = Parameter(name="go", type="str", tooltip="t", traits={Button(label="Go")})
+        parameter = Parameter(name="go", type="str", tooltip="t", traits={_RenderOnlyTrait(label="Go")})
         caplog.set_level(logging.WARNING, logger="griptape_nodes")
 
-        parameter.adopt_ui_options({"button_label": "Written"})
+        parameter.ui_options = {"badge_label": "Written"}
 
         assert any(
-            "'button_label'" in record.getMessage() and "'go'" in record.getMessage() for record in caplog.records
+            "'badge_label'" in record.getMessage() and "'go'" in record.getMessage() for record in caplog.records
         )
 
     def test_a_write_matching_what_it_renders_is_not_reported(self, caplog: pytest.LogCaptureFixture) -> None:
         """The editor echoing back what it was given changes nothing."""
-        parameter = Parameter(name="go", type="str", tooltip="t", traits={Button(label="Go")})
+        parameter = Parameter(name="go", type="str", tooltip="t", traits={_RenderOnlyTrait(label="Go")})
         caplog.set_level(logging.WARNING, logger="griptape_nodes")
 
-        parameter.adopt_ui_options({"button_label": "Go"})
+        parameter.ui_options = {"badge_label": "Go"}
 
         assert caplog.records == []
 
     def test_a_write_to_a_key_no_trait_renders_is_not_reported(self, caplog: pytest.LogCaptureFixture) -> None:
-        parameter = Parameter(name="go", type="str", tooltip="t", traits={Button(label="Go")})
+        parameter = Parameter(name="go", type="str", tooltip="t", traits={_RenderOnlyTrait(label="Go")})
         caplog.set_level(logging.WARNING, logger="griptape_nodes")
 
-        parameter.adopt_ui_options({"hide": True})
+        parameter.ui_options = {"hide": True}
 
         assert caplog.records == []
 
     def test_a_parameter_with_no_traits_stores_the_whole_write(self) -> None:
         parameter = Parameter(name="steps", type="int", tooltip="t")
 
-        parameter.adopt_ui_options({"simple_dropdown": ["a", "b"], "hide": True})
+        parameter.ui_options = {"simple_dropdown": ["a", "b"], "hide": True}
 
         assert parameter.authored_ui_options() == {"simple_dropdown": ["a", "b"], "hide": True}
 
@@ -198,6 +249,14 @@ class TestNodeCodeWritesAdoptToo:
 
         assert (trait.min, trait.max) == (0, 512)
         assert parameter.ui_options["slider"] == {"min_val": 0, "max_val": 512}
+
+    def test_assigning_ui_options_moves_a_dropdown_choice_list(self) -> None:
+        trait = Options(choices=["a"])
+        parameter = Parameter(name="model", type="str", tooltip="t", traits={trait})
+
+        parameter.ui_options = {**parameter.ui_options, "simple_dropdown": ["a", "b"]}
+
+        assert trait.choices == ["a", "b"]
 
     def test_update_ui_options_key_moves_a_dropdown_choice_list(self) -> None:
         trait = Options(choices=["a"])
@@ -275,7 +334,7 @@ class TestStateTheTraitWillNotAccept:
         trait = _MisdeclaredTrait(level=_UNTOUCHED_LEVEL)
         parameter = Parameter(name="level", type="int", tooltip="t", traits={trait})
 
-        parameter.adopt_ui_options({"misdeclared": 9})
+        parameter.ui_options = {"misdeclared": 9}
 
         assert trait.level == _UNTOUCHED_LEVEL
 
@@ -283,7 +342,7 @@ class TestStateTheTraitWillNotAccept:
         parameter = Parameter(name="level", type="int", tooltip="t", traits={_MisdeclaredTrait()})
         caplog.set_level(logging.WARNING, logger="griptape_nodes")
 
-        parameter.adopt_ui_options({"misdeclared": 9})
+        parameter.ui_options = {"misdeclared": 9}
 
         assert any(
             "_MisdeclaredTrait" in record.getMessage() and "'level'" in record.getMessage() for record in caplog.records
@@ -292,7 +351,7 @@ class TestStateTheTraitWillNotAccept:
     def test_the_rest_of_the_write_is_still_stored(self) -> None:
         parameter = Parameter(name="level", type="int", tooltip="t", traits={_MisdeclaredTrait()})
 
-        parameter.adopt_ui_options({"misdeclared": 9, "hide": True})
+        parameter.ui_options = {"misdeclared": 9, "hide": True}
 
         assert parameter.authored_ui_options()["hide"] is True
 
@@ -343,7 +402,7 @@ class TestStateAValidatorRejects:
         trait = _RangeLimitedTrait(level=_ALLOWED_RANGE_LIMITED_LEVEL)
         parameter = Parameter(name="level", type="int", tooltip="t", traits={trait})
 
-        parameter.adopt_ui_options({"ranged": 99})
+        parameter.ui_options = {"ranged": 99}
 
         assert trait.level == _ALLOWED_RANGE_LIMITED_LEVEL
 
@@ -351,7 +410,7 @@ class TestStateAValidatorRejects:
         parameter = Parameter(name="level", type="int", tooltip="t", traits={_RangeLimitedTrait()})
         caplog.set_level(logging.WARNING, logger="griptape_nodes")
 
-        parameter.adopt_ui_options({"ranged": 99})
+        parameter.ui_options = {"ranged": 99}
 
         assert any(
             "_RangeLimitedTrait" in record.getMessage() and "'level'" in record.getMessage()

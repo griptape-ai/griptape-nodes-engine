@@ -1,8 +1,9 @@
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, get_args
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, get_args
 
 from griptape_nodes.exe_types.core_types import NodeMessagePayload, NodeMessageResult, Trait
+from griptape_nodes.exe_types.trait_state import state_from_rendered_keys
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -90,6 +91,21 @@ class Button(Trait):
     ON_CLICK_MESSAGE_TYPE = "on_click"
     GET_BUTTON_STATUS_MESSAGE_TYPE = "get_button_status"
     SET_BUTTON_STATUS_MESSAGE_TYPE = "set_button_status"
+
+    RENDERED_STATE_KEYS: ClassVar[dict[str, str]] = {
+        "button_label": "label",
+        "variant": "variant",
+        "size": "size",
+        "state": "state",
+        "full_width": "full_width",
+        "button_icon": "icon",
+        "iconPosition": "icon_position",
+        "icon_class": "icon_class",
+        "loading_label": "loading_label",
+        "loading_icon": "loading_icon",
+        "loading_icon_class": "loading_icon_class",
+        "tooltip": "tooltip",
+    }
 
     # Button styling and behavior properties
     label: str = "Button"
@@ -180,6 +196,10 @@ class Button(Trait):
         for name in self.to_state():
             if name in state:
                 setattr(self, name, state[name])
+
+    @classmethod
+    def state_from_ui_options(cls, ui_options: dict[str, Any]) -> dict[str, Any]:
+        return state_from_rendered_keys(ui_options, cls.RENDERED_STATE_KEYS)
 
     def _create_button_link_handler(self, url: str) -> OnClickCallback:
         """Create a default handler for button_link URLs."""

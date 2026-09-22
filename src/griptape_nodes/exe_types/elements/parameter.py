@@ -25,7 +25,7 @@ from griptape_nodes.exe_types.elements.parameter_types import (
 from griptape_nodes.exe_types.elements.tooltips import default_parameter_tooltip
 from griptape_nodes.exe_types.elements.trait import Trait, instantiate_trait
 from griptape_nodes.exe_types.elements.ui_options import UIOptionsMixin, seed_ui_options
-from griptape_nodes.exe_types.trait_state import TraitStateEntry, as_saved_state_value
+from griptape_nodes.exe_types.trait_state import TraitStateEntry, as_saved_state_value, changed_trait_states
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -459,20 +459,15 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
     @ui_options.setter
     @BaseNodeElement.emits_update_on_write
     def ui_options(self, value: dict) -> None:
+        """Route trait-owned keys to the traits that render them, then store the write as given.
+
+        Every write lands here: node code, the editor, a saved file, and ``update_ui_options``.
+        Keeping the flat write stored means detaching a trait reveals the written value.
+        """
+        self._adopt_trait_options(value)
         self._ui_options = value
 
-    def _store_ui_options(self, value: dict[str, Any]) -> None:
-        """Route a runtime write through the same adoption a saved file or the editor gets."""
-        self.adopt_ui_options(value)
-
-    def adopt_ui_options(self, value: dict) -> None:
-        """Route inbound trait-owned options to their traits.
-
-        Keep the flat input stored so detaching a trait reveals the written value. Every write
-        reaches this: the editor and a saved file call it directly, and ``_store_ui_options``
-        routes ``update_ui_options`` and the convenience setters through it too, so a runtime
-        write to a trait-owned key is applied and saved rather than silently kept as dead state.
-        """
+    def _adopt_trait_options(self, value: dict) -> None:
         for trait in self.find_elements_by_type(Trait):
             adopted = trait.state_from_ui_options(value)
             if not adopted:
@@ -487,7 +482,6 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
                     type(trait).__name__,
                     self.name,
                 )
-        self.ui_options = value
 
     def _report_unadopted_trait_options(self, trait: Trait, value: dict) -> None:
         """Report a write the trait renders over, which is neither applied nor saved.
@@ -803,8 +797,11 @@ def diff_parameters(parameter: Parameter, other: Parameter) -> dict:
     differences = {}
     for key, self_value in self_dict.items():
         other_value = other_dict.get(key, None)
+        if key == "traits":
+            if self_value != other_value:
+                differences[key] = changed_trait_states(self_value, other_dict["traits"])
         # handle children here
-        if isinstance(self_value, BaseNodeElement) and isinstance(other_value, BaseNodeElement):
+        elif isinstance(self_value, BaseNodeElement) and isinstance(other_value, BaseNodeElement):
             if self_value != other_value:
                 differences[key] = other_value
         elif isinstance(self_value, (list, set)) and isinstance(other_value, (list, set)):

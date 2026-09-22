@@ -43,7 +43,7 @@ For the full list of traits, the widgets they render, and the `ui_options` keys 
 
 **Saving trait state**: A trait opts into state persistence with `to_state()` and `apply_state()`. Return constructor-shaped state containing text, numbers, booleans, and lists or dictionaries of those values. Unsupported values are omitted with a warning. Traits using the default methods have no saved state.
 
-**Accepting UI option writes**: Implement `state_from_ui_options()` to map editor and saved-file `ui_options` to the same state accepted by `apply_state()`. The default ignores writes, which suits rendered keys with no mutable state. A write that would have changed what the trait renders is logged if the trait does not accept it.
+**Accepting UI option writes**: Implement `state_from_ui_options()` to map a `ui_options` write, from node code, the editor, or a saved file, to the same state accepted by `apply_state()`. The default ignores writes, which suits rendered keys with no mutable state. A write that would have changed what the trait renders is logged if the trait does not accept it.
 
 ## Parameter helper constructs (`ParameterString`, `ParameterInt`, ...)
 

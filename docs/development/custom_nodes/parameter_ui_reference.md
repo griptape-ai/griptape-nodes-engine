@@ -118,7 +118,7 @@ Pass `soft_limits=True` when the range should only size the slider track, so a u
 
 ## Traits
 
-Traits live in `griptape_nodes.traits` and are attached with `add_trait()` or `traits={...}` on the parameter. Each row lists what the trait renders and any `ui_options` keys it manages. Set the trait rather than those keys. A trait wins over stored values for its keys. Writes from the editor or a saved file are routed through [`state_from_ui_options`](parameters.md#traits).
+Traits live in `griptape_nodes.traits` and are attached with `add_trait()` or `traits={...}` on the parameter. Each row lists what the trait renders and any `ui_options` keys it manages. Set the trait rather than those keys. A trait wins over stored values for its keys. Every `ui_options` write, from node code, the editor, or a saved file, is routed through [`state_from_ui_options`](parameters.md#traits).
 
 | Trait                | Typical types             | What it does                                                                                                   | `ui_options` it writes                                            |
 | -------------------- | ------------------------- | -------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |

@@ -1,12 +1,30 @@
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 
 from griptape_nodes.exe_types.core_types import Parameter, Trait
+from griptape_nodes.exe_types.trait_state import state_from_rendered_keys
 
 
 @dataclass(eq=False)
 class FileSystemPicker(Trait):
+    RENDERED_STATE_KEYS: ClassVar[dict[str, str]] = {
+        "allowFiles": "allow_files",
+        "allowDirectories": "allow_directories",
+        "allowSequences": "allow_sequences",
+        "multiple": "multiple",
+        "workspaceOnly": "workspace_only",
+        "allowCreate": "allow_create",
+        "allowRename": "allow_rename",
+        "fileTypes": "file_types",
+        "fileExtensions": "file_extensions",
+        "excludePatterns": "exclude_patterns",
+        "includePatterns": "include_patterns",
+        "maxFileSize": "max_file_size",
+        "minFileSize": "min_file_size",
+        "initialPath": "initial_path",
+    }
+
     allow_files: bool = False
     allow_directories: bool = True
     allow_sequences: bool = False
@@ -83,6 +101,10 @@ class FileSystemPicker(Trait):
         for name in self.to_state():
             if name in state:
                 setattr(self, name, state[name])
+
+    @classmethod
+    def state_from_ui_options(cls, ui_options: dict[str, Any]) -> dict[str, Any]:
+        return state_from_rendered_keys(ui_options.get("fileSystemPicker"), cls.RENDERED_STATE_KEYS)
 
     def ui_options_for_trait(self) -> dict[str, Any]:
         """Generate the fileSystemPicker UI options dictionary."""

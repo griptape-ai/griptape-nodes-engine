@@ -21,7 +21,9 @@ class Threshold(Trait):
 
 The default methods save nothing, so existing traits remain compatible. State must contain plain
 JSON-compatible values. The engine applies it to the trait the node already built, preserving
-callbacks and other constructor wiring.
+callbacks and other constructor wiring. For a parameter the node declares, only keys that differ
+from what the node builds are saved, so changing a constructor default still reaches existing
+workflows.
 
 ## Branched workflows show a title instead of a file path
 

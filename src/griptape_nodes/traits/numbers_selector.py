@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode, Trait
+from griptape_nodes.exe_types.trait_state import state_from_rendered_keys
 
 
 @dataclass(eq=False)
@@ -44,6 +45,11 @@ class NumbersSelector(Trait):
         for name in ("defaults", "step", "overall_min", "overall_max"):
             if name in state:
                 setattr(self, name, state[name])
+
+    @classmethod
+    def state_from_ui_options(cls, ui_options: dict[str, Any]) -> dict[str, Any]:
+        keys = ("defaults", "step", "overall_min", "overall_max")
+        return state_from_rendered_keys(ui_options.get("numbers_selector"), {key: key for key in keys})
 
     def ui_options_for_trait(self) -> dict:
         return {

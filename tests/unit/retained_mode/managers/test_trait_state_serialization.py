@@ -379,6 +379,35 @@ def _round_trip(engine: Engine, source: _DeclaredControls) -> _DeclaredControls:
     return target
 
 
+def _altered_trait_states(engine: Engine, node: BaseNode, parameter: str) -> list[dict[str, Any]] | None:
+    result = engine.node_manager.on_serialize_node_to_commands(SerializeNodeToCommandsRequest(node_name=node.name))
+    assert isinstance(result, SerializeNodeToCommandsResultSuccess)
+    for command in result.serialized_node_commands.element_modification_commands:
+        if isinstance(command, AlterParameterDetailsRequest) and command.parameter_name == parameter:
+            return command.traits
+    return None
+
+
+class TestOnlyChangedTraitStateIsSaved:
+    """A key the node still builds the same way is left to node code, so a library release reaches it."""
+
+    def test_a_narrowed_slider_saves_only_the_moved_bound(self, engine: Engine) -> None:
+        node = _add_declared_node(engine, "source")
+        _control(node, "width", Slider).max = NARROWED_MAX
+
+        traits = _altered_trait_states(engine, node, "width")
+
+        assert traits == [{"trait_name": "Slider", "trait_state": {"max_val": NARROWED_MAX}}]
+
+    def test_changed_choices_leave_constructor_config_out(self, engine: Engine) -> None:
+        node = _add_declared_node(engine, "source")
+        _control(node, "model", Options).choices = ["x", "y"]
+
+        traits = _altered_trait_states(engine, node, "model")
+
+        assert traits == [{"trait_name": "Options", "trait_state": {"choices": ["x", "y"]}}]
+
+
 class TestRunTimeStateReachesTheTrait:
     """The defect this exists to fix: state reached the file but never the trait object."""
 

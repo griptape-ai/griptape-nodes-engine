@@ -2419,12 +2419,7 @@ class NodeManager(EngineScoped):
             if request.traits is not None:
                 NodeManager._apply_trait_states(parameter, request.traits)
         if request.ui_options is not None and hasattr(parameter, "ui_options"):
-            if isinstance(parameter, Parameter):
-                # An inbound write comes from the editor or a saved file, neither of which
-                # knows which keys an attached trait owns, so route those to their owner.
-                parameter.adopt_ui_options(request.ui_options)
-            else:
-                parameter.ui_options = request.ui_options  # type: ignore[attr-defined]
+            parameter.ui_options = request.ui_options  # type: ignore[attr-defined]
 
     def modify_key_parameter_fields(self, request: AlterParameterDetailsRequest, parameter: Parameter) -> None:  # noqa: C901, PLR0912
         if request.type is not None:

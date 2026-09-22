@@ -54,6 +54,51 @@ def _as_saved_sequence(value: list | tuple | set | frozenset) -> SavedStateValue
     return SavedStateValue(value=saved, unsupported_type=None)
 
 
+def state_from_rendered_keys(written: Any, renames: dict[str, str]) -> dict[str, Any]:
+    """Map rendered UI option keys back to trait state keys, skipping any not written."""
+    if not isinstance(written, dict):
+        return {}
+    return {state_key: written[ui_key] for ui_key, state_key in renames.items() if ui_key in written}
+
+
+def changed_trait_states(built: list[dict[str, Any]], current: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop each state key that still matches the same trait in ``built``.
+
+    ``built`` is what the node's own code constructs. Leaving an unchanged key out of the save
+    lets a library release that changes it reach existing workflows. An entry with no
+    counterpart keeps its full state, since nothing else would supply it.
+    """
+    unmatched = list(built)
+    changed: list[dict[str, Any]] = []
+    for entry in current:
+        counterpart = _take_counterpart(unmatched, entry)
+        if counterpart is None:
+            changed.append(entry)
+            continue
+        built_state = counterpart["trait_state"]
+        trait_state = {
+            key: value
+            for key, value in entry["trait_state"].items()
+            if key not in built_state or built_state[key] != value
+        }
+        changed.append({**entry, "trait_state": trait_state})
+    return changed
+
+
+def _take_counterpart(candidates: list[dict[str, Any]], entry: dict[str, Any]) -> dict[str, Any] | None:
+    """Take the first candidate with the same identity, consuming it so two entries cannot share one."""
+    identity = _trait_identity(entry)
+    for candidate in candidates:
+        if _trait_identity(candidate) == identity:
+            candidates.remove(candidate)
+            return candidate
+    return None
+
+
+def _trait_identity(entry: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in entry.items() if key != "trait_state"}
+
+
 @dataclass(frozen=True)
 class TraitStateEntry:
     """Saved trait identity and state."""
