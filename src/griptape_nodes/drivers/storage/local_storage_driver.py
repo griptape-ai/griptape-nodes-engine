@@ -192,12 +192,15 @@ class LocalStorageDriver(BaseStorageDriver):
 
         # Version the URL by the served file's identity rather than by mint time:
         # unchanged content yields the same URL on every mint, so the browser's
-        # cache HITS instead of refetching, and a rewrite changes st_mtime_ns and
-        # therefore the URL. The guarantee is bounded by filesystem timestamp
-        # resolution: a same-size rewrite landing within one tick of the prior
-        # mtime fingerprints identically. Negligible on NTFS/APFS/ext4 (<=100ns
-        # ticks); real on FAT/exFAT (2s) external drives. True content identity
-        # is the #5607 design's job.
+        # cache HITS instead of refetching, and a rewrite changes the URL.
+        # mtime alone cannot carry that guarantee — kernels write timestamps from
+        # a coarse clock (millisecond-scale ticks on Linux, regardless of the
+        # nanosecond field ext4 stores), so a same-size rewrite lands inside one
+        # tick roughly half the time. st_ino closes that for the engine's own
+        # writes: every OVERWRITE promotes a scratch file by rename, which
+        # allocates a fresh inode per rewrite. The residual bound — an external
+        # tool rewriting IN PLACE, same size, within one clock tick — is what
+        # #5607's content-identity design exists to close.
         # Stat the pre-strip path: on Windows, a >MAX_PATH file can only be
         # stat'ed with the \\?\ prefix that the URL branches above had to drop.
         try:
@@ -206,7 +209,8 @@ class LocalStorageDriver(BaseStorageDriver):
             # Nothing to fingerprint yet (file still being staged, unreachable
             # mount): fall back to mint time so the URL still busts caches.
             return f"{url}?v={time.time_ns() // 1_000_000}"
-        version = blake2b(f"{stat_result.st_size}:{stat_result.st_mtime_ns}".encode(), digest_size=8).hexdigest()
+        fingerprint = f"{stat_result.st_ino}:{stat_result.st_size}:{stat_result.st_mtime_ns}"
+        version = blake2b(fingerprint.encode(), digest_size=8).hexdigest()
         return f"{url}?v={version}"
 
     def delete_file(self, path: Path) -> None:

@@ -426,24 +426,50 @@ class TestDeterministicUrlVersioning:
 
         assert before != after
 
-    def test_same_size_rewrite_within_one_tick_is_a_known_collision(
+    def test_same_size_rename_rewrite_mints_a_different_url_even_within_one_clock_tick(
         self, driver: LocalStorageDriver, workspace: Path
     ) -> None:
-        """KNOWN LIMITATION: same size + same filesystem-tick mtime → same URL.
+        """The engine's own rewrites can't collide: rename allocates a fresh inode.
 
-        The fingerprint is (size, mtime_ns), not content. On FAT/exFAT (2s
-        ticks) a same-size rewrite inside one tick mints the identical URL and
-        a cached response can outlive its bytes; NTFS/APFS/ext4 ticks are
-        <=100ns so the window is negligible there. Content identity is #5607's
-        job — this test documents the bound so a future fix flips it knowingly.
+        Kernel clocks tick at millisecond scale, so a same-size fast rewrite
+        often lands with an identical mtime — measured at ~50% through this very
+        driver. st_ino in the fingerprint covers it for every engine write,
+        because OVERWRITE promotes a scratch file by rename. mtime is pinned
+        identical here to prove the inode alone changes the URL.
         """
         served = workspace / "photo.png"
         served.write_bytes(b"content")
         stat_result = served.stat()
         before = driver.create_signed_download_url(served)
 
-        served.write_bytes(b"CONTENT")  # same byte count
-        # Pin mtime back to the original to simulate a rewrite inside one tick.
+        # The engine's overwrite shape: same byte count, new inode via rename.
+        scratch = workspace / ".scratch.partial"
+        scratch.write_bytes(b"CONTENT")
+        scratch.replace(served)
+        os.utime(served, ns=(stat_result.st_atime_ns, stat_result.st_mtime_ns))
+        after = driver.create_signed_download_url(served)
+
+        assert before != after
+
+    def test_in_place_same_size_rewrite_within_one_tick_is_a_known_collision(
+        self, driver: LocalStorageDriver, workspace: Path
+    ) -> None:
+        """KNOWN LIMITATION: in-place rewrite, same size, same clock tick → same URL.
+
+        The fingerprint is (ino, size, mtime_ns), not content. An EXTERNAL tool
+        that rewrites a served file in place (same inode) with same-size content
+        inside one kernel-clock tick mints the identical URL, and a cached
+        response can outlive its bytes. The engine's own writes never hit this
+        (rename → fresh inode, previous test). Content identity is #5607's job —
+        this test documents the residual bound so a future fix flips it knowingly.
+        """
+        served = workspace / "photo.png"
+        served.write_bytes(b"content")
+        stat_result = served.stat()
+        before = driver.create_signed_download_url(served)
+
+        served.write_bytes(b"CONTENT")  # in place: same inode, same byte count
+        # Pin mtime back to the original to simulate landing inside one tick.
         os.utime(served, ns=(stat_result.st_atime_ns, stat_result.st_mtime_ns))
         after = driver.create_signed_download_url(served)
 
