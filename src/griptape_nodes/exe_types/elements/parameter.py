@@ -139,12 +139,12 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         tooltip_as_property: str | list[dict] | None = None,
         tooltip_as_output: str | list[dict] | None = None,
         allowed_modes: set[ParameterMode] | None = None,
-        on_local_object_drop: Callable[[Any], None] | None = None,
         converters: list[Callable[[Any], Any]] | None = None,
         validators: list[Callable[[Parameter, Any], None]] | None = None,
         traits: set[Trait.__class__ | Trait] | None = None,  # We are going to make these children.
         ui_options: dict | None = None,
         *,
+        on_local_object_drop: Callable[[Any], None] | None = None,
         hide: bool | None = None,
         hide_label: bool | None = None,
         hide_property: bool | None = None,

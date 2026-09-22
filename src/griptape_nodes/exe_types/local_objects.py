@@ -34,9 +34,14 @@ if TYPE_CHECKING:
 _REFERENCE_KIND = "local_object_reference"
 
 
-def make_reference(*, worker: str, key: str) -> dict[str, str]:
-    """The envelope for an object held in `worker` under `key`."""
-    return {"kind": _REFERENCE_KIND, "worker": worker, "key": key}
+def make_reference(*, worker: str, key: str, source: str) -> dict[str, str]:
+    """The envelope for an object held in `worker` under `key`, produced by `source`.
+
+    `source` is carried so ownership is a field rather than something recovered from the key's shape. A
+    reference travels by value, so a pass-through node's own outputs can hold one it did not produce -- and
+    deleting that node must not release what another node is still using.
+    """
+    return {"kind": _REFERENCE_KIND, "worker": worker, "key": key, "source": source}
 
 
 def is_reference(value: Any) -> bool:
@@ -81,10 +86,9 @@ class LocalObjectScope:
     process resolves to nothing, because there is nothing here to resolve it to.
     """
 
-    def __init__(self, *, node: BaseNode, library: str | None, source: str) -> None:
+    def __init__(self, *, node: BaseNode, library: str | None) -> None:
         self._node = node
         self._library = library
-        self._source = source
 
     @property
     def owner(self) -> str:
@@ -95,6 +99,17 @@ class LocalObjectScope:
         rather than stored: a scope outlives nothing, but the engine reference is fetched lazily anyway.
         """
         return self._manager().engine.engine_identity_manager.engine_id
+
+    @property
+    def source(self) -> str:
+        """Which node produced what this scope caches, read per call rather than captured.
+
+        A worker's transient node is handed the orchestrator's identity *after* its `__init__` has run, so a
+        library that touches `local_objects` from `__init__` would otherwise freeze the throwaway one minted
+        at construction. Every run would then cache under a different source, nothing would ever displace
+        anything, and each run would strand the previous run's object with its hook unrun.
+        """
+        return self._node.local_object_source
 
     @property
     def library(self) -> str | None:
@@ -116,7 +131,7 @@ class LocalObjectScope:
         return self._manager().put_local_object(
             value,
             owner=self.owner,
-            source=self._source,
+            source=self.source,
             key=self._namespaced(key),
             library=self._library,
             on_drop=on_drop,
@@ -145,8 +160,8 @@ class LocalObjectScope:
         return self._manager().put_local_object(
             value,
             owner=self.owner,
-            source=self._source,
-            key=f"{self._source}.{parameter_name}#{uuid.uuid4().hex[:8]}",
+            source=self.source,
+            key=f"{self.source}.{parameter_name}#{uuid.uuid4().hex[:8]}",
             slot=slot if slot is not None else parameter_name,
             library=self._library,
             on_drop=on_drop,
@@ -172,10 +187,22 @@ class LocalObjectScope:
     def parked_keys_within(self, value: Any) -> set[str]:
         """Every cache key reachable inside `value`, `value` itself included.
 
-        What the release scan collects and what the save and metadata guards ask about. A key reaches a
-        parameter bare or nested, because a container carries its children's values.
+        What the save and metadata guards ask about: they only need to know a reference is in there.
         """
         return collect_leaves(value, lambda leaf: self.look_up(leaf).is_a_key)
+
+    def keys_this_node_produced(self, value: Any) -> set[str]:
+        """The cache keys inside `value` that this node itself produced.
+
+        What deletion releases. A reference travels by value, so a node's own outputs can carry one it
+        merely passed along -- `EndNode` copies every input to an output, and a subflow's boundary nodes do
+        the same -- and releasing on that basis would free an object its real producer is still using,
+        leaving live consumers told to re-run a producer that never changed.
+        """
+        mine = self.source
+        return collect_leaves(
+            value, lambda leaf: is_reference(leaf) and leaf.get("source") == mine and self.look_up(leaf).is_a_key
+        )
 
     def contains_a_parked_object(self, value: Any) -> bool:
         """Whether a cache key is anywhere in `value`, including nested inside it."""
@@ -217,7 +244,7 @@ class LocalObjectScope:
         than the key itself. A bare string is never treated as a reference -- that is what makes an ordinary
         string value safe from being mistaken for one -- so it has to be said explicitly.
         """
-        return make_reference(worker=self.owner, key=key)
+        return make_reference(worker=self.owner, key=key, source=self.source)
 
     def key_for(self, suffix: str) -> str:
         """The full key for a suffix this library chose, without putting anything.
@@ -258,7 +285,7 @@ class LocalObjectScope:
         Raises:
             RuntimeError: if the object is not held here.
         """
-        where_node = node_name if node_name is not None else self._source
+        where_node = node_name if node_name is not None else self.source
         if not isinstance(key, str):
             # RuntimeError, not TypeError: every failure a library author can cause here carries the same
             # artist-readable shape, and the caller catches one type.
@@ -281,8 +308,6 @@ class LocalObjectScope:
         Raises:
             RuntimeError: if something in `value` names an object this process cannot hand over.
         """
-        if not self._manager().could_hold_a_key():
-            return value
 
         def resolve(leaf: Any) -> Any:
             lookup = self.look_up(leaf)
@@ -315,7 +340,7 @@ class LocalObjectScope:
 
     def key_held_in_slot(self, slot: str, value: Any) -> str | None:
         """The key this node already holds `value` under in `slot`, or None."""
-        return self._manager().key_held_in_slot(owner=self.owner, source=self._source, slot=slot, value=value)
+        return self._manager().key_held_in_slot(owner=self.owner, source=self.source, slot=slot, value=value)
 
     def drop(self, key: str) -> bool:
         """Release one object this library is holding. Returns whether it was released."""
@@ -332,7 +357,7 @@ class LocalObjectScope:
         park: an upstream's key passed through, or None. The upstream's own entry cannot be caught here,
         because it sits under the upstream's source.
         """
-        self._manager().vacate_slot(owner=self.owner, source=self._source, slot=slot, keeping=keeping)
+        self._manager().vacate_slot(owner=self.owner, source=self.source, slot=slot, keeping=keeping)
 
     def drop_all(self) -> int:
         """Release everything THIS library is holding in this worker, returning how many went.
@@ -350,8 +375,6 @@ class LocalObjectScope:
         # numpy, and a one-element tensor answers falsy.
         if key is None or (isinstance(key, str) and not key):
             cause = "nothing is connected to it"
-        elif not isinstance(key, str):
-            cause = "the value it received is not a reference to a held object"
         else:
             cause = "the value it received is not a reference to a held object"
         return (
@@ -495,7 +518,7 @@ def substitute_leaves(value: Any, transform: Callable[[Any], Any]) -> Any:
     than silently handing back the originals.
 
     Raises:
-        TypeError: if a substitution would have to rebuild a set.
+        RuntimeError: if a substitution would have to rebuild a set.
     """
     return _substitute_leaves(value, transform, memo={})
 
@@ -521,7 +544,9 @@ def _substitute_leaves(value: Any, transform: Callable[[Any], Any], *, memo: dic
             "Attempted to read a value held in this process. Failed due to: it is inside a set, which "
             "cannot be rebuilt around it. Put held values in a list or a dictionary instead."
         )
-        raise TypeError(msg)
+        # RuntimeError, not TypeError: a library author reaching this gets the same artist-readable shape
+        # as every other failure on this surface, and one exception type to catch.
+        raise RuntimeError(msg)  # noqa: TRY004
     if isinstance(value, dict):
         rebuilt: Any = dict(zip(value.keys(), substituted, strict=True))
     elif isinstance(value, tuple):

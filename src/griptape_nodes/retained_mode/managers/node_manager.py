@@ -3169,15 +3169,17 @@ class NodeManager(EngineScoped):
         being deleted did not.
         """
         owned: set[str] = set()
-        # Its own outputs, which is what "produced" means. A consumer's inputs are deliberately not
-        # collected: the consumer borrows and owns nothing.
+        # Its own outputs, and of those only the references it produced itself. A consumer's inputs are
+        # deliberately not collected -- the consumer borrows and owns nothing -- and neither is a reference a
+        # pass-through merely copied into its own outputs, which EndNode and the subflow boundary nodes do
+        # for every parameter they carry.
         #
         # Read from the values rather than from this process's store, because the object is cached in the
         # worker that ran the node while deletion happens on the orchestrator -- so the orchestrator holds
         # no entry for it and has only the reference to go on. Snapshot: node bodies write outputs from
         # worker threads.
         for value in list(node.parameter_output_values.values()):
-            owned |= node.local_objects.parked_keys_within(value)
+            owned |= node.local_objects.keys_this_node_produced(value)
         # Plus anything this process does hold for the node, which covers an in-process library and an entry
         # whose parameter was renamed or removed after it was cached.
         owned.update(

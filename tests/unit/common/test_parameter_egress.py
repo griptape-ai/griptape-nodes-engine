@@ -444,7 +444,7 @@ class TestReadingTheDictDirectly:
     def test_a_reference_from_another_process_is_left_alone(self) -> None:
         """The orchestrator cannot resolve one and still has to send it onward, so it must survive."""
         node = _node()
-        elsewhere = make_reference(worker="another-worker", key="P@abc12345.pipe#deadbeef")
+        elsewhere = make_reference(worker="another-worker", key="P@abc12345.pipe#deadbeef", source="P@abc12345")
 
         assert node.local_objects.resolve_what_is_here(elsewhere) is elsewhere
 

@@ -1467,11 +1467,7 @@ class BaseNode(ABC):
         replaced or this node goes away.
         """
         if self._local_objects is None:
-            self._local_objects = LocalObjectScope(
-                node=self,
-                library=self.metadata.get("library"),
-                source=self.local_object_source,
-            )
+            self._local_objects = LocalObjectScope(node=self, library=self.metadata.get("library"))
         return self._local_objects
 
     def park_for_egress(self, parameter: Parameter, value: Any, *, travels_as_data: bool) -> Any:
@@ -1499,9 +1495,9 @@ class BaseNode(ABC):
         # under rather than minting a second one for the same thing.
         existing = scope.key_held_in_slot(slot, value)
         if existing is not None:
-            return make_reference(worker=scope.owner, key=existing)
+            return make_reference(worker=scope.owner, key=existing, source=scope.source)
         key = scope.park(value, parameter_name=parameter.name, slot=slot, on_drop=parameter.on_local_object_drop)
-        return make_reference(worker=scope.owner, key=key)
+        return make_reference(worker=scope.owner, key=key, source=scope.source)
 
     def clear_node(self) -> None:
         # set state to unresolved

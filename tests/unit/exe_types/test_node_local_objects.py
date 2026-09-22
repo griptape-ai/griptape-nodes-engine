@@ -194,11 +194,11 @@ class TestWhatTheAuthorSeesWhenSomethingIsWrong:
         too, so anything a library does outside `process` lands here.
         """
         consumer = _consumer()
-        # A key from another process can only be here because a worker existed, which is the condition the
-        # read's fast path latches on. Without one, no value in this process can name a cached object.
-        consumer.local_objects._manager().engine.worker_manager._has_ever_had_a_worker = True
         consumer.set_parameter_value(
-            "pipeline", make_reference(worker="some-other-worker", key="LoadPipeline.pipeline#deadbeef")
+            "pipeline",
+            make_reference(
+                worker="some-other-worker", key="LoadPipeline.pipeline#deadbeef", source="LoadPipeline@abc12345"
+            ),
         )
 
         with pytest.raises(RuntimeError) as caught:

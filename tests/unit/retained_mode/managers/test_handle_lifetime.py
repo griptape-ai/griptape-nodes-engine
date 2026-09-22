@@ -926,3 +926,36 @@ class TestANonSerializableContainer:
 
         assert node.parameter_output_values["latents"] is batch
         assert engine.node_manager._cached_objects_owned_by(node) == []
+
+
+class TestAPassThroughDoesNotOwnWhatItCarries:
+    """A reference travels by value, so a node's own outputs can hold one it merely passed along.
+
+    `EndNode.process` copies every input to an output, and the subflow boundary nodes do the same, so a
+    subflow's End node's output values hold the inner producer's reference verbatim. Releasing on that
+    basis frees an object whose real producer is still alive and holding it, and every live consumer is
+    then told to re-run a producer that never changed.
+    """
+
+    def test_deleting_it_leaves_the_producers_object_alone(self, engine: Engine, flow_name: str) -> None:
+        producer = _add(engine, _Producer(name="Producer"), flow_name)
+        relay = _add(engine, _Producer(name="Relay"), flow_name)
+        producer.parameter_output_values["latent"] = Held("latent")
+        reference = _egress(producer)["latent"]
+        # What a pass-through does: the upstream's reference copied into its own output.
+        relay.parameter_output_values["latent"] = reference
+
+        engine.handle_request(DeleteNodeRequest(node_name="Relay"))
+
+        assert producer.released == []
+        assert _is_held(engine, reference)
+
+    def test_the_producer_still_releases_its_own(self, engine: Engine, flow_name: str) -> None:
+        producer = _add(engine, _Producer(name="Producer"), flow_name)
+        producer.parameter_output_values["latent"] = Held("latent")
+        reference = _egress(producer)["latent"]
+
+        engine.handle_request(DeleteNodeRequest(node_name="Producer"))
+
+        assert producer.released == ["latent"]
+        assert not _is_held(engine, reference)
