@@ -586,6 +586,49 @@ class TestConfigManager:
                 assert manager.get_config_value("log_level") == "ERROR"
                 assert manager.project_config == {"log_level": "ERROR"}
 
+    def test_dotted_key_in_config_file_warns_and_is_not_applied(
+        self, isolate_user_config: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A flat dotted key configures nothing, so loading the file warns with the nested form."""
+        isolate_user_config.write_text(json.dumps({"worker.heartbeat_timeout_s": 45}), encoding="utf-8")
+
+        with patch.dict(os.environ, {}, clear=True):
+            with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+                manager = ConfigManager()
+
+            assert manager.get_config_value("worker.heartbeat_timeout_s") != 45  # noqa: PLR2004
+            warnings = [record for record in caplog.records if "worker.heartbeat_timeout_s" in record.message]
+            assert len(warnings) == 1
+            assert '{"worker": {"heartbeat_timeout_s": "..."}}' in warnings[0].message
+
+    def test_dotted_key_warning_logged_once_per_file_and_key(
+        self, isolate_user_config: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Reloading configs, as a project switch does, doesn't re-warn about the same key."""
+        isolate_user_config.write_text(json.dumps({"worker.heartbeat_timeout_s": 45}), encoding="utf-8")
+
+        with patch.dict(os.environ, {}, clear=True):
+            with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+                manager = ConfigManager()
+                manager.load_configs()
+
+            warnings = [record for record in caplog.records if "worker.heartbeat_timeout_s" in record.message]
+            assert len(warnings) == 1
+
+    def test_dotted_key_below_top_level_does_not_warn(
+        self, isolate_user_config: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Mapping keys such as `project_workspaces` paths may contain dots."""
+        isolate_user_config.write_text(
+            json.dumps({"project_workspaces": {"/projects/my.project": "/workspaces/my.project"}}), encoding="utf-8"
+        )
+
+        with patch.dict(os.environ, {}, clear=True):
+            with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+                ConfigManager()
+
+            assert not [record for record in caplog.records if "Ignoring setting" in record.message]
+
     def test_non_gtn_config_env_vars_ignored(self) -> None:
         """Test that environment variables not starting with GTN_CONFIG_ are ignored."""
         with patch.dict(
