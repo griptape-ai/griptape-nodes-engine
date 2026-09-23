@@ -18,7 +18,7 @@ What this harness covers
 - Worker-side forwarding of orchestrator-owned requests back to the
   orchestrator is wired by registering a test RemoteHandler (mirrors the
   production `register_remote_handlers` swap) that, when the worker is inside
-  a `worker_node_execution_scope`, dispatches to the orchestrator-side
+  a `node_execution_scope`, dispatches to the orchestrator-side
   `EventManager.ahandle_request` instead of running locally.
 
 Intentional limits
@@ -69,7 +69,7 @@ class InProcessWorkerHarness:
         """Register a RemoteHandler on the worker for ``request_type``.
 
         Mirrors production ``register_remote_handlers``: while the worker side is
-        inside a ``worker_node_execution_scope``, dispatches to the orchestrator-
+        inside a ``node_execution_scope``, dispatches to the orchestrator-
         side EventManager. Outside the scope, delegates to whatever handler was
         already registered on the worker (if any).
         """
@@ -86,7 +86,7 @@ class InProcessWorkerHarness:
             if original is None:
                 msg = (
                     f"Harness RemoteHandler for {request_type.__name__} was invoked "
-                    "outside a worker_node_execution_scope and no local worker handler is registered."
+                    "outside a node_execution_scope and no local worker handler is registered."
                 )
                 raise RuntimeError(msg)
             return await _invoke_handler(original, request)

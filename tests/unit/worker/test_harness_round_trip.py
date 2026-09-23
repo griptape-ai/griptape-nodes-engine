@@ -12,7 +12,7 @@ Covers the two routing paths the harness is meant to exercise:
    ``harness.install_remote_handler(...)`` for test purposes, mirroring
    production ``register_remote_handlers``) is forwarded to the
    orchestrator's handler while the worker is inside
-   ``worker_node_execution_scope``.
+   ``node_execution_scope``.
 
 These are the invariants the harness owes its callers. Anything
 finer-grained (serialization fidelity, concurrency) belongs in
@@ -117,8 +117,8 @@ class TestHarnessWorkerToOrchestratorForwarding:
         harness.orchestrator.assign_manager_to_request_type(_ForwardableRequest, orchestrator_handler)
         harness.install_remote_handler(_ForwardableRequest)
 
-        # Forwarding only activates inside worker_node_execution_scope.
-        with harness.worker.worker_node_execution_scope():
+        # Forwarding only activates inside node_execution_scope.
+        with harness.worker.node_execution_scope():
             result_event = await harness.worker.ahandle_request(_ForwardableRequest(marker="m1"))
 
         assert result_event.succeeded()
