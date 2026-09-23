@@ -104,7 +104,7 @@ class TestEventManagerBroadcasting:
         await event_manager.abroadcast_app_event(local)
         await event_manager.abroadcast_peer_app_event(peer)
 
-        assert listener.await_count == 2
+        assert listener.await_count == 2  # noqa: PLR2004
         assert [call.args[0] for call in listener.await_args_list] == [local, peer]
 
     @pytest.mark.asyncio
