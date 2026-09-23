@@ -210,11 +210,11 @@ class TestReadLibraryManifest:
                 }
             )
         )
-        name, deps, _flags = read_library_manifest(manifest)
+        name, deps, _exec_deps, _flags = read_library_manifest(manifest)
         assert name == "Test Library"
         assert deps == ["numpy>=1.26", "torch>=2.0"]
 
-    def test_includes_exec_deps(self, tmp_path: Path) -> None:
+    def test_splits_exec_deps(self, tmp_path: Path) -> None:
         manifest = tmp_path / "lib.json"
         manifest.write_text(
             json.dumps(
@@ -229,23 +229,26 @@ class TestReadLibraryManifest:
                 }
             )
         )
-        _name, deps, _flags = read_library_manifest(manifest)
-        assert deps == ["numpy", "torch"]
+        _name, deps, exec_deps, _flags = read_library_manifest(manifest)
+        assert deps == ["numpy"]
+        assert exec_deps == ["torch"]
 
     def test_empty_deps(self, tmp_path: Path) -> None:
         manifest = tmp_path / "lib.json"
         manifest.write_text(json.dumps({"name": "Empty", "metadata": {}}))
-        name, deps, flags = read_library_manifest(manifest)
+        name, deps, exec_deps, flags = read_library_manifest(manifest)
         assert name == "Empty"
         assert deps == []
+        assert exec_deps == []
         assert flags == []
 
     def test_invalid_json(self, tmp_path: Path) -> None:
         manifest = tmp_path / "lib.json"
         manifest.write_text("not json")
-        name, deps, flags = read_library_manifest(manifest)
+        name, deps, exec_deps, flags = read_library_manifest(manifest)
         assert name == ""
         assert deps == []
+        assert exec_deps == []
         assert flags == []
 
 

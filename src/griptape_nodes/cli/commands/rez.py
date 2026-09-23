@@ -709,7 +709,7 @@ def _build_library_from_dir(  # noqa: C901
 
     console.print(f"  Manifest: [cyan]{library_json}[/cyan]")
 
-    library_name, pip_dependencies, pip_install_flags = read_library_manifest(library_json)
+    library_name, pip_dependencies, pip_dependencies_exec, pip_install_flags = read_library_manifest(library_json)
     if not library_name:
         console.print("[red]Could not read library name from manifest.[/red]")
         raise typer.Exit(1)
@@ -717,7 +717,7 @@ def _build_library_from_dir(  # noqa: C901
     library_deps = read_library_dependencies(library_json)
 
     console.print(f"  Library:      [green]{library_name}[/green]")
-    console.print(f"  Pip deps:     [green]{len(pip_dependencies)}[/green]")
+    console.print(f"  Pip deps:     [green]{len(pip_dependencies)} edit + {len(pip_dependencies_exec)} exec[/green]")
     if pip_install_flags:
         console.print(f"  Install flags: [green]{' '.join(pip_install_flags)}[/green]")
     if library_deps:
@@ -751,6 +751,7 @@ def _build_library_from_dir(  # noqa: C901
         install_library_as_rez_package(
             library_name,
             pip_dependencies,
+            pip_dependencies_exec=pip_dependencies_exec or None,
             library_file_path=library_json,
             pip_install_flags=pip_install_flags or None,
             skip_installed=skip_installed,

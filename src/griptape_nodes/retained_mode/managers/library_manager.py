@@ -287,6 +287,7 @@ from griptape_nodes.utils.rez_utils import (
     is_rez_enabled,
     is_rez_library_path,
     library_file_path_to_rez_family,
+    pip_spec_name,
     resolve_rez_library_json_path,
     rez_library_package_name,
     rez_library_package_version,
@@ -3452,9 +3453,18 @@ class LibraryManager(EngineScoped):
         """Add a library's directory and dependency paths to sys.path.
 
         For rez libraries, resolves the rez environment to discover PYTHONPATH
-        entries (pip dependency paths) and adds them. For non-rez libraries,
-        adds the edit-time venv site-packages. The execution environment is
-        never spliced here -- a worker receives it as PYTHONPATH at spawn.
+        entries (pip dependency paths) and adds them.  For non-rez libraries,
+        adds the edit-time venv site-packages.
+
+        The edit-time environment is added in every process, because importing node modules and
+        instantiating nodes needs it. The execution environment is never added here, in either
+        process -- a worker receives it as PYTHONPATH at spawn, before it imports anything. See the
+        body for why splicing it into a running interpreter would not work.
+
+        Where both exist, the execution environment must keep precedence: it is the one resolved
+        over both dependency sets, so it holds the only versions of a shared package that one
+        resolver agreed on. PYTHONPATH sits at ``sys.path[1]``, which any ``insert(0, ...)`` would
+        overtake, so ``_add_library_edit_venv_to_sys_path`` declines rather than ordering around it.
 
         Args:
             library_name: Name of the library (for venv lookup)
@@ -3468,10 +3478,29 @@ class LibraryManager(EngineScoped):
             is_rez_enabled()
             and is_library_rez_package_available(library_name, library_file_path=Path(library_file_path))
         ):
-            from griptape_nodes.utils.rez_utils import resolve_rez_pythonpath
+            from griptape_nodes.utils.rez_utils import read_library_manifest, resolve_rez_pythonpath
+            from griptape_nodes.utils.rez_uv import rez_name
 
             rez_family = library_file_path_to_rez_family(Path(library_file_path))
-            rez_paths = await asyncio.to_thread(resolve_rez_pythonpath, [rez_family])
+
+            # Resolve only edit-time deps for the orchestrator — mirrors the venv
+            # model where only .venv (edit) goes on sys.path, never .venv-exec.
+            # The worker resolves the full family via rez-env, which includes exec deps.
+            _, edit_deps, exec_deps, _ = read_library_manifest(Path(library_file_path))
+            if exec_deps:
+                edit_rez_specs = [rez_name(pip_spec_name(dep)) for dep in edit_deps] if edit_deps else []
+                if edit_rez_specs:
+                    logger.debug(
+                        "[Rez] resolving edit-time deps only for orchestrator (%d edit, %d exec skipped)",
+                        len(edit_rez_specs),
+                        len(exec_deps),
+                    )
+                    rez_paths = await asyncio.to_thread(resolve_rez_pythonpath, edit_rez_specs)
+                else:
+                    rez_paths = []
+            else:
+                rez_paths = await asyncio.to_thread(resolve_rez_pythonpath, [rez_family])
+
             for rez_path in rez_paths:
                 if rez_path not in sys.path:
                     sys.path.insert(0, rez_path)
@@ -6629,8 +6658,14 @@ class LibraryManager(EngineScoped):
         """Resolve a `libraries_to_register` entry to a concrete on-disk path to scan.
 
         Entries using the ``REZ:<family>`` syntax are resolved from the rez
-        package store instead of the filesystem.  Regular entries resolve
-        against the workspace.  Returns None when the path does not exist.
+        package store instead of the filesystem.  Regular entries name an
+        already-present local library by ``path``, which resolves against the
+        workspace.  Libraries pinned to a git source live in
+        ``libraries_to_download`` and are resolved separately in
+        ``_discover_library_files`` by locating their provisioned manifest under
+        the workspace libraries directory, so they never need a
+        ``libraries_to_register`` entry.  Returns None when the path does not
+        exist on disk.
         """
         if is_rez_library_path(entry.path):
             rez_family = rez_library_package_name(entry.path)

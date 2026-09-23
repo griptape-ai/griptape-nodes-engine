@@ -289,14 +289,17 @@ def find_library_manifest(directory: Path) -> Path | None:
     return find_file_in_directory(directory, "griptape[-_]nodes[-_]library.json")
 
 
-def read_library_manifest(library_json: Path) -> tuple[str, list[str], list[str]]:
-    """Read library name, pip dependencies, and install flags from a manifest.
+def read_library_manifest(library_json: Path) -> tuple[str, list[str], list[str], list[str]]:
+    """Read library name, pip dependencies (split), and install flags from a manifest.
 
-    Returns ``(name, pip_dependencies, pip_install_flags)`` where
-    ``pip_dependencies`` is the union of ``pip_dependencies`` and
-    ``pip_dependencies_exec``, and ``pip_install_flags`` are extra flags
-    for uv/pip (e.g. ``["--torch-backend=auto"]``).
-    Returns ``("", [], [])`` if the file cannot be read.
+    Returns ``(name, pip_dependencies, pip_dependencies_exec, pip_install_flags)``:
+
+    - ``pip_dependencies`` — edit-time only (what the orchestrator needs)
+    - ``pip_dependencies_exec`` — execution-time only (what the worker needs
+      on top of edit-time deps)
+    - ``pip_install_flags`` — shared flags for uv/pip
+
+    Returns ``("", [], [], [])`` if the file cannot be read.
     """
     import json
 
@@ -305,21 +308,21 @@ def read_library_manifest(library_json: Path) -> tuple[str, list[str], list[str]
             data = json.load(f)
     except (json.JSONDecodeError, OSError):
         logger.warning("[Rez] failed to read library manifest: %s", library_json)
-        return "", [], []
+        return "", [], [], []
 
     name = data.get("name", "")
     pip_dependencies: list[str] = []
+    pip_dependencies_exec: list[str] = []
     pip_install_flags: list[str] = []
 
     metadata = data.get("metadata", {})
     deps = metadata.get("dependencies", {})
     if deps:
         pip_dependencies = list(deps.get("pip_dependencies", []) or [])
-        pip_dependencies_exec = deps.get("pip_dependencies_exec", []) or []
-        pip_dependencies.extend(pip_dependencies_exec)
+        pip_dependencies_exec = list(deps.get("pip_dependencies_exec", []) or [])
         pip_install_flags = list(deps.get("pip_install_flags", []) or [])
 
-    return name, pip_dependencies, pip_install_flags
+    return name, pip_dependencies, pip_dependencies_exec, pip_install_flags
 
 
 def read_library_dependencies(library_json: Path) -> list[dict[str, str | bool]]:
@@ -939,6 +942,7 @@ def install_library_as_rez_package(  # noqa: PLR0913
     library_name: str,
     pip_dependencies: list[str],
     *,
+    pip_dependencies_exec: list[str] | None = None,
     library_file_path: Path | None = None,
     extra_index_url: str | None = None,
     pip_install_flags: list[str] | None = None,
@@ -947,12 +951,18 @@ def install_library_as_rez_package(  # noqa: PLR0913
 ) -> None:
     """Install a library's pip dependencies as rez packages and write a library meta-package.
 
-    Intended to be called (via asyncio.to_thread) after a successful pip/venv
-    install so the same dependency set is also available to the rez resolver.
+    All dependencies (edit + exec) are installed as individual rez packages so
+    the worker's ``rez-env <family> --`` can resolve everything.  The library
+    meta-package's ``requires`` list includes ALL deps so the worker inherits
+    the full set.  The orchestrator resolves only the edit-time subset when
+    populating ``sys.path`` — see ``_add_library_paths_to_sys_path``.
 
     Args:
         library_name: Human-readable library name (used to derive the rez family name).
-        pip_dependencies: Direct pip dependency specs from the library JSON.
+        pip_dependencies: Edit-time pip dependency specs from the library JSON.
+        pip_dependencies_exec: Execution-time pip dependency specs.  Installed as
+            rez packages alongside edit deps but kept separate so the orchestrator
+            can resolve only what it needs.
         library_file_path: Path to the library JSON file; used to locate
             ``pyproject.toml`` and git metadata for version derivation.
         extra_index_url: Additional pip index URL (e.g. a PyTorch CUDA mirror).
@@ -963,7 +973,11 @@ def install_library_as_rez_package(  # noqa: PLR0913
         skip_installed: When True (default), skip packages whose rez package
             already exists. When False, overwrite everything.
     """
-    if not pip_dependencies:
+    all_pip_dependencies = list(pip_dependencies)
+    if pip_dependencies_exec:
+        all_pip_dependencies.extend(pip_dependencies_exec)
+
+    if not all_pip_dependencies:
         logger.debug("[Rez] library '%s' has no pip dependencies — skipping rez install", library_name)
         return
 
@@ -980,22 +994,27 @@ def install_library_as_rez_package(  # noqa: PLR0913
     from griptape_nodes.utils.rez_uv import install as rez_uv_install
     from griptape_nodes.utils.rez_uv import resolve_full, rez_name
 
-    logger.info("[Rez] resolving deps for library '%s' (%d direct specs) ...", library_name, len(pip_dependencies))
+    logger.info(
+        "[Rez] resolving deps for library '%s' (%d edit + %d exec specs) ...",
+        library_name,
+        len(pip_dependencies),
+        len(pip_dependencies_exec or []),
+    )
 
     resolved = resolve_full(
-        pip_dependencies,
+        all_pip_dependencies,
         extra_index_url=extra_index_url,
         extra_flags=pip_install_flags,
         python_version=python_version,
     )
 
-    direct_names = {pip_spec_name(spec) for spec in pip_dependencies}
+    direct_names = {pip_spec_name(spec) for spec in all_pip_dependencies}
     resolved_requires = [
         f"{rez_name(pkg.pip_name)}-{pkg.version}" for pkg in resolved if pip_spec_name(pkg.pip_name) in direct_names
     ]
 
     rez_uv_install(
-        pip_dependencies,
+        all_pip_dependencies,
         packages_dir=packages_root,
         extra_index_url=extra_index_url,
         extra_flags=pip_install_flags,
