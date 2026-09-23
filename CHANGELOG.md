@@ -24,6 +24,11 @@ the engine's request API from working without edits. Migration steps live in
   [MIGRATION.md](MIGRATION.md#package_to_folder-reports-where-it-put-the-workflow).
   [#5326](https://github.com/griptape-ai/griptape-nodes-engine/issues/5326)
 
+### Removed
+
+- The engine no longer runs its own static file server. The Griptape Nodes app serves the
+  workspace, as it has since v0.95.0. `STATIC_SERVER_ENABLED` is gone.
+
 ### Fixed
 
 - Model dropdowns no longer mark every model "Not permitted by your license" when two installed
