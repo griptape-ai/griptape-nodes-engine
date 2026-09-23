@@ -1,5 +1,3 @@
-"""Built-in traits expose their saved state without changing their constructors."""
-
 from typing import Any
 
 import pytest

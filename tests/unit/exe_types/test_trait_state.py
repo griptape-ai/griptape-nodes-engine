@@ -1,5 +1,3 @@
-"""What a trait's saved state may hold, and the one declaration of a saved trait's shape."""
-
 from __future__ import annotations
 
 from pathlib import Path

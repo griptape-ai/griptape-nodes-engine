@@ -1,5 +1,3 @@
-"""Saved trait entries pair with attached traits by class, not by name."""
-
 import sys
 from collections.abc import Generator
 from types import ModuleType
@@ -103,8 +101,6 @@ class TestPairingByClass:
 
 
 class TestPairingIsOneToOne:
-    """A parameter can carry two traits of one class, and each entry describes one of them."""
-
     def test_both_traits_of_a_class_get_their_own_state(self) -> None:
         first = Options(choices=["a"])
         second = Options(choices=["b"])

@@ -29,8 +29,6 @@ class TestTraitUIOptionOwnership:
         assert parameter.ui_options["slider"] == {"min_val": 1, "max_val": 50}
 
     def test_a_trait_change_still_reaches_the_ui_after_a_ui_tweak(self) -> None:
-        # The regression: hiding the parameter used to freeze a copy of the slider's options
-        # in stored state, so later changes to the trait updated the validator but not the UI.
         slider = Slider(min_val=1, max_val=50)
         parameter = Parameter(name="steps", type="int", tooltip="Sampling steps", traits={slider})
         parameter.hide = True
@@ -66,7 +64,6 @@ class TestAnEchoedMergedViewCannotBecomeStoredState:
         parameter = _slider_parameter()
         parameter.hide = True
 
-        # What the editor received, with one authored option flipped and sent back.
         echoed = parameter.to_dict()["ui_options"]
         echoed["hide"] = False
         parameter.ui_options = echoed
@@ -80,7 +77,6 @@ class TestAnEchoedMergedViewCannotBecomeStoredState:
         parameter.ui_options = parameter.to_dict()["ui_options"]
         slider.max = 10
 
-        # Would report the echoed copy's max of 50 if the echo had been stored.
         assert parameter.ui_options["slider"] == {"min_val": 1, "max_val": 10}
 
     def test_a_parameter_with_no_traits_stores_what_it_is_given(self) -> None:
@@ -134,9 +130,6 @@ class TestOwnershipHoldsWhateverOrderThingsHappenIn:
     """A trait can attach before or after a key is written, and neither order stores a copy."""
 
     def test_a_constructor_handed_a_trait_owned_key_stores_none_of_it(self) -> None:
-        # ParameterButton renders its Button trait's options and passes them down to
-        # Parameter.__init__, which assigns _ui_options directly rather than through the
-        # setter. Storing them would leave the save carrying a copy of the trait.
         parameter = ParameterButton(name="go", label="Original", icon="play")
 
         assert "button_label" not in parameter.authored_ui_options()
@@ -150,9 +143,6 @@ class TestOwnershipHoldsWhateverOrderThingsHappenIn:
         assert parameter.ui_options["button_label"] == "Changed"
 
     def test_attaching_a_trait_takes_over_a_key_already_authored(self) -> None:
-        # The reverse order: the key is authored while nothing owns it, then a trait that
-        # renders it attaches. The authored value must stop being reported and stop being
-        # saved, or it shadows the trait that now owns it.
         parameter = ParameterJson(name="payload", tooltip="JSON")
         parameter.button_label = "Mine"
 
@@ -200,8 +190,6 @@ class TestReportingATraitOwnedChange:
         assert parameter in node._tracked_parameters
 
     def test_clearing_a_styling_option_stops_reporting_it(self) -> None:
-        # The trait publishes an icon's options only while it has an icon, so clearing the
-        # icon has to drop them from the reported view rather than leave a stored copy behind.
         parameter = ParameterButton(name="go", label="Go", icon="play")
 
         parameter.icon = None

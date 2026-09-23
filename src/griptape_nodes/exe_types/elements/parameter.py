@@ -316,14 +316,8 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         return states
 
     def save_dict(self) -> dict[str, Any]:
-        """Return ``to_dict()`` with trait-owned and code-only fields in their saved form.
-
-        ``equals()`` and ``NodeManager`` both need this view, and it has to be the same view
-        in both places or a diff-based save writes the wrong thing.
-        """
+        """Return the view shared by diffing and persistence."""
         our_dict = self.to_dict()
-        # Trait-derived keys belong to the trait, not the parameter: ``traits`` below carries
-        # them, so the merged ``ui_options`` would duplicate them as stored options.
         our_dict["ui_options"] = self.authored_ui_options()
         our_dict["traits"] = self.trait_states()
         return our_dict
@@ -459,11 +453,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
     @ui_options.setter
     @BaseNodeElement.emits_update_on_write
     def ui_options(self, value: dict) -> None:
-        """Route trait-owned keys to the traits that render them, then store the write as given.
-
-        Every write lands here: node code, the editor, a saved file, and ``update_ui_options``.
-        Keeping the flat write stored means detaching a trait reveals the written value.
-        """
+        """Route trait-owned keys to traits while retaining the write for later detachment."""
         self._adopt_trait_options(value)
         self._ui_options = value
 
@@ -484,11 +474,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
                 )
 
     def _report_unadopted_trait_options(self, trait: Trait, value: dict) -> None:
-        """Report a write the trait renders over, which is neither applied nor saved.
-
-        A write matching what the trait already renders is the editor echoing it back, and
-        changes nothing.
-        """
+        """Ignore echoed values; warn when a differing write is neither applied nor saved."""
         ignored = sorted(
             key for key, rendered in trait.ui_options_for_trait().items() if key in value and value[key] != rendered
         )
@@ -504,11 +490,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         )
 
     def remove_ui_options_key(self, key: str) -> None:
-        """Remove a stored option, or report that a trait renders it regardless.
-
-        A trait-rendered key is never stored raw, so there is no copy to remove: only the
-        trait's own state controls it.
-        """
+        """Warn instead of removing a key rendered by an attached trait."""
         for trait in self.find_elements_by_type(Trait):
             if key in trait.ui_options_for_trait():
                 self._report_unremovable_trait_option(trait, key)

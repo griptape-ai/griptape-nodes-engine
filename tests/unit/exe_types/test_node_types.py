@@ -276,8 +276,6 @@ class TestLockedSuccessFailureNodeRouting:
 
 
 class TestParameterVisibilityKeepsTraitStateLive:
-    """Hiding a parameter must not freeze a copy of what its trait currently renders."""
-
     def test_hiding_a_parameter_with_a_trait_stores_no_trait_copy(self) -> None:
         node = MockNode()
         parameter = Parameter(name="top", tooltip="t", traits={Slider(min_val=0, max_val=100)})
@@ -289,7 +287,6 @@ class TestParameterVisibilityKeepsTraitStateLive:
         assert "slider" not in parameter.authored_ui_options()
 
     def test_a_later_trait_change_still_reaches_a_hidden_parameter(self) -> None:
-        """A stored trait copy would shadow this; there must be none to shadow it."""
         node = MockNode()
         trait = Slider(min_val=0, max_val=100)
         parameter = Parameter(name="top", tooltip="t", traits={trait})

@@ -1,5 +1,3 @@
-"""Plain-data representations of saved trait state."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -86,7 +84,6 @@ def changed_trait_states(built: list[dict[str, Any]], current: list[dict[str, An
 
 
 def _take_counterpart(candidates: list[dict[str, Any]], entry: dict[str, Any]) -> dict[str, Any] | None:
-    """Take the first candidate with the same identity, consuming it so two entries cannot share one."""
     identity = _trait_identity(entry)
     for candidate in candidates:
         if _trait_identity(candidate) == identity:
@@ -108,7 +105,6 @@ class TraitStateEntry:
 
     @classmethod
     def from_dict(cls, entry: dict[str, Any]) -> Self | None:
-        """Return ``None`` when the entry names no trait."""
         trait_name = entry.get("trait_name")
         if not isinstance(trait_name, str):
             return None

@@ -1,9 +1,3 @@
-"""A container's layout options are authored, so they survive a save and an unrelated write.
-
-``collapsed``, ``child_prefix``, ``display``, and ``columns`` live in attributes rather than
-in ``_ui_options``, so anything treating ``_ui_options`` as the whole authored set drops them.
-"""
-
 from griptape_nodes.exe_types.core_types import ParameterList
 
 GRID_COLUMNS = 3
@@ -39,9 +33,6 @@ class TestContainerLayoutIsAuthored:
         assert "columns" not in parameter.authored_ui_options()
 
     def test_an_unrelated_write_keeps_the_layout(self) -> None:
-        # The regression: hiding the list read the authored options as _ui_options alone, so
-        # the assignment that followed handed the setter a dict with no "display" key and it
-        # turned grid mode off.
         parameter = _grid_list()
 
         parameter.hide = True
@@ -60,8 +51,6 @@ class TestContainerLayoutIsAuthored:
         assert parameter.ui_options["child_prefix"] == "Item"
 
     def test_a_collapse_is_reported_as_a_difference(self) -> None:
-        # What the workflow save compares against the node's declared parameter: without the
-        # layout in the save view both sides looked identical and the collapse was never saved.
         declared = ParameterList(name="items", tooltip="t", input_types=["str"], collapsed=False)
         live = ParameterList(name="items", tooltip="t", input_types=["str"], collapsed=False)
 

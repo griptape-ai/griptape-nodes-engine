@@ -1,9 +1,3 @@
-"""The production save path.
-
-On_serialize_node_to_commands emits traits/value_callbacks that AddParameterToNodeRequest
-can replay onto a fresh node.
-"""
-
 import logging
 from collections.abc import Callable, Generator
 from typing import Any
@@ -117,7 +111,6 @@ class _DeclaredControls(BaseNode):
 
 @pytest.fixture(autouse=True)
 def _registered_node_type() -> Generator[None, None, None]:
-    """Register _ModelPicker under a real library, matching what CreateNodeRequest sets up."""
     LibraryRegistry._clear()
     schema = LibrarySchema(
         name=_LIBRARY_NAME,
@@ -156,8 +149,6 @@ def _added_parameter_commands(commands: list) -> dict[str, AddParameterToNodeReq
 
 
 class TestSerializeThenReplay:
-    """The scenario the deleted demo script covered: build, serialize, replay onto a fresh node."""
-
     def test_emitted_commands_carry_trait_state(self, engine: Engine) -> None:
         node = _add_node(engine, "picker")
         node.discover()
@@ -243,7 +234,6 @@ class _MisdeclaredTraitNode(BaseNode):
 
 @pytest.fixture(autouse=True)
 def _registered_misdeclared_node_type(_registered_node_type: None) -> None:
-    """Register _MisdeclaredTraitNode alongside _ModelPicker under the same test library."""
     library = LibraryRegistry.get_library(_LIBRARY_NAME)
     library.register_new_node_type(
         _MisdeclaredTraitNode, NodeMetadata(category="t", description="d", display_name="Misdeclared Trait Node")
@@ -409,10 +399,7 @@ class TestOnlyChangedTraitStateIsSaved:
 
 
 class TestRunTimeStateReachesTheTrait:
-    """The defect this exists to fix: state reached the file but never the trait object."""
-
     def test_a_narrowed_slider_still_enforces_its_new_bound(self, engine: Engine) -> None:
-        """Before, the UI was told 0-50 while the validator still accepted 80."""
         node = _add_declared_node(engine, "source")
         _control(node, "width", Slider).max = NARROWED_MAX
 

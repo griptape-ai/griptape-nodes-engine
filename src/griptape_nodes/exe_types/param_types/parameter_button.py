@@ -268,8 +268,7 @@ class ParameterButton(Parameter):
     @label.setter
     def label(self, value: str) -> None:
         """Set the button label (display text only - separate from parameter value)."""
-        # The trait owns every styling option below: it renders them into the parameter's
-        # ui_options, so setting the trait and reporting the change is the whole write.
+        # Styling is trait-owned; report the change without storing rendered options.
         self._get_button_trait().label = value
         self.report_ui_options_change()
 

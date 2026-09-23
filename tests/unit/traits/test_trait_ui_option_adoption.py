@@ -1,9 +1,4 @@
-"""A ui_options write from outside the engine reaches the trait that owns the key.
-
-The editor and any workflow saved before trait state was carried in its own right both write
-a trait's options straight into the parameter's ``ui_options``. Stored there, the value is
-shadowed at read time and dropped at save time, so the write has to be routed to its owner.
-"""
+"""Trait-owned UI-option writes must update the trait because they are not stored."""
 
 import logging
 from typing import Any
@@ -60,8 +55,6 @@ class TestAdoptingADropdown:
         assert parameter.authored_ui_options() == {"hide": True}
 
     def test_a_converter_accepts_a_value_from_the_written_choices(self) -> None:
-        # The point of adopting: the converter reads trait.choices, so a value the write made
-        # legal has to stay legal rather than being rewritten to the first original choice.
         parameter = Parameter(name="model", type="str", tooltip="t", traits={Options(choices=["base-1"])})
         parameter.ui_options = {"simple_dropdown": ["base-1", "runtime-a"]}
 
@@ -233,13 +226,7 @@ class TestATraitWithNothingToAdopt:
 
 
 class TestNodeCodeWritesAdoptToo:
-    """``update_ui_options`` and its siblings route through the same adoption as the editor.
-
-    A node keeping a slider's bound in step with a loaded image (as an image crop node does)
-    used to write straight into stored options: never read back, since the trait's own
-    rendered bound always won, and never saved, since a trait-owned key is stripped from what
-    gets stored.
-    """
+    """Node-code writes follow the same adoption path as editor writes."""
 
     def test_update_ui_options_moves_a_slider_bound(self) -> None:
         trait = Slider(min_val=0, max_val=100)
@@ -324,11 +311,7 @@ class _MisdeclaredTrait(Trait):
 
 
 class TestStateTheTraitWillNotAccept:
-    """Adopted state its own constructor rejects leaves the trait as it was.
-
-    Out of reach for the in-tree traits, which only ever name their own arguments. This is
-    the contract for a third-party one: the mistake costs a control, not the whole load.
-    """
+    """Invalid adopted state leaves the trait unchanged instead of failing the load."""
 
     def test_the_trait_keeps_the_state_it_had(self) -> None:
         trait = _MisdeclaredTrait(level=_UNTOUCHED_LEVEL)
