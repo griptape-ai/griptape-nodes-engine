@@ -295,6 +295,55 @@ class TestLocalFileDriverFileURI:
         unc_uri = "file://remote-server.invalid/path/to/file.txt"
         assert await driver.exists(unc_uri) is False
 
+    @pytest.mark.asyncio
+    async def test_read_normalizes_os_error_from_unreachable_unc_host(
+        self, driver: LocalFileDriver, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Normalize a real Windows SMB failure (e.g. WinError 53) into FileNotFoundError.
+
+        Such a failure surfaces from resolve() as a raw OSError rather than our own
+        FileNotFoundError. Mac/Linux never raise this for a UNC-shaped path (there's no SMB
+        layer to fail), so this mocks the failure directly to prove read() normalizes it,
+        rather than relying on a real unreachable host.
+        """
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        monkeypatch.setattr(
+            "griptape_nodes.files.drivers.local_file_driver.normalize_path_for_platform",
+            Mock(side_effect=OSError("[WinError 53] The network path was not found")),
+        )
+        unc_uri = "file://remote-server.invalid/path/to/file.txt"
+
+        with pytest.raises(FileNotFoundError):
+            await driver.read(unc_uri, timeout=10.0)
+
+    @pytest.mark.asyncio
+    async def test_exists_returns_false_for_os_error_from_unreachable_unc_host(
+        self, driver: LocalFileDriver, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """exists() must return False, not raise, when the host resolution itself fails."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        monkeypatch.setattr(
+            "griptape_nodes.files.drivers.local_file_driver.normalize_path_for_platform",
+            Mock(side_effect=OSError("[WinError 53] The network path was not found")),
+        )
+        unc_uri = "file://remote-server.invalid/path/to/file.txt"
+
+        assert await driver.exists(unc_uri) is False
+
+    def test_get_size_normalizes_os_error_from_unreachable_unc_host(
+        self, driver: LocalFileDriver, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same normalization as read(), for the synchronous get_size() path."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        monkeypatch.setattr(
+            "griptape_nodes.files.drivers.local_file_driver.normalize_path_for_platform",
+            Mock(side_effect=OSError("[WinError 53] The network path was not found")),
+        )
+        unc_uri = "file://remote-server.invalid/path/to/file.txt"
+
+        with pytest.raises(FileNotFoundError):
+            driver.get_size(unc_uri)
+
     def test_get_size_file_uri(self, driver: LocalFileDriver, temp_file: Path) -> None:
         """Test get_size with file:// URI."""
         file_uri = temp_file.as_uri()
