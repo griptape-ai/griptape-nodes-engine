@@ -38,11 +38,49 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("griptape_nodes")
 
-# Denial decoration, shared so a gated static dropdown and a gated HuggingFace dropdown are
-# indistinguishable to an artist.
-DENIED_ROW_ICON = "shield-off"
-DENIED_ROW_SUBTITLE = "Not permitted by your license"
-BADGE_TITLE = "Model Not Permitted"
+
+@dataclass(frozen=True)
+class DenialDecoration:
+    """How a refusal reads to an artist: the row it marks and the badge it raises.
+
+    Shared by both dropdown components, so a gated static dropdown and a gated HuggingFace
+    dropdown are indistinguishable.
+
+    There are two instances, and which one a parameter wears is the difference between an answer
+    and a missing answer. ``DENIED_DECORATION`` is for a check that ran and said no: the artist's
+    license does not cover the model, and nothing about that is a fault. ``CHECK_FAILED_DECORATION``
+    is for a check that could not run at all, which is the engine's fault and not theirs. The two
+    differ on every surface -- the row, the badge title, and the badge's opening line -- because a
+    surface still saying "not permitted by your license" would blame the artist's plan for an
+    engine-side fault, and they have no way to tell the two apart.
+
+    ``badge_lead`` is that opening line and carries a ``{value}`` placeholder for the model id;
+    ``apply_denial_badge`` fills it in and appends the consequence and the reason.
+    """
+
+    icon: str
+    row_subtitle: str
+    badge_title: str
+    badge_lead: str
+
+
+DENIED_DECORATION = DenialDecoration(
+    icon="shield-off",
+    row_subtitle="Not permitted by your license",
+    badge_title="Model Not Permitted",
+    badge_lead="Model `{value}` is not permitted.",
+)
+
+CHECK_FAILED_DECORATION = DenialDecoration(
+    # `alert-triangle` is what `ParameterMessage` maps its "warning" variant to; an unanswerable
+    # check is that, not a verdict.
+    icon="alert-triangle",
+    row_subtitle="Couldn't be checked",
+    badge_title="Model Check Failed",
+    # Only the consequence: `apply_denial_badge` appends `failure_detail`, which is what explains
+    # this state, and a lead that explained it too would say it twice before the part that helps.
+    badge_lead="`{value}` can't be used right now.",
+)
 
 
 @dataclass(frozen=True)
@@ -131,6 +169,22 @@ class ModelPolicySnapshot:
         """
         return bool(self.catalog_ids_by_provider_id) or self.has_unmatchable_entries
 
+    @property
+    def decoration(self) -> DenialDecoration:
+        """How this snapshot's refusals should read on a row and in a badge.
+
+        The one place the two states are told apart, so a surface cannot be missed and left
+        announcing a licensing problem for an engine-side fault.
+
+        Only ``failure_detail`` -- a query the engine could not answer -- reads as "couldn't be
+        checked". The ``unmatchable_denials`` refusal in ``denial_for`` deliberately does NOT:
+        policy really did deny a model there, and telling an artist their license was never
+        consulted would be false.
+        """
+        if self.failure_detail is not None:
+            return CHECK_FAILED_DECORATION
+        return DENIED_DECORATION
+
     def denial_for(  # noqa: PLR0911 -- a chain of early-exit verdicts, one per snapshot state
         self, provider_model_id: str | None, *, refuse_unrecognized: bool = False
     ) -> CheckpointDenial | None:
@@ -175,8 +229,9 @@ class ModelPolicySnapshot:
                         detail=(
                             "Your license does not permit one of the models this node offers, and this "
                             "library does not describe its models precisely enough to tell which one. No "
-                            "model can be used here until the library is updated. Contact whoever "
-                            "maintains this node library."
+                            "model can be used here until the library is updated. If this node came with "
+                            "Griptape Nodes, please report it from the editor's File > Report Issue menu; "
+                            "otherwise, contact whoever maintains this node library."
                         )
                     ),
                 )
@@ -277,14 +332,16 @@ def query_model_policy(node: BaseNode, *, fail_closed: bool = True) -> ModelPoli
             request.node_type,
             details,
         )
-        # Artist-facing, like the `unmatchable_denials` wording in `denial_for`: state the effect
-        # and who to ask. The node type, the engine's reason, and the manifest instruction stay in
-        # the warning above -- an artist cannot edit a library manifest, and naming one reads as a
-        # licensing problem when the actual fault is a broken registration.
+        # Artist-facing, so it states the effect and where to report it, and nothing they cannot
+        # act on: the node type, the engine's reason, and the manifest instruction stay in the
+        # warning above. It names the menu rather than an action ("File > Report Issue" over "use
+        # Report Issue") because the same string surfaces as a run error under `gtn run` and in
+        # published workflows, where there is no menu in front of them.
         return ModelPolicySnapshot(
             failure_detail=(
-                "This node's models could not be checked against your license, so nothing can be "
-                "used here yet. Contact whoever maintains this node library."
+                "Griptape Nodes couldn't check which models this node is allowed to use, so nothing "
+                "can be used here yet. This is a bug, not a limit on your plan or your API key. "
+                "Please report it from the editor's File > Report Issue menu."
             )
         )
 
@@ -329,18 +386,25 @@ def query_model_policy(node: BaseNode, *, fail_closed: bool = True) -> ModelPoli
     )
 
 
-def apply_denial_badge(parameter: Parameter, value: str, denial: CheckpointDenial | None) -> None:
+def apply_denial_badge(
+    parameter: Parameter, value: str, denial: CheckpointDenial | None, *, decoration: DenialDecoration
+) -> None:
     """Set or clear ``parameter``'s denial badge.
 
     Always clears when there is no denial, so a badge cannot outlive the condition that set it
     (a license change, or enforcement being turned off entirely).
+
+    ``decoration`` is required rather than defaulted, so a caller cannot quietly raise a badge
+    saying "not permitted by your license" over a check that never ran. Pass the owning snapshot's
+    ``decoration``.
     """
     if denial is None:
         parameter.clear_badge()
         return
+    lead = decoration.badge_lead.format(value=value)
     parameter.set_badge(
         variant="error",
-        title=BADGE_TITLE,
-        message=f"Model `{value}` is not permitted. Running this node will fail.\n\nReason(s): {denial.reason()}",
-        icon=DENIED_ROW_ICON,
+        title=decoration.badge_title,
+        message=f"{lead} Running this node will fail.\n\nReason(s): {denial.reason()}",
+        icon=decoration.icon,
     )
