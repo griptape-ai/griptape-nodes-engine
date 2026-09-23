@@ -1,6 +1,6 @@
 import logging
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -97,19 +97,9 @@ _SAME_VALUE_UNSET = object()
 
 
 class ResourceManager(EngineScoped):
-    """What this machine has, and what this process is holding.
+    """Machine capabilities and process-local objects.
 
-    Two separate maps, deliberately:
-
-    - `_capability_instances` describes the machine. `OSManager` populates it at boot with one record
-      each for OS, CPU and compute backends, and `ListCompatibleResourceInstances` matches a library's
-      declared `resources.required` against it to decide whether that library can execute here.
-    - `_local_objects` holds live Python objects a library parked in this process, keyed by an opaque
-      string that travels as a parameter value. Nothing else in the engine reads them.
-
-    Keeping them apart is load-bearing. The capability query walks every entry it can see and its
-    answer gates library executability, so a library's cached pipeline must never appear in it. A
-    third unrelated map does not belong here either; it belongs in its own manager.
+    Separate maps, because the capability query gates library executability.
     """
 
     def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
@@ -119,16 +109,13 @@ class ResourceManager(EngineScoped):
         self._capability_instances: dict[str, ResourceInstance] = {}
         # Maps an engine-minted key to a live object a library parked in THIS process.
         self._local_objects: dict[str, LocalObjectEntry] = {}
-        # Release hooks held back because a node was executing: see drain_deferred_releases.
-        self._deferred_releases: dict[str, LocalObjectEntry] = {}
-        # Node bodies that yield a callable run on real threads (`async_utils.to_thread`), and parallel
-        # resolution runs several node tasks at once, so two nodes can be inside these methods together.
-        # Every mutation happens under this lock; release hooks run outside it, since a hook is caller
-        # code that may be slow or may call back in.
-        #
-        # The guarantee is narrower than "thread-safe": the MAP is consistent, the held OBJECT is not
-        # protected. A reader is not protected against a concurrent drop, which can run a release hook on
-        # an object another node is still using. There is no borrow or lease.
+        # Release hooks held back because a node was executing: see drain_deferred_releases. A list, not a
+        # map: a stable key deferred twice before a drain -- a pipeline rebuilt under one config hash --
+        # would otherwise lose the first entry and strand what it held.
+        self._deferred_releases: list[tuple[str, LocalObjectEntry]] = []
+        # Parallel resolution puts several nodes in these methods at once, so every mutation happens under
+        # this lock. Hooks run outside it: a hook is caller code that may be slow or call back in. The lock
+        # protects the map, not the held object, which is why engine releases defer (drain_deferred_releases).
         self._local_objects_lock = threading.Lock()
 
         # Keys released here that a worker may also be holding. The releases happen on sync paths -- a
@@ -424,7 +411,7 @@ class ResourceManager(EngineScoped):
     # Plain calls, not request handlers: a request carrying a live object would be forwarded to a
     # worker and stringified by `json.dumps(default=str)` on the way.
 
-    def put_local_object(  # noqa: PLR0913 (each is a distinct fact about the entry; a params object would be one caller's convenience)
+    def put_local_object(  # noqa: PLR0913
         self,
         value: Any,
         *,
@@ -466,14 +453,7 @@ class ResourceManager(EngineScoped):
             if displaced_slot_entries:
                 self._pending_worker_releases.extend(displaced_slot_entries)
 
-        # Reusing a key replaces what was there, and that entry's release hook still has to run:
-        # dropping the last reference does not free what the object was holding, which is the whole
-        # reason on_drop exists. Rebuilding a pipeline under the same config hash would otherwise
-        # strand its GPU memory on every rebuild.
-        #
-        # Identity check, not just presence: re-registering the SAME object under its own key is the
-        # obvious way to write the reuse this API recommends, and tearing down the value that is now
-        # live in the map would hand the next reader a released object.
+        # Release the displaced object unless it is the same object or still held elsewhere.
         if displaced is not None and displaced.value is not value and not displaced_value_survives:
             self._invoke_hooks_once_per_object({full_key: displaced})
         self._invoke_hooks_once_per_object(displaced_slot_entries)
@@ -600,12 +580,7 @@ class ResourceManager(EngineScoped):
             del self._local_objects[key]
             survives = self._value_still_held_locked(entry.value)
         if not survives:
-            # Deferred like any other release, despite arriving from the orchestrator. The exemption used to
-            # rest on "the value was already replaced there, so a node running here was handed the new one"
-            # -- true of displacement, which never reaches a worker this way: both displacement fillers run
-            # inside park_for_egress, which is worker-only. What does arrive is node deletion, where the
-            # premise inverts. The object is being destroyed while a consumer may be mid-forward-pass
-            # holding it, so freeing now is the CUDA fault the deferral exists to prevent.
+            # Node deletion can arrive while a consumer is using this object, so defer like any other release.
             self._invoke_hooks_once_per_object({key: entry})
         return True
 
@@ -722,7 +697,7 @@ class ResourceManager(EngineScoped):
         return any(entry.value is value for entry in self._local_objects.values())
 
     def drain_deferred_releases(self) -> int:
-        """Run the release hooks held back during node execution. Returns how many objects went.
+        """Run the release hooks held back during node execution. Returns how many entries went.
 
         Safe only once nothing is executing: a hook frees what the object holds -- GPU memory, a file
         handle -- and a node that read the object is using it for as long as it runs. The map's lock cannot
@@ -738,7 +713,7 @@ class ResourceManager(EngineScoped):
             return 0
         with self._local_objects_lock:
             deferred = self._deferred_releases
-            self._deferred_releases = {}
+            self._deferred_releases = []
         if deferred:
             self._run_hooks(deferred)
         return len(deferred)
@@ -756,14 +731,14 @@ class ResourceManager(EngineScoped):
             # A node is running and may be using one of these. Held until it finishes rather than freed
             # underneath it; `drain_deferred_releases` runs them then.
             with self._local_objects_lock:
-                self._deferred_releases.update(removed)
+                self._deferred_releases.extend(removed.items())
             return
 
-        self._run_hooks(removed)
+        self._run_hooks(removed.items())
 
-    def _run_hooks(self, removed: dict[str, LocalObjectEntry]) -> None:
+    def _run_hooks(self, removed: Iterable[tuple[str, LocalObjectEntry]]) -> None:
         seen: set[int] = set()
-        for key, entry in removed.items():
+        for key, entry in removed:
             if id(entry.value) in seen:
                 continue
             if entry.on_drop is not None:

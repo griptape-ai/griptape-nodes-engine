@@ -463,11 +463,7 @@ class TestUnmetRequirementCostsExecutionNotEditing:
 class TestUnshippableOutputIsKept:
     @pytest.mark.asyncio
     async def test_worker_producing_an_unshippable_value_ships_a_reference(self, tmp_path: Path) -> None:
-        """A serializable=False output stays in the worker and a reference crosses in its place.
-
-        This used to be refused with instructions to cache it library-side by hand. The engine owns that
-        cache now, so the node runs.
-        """
+        """A serializable=False output stays in the worker and a reference crosses in its place."""
         from griptape_nodes.exe_types.local_objects import is_reference
         from griptape_nodes.retained_mode.events.execution_events import (
             ExecuteNodeRequest,
@@ -509,7 +505,7 @@ class TestManagerAccessDuringWorkerExecution:
         library_manager._is_worker = True
         event_manager = current_engine().event_manager
 
-        with event_manager.worker_node_execution_scope(), pytest.raises(RuntimeError) as excinfo:
+        with event_manager.node_execution_scope(), pytest.raises(RuntimeError) as excinfo:
             GriptapeNodes.ConfigManager()
 
         message = str(excinfo.value)
@@ -520,7 +516,7 @@ class TestManagerAccessDuringWorkerExecution:
         current_engine().library_manager._is_worker = True
         event_manager = current_engine().event_manager
 
-        with event_manager.worker_node_execution_scope():
+        with event_manager.node_execution_scope():
             with pytest.raises(RuntimeError, match="GetSecretValueRequest"):
                 GriptapeNodes.SecretsManager()
             with pytest.raises(RuntimeError, match="ReadFileRequest"):
@@ -543,7 +539,7 @@ class TestManagerAccessDuringWorkerExecution:
         ]
         assert len(accessors) > minimum_believable_sweep, "sweep found too few accessors to be believed"
 
-        with event_manager.worker_node_execution_scope():
+        with event_manager.node_execution_scope():
             for name in accessors:
                 if name == "StaticFilesManager":
                     assert getattr(GriptapeNodes, name)() is not None
@@ -562,7 +558,7 @@ class TestManagerAccessDuringWorkerExecution:
         """The refusal is about being in a worker, not about executing."""
         event_manager = current_engine().event_manager
 
-        with event_manager.worker_node_execution_scope():
+        with event_manager.node_execution_scope():
             assert GriptapeNodes.ConfigManager() is not None
 
     def test_static_files_manager_stays_available(self) -> None:
@@ -570,5 +566,5 @@ class TestManagerAccessDuringWorkerExecution:
         current_engine().library_manager._is_worker = True
         event_manager = current_engine().event_manager
 
-        with event_manager.worker_node_execution_scope():
+        with event_manager.node_execution_scope():
             assert GriptapeNodes.StaticFilesManager() is not None

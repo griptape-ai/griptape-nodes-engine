@@ -404,12 +404,28 @@ class TestReleasingWhileANodeRuns:
         node.local_objects.put(Pipeline("first"), key="cfg", on_drop=lambda value: released.append(value.label))
         manager = node.local_objects._manager()
 
-        with manager.engine.event_manager.worker_node_execution_scope():
+        with manager.engine.event_manager.node_execution_scope():
             node.local_objects.put(Pipeline("second"), key="cfg")
             assert released == []
 
         assert manager.drain_deferred_releases() == 1
         assert released == ["first"]
+
+    def test_two_releases_of_one_key_both_run(self) -> None:
+        """A library key is stable, so one node run can displace it twice before anything drains."""
+        node = _node()
+        released: list[str] = []
+        node.local_objects.put(Pipeline("first"), key="cfg", on_drop=lambda value: released.append(value.label))
+        manager = node.local_objects._manager()
+
+        with manager.engine.event_manager.node_execution_scope():
+            node.local_objects.put(Pipeline("second"), key="cfg", on_drop=lambda value: released.append(value.label))
+            node.local_objects.put(Pipeline("third"), key="cfg")
+            assert released == []
+
+        drained = manager.drain_deferred_releases()
+        assert released == ["first", "second"]
+        assert drained == len(released)
 
     def test_outside_execution_a_release_is_immediate(self) -> None:
         node = _node()
@@ -470,8 +486,8 @@ class TestReleasingWhileAnotherNodeRuns:
         manager = node.local_objects._manager()
         events = manager.engine.event_manager
 
-        with events.worker_node_execution_scope():  # node A
-            with events.worker_node_execution_scope():  # node B, concurrent
+        with events.node_execution_scope():  # node A
+            with events.node_execution_scope():  # node B, concurrent
                 node.local_objects.put(Pipeline("second"), key="cfg")
                 assert released == []
             # B has exited, A is still running: the drain refuses rather than freeing what A may hold.

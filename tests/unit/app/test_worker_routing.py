@@ -4,7 +4,7 @@ These tests pin down the two invariants that replaced the old
 ``ForwardFromWorkerMixin`` machinery:
 
 1. ``RemoteHandler`` forwards to the orchestrator only while the worker is
-   inside a ``worker_node_execution_scope``. Outside that scope it delegates
+   inside a ``node_execution_scope``. Outside that scope it delegates
    to the ``original`` handler it displaced, which preserves bootstrap and
    library-load behaviour (e.g. nodes calling ``self.add_parameter(...)``
    during LOAD_PROBE).
@@ -122,7 +122,7 @@ class TestRemoteHandlerScopeGate:
 
         handler = RemoteHandler(original=original, event_manager=event_manager)
 
-        with event_manager.worker_node_execution_scope():
+        with event_manager.node_execution_scope():
             result = await handler(_ProbeRequest(marker="m2"))
 
         assert isinstance(result, _ProbeResult)
@@ -276,7 +276,7 @@ class TestInstallRemoteHandlersSwap:
         """Bootstrap-path regression guard: LOAD_PROBE-style calls must stay local.
 
         A node's ``__init__`` running under LOAD_PROBE will issue an
-        ``AddParameterToNodeRequest`` outside ``worker_node_execution_scope``.
+        ``AddParameterToNodeRequest`` outside ``node_execution_scope``.
         The RemoteHandler installed for that type must delegate to the
         original handler rather than trying to forward.
         """
@@ -303,23 +303,32 @@ class TestInstallRemoteHandlersSwap:
 class TestDropAllLocalObjectsHandler:
     """The worker half of workflow teardown: release what this process is holding.
 
-    This is the process with the pipeline the orchestrator has no torch to hold, so the branch that
-    declines to release decides whether gigabytes stay resident.
+    This is the process with the pipeline the orchestrator has no torch to hold, so what this handler
+    accepts decides whether gigabytes stay resident.
     """
 
     @pytest.mark.asyncio
-    async def test_declines_while_executing_a_node(self, engine: Engine) -> None:
-        """Releasing mid-execution would free the pipeline under a forward pass already running."""
-        held = object()
-        key = engine.resource_manager.put_local_object(held, owner="Lib A", source="N", key="N-slot")
+    async def test_it_accepts_mid_execution_but_the_hook_waits(self, engine: Engine) -> None:
+        """Teardown arriving mid-render takes the entries now and frees them once the node is done.
 
-        with engine.event_manager.worker_node_execution_scope():
+        Freeing under a running forward pass is what must not happen; forgetting where the object is cannot
+        hurt a node that already holds it. Declining both would report success for work nothing re-issues.
+        """
+        released: list[str] = []
+        key = engine.resource_manager.put_local_object(
+            object(), owner="Lib A", source="N", key="cfg", on_drop=lambda _v: released.append("gone")
+        )
+
+        with engine.event_manager.node_execution_scope():
             result = await _handle_drop_all_local_objects(
                 DropAllLocalObjectsRequest(), event_manager=engine.event_manager
             )
+            assert isinstance(result, DropAllLocalObjectsResultSuccess)
+            assert engine.resource_manager.entry_for(key) is None
+            assert released == []
 
-        assert isinstance(result, DropAllLocalObjectsResultSuccess)
-        assert engine.resource_manager.get_local_object(key, owner="Lib A") is held
+        assert engine.resource_manager.drain_deferred_releases() == 1
+        assert released == ["gone"]
 
     @pytest.mark.asyncio
     async def test_releases_off_the_event_loop(self, engine: Engine) -> None:
@@ -397,7 +406,7 @@ class TestDropLocalObjectsHandler:
             object(), owner="Lib A", source="N", key="cfg", slot="out", on_drop=lambda _v: released.append("gone")
         )
 
-        with engine.event_manager.worker_node_execution_scope():
+        with engine.event_manager.node_execution_scope():
             result = await _handle_drop_local_objects(
                 DropLocalObjectsRequest(keys=[key]), event_manager=engine.event_manager
             )

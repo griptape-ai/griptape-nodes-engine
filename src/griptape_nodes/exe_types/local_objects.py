@@ -1,7 +1,7 @@
 """A node's view of the process-local object store.
 
-Values a library passes between nodes are held by their parameter: assigning an object to a
-`serializable=False` output holds it and stores a key, and the engine releases that key when it is
+Values a library passes between nodes are held for their parameter: a `serializable=False` output is held
+when it leaves the process, a reference travels in its place, and the engine releases it when the value is
 replaced or the node goes away. This module is for the other case -- a *resource* the library reuses
 across runs, like a pipeline whose load takes 30 seconds -- which needs a key the library can name again.
 
@@ -27,19 +27,18 @@ if TYPE_CHECKING:
     from griptape_nodes.exe_types.node_types import BaseNode
     from griptape_nodes.retained_mode.managers.resource_manager import ResourceManager
 
-# What a parameter value holds when the cache is holding the real thing. A typed envelope rather than a
-# string, so recognising one is a structural question: no pattern to match, and no chance of mistaking an
-# ordinary string a node happened to produce for a reference. The worker id travels in it, so a reader
-# compares it to its own and never parses anything.
+# What a parameter value holds when the cache is holding the real thing. A typed envelope, so recognising
+# one is structural: an ordinary string a node produced can never be mistaken for a reference. The worker id
+# travels in it, so a reader compares it to its own and never parses anything.
 _REFERENCE_KIND = "local_object_reference"
 
 
 def make_reference(*, worker: str, key: str, source: str) -> dict[str, str]:
     """The envelope for an object held in `worker` under `key`, produced by `source`.
 
-    `source` is carried so ownership is a field rather than something recovered from the key's shape. A
-    reference travels by value, so a pass-through node's own outputs can hold one it did not produce -- and
-    deleting that node must not release what another node is still using.
+    `source` is carried so ownership is a field. A reference travels by value, so a pass-through node's own
+    outputs can hold one it did not produce, and deleting that node must not release what another node is
+    still using.
     """
     return {"kind": _REFERENCE_KIND, "worker": worker, "key": key, "source": source}
 
@@ -50,12 +49,7 @@ def is_reference(value: Any) -> bool:
 
 
 class KeyVerdict(Enum):
-    """What a string turned out to be, as far as this worker's cache is concerned.
-
-    One question with four answers, rather than the several booleans this used to be. Every call site
-    switches on the verdict, so "which predicate belongs here" stops being a thing anyone can get wrong --
-    and the answers are exhaustive, so a new call site cannot quietly forget a case.
-    """
+    """Classifies a value as ordinary, held here, released, or held by another worker."""
 
     NOT_A_KEY = auto()
     HELD = auto()
@@ -137,23 +131,44 @@ class LocalObjectScope:
             on_drop=on_drop,
         )
 
-    def park(
+    def _park_for_egress(self, parameter: Parameter, value: Any, *, travels_as_data: bool) -> Any:
+        """Hold `value` in this process and return the reference to send in its place.
+
+        Called only where a parameter value is about to leave the process -- a worker dispatch or a worker
+        result -- never on a write. A node's own dicts keep the real object, so reading one back in-process
+        gives what was put there, and a graph that never crosses a process boundary never parks anything at
+        all.
+
+        Runs wherever the value was produced, so an object built in a worker stays in that worker and only
+        the reference crosses. A value that is already a reference passes through: it came from an upstream
+        that cached it. None passes through too, so a consumer is told nothing is connected rather than
+        resolving to None.
+        """
+        slot = parameter.name
+        if travels_as_data:
+            # Nothing fresh was cached this run, so whatever this slot held last run is now unreachable --
+            # unless the value passing through is a reference to that very entry.
+            keeping = str(value["key"]) if is_reference(value) else None
+            self._vacate_slot(slot, keeping=keeping)
+            return value
+        # Egress can happen more than once for one object, so reuse the key this slot already holds it
+        # under rather than minting a second one for the same thing.
+        existing = self._key_held_in_slot(slot, value)
+        if existing is not None:
+            return self.reference_for(existing)
+        key = self._park(value, parameter_name=slot, slot=slot, on_drop=parameter.on_local_object_drop)
+        return self.reference_for(key)
+
+    def _park(
         self, value: Any, *, parameter_name: str, slot: str | None = None, on_drop: Callable[[Any], None] | None = None
     ) -> str:
         """Hold a value on behalf of a parameter, under a key minted for this assignment.
 
-        For the engine's own use from the write path.
-
-        The key is unique per call so that a stale one is detectably stale. A consumer holding a key from
-        the previous run finds it dangling and is told to re-run the producer, which is the honest answer:
-        the object it wanted is gone. A key stable across runs would resolve to whatever the producer put
-        most recently, and that consumer would read the new object believing it had the old one. Do not
-        make the key stable to save the uuid -- the editor has no use for the difference either way, since
-        all it can display is the key.
+        The key is unique per call, so a stale reference fails instead of resolving to a newer object in the
+        same slot.
 
         The slot carries the identity: one object per (owner, source, parameter), and parking into it again
-        releases the previous occupant in the process holding it -- which is what frees the last run's
-        object, however the parameter values themselves were cleared in between.
+        releases the previous occupant in the process holding it.
         """
         # Straight to the manager: `slot` is what makes an entry the engine's to release and to displace,
         # and it stays off the library-facing `put` on purpose.
@@ -170,10 +185,7 @@ class LocalObjectScope:
     def look_up(self, value: Any) -> KeyLookup:
         """What `value` is, as far as this worker's cache is concerned. The one question about a value.
 
-        Only an envelope is ever a reference. A string is just a string, whatever it looks like, which is
-        what makes this free of false positives -- the previous shape-matching pattern had to be kept narrow
-        to avoid mistaking a URL for a reference, and still could not tell a library name containing a slash
-        from one that did not.
+        Only an envelope is a reference. Ordinary strings never are.
         """
         if not is_reference(value):
             return KeyLookup(KeyVerdict.NOT_A_KEY)
@@ -338,7 +350,7 @@ class LocalObjectScope:
 
         return substitute_leaves(value, resolve)
 
-    def key_held_in_slot(self, slot: str, value: Any) -> str | None:
+    def _key_held_in_slot(self, slot: str, value: Any) -> str | None:
         """The key this node already holds `value` under in `slot`, or None."""
         return self._manager().key_held_in_slot(owner=self.owner, source=self.source, slot=slot, value=value)
 
@@ -350,7 +362,7 @@ class LocalObjectScope:
             return False
         return self._manager().drop_local_object(key, owner=self.owner)
 
-    def vacate_slot(self, slot: str, *, keeping: str | None = None) -> None:
+    def _vacate_slot(self, slot: str, *, keeping: str | None = None) -> None:
         """Release whatever this node parked in `slot`, except the entry behind `keeping`.
 
         For the egress path, when a run ends with the parameter carrying something other than a fresh
@@ -421,35 +433,19 @@ class LocalObjectScope:
         for separately-versioned library code and saved workflow files. Read per call rather than captured,
         so it follows the node's own deferred resolution instead of pinning whichever engine was ambient
         when the scope was built.
-
-        Reaching the facade here raised during worker execution, and correctly so: the guard on those
-        accessors cannot tell engine plumbing from library code, so engine-internal code that goes through
-        it trips a rule aimed at node authors. That was this cache's version of a documented failure.
         """
         return self._node.engine.resource_manager
 
 
-# --- walking a parameter value -------------------------------------------------------------------
+# Three walks over a parameter value -- is this already data, which keys are in here, turn keys into
+# objects -- sharing one set of rules:
 #
-# The cache asks three questions of a value, and every one of them has to walk it: is this already data,
-# which cached keys are in here, and turn the keys into objects. A parameter value is whatever a node
-# assigned, so all three have to survive a container that refers to itself and one whose substructure is
-# shared rather than nested. Hand-rolling that guard per question is what produced five separate defects
-# in this feature's history, so the rules live here, once:
-#
-#   * a container reached twice is visited once. Without this, shared substructure is exponential in its
-#     depth rather than linear in its size.
-#   * a container that reaches itself terminates. What that *means* differs by question, so each one seeds
-#     its own answer for the revisit rather than sharing one.
+#   * a container reached twice is visited once, so shared substructure is linear in its size.
+#   * a container that reaches itself terminates. What that means differs per walk, so each seeds its own
+#     answer for the revisit.
 #   * substitution hands back the value it was given when nothing changed, so a node that reads a list and
 #     mutates it in place is mutating the stored list.
-#   * a reference envelope is a leaf in all three, never a container to descend. It is a dict, so getting
-#     this wrong in one of them and not the others is exactly the shape of bug this module exists to make
-#     unrepresentable.
-#
-# Nothing outside the cache uses these. Other walks over the same shape -- variable substitution, artifact
-# hydration -- are separate concerns that happen to share a spine, and coupling them here would tie the
-# cache to code that has no reason to know about it.
+#   * a reference envelope is a leaf in all three, never a container to descend.
 
 _CONTAINER_TYPES = (list, tuple, dict, set)
 
@@ -586,7 +582,7 @@ def cache_outputs_for_egress(values: Mapping[str, Any], *, node: BaseNode) -> di
     for name, value in dict(values).items():
         parameter = node.get_parameter_by_name(name)
         if parameter is not None and caches_its_values(parameter):
-            cached[name] = node.park_for_egress(parameter, value, travels_as_data=is_plain_data(value))
+            cached[name] = node.local_objects._park_for_egress(parameter, value, travels_as_data=is_plain_data(value))
             continue
         cached[name] = value
     return cached
