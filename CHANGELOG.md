@@ -26,6 +26,10 @@ the engine's request API from working without edits. Migration steps live in
 
 ### Fixed
 
+- Image, video, audio, and 3D inputs given a `localhost` static server URL use the file where it
+  already is, instead of copying it into `staticfiles/` again. The extra copy could overwrite a
+  different file with the same name.
+  [#5647](https://github.com/griptape-ai/griptape-nodes-engine/issues/5647)
 - Model dropdowns no longer mark every model "Not permitted by your license" when two installed
   libraries provide a node with the same name.
   [#5618](https://github.com/griptape-ai/griptape-nodes-engine/issues/5618)
