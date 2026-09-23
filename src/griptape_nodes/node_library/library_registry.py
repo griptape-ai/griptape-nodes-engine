@@ -18,6 +18,7 @@ from griptape_nodes.node_library.library_declarations import (
     find_model_catalog,
     resolve_node_models,
 )
+from griptape_nodes.retained_mode.beta_features import BetaFeature, parse_library_beta_features
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries.duplicate_node_registration_problem import (
     DuplicateNodeRegistrationProblem,
 )
@@ -277,8 +278,9 @@ class LibrarySchema(BaseModel):
     """
 
     # Dependencies.pip_dependencies_exec is optional, so a manifest written against an earlier
-    # schema still validates: its absence means every dependency is edit-time.
-    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.13.0"
+    # schema still validates: its absence means every dependency is edit-time. 0.14.0 adds the
+    # optional beta_features list, which older engines ignore.
+    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.14.0"
 
     name: str
     library_schema_version: str
@@ -293,6 +295,10 @@ class LibrarySchema(BaseModel):
     is_default_library: bool | None = None
     advanced_library_path: str | None = None
     widgets: list[WidgetDefinition] | None = None
+    # Beta features this library defines. Kept as raw entries so one bad entry cannot fail the
+    # whole manifest. parse_library_beta_features checks each one, and the load reports the
+    # dropped ones as library problems.
+    beta_features: list[Any] | None = None
 
 
 class LibraryRegistry:
@@ -640,6 +646,10 @@ class Library:
         self._registered_pre_dispatch_hooks = []
         self._registered_post_dispatch_hooks = []
         self._registered_request_handler_types = []
+
+    def get_beta_features(self) -> dict[str, BetaFeature]:
+        """The valid beta features this library declares, keyed by id, including expired ones."""
+        return parse_library_beta_features(self._library_data.name, self._library_data.beta_features or []).features
 
     def get_registered_app_event_listeners(self) -> list[tuple[type, Callable]]:
         return list(self._registered_app_event_listeners)

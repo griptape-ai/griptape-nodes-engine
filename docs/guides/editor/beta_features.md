@@ -4,7 +4,7 @@ Beta features are new features that aren't ready to be on for everyone yet.
 You can turn them on to try them early, and turn them off again at any time.
 They're managed from the **Beta Features** page in the editor's settings.
 
-<!-- screenshot: the Beta Features settings page with Editor and Engine groups and a few toggles -->
+<!-- screenshot: the Beta Features settings page with Editor, Engine, and library groups and a few toggles -->
 
 ## Turning a beta feature on or off
 
@@ -19,6 +19,10 @@ Features are grouped by where they live:
 - **Engine** features change what happens behind the scenes, such as
     how workflows run. They come from the engine you're connected to, so
     the list can differ between engines and engine versions.
+- **Library** features come from the node libraries you have loaded, and
+    are grouped under each library's name. They usually add or change
+    something on that library's nodes. They appear when the library is
+    loaded and disappear when it's removed.
 
 To go back to the standard behavior for everything, click **Reset all**.
 Every feature returns to its default, which is almost always off.
@@ -57,6 +61,20 @@ Your choices are saved in the `beta_features` section of your
 }
 ```
 
+Library features are saved in `library_beta_features`, under the
+library's name in lowercase with spaces and punctuation turned into
+underscores. For a library called "Acme Image Tools":
+
+```json
+{
+    "library_beta_features": {
+        "acme_image_tools": {
+            "sharpen_after_upscale": true
+        }
+    }
+}
+```
+
 Only `true` or `false` counts. Any other value, such as `"yes"`, is
 ignored with a warning in the engine log, and the feature uses its
 default. A mistake here never affects your other settings.
@@ -69,6 +87,15 @@ environment variable. Put the feature's id, in capitals, after
 GTN_CONFIG_BETA_FEATURES__PARALLEL_BRANCH_RESOLUTION=true gtn
 ```
 
-The feature names used above are examples. See
-[Engine Configuration](../configuration.md) for how config files and
-environment variables are loaded.
+For a library feature, use `GTN_CONFIG_LIBRARY_BETA_FEATURES__`, then the
+library's key in capitals, two underscores, and the feature's id:
+
+```bash
+GTN_CONFIG_LIBRARY_BETA_FEATURES__ACME_IMAGE_TOOLS__SHARPEN_AFTER_UPSCALE=true gtn
+```
+
+The feature and library names used above are examples. To add beta
+features to a library you're building, see
+[Authoring Libraries](../../development/custom_nodes/authoring_libraries.md#beta-features).
+See [Engine Configuration](../configuration.md) for how config files
+and environment variables are loaded.

@@ -244,7 +244,7 @@ This will start a local webserver (usually at `http://127.0.0.1:8000/`). The sit
 
 If you're building something user-visible or behavior-changing that isn't ready to be on for everyone, you can put it behind a beta feature. Users turn beta features on and off from the Beta page in the editor's Settings. Every feature you register in the engine appears there automatically, with no editor change needed.
 
-Beta features are for engine and editor work only. Node libraries can't define their own. To gate unfinished work in a library, use a library setting or ship it in a separate version.
+This section covers engine features. Node libraries, including the standard library, declare their own in the `beta_features` list of their library JSON and check them from nodes with `self.is_beta_feature_enabled("<id>")`. See [Beta Features in Authoring Libraries](docs/development/custom_nodes/authoring_libraries.md#beta-features).
 
 1. **Register the feature** in `src/griptape_nodes/retained_mode/beta_features.py`. All engine features live in that one module. The `name` and `description` are shown to users on the Beta page, so describe what changes and where, in plain terms:
 

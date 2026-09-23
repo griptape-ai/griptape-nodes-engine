@@ -65,7 +65,7 @@ Instance methods come first because they can call anything. Class methods come n
 
 ## Beta Features
 
-**When to use a beta flag** - Gate user-visible or behavior-changing work that isn't ready to be on by default. Users turn flags on and off from the editor's Beta settings page, which lists engine features automatically through `ListBetaFeaturesRequest`. Beta flags are for engine and editor features only. Node libraries cannot define their own, and nothing should register a feature from library code.
+**When to use a beta flag** - Gate user-visible or behavior-changing work that isn't ready to be on by default. Users turn flags on and off from the editor's Beta settings page, which lists engine and library features automatically through `ListBetaFeaturesRequest`. Node libraries never call `register_beta_feature`. They declare features in the `beta_features` list of their library JSON, and nodes check them with `self.is_beta_feature_enabled("<id>")`. Library features are stored under `library_beta_features.<library slug>.<id>` and are covered in `docs/development/custom_nodes/authoring_libraries.md`.
 
 **Register every flag in `retained_mode/beta_features.py`** - Keep all registrations in that one module so they are easy to audit. The `description` is shown to users on the Beta page, so write it for artists: what changes and where.
 

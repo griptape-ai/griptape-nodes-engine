@@ -107,6 +107,7 @@ Bundle nodes into libraries for sharing. Create `griptape_nodes_library.json`:
     - Secrets are read with `GriptapeNodes.handle_request(GetSecretValueRequest(key=...))`
 - **metadata.dependencies**: PIP packages installed on library load
 - **metadata.declarations** / per-node **metadata.declarations**: typed identity properties (lifecycle stage, arbitrary Python execution) and a library-level model catalog plus per-node references into it. See [Library and Node Declarations](#library-and-node-declarations) below.
+- **beta_features**: Experimental features users can turn on from the editor's Beta Features page. See [Beta Features](#beta-features) below.
 - **widgets**: Register custom JS widget components (see [Custom Widgets](custom_widgets.md))
 - **categories**: Group nodes in UI with colors and icons
 - **nodes**: List node classes, file paths, and metadata
@@ -325,6 +326,93 @@ A node can carry any combination of declarations. For example, a Labs node that 
 ```
 
 New declaration types added in future engine releases land additively under this same `declarations` field without a schema-version bump.
+
+### Beta Features
+
+A beta feature lets you ship something new in your library but leave it off until users choose to
+try it. Your features show up under your library's name on the editor's
+[Beta Features](../../guides/editor/beta_features.md) settings page, where users turn them on and off.
+
+Declare each feature in the `beta_features` list of `griptape_nodes_library.json`:
+
+```jsonc
+"beta_features": [
+  {
+    "id": "sharpen_after_upscale",
+    "name": "Sharpen after upscaling",
+    "description": "Adds a Sharpen setting to the Upscale Image node.",
+    "owner": "@your-github-handle",
+    "remove_by": "2027-03-31"
+  }
+]
+```
+
+| Field         | Meaning                                                                                                   |
+| ------------- | --------------------------------------------------------------------------------------------------------- |
+| `id`          | Lowercase letters, digits, and underscores, starting with a letter. Unique within your library.           |
+| `name`        | Short label shown on the Beta Features page.                                                              |
+| `description` | One or two sentences telling users what changes and where.                                                |
+| `default`     | Optional. Whether the feature is on for users who haven't chosen. Defaults to `false`.                    |
+| `owner`       | Who is responsible for finishing or removing the feature.                                                 |
+| `remove_by`   | `YYYY-MM-DD` date by which you make the feature standard or remove it. At most 180 days after you add it. |
+
+Check the feature from a node with `self.is_beta_feature_enabled("<id>")`. It returns the user's
+choice, or `default` if they haven't made one. **Always create the parameters a feature uses, and
+only hide or show them based on the feature.** A workflow saved by someone with the feature on then
+still opens for someone with it off, and the other way around.
+
+```python
+from typing import Any
+
+from griptape_nodes.exe_types.core_types import Parameter
+from griptape_nodes.exe_types.node_types import DataNode
+
+
+class UpscaleImage(DataNode):
+    def __init__(self, name: str, metadata: dict[str, Any] | None = None) -> None:
+        super().__init__(name, metadata)
+
+        self.add_parameter(
+            Parameter(name="image", input_types=["ImageArtifact"], type="ImageArtifact", tooltip="Image to upscale")
+        )
+
+        # Created for everyone, shown only to users who turned the beta feature on.
+        self.add_parameter(
+            Parameter(
+                name="sharpen",
+                input_types=["float"],
+                type="float",
+                default_value=0.0,
+                tooltip="How much to sharpen the image after upscaling",
+            )
+        )
+        if not self.is_beta_feature_enabled("sharpen_after_upscale"):
+            self.hide_parameter_by_name("sharpen")
+
+    def process(self) -> None:
+        image = self.get_parameter_value("image")
+        upscaled = upscale(image)
+
+        if self.is_beta_feature_enabled("sharpen_after_upscale"):
+            upscaled = sharpen(upscaled, self.get_parameter_value("sharpen"))
+
+        self.parameter_output_values["image"] = upscaled
+```
+
+A few rules worth knowing:
+
+- **A mistake in one entry doesn't stop your library from loading.** A missing field, an invalid
+    `id`, or a repeated `id` is reported as a library problem, and that feature is left out. Your
+    other features and nodes still work.
+- **Checking an id you didn't declare returns `false`** and logs a warning naming the feature.
+- **After `remove_by`, the feature always uses its `default`.** It disappears from the Beta
+    Features page and the library reports a problem until you make the feature standard or remove it.
+    A `remove_by` more than 180 days away is also reported.
+- **Users' choices are stored per library** under `library_beta_features` in their config, keyed by
+    your library's name in lowercase with spaces and punctuation turned into underscores. "Acme
+    Image Tools" becomes `library_beta_features.acme_image_tools.sharpen_after_upscale`.
+- **Engines released before library schema `0.14.0` ignore `beta_features`.** Set
+    `library_schema_version` to `0.14.0` or later when you add them.
 
 ## Library Structure with uv Dependency Management
 

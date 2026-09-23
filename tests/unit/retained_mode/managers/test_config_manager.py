@@ -228,6 +228,59 @@ class TestConfigManager:
 
             assert manager.merged_config["log_level"] == "ERROR"
 
+    def test_library_beta_feature_env_var_is_read_as_bool(self) -> None:
+        """GTN_CONFIG_LIBRARY_BETA_FEATURES__<LIBRARY>__<ID> lands as a real bool under the library's map."""
+        with patch.dict(
+            os.environ, {"GTN_CONFIG_LIBRARY_BETA_FEATURES__MY_LIBRARY__FAST_UPSCALE": "false"}, clear=True
+        ):
+            manager = ConfigManager()
+            manager.load_configs()
+
+            assert manager.get_config_value("library_beta_features.my_library.fast_upscale") is False
+
+    def test_invalid_library_beta_feature_env_var_reported_as_bad_value(self, caplog: pytest.LogCaptureFixture) -> None:
+        with patch.dict(
+            os.environ, {"GTN_CONFIG_LIBRARY_BETA_FEATURES__MY_LIBRARY__FAST_UPSCALE": "maybe"}, clear=True
+        ):
+            with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+                manager = ConfigManager()
+                env_config = manager._load_config_from_env_vars()
+
+            assert env_config == {}
+            messages = [record.message for record in caplog.records]
+            assert any(
+                "is not a valid value for the 'library_beta_features.my_library.fast_upscale' setting" in m
+                for m in messages
+            )
+
+    def test_invalid_library_beta_features_do_not_reset_the_rest_of_the_config(
+        self, isolate_user_config: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Bad library entries are dropped one at a time, like `beta_features` entries."""
+        isolate_user_config.write_text(
+            json.dumps(
+                {
+                    "log_level": "ERROR",
+                    "library_beta_features": {
+                        "lib_a": {"lib_good": True, "lib_bad": "maybe"},
+                        "lib_not_a_map": "on",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {}, clear=True):
+            with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+                manager = ConfigManager()
+                manager.load_configs()
+
+            assert manager.merged_config["log_level"] == "ERROR"
+            assert manager.get_config_value("library_beta_features.lib_a.lib_good") is True
+            messages = [record.message for record in caplog.records]
+            assert any("library_beta_features.lib_a.lib_bad:" in m for m in messages)
+            assert any("library_beta_features.lib_not_a_map:" in m for m in messages)
+
     def test_load_config_from_env_vars_unknown_nested_key_rejected(self, caplog: pytest.LogCaptureFixture) -> None:
         """A sub-key a declared nested model doesn't recognize is rejected, not kept as a raw string.
 

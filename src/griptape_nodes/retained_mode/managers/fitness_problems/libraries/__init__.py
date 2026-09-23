@@ -14,6 +14,7 @@ from .duplicate_widget_registration_problem import DuplicateWidgetRegistrationPr
 from .engine_version_error_problem import EngineVersionErrorProblem
 from .incompatible_requirements_problem import IncompatibleRequirementsProblem
 from .insufficient_disk_space_problem import InsufficientDiskSpaceProblem
+from .invalid_beta_feature_problem import InvalidBetaFeatureProblem
 from .invalid_version_string_problem import InvalidVersionStringProblem
 from .library_dependency_problem import LibraryDependencyProblem
 from .library_json_decode_problem import LibraryJsonDecodeProblem
@@ -60,6 +61,7 @@ __all__ = [
     "EngineVersionErrorProblem",
     "IncompatibleRequirementsProblem",
     "InsufficientDiskSpaceProblem",
+    "InvalidBetaFeatureProblem",
     "InvalidVersionStringProblem",
     "LibraryDependencyProblem",
     "LibraryJsonDecodeProblem",
