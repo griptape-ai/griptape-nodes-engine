@@ -32,6 +32,27 @@ class Twin(Trait):
         return {}
 
 
+class Strict(Trait):
+    """A third-party trait that indexes saved state instead of checking for keys."""
+
+    def __init__(self, level: int = 1) -> None:
+        super().__init__()
+        self.level = level
+
+    @classmethod
+    def get_trait_keys(cls) -> list[str]:
+        return []
+
+    def to_state(self) -> dict[str, int]:
+        return {"level": self.level}
+
+    def apply_state(self, state: dict) -> None:
+        self.level = state["level"]
+
+    def ui_options_for_trait(self) -> dict:
+        return {}
+
+
 _ALLOWED_LEVEL = 2
 
 
@@ -148,6 +169,26 @@ class TestPartialState:
         )
 
         assert (slider.min, slider.max) == (2, 1)
+
+
+class TestATraitRaisingAnUnexpectedError:
+    """Library code can raise anything; the load must still keep the parameter."""
+
+    def test_partial_state_keeps_what_init_built(self) -> None:
+        strict = Strict(level=_ALLOWED_LEVEL)
+        parameter = Parameter(name="p", tooltip="t", traits={strict})
+
+        NodeManager._apply_trait_states(parameter, [{"trait_name": "Strict", "trait_state": {}}])
+
+        assert strict.level == _ALLOWED_LEVEL
+
+    def test_the_warning_carries_the_error(self, caplog: pytest.LogCaptureFixture) -> None:
+        parameter = Parameter(name="p", tooltip="t", traits={Strict()})
+        caplog.set_level("WARNING", logger="griptape_nodes")
+
+        NodeManager._apply_trait_states(parameter, [{"trait_name": "Strict", "trait_state": {}}])
+
+        assert any("Strict" in record.getMessage() and "level" in record.getMessage() for record in caplog.records)
 
 
 class TestAValidatorRejectingSavedState:

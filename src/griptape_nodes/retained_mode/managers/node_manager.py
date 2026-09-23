@@ -4646,14 +4646,16 @@ class NodeManager(EngineScoped):
                     entry.trait_name,
                 )
                 continue
+            # Library code can raise anything, and a bad trait must not fail the load.
             try:
                 trait.apply_state(entry.trait_state)
-            except (TypeError, ValueError):
+            except Exception as error:
                 logger.warning(
                     "Parameter '%s' was saved with state for its '%s' control, but the control did not "
-                    "accept it. The parameter keeps the state its node supplied.",
+                    "accept it (%s). The parameter keeps the state its node supplied.",
                     parameter.name,
                     entry.trait_name,
+                    error,
                 )
 
     @staticmethod
