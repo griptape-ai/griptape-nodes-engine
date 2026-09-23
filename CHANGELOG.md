@@ -10,6 +10,15 @@ the engine's request API from working without edits. Migration steps live in
 
 ## [Unreleased]
 
+### Fixed
+
+- A parameter that a node both shows and passes on, such as the text on a text node, keeps an edit
+  made after the node has run. Before, reopening the workflow or refreshing the page showed the
+  value from the last run instead of the edit.
+- Renaming a parameter that holds an output value now reports that the old name no longer has one,
+  alongside the new name's value. Before, only the new name was reported, so anything tracking
+  output values by parameter name kept the old name's value.
+
 ## [0.102.0] - 2026-09-24
 
 ### Added

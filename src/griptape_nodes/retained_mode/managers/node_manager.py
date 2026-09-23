@@ -53,6 +53,7 @@ from griptape_nodes.exe_types.node_types import (
     NodeDependencies,
     NodeResolutionState,
     TransformedParameterValue,
+    _values_differ,
     aprocess_scope,
     sanctioned_parameter_mutation,
 )
@@ -2873,6 +2874,8 @@ class NodeManager(EngineScoped):
         if request.initial_setup is False and not request.is_output and modified:
             # Mark node as unresolved, broadcast an event
             node.make_node_unresolved(current_states_to_trigger_change_event=set({NodeResolutionState.RESOLVED}))
+            if output_snapshot is not None:
+                self._discard_stale_output_value(node, request.parameter_name, output_snapshot)
             # Get the flow
             # Pass the value through to connected downstream parameters!
             # Set incoming_connection_source fields to identify this as legitimate upstream value propagation
@@ -2937,6 +2940,32 @@ class NodeManager(EngineScoped):
             finalized_value=finalized_value, data_type=parameter.type, result_details=details
         )
         return result
+
+    def _discard_stale_output_value(self, node: BaseNode, parameter_name: str, output_snapshot: dict[str, Any]) -> None:
+        """Discard the output value that the set we just applied has invalidated.
+
+        A PROPERTY+OUTPUT parameter stores the typed value and the produced value under one name, and
+        reads prefer the produced one, so a leftover output would mask the new value. Only that
+        parameter's own output value is discarded; the rest still reflect the last run.
+
+        This covers upstream propagation as well as manual edits -- an arriving connection value is a
+        set like any other, and the output recorded under that name predates it either way.
+
+        A value that changed since `output_snapshot` was taken was recomputed in `after_value_set`,
+        making it newer than the set, so it stays. A recompute landing on an equal value is not
+        detected; see `test_equal_value_recompute_is_not_yet_detected`.
+        """
+        if parameter_name not in node.parameter_output_values:
+            return
+        if parameter_name not in output_snapshot:
+            # Nothing was recorded here before the set, so whatever is here now was written during it.
+            return
+        recomputed_during_set = _values_differ(
+            output_snapshot[parameter_name], node.parameter_output_values[parameter_name]
+        )
+        if recomputed_during_set:
+            return
+        del node.parameter_output_values[parameter_name]
 
     def _set_and_pass_through_values(self, request: SetParameterValueRequest, node: BaseNode) -> ModifiedReturnValue:
         """Set the parameter value on the node according to the specifications."""
@@ -5343,15 +5372,8 @@ class NodeManager(EngineScoped):
                 # Update the index key from old name to new name
                 outgoing_connections[request.new_parameter_name] = outgoing_connections.pop(request.parameter_name)
 
-        # Update parameter name
         old_name = parameter.name
-        parameter.name = request.new_parameter_name
-
-        # Update parameter values if they exist
-        if old_name in node.parameter_values:
-            node.parameter_values[request.new_parameter_name] = node.parameter_values.pop(old_name)
-        if old_name in node.parameter_output_values:
-            node.parameter_output_values[request.new_parameter_name] = node.parameter_output_values.pop(old_name)
+        self._apply_parameter_rename(node, parameter, request.new_parameter_name)
 
         return RenameParameterResultSuccess(
             old_parameter_name=old_name,
@@ -5359,6 +5381,33 @@ class NodeManager(EngineScoped):
             node_name=node_name,
             result_details=f"Successfully renamed parameter '{old_name}' to '{request.new_parameter_name}' on node '{node_name}'.",
         )
+
+    def _apply_parameter_rename(self, node: BaseNode, parameter: Parameter, new_name: str) -> None:
+        """Rename a parameter and carry the values stored under its old name across.
+
+        The values move off the old name first and back on after, because the output value's change
+        events are looked up by parameter name: a move done after the rename finds no parameter for
+        the old name, so consumers are told the new name has a value but never that the old one lost
+        it.
+        """
+        old_name = parameter.name
+        output_value = None
+        had_output_value = old_name in node.parameter_output_values
+        if had_output_value:
+            output_value = node.parameter_output_values[old_name]
+            del node.parameter_output_values[old_name]
+
+        set_value = None
+        had_set_value = old_name in node.parameter_values
+        if had_set_value:
+            set_value = node.parameter_values.pop(old_name)
+
+        parameter.name = new_name
+
+        if had_set_value:
+            node.parameter_values[new_name] = set_value
+        if had_output_value:
+            node.parameter_output_values[new_name] = output_value
 
     def on_toggle_lock_node_request(self, request: SetLockNodeStateRequest) -> ResultPayload:
         node_name = request.node_name
