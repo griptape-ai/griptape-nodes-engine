@@ -32,6 +32,9 @@ from griptape_nodes.retained_mode.events.config_events import (
     ListBetaFeaturesResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
+from griptape_nodes.retained_mode.managers.fitness_problems.libraries.beta_feature_settings_collision_problem import (
+    BetaFeatureSettingsCollisionProblem,
+)
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries.invalid_beta_feature_problem import (
     InvalidBetaFeatureProblem,
 )
@@ -152,7 +155,9 @@ class TestRegistry:
         with pytest.raises(ValueError, match="sample_feature"):
             register_beta_feature(_make_feature())
 
-    @pytest.mark.parametrize("bad_id", ["CamelCase", "1starts_with_digit", "has-dash", "has space", ""])
+    @pytest.mark.parametrize(
+        "bad_id", ["CamelCase", "1starts_with_digit", "has-dash", "has space", "", "double__underscore", "trailing_"]
+    )
     def test_non_snake_case_id_is_rejected(self, bad_id: str) -> None:
         with pytest.raises(ValidationError):
             _make_feature(bad_id)
@@ -298,6 +303,36 @@ class TestLibraryBetaFeatures:
         assert [issue.feature_id for issue in parsed.issues] == ["no_date", "Bad-Id", "#4", "good"]
         assert "remove_by" in parsed.issues[0].reason
         assert "more than once" in parsed.issues[3].reason
+
+    @pytest.mark.usefixtures("clear_libraries")
+    @pytest.mark.parametrize(
+        ("other_features", "new_features", "collides"),
+        [
+            (True, True, True),
+            (True, False, False),
+            (False, True, False),
+        ],
+    )
+    def test_settings_collision_needs_valid_features_on_both(
+        self, engine: Engine, *, other_features: bool, new_features: bool, collides: bool
+    ) -> None:
+        """Only libraries that both have usable features can share a settings key."""
+        entries_by_flag: dict[bool, list[object]] = {True: [_library_entry()], False: [_library_entry("Bad-Id")]}
+        _register_library(entries_by_flag[other_features], name="My Library")
+        _register_library(entries_by_flag[new_features], name="my-library")
+
+        problems = engine.library_manager._check_beta_feature_settings_collision(
+            "my-library", LibraryRegistry.get_library("my-library")
+        )
+
+        if collides:
+            assert problems == [
+                BetaFeatureSettingsCollisionProblem(
+                    other_library_name="My Library", config_key="library_beta_features.my_library"
+                )
+            ]
+        else:
+            assert problems == []
 
     def test_load_reports_problems_as_warnings(self, engine: Engine) -> None:
         schema = LibrarySchema(

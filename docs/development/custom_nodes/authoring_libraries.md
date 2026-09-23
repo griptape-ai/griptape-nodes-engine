@@ -333,7 +333,8 @@ A beta feature lets you ship something new in your library but leave it off unti
 try it. Your features show up under your library's name on the editor's
 [Beta Features](../../guides/editor/beta_features.md) settings page, where users turn them on and off.
 
-Declare each feature in the `beta_features` list of `griptape_nodes_library.json`:
+Declare each feature in a `beta_features` list at the top level of `griptape_nodes_library.json`,
+next to `name`, `metadata`, and `nodes`. It is not part of `metadata`:
 
 ```jsonc
 "beta_features": [
@@ -347,14 +348,16 @@ Declare each feature in the `beta_features` list of `griptape_nodes_library.json
 ]
 ```
 
-| Field         | Meaning                                                                                                   |
-| ------------- | --------------------------------------------------------------------------------------------------------- |
-| `id`          | Lowercase letters, digits, and underscores, starting with a letter. Unique within your library.           |
-| `name`        | Short label shown on the Beta Features page.                                                              |
-| `description` | One or two sentences telling users what changes and where.                                                |
-| `default`     | Optional. Whether the feature is on for users who haven't chosen. Defaults to `false`.                    |
-| `owner`       | Who is responsible for finishing or removing the feature.                                                 |
-| `remove_by`   | `YYYY-MM-DD` date by which you make the feature standard or remove it. At most 180 days after you add it. |
+Set `remove_by` to your own date, no more than 180 days from the day you add the feature.
+
+| Field         | Meaning                                                                                                                 |
+| ------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `id`          | Lowercase words of letters and digits joined by single underscores, starting with a letter. Unique within your library. |
+| `name`        | Short label shown on the Beta Features page.                                                                            |
+| `description` | One or two sentences telling users what changes and where.                                                              |
+| `default`     | Optional. Whether the feature is on for users who haven't chosen. Defaults to `false`.                                  |
+| `owner`       | Who is responsible for finishing or removing the feature.                                                               |
+| `remove_by`   | `YYYY-MM-DD` date by which you make the feature standard or remove it. At most 180 days after you add it.               |
 
 Check the feature from a node with `self.is_beta_feature_enabled("<id>")`. It returns the user's
 choice, or `default` if they haven't made one. **Always create the parameters a feature uses, and

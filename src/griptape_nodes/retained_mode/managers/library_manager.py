@@ -70,7 +70,6 @@ from griptape_nodes.retained_mode.beta_features import (
     LIBRARY_BETA_FEATURES_KEY,
     find_library_config_slug_collision,
     library_config_slug,
-    parse_library_beta_features,
 )
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import (
@@ -2922,7 +2921,9 @@ class LibraryManager(EngineScoped):
                         if library_data.settings is not None:
                             library_info.problems.extend(self._persist_library_settings(library_data))
 
-                        library_info.problems.extend(self._check_beta_feature_settings_collision(library_data))
+                        library_info.problems.extend(
+                            self._check_beta_feature_settings_collision(library_data.name, library)
+                        )
 
                         # For worker-delegated libraries on the orchestrator, skip node module
                         # imports entirely -- importing them would pull heavy deps (torch, triton,
@@ -3025,14 +3026,13 @@ class LibraryManager(EngineScoped):
         library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.FAILURE
         self._library_file_path_to_info[library_info.library_path] = library_info
 
-    def _check_beta_feature_settings_collision(self, library_data: LibrarySchema) -> list[LibraryProblem]:
+    def _check_beta_feature_settings_collision(self, library_name: str, library: Library) -> list[LibraryProblem]:
         """Report another loaded library that would store its beta feature choices in the same place.
 
         Runs after registration, because the fitness check runs before any library is registered
         and so can't see the others. Only libraries that both declare beta features can collide.
         """
-        library_name = library_data.name
-        if not parse_library_beta_features(library_name, library_data.beta_features or []).features:
+        if not library.get_beta_features():
             return []
 
         other_names_with_features = [

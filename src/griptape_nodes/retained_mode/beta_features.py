@@ -56,7 +56,7 @@ class BetaFeature(BaseModel):
     """One experimental feature, in the definition shape the editor shares.
 
     Attributes:
-        id: snake_case identifier, unique across the editor and the engine. Also the config key
+        id: snake_case identifier with single underscores, unique across the editor and the engine. Also the config key
             under `beta_features`.
         name: Short label shown on the editor's Beta settings page.
         description: One or two sentences in user terms: what changes and where.
@@ -72,7 +72,9 @@ class BetaFeature(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    id: str = Field(pattern=r"^[a-z][a-z0-9_]*$")
+    # Words joined by single underscores. "__" separates path parts in GTN_CONFIG_ variable names,
+    # so an id containing it couldn't be set from the environment.
+    id: str = Field(pattern=r"^[a-z][a-z0-9]*(_[a-z0-9]+)*$")
     name: str
     description: str
     default: bool = False
