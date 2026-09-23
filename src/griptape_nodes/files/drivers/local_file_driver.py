@@ -3,6 +3,7 @@
 from pathlib import Path
 
 import anyio
+import anyio.to_thread
 
 from griptape_nodes.files.base_file_driver import BaseFileDriver
 from griptape_nodes.files.path_utils import (
@@ -115,7 +116,10 @@ class LocalFileDriver(BaseFileDriver):
             PermissionError: No read permission
             ValueError: Invalid file:// URI
         """
-        path = anyio.Path(self._resolve_path(location))
+        # Resolving a UNC path can trigger real DNS/NetBIOS/SMB negotiation, which would
+        # block the event loop if run inline. Offload to a thread to keep this async.
+        resolved_path = await anyio.to_thread.run_sync(self._resolve_path, location)
+        path = anyio.Path(resolved_path)
 
         if not await path.exists():
             msg = f"File not found: {location}"
@@ -138,7 +142,9 @@ class LocalFileDriver(BaseFileDriver):
             True if file exists and is a file (not directory)
         """
         try:
-            path = anyio.Path(self._resolve_path(location))
+            # Same rationale as read(): keep UNC resolution off the event loop.
+            resolved_path = await anyio.to_thread.run_sync(self._resolve_path, location)
+            path = anyio.Path(resolved_path)
         except ValueError:
             return False
 
