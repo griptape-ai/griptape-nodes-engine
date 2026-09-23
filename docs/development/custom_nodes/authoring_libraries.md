@@ -409,6 +409,9 @@ A few rules worth knowing:
     `id`, or a repeated `id` is reported as a library problem, and that feature is left out. Your
     other features and nodes still work.
 - **Checking an id you didn't declare returns `false`** and logs a warning naming the feature.
+- **A check in `__init__` only runs when the node is created.** If a user turns the feature on or
+    off, nodes already on the canvas keep the parameters they were shown with until the user adds the
+    node again or reopens the workflow. A check in `process` sees the new value on the next run.
 - **After `remove_by`, the feature always uses its `default`.** It disappears from the Beta
     Features page and the library reports a problem until you make the feature standard or remove it.
     A `remove_by` more than 180 days away is also reported.

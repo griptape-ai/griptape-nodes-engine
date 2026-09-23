@@ -28,6 +28,12 @@ Features are grouped by where they live:
 To go back to the standard behavior for everything, click **Reset all**.
 Every feature returns to its default, which is almost always off.
 
+### Nodes already on the canvas
+
+A library feature that adds or hides settings on a node shows the change
+on nodes you add after turning it on or off. Nodes already on the canvas
+keep the settings they were created with. To update one, refresh the node, delete it and add it again, or save and reopen the workflow.
+
 ### When a toggle can't be changed
 
 A toggle is greyed out when something outside your own settings is
