@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 import warnings
 from abc import ABC, abstractmethod
 from copy import deepcopy
-from dataclasses import field
 from typing import TYPE_CHECKING, Any
 
+from griptape_nodes.exe_types.callback_binding import name_callback, resolve_callback
 from griptape_nodes.exe_types.elements.badge import set_initial_badge
 from griptape_nodes.exe_types.elements.base import BaseNodeElement
 from griptape_nodes.exe_types.elements.parameter_types import (
@@ -24,12 +25,15 @@ from griptape_nodes.exe_types.elements.parameter_types import (
 from griptape_nodes.exe_types.elements.tooltips import default_parameter_tooltip
 from griptape_nodes.exe_types.elements.trait import Trait, instantiate_trait
 from griptape_nodes.exe_types.elements.ui_options import UIOptionsMixin, seed_ui_options
+from griptape_nodes.exe_types.trait_state import TraitStateEntry
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from griptape_nodes.exe_types.elements.badge import BadgeData
     from griptape_nodes.exe_types.node_types import BaseNode
+
+logger = logging.getLogger("griptape_nodes")
 
 
 class ParameterBase(BaseNodeElement, ABC):
@@ -104,13 +108,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
     private: bool = False
     exclude_from_metadata: bool = False
     allow_variable_substitution: bool = True
-    _allowed_modes: set = field(
-        default_factory=lambda: {
-            ParameterMode.OUTPUT,
-            ParameterMode.INPUT,
-            ParameterMode.PROPERTY,
-        }
-    )
+    _allowed_modes: set
     _converters: list[Callable[[Any], Any]]
     _validators: list[Callable[[Parameter, Any], None]]
     _on_incoming_connection_removed: list[Callable[[Parameter, str, str], None]]
@@ -290,6 +288,38 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
 
         return our_dict
 
+    def trait_states(self) -> list[dict[str, Any]]:
+        """Return save-only trait identity, constructor state, and callbacks.
+
+        ``NodeManager`` stabilizes dynamic library module names before saving.
+        """
+        owner = self.get_node()
+        states: list[dict[str, Any]] = []
+        for trait in self.find_elements_by_type(Trait):
+            entry = TraitStateEntry(
+                trait_name=type(trait).__name__,
+                trait_module=type(trait).__module__,
+                trait_state=trait.to_state(),
+                trait_callbacks=trait.callback_names(owner),
+            )
+            states.append(entry.to_dict())
+        return states
+
+    def save_dict(self) -> dict[str, Any]:
+        """Return ``to_dict()`` with trait-owned and code-only fields in their saved form.
+
+        ``equals()`` and ``NodeManager`` both need this view, and it has to be the same view
+        in both places or a diff-based save writes the wrong thing.
+        """
+        our_dict = self.to_dict()
+        # Trait-derived keys belong to the trait, not the parameter: ``traits`` below carries
+        # them, so the merged ``ui_options`` would duplicate them as stored options.
+        our_dict["ui_options"] = self.authored_ui_options()
+        our_dict["traits"] = self.trait_states()
+        # Converters and validators are code, represented by the method names they resolve to.
+        our_dict["value_callbacks"] = self.value_callback_names(self.get_node())
+        return our_dict
+
     def to_event(self, node: BaseNode) -> dict:
         event_dict = self.to_dict()
         event_data = super().to_event(node)
@@ -366,6 +396,43 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         """
         return bool(self._validators)
 
+    def value_callback_names(self, owner: BaseNode | None) -> dict[str, list[str]]:
+        """Return directly attached callbacks by method name.
+
+        Each callback list is omitted unless every member is nameable because restoring a
+        partial converter or validator pipeline would change its behavior.
+        """
+        names: dict[str, list[str]] = {}
+        for key, callbacks in (("converters", self._converters), ("validators", self._validators)):
+            if not callbacks:
+                continue
+            resolved = [name_callback(callback, owner) for callback in callbacks]
+            if any(name is None for name in resolved):
+                continue
+            names[key] = [name for name in resolved if name is not None]
+        return names
+
+    def unnameable_value_callbacks(self, owner: BaseNode | None) -> dict[str, int]:
+        """Count directly attached callbacks that cannot be saved by name."""
+        unnameable: dict[str, int] = {}
+        for key, callbacks in (("converters", self._converters), ("validators", self._validators)):
+            count = sum(1 for callback in callbacks if name_callback(callback, owner) is None)
+            if count:
+                unnameable[key] = count
+        return unnameable
+
+    def apply_value_callback_names(self, names: dict[str, list[str]], owner: BaseNode | None) -> None:
+        """Bind saved callbacks not already attached."""
+        for key, target in (("converters", self._converters), ("validators", self._validators)):
+            attached = {name_callback(callback, owner) for callback in target}
+            for method_name in names.get(key, []):
+                if method_name in attached:
+                    continue
+                described_as = f"the '{method_name}' {key[:-1]} of parameter '{self.name}'"
+                callback = resolve_callback(method_name, owner, described_as=described_as)
+                if callback is not None:
+                    target.append(callback)
+
     @property
     def has_traits(self) -> bool:
         """Any Trait child is attached.
@@ -409,17 +476,104 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
 
     @property
     def ui_options(self) -> dict:
-        ui_options = {}
-        traits = self.find_elements_by_type(Trait)
-        for trait in traits:
+        """Overlay trait-rendered options on stored options.
+
+        Trait state wins over stale stored copies. Only authored options are persisted.
+        """
+        ui_options = self.authored_ui_options()
+        for trait in self.find_elements_by_type(Trait):
             ui_options = ui_options | trait.ui_options_for_trait()
-        ui_options = ui_options | self._ui_options
         return ui_options
 
     @ui_options.setter
     @BaseNodeElement.emits_update_on_write
     def ui_options(self, value: dict) -> None:
         self._ui_options = value
+
+    def _store_ui_options(self, value: dict[str, Any]) -> None:
+        """Route a runtime write through the same adoption a saved file or the editor gets."""
+        self.adopt_ui_options(value)
+
+    def adopt_ui_options(self, value: dict) -> None:
+        """Route inbound trait-owned options to their traits.
+
+        Keep the flat input stored so detaching a trait reveals the written value. Every write
+        reaches this: the editor and a saved file call it directly, and ``_store_ui_options``
+        routes ``update_ui_options`` and the convenience setters through it too, so a runtime
+        write to a trait-owned key is applied and saved rather than silently kept as dead state.
+        """
+        for trait in self.find_elements_by_type(Trait):
+            adopted = trait.state_from_ui_options(value)
+            if not adopted:
+                self._report_unadopted_trait_options(trait, value)
+                continue
+            # Supply complete constructor state when the input mentions only some fields.
+            try:
+                trait.apply_state({**trait.to_state(), **adopted})
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Attempted to update the %s control on parameter '%s' from a UI option change, "
+                    "but it would not accept those values, so the control is unchanged.",
+                    type(trait).__name__,
+                    self.name,
+                )
+        self.ui_options = value
+
+    def _report_unadopted_trait_options(self, trait: Trait, value: dict) -> None:
+        """Report a write the trait renders over, which is neither applied nor saved.
+
+        A write matching what the trait already renders is the editor echoing it back, and
+        changes nothing.
+        """
+        ignored = sorted(
+            key for key, rendered in trait.ui_options_for_trait().items() if key in value and value[key] != rendered
+        )
+        if not ignored:
+            return
+        logger.warning(
+            "Attempted to set %s on parameter '%s', but its %s control renders those keys and does "
+            "not read them back, so the change has no effect and is not saved. Set the control's own "
+            "state instead, or give the control a 'state_from_ui_options' that accepts these keys.",
+            ", ".join(f"'{key}'" for key in ignored),
+            self.name,
+            type(trait).__name__,
+        )
+
+    def remove_ui_options_key(self, key: str) -> None:
+        """Remove a stored option, or report that a trait renders it regardless.
+
+        A trait-rendered key is never stored raw, so there is no copy to remove: only the
+        trait's own state controls it.
+        """
+        for trait in self.find_elements_by_type(Trait):
+            if key in trait.ui_options_for_trait():
+                self._report_unremovable_trait_option(trait, key)
+                return
+        super().remove_ui_options_key(key)
+
+    def _report_unremovable_trait_option(self, trait: Trait, key: str) -> None:
+        logger.warning(
+            "Attempted to remove '%s' from parameter '%s', but its %s control renders that key "
+            "regardless, so removing it here has no effect. Change the control's own state "
+            "instead, or detach it.",
+            key,
+            self.name,
+            type(trait).__name__,
+        )
+
+    def authored_ui_options(self) -> dict[str, Any]:
+        """Remove options rendered by attached traits.
+
+        Filtering on read handles keys written before or after trait attachment while
+        preserving stored values if the trait is detached.
+        """
+        return self._without_trait_owned_keys(super().authored_ui_options())
+
+    def _without_trait_owned_keys(self, value: dict) -> dict:
+        trait_owned: set[str] = set()
+        for trait in self.find_elements_by_type(Trait):
+            trait_owned.update(trait.ui_options_for_trait())
+        return {key: option for key, option in value.items() if key not in trait_owned}
 
     @property
     def hide(self) -> bool:
@@ -496,9 +650,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
             value: Display name string, or None to use the default (parameter name)
         """
         if value is None:
-            ui_options = self.ui_options.copy()
-            ui_options.pop("display_name", None)
-            self.ui_options = ui_options
+            self.remove_ui_options_key("display_name")
         else:
             self.update_ui_options_key("display_name", value)
 
@@ -668,8 +820,8 @@ def diff_parameters(parameter: Parameter, other: Parameter) -> dict:
 
     A dict rather than true or false, because callers alter the fields it names.
     """
-    self_dict = parameter.to_dict().copy()
-    other_dict = other.to_dict().copy()
+    self_dict = parameter.save_dict()
+    other_dict = other.save_dict()
     self_dict.pop("next", None)
     self_dict.pop("prev", None)
     self_dict.pop("element_id", None)

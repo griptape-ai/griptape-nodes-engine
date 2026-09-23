@@ -1,11 +1,17 @@
 import logging
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal, get_args
+from collections.abc import Callable
+from typing import Literal, get_args
 
-from griptape_nodes.exe_types.core_types import NodeMessagePayload, NodeMessageResult, Trait
+import attrs
 
-if TYPE_CHECKING:
-    from collections.abc import Callable
+from griptape_nodes.exe_types.core_types import (
+    BEHAVIOR,
+    WIRING,
+    NodeMessagePayload,
+    NodeMessageResult,
+    Trait,
+    default_element_id,
+)
 
 # Don't export callback types - let users import explicitly
 
@@ -80,107 +86,90 @@ class SetButtonStatusMessagePayload(NodeMessagePayload):
     updates: dict[str, str | bool | None]
 
 
-@dataclass(eq=False)
+def _build_link_handler(url: str) -> Callable:
+    """Build a link callback from saved URL state."""
+
+    def handler(
+        button: "Button",  # noqa: ARG001
+        button_details: ButtonDetailsMessagePayload,
+    ) -> NodeMessageResult:
+        return NodeMessageResult(
+            success=True,
+            details="Opening URL",
+            response=OnClickMessageResultPayload(
+                button_details=button_details,
+                href=url,
+            ),
+            altered_workflow_state=False,
+        )
+
+    return handler
+
+
 class Button(Trait):
-    # Specific callback types for better type safety and clarity
     type OnClickCallback = Callable[[Button, ButtonDetailsMessagePayload], NodeMessageResult | None]
     type GetButtonStateCallback = Callable[[Button, ButtonDetailsMessagePayload], NodeMessageResult | None]
 
-    # Static message type constants
     ON_CLICK_MESSAGE_TYPE = "on_click"
     GET_BUTTON_STATUS_MESSAGE_TYPE = "get_button_status"
     SET_BUTTON_STATUS_MESSAGE_TYPE = "set_button_status"
 
-    # Button styling and behavior properties
-    label: str = "Button"
-    variant: ButtonVariant = "default"
-    size: ButtonSize = "default"
-    state: ButtonState = "normal"
-    icon: str | None = None
-    icon_class: str | None = None
-    icon_position: IconPosition | None = None
-    full_width: bool = False
-    loading_label: str | None = None
-    loading_icon: str | None = None
-    loading_icon_class: str | None = None
-    tooltip: str | None = None
-    button_link: str | None = None
+    element_id: str = attrs.field(default="Button", converter=default_element_id, metadata=WIRING)
 
-    element_id: str = field(default_factory=lambda: "Button")
-    on_click_callback: OnClickCallback | None = field(default=None, init=False)
-    get_button_state_callback: GetButtonStateCallback | None = field(default=None, init=False)
+    label: str = attrs.field(default="")  # Allows a button with no text.
+    variant: ButtonVariant = attrs.field(default="secondary")
+    size: ButtonSize = attrs.field(default="default")
+    state: ButtonState = attrs.field(default="normal")
+    icon: str | None = attrs.field(default=None)
+    icon_class: str | None = attrs.field(default=None)
+    icon_position: IconPosition | None = attrs.field(default=None)
+    full_width: bool = attrs.field(default=False)
+    loading_label: str | None = attrs.field(default=None)
+    loading_icon: str | None = attrs.field(default=None)
+    loading_icon_class: str | None = attrs.field(default=None)
+    tooltip: str | None = attrs.field(default=None)
 
-    def __init__(  # noqa: PLR0913
-        self,
-        *,
-        label: str = "",  # Allows a button with no text.
-        variant: ButtonVariant = "secondary",
-        size: ButtonSize = "default",
-        state: ButtonState = "normal",
-        icon: str | None = None,
-        icon_class: str | None = None,
-        icon_position: IconPosition | None = None,
-        full_width: bool = False,
-        loading_label: str | None = None,
-        loading_icon: str | None = None,
-        loading_icon_class: str | None = None,
-        tooltip: str | None = None,
-        button_link: str | None = None,
-        on_click: OnClickCallback | None = None,
-        get_button_state: GetButtonStateCallback | None = None,
-    ) -> None:
-        super().__init__(element_id="Button")
-        self.label = label
-        self.variant = variant
-        self.size = size
-        self.state = state
-        self.icon = icon
-        self.icon_class = icon_class
-        self.icon_position = icon_position
-        self.full_width = full_width
-        self.loading_label = loading_label
-        self.loading_icon = loading_icon
-        self.loading_icon_class = loading_icon_class
-        self.tooltip = tooltip
-        self.button_link = button_link
+    # State a handler may leave stored but unread: reading always prefers the handler, so a
+    # link saved alongside one is inert rather than cleared. See ``on_click_callback``.
+    button_link: str | None = attrs.field(default=None)
 
-        # Validate that both button_link and on_click are not provided simultaneously
-        if button_link is not None and on_click is not None:
+    # Cache of the handler derived from ``button_link``, valid while the URL is unchanged.
+    _link_handler_url: str | None = attrs.field(default=None, init=False)
+    _link_handler: Callable | None = attrs.field(default=None, init=False)
+
+    # A link callback is derived state and must not be saved as node behavior.
+    on_click_handler: OnClickCallback | None = attrs.field(
+        default=None, alias="on_click", metadata=BEHAVIOR, kw_only=True
+    )
+    get_button_state_callback: GetButtonStateCallback | None = attrs.field(
+        default=None, alias="get_button_state", metadata=BEHAVIOR, kw_only=True
+    )
+
+    def __attrs_post_init__(self) -> None:
+        # Before the element is adopted, so a rejected button is never half-attached.
+        if self.button_link is not None and self.on_click_handler is not None:
             error_msg = (
                 "Cannot specify both 'button_link' and 'on_click' for Button. "
                 "Use 'button_link' for simple URL navigation or 'on_click' for custom behavior."
             )
             raise ValueError(error_msg)
+        super().__attrs_post_init__()
 
-        # If button_link is provided and no custom on_click handler, create a default handler
-        if button_link is not None:
-            self.on_click_callback = self._create_button_link_handler(button_link)
-        else:
-            self.on_click_callback = on_click
-        self.get_button_state_callback = get_button_state
+    @property
+    def on_click_callback(self) -> OnClickCallback | None:
+        """The callback a click fires: a handler set by node code wins over a derived link."""
+        if self.on_click_handler is not None:
+            return self.on_click_handler
+        if self.button_link is None:
+            return None
+        if self._link_handler_url != self.button_link:
+            self._link_handler = _build_link_handler(self.button_link)
+            self._link_handler_url = self.button_link
+        return self._link_handler
 
-    def _create_button_link_handler(self, url: str) -> OnClickCallback:
-        """Create a default handler for button_link URLs."""
-
-        def handler(
-            button: Button,  # noqa: ARG001
-            button_details: ButtonDetailsMessagePayload,
-        ) -> NodeMessageResult:
-            return NodeMessageResult(
-                success=True,
-                details="Opening URL",
-                response=OnClickMessageResultPayload(
-                    button_details=button_details,
-                    href=url,
-                ),
-                altered_workflow_state=False,
-            )
-
-        return handler
-
-    @classmethod
-    def get_trait_keys(cls) -> list[str]:
-        return ["button", "addbutton"]
+    @on_click_callback.setter
+    def on_click_callback(self, callback: OnClickCallback | None) -> None:
+        self.on_click_handler = callback
 
     def get_button_details(self, state: ButtonState | None = None) -> ButtonDetailsMessagePayload:
         """Create a ButtonDetailsMessagePayload with current or specified button state."""

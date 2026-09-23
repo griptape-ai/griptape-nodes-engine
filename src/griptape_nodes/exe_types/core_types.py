@@ -6,7 +6,15 @@ and re-exports them.
 """
 
 from griptape_nodes.exe_types.elements.badge import VALID_BADGE_VARIANTS, BadgeData, BadgeVariantType
-from griptape_nodes.exe_types.elements.base import BaseNodeElement
+from griptape_nodes.exe_types.elements.base import (
+    BEHAVIOR,
+    WIRING,
+    BaseNodeElement,
+    ElementMeta,
+    default_element_id,
+    default_element_name,
+    default_element_type,
+)
 from griptape_nodes.exe_types.elements.containers import (
     ParameterContainer,
     ParameterDictionary,
@@ -37,8 +45,10 @@ from griptape_nodes.exe_types.elements.trait import Trait
 from griptape_nodes.exe_types.elements.ui_options import UIOptionsMixin
 
 __all__ = [
+    "BEHAVIOR",
     "VALID_BADGE_VARIANTS",
     "VALID_PARAMETER_RENDER_LOCATIONS",
+    "WIRING",
     "BadgeData",
     "BadgeVariantType",
     "BaseNodeElement",
@@ -47,6 +57,7 @@ __all__ = [
     "ControlParameterOutput",
     "DeprecationMessage",
     "ElementMessageCallback",
+    "ElementMeta",
     "NodeMessagePayload",
     "NodeMessageResult",
     "Parameter",
@@ -64,4 +75,7 @@ __all__ = [
     "ParameterTypeBuiltin",
     "Trait",
     "UIOptionsMixin",
+    "default_element_id",
+    "default_element_name",
+    "default_element_type",
 ]

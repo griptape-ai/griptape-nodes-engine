@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, ClassVar, Self, TypeVar
+from abc import ABCMeta
+from contextlib import contextmanager
+from dataclasses import field
+from typing import TYPE_CHECKING, Any, ClassVar, Self, TypeVar, dataclass_transform
+
+import attrs
 
 from griptape_nodes.exe_types.elements.badge import handle_badge_message, write_badge_fields
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
     from types import TracebackType
 
     from griptape_nodes.exe_types.elements.badge import BadgeData, BadgeVariantType
@@ -19,35 +23,107 @@ if TYPE_CHECKING:
 
 N = TypeVar("N", bound="BaseNodeElement")
 
+# Excludes element wiring from trait state.
+WIRING: dict[str, bool] = {"wiring": True}
 
-@dataclass(kw_only=True)
-class BaseNodeElement:
-    element_id: str = field(default_factory=lambda: str(uuid.uuid4().hex))
-    element_type: str = field(default_factory=lambda: BaseNodeElement.__name__)
-    name: str = field(default_factory=lambda: str(f"{BaseNodeElement.__name__}_{uuid.uuid4().hex}"))
-    parent_group_name: str | None = None
-    _changes: dict[str, Any] = field(default_factory=dict)
+# Saves callbacks by owning-node method name rather than as data.
+BEHAVIOR: dict[str, bool] = {"behavior": True}
 
-    _children: list[BaseNodeElement] = field(default_factory=list)
+
+def default_element_id(element_id: str | None) -> str:
+    """Generate an ID for ``None``.
+
+    Public because subclasses that fix ``element_id`` must retain this conversion.
+    """
+    if element_id is None:
+        return uuid.uuid4().hex
+    return element_id
+
+
+def default_element_type(element_type: str | None) -> str:
+    """Preserve the hand-written constructor's fallback element type."""
+    # ``to_dict()`` reports the class name, but alter-element events read this attribute.
+    if element_type is None:
+        return "BaseNodeElement"
+    return element_type
+
+
+def default_element_name(name: str | None) -> str:
+    """Generate an element name for ``None``."""
+    if name is None:
+        return f"BaseNodeElement_{uuid.uuid4().hex}"
+    return name
+
+
+# Runtime type returned by ``attrs.field()``.
+_DECLARED_FIELD = type(attrs.field())
+
+
+@dataclass_transform(field_specifiers=(field, attrs.field, attrs.Factory), eq_default=False, kw_only_default=True)
+class ElementMeta(ABCMeta):
+    """Apply attrs to every element class.
+
+    Classes declaring fields get generated keyword-only constructors. Classes with explicit
+    constructors keep them, and classes declaring neither inherit their parent's constructor.
+
+    ``auto_attribs=False`` keeps bare annotations from becoming fields. ``slots=False`` lets
+    elements hold non-field attributes. ``eq=False`` preserves identity comparison.
+    """
+
+    def __new__(cls, name: str, bases: tuple[type, ...], namespace: dict[str, Any], **kwargs: Any) -> ElementMeta:
+        created = super().__new__(cls, name, bases, namespace, **kwargs)
+        declares_fields = any(isinstance(value, _DECLARED_FIELD) for value in namespace.values())
+        generate_init = declares_fields and "__init__" not in namespace
+        return attrs.define(eq=False, slots=False, auto_attribs=False, kw_only=True, init=generate_init)(created)
+
+
+class BaseNodeElement(metaclass=ElementMeta):
+    """Base for parameters, groups, messages, and traits.
+
+    Public fields convert ``None`` to their defaults so subclasses may forward optional
+    arguments. Subclasses may use generated attrs constructors or define their own.
+    """
+
     _stack: ClassVar[list[BaseNodeElement]] = []
-    _parent: BaseNodeElement | None = field(default=None)
-    _node_context: BaseNode | None = field(default=None)
-    _badge: BadgeData | None = field(default=None)
+
+    element_id: str = attrs.field(default=None, converter=default_element_id, metadata=WIRING)
+    element_type: str = attrs.field(default=None, converter=default_element_type, metadata=WIRING)
+    name: str = attrs.field(default=None, converter=default_element_name, metadata=WIRING)
+    parent_group_name: str | None = attrs.field(default=None, metadata=WIRING)
+    _changes: dict[str, Any] = attrs.field(factory=dict, init=False)
+    _children: list[BaseNodeElement] = attrs.field(factory=list, init=False)
+    _parent: BaseNodeElement | None = attrs.field(default=None, init=False)
+    _node_context: BaseNode | None = attrs.field(default=None, init=False)
+    _badge: BadgeData | None = attrs.field(default=None, init=False)
+
+    def __attrs_post_init__(self) -> None:
+        # Adopt only after construction so the parent sees a complete child.
+        current = BaseNodeElement.get_current()
+        if current is not None:
+            current.add_child(self)
 
     @property
     def children(self) -> list[BaseNodeElement]:
         return self._children
 
-    def __post_init__(self) -> None:
-        # If there's currently an active element, add this new element as a child
-        current = BaseNodeElement.get_current()
-        if current is not None:
-            current.add_child(self)
-
     def __enter__(self) -> Self:
         # Push this element onto the global stack
         BaseNodeElement._stack.append(self)
         return self
+
+    @staticmethod
+    @contextmanager
+    def detached() -> Iterator[None]:
+        """Suppress adoption by an open element context.
+
+        Mutate the stack in place so nested ``__exit__`` calls retain their references.
+        """
+        open_elements = BaseNodeElement._stack[:]
+        BaseNodeElement._stack.clear()
+        try:
+            yield
+        finally:
+            BaseNodeElement._stack[:] = open_elements
 
     def __exit__(
         self,
