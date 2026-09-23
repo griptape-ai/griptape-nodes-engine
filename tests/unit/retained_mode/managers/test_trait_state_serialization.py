@@ -412,6 +412,70 @@ class TestTraitStateMissingARequiredArgument:
         )
 
 
+class _IndexingTrait(Trait):
+    """Builds from state by indexing, so partial state raises ``KeyError``."""
+
+    def __init__(self, threshold: int = 1) -> None:
+        super().__init__()
+        self.level = threshold
+
+    @classmethod
+    def get_trait_keys(cls) -> list[str]:
+        return []
+
+    def to_state(self) -> dict[str, Any]:
+        return {"level": self.level}
+
+    @classmethod
+    def from_state(cls, state: dict[str, Any]) -> "_IndexingTrait":
+        return cls(threshold=state["level"])
+
+    def ui_options_for_trait(self) -> dict:
+        return {}
+
+
+class TestFromStateRaisingAnUnexpectedError:
+    """Library code can raise anything; the parameter must still load."""
+
+    def test_the_parameter_loads_without_the_trait(self, engine: Engine) -> None:
+        target = _add_node(engine, "target")
+
+        result = engine.handle_request(
+            AddParameterToNodeRequest(
+                node_name=target.name,
+                parameter_name="model",
+                tooltip="t",
+                type="str",
+                traits=[{"trait_name": "_IndexingTrait", "trait_module": __name__, "trait_state": {}}],
+            )
+        )
+
+        assert isinstance(result, AddParameterToNodeResultSuccess)
+        parameter = target.get_parameter_by_name("model")
+        assert parameter is not None
+        assert parameter.trait_states() == []
+
+    def test_the_warning_carries_the_error(self, engine: Engine, caplog: pytest.LogCaptureFixture) -> None:
+        target = _add_node(engine, "target")
+        caplog.set_level(logging.WARNING, logger="griptape_nodes")
+
+        engine.handle_request(
+            AddParameterToNodeRequest(
+                node_name=target.name,
+                parameter_name="model",
+                tooltip="t",
+                type="str",
+                traits=[{"trait_name": "_IndexingTrait", "trait_module": __name__, "trait_state": {}}],
+            )
+        )
+
+        assert any(
+            "_IndexingTrait" in record.getMessage() and "level" in record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.WARNING
+        )
+
+
 def _add_declared_node(engine: Engine, name: str) -> _DeclaredControls:
     context = engine.handle_request(
         EnsureWorkflowAndFlowRequest(workflow_name="trait_state_test", display_name="trait_state_test")

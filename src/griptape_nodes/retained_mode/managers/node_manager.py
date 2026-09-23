@@ -4669,14 +4669,16 @@ class NodeManager(EngineScoped):
             if existing is None:
                 NodeManager._build_saved_trait(parameter, entry, trait_class)
                 continue
+            # Library code can raise anything, and a bad trait must not fail the load.
             try:
                 existing.apply_state(entry.trait_state)
-            except (TypeError, ValueError):
+            except Exception as error:
                 logger.warning(
                     "Parameter '%s' was saved with state for its '%s' control, but the control did not "
-                    "accept it. The parameter keeps the state its node supplied.",
+                    "accept it (%s). The parameter keeps the state its node supplied.",
                     parameter.name,
                     entry.trait_name,
+                    error,
                 )
 
     @staticmethod
@@ -4718,14 +4720,16 @@ class NodeManager(EngineScoped):
                 entry.trait_module,
             )
             return
+        # Library code can raise anything, and a bad trait must not drop the parameter.
         try:
             trait = trait_class.from_state(entry.trait_state)
-        except (TypeError, ValueError):
+        except Exception as error:
             logger.warning(
                 "Parameter '%s' was saved with the '%s' trait, but its saved state could not build that "
-                "control. The parameter loads without it. Check that the library providing it is up to date.",
+                "control (%s). The parameter loads without it. Check that the library providing it is up to date.",
                 parameter.name,
                 entry.trait_name,
+                error,
             )
             return
         parameter.add_trait(trait)
