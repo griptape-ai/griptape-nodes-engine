@@ -105,7 +105,7 @@ Instance methods come first because they can call anything. Class methods come n
 - One or two sentences. Longer explanations go in docs or `MIGRATION.md`, linked from the entry.
 - Plain words. No "improved", "enhanced", or "better"; say what changed.
 - One entry per change. When a later PR extends an unreleased change, edit its entry instead of adding another.
-- No PR numbers, commit hashes, or `@handles`. The GitHub release already lists merged PRs.
+- Link the GitHub issue on its own last line when there is one: `[#1234](https://github.com/griptape-ai/griptape-nodes-engine/issues/1234)`. Issues carry the background and lead on to the PRs. Leave out PR numbers, commit hashes, and `@handles`; they record the implementation, not why it changed.
 - Wrap lines at about 100 characters and indent continuation lines two spaces. mdformat skips this file.
 
 ```markdown
@@ -115,6 +115,7 @@ Instance methods come first because they can call anything. Class methods come n
 <!-- Good: what the user sees, and when -->
 - Model dropdowns no longer mark every model "Not permitted by your license" when two installed
   libraries provide a node with the same name.
+  [#5618](https://github.com/griptape-ai/griptape-nodes-engine/issues/5618)
 
 <!-- Bad: vague -->
 - Fix group node ports.
@@ -122,6 +123,7 @@ Instance methods come first because they can call anything. Class methods come n
 <!-- Good -->
 - Group nodes in a reopened workflow now show the ports and connections of parameters added to
   the group.
+  [#5563](https://github.com/griptape-ai/griptape-nodes-engine/issues/5563)
 ```
 
 **Mark breaking changes** - A change that makes a saved workflow, node library, or request API client stop working without edits starts with `**Breaking:**`, stays under its type (usually `Changed` or `Removed`), and comes first in that list. Say what breaks and what to do. Long upgrade steps go in `MIGRATION.md`; link the section.

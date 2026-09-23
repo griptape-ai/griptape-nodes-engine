@@ -262,9 +262,10 @@ A PR with a user-facing change adds a bullet under `## [Unreleased]`, grouped un
 
 - Model dropdowns no longer mark every model "Not permitted by your license" when two installed
   libraries provide a node with the same name.
+  [#5618](https://github.com/griptape-ai/griptape-nodes-engine/issues/5618)
 ```
 
-Write for the person upgrading, not the reviewer: what they will notice, where, and why. Start breaking changes with `**Breaking:**` and link the upgrade steps in `MIGRATION.md`. Refactors, tests, CI, and docs-only changes get no entry. The full style guide is in [CLAUDE.md](CLAUDE.md#changelog).
+Write for the person upgrading, not the reviewer: what they will notice, where, and why. Link the GitHub issue on the entry's last line when there is one. Start breaking changes with `**Breaking:**` and link the upgrade steps in `MIGRATION.md`. Refactors, tests, CI, and docs-only changes get no entry. The full style guide is in [CLAUDE.md](CLAUDE.md#changelog).
 
 `make check/changelog`, part of `make check` and CI, validates the file's structure. It never requires a PR to add an entry. That call stays with people.
 
