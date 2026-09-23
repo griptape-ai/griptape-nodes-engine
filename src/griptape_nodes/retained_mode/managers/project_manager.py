@@ -1309,7 +1309,65 @@ class ProjectManager(EngineScoped):
                     line_number=overlay.line_info.get_line(parent_link_field),
                 )
             return None
+
+        self._register_resolved_ancestor(
+            project_file_path=parent_file_path,
+            overlay=parent_overlay,
+            template=parent_template,
+            validation=parent_merge_validation,
+        )
         return parent_template
+
+    def _register_resolved_ancestor(
+        self,
+        *,
+        project_file_path: Path,
+        overlay: ProjectOverlayData,
+        template: ProjectTemplate,
+        validation: ProjectValidationInfo,
+    ) -> None:
+        """Cache an ancestor resolved during a parent-chain walk as a loaded project.
+
+        A parent named only by `parent_project_path` is read and merged by the walk but
+        would otherwise never enter the registry. The listing reports each entry's parent
+        by id, so an unregistered parent leaves `_reduce_parent_link_to_id` nothing to map
+        and it emits the parent's canonical path string instead -- a value no id-keyed
+        lookup resolves, which is what makes `GetProjectTemplateRequest` fail for a parent
+        the child inherited from successfully.
+
+        Not gated on the LOAD_PROJECT checkpoint that `_load_and_cache_project_template`
+        applies: access to a child does not require access to its parent, and by this point
+        the parent's content is merged into the child either way.
+
+        Registers in memory only. The path is never appended to projects_to_register, so
+        inheriting from a parent does not mutate the user's persisted project list.
+        """
+        project_id = overlay.id if overlay.id is not None else str(project_file_path)
+
+        # An id already present is left untouched, whether it is this same file (already
+        # loaded, so its entry is at least as complete as this one) or a different file (a
+        # collision that a child's load has no business resolving by eviction).
+        if project_id in self._successfully_loaded_project_templates:
+            return
+
+        # Parsed into the ancestor's own merge validation, which the caller has already
+        # gated on, so problems found here cannot change the child's load outcome. An
+        # ancestor whose macros do not parse is not a usable project and is not cached.
+        situation_schemas = self._parse_situation_macros(template.situations, validation)
+        directory_schemas = self._parse_directory_macros(template.directories, validation)
+        if not validation.is_usable():
+            return
+
+        self._successfully_loaded_project_templates[project_id] = ProjectInfo(
+            project_id=project_id,
+            project_file_path=project_file_path,
+            project_base_dir=project_file_path.parent,
+            template=template,
+            validation=validation,
+            parsed_situation_schemas=situation_schemas,
+            parsed_directory_schemas=directory_schemas,
+        )
+        self._install_project_variables(project_id, template)
 
     def get_loaded_project_dir(self, project_id: str) -> Path | None:
         """Return the directory of a loaded, file-backed project, or None.
