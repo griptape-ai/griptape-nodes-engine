@@ -1,5 +1,3 @@
-"""ParameterButton's href is stored as the Button trait's ``button_link``."""
-
 from griptape_nodes.exe_types.param_types.parameter_button import ParameterButton
 from griptape_nodes.traits.button import Button
 
@@ -62,7 +60,6 @@ class TestHrefRoutesToTheLink:
         assert parameter.href == "https://docs.example.test"
 
     def test_href_replaces_an_on_click_set_after_construction(self) -> None:
-        """Setting href is how a button already wired to ``on_click`` switches to a link."""
         parameter = ParameterButton(name="docs", on_click=lambda button, details: None)  # noqa: ARG005
 
         parameter.href = "https://docs.example.test"
