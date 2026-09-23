@@ -378,12 +378,7 @@ class TestEditorTimeBehaviorOnRealNodes:
 
 
 class TestUnshippableOutputsAreKept:
-    """A value the author declared unserializable stays in the worker and a reference travels.
-
-    It used to be refused outright, with a message telling the author to cache it library-side and
-    ship a descriptor the consumer trades back. The engine does that itself now, so the node runs and
-    what crosses is the reference.
-    """
+    """A value the author declared unserializable stays in the worker and a reference travels."""
 
     @pytest.mark.asyncio
     async def test_a_worker_keeps_an_unserializable_output_and_ships_a_reference(self) -> None:

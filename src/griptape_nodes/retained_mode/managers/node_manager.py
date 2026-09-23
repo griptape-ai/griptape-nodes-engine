@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import copy
 import logging
 import pickle
@@ -3163,14 +3162,9 @@ class NodeManager(EngineScoped):
         releases what that node made and nothing else, and a consumer left holding a reference to it finds
         it stale and is told to re-run the producer -- which is the same answer it already gets when the
         producer re-runs and displaces what it made.
-
-        The alternative, keeping an object alive while any node still carries its reference, made the rules
-        disagree with each other: a producer re-running freed it out from under a consumer, while a producer
-        being deleted did not.
         """
         owned: set[str] = set()
-        # Its own outputs, and of those only the references it produced itself. A consumer's inputs are
-        # deliberately not collected -- the consumer borrows and owns nothing -- and neither is a reference a
+        # Its own outputs, and of those only the references it produced itself -- not a reference a
         # pass-through merely copied into its own outputs, which EndNode and the subflow boundary nodes do
         # for every parameter they carry.
         #
@@ -3589,15 +3583,15 @@ class NodeManager(EngineScoped):
     async def _hydrate_and_run_node(self, node: BaseNode, request: ExecuteNodeRequest) -> ResultPayload:
         """Hydrate a node's input parameters and execute it.
 
-        On a worker, hydration and node.aprocess() both run inside
-        worker_node_execution_scope so that any nested handle_request calls
-        originated from node code forward to the orchestrator. Hydration calls
+        Hydration and node.aprocess() both run inside node_execution_scope. On a
+        worker that is what makes any nested handle_request calls originated from
+        node code forward to the orchestrator: hydration calls
         set_parameter_value, which cascades into ListConnectionsForNodeRequest
-        and similar cross-node lookups; those must forward because the worker
+        and similar cross-node lookups, and those must forward because the worker
         only owns its single node copy and cannot resolve parent-flow or peer-
-        node state locally. On the orchestrator we skip the scope entirely --
-        there is no RemoteHandler to read the flag, so opening it there would
-        only bump a refcount nothing observes.
+        node state locally. Everywhere it also marks the window in which a held
+        object must not be freed, which is why it is opened on the orchestrator
+        too.
         """
         # Register this aprocess task under its request_id so
         # CancelExecuteNodeRequest can locate it. Only populated when the caller
@@ -3653,15 +3647,7 @@ class NodeManager(EngineScoped):
 
     async def _hydrate_and_run_node_inner(self, node: BaseNode, request: ExecuteNodeRequest) -> ResultPayload:
         node_name = request.node_name
-        # The node-execution scope only has meaning on a worker: it is what
-        # RemoteHandler consults to decide whether to forward a request to the
-        # orchestrator. On the orchestrator itself there is no RemoteHandler
-        # installed (register_remote_handlers is worker-only), so opening the
-        # scope there would just bump a refcount that nothing reads. Skip it
-        # to keep the depth counter accurate to its name.
-        is_worker = self.engine.library_manager.is_worker
-        scope_cm = self.engine.event_manager.worker_node_execution_scope() if is_worker else contextlib.nullcontext()
-        with scope_cm:
+        with self.engine.event_manager.node_execution_scope():
             # Rehydrate serialized artifacts that crossed the orchestrator->worker JSON boundary.
             parameter_values = hydrate_parameter_values(request.parameter_values)
             hydration_failure = self._apply_hydrated_values(node, node_name, parameter_values)
@@ -4910,10 +4896,6 @@ class NodeManager(EngineScoped):
         # reload holding a dead reference on a node marked RESOLVED, with nothing re-running to replace it.
         # Asked of the store rather than inferred from the parameter's flag, so a key that reached a
         # serializable parameter is still skipped.
-        #
-        # Publishing (serialize_all_parameter_values) does not change this: a held value is already skipped
-        # by its parameter's own flag today, so nothing regresses, and a key would be useless in the
-        # published copy either way. The node comes back UNRESOLVED and its producer re-runs.
         if node.local_objects.contains_a_parked_object(value):
             if isinstance(create_node_request, CreateNodeRequest):
                 create_node_request.resolution = NodeResolutionState.UNRESOLVED.value

@@ -57,16 +57,11 @@ Three consequences worth internalising:
     that declare nothing at all, which is why the consuming parameter above is an
     ordinary `Parameter`.
 
-## `serializable=False` means two things now
+## What `serializable=False` means
 
-It has always meant "keep this out of saved workflow files" — the right choice for
-drivers, file handles and large transient buffers. It now also means "hold this in
-the process that made it, and send a key across a process boundary."
-
-Those are the same fact about an object: something that cannot be written to a file
-cannot be written to a socket either. But the flag is not a switch you throw to get
-holding behaviour, because **plain data on a declared parameter is still sent as
-data**:
+It keeps a value out of saved workflow files. On an output, it also keeps a non-data
+value in the process that made it and sends a key across a process boundary. **Plain
+data on a declared parameter is still sent as data**:
 
 | Value on a `serializable=False` output | What crosses                 | Why                                                                        |
 | -------------------------------------- | ---------------------------- | -------------------------------------------------------------------------- |

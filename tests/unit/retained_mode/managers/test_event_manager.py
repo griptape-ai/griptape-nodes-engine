@@ -12,8 +12,13 @@ import pytest
 
 from griptape_nodes.app.worker_routing import RemoteHandler
 from griptape_nodes.retained_mode.engine import Engine, current_engine
-from griptape_nodes.retained_mode.events.app_events import ConfigChanged
+from griptape_nodes.retained_mode.events.app_events import (
+    AppInitializationComplete,
+    ConfigChanged,
+    LibraryLoadedNotification,
+)
 from griptape_nodes.retained_mode.events.base_events import (
+    AppPayload,
     EventResultFailure,
     EventResultSuccess,
     ExecutionEvent,
@@ -66,57 +71,48 @@ class TestEventManagerBroadcasting:
         listener2.assert_called_once_with(event)
 
     @pytest.mark.asyncio
-    async def test_a_peer_event_does_not_reach_a_local_listener(self) -> None:
-        """The isolation the peer split exists for.
+    async def test_a_peer_event_is_dropped_unless_its_type_opts_in(self) -> None:
+        """The isolation this exists for.
 
-        A local listener reads the payload as describing this process, so a peer's copy reaching
-        one is how the orchestrator came to set `_is_worker` from a worker's boot event. Merging
-        the two listener sets back together would otherwise pass CI.
+        A listener reads the payload as describing its own process, so a worker's boot event
+        reaching the orchestrator's is how the orchestrator came to set `_is_worker` on itself.
         """
         event_manager = EventManager()
-        local_listener = AsyncMock()
-        event_manager.add_listener_to_app_event(ConfigChanged, local_listener)
+        listener = AsyncMock()
+        event_manager.add_listener_to_app_event(AppInitializationComplete, listener)
 
-        await event_manager.abroadcast_peer_app_event(ConfigChanged(key="k", old_value="a", new_value="b"))
+        await event_manager.abroadcast_adopted_app_event(AppInitializationComplete(is_worker=True))
 
-        local_listener.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_a_local_event_does_not_reach_a_peer_listener(self) -> None:
-        event_manager = EventManager()
-        peer_listener = AsyncMock()
-        event_manager.add_listener_to_peer_app_event(ConfigChanged, peer_listener)
-
-        await event_manager.abroadcast_app_event(ConfigChanged(key="k", old_value="a", new_value="b"))
-
-        peer_listener.assert_not_called()
+        listener.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_a_callback_on_both_sets_is_called_once_per_origin(self) -> None:
-        """How a listener that handles either origin is registered, which one listener needs."""
+    async def test_a_peer_event_reaches_listeners_when_its_type_opts_in(self) -> None:
         event_manager = EventManager()
         listener = AsyncMock()
-        event_manager.add_listener_to_app_event(ConfigChanged, listener)
-        event_manager.add_listener_to_peer_app_event(ConfigChanged, listener)
+        event_manager.add_listener_to_app_event(LibraryLoadedNotification, listener)
 
-        local = ConfigChanged(key="local", old_value="a", new_value="b")
-        peer = ConfigChanged(key="peer", old_value="a", new_value="b")
-        await event_manager.abroadcast_app_event(local)
-        await event_manager.abroadcast_peer_app_event(peer)
+        event = LibraryLoadedNotification(library_name="lib", fitness="usable")
+        await event_manager.abroadcast_adopted_app_event(event)
 
-        assert listener.await_count == 2  # noqa: PLR2004
-        assert [call.args[0] for call in listener.await_args_list] == [local, peer]
+        listener.assert_called_once_with(event)
 
     @pytest.mark.asyncio
-    async def test_a_peer_event_reaches_its_peer_listener(self) -> None:
+    async def test_a_local_event_reaches_listeners_whatever_its_type_says(self) -> None:
+        """The flag gates adoption only. Gating the local path too would stop boot entirely."""
         event_manager = EventManager()
-        peer_listener = AsyncMock()
-        event_manager.add_listener_to_peer_app_event(ConfigChanged, peer_listener)
+        listener = AsyncMock()
+        event_manager.add_listener_to_app_event(AppInitializationComplete, listener)
 
-        event = ConfigChanged(key="k", old_value="a", new_value="b")
-        await event_manager.abroadcast_peer_app_event(event)
+        event = AppInitializationComplete()
+        await event_manager.abroadcast_app_event(event)
 
-        peer_listener.assert_called_once_with(event)
+        listener.assert_called_once_with(event)
+
+    def test_only_the_worker_report_is_adoptable(self) -> None:
+        """Pins the production marking, which is the part a future payload can silently get wrong."""
+        assert AppPayload.adoptable_from_peers is False
+        assert AppInitializationComplete.adoptable_from_peers is False
+        assert LibraryLoadedNotification.adoptable_from_peers is True
 
     @pytest.mark.asyncio
     async def test_abroadcast_app_event_with_no_listeners(self) -> None:
@@ -388,7 +384,7 @@ class TestHandleRequestForwardingFromRunningLoop:
         event_manager.forward_to_orchestrator = fake_forward  # type: ignore[method-assign]
 
         try:
-            with event_manager.worker_node_execution_scope():
+            with event_manager.node_execution_scope():
                 result = event_manager.handle_request(_ForwardableProbeRequest())
         finally:
             ws_loop.call_soon_threadsafe(ws_loop.stop)

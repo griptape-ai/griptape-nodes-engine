@@ -746,20 +746,7 @@ class LibraryManager(EngineScoped):
             PreviewProjectProvisioningRequest, self.on_preview_project_provisioning_request
         )
 
-        self._register_app_event_listeners(event_manager)
-
-        worker_manager.register_worker_evicted_callback(self.on_worker_evicted)
-        self._pre_reload_callbacks.append(worker_manager.reset_workers)
-
-    def _register_app_event_listeners(self, event_manager: EventManager) -> None:
-        """Subscribe to the app events this manager reacts to."""
         event_manager.add_listener_to_app_event(
-            LibraryLoadedNotification,
-            self._on_library_loaded_notification,
-        )
-        # A worker-mode library's node schemas arrive on the worker's notification, and this is
-        # what registers stub classes from them.
-        event_manager.add_listener_to_peer_app_event(
             LibraryLoadedNotification,
             self._on_library_loaded_notification,
         )
@@ -771,6 +758,9 @@ class LibraryManager(EngineScoped):
             AppSessionStartedEvent,
             self._on_session_started,
         )
+
+        worker_manager.register_worker_evicted_callback(self.on_worker_evicted)
+        self._pre_reload_callbacks.append(worker_manager.reset_workers)
 
     def is_initializing(self) -> bool:
         """Return True while the engine is running its initialization sequence.
@@ -3506,7 +3496,7 @@ class LibraryManager(EngineScoped):
         #
         # This process only. Reloading every library restarts the workers, which takes their copies with
         # them, but updating or switching the ref of a single library does not.
-        dropped = self.engine.resource_manager.drop_objects_for_library(request.library_name)
+        dropped = self.engine.resource_manager.drop_objects_for_group(request.library_name)
         if dropped:
             logger.debug(
                 "Released %d held object(s) belonging to library '%s' as it unloaded.",
