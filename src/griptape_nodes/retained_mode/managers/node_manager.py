@@ -3681,6 +3681,19 @@ class NodeManager(EngineScoped):
                 node.parameter_values[param.name] = param.default_value
             if self.engine.library_manager.is_worker:
                 self._resolve_cached_inputs_in_place(node)
+
+            # After hydration and after cached inputs have become objects again, so a check here reads
+            # what `aprocess` will read. Before `aprocess`, so a node that cannot run does not half-run.
+            validation_exceptions = node.validate_in_execution_environment()
+            if validation_exceptions:
+                return ExecuteNodeResultFailure(
+                    result_details=(
+                        f"Attempted to execute node '{node_name}'. It declined to run: "
+                        f"{'; '.join(str(exception) for exception in validation_exceptions)}"
+                    ),
+                    validation_exceptions=validation_exceptions,
+                )
+
             try:
                 with aprocess_scope(request.variables):
                     await node.aprocess()
