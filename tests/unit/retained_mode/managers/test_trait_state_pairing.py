@@ -1,5 +1,6 @@
 import sys
 from collections.abc import Generator
+from pathlib import Path
 from types import ModuleType
 
 import pytest
@@ -339,3 +340,19 @@ class TestBuildingFromState:
 
         built = parameter.find_elements_by_type(Threshold)
         assert [trait.level for trait in built] == [_SAVED_THRESHOLD]
+
+    def test_a_broken_trait_module_is_imported_once(
+        self, caplog: pytest.LogCaptureFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A module that raises on import is not cached, so each resolve runs it again.
+        (tmp_path / "exploding_pairing_module.py").write_text('raise RuntimeError("library blew up on import")')
+        monkeypatch.syspath_prepend(str(tmp_path))
+        parameter = Parameter(name="p", tooltip="t", traits=set())
+        caplog.set_level("WARNING", logger="griptape_nodes")
+
+        NodeManager._apply_trait_states(
+            parameter,
+            [{"trait_name": "Slider", "trait_module": "exploding_pairing_module", "trait_state": {}}],
+        )
+
+        assert caplog.text.count("library blew up on import") == 1

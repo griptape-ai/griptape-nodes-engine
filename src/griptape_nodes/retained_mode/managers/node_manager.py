@@ -4012,7 +4012,9 @@ class NodeManager(EngineScoped):
                 # Create the parameter, or alter it on the existing node
                 if parameter.user_defined:
                     # Always serialize user-defined parameters regardless of node type
-                    add_param_request = AddParameterToNodeRequest.create(**self._parameter_save_dict(parameter))
+                    param_dict = parameter.save_dict()
+                    param_dict["traits"] = self._stabilize_trait_modules(param_dict["traits"])
+                    add_param_request = AddParameterToNodeRequest.create(**param_dict, initial_setup=True)
                     element_modification_commands.append(add_param_request)
                 elif isinstance(node, ErrorProxyNode):
                     # For ErrorProxyNode, replay all recorded initialization requests for this parameter
@@ -4028,7 +4030,9 @@ class NodeManager(EngineScoped):
                     element_modification_commands.extend(matching_requests)
                 elif reference_node is None:
                     # Normal node with no reference - treat all parameters as needing serialization
-                    add_param_request = AddParameterToNodeRequest.create(**self._parameter_save_dict(parameter))
+                    param_dict = parameter.save_dict()
+                    param_dict["traits"] = self._stabilize_trait_modules(param_dict["traits"])
+                    add_param_request = AddParameterToNodeRequest.create(**param_dict, initial_setup=True)
                     element_modification_commands.append(add_param_request)
                 else:
                     # Normal node - compare against reference node
@@ -4625,12 +4629,6 @@ class NodeManager(EngineScoped):
             result_details=f"Successfully duplicated {len(serialize_result.node_names_serialized)} nodes.",
         )
 
-    def _parameter_save_dict(self, parameter: Parameter) -> dict[str, Any]:
-        param_dict = parameter.save_dict()
-        param_dict["initial_setup"] = True
-        param_dict["traits"] = self._stabilize_trait_modules(param_dict["traits"])
-        return param_dict
-
     def _stabilize_trait_modules(self, trait_states: list[dict[str, Any]]) -> list[dict[str, Any]]:
         library_manager = self.engine.library_manager
         for entry in trait_states:
@@ -4654,11 +4652,22 @@ class NodeManager(EngineScoped):
     @staticmethod
     def _apply_trait_states(parameter: Parameter, trait_states: list[dict[str, Any]]) -> None:
         """Update attached traits in place to preserve constructor wiring such as callbacks."""
-        entries = NodeManager._parse_trait_entries(parameter, trait_states)
-        paired = NodeManager._pair_saved_traits(parameter, entries)
-        for entry, existing in zip(entries, paired, strict=True):
+        unmatched = parameter.find_elements_by_type(Trait)
+        for state in trait_states:
+            entry = TraitStateEntry.from_dict(state)
+            if entry is None:
+                logger.warning(
+                    "Parameter '%s' was saved with a trait entry that names no trait, so it is skipped. "
+                    "The parameter will load without whatever control that entry described.",
+                    parameter.name,
+                )
+                continue
+            trait_class = None
+            if entry.trait_module is not None:
+                trait_class = resolve_trait(entry.trait_name, entry.trait_module)
+            existing = NodeManager._take_attached_trait(unmatched, entry, trait_class)
             if existing is None:
-                NodeManager._build_saved_trait(parameter, entry)
+                NodeManager._build_saved_trait(parameter, entry, trait_class)
                 continue
             try:
                 existing.apply_state(entry.trait_state)
@@ -4671,45 +4680,27 @@ class NodeManager(EngineScoped):
                 )
 
     @staticmethod
-    def _parse_trait_entries(parameter: Parameter, trait_states: list[dict[str, Any]]) -> list[TraitStateEntry]:
-        entries: list[TraitStateEntry] = []
-        for state in trait_states:
-            entry = TraitStateEntry.from_dict(state)
-            if entry is None:
-                logger.warning(
-                    "Parameter '%s' was saved with a trait entry that names no trait, so it is skipped. "
-                    "The parameter will load without whatever control that entry described.",
-                    parameter.name,
-                )
-                continue
-            entries.append(entry)
-        return entries
+    def _take_attached_trait(
+        unmatched: list[Trait], entry: TraitStateEntry, trait_class: type[Trait] | None
+    ) -> Trait | None:
+        """Take the first match by resolved class, or by name when the class cannot be resolved.
 
-    @staticmethod
-    def _pair_saved_traits(parameter: Parameter, entries: list[TraitStateEntry]) -> list[Trait | None]:
-        """Match by resolved class, or by name when the class cannot be resolved.
-
-        The name fallback covers a library moving a trait to another module while the node
-        still builds it. Each attached trait is consumed at most once.
+        Consumed so two entries cannot share one trait. The name fallback covers a library moving
+        a trait to another module while the node still builds it. Save-side pairing in
+        ``changed_trait_states`` compares module strings instead, since both its sides are live.
         """
-        unmatched = parameter.find_elements_by_type(Trait)
-        paired: list[Trait | None] = []
-        for entry in entries:
-            trait_class = NodeManager._resolve_saved_trait(entry)
-            match = None
-            for candidate in unmatched:
-                matches_resolved_class = trait_class is not None and type(candidate) is trait_class
-                matches_legacy_name = trait_class is None and type(candidate).__name__ == entry.trait_name
-                if matches_resolved_class or matches_legacy_name:
-                    match = candidate
-                    break
-            if match is not None:
-                unmatched.remove(match)
-            paired.append(match)
-        return paired
+        for candidate in unmatched:
+            if trait_class is None:
+                matched = type(candidate).__name__ == entry.trait_name
+            else:
+                matched = type(candidate) is trait_class
+            if matched:
+                unmatched.remove(candidate)
+                return candidate
+        return None
 
     @staticmethod
-    def _build_saved_trait(parameter: Parameter, entry: TraitStateEntry) -> Trait | None:
+    def _build_saved_trait(parameter: Parameter, entry: TraitStateEntry, trait_class: type[Trait] | None) -> None:
         if entry.trait_module is None:
             logger.warning(
                 "Parameter '%s' was saved with a '%s' control, but no module was recorded and the node did "
@@ -4717,9 +4708,7 @@ class NodeManager(EngineScoped):
                 parameter.name,
                 entry.trait_name,
             )
-            return None
-
-        trait_class = NodeManager._resolve_saved_trait(entry)
+            return
         if trait_class is None:
             logger.warning(
                 "Parameter '%s' was saved with the '%s' trait from '%s', but that trait could not be loaded. "
@@ -4728,7 +4717,7 @@ class NodeManager(EngineScoped):
                 entry.trait_name,
                 entry.trait_module,
             )
-            return None
+            return
         try:
             trait = trait_class.from_state(entry.trait_state)
         except (TypeError, ValueError):
@@ -4738,15 +4727,8 @@ class NodeManager(EngineScoped):
                 parameter.name,
                 entry.trait_name,
             )
-            return None
+            return
         parameter.add_trait(trait)
-        return trait
-
-    @staticmethod
-    def _resolve_saved_trait(entry: TraitStateEntry) -> type[Trait] | None:
-        if entry.trait_module is None:
-            return None
-        return resolve_trait(entry.trait_name, entry.trait_module)
 
     @staticmethod
     def _manage_alter_details(parameter: Parameter, base_node_obj: BaseNode) -> dict:

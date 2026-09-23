@@ -84,6 +84,11 @@ def changed_trait_states(built: list[dict[str, Any]], current: list[dict[str, An
 
 
 def _take_counterpart(candidates: list[dict[str, Any]], entry: dict[str, Any]) -> dict[str, Any] | None:
+    """Pair by name and module, which agree because both sides come from live traits.
+
+    Load-side pairing in ``NodeManager._take_attached_trait`` resolves classes instead, since
+    saved modules are stable names.
+    """
     identity = _trait_identity(entry)
     for candidate in candidates:
         if _trait_identity(candidate) == identity:
