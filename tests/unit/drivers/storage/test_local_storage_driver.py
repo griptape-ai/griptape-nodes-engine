@@ -1,3 +1,4 @@
+import os
 import platform
 from pathlib import Path
 from typing import Any
@@ -164,7 +165,7 @@ class TestLocalStorageDriverCreateSignedDownloadUrl:
             mock_time.time_ns.return_value = 1_000_000_000
             url = local_storage_driver.create_signed_download_url(Path("/workspace/images/photo.png"))
 
-        assert url == "http://localhost:8124/workspace/images/photo.png?t=1000"
+        assert url == "http://localhost:8124/workspace/images/photo.png?v=1000"
 
     def test_external_unix_file_uses_external_url(
         self,
@@ -180,7 +181,7 @@ class TestLocalStorageDriverCreateSignedDownloadUrl:
             mock_resolve.return_value = external_path
             url = local_storage_driver.create_signed_download_url(external_path)
 
-        assert url == "http://localhost:8124/external/external/video.mp4?t=1000"
+        assert url == "http://localhost:8124/external/external/video.mp4?v=1000"
 
     def test_external_windows_file_uses_forward_slashes_in_url(
         self,
@@ -197,6 +198,9 @@ class TestLocalStorageDriverCreateSignedDownloadUrl:
                 # but .as_posix() = "C:/Users/foo/image.png"
                 mock_path = Mock()
                 mock_path.relative_to.side_effect = ValueError("not relative")
+                # The simulated Windows path doesn't exist here, so the version
+                # fingerprint falls back to mint time.
+                mock_path.stat.side_effect = OSError("no such file")
                 mock_path.as_posix.return_value = "C:/Users/foo/image.png"
                 mock_path.__str__ = lambda _self: "C:\\Users\\foo\\image.png"
                 mock_resolve.return_value = mock_path
@@ -205,7 +209,7 @@ class TestLocalStorageDriverCreateSignedDownloadUrl:
         # The URL must use forward slashes and not have backslashes
         assert "\\" not in url
         assert "C:/Users/foo/image.png" in url
-        assert url == "http://localhost:8124/external/C:/Users/foo/image.png?t=1000"
+        assert url == "http://localhost:8124/external/C:/Users/foo/image.png?v=1000"
 
     def test_external_long_path_prefixed_file_matches_clean_spelling(
         self,
@@ -227,9 +231,9 @@ class TestLocalStorageDriverCreateSignedDownloadUrl:
             mock_resolve.return_value = Path("//?/C:/Users/foo/image.png")
             url = local_storage_driver.create_signed_download_url(Path("C:/Users/foo/image.png"))
 
-        assert "?/" not in url.removesuffix("?t=1000")
+        assert "?/" not in url.removesuffix("?v=1000")
         assert "\\" not in url
-        assert url == "http://localhost:8124/external/C:/Users/foo/image.png?t=1000"
+        assert url == "http://localhost:8124/external/C:/Users/foo/image.png?v=1000"
 
     @pytest.mark.skipif(platform.system() != "Windows", reason="Only Windows pathlib parses a drive-letter anchor")
     def test_long_path_prefixed_workspace_file_uses_workspace_relative_url(self) -> None:
@@ -249,7 +253,7 @@ class TestLocalStorageDriverCreateSignedDownloadUrl:
             mock_resolve.return_value = Path(r"\\?\C:\ws\images\photo.png")
             url = driver.create_signed_download_url(Path(r"C:\ws\images\photo.png"))
 
-        assert url == "http://localhost:8124/workspace/images/photo.png?t=1000"
+        assert url == "http://localhost:8124/workspace/images/photo.png?v=1000"
 
 
 class TestSignedDownloadUrlRoundTrip:
@@ -287,7 +291,7 @@ class TestSignedDownloadUrlRoundTrip:
         assert parse_static_server_url(url, Path("/workspace")) == original
 
     def test_cachebuster_does_not_reach_the_filename(self) -> None:
-        """The ``?t=`` the builder appends must not survive into the resolved path.
+        """The ``?v=`` the builder appends must not survive into the resolved path.
 
         It rode along into the filename in the original bug, so no such file existed.
         """
@@ -297,8 +301,8 @@ class TestSignedDownloadUrlRoundTrip:
             mock_time.time_ns.return_value = 1_000_000_000
             url = driver.create_signed_download_url(Path("/workspace/staticfiles/clip.mp4"))
 
-        assert "?t=1000" in url
-        assert "?t=" not in str(parse_static_server_url(url, Path("/workspace")))
+        assert "?v=1000" in url
+        assert "?v=" not in str(parse_static_server_url(url, Path("/workspace")))
 
 
 class TestLocalStorageDriverGetAssetUrl:
@@ -383,3 +387,90 @@ class TestLocalStorageDriverDeleteFile:
             pytest.raises(RuntimeError, match="Failed to delete file"),
         ):
             driver.delete_file(TEST_FILE_PATH)
+
+
+class TestDeterministicUrlVersioning:
+    """URLs are versioned by the served file's identity, not by mint time."""
+
+    @pytest.fixture
+    def workspace(self, tmp_path: Path) -> Path:
+        return tmp_path
+
+    @pytest.fixture
+    def driver(self, workspace: Path) -> LocalStorageDriver:
+        return LocalStorageDriver(Mock(workspace_path=workspace), Mock(), base_url="http://localhost:8124/workspace")
+
+    def test_unchanged_file_mints_identical_urls(self, driver: LocalStorageDriver, workspace: Path) -> None:
+        """Same bytes → same URL across mints, so browser caches HIT instead of busting."""
+        served = workspace / "photo.png"
+        served.write_bytes(b"content")
+
+        first = driver.create_signed_download_url(served)
+        second = driver.create_signed_download_url(served)
+
+        assert first == second
+        assert "?v=" in first
+
+    def test_rewritten_file_mints_a_different_url(self, driver: LocalStorageDriver, workspace: Path) -> None:
+        """A real rewrite changes the fingerprint through size alone.
+
+        No artificial mtime bump: different-size content must change the URL
+        even when the rewrite lands within the filesystem's timestamp tick.
+        """
+        served = workspace / "photo.png"
+        served.write_bytes(b"content")
+        before = driver.create_signed_download_url(served)
+
+        served.write_bytes(b"rewritten with different length")
+        after = driver.create_signed_download_url(served)
+
+        assert before != after
+
+    def test_same_size_rename_rewrite_mints_a_different_url_even_within_one_clock_tick(
+        self, driver: LocalStorageDriver, workspace: Path
+    ) -> None:
+        """The engine's own rewrites can't collide: rename allocates a fresh inode.
+
+        Kernel clocks tick at millisecond scale, so a same-size fast rewrite
+        often lands with an identical mtime — measured at ~50% through this very
+        driver. st_ino in the fingerprint covers it for every engine write,
+        because OVERWRITE promotes a scratch file by rename. mtime is pinned
+        identical here to prove the inode alone changes the URL.
+        """
+        served = workspace / "photo.png"
+        served.write_bytes(b"content")
+        stat_result = served.stat()
+        before = driver.create_signed_download_url(served)
+
+        # The engine's overwrite shape: same byte count, new inode via rename.
+        scratch = workspace / ".scratch.partial"
+        scratch.write_bytes(b"CONTENT")
+        scratch.replace(served)
+        os.utime(served, ns=(stat_result.st_atime_ns, stat_result.st_mtime_ns))
+        after = driver.create_signed_download_url(served)
+
+        assert before != after
+
+    def test_in_place_same_size_rewrite_within_one_tick_is_a_known_collision(
+        self, driver: LocalStorageDriver, workspace: Path
+    ) -> None:
+        """KNOWN LIMITATION: in-place rewrite, same size, same clock tick → same URL.
+
+        The fingerprint is (ino, size, mtime_ns), not content. An EXTERNAL tool
+        that rewrites a served file in place (same inode) with same-size content
+        inside one kernel-clock tick mints the identical URL, and a cached
+        response can outlive its bytes. The engine's own writes never hit this
+        (rename → fresh inode, previous test). Content identity is #5607's job —
+        this test documents the residual bound so a future fix flips it knowingly.
+        """
+        served = workspace / "photo.png"
+        served.write_bytes(b"content")
+        stat_result = served.stat()
+        before = driver.create_signed_download_url(served)
+
+        served.write_bytes(b"CONTENT")  # in place: same inode, same byte count
+        # Pin mtime back to the original to simulate landing inside one tick.
+        os.utime(served, ns=(stat_result.st_atime_ns, stat_result.st_mtime_ns))
+        after = driver.create_signed_download_url(served)
+
+        assert before == after
