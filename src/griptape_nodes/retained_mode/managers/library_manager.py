@@ -282,16 +282,20 @@ from griptape_nodes.utils.library_utils import (
     normalize_library_registrations,
 )
 from griptape_nodes.utils.rez_utils import (
+    _library_rez_name,
     get_library_rez_package_version,
     is_library_rez_package_available,
     is_rez_enabled,
     is_rez_library_path,
     library_file_path_to_rez_family,
     pip_spec_name,
+    read_library_manifest,
     resolve_rez_library_json_path,
+    resolve_rez_pythonpath,
     rez_library_package_name,
     rez_library_package_version,
 )
+from griptape_nodes.utils.rez_uv import rez_name as rez_uv_name
 from griptape_nodes.utils.uv_utils import find_uv_bin, is_venv_functional, venv_python_path
 from griptape_nodes.utils.version_utils import (
     engine_version_failure_detail,
@@ -2796,11 +2800,6 @@ class LibraryManager(EngineScoped):
                                 # In rez mode, check if the dependency already exists as a
                                 # rez package before downloading and building a venv.
                                 if is_rez_enabled():
-                                    from griptape_nodes.utils.rez_utils import (
-                                        _library_rez_name,
-                                        resolve_rez_library_json_path,
-                                    )
-
                                     dep_rez_family = _library_rez_name(repo_name)
                                     dep_rez_json = resolve_rez_library_json_path(dep_rez_family)
                                     if dep_rez_json is not None:
@@ -3478,9 +3477,6 @@ class LibraryManager(EngineScoped):
             is_rez_enabled()
             and is_library_rez_package_available(library_name, library_file_path=Path(library_file_path))
         ):
-            from griptape_nodes.utils.rez_utils import read_library_manifest, resolve_rez_pythonpath
-            from griptape_nodes.utils.rez_uv import rez_name
-
             rez_family = library_file_path_to_rez_family(Path(library_file_path))
 
             # Resolve only edit-time deps for the orchestrator — mirrors the venv
@@ -3488,7 +3484,7 @@ class LibraryManager(EngineScoped):
             # The worker resolves the full family via rez-env, which includes exec deps.
             _, edit_deps, exec_deps, _ = read_library_manifest(Path(library_file_path))
             if exec_deps:
-                edit_rez_specs = [rez_name(pip_spec_name(dep)) for dep in edit_deps] if edit_deps else []
+                edit_rez_specs = [rez_uv_name(pip_spec_name(dep)) for dep in edit_deps] if edit_deps else []
                 if edit_rez_specs:
                     logger.debug(
                         "[Rez] resolving edit-time deps only for orchestrator (%d edit, %d exec skipped)",
