@@ -346,14 +346,18 @@ def parse_file_uri(location: str) -> str | None:
 
     drive_letter_match = _DRIVE_LETTER_NETLOC_PATTERN.match(netloc)
     if drive_letter_match:
-        # A bare drive letter in the netloc slot names a local Windows path, not a host.
-        return f"{netloc[0]}:{path}"
+        # A bare drive letter in the netloc slot (file://C:/... or file://c|/...) names a
+        # local Windows path, not a host. Fold it into the path so the local branch below
+        # handles it the same way as file:///C:/... -- one drive-letter fixup, not two.
+        drive_letter = netloc[0]
+        netloc = ""
+        path = f"/{drive_letter}:{path}"
 
     is_local = not netloc or netloc.lower() == "localhost"
-    if not is_local:
-        return _parse_unc_host(netloc, path)
 
-    return _parse_local_path(path)
+    if is_local:
+        return _parse_local_path(path)
+    return _parse_unc_host(netloc, path)
 
 
 def is_url(location: str) -> bool:
