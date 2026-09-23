@@ -1970,3 +1970,57 @@ class TestWorkerExecutionPath:
             await worker_manager.spawn_worker([sys.executable, "-c", ""], "Light Library")
 
         assert "PYTHONPATH" not in spawn.call_args.kwargs["env"]
+
+
+class TestHeartbeatIntervalFloor:
+    """A configured interval the code cannot run is raised to the minimum, loudly.
+
+    The interval divides the timeout to size the challenge allowance and is the sleep in both
+    heartbeat loops, so a non-positive value is a ZeroDivisionError on one path and a hot loop on
+    the other.
+    """
+
+    @staticmethod
+    def _manager_with_interval(interval: float) -> WorkerManager:
+        gtn = MagicMock()
+        gtn.get_session_id.return_value = _SESSION
+        gtn.get_engine_id.return_value = _ENGINE
+
+        def _config(key: str, default: float, cast_type: type = float) -> float:
+            from griptape_nodes.retained_mode.managers.settings import WORKER_HEARTBEAT_INTERVAL_KEY
+
+            if key == WORKER_HEARTBEAT_INTERVAL_KEY:
+                return cast_type(interval)
+            return cast_type(default)
+
+        gtn.config_manager.get_config_value.side_effect = _config
+        return WorkerManager(engine=gtn, event_manager=MagicMock())
+
+    def test_a_zero_interval_is_raised_to_the_minimum(self) -> None:
+        manager = self._manager_with_interval(0.0)
+
+        assert manager.heartbeat_interval_s == WorkerManager.MINIMUM_HEARTBEAT_INTERVAL_S
+
+    def test_a_negative_interval_is_raised_to_the_minimum(self) -> None:
+        manager = self._manager_with_interval(-5.0)
+
+        assert manager.heartbeat_interval_s == WorkerManager.MINIMUM_HEARTBEAT_INTERVAL_S
+
+    def test_a_zero_interval_leaves_the_challenge_allowance_computable(self) -> None:
+        """The division is what a zero interval used to break."""
+        manager = self._manager_with_interval(0.0)
+
+        assert manager.unanswered_challenges_allowed >= 1
+
+    def test_raising_the_interval_is_reported(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING):
+            self._manager_with_interval(0.0)
+
+        assert "cannot be used" in caplog.text
+
+    def test_a_usable_interval_is_left_alone(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING):
+            manager = self._manager_with_interval(2.5)
+
+        assert manager.heartbeat_interval_s == 2.5
+        assert "cannot be used" not in caplog.text

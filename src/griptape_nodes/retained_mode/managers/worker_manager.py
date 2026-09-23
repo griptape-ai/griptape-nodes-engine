@@ -90,6 +90,11 @@ class WorkerManager(EngineScoped):
 
     DEFAULT_HEARTBEAT_INTERVAL_S: float = 5.0
     DEFAULT_HEARTBEAT_TIMEOUT_S: float = 15.0
+    # Floor on the configured interval. Zero or negative is a configuration a human can write and
+    # the code cannot run: the interval divides the timeout to size the challenge allowance, and it
+    # is the sleep in both heartbeat loops, so a non-positive value is a ZeroDivisionError on one
+    # path and a hot loop on the other. Low enough that any interval meant seriously survives it.
+    MINIMUM_HEARTBEAT_INTERVAL_S: float = 0.1
     # How long after spawn to wait before enforcing heartbeat timeout.
     # Workers install venv deps and import modules before receiving heartbeats;
     # this matches the _await_pending_workers() ceiling so a worker never kills
@@ -160,9 +165,18 @@ class WorkerManager(EngineScoped):
         self._worker_unavailable: dict[str, str] = {}
 
         config = engine.config_manager
-        self.heartbeat_interval_s: float = config.get_config_value(
+        configured_interval_s: float = config.get_config_value(
             WORKER_HEARTBEAT_INTERVAL_KEY, default=WorkerManager.DEFAULT_HEARTBEAT_INTERVAL_S, cast_type=float
         )
+        self.heartbeat_interval_s: float = max(WorkerManager.MINIMUM_HEARTBEAT_INTERVAL_S, configured_interval_s)
+        if self.heartbeat_interval_s != configured_interval_s:
+            logger.warning(
+                "Worker heartbeat interval of %.3gs cannot be used; running at the %.3gs minimum instead. "
+                "Set '%s' to a positive number of seconds.",
+                configured_interval_s,
+                self.heartbeat_interval_s,
+                WORKER_HEARTBEAT_INTERVAL_KEY,
+            )
         self.heartbeat_timeout_s: float = config.get_config_value(
             WORKER_HEARTBEAT_TIMEOUT_KEY, default=WorkerManager.DEFAULT_HEARTBEAT_TIMEOUT_S, cast_type=float
         )
@@ -199,6 +213,11 @@ class WorkerManager(EngineScoped):
         meaning and takes effect without a restart: the timeout still says how much silence is
         tolerated, expressed in challenges rather than seconds. At least one, so a configuration
         that rounds to zero cannot evict a worker the first time it is asked.
+
+        Note that the timeout is read two ways. Here it sizes an allowance in challenges, which is
+        why a slow sweep cannot evict a worker that was never asked. On the worker,
+        `worker_heartbeat_monitor` compares it against elapsed time, because a worker can only
+        measure silence from a peer it cannot poll.
         """
         return max(1, round(self.heartbeat_timeout_s / self.heartbeat_interval_s))
 
