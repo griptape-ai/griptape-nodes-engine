@@ -5,7 +5,7 @@ import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -314,7 +314,12 @@ class ExecutionPayload(Payload):
 
 
 class AppPayload(Payload):
-    pass
+    # Whether a copy of this event raised in another process may be dispatched to this process's
+    # listeners. Closed by default: an app event almost always describes the process that raised
+    # it, so adopting one lets a peer reconfigure this engine. Open it only for a payload that
+    # reports about its sender, and check every listener of the type before doing so, because the
+    # flag admits peer copies to all of them.
+    adoptable_from_peers: ClassVar[bool] = False
 
 
 # Type variables for our generic payloads

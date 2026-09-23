@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
+from typing import Any, ClassVar
 
 from griptape_nodes.retained_mode.events.base_events import (
     AppPayload,
@@ -261,6 +261,11 @@ class LibraryLoadedNotification(AppPayload):
         node_schemas: Serialized node/parameter schemas from the worker process, or None
             if this notification was not produced by a worker.
     """
+
+    # A worker raises this to report its own outcome to the orchestrator, which must act on the
+    # peer's copy. Safe as a type-wide flag because LibraryManager is its only listener there: the
+    # app's relay listener exists on workers alone, and a worker never sees another worker's events.
+    adoptable_from_peers: ClassVar[bool] = True
 
     library_name: str
     fitness: str
