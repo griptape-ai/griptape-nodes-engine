@@ -565,7 +565,18 @@ class LibraryManager(EngineScoped):
         has_rez_package: bool = False
         rez_family: str | None = None
         rez_version: str | None = None
+        # True when this library's nodes EXECUTE in a dedicated worker process, for either
+        # reason: legacy worker-mode declarations (requires_worker above, which also skips
+        # orchestrator-side loading in favor of stubs) or execution dependencies
+        # (pip_dependencies_exec -- the library loads REAL nodes on the orchestrator and
+        # only its process() runs in the worker, where .venv-exec is on sys.path).
+        # Consumed by execution routing; never by load-time skips.
         executes_in_worker: bool = False
+
+        # Why the last `.venv-exec` build failed; None when it succeeded. Deliberately separate
+        # from execution_unavailable_reason, which _start_workers clears before every spawn attempt
+        # -- the spawn refusal reads THIS field, so a failure recorded at registration must survive
+        # that clearing.
         execution_env_failure: str | None = None
 
     class RegisterLibraryPrerequisites(NamedTuple):
@@ -2862,6 +2873,10 @@ class LibraryManager(EngineScoped):
                         InstallLibraryDependenciesRequest(library_file_path=library_info.library_path)
                     )
                     if isinstance(install_result, InstallLibraryDependenciesResultFailure):
+                        # Replaced, not appended: the lifecycle re-enters at EVALUATED on every
+                        # reload while the LibraryInfo survives, and the display shows the
+                        # OLDEST instance -- appending would keep reporting the first reason.
+                        # Fitness stays with the dependency block above, which decides it.
                         library_info.problems = [
                             problem
                             for problem in library_info.problems
