@@ -414,7 +414,7 @@ class TestRunTimeStateReachesTheTrait:
             for validator in parameter.validators:
                 validator(parameter, value)
 
-        with pytest.raises(ValueError, match="out of range"):
+        with pytest.raises(ValueError, match="must be between"):
             enforce(NARROWED_MAX + 30)
 
     def test_a_dropdown_filled_at_run_time_keeps_its_choices(self, engine: Engine) -> None:

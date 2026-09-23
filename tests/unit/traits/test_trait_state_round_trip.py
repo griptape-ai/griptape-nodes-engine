@@ -17,7 +17,7 @@ from griptape_nodes.traits.widget import Widget
 @pytest.mark.parametrize(
     ("trait", "state"),
     [
-        (Slider(min_val=1, max_val=9), {"min_val": 1, "max_val": 9}),
+        (Slider(min_val=1, max_val=9), {"min_val": 1, "max_val": 9, "soft_limits": False}),
         (Clamp(min_val=1, max_val=9), {"min_val": 1, "max_val": 9}),
         (MinMax(min_val=1, max_val=9), {"min_val": 1, "max_val": 9}),
         (ColorPicker(format="rgb"), {"format": "rgb"}),

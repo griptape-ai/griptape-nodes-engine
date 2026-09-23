@@ -77,7 +77,7 @@ class TestAdoptingSliderBounds:
 
         parameter.ui_options = {"slider": {"min_val": 0, "max_val": 10}}
 
-        with pytest.raises(ValueError, match="out of range"):
+        with pytest.raises(ValueError, match="must be between 0 and 10"):
             parameter.validators[0](parameter, 40)
 
     def test_one_written_bound_leaves_the_other_alone(self) -> None:
@@ -89,6 +89,15 @@ class TestAdoptingSliderBounds:
         parameter.ui_options = {"slider": {"max_val": 10}}
 
         assert (trait.min, trait.max) == (1, 10)
+
+    def test_written_soft_limits_land_on_the_trait(self) -> None:
+        trait = Slider(min_val=1, max_val=50)
+        parameter = Parameter(name="steps", type="int", tooltip="t", traits={trait})
+
+        parameter.ui_options = {"slider": {"min_val": 1, "max_val": 50, "soft_limits": True}}
+
+        assert trait.soft_limits is True
+        assert parameter.validators == []
 
     def test_a_slider_key_that_is_not_a_pair_of_bounds_is_ignored(self) -> None:
         trait = Slider(min_val=1, max_val=50)
@@ -286,7 +295,7 @@ class TestAdoptionUsesTheTraitProtocol:
         assert set(Options(choices=[]).to_state()) == {"choices", "show_search", "search_filter", "allow_custom"}
 
     def test_slider_bounds_are_saved(self) -> None:
-        assert set(Slider(min_val=0, max_val=1).to_state()) == {"min_val", "max_val"}
+        assert set(Slider(min_val=0, max_val=1).to_state()) == {"min_val", "max_val", "soft_limits"}
 
 
 _UNTOUCHED_LEVEL = 3
