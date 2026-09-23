@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import tomllib
 from datetime import UTC, datetime
@@ -97,6 +98,8 @@ def build_engine_package(
         console.print(f"  [yellow]Existing package {version} will be overwritten.[/yellow]")
     console.print()
 
+    _check_rez_bindings(interactive=not yes)
+
     if not yes and not typer.confirm("Proceed with build?", default=True):
         raise typer.Abort
 
@@ -136,6 +139,67 @@ def _resolve_and_validate_repo(engine_repo_path: str | None) -> tuple[Path, Path
 
     console.print(f"  Engine repo: [cyan]{repo_path}[/cyan]")
     return repo_path, pyproject_path
+
+
+def _check_rez_bindings(*, interactive: bool = True) -> None:
+    """Verify that rez system bindings (platform, os, python) exist.
+
+    These packages are created by ``rez bind`` and are required for rez
+    to resolve environments on this machine. Without them, built packages
+    will fail to resolve when someone tries to use them.
+
+    When *interactive* is True (default), prompts the user to continue.
+    When False (--yes mode), prints a warning but proceeds.
+    """
+    rez_search = _rez_executable("rez-search")
+    python_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    required = {
+        "platform": "rez bind platform",
+        "os": "rez bind os",
+        f"python-{python_version}": f"rez bind python (version {python_version})",
+    }
+
+    missing: list[tuple[str, str]] = []
+    for family, bind_hint in required.items():
+        try:
+            result = subprocess.run(  # noqa: S603
+                [rez_search, family], capture_output=True, text=True, check=False, timeout=10
+            )
+            if result.returncode != 0:
+                missing.append((family, bind_hint))
+        except (OSError, subprocess.SubprocessError):
+            missing.append((family, bind_hint))
+
+    if not missing:
+        return
+
+    console.print()
+    console.print(
+        Panel(
+            "[bold yellow]Rez system bindings not found[/bold yellow]\n\n"
+            "The following rez system packages are missing from local and release stores:\n"
+            + "".join(f"\n  [red]x[/red] [bold]{family}[/bold]" for family, _ in missing)
+            + "\n\n"
+            "These are created by [cyan]rez bind[/cyan] and tell rez what platform,\n"
+            "operating system, and Python version are available on this machine.\n"
+            "Without them, built packages cannot be resolved into environments.\n\n"
+            "To fix this, run:\n" + "".join(f"\n  [cyan]{hint}[/cyan]" for _, hint in missing) + "\n\n"
+            "If you are building packages to copy to another machine (e.g. a shared\n"
+            "network store), you can skip this check and bind on the target instead.",
+            title="Missing Rez Bindings",
+            expand=False,
+        )
+    )
+
+    if not interactive:
+        console.print("[yellow]Proceeding without bindings (--yes mode).[/yellow]")
+        console.print()
+        return
+
+    if not typer.confirm("Continue building without rez bindings?", default=False):
+        raise typer.Abort
+
+    console.print()
 
 
 def _read_project_metadata(pyproject_path: Path) -> tuple[str, list[str]]:
@@ -573,6 +637,8 @@ def build_library_package(
         else:
             console.print("[red]Set GTN_REZ_ROOT + GTN_REZ_LOCAL_PACKAGES_PATH or provide --packages-path.[/red]")
             raise typer.Exit(1)
+
+    _check_rez_bindings()
 
     if git_url:
         _build_library_from_git(git_url, branch, packages_root, skip_installed=skip_installed)
