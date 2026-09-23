@@ -95,6 +95,14 @@ PARALLEL_BRANCH_RESOLUTION = register_beta_feature(
 
 **Turning a flag on while developing** - Add it to the `beta_features` section of your config file, or set `GTN_CONFIG_BETA_FEATURES__<ID>=true` (id in uppercase). Only real `true`/`false` values count. Anything else is ignored with a warning and the feature uses its default.
 
+## Media Parameter Values
+
+**Reduce a media value to a string, then normalize it** - A media parameter value arrives as an artifact, a string (URL, project macro path, filesystem path), or a serialized artifact dict. `normalize_artifact_input` handles all three by collapsing them to a string and handing it to `_normalize_string_input`, which resolves the path, uploads it to static storage, and builds the artifact type the parameter declared. Add new input shapes by extracting their string and falling through to that branch. Do not rebuild the artifact from its marshmallow schema (`BaseArtifact.from_dict` / `get_schema().load()`): generated schemas set `unknown = INCLUDE`, so the display metadata the editor sends alongside a value (`width`, `height`, `duration`) reaches the constructor and raises, and the schema builds whatever type the dict names rather than the type the parameter wants. The string route has neither problem.
+
+**A serialized dict's declared `type` distinguishes a path from a payload** - `<Kind>UrlArtifact` dicts hold a path or URL in `value`; raw `<Kind>Artifact` dicts hold base64 bytes. Only unwrap `value` when the dict's `type` names the artifact type you are normalizing to, or base64 is treated as a path. The node libraries make the same check in `coerce_media_url_or_data_uri`.
+
+**Do not derive artifact ids to stabilize equality** - `BaseArtifact.id` defaults to random hex and takes part in `__eq__`, and `NodeManager` reads artifact inequality as a user edit, so normalizing the same input twice unresolves the downstream subgraph. That is a property of the existing string branch too, and the fix belongs in that comparison, not in the value feeding it. Do not fingerprint payloads into synthetic ids to work around it for one branch — it leaves the branch beside it inconsistent and hides the real bug. See [#5621](https://github.com/griptape-ai/griptape-nodes-engine/issues/5621).
+
 ## Documentation
 
 **Update docs with user-facing changes** - When a change affects what users see or do, update the documentation in the same PR. Common mappings:
