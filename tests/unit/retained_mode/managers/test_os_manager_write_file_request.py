@@ -751,7 +751,6 @@ class TestSidecarMetadata:
         assert len(record_files) == 1
         data = _yaml_load(record_files[0].read_text())
         assert data["artifact"]["file_name"] == "output_1.png"
-        assert data["artifact"]["requested_path"] == str(file_path)
 
     def test_record_file_extension_unchanged_for_alias_extensions(self, engine: Engine, temp_dir: Path) -> None:
         """The record situation's ``file_extension`` must reflect the on-disk name, not the raw sniff.

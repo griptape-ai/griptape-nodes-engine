@@ -135,7 +135,6 @@ class ArtifactWriteFacts:
     final_file_path: Path
     final_content_bytes: bytes
     append: bool = False
-    requested_path: str | None = None
     extension_coerced_from: str | None = None
 
 
@@ -499,24 +498,13 @@ class ProvenanceManager(EngineScoped):
     ) -> ProvenanceRecord:
         final_file_path = facts.final_file_path
         content_hash = hash_content(facts.final_content_bytes)
-        workspace_dir = self._current_workspace_dir()
-        workspace_relative_path: str | None = None
-        if workspace_dir is not None:
-            try:
-                workspace_relative_path = final_file_path.relative_to(workspace_dir).as_posix()
-            except ValueError:
-                workspace_relative_path = None
-
-        requested_path = facts.requested_path
         artifact = ArtifactIdentity(
             final_path=str(final_file_path),
             macro_path=self._macro_path_for(final_file_path),
-            workspace_relative_path=workspace_relative_path,
             file_name=final_file_path.name,
             content_hash=content_hash,
             size_bytes=len(facts.final_content_bytes),
             append=facts.append,
-            requested_path=requested_path if requested_path != str(final_file_path) else None,
             extension_coerced_from=facts.extension_coerced_from,
         )
 
@@ -660,7 +648,7 @@ class ProvenanceManager(EngineScoped):
                 excerpt = excerpt[: _SUMMARY_PARAM_EXCERPT_CHARS - 1] + "…"
             param_part = f" — {excerpt_name}='{excerpt}'"
 
-        target = record.artifact.workspace_relative_path or record.artifact.file_name
+        target = record.artifact.macro_path or record.artifact.file_name
         return f"{node_part}{workflow_part}{param_part} → {target}"
 
     @staticmethod

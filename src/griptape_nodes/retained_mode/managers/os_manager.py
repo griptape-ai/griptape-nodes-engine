@@ -2933,7 +2933,6 @@ class OSManager(EngineScoped):
                         final_file_path=Path(final_file_path),
                         final_content_bytes=final_bytes_for_record,
                         append=request.append,
-                        requested_path=str(file_path) if used_indexed_fallback else None,
                         extension_coerced_from=(requested_suffix_before_alignment if swapped_ext is not None else None),
                     ),
                     provenance_content,  # type: ignore[arg-type]  # plan is active => content is set

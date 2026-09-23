@@ -237,7 +237,7 @@ class TestRecordContents:
         record = _load_single_record(_record_dir_for(temp_dir, "hero.txt"))
         assert record.record_id == result.provenance.record_id
         assert record.artifact.final_path == str(file_path)
-        assert record.artifact.workspace_relative_path == "hero.txt"
+        assert record.artifact.file_name == "hero.txt"
         assert record.artifact.content_hash == hash_content(b"pixels")
         assert record.artifact.size_bytes == len(b"pixels")
         assert record.producing_node is not None
@@ -299,7 +299,6 @@ class TestRecordContents:
 
         record = _load_single_record(_record_dir_for(temp_dir, "hero_1.txt"))
         assert record.artifact.file_name == "hero_1.txt"
-        assert record.artifact.requested_path == str(file_path)
 
 
 class TestFailurePolicies:

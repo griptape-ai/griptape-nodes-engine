@@ -107,7 +107,6 @@ class ArtifactIdentity(BaseModel):
             "Null when the location has no macro mapping."
         ),
     )
-    workspace_relative_path: str | None = Field(default=None, description="Null when outside the workspace")
     file_name: str
     content_hash: str = Field(description="Hash of the exact bytes written, e.g. 'blake2b-256:<hex>'")
     size_bytes: int
@@ -119,7 +118,6 @@ class ArtifactIdentity(BaseModel):
             "bytes this save added. Media saves are never appends."
         ),
     )
-    requested_path: str | None = Field(default=None, description="Pre-walk intent; null if identical to final_path")
     extension_coerced_from: str | None = Field(
         default=None, description="Requested extension when sniff-and-swap renamed the file"
     )
