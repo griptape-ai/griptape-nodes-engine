@@ -72,9 +72,9 @@ class LocalObjectEntry:
     value: Any
     owner: str
     source: str
-    # Which library parked this. Not part of the namespace -- the worker is -- but a library unloading or
-    # clearing its own cache has to find its objects among its co-tenants'.
-    library: str | None = None
+    # Which group of sources parked this. Not part of the namespace -- the owner is -- but a group
+    # releasing its own objects has to find them among its co-tenants'.
+    group: str | None = None
     # Which slot of `source` the engine parked this for, or None when the owner named the key itself.
     # Provenance lives here rather than in the key's shape, because the engine may only ever release
     # what it parked, and an owner-chosen key can look like anything.
@@ -83,11 +83,11 @@ class LocalObjectEntry:
 
     @property
     def is_slot_bound(self) -> bool:
-        """Whether the engine took this on a parameter's behalf, rather than the library naming it.
+        """Whether the engine took this on a parameter's behalf, rather than the caller naming it.
 
         `slot` carries both facts deliberately: which slot to displace, and whose entry this is. A separate
         lifetime field would say the same thing twice and every caller would have to keep the two agreeing.
-        Only a slot-bound entry is the engine's to displace or release; a library-named one is stable by
+        Only a slot-bound entry is the engine's to displace or release; a caller-named one is stable by
         construction and several sources may hold it.
         """
         return self.slot is not None
@@ -107,7 +107,7 @@ class ResourceManager(EngineScoped):
         self._resource_types: set[ResourceType] = set()
         # Maps instance_id to ResourceInstance objects describing this machine's capabilities.
         self._capability_instances: dict[str, ResourceInstance] = {}
-        # Maps an engine-minted key to a live object a library parked in THIS process.
+        # Maps a namespaced key to a live object parked in THIS process.
         self._local_objects: dict[str, LocalObjectEntry] = {}
         # Release hooks held back because a node was executing: see drain_deferred_releases. A list, not a
         # map: a stable key deferred twice before a drain -- a pipeline rebuilt under one config hash --
@@ -419,12 +419,14 @@ class ResourceManager(EngineScoped):
         source: str,
         key: str,
         slot: str | None = None,
-        library: str | None = None,
+        group: str | None = None,
         on_drop: Callable[[Any], None] | None = None,
     ) -> str:
         """Hold `value` in this process and return the key that refers to it.
 
         The key is namespaced by `owner`, so two owners choosing the same suffix scheme cannot collide.
+        `group` labels the entry for `drop_objects_for_group`, which is how one of several sources sharing
+        an owner releases its own without touching the rest.
 
         `slot` marks an entry the engine parked for one of `source`'s parameters. A slot holds one object:
         parking into it again releases the previous occupant, in this process, which is the process that
@@ -438,7 +440,7 @@ class ResourceManager(EngineScoped):
             owner=owner,
             source=source,
             slot=slot,
-            library=library,
+            group=group,
             on_drop=on_drop,
         )
         with self._local_objects_lock:
@@ -620,7 +622,7 @@ class ResourceManager(EngineScoped):
             if keep_value is not _SAME_VALUE_UNSET and existing.value is keep_value:
                 continue
             # One object can sit in several entries -- parked on two outputs, or parked and also cached
-            # under a library key. Displacing one entry must not tear the object down while another still
+            # under a caller's own key. Displacing one entry must not tear the object down while another still
             # hands it out, so an entry whose object survives elsewhere is removed silently: no hook, no
             # broadcast.
             if any(remaining.value is existing.value for remaining in self._local_objects.values()):
@@ -631,7 +633,7 @@ class ResourceManager(EngineScoped):
     def release_key_everywhere(self, key: str, *, owner: str) -> bool:
         """Release `key` here and remember to tell the workers, returning whether this process held it.
 
-        The object may be in this process, in a worker, or in both when two libraries share a namespace, so
+        The object may be in this process, in a worker, or in both when two callers share a namespace, so
         the local release cannot tell you whether anything is left holding it. Callers on sync paths use
         this and let `drain_pending_worker_releases` do the rest.
         """
@@ -657,7 +659,7 @@ class ResourceManager(EngineScoped):
         """Release everything held in this process, returning how many went.
 
         For clearing workflow state. A parked entry is unreachable once its nodes are gone, so taking it is
-        forced. A library-named entry is not -- its key is a hash the library re-derives, so it would still
+        forced. A caller-named entry is not -- its key is one the caller re-derives, so it would still
         be findable -- and it goes anyway: objects are not kept across workflows, and a cache surviving
         into a different graph would hand out something built for the previous one. The cost is a rebuild
         on the next run, which is the intended trade.
@@ -669,19 +671,17 @@ class ResourceManager(EngineScoped):
         self._invoke_hooks_once_per_object(doomed)
         return len(doomed)
 
-    def drop_objects_for_library(self, library: str | None) -> int:
-        """Release everything one library parked in this process, leaving its co-tenants' objects alone.
+    def drop_objects_for_group(self, group: str | None) -> int:
+        """Release everything one group parked in this process, leaving its co-tenants' objects alone.
 
-        The namespace is the worker, so a library sharing a worker with others cannot be found by owner.
-        What a library unloading needs, and what a "clear cache" node should do rather than emptying the
-        whole worker.
+        The namespace is the owner, so a group sharing an owner with others cannot be found by owner alone.
         """
         with self._local_objects_lock:
-            doomed = {key: entry for key, entry in self._local_objects.items() if entry.library == library}
+            doomed = {key: entry for key, entry in self._local_objects.items() if entry.group == group}
             for key in doomed:
                 del self._local_objects[key]
-            # A co-tenant may hold the same object: they share this worker's cache deliberately, so a
-            # library unloading must not tear down what another one is still handing out.
+            # A co-tenant may hold the same object: groups sharing an owner share its cache deliberately,
+            # so one group's release must not tear down what another is still handing out.
             to_release = {key: entry for key, entry in doomed.items() if not self._value_still_held_locked(entry.value)}
 
         self._invoke_hooks_once_per_object(to_release)
@@ -724,7 +724,7 @@ class ResourceManager(EngineScoped):
         """Run release hooks for a batch of removed entries, once per distinct object.
 
         One object can sit in several entries -- parked on two outputs, or parked and also cached under
-        a library key -- and a batch removal takes them all at once. Freeing is per object, not per
+        a caller's own key -- and a batch removal takes them all at once. Freeing is per object, not per
         entry, so the hook runs once: the first entry carrying one, since an entry may have none.
         """
         if removed and defer_during_execution and self.engine.event_manager.in_node_execution():

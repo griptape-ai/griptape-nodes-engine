@@ -127,7 +127,7 @@ class LocalObjectScope:
             owner=self.owner,
             source=self.source,
             key=self._namespaced(key),
-            library=self._library,
+            group=self._library,
             on_drop=on_drop,
         )
 
@@ -178,7 +178,7 @@ class LocalObjectScope:
             source=self.source,
             key=f"{self.source}.{parameter_name}#{uuid.uuid4().hex[:8]}",
             slot=slot if slot is not None else parameter_name,
-            library=self._library,
+            group=self._library,
             on_drop=on_drop,
         )
 
@@ -379,7 +379,7 @@ class LocalObjectScope:
         """
         # No library is its own bucket rather than a no-op, so a node outside any library can still clear
         # what it put. Only reachable from tests and embedders; every registered node has a library.
-        return self._manager().drop_objects_for_library(self._library)
+        return self._manager().drop_objects_for_group(self._library)
 
     def _not_a_key_message(self, key: Any, *, parameter_name: str | None, node_name: str) -> str:
         """Nothing the cache recognises arrived: unwired, or wired to something that is not a reference."""
