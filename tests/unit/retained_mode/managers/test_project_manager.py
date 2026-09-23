@@ -8086,6 +8086,97 @@ directories:
         assert isinstance(fetched, GetProjectTemplateResultSuccess)
         assert fetched.template.name == "Base With Id"
 
+    @pytest.mark.asyncio
+    async def test_denied_child_leaves_its_parent_unregistered(self, pm: ProjectManager, tmp_path: Path) -> None:
+        """A child denied by LOAD_PROJECT must not register the parent its walk read.
+
+        The chain walk runs before the checkpoint, so registering ancestors as they resolve
+        would make a one-line child naming a forbidden parent enough to put that parent in
+        the registry and expose its template through GetProjectTemplateRequest.
+        """
+        from griptape_nodes.retained_mode.events.project_events import (
+            GetProjectTemplateRequest,
+            GetProjectTemplateResultFailure,
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultFailure,
+        )
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+            AuthorizationCheckpoint,
+            CheckpointDenial,
+            CheckpointFailure,
+        )
+
+        base_path = (tmp_path / "base.yml").resolve()
+        child_path = (tmp_path / "child.yml").resolve()
+        files = {
+            base_path: self.BASE_PROJECT_YAML,
+            child_path: self.CHILD_PROJECT_YAML_TEMPLATE.format(parent=base_path.as_posix()),
+        }
+
+        def deny(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            if checkpoint.action == "LoadProject":
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Ask your admin to grant this project."),))
+            return None
+
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.side_effect = deny
+            mock_engine.ahandle_request = self._file_router(files)
+            child_load = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=child_path))
+
+        assert isinstance(child_load, LoadProjectTemplateResultFailure)
+        assert str(child_path) not in pm._successfully_loaded_project_templates
+        assert str(base_path) not in pm._successfully_loaded_project_templates
+
+        fetched = pm.on_get_project_template_request(GetProjectTemplateRequest(project_id=str(base_path)))
+        assert isinstance(fetched, GetProjectTemplateResultFailure)
+
+    @pytest.mark.asyncio
+    async def test_registered_ancestor_reports_its_own_read_problems(self, pm: ProjectManager, tmp_path: Path) -> None:
+        """A registered ancestor carries the problems its own read found, not just merge ones.
+
+        An unresolvable workspace_dir is a recoverable error, so the parent still merges into
+        the child. Listing that parent as GOOD with no problems would hide a value the user
+        has to fix before the parent can be activated.
+        """
+        from griptape_nodes.common.project_templates.validation import ProjectValidationStatus
+        from griptape_nodes.retained_mode.events.project_events import (
+            ListProjectTemplatesRequest,
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+        )
+
+        base_with_bad_workspace_yaml = """\
+project_template_schema_version: "0.3.2"
+name: Base With Bad Workspace
+workspace_dir: "{unknown_macro_token}/somewhere"
+directories:
+  shared_outputs:
+    path_macro: "{workspace_dir}/base_outputs"
+"""
+        base_path = (tmp_path / "base.yml").resolve()
+        child_path = (tmp_path / "child.yml").resolve()
+        files = {
+            base_path: base_with_bad_workspace_yaml,
+            child_path: self.CHILD_PROJECT_YAML_TEMPLATE.format(parent=base_path.as_posix()),
+        }
+
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = self._file_router(files)
+            child_load = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=child_path))
+
+        assert isinstance(child_load, LoadProjectTemplateResultSuccess)
+
+        list_result = await pm.on_list_project_templates_request(
+            ListProjectTemplatesRequest(include_system_builtins=False)
+        )
+        by_id = {info.project_id: info for info in list_result.successfully_loaded}
+        parent_info = by_id[str(base_path)]
+        assert parent_info.validation.status == ProjectValidationStatus.FLAWED
+        assert any(problem.field_path == "workspace_dir" for problem in parent_info.validation.problems)
+
 
 class TestSaveProjectTemplate:
     """Tests for `SaveProjectTemplateRequest`'s parent-aware overlay diff.

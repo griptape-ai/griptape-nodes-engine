@@ -153,6 +153,9 @@ Parents are loaded, not *added*: they are not written into your saved project li
 opening a child does not permanently accumulate its ancestors. A parent that you had
 already registered yourself keeps the entry it already had.
 
+This happens only when the child itself loads. If the child turns out to be unusable, or you
+do not have permission to open it, nothing from its chain is left in the projects list.
+
 ### Cycles and missing parents
 
 The engine refuses to load a project whose parent chain contains a cycle. A direct self-reference, A → B → A, and longer cycles are all caught and reported as a validation error on the child being loaded.

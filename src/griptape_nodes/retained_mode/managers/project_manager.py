@@ -427,6 +427,22 @@ class ProjectInfo:
 
 
 @dataclass(frozen=True)
+class _ResolvedAncestor:
+    """A parent project read and merged during a parent-chain walk, awaiting registration.
+
+    Held rather than registered on the spot because the walk runs before its caller has
+    decided anything: a child can still be rejected as unusable or denied by the
+    LOAD_PROJECT checkpoint after inheriting successfully, and such a child must not leave
+    its ancestors in the registry.
+    """
+
+    project_id: ProjectID
+    project_file_path: Path
+    template: ProjectTemplate
+    validation: ProjectValidationInfo
+
+
+@dataclass(frozen=True)
 class ProjectChainEntry:
     """One project in a resolved ancestry chain: its id and best-effort name.
 
@@ -844,11 +860,13 @@ class ProjectManager(EngineScoped):
         # Resolve the parent chain (if declared) into a base ProjectTemplate.
         # Cycle detection seeds the visited set with the current project's path
         # so a self-reference also fails fast.
+        resolved_ancestors: list[_ResolvedAncestor] = []
         base_template = await self._resolve_parent_chain(
             overlay=overlay,
             project_file_path=project_file_path,
             validation=validation,
             visited={project_file_path},
+            resolved_ancestors=resolved_ancestors,
         )
         if base_template is None:
             # _resolve_parent_chain records the specific cause (e.g. an
@@ -877,19 +895,7 @@ class ProjectManager(EngineScoped):
         situation_schemas = self._parse_situation_macros(template.situations, validation)
         directory_schemas = self._parse_directory_macros(template.directories, validation)
 
-        # A declared variable that collides with a computed name (builtin or directory)
-        # is legal but shadowed: computed wins within the PROJECT tier, so the stored
-        # value is unreachable until the collision is removed. Warn, don't fail.
-        computed_names = BUILTIN_VARIABLES | set(template.directories.keys())
-        for var_name in template.variables:
-            if var_name in computed_names:
-                validation.add_warning(
-                    field_path=f"variables.{var_name}",
-                    message=(
-                        f"Variable '{var_name}' collides with a builtin or directory name. "
-                        f"The builtin/directory value wins; this variable will never resolve."
-                    ),
-                )
+        self._warn_shadowed_variables(template, validation)
 
         # Now check if validation is usable after collecting all errors
         if not validation.is_usable():
@@ -943,6 +949,10 @@ class ProjectManager(EngineScoped):
         # at load time); runtime writes to READ_WRITE entries mutate the layer and
         # persist back through the save-overlay path.
         self._install_project_variables(project_id, template)
+
+        # Only now that this project is cached: an ancestor the walk read is registered on
+        # behalf of a project that actually loaded, never one this method turned away.
+        self._commit_resolved_ancestors(resolved_ancestors)
 
         # Track validation status for all load attempts (for UI display)
         self._registered_template_status[project_file_path] = validation
@@ -1174,6 +1184,7 @@ class ProjectManager(EngineScoped):
         project_file_path: Path,
         validation: ProjectValidationInfo,
         visited: set[Path],
+        resolved_ancestors: list[_ResolvedAncestor],
     ) -> ProjectTemplate | None:
         """Resolve the parent chain declared by an overlay into a base ProjectTemplate.
 
@@ -1205,6 +1216,12 @@ class ProjectManager(EngineScoped):
         Errors during parent resolution (missing file, unregistered id, unparsable
         YAML, cycle) are recorded on the child's `validation` and surfaced to the
         caller as a None return.
+
+        Every ancestor the walk resolves is appended to `resolved_ancestors` instead of
+        being registered here, because whether they should be registered depends on what
+        the caller does next. A caller that goes on to cache its own project passes the
+        list to `_commit_resolved_ancestors`; a caller that bails, or only needed a merge
+        base, discards it.
         """
         # Precedence: an explicit parent_project_id (portable, registry-located)
         # wins and the path is ignored. parent_project_path is the legacy
@@ -1291,18 +1308,21 @@ class ProjectManager(EngineScoped):
             project_file_path=parent_file_path,
             validation=validation,
             visited={*visited, parent_file_path},
+            resolved_ancestors=resolved_ancestors,
         )
         if ancestor_base is None:
             return None
 
-        # Merge the parent overlay onto its own ancestor base using a fresh
-        # validation info so the parent's overrides don't bleed into the child's
-        # validation record. Errors during the parent merge still propagate
-        # upward via add_error below.
-        parent_merge_validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
-        parent_template = ProjectTemplate.merge(ancestor_base, parent_overlay, parent_merge_validation)
-        if not parent_merge_validation.is_usable():
-            for problem in parent_merge_validation.problems:
+        # Merge the parent overlay onto its own ancestor base into the PARENT's own validation
+        # record, never the child's: the parent's overrides are not the child's problems, and an
+        # ancestor registered from this walk is listed with this record, so it has to carry
+        # everything _read_overlay found (above all the recoverable workspace_dir/libraries_dir
+        # errors that make a project FLAWED) and not just the merge. merge_problem_start marks
+        # where the merge's own problems begin, so only those propagate to the child below.
+        merge_problem_start = len(parent_validation.problems)
+        parent_template = ProjectTemplate.merge(ancestor_base, parent_overlay, parent_validation)
+        if not parent_validation.is_usable():
+            for problem in parent_validation.problems[merge_problem_start:]:
                 validation.add_error(
                     field_path=f"{parent_link_field}.{problem.field_path}",
                     message=f"Parent '{parent_label}': {problem.message}",
@@ -1310,23 +1330,18 @@ class ProjectManager(EngineScoped):
                 )
             return None
 
-        self._register_resolved_ancestor(
-            project_file_path=parent_file_path,
-            overlay=parent_overlay,
-            template=parent_template,
-            validation=parent_merge_validation,
+        resolved_ancestors.append(
+            _ResolvedAncestor(
+                project_id=parent_overlay.id if parent_overlay.id is not None else str(parent_file_path),
+                project_file_path=parent_file_path,
+                template=parent_template,
+                validation=parent_validation,
+            )
         )
         return parent_template
 
-    def _register_resolved_ancestor(
-        self,
-        *,
-        project_file_path: Path,
-        overlay: ProjectOverlayData,
-        template: ProjectTemplate,
-        validation: ProjectValidationInfo,
-    ) -> None:
-        """Cache an ancestor resolved during a parent-chain walk as a loaded project.
+    def _commit_resolved_ancestors(self, resolved_ancestors: list[_ResolvedAncestor]) -> None:
+        """Cache ancestors resolved during a parent-chain walk as loaded projects.
 
         A parent named only by `parent_project_path` is read and merged by the walk but
         would otherwise never enter the registry. The listing reports each entry's parent
@@ -1335,39 +1350,62 @@ class ProjectManager(EngineScoped):
         lookup resolves, which is what makes `GetProjectTemplateRequest` fail for a parent
         the child inherited from successfully.
 
-        Not gated on the LOAD_PROJECT checkpoint that `_load_and_cache_project_template`
-        applies: access to a child does not require access to its parent, and by this point
-        the parent's content is merged into the child either way.
+        Call this only after the load that walked the chain has cached its own project. A
+        child rejected as unusable or denied by the LOAD_PROJECT checkpoint must leave no
+        ancestors behind, or a one-line child naming a forbidden parent would be enough to
+        put that parent in the registry.
 
-        Registers in memory only. The path is never appended to projects_to_register, so
-        inheriting from a parent does not mutate the user's persisted project list.
+        The ancestors themselves are not gated on LOAD_PROJECT: access to a child does not
+        require access to its parent, and a child that reached this point already carries
+        the parent's merged content.
+
+        Registers in memory only. Ancestor paths are never appended to projects_to_register,
+        so inheriting from a parent does not mutate the user's persisted project list.
         """
-        project_id = overlay.id if overlay.id is not None else str(project_file_path)
+        for ancestor in resolved_ancestors:
+            # An id already present is left untouched, whether it is this same file (already
+            # loaded, so its entry is at least as complete as this one) or a different file (a
+            # collision that a child's load has no business resolving by eviction).
+            if ancestor.project_id in self._successfully_loaded_project_templates:
+                continue
 
-        # An id already present is left untouched, whether it is this same file (already
-        # loaded, so its entry is at least as complete as this one) or a different file (a
-        # collision that a child's load has no business resolving by eviction).
-        if project_id in self._successfully_loaded_project_templates:
-            return
+            # Problems land on the ancestor's own validation record, which the child's merge
+            # never reads, so an ancestor whose macros do not parse is skipped here without
+            # changing the outcome of the load that walked through it.
+            situation_schemas = self._parse_situation_macros(ancestor.template.situations, ancestor.validation)
+            directory_schemas = self._parse_directory_macros(ancestor.template.directories, ancestor.validation)
+            self._warn_shadowed_variables(ancestor.template, ancestor.validation)
+            if not ancestor.validation.is_usable():
+                continue
 
-        # Parsed into the ancestor's own merge validation, which the caller has already
-        # gated on, so problems found here cannot change the child's load outcome. An
-        # ancestor whose macros do not parse is not a usable project and is not cached.
-        situation_schemas = self._parse_situation_macros(template.situations, validation)
-        directory_schemas = self._parse_directory_macros(template.directories, validation)
-        if not validation.is_usable():
-            return
+            self._successfully_loaded_project_templates[ancestor.project_id] = ProjectInfo(
+                project_id=ancestor.project_id,
+                project_file_path=ancestor.project_file_path,
+                project_base_dir=ancestor.project_file_path.parent,
+                template=ancestor.template,
+                validation=ancestor.validation,
+                parsed_situation_schemas=situation_schemas,
+                parsed_directory_schemas=directory_schemas,
+            )
+            self._install_project_variables(ancestor.project_id, ancestor.template)
 
-        self._successfully_loaded_project_templates[project_id] = ProjectInfo(
-            project_id=project_id,
-            project_file_path=project_file_path,
-            project_base_dir=project_file_path.parent,
-            template=template,
-            validation=validation,
-            parsed_situation_schemas=situation_schemas,
-            parsed_directory_schemas=directory_schemas,
-        )
-        self._install_project_variables(project_id, template)
+    def _warn_shadowed_variables(self, template: ProjectTemplate, validation: ProjectValidationInfo) -> None:
+        """Warn for each declared variable that a computed name shadows.
+
+        A declared variable that collides with a computed name (builtin or directory) is legal
+        but shadowed: computed wins within the PROJECT tier, so the stored value is unreachable
+        until the collision is removed. Warn, don't fail.
+        """
+        computed_names = BUILTIN_VARIABLES | set(template.directories.keys())
+        for var_name in template.variables:
+            if var_name in computed_names:
+                validation.add_warning(
+                    field_path=f"variables.{var_name}",
+                    message=(
+                        f"Variable '{var_name}' collides with a builtin or directory name. "
+                        f"The builtin/directory value wins; this variable will never resolve."
+                    ),
+                )
 
     def get_loaded_project_dir(self, project_id: str) -> Path | None:
         """Return the directory of a loaded, file-backed project, or None.
@@ -3753,8 +3791,14 @@ class ProjectManager(EngineScoped):
         upgraded_overlay = overlay._replace(project_template_schema_version=latest_version)
 
         validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        # The resolved ancestors are discarded: this walk only computes a merge base for the
+        # re-stamped overlay, and the load that registered this project already registered them.
         base_template = await self._resolve_parent_chain(
-            upgraded_overlay, project_file_path, validation, visited={canonicalize_for_identity(project_file_path)}
+            upgraded_overlay,
+            project_file_path,
+            validation,
+            visited={canonicalize_for_identity(project_file_path)},
+            resolved_ancestors=[],
         )
         if base_template is None or not validation.is_usable():
             return UpgradeProjectSchemaResultFailure(
