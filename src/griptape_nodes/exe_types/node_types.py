@@ -2143,6 +2143,23 @@ class BaseNode(ABC):
         return element_names.index(element_name)
 
 
+def _values_differ(old_value: Any, new_value: Any) -> bool:
+    """Whether a parameter's value changed, for values that may not support `!=` as a bool.
+
+    A node can hold an array-like whose `__ne__` returns another array rather than a bool, so
+    `old != new` raises instead of answering ("The truth value of an array with more than one
+    element is ambiguous"). Identity is checked first because it answers the common re-assignment
+    without touching `__ne__` at all, and an uncomparable pair is reported as changed: emitting an
+    event the editor ignores costs a message, while swallowing one leaves it showing a stale value.
+    """
+    if old_value is new_value:
+        return False
+    try:
+        return bool(old_value != new_value)
+    except (ValueError, TypeError):
+        return True
+
+
 class TrackedParameterOutputValues(dict[str, Any]):
     """A dictionary that tracks modifications and emits AlterElementEvent when parameter output values change."""
 
@@ -2168,7 +2185,7 @@ class TrackedParameterOutputValues(dict[str, Any]):
         # None -- self.get(key) returns None for both, so without the had_key
         # check an unset -> None transition would be silently dropped and the UI
         # would keep showing the stale prior value.
-        if not had_key or old_value != value:
+        if not had_key or _values_differ(old_value, value):
             self._emit_parameter_change_event(key, value)
 
     def __delitem__(self, key: str) -> None:
