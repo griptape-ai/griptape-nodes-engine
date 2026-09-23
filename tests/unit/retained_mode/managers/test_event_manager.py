@@ -66,6 +66,59 @@ class TestEventManagerBroadcasting:
         listener2.assert_called_once_with(event)
 
     @pytest.mark.asyncio
+    async def test_a_peer_event_does_not_reach_a_local_listener(self) -> None:
+        """The isolation the peer split exists for.
+
+        A local listener reads the payload as describing this process, so a peer's copy reaching
+        one is how the orchestrator came to set `_is_worker` from a worker's boot event. Merging
+        the two listener sets back together would otherwise pass CI.
+        """
+        event_manager = EventManager()
+        local_listener = AsyncMock()
+        event_manager.add_listener_to_app_event(ConfigChanged, local_listener)
+
+        await event_manager.abroadcast_peer_app_event(ConfigChanged(key="k", old_value="a", new_value="b"))
+
+        local_listener.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_local_event_does_not_reach_a_peer_listener(self) -> None:
+        event_manager = EventManager()
+        peer_listener = AsyncMock()
+        event_manager.add_listener_to_peer_app_event(ConfigChanged, peer_listener)
+
+        await event_manager.abroadcast_app_event(ConfigChanged(key="k", old_value="a", new_value="b"))
+
+        peer_listener.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_callback_on_both_sets_is_called_once_per_origin(self) -> None:
+        """How a listener that handles either origin is registered, which one listener needs."""
+        event_manager = EventManager()
+        listener = AsyncMock()
+        event_manager.add_listener_to_app_event(ConfigChanged, listener)
+        event_manager.add_listener_to_peer_app_event(ConfigChanged, listener)
+
+        local = ConfigChanged(key="local", old_value="a", new_value="b")
+        peer = ConfigChanged(key="peer", old_value="a", new_value="b")
+        await event_manager.abroadcast_app_event(local)
+        await event_manager.abroadcast_peer_app_event(peer)
+
+        assert listener.await_count == 2
+        assert [call.args[0] for call in listener.await_args_list] == [local, peer]
+
+    @pytest.mark.asyncio
+    async def test_a_peer_event_reaches_its_peer_listener(self) -> None:
+        event_manager = EventManager()
+        peer_listener = AsyncMock()
+        event_manager.add_listener_to_peer_app_event(ConfigChanged, peer_listener)
+
+        event = ConfigChanged(key="k", old_value="a", new_value="b")
+        await event_manager.abroadcast_peer_app_event(event)
+
+        peer_listener.assert_called_once_with(event)
+
+    @pytest.mark.asyncio
     async def test_abroadcast_app_event_with_no_listeners(self) -> None:
         """Test that abroadcast_app_event handles events with no listeners gracefully."""
         event_manager = EventManager()
