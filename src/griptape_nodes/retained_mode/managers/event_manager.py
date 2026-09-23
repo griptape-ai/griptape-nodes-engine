@@ -1459,7 +1459,7 @@ class EventManager(EngineScoped):
                 for listener_callback in listener_set:
                     tg.create_task(self._call_app_event_listener(listener_callback, app_event))
 
-    async def abroadcast_peer_app_event(self, app_event: AP) -> None:
+    async def abroadcast_adopted_app_event(self, app_event: AP) -> None:
         """Broadcast an app event another process raised, if its type opts into being adopted.
 
         Dropped otherwise: a listener registered for the type configures this process, and the

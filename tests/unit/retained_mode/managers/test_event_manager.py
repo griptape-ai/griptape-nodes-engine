@@ -81,7 +81,7 @@ class TestEventManagerBroadcasting:
         listener = AsyncMock()
         event_manager.add_listener_to_app_event(AppInitializationComplete, listener)
 
-        await event_manager.abroadcast_peer_app_event(AppInitializationComplete(is_worker=True))
+        await event_manager.abroadcast_adopted_app_event(AppInitializationComplete(is_worker=True))
 
         listener.assert_not_called()
 
@@ -92,7 +92,7 @@ class TestEventManagerBroadcasting:
         event_manager.add_listener_to_app_event(LibraryLoadedNotification, listener)
 
         event = LibraryLoadedNotification(library_name="lib", fitness="usable")
-        await event_manager.abroadcast_peer_app_event(event)
+        await event_manager.abroadcast_adopted_app_event(event)
 
         listener.assert_called_once_with(event)
 
