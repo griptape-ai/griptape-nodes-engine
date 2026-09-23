@@ -10,6 +10,8 @@ from griptape_nodes.common.macro_parser.exceptions import MacroResolutionError, 
 from griptape_nodes.common.macro_parser.segments import ParsedVariable
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from griptape_nodes.retained_mode.engine import Engine
 
 logger = logging.getLogger("griptape_nodes")
@@ -38,15 +40,36 @@ class VariableResolver:
     _MACRO_TOKEN: ClassVar[re.Pattern[str]] = re.compile(r"\{([^{}]*)\}")
 
     @staticmethod
+    def _contains_string(value: Any, matches: Callable[[str], bool], _active: set[int] | None = None) -> bool:
+        """Whether `value` is, or contains, a string that `matches` accepts.
+
+        Shared by the predicates below so the cycle guard cannot be added to one walk and forgotten
+        in the other. A value can reach itself, and a repeat visit answers False rather than
+        recursing: a container cannot contain a macro by way of containing itself.
+        """
+        if isinstance(value, str):
+            return matches(value)
+        if not isinstance(value, (dict, list)):
+            return False
+
+        if _active is None:
+            _active = set()
+        if id(value) in _active:
+            return False
+
+        _active.add(id(value))
+        try:
+            items = value.values() if isinstance(value, dict) else value
+            return any(VariableResolver._contains_string(item, matches, _active) for item in items)
+        finally:
+            _active.discard(id(value))
+
+    @staticmethod
     def contains_variable_macro(value: Any) -> bool:
         """Return True if value is, or recursively contains, a str with a variable macro reference."""
-        if isinstance(value, str):
-            return bool(VariableResolver._HAS_VARIABLE_MACRO.search(value))
-        if isinstance(value, dict):
-            return any(VariableResolver.contains_variable_macro(v) for v in value.values())
-        if isinstance(value, list):
-            return any(VariableResolver.contains_variable_macro(item) for item in value)
-        return False
+        return VariableResolver._contains_string(
+            value, lambda text: bool(VariableResolver._HAS_VARIABLE_MACRO.search(text))
+        )
 
     @staticmethod
     def resolve_macro_token(token: str, variables: dict[str, str | int], node_name: str | None = None) -> str:
@@ -275,16 +298,13 @@ class VariableResolver:
         ``{VAR?}`` counts as a rewrite whether or not the variable exists, because
         the resolver substitutes "" for it either way.
         """
-        if isinstance(value, str):
+        def rewrites(text: str) -> bool:
             return any(
                 VariableResolver.resolve_macro_token(match.group(0), variables) != match.group(0)
-                for match in VariableResolver._MACRO_TOKEN.finditer(value)
+                for match in VariableResolver._MACRO_TOKEN.finditer(text)
             )
-        if isinstance(value, dict):
-            return any(VariableResolver.would_substitute(v, variables) for v in value.values())
-        if isinstance(value, list):
-            return any(VariableResolver.would_substitute(item, variables) for item in value)
-        return False
+
+        return VariableResolver._contains_string(value, rewrites)
 
     @staticmethod
     def get_variables_without_memoizing(engine: Engine, node_name: str) -> dict[str, str | int] | None:

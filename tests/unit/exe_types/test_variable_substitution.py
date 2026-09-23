@@ -1107,3 +1107,42 @@ class TestResolveValueIdentity:
         assert resolved[0] == "replaced"
         # The cycle is handed back as the original container rather than walked again.
         assert resolved[1] is value
+
+
+class TestPredicateWalksSurviveCycles:
+    """The predicates walk the same shapes `resolve_value` does, so they need the same guard.
+
+    A self-referential value used to die at the output write, so these walks were never reached
+    with one. Now that the write survives it, the value can reach them.
+    """
+
+    def test_contains_variable_macro_terminates_on_a_self_referential_list(self) -> None:
+        value: list = ["plain"]
+        value.append(value)
+
+        assert VariableResolver.contains_variable_macro(value) is False
+
+    def test_contains_variable_macro_still_finds_a_macro_past_a_cycle(self) -> None:
+        value: list = ["{VAR}"]
+        value.append(value)
+
+        assert VariableResolver.contains_variable_macro(value) is True
+
+    def test_contains_variable_macro_terminates_on_a_mutually_referential_pair(self) -> None:
+        left: dict = {}
+        right: dict = {"left": left}
+        left["right"] = right
+
+        assert VariableResolver.contains_variable_macro(left) is False
+
+    def test_would_substitute_terminates_on_a_self_referential_list(self) -> None:
+        value: list = ["plain"]
+        value.append(value)
+
+        assert VariableResolver.would_substitute(value, {"VAR": "x"}) is False
+
+    def test_would_substitute_still_finds_a_rewrite_past_a_cycle(self) -> None:
+        value: list = ["{VAR}"]
+        value.append(value)
+
+        assert VariableResolver.would_substitute(value, {"VAR": "x"}) is True
