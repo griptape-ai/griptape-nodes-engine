@@ -26,6 +26,8 @@ the engine's request API from working without edits. Migration steps live in
 
 ### Fixed
 
+- Connecting a video, image, or audio file uploaded through the editor to a node that requires that
+  media type no longer fails with a message saying the parameter must be an artifact.
 - Model dropdowns no longer mark every model "Not permitted by your license" when two installed
   libraries provide a node with the same name.
   [#5618](https://github.com/griptape-ai/griptape-nodes-engine/issues/5618)
