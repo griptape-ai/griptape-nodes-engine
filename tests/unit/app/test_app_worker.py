@@ -1774,7 +1774,7 @@ class TestWorkerManagerDomainEventListeners:
         gtn.config_manager.get_config_value.side_effect = lambda _key, default, cast_type=float: cast_type(default)
         wm = WorkerManager(engine=gtn, event_manager=EventManager())
         wm.attach_transport(
-                send_message=AsyncMock(),
+            send_message=AsyncMock(),
             subscribe_to_topic=AsyncMock(),
             unsubscribe_from_topic=AsyncMock(),
             request_client=_FakeRequestClient(),  # type: ignore[arg-type]
@@ -1982,7 +1982,7 @@ class TestHeartbeatIntervalFloor:
         with caplog.at_level(logging.WARNING):
             manager = self._manager_with_interval(2.5)
 
-        assert manager.heartbeat_interval_s == 2.5
+        assert manager.heartbeat_interval_s == 2.5  # noqa: PLR2004
         assert "cannot be used" not in caplog.text
 
 
@@ -2034,17 +2034,17 @@ class TestChallengeAllowanceRounding:
         monkeypatch.setattr(worker_manager, "heartbeat_interval_s", 5.0)
 
         # Nearest would give 2, evicting after ~10s against a 12s timeout.
-        assert worker_manager.unanswered_challenges_allowed == 3
+        assert worker_manager.unanswered_challenges_allowed == 3  # noqa: PLR2004
 
     def test_a_half_ratio_rounds_up(self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch) -> None:
         """Banker's rounding makes `round(2.5)` 2, which is below the configured tolerance."""
         monkeypatch.setattr(worker_manager, "heartbeat_timeout_s", 12.5)
         monkeypatch.setattr(worker_manager, "heartbeat_interval_s", 5.0)
 
-        assert worker_manager.unanswered_challenges_allowed == 3
+        assert worker_manager.unanswered_challenges_allowed == 3  # noqa: PLR2004
 
     def test_an_exact_ratio_is_unchanged(self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(worker_manager, "heartbeat_timeout_s", 15.0)
         monkeypatch.setattr(worker_manager, "heartbeat_interval_s", 5.0)
 
-        assert worker_manager.unanswered_challenges_allowed == 3
+        assert worker_manager.unanswered_challenges_allowed == 3  # noqa: PLR2004
