@@ -4,11 +4,12 @@ Beta features are new features that aren't ready to be on for everyone yet.
 You can turn them on to try them early, and turn them off again at any time.
 They're managed from the **Beta Features** page in the editor's settings.
 
-<!-- screenshot: the Beta Features settings page with Editor, Engine, and library groups and a few toggles -->
+![Beta Features](images/beta_features.png)
 
 ## Turning a beta feature on or off
 
-Open **Settings → Beta Features**. Each feature is listed with a short
+Open the **Settings** menu in the editor's header, choose **All Settings**,
+and click **Beta Features** at the bottom of the list on the left. Each feature is listed with a short
 description of what it changes and where, and a toggle to turn it on or
 off. Your choice is saved with the rest of your settings, so it stays
 the same the next time you open the editor.
@@ -56,7 +57,7 @@ Your choices are saved in the `beta_features` section of your
 ```json
 {
     "beta_features": {
-        "parallel_branch_resolution": true
+        "canvas_toolbar_placement_button": true
     }
 }
 ```
