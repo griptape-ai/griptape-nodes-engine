@@ -73,27 +73,25 @@ def _resolve_file_path(file_path: str) -> Path | None:  # noqa: PLR0911
     return None
 
 
-def _upload_file_to_static_storage(file_path: Path, artifact_type: type[Any]) -> Any | None:
-    """Upload a file to static storage and return an artifact.
+def _wrap_file_in_place(file_path: Path, artifact_type: type[Any]) -> Any | None:
+    """Wrap a file in an artifact that serves it from where it is.
 
     Args:
-        file_path: Path to the file to upload
+        file_path: Path to the file to wrap
         artifact_type: The artifact class to create (ImageUrlArtifact, VideoUrlArtifact, AudioUrlArtifact)
 
     Returns:
-        Artifact object with localhost URL, or None if upload fails
+        Artifact object with a static server URL for the file, or None if the file can't be served
     """
     if not file_path.exists() or not file_path.is_file():
         return None
 
     try:
-        file_data = file_path.read_bytes()
-        file_name = file_path.name
-        static_files_manager = current_engine().static_files_manager
-        url = static_files_manager.save_static_file(file_data, file_name)
+        storage_driver = current_engine().static_files_manager.storage_driver
+        url = storage_driver.create_signed_download_url(file_path)
         return artifact_type(url)
     except Exception as e:
-        logger.debug("Failed to upload file '%s' to static storage: %s", file_path, e)
+        logger.debug("Failed to create a static server URL for file '%s': %s", file_path, e)
         return None
 
 
@@ -111,10 +109,10 @@ def _normalize_string_input(artifact_input: str, artifact_type: type[Any]) -> An
     if artifact_input.startswith(("http://", "https://")):
         return artifact_type(artifact_input)
 
-    # Try to resolve and upload file path
+    # The static server serves workspace files and external absolute paths directly, so no copy is needed
     file_path = _resolve_file_path(artifact_input)
     if file_path:
-        artifact = _upload_file_to_static_storage(file_path, artifact_type)
+        artifact = _wrap_file_in_place(file_path, artifact_type)
         if artifact:
             return artifact
 
@@ -130,7 +128,7 @@ def normalize_artifact_input(
     """Normalize an artifact input, converting string paths to the specified artifact type.
 
     This ensures consistency whether values come from user input or node connections.
-    String paths are uploaded to static storage and converted to artifact objects.
+    String paths are converted to artifact objects that point at the file where it is.
     Objects that are already the correct artifact type are returned unchanged.
 
     Args:
@@ -166,7 +164,7 @@ def normalize_artifact_list(
     """Normalize a list of artifact inputs, converting string paths to the specified artifact type.
 
     This ensures consistency whether values come from user input or node connections.
-    String paths are uploaded to static storage and converted to artifact objects.
+    String paths are converted to artifact objects that point at the file where it is.
     Objects that are already the correct artifact type are passed through unchanged.
 
     Args:
