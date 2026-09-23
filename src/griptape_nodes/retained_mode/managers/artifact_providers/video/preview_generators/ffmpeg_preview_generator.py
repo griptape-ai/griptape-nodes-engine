@@ -19,6 +19,7 @@ from griptape_nodes.retained_mode.managers.artifact_providers.base_generator_par
     Field,
 )
 from griptape_nodes.utils.async_utils import subprocess_run, to_thread
+from griptape_nodes.utils.file_utils import promote_scratch_file_async
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
@@ -237,21 +238,9 @@ class FFmpegPreviewGenerator(BaseArtifactPreviewGenerator):
                 msg = f"Attempted to generate a preview at {destination_path}. Failed because ffmpeg produced no output file."
                 raise OSError(msg)
 
-            # Same directory keeps the rename on one filesystem, so it is atomic: a reader sees
-            # either the previous preview or this finished one. On Windows the rename can be
-            # transiently denied — by a competing generation promoting its own scratch file onto
-            # the same destination (clears in microseconds), or by a reader serving the old file.
-            # Retry briefly so the promote race resolves itself; a persistent denial (long-lived
-            # reader) still raises, and must not orphan the scratch file.
-            replace_attempts = 3
-            for attempt in range(1, replace_attempts + 1):
-                try:
-                    await anyio.Path(temp_path).replace(destination_path)
-                    break
-                except PermissionError:
-                    if attempt == replace_attempts:
-                        raise
-                    await anyio.sleep(0.05)
+            # Same-directory rename: atomic, and rides out Windows' transient
+            # denials. A persistent denial raises and must not orphan the scratch.
+            await promote_scratch_file_async(temp_path, destination_path)
         finally:
             await self._discard_partial_preview(temp_path)
 

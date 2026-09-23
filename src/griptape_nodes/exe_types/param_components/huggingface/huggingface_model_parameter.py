@@ -5,8 +5,6 @@ from abc import ABC, abstractmethod
 from griptape_nodes.exe_types.core_types import NodeMessageResult, Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.exe_types.param_components.model_policy import (
-    DENIED_ROW_ICON,
-    DENIED_ROW_SUBTITLE,
     ModelPolicySnapshot,
     apply_denial_badge,
     query_model_policy,
@@ -393,9 +391,7 @@ class HuggingFaceModelParameter(ABC):
         ambiguous across two libraries, or mid-reload), and treating that as "allow everything"
         would let an admin's deny be bypassed by a lookup error.
         """
-        self._policy = query_model_policy(
-            self._node.engine, type(self._node).__name__, fail_closed=self._gate_mode is not False
-        )
+        self._policy = query_model_policy(self._node, fail_closed=self._gate_mode is not False)
 
     def _apply_denial_badge(self, parameter: Parameter, value: str | None = None) -> None:
         """Set or clear the parameter's badge for the current selection.
@@ -407,7 +403,7 @@ class HuggingFaceModelParameter(ABC):
         """
         if value is None:
             value = str(self._node.get_parameter_value(self._parameter_name) or "")
-        apply_denial_badge(parameter, value, self.query_for_denial(value))
+        apply_denial_badge(parameter, value, self.query_for_denial(value), decoration=self._policy.decoration)
 
     def _refresh_downloading_model_ids(self) -> None:
         # Only called from refresh_parameters() — never from inside a button
@@ -435,6 +431,8 @@ class HuggingFaceModelParameter(ABC):
         not_downloaded = set(self.get_not_downloaded_choices())
         downloading = self._downloading_model_ids
 
+        decoration = self._policy.decoration
+
         data = []
         for choice in choices:
             repo_id, _ = self._key_to_repo_revision(choice)
@@ -444,7 +442,7 @@ class HuggingFaceModelParameter(ABC):
             # `dropdown_row_icons`, and `dropdown_row_subtitles` have exactly one owner, so a
             # refresh cannot silently erase the other's rows.
             if self._gated and self.query_for_denial(choice) is not None:
-                data.append({"name": choice, "icon": DENIED_ROW_ICON, "subtitle": DENIED_ROW_SUBTITLE})
+                data.append({"name": choice, "icon": decoration.icon, "subtitle": decoration.row_subtitle})
             # Downloading check must come before downloaded: HuggingFace creates
             # cache entries as soon as a download starts, so a partially-downloaded
             # model appears in fetch_repo_revisions() and would otherwise show
