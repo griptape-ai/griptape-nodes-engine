@@ -240,6 +240,59 @@ This will start a local webserver (usually at `http://127.0.0.1:8000/`). The sit
 - We use **Pyright** for static type checking. Run `make check` to ensure there are no type errors.
 - Run tests using `make test/unit` or `uv run pytest`.
 
+## Gating Work Behind a Beta Feature
+
+If you're building something user-visible or behavior-changing that isn't ready to be on for everyone, you can put it behind a beta feature. Users turn beta features on and off from the Beta page in the editor's Settings. Every feature you register in the engine appears there automatically, with no editor change needed.
+
+Beta features are for engine and editor work only. Node libraries can't define their own. To gate unfinished work in a library, use a library setting or ship it in a separate version.
+
+1. **Register the feature** in `src/griptape_nodes/retained_mode/beta_features.py`. All engine features live in that one module. The `name` and `description` are shown to users on the Beta page, so describe what changes and where, in plain terms:
+
+    ```python
+    PARALLEL_BRANCH_RESOLUTION = register_beta_feature(
+        BetaFeature(
+            id="parallel_branch_resolution",
+            name="Parallel branch resolution",
+            description="Runs independent branches of a flow at the same time instead of one after another.",
+            owner="@your-github-handle",
+            remove_by=date(2027, 1, 31),
+        )
+    )
+    ```
+
+1. **Check it** at the point where the old and new behavior split:
+
+    ```python
+    if is_beta_enabled(PARALLEL_BRANCH_RESOLUTION, self.engine.config_manager):
+        ...
+    ```
+
+1. **Turn it on locally** by adding it to the `beta_features` section of your `griptape_nodes_config.json`:
+
+    ```json
+    {
+      "beta_features": {
+        "parallel_branch_resolution": true
+      }
+    }
+    ```
+
+    You can also set it for a single run with an environment variable:
+
+    ```shell
+    GTN_CONFIG_BETA_FEATURES__PARALLEL_BRANCH_RESOLUTION=true make run
+    ```
+
+**Rules:**
+
+- A beta feature must never change saved data or the protocol. Workflows have to open the same way whether the feature is on or off.
+- Every feature needs a `remove_by` date, at most 180 days out. By that date, make the feature standard or delete it.
+- Ids are lowercase snake_case and must be unique across the engine and the editor, so check the editor's features before picking one.
+
+**When `tests/unit/retained_mode/test_beta_features.py` fails:** once a feature passes its `remove_by` date, this test fails on every PR, including ones that don't touch the feature. The failure names the feature and its owner. To fix it, make the feature standard, delete it, or extend `remove_by` (still at most 180 days out) and explain why in the PR.
+
+**Removing a feature:** delete its registration and every `is_beta_enabled` check. If the feature is becoming standard, keep the new code path. Users' leftover `beta_features` entries do nothing and don't need cleaning up.
+
 ## Submitting Changes
 
 1. Create a new branch for your feature or bug fix: `git checkout -b my-feature-branch`.

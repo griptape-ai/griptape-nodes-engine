@@ -10,6 +10,7 @@ from xdg_base_dirs import xdg_config_home
 
 from griptape_nodes.files.path_utils import resolve_workspace_path
 from griptape_nodes.node_library.library_registry import LibraryRegistry
+from griptape_nodes.retained_mode.beta_features import list_beta_features
 from griptape_nodes.retained_mode.engine import Engine, EngineScoped
 from griptape_nodes.retained_mode.events.app_events import ConfigChanged
 from griptape_nodes.retained_mode.events.artifact_events import (
@@ -37,6 +38,8 @@ from griptape_nodes.retained_mode.events.config_events import (
     GetConfigValueResultSuccess,
     GetWorkspaceRequest,
     GetWorkspaceResultSuccess,
+    ListBetaFeaturesRequest,
+    ListBetaFeaturesResultSuccess,
     ResetConfigRequest,
     ResetConfigResultFailure,
     ResetConfigResultSuccess,
@@ -59,6 +62,7 @@ from griptape_nodes.retained_mode.events.os_events import (
 )
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.settings import (
+    BETA_FEATURES_FROM_ENV_CONTEXT,
     DEFAULT_LIBRARIES_DIRECTORY,
     DISCOVERY_MAX_DEPTH_KEY,
     LIBRARIES_DIRECTORY_KEY,
@@ -347,6 +351,9 @@ class ConfigManager(EngineScoped):
                 GetConfigSchemaRequest, self.on_handle_get_config_schema_request
             )
             event_manager.assign_manager_to_request_type(ResetConfigRequest, self.on_handle_reset_config_request)
+            event_manager.assign_manager_to_request_type(
+                ListBetaFeaturesRequest, self.on_handle_list_beta_features_request
+            )
 
     @property
     def workspace_path(self) -> Path:
@@ -964,7 +971,7 @@ class ConfigManager(EngineScoped):
         candidate = set_dot_value({}, config_key, raw_value)
 
         try:
-            validated = Settings.model_validate(candidate)
+            validated = Settings.model_validate(candidate, context={BETA_FEATURES_FROM_ENV_CONTEXT: True})
         except ValidationError:
             return _REJECTED_BAD_VALUE
 
@@ -1524,6 +1531,11 @@ class ConfigManager(EngineScoped):
     def on_handle_get_workspace_request(self, request: GetWorkspaceRequest) -> ResultPayload:  # noqa: ARG002
         result_details = "Successfully returned the absolute workspace path."
         return GetWorkspaceResultSuccess(workspace_path=str(self.workspace_path), result_details=result_details)
+
+    def on_handle_list_beta_features_request(self, request: ListBetaFeaturesRequest) -> ResultPayload:  # noqa: ARG002
+        features = [feature.model_dump(mode="json") for feature in list_beta_features()]
+        result_details = f"Successfully listed {len(features)} beta feature(s)."
+        return ListBetaFeaturesResultSuccess(features=features, result_details=result_details)
 
     def on_handle_get_config_schema_request(self, request: GetConfigSchemaRequest) -> ResultPayload:  # noqa: ARG002
         """Handle request to get the configuration schema with current values and library settings.

@@ -120,8 +120,8 @@ on:
 
 Everything configurable, grouped under a **Settings** submenu (All
 Settings, Agent Settings, Editor Settings, Theme Settings, Engine
-Settings, File System, Libraries, Library Settings, MCP Servers, and
-API Keys & Secrets), plus three actions below it: **Copy Path to
+Settings, File System, Libraries, Library Settings, MCP Servers,
+API Keys & Secrets, and [Beta Features](beta_features.md)), plus three actions below it: **Copy Path to
 Settings** (copies the settings file's path to your clipboard),
 **Show Settings Folder** (opens it in Finder/Explorer/your file
 manager), and **Reset Settings to Default**.

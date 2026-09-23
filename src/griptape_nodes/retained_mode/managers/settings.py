@@ -1,8 +1,9 @@
+import logging
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError, ValidationInfo, field_validator
 from pydantic import Field as PydanticField
 
 from griptape_nodes.common.project_templates import PerPlatformProjectPath
@@ -29,6 +30,36 @@ DEFAULT_LIBRARIES_DIRECTORY = "libraries"
 LIBRARY_DEPENDENCY_INSTALL_BEHAVIOR_KEY = "library.dependency_install_behavior"
 LIBRARY_MINIMUM_RELEASE_AGE_KEY = "library.minimum_release_age"
 LIBRARY_LAZY_NODE_LOADING_KEY = "library.lazy_node_loading"
+BETA_FEATURES_KEY = "beta_features"
+# Validation context flag ConfigManager sets when checking a single GTN_CONFIG_ variable. Env vars
+# are always strings, so under this flag `beta_features` entries are converted to booleans, and one
+# that can't be converted fails validation so the variable is reported as a bad value.
+BETA_FEATURES_FROM_ENV_CONTEXT = "beta_features_from_env"
+
+logger = logging.getLogger("griptape_nodes")
+
+_BOOL_ADAPTER = TypeAdapter(bool)
+# (feature id, repr of value) pairs already warned about. Settings is validated on every config
+# reload, so without this one bad entry would log the same warning many times per session.
+_reported_invalid_beta_features: set[tuple[str, str]] = set()
+
+
+def _env_value_to_bool(feature_id: str, value: Any) -> bool:
+    """Convert a GTN_CONFIG_BETA_FEATURES__<ID> string to a boolean, raising when it isn't one."""
+    try:
+        return _BOOL_ADAPTER.validate_python(value)
+    except ValidationError as e:
+        msg = f"beta_features.{feature_id} must be true or false, got {value!r}"
+        raise ValueError(msg) from e
+
+
+def _warn_once(report_key: tuple[str, str], message: str) -> None:
+    """Log a beta_features warning the first time this (feature id, value) pair is seen."""
+    if report_key in _reported_invalid_beta_features:
+        return
+
+    _reported_invalid_beta_features.add(report_key)
+    logger.warning(message)
 
 
 class Category(BaseModel):
@@ -54,6 +85,7 @@ STATIC_SERVER = Category(name="Static Server", description="Static file server c
 ARTIFACTS = Category(name="Artifacts", description="Settings for artifact providers and preview generation")
 AGENT = Category(name="Agent", description="Agent behavior and system prompt")
 LIBRARIES = Category(name="Libraries", description="Settings for library management and dependency installation")
+BETA_FEATURES = Category(name="Beta Features", description="Experimental features that can be turned on or off")
 
 
 def Field(category: str | Category = "General", **kwargs) -> Any:
@@ -523,3 +555,49 @@ class Settings(BaseModel):
         category=LIBRARIES,
         default_factory=LibrarySettings,
     )
+    beta_features: dict[str, bool] = Field(
+        category=BETA_FEATURES,
+        default_factory=dict,
+        description="Experimental features turned on or off, keyed by feature id. The editor's Beta settings page writes these. A feature missing from this map uses its default. Any key is accepted, so editor-only features never need an engine release.",
+    )
+
+    @field_validator("beta_features", mode="before")
+    @classmethod
+    def validate_beta_features(cls, v: Any, info: ValidationInfo) -> dict[str, bool]:
+        """Drop entries that aren't true or false instead of failing the whole config.
+
+        The map is free-form and hand-editable, so the engine cannot vouch for its contents.
+        Without this, one entry such as `"maybe"` fails Settings validation and `load_configs`
+        resets the user's entire config to defaults.
+
+        Only a real boolean counts, which is the same rule `is_beta_enabled` and the editor apply.
+        A string like `"true"` in a config file is dropped with a warning rather than converted,
+        because the merged config keeps raw values and readers would treat it as unset anyway.
+
+        A `GTN_CONFIG_BETA_FEATURES__<ID>` variable is the exception. It is validated under
+        `BETA_FEATURES_FROM_ENV_CONTEXT`, which converts its string to a boolean and raises when
+        it can't, so the env loader reports the variable as having an invalid value.
+        """
+        from_env = bool(info.context and info.context.get(BETA_FEATURES_FROM_ENV_CONTEXT))
+        if not isinstance(v, dict):
+            _warn_once(
+                ("", repr(v)),
+                f"Ignoring beta_features: expected a map of feature ids to true or false, got {v!r}. "
+                "Every beta feature uses its default.",
+            )
+            return {}
+
+        if from_env:
+            return {feature_id: _env_value_to_bool(feature_id, value) for feature_id, value in v.items()}
+
+        valid: dict[str, bool] = {}
+        for feature_id, value in v.items():
+            if not isinstance(value, bool):
+                _warn_once(
+                    (feature_id, repr(value)),
+                    f"Ignoring beta_features.{feature_id}: expected true or false, got {value!r}. "
+                    "The feature uses its default.",
+                )
+                continue
+            valid[feature_id] = value
+        return valid

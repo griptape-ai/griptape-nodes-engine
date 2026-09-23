@@ -163,6 +163,71 @@ class TestConfigManager:
 
             assert manager.merged_config["log_level"] == "ERROR"
 
+    def test_beta_feature_env_var_is_read_as_bool(self) -> None:
+        """GTN_CONFIG_BETA_FEATURES__<ID> lands as a real bool, not the truthy string "false"."""
+        with patch.dict(
+            os.environ,
+            {"GTN_CONFIG_BETA_FEATURES__FOO": "true", "GTN_CONFIG_BETA_FEATURES__BAR": "false"},
+            clear=True,
+        ):
+            manager = ConfigManager()
+            manager.load_configs()
+
+            assert manager.get_config_value("beta_features.foo") is True
+            assert manager.get_config_value("beta_features.bar") is False
+
+    def test_invalid_beta_feature_env_var_reported_as_bad_value(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A non-boolean beta feature variable is ignored and named as an invalid value, not an unknown setting."""
+        with patch.dict(os.environ, {"GTN_CONFIG_BETA_FEATURES__FOO": "maybe"}, clear=True):
+            with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+                manager = ConfigManager()
+                env_config = manager._load_config_from_env_vars()
+
+            assert env_config == {}
+            messages = [record.message for record in caplog.records]
+            assert any("is not a valid value for the 'beta_features.foo' setting" in m for m in messages)
+            assert not any("there is no 'beta_features.foo' setting" in m for m in messages)
+
+    def test_invalid_beta_feature_entry_does_not_reset_the_rest_of_the_config(
+        self, isolate_user_config: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """One bad `beta_features` entry in a config file must not wipe the user's other settings.
+
+        `load_configs` falls back to defaults for the whole config when validation fails, and the
+        map is free-form and hand-editable, so the validator drops a bad entry instead of failing.
+        """
+        isolate_user_config.write_text(
+            json.dumps(
+                {
+                    "log_level": "ERROR",
+                    "beta_features": {"good": True, "bad": "maybe", "string_true": "true", "empty": None},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {}, clear=True):
+            with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+                manager = ConfigManager()
+                manager.load_configs()
+
+            assert manager.merged_config["log_level"] == "ERROR"
+            assert manager.get_config_value("beta_features.good") is True
+            messages = [record.message for record in caplog.records]
+            # A string "true" is warned about too: readers only honor real booleans.
+            for feature_id in ("bad", "string_true", "empty"):
+                assert any(f"beta_features.{feature_id}:" in m for m in messages)
+
+    def test_non_mapping_beta_features_does_not_reset_the_rest_of_the_config(self, isolate_user_config: Path) -> None:
+        """`beta_features` set to something other than a map is ignored, keeping the other settings."""
+        isolate_user_config.write_text(json.dumps({"log_level": "ERROR", "beta_features": "on"}), encoding="utf-8")
+
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.load_configs()
+
+            assert manager.merged_config["log_level"] == "ERROR"
+
     def test_load_config_from_env_vars_unknown_nested_key_rejected(self, caplog: pytest.LogCaptureFixture) -> None:
         """A sub-key a declared nested model doesn't recognize is rejected, not kept as a raw string.
 

@@ -414,3 +414,30 @@ class GetConfigSchemaResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess
 @PayloadRegistry.register
 class GetConfigSchemaResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Configuration schema retrieval failed. Common causes: schema generation error, model validation issues."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ListBetaFeaturesRequest(RequestPayload):
+    """List the beta features this engine defines.
+
+    Use when: Showing engine features on the editor's Beta settings page. Values are read and
+    written separately, through the `beta_features.<id>` config keys.
+
+    Results: ListBetaFeaturesResultSuccess (empty list when no features are registered)
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class ListBetaFeaturesResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Beta features listed successfully.
+
+    Args:
+        features: One object per registered feature, with keys `id`, `name`, `description`,
+            `default`, `owner`, `remove_by` (an ISO `YYYY-MM-DD` date string), and `config_key`
+            (the dot-notation key holding the user's value, read and written with the config
+            requests). The editor is built against these names, so keep them exact.
+    """
+
+    features: list[dict[str, Any]]

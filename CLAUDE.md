@@ -63,6 +63,38 @@ Instance methods come first because they can call anything. Class methods come n
 
 **Prefer the named helpers over composing primitives** - `sanitize_path_string`, `expand_path`, `resolve_path_safely`, and `normalize_path_for_platform` are building blocks. If you find yourself chaining them, use one of the two canonicalize helpers instead so behavior stays consistent across call sites.
 
+## Beta Features
+
+**When to use a beta flag** - Gate user-visible or behavior-changing work that isn't ready to be on by default. Users turn flags on and off from the editor's Beta settings page, which lists engine features automatically through `ListBetaFeaturesRequest`. Beta flags are for engine and editor features only. Node libraries cannot define their own, and nothing should register a feature from library code.
+
+**Register every flag in `retained_mode/beta_features.py`** - Keep all registrations in that one module so they are easy to audit. The `description` is shown to users on the Beta page, so write it for artists: what changes and where.
+
+```python
+PARALLEL_BRANCH_RESOLUTION = register_beta_feature(
+    BetaFeature(
+        id="parallel_branch_resolution",
+        name="Parallel branch resolution",
+        description="Runs independent branches of a flow at the same time instead of one after another.",
+        owner="@your-github-handle",
+        remove_by=date(2027, 1, 31),
+    )
+)
+```
+
+**Check it where behavior diverges** - Call `is_beta_enabled(FEATURE, self.engine.config_manager)` at the point where the old and new behavior split. Do not thread the result through call chains. It takes the config manager because engine-internal code must not use the `GriptapeNodes` facade.
+
+**Rules**:
+
+- A flag must never change saved data or the protocol. Workflows have to open the same way whether a flag is on or off.
+- Every flag needs a `remove_by` date at most 180 days out. By then, promote the feature to default or delete it.
+- Ids are lowercase snake_case and unique across the editor and the engine. The editor's own flags are registered in griptape-vsl-gui, so check there before picking an id.
+
+**When `test_beta_features.py` fails on `remove_by`** - The test fails on a fixed date, even on PRs that don't touch the flag. Fix it one of three ways: promote the feature to default, delete it, or extend `remove_by` (still at most 180 days out) and give the reason in the PR.
+
+**Removing a flag** - Delete the registration and every `is_beta_enabled` branch, keeping the promoted path when the feature becomes standard. Users' leftover `beta_features.<id>` config entries are harmless and need no migration.
+
+**Turning a flag on while developing** - Add it to the `beta_features` section of your config file, or set `GTN_CONFIG_BETA_FEATURES__<ID>=true` (id in uppercase). Only real `true`/`false` values count. Anything else is ignored with a warning and the feature uses its default.
+
 ## Documentation
 
 **Update docs with user-facing changes** - When a change affects what users see or do, update the documentation in the same PR. Common mappings:

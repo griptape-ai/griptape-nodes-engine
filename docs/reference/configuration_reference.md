@@ -106,3 +106,11 @@ Settings for library management and dependency installation
 | Setting   | Type   | Default         | Environment variable                                                                                                                  | Description                                                                                                                      |
 | --------- | ------ | --------------- | ------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
 | `library` | object | (nested object) | `GTN_CONFIG_LIBRARY__DEPENDENCY_INSTALL_BEHAVIOR`, `GTN_CONFIG_LIBRARY__LAZY_NODE_LOADING`, `GTN_CONFIG_LIBRARY__MINIMUM_RELEASE_AGE` | Nested settings; the listed sub-keys can be set from the environment, and every sub-key can be edited directly in a config file. |
+
+## Beta Features
+
+Experimental features that can be turned on or off
+
+| Setting         | Type   | Default | Environment variable              | Description                                                                                                                                                                                                                             |
+| --------------- | ------ | ------- | --------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `beta_features` | object | `{}`    | `GTN_CONFIG_BETA_FEATURES__<KEY>` | Experimental features turned on or off, keyed by feature id. The editor's Beta settings page writes these. A feature missing from this map uses its default. Any key is accepted, so editor-only features never need an engine release. |
