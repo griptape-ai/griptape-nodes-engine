@@ -4626,14 +4626,12 @@ class NodeManager(EngineScoped):
         )
 
     def _parameter_save_dict(self, parameter: Parameter) -> dict[str, Any]:
-        """Build the fields that recreate a parameter."""
         param_dict = parameter.save_dict()
         param_dict["initial_setup"] = True
         param_dict["traits"] = self._stabilize_trait_modules(param_dict["traits"])
         return param_dict
 
     def _stabilize_trait_modules(self, trait_states: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Replace process-local library module names with stable namespaces."""
         library_manager = self.engine.library_manager
         for entry in trait_states:
             trait_module = entry.get("trait_module")
@@ -4655,11 +4653,7 @@ class NodeManager(EngineScoped):
 
     @staticmethod
     def _apply_trait_states(parameter: Parameter, trait_states: list[dict[str, Any]]) -> None:
-        """Hand saved state to the trait the node built, or build one it did not.
-
-        Updating the attached instance rather than replacing it is what keeps a callback the
-        node's ``__init__`` supplied, along with everything else the constructor wired.
-        """
+        """Update attached traits in place to preserve constructor wiring such as callbacks."""
         entries = NodeManager._parse_trait_entries(parameter, trait_states)
         paired = NodeManager._pair_saved_traits(parameter, entries)
         for entry, existing in zip(entries, paired, strict=True):
@@ -4716,7 +4710,6 @@ class NodeManager(EngineScoped):
 
     @staticmethod
     def _build_saved_trait(parameter: Parameter, entry: TraitStateEntry) -> Trait | None:
-        """Construct a saved trait no attached instance accounts for."""
         if entry.trait_module is None:
             logger.warning(
                 "Parameter '%s' was saved with a '%s' control, but no module was recorded and the node did "

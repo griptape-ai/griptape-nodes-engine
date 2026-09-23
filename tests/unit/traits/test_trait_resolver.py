@@ -1,5 +1,3 @@
-"""resolve_trait finds a saved trait through its recorded module."""
-
 from __future__ import annotations
 
 import logging
@@ -50,7 +48,6 @@ _CollisionTraitB.__module__ = "tests.fake.collision_module_b"
 
 @pytest.fixture(autouse=True)
 def _fake_collision_modules() -> Generator[None]:
-    """Register the two fake modules the collision classes claim to live in."""
     module_a = ModuleType(_CollisionTraitA.__module__)
     setattr(module_a, "SharedTraitName", _CollisionTraitA)  # noqa: B010
     module_b = ModuleType(_CollisionTraitB.__module__)

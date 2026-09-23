@@ -98,11 +98,7 @@ def _trait_identity(entry: dict[str, Any]) -> dict[str, Any]:
 
 @dataclass(frozen=True)
 class TraitStateEntry:
-    """Saved trait identity and state.
-
-    ``trait_module`` distinguishes same-named traits from different libraries, and is what
-    finds the class when no instance is attached to carry the state.
-    """
+    """``trait_module`` disambiguates same-named traits and locates unattached classes."""
 
     trait_name: str
     trait_module: str | None = None
