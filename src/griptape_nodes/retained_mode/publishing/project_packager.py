@@ -92,6 +92,10 @@ WORKSPACE_DIRECTORY_KEY = "workspace_directory"
 _MIRROR_IGNORE_PATTERNS = [
     ".env",
     ".venv",
+    # Matched by fnmatch, so ".venv" does not cover it. An execution venv is a full torch
+    # install with host-specific binaries and absolute paths in pyvenv.cfg -- gigabytes that
+    # are wrong on any other machine.
+    ".venv-exec",
     ".git",
     "__pycache__",
     ".griptape-nodes-previews",

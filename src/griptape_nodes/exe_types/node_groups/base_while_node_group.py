@@ -81,9 +81,7 @@ class BaseWhileNodeGroup(SubflowNodeGroup):
         self.add_parameter(self.iteration)
 
         # Track left parameters for UI layout
-        if LEFT_PARAMETERS_KEY not in self.metadata:
-            self.metadata[LEFT_PARAMETERS_KEY] = []
-        self.metadata[LEFT_PARAMETERS_KEY].append("iteration")
+        self._register_side_parameter(LEFT_PARAMETERS_KEY, self.iteration.name)
 
         # Control input for done (right side)
         self.done = ControlParameterInput(
@@ -113,15 +111,12 @@ class BaseWhileNodeGroup(SubflowNodeGroup):
         self.add_parameter(self.total_iterations)
 
         # Track right parameters for UI layout
-        if RIGHT_PARAMETERS_KEY not in self.metadata:
-            self.metadata[RIGHT_PARAMETERS_KEY] = []
-        self.metadata[RIGHT_PARAMETERS_KEY].extend(
-            [
-                WhileControlParam.DONE.value,
-                WhileControlParam.CONTINUE.value,
-                "total_iterations",
-            ]
-        )
+        for parameter_name in (
+            WhileControlParam.DONE.value,
+            WhileControlParam.CONTINUE.value,
+            self.total_iterations.name,
+        ):
+            self._register_side_parameter(RIGHT_PARAMETERS_KEY, parameter_name)
 
     def _before_loop_iteration(self, iteration: int, flow_name: str) -> None:  # noqa: ARG002
         """Called before each loop iteration (after the first).
@@ -132,12 +127,10 @@ class BaseWhileNodeGroup(SubflowNodeGroup):
             iteration: The upcoming iteration number (1-based)
             flow_name: Name of the deserialized flow being executed
         """
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
         # Reset all nodes to UNRESOLVED so they re-execute. The DAG builder
         # skips RESOLVED upstream dependencies, so without this reset nodes
         # won't be added to the DAG and won't run on subsequent iterations.
-        GriptapeNodes.FlowManager().unresolve_all_nodes_in_flow(flow_name)
+        self.engine.flow_manager.unresolve_all_nodes_in_flow(flow_name)
 
     def _on_complete(self, *, condition_met: bool, iterations: int) -> None:  # noqa: ARG002
         """Called after all loop iterations are finished, before the node resolves.
