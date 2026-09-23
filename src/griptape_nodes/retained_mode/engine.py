@@ -75,6 +75,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.os_manager import OSManager
     from griptape_nodes.retained_mode.managers.project_manager import ProjectManager
     from griptape_nodes.retained_mode.managers.resource_manager import ResourceManager
+    from griptape_nodes.retained_mode.managers.rez_manager import RezManager
     from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
     from griptape_nodes.retained_mode.managers.session_manager import SessionManager
     from griptape_nodes.retained_mode.managers.static_files_manager import (
@@ -169,6 +170,7 @@ class Engine:
     _project_manager: ProjectManager
     _artifact_manager: ArtifactManager
     _manifest_manager: ManifestManager
+    _rez_manager: RezManager
     _worker_manager: WorkerManager
 
     def __init__(self) -> None:  # noqa: PLR0915
@@ -195,6 +197,7 @@ class Engine:
         from griptape_nodes.retained_mode.managers.os_manager import OSManager
         from griptape_nodes.retained_mode.managers.project_manager import ProjectManager
         from griptape_nodes.retained_mode.managers.resource_manager import ResourceManager
+        from griptape_nodes.retained_mode.managers.rez_manager import RezManager
         from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
         from griptape_nodes.retained_mode.managers.session_manager import SessionManager
         from griptape_nodes.retained_mode.managers.static_files_manager import (
@@ -245,6 +248,7 @@ class Engine:
         )
         self._artifact_manager = ArtifactManager(self._event_manager, engine=self)
         self._manifest_manager = ManifestManager(self._event_manager, engine=self)
+        self._rez_manager = RezManager(self._event_manager, engine=self)
 
         # Assign handlers now that these are created.
         self._event_manager.assign_manager_to_request_type(GetEngineVersionRequest, self.handle_engine_version_request)
@@ -357,6 +361,10 @@ class Engine:
     @property
     def manifest_manager(self) -> ManifestManager:
         return self._manifest_manager
+
+    @property
+    def rez_manager(self) -> RezManager:
+        return self._rez_manager
 
     @property
     def worker_manager(self) -> WorkerManager:

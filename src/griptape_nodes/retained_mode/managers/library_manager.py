@@ -281,6 +281,16 @@ from griptape_nodes.utils.library_utils import (
     normalize_library_downloads,
     normalize_library_registrations,
 )
+from griptape_nodes.utils.rez_utils import (
+    get_library_rez_package_version,
+    is_library_rez_package_available,
+    is_rez_enabled,
+    is_rez_library_path,
+    library_file_path_to_rez_family,
+    resolve_rez_library_json_path,
+    rez_library_package_name,
+    rez_library_package_version,
+)
 from griptape_nodes.utils.uv_utils import find_uv_bin, is_venv_functional, venv_python_path
 from griptape_nodes.utils.version_utils import (
     engine_version_failure_detail,
@@ -552,18 +562,10 @@ class LibraryManager(EngineScoped):
         # parsed (discovery or lifecycle progression). Absence of the relevant
         # declarations falls through to False.
         requires_worker: bool = False
-        # True when this library's nodes EXECUTE in a dedicated worker process, for either
-        # reason: legacy worker-mode declarations (requires_worker above, which also skips
-        # orchestrator-side loading in favor of stubs) or execution dependencies
-        # (pip_dependencies_exec -- the library loads REAL nodes on the orchestrator and
-        # only its process() runs in the worker, where .venv-exec is on sys.path).
-        # Consumed by execution routing; never by load-time skips.
+        has_rez_package: bool = False
+        rez_family: str | None = None
+        rez_version: str | None = None
         executes_in_worker: bool = False
-
-        # Why the last `.venv-exec` build failed; None when it succeeded. Deliberately separate
-        # from execution_unavailable_reason, which _start_workers clears before every spawn attempt
-        # -- the spawn refusal reads THIS field, so a failure recorded at registration must survive
-        # that clearing.
         execution_env_failure: str | None = None
 
     class RegisterLibraryPrerequisites(NamedTuple):
@@ -2380,7 +2382,7 @@ class LibraryManager(EngineScoped):
         )
         return result
 
-    async def register_library_from_file_request(self, request: RegisterLibraryFromFileRequest) -> ResultPayload:  # noqa: PLR0911 (result determination needs multiple returns)
+    async def register_library_from_file_request(self, request: RegisterLibraryFromFileRequest) -> ResultPayload:  # noqa: PLR0911, C901 (result determination needs multiple returns)
         """Register a library by name or path, progressing through all lifecycle phases.
 
         Supports loading by library_name OR file_path (mutually exclusive), with optional
@@ -2422,6 +2424,24 @@ class LibraryManager(EngineScoped):
         if library_info.library_name is None:
             details = "Library loaded but library_name was not set during metadata loading"
             return RegisterLibraryFromFileResultFailure(result_details=details)
+
+        if is_rez_enabled() and library_info.library_name:
+            if library_info.library_path:
+                family = library_file_path_to_rez_family(Path(library_info.library_path))
+                library_info.rez_family = family
+                version = get_library_rez_package_version(
+                    library_info.library_name, library_file_path=Path(library_info.library_path)
+                )
+                library_info.has_rez_package = version is not None
+                library_info.rez_version = version
+            logger.info(
+                "[Rez] Library '%s' registered — rez package '%s': %s",
+                library_info.library_name,
+                f"{library_info.rez_family}-{library_info.rez_version}"
+                if library_info.rez_version
+                else library_info.rez_family or "(unknown)",
+                "available" if library_info.has_rez_package else "not built",
+            )
 
         match library_info.fitness:
             case LibraryManager.LibraryFitness.GOOD:
@@ -2676,6 +2696,14 @@ class LibraryManager(EngineScoped):
                         library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.FAILURE
                         library_info.problems.extend(evaluate_result.problems)
                         self._library_file_path_to_info[library_info.library_path] = library_info
+                        if library_info.has_rez_package or (
+                            library_info.registered_path and is_rez_library_path(library_info.registered_path)
+                        ):
+                            logger.warning(
+                                "[Rez] library '%s' is configured as a rez package but was denied by policy: %s",
+                                metadata_result.library_schema.name,
+                                evaluate_result.result_details,
+                            )
                         return RegisterLibraryFromFileResultFailure(result_details=evaluate_result.result_details)
 
                     # Update library_info with evaluation results
@@ -2752,6 +2780,36 @@ class LibraryManager(EngineScoped):
                                         dep.url,
                                     )
                                     continue
+
+                                # In rez mode, check if the dependency already exists as a
+                                # rez package before downloading and building a venv.
+                                if is_rez_enabled():
+                                    from griptape_nodes.utils.rez_utils import (
+                                        _library_rez_name,
+                                        resolve_rez_library_json_path,
+                                    )
+
+                                    dep_rez_family = _library_rez_name(repo_name)
+                                    dep_rez_json = resolve_rez_library_json_path(dep_rez_family)
+                                    if dep_rez_json is not None:
+                                        logger.info(
+                                            "[Rez] library dependency '%s' found in rez store as '%s' — registering from rez package",
+                                            dep.url,
+                                            dep_rez_family,
+                                        )
+                                        rez_dep_result = await self.register_library_from_file_request(
+                                            RegisterLibraryFromFileRequest(file_path=str(dep_rez_json))
+                                        )
+                                        if isinstance(rez_dep_result, RegisterLibraryFromFileResultFailure):
+                                            logger.warning(
+                                                "[Rez] rez package '%s' registration had issues: %s",
+                                                dep_rez_family,
+                                                rez_dep_result.result_details,
+                                            )
+                                        # Always skip download when rez package exists — downloading
+                                        # a venv copy won't fix missing rez dependencies.
+                                        continue
+
                                 if install_behavior == LibraryDependencyInstallBehavior.NEVER:
                                     if dep.required:
                                         library_info.problems.append(
@@ -2804,10 +2862,6 @@ class LibraryManager(EngineScoped):
                         InstallLibraryDependenciesRequest(library_file_path=library_info.library_path)
                     )
                     if isinstance(install_result, InstallLibraryDependenciesResultFailure):
-                        # Replaced, not appended: the lifecycle re-enters at EVALUATED on every
-                        # reload while the LibraryInfo survives, and the display shows the
-                        # OLDEST instance -- appending would keep reporting the first reason.
-                        # Fitness stays with the dependency block above, which decides it.
                         library_info.problems = [
                             problem
                             for problem in library_info.problems
@@ -3380,17 +3434,12 @@ class LibraryManager(EngineScoped):
         return xdg_data_home() / "griptape_nodes" / "libraries" / clean_library_name / venv_dir_name
 
     async def _add_library_paths_to_sys_path(self, library_name: str, library_file_path: str, base_dir: Path) -> None:
-        """Add a library's directory and edit-time venv site-packages to sys.path.
+        """Add a library's directory and dependency paths to sys.path.
 
-        The edit-time environment is added in every process, because importing node modules and
-        instantiating nodes needs it. The execution environment is never added here, in either
-        process -- a worker receives it as PYTHONPATH at spawn, before it imports anything. See the
-        body for why splicing it into a running interpreter would not work.
-
-        Where both exist, the execution environment must keep precedence: it is the one resolved
-        over both dependency sets, so it holds the only versions of a shared package that one
-        resolver agreed on. PYTHONPATH sits at `sys.path[1]`, which any `insert(0, ...)` would
-        overtake, so `_add_library_edit_venv_to_sys_path` declines rather than ordering around it.
+        For rez libraries, resolves the rez environment to discover PYTHONPATH
+        entries (pip dependency paths) and adds them. For non-rez libraries,
+        adds the edit-time venv site-packages. The execution environment is
+        never spliced here -- a worker receives it as PYTHONPATH at spawn.
 
         Args:
             library_name: Name of the library (for venv lookup)
@@ -3398,6 +3447,27 @@ class LibraryManager(EngineScoped):
             base_dir: Library base directory to add for relative imports
         """
         sys.path.insert(0, str(base_dir))
+        logger.debug("[path] Added library '%s' base_dir to sys.path: %s", library_name, base_dir)
+
+        if is_rez_library_path(library_file_path) or (
+            is_rez_enabled()
+            and is_library_rez_package_available(library_name, library_file_path=Path(library_file_path))
+        ):
+            from griptape_nodes.utils.rez_utils import resolve_rez_pythonpath
+
+            rez_family = library_file_path_to_rez_family(Path(library_file_path))
+            rez_paths = await asyncio.to_thread(resolve_rez_pythonpath, [rez_family])
+            for rez_path in rez_paths:
+                if rez_path not in sys.path:
+                    sys.path.insert(0, rez_path)
+                    logger.debug("[Rez] added rez dep path for '%s': %s", library_name, rez_path)
+            if rez_paths:
+                logger.info("[Rez] added %d dependency paths for library '%s'", len(rez_paths), library_name)
+            else:
+                logger.warning(
+                    "[Rez] no dependency paths resolved for library '%s' (family: %s)", library_name, rez_family
+                )
+            return
 
         await self._add_library_edit_venv_to_sys_path(library_name, library_file_path)
 
@@ -4730,6 +4800,9 @@ class LibraryManager(EngineScoped):
             self._is_initializing = False
 
     async def _run_app_initialization(self, payload: AppInitializationComplete) -> None:
+        logger.info("Rez integration: %s", "enabled" if is_rez_enabled() else "disabled")
+        if is_rez_enabled():
+            self.engine.rez_manager.run_startup_health_check()
         if payload.skip_library_loading:
             # Register all secrets even in headless mode
             self.engine.secrets_manager.register_all_secrets()
@@ -6540,13 +6613,18 @@ class LibraryManager(EngineScoped):
     def _resolve_discovery_path(entry: LibraryRegistration, workspace_path: Path) -> ResolvedDiscoveryPath | None:
         """Resolve a `libraries_to_register` entry to a concrete on-disk path to scan.
 
-        A register entry names an already-present local library by `path`, which
-        resolves against the workspace. Libraries pinned to a git source live in
-        `libraries_to_download` and are resolved separately in
-        `_discover_library_files` by locating their provisioned manifest under the
-        workspace libraries directory, so they never need a `libraries_to_register`
-        entry. Returns None when the path does not exist on disk.
+        Entries using the ``REZ:<family>`` syntax are resolved from the rez
+        package store instead of the filesystem.  Regular entries resolve
+        against the workspace.  Returns None when the path does not exist.
         """
+        if is_rez_library_path(entry.path):
+            rez_family = rez_library_package_name(entry.path)
+            rez_version = rez_library_package_version(entry.path)
+            json_path = resolve_rez_library_json_path(rez_family, version=rez_version)
+            if json_path is None:
+                return None
+            return LibraryManager.ResolvedDiscoveryPath(path=json_path, registered_path=entry.path)
+
         # TODO: Update to check on project manager for workspace path. https://github.com/griptape-ai/griptape-nodes/issues/4396
         library_path = resolve_workspace_path(Path(entry.path), workspace_path)
         if not library_path.exists():
@@ -6640,6 +6718,54 @@ class LibraryManager(EngineScoped):
         # unregistered. Wait for the rebuild to finish first.
         await self._libraries_loading_complete.wait()
 
+        library_info = self.get_library_info_by_library_name(library_name)
+        is_rez_managed = library_info is not None and (
+            library_info.has_rez_package
+            or bool(library_info.registered_path and is_rez_library_path(library_info.registered_path))
+        )
+
+        # REZ:-sourced libraries have no local git clone to check. Compare the
+        # loaded version against the latest in the package store instead.
+        if (
+            is_rez_managed
+            and library_info is not None
+            and library_info.registered_path
+            and is_rez_library_path(library_info.registered_path)
+        ):
+            current_version = library_info.rez_version
+            pinned_version = rez_library_package_version(library_info.registered_path)
+            latest_version = get_library_rez_package_version(
+                library_name, library_file_path=Path(library_info.library_path) if library_info.library_path else None
+            )
+
+            if pinned_version:
+                return CheckLibraryUpdateResultSuccess(
+                    has_update=False,
+                    current_version=current_version,
+                    latest_version=current_version,
+                    git_remote=None,
+                    git_ref=None,
+                    local_commit=None,
+                    remote_commit=None,
+                    rez_managed=True,
+                    result_details=f"Library '{library_name}' is pinned to version {pinned_version}.",
+                )
+
+            has_update = (
+                latest_version is not None and current_version is not None and latest_version != current_version
+            )
+            return CheckLibraryUpdateResultSuccess(
+                has_update=has_update,
+                current_version=current_version,
+                latest_version=latest_version,
+                git_remote=None,
+                git_ref=None,
+                local_commit=None,
+                remote_commit=None,
+                rez_managed=True,
+                result_details=f"Library '{library_name}' is rez-managed. {'Newer version available — refresh to update.' if has_update else 'Up to date.'}",
+            )
+
         # Check if the library exists
         try:
             library = LibraryRegistry.get_library(name=library_name)
@@ -6650,7 +6776,6 @@ class LibraryManager(EngineScoped):
         # Find the library file path. Route through the shared resolver so the update path
         # (_validate_and_prepare_library_for_git_operation) and this check path can never
         # disagree about which on-disk copy a duplicately-registered library maps to.
-        library_info = self.get_library_info_by_library_name(library_name)
         if library_info is None:
             details = f"Attempted to check for updates for Library '{library_name}'. Failed because no file path could be found for this library."
             return CheckLibraryUpdateResultFailure(result_details=details)
@@ -6829,6 +6954,7 @@ class LibraryManager(EngineScoped):
             update_gated_by_age=update_gated_by_age,
             target_commit_age_hours=target_commit_age_hours,
             minimum_release_age_hours=minimum_release_age_hours,
+            rez_managed=is_rez_managed,
             result_details=details,
         )
 
@@ -7338,7 +7464,7 @@ class LibraryManager(EngineScoped):
             result_details=details,
         )
 
-    async def install_library_dependencies_request(self, request: InstallLibraryDependenciesRequest) -> ResultPayload:
+    async def install_library_dependencies_request(self, request: InstallLibraryDependenciesRequest) -> ResultPayload:  # noqa: C901
         """Install a library's dependencies into its edit-time and execution environments.
 
         Edit-time dependencies go into ``.venv``, which is always created even when there is
@@ -7367,6 +7493,24 @@ class LibraryManager(EngineScoped):
             pip_dependencies = library_metadata.dependencies.pip_dependencies or []
             pip_dependencies_exec = library_metadata.dependencies.pip_dependencies_exec or []
             pip_install_flags = library_metadata.dependencies.pip_install_flags or []
+
+        if is_rez_library_path(library_file_path):
+            logger.info("[Rez] library '%s' is a REZ: package — skipping venv build entirely", library_name)
+            return InstallLibraryDependenciesResultSuccess(
+                library_name=library_name,
+                dependencies_installed=0,
+                result_details=f"Library '{library_name}' sourced from rez package — no venv needed",
+            )
+
+        if is_rez_enabled() and is_library_rez_package_available(
+            library_name, library_file_path=Path(library_file_path)
+        ):
+            logger.info("[Rez] library '%s' resolved from rez — skipping venv build", library_name)
+            return InstallLibraryDependenciesResultSuccess(
+                library_name=library_name,
+                dependencies_installed=0,
+                result_details=f"Library '{library_name}' dependencies resolved from rez packages",
+            )
 
         # A declared dependency's execution set belongs to THIS environment, so every decision
         # below reads the combined set. A library that declares no execution dependencies of its
@@ -7609,6 +7753,9 @@ class LibraryManager(EngineScoped):
             return
 
         venv_path = self._get_library_venv_path(library_name, library_file_path, execution=execution)
+
+        if is_rez_enabled():
+            logger.info("[Rez] UV would build environment for library '%s' at %s", library_name, venv_path)
 
         try:
             venv_init = await self._init_library_venv(venv_path)

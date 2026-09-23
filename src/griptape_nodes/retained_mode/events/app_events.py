@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
@@ -11,6 +13,7 @@ from griptape_nodes.retained_mode.events.base_events import (
     WorkflowNotAlteredMixin,
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
+from griptape_nodes.retained_mode.events.rez_events import RezHealthStatus, RezLibraryStatus
 
 
 class InitializationPhase(StrEnum):
@@ -577,3 +580,16 @@ class GetEngineNameResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """
 
     error_message: str
+
+
+@dataclass
+@PayloadRegistry.register
+class RezStatusNotification(AppPayload):
+    """Broadcast rez integration status at startup and after state changes."""
+
+    enabled: bool = False
+    context_string: str = ""
+    health: RezHealthStatus | None = None
+    library_statuses: list[RezLibraryStatus] = field(default_factory=list)
+    health_green_threshold_ms: float = 500.0
+    health_red_threshold_ms: float = 2000.0

@@ -10,6 +10,7 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import anyio
@@ -26,6 +27,13 @@ from griptape_nodes.retained_mode.managers.settings import (
     WORKER_HEARTBEAT_TIMEOUT_KEY,
 )
 from griptape_nodes.servers.static import ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV
+from griptape_nodes.utils.rez_utils import (
+    build_rez_env_prefix,
+    is_library_rez_package_available,
+    is_rez_enabled,
+    library_file_path_to_rez_family,
+    resolve_and_log_rez_context,
+)
 from griptape_nodes.utils.version_utils import engine_version
 
 if TYPE_CHECKING:
@@ -373,39 +381,25 @@ class WorkerManager(EngineScoped):
         if worker_key in self._managed_worker_processes or worker_key in self._spawns_in_flight:
             logger.error("Worker for key '%s' already spawned; refusing duplicate spawn.", worker_key)
             return
-        # Claimed in the same step as the check above, so no await separates them. The registry
-        # entry cannot serve as this guard: it is written only once the subprocess exists, and the
-        # work in between suspends. A second fork for one library leaves one of the two processes
-        # untracked, holding that library's dependencies until its own heartbeat lapses.
         claim = object()
         self._spawns_in_flight[worker_key] = claim
         try:
-            # Spawn with the orchestrator's PRE-project environ so the worker boots with the
-            # same clean env baseline a fresh engine would have. Inheriting the live os.environ
-            # would bake the orchestrator's current-project env vars into the worker's restore
-            # baseline, leaving the worker unable to unset them on a later project switch.
             base_environ = self.engine.project_manager.get_pre_project_environ()
             worker_environ = {**base_environ, "GTN_ENGINE_ID": str(uuid.uuid4())}
-            # Stamp the spawning orchestrator's id so the worker can report it in its discovery
-            # heartbeat (orchestrator_engine_id), letting clients identify and nest worker engines.
-            # The orchestrator always has an id by the time it spawns a worker; guard the None
-            # case anyway so a subprocess env value is never None.
             orchestrator_engine_id = self.engine.engine_identity_manager.active_engine_id
             if orchestrator_engine_id is not None:
                 worker_environ["GTN_ORCHESTRATOR_ENGINE_ID"] = orchestrator_engine_id
-            # Worker stdout is a pipe when the orchestrator is hosted by a GUI app (e.g. the
-            # desktop app); unbuffered output keeps worker log lines from stalling in Python's
-            # block buffer and from being lost on a crash.
             worker_environ["PYTHONUNBUFFERED"] = "1"
 
-            # PYTHONPATH precedes site-packages, making this library-first with the engine's own
-            # environment as the fallback. It must be the environment rather than a later sys.path
-            # splice: sys.modules never reconsiders a module this process has already imported.
+            # Forward rez configuration vars so the worker subprocess can resolve rez packages.
+            if is_rez_enabled():
+                rez_vars = {k: v for k, v in os.environ.items() if k.startswith(("REZ_", "GTN_REZ_"))}
+                worker_environ.update(rez_vars)
+                if rez_vars:
+                    logger.debug("[Rez] forwarding %d rez env vars to worker: %s", len(rez_vars), list(rez_vars.keys()))
+
             execution_site_packages = self.engine.library_manager.execution_site_packages(worker_key)
             if execution_site_packages is not None:
-                # Prepended, not assigned: a launcher-set PYTHONPATH (embedding hosts, source checkouts)
-                # is part of the environment the engine itself booted with, and dropping it only in
-                # exec-deps workers would lose those modules in exactly one process kind.
                 inherited_pythonpath = worker_environ.get("PYTHONPATH")
                 worker_environ["PYTHONPATH"] = (
                     execution_site_packages + os.pathsep + inherited_pythonpath
@@ -418,36 +412,18 @@ class WorkerManager(EngineScoped):
                     execution_site_packages,
                 )
 
-            # No workspace variable here: GTN_CONFIG_ outranks the runtime project override, so a worker
-            # handed one could never follow its orchestrator onto a project's workspace again. The
-            # workspace arrives with the project the orchestrator activates on it.
-
-            # Both processes share the workspace on disk, so the orchestrator's long-lived server
-            # is the one that must serve it: a worker serving its own wins an arbitrary port, and
-            # every asset URL on it is dead by the time a saved workflow is reopened.
             static_base_url = await self._orchestrator_static_server_base_url()
             if static_base_url is not None:
                 worker_environ[ORCHESTRATOR_STATIC_SERVER_BASE_URL_ENV] = static_base_url
-            # Hand the orchestrator's own stdout/stderr to the worker explicitly so worker log
-            # lines land in the same stream as orchestrator logs. Implicit inheritance is
-            # POSIX-only: on Windows, redirected std handles (e.g. the desktop app's pipes) are
-            # not passed to a child unless subprocess sends them via STARTF_USESTDHANDLES, so
-            # the worker would log to an invisible console instead.
             proc = await asyncio.create_subprocess_exec(
                 *args,
                 env=worker_environ,
                 stdout=sys.stdout,
                 stderr=sys.stderr,
             )
-            # Record the loop that owns this subprocess so termination can hop back to it.
-            # All spawns run on the engine event-queue loop, so this is idempotent.
             self._spawn_loop = asyncio.get_running_loop()
             self._managed_worker_processes[worker_key] = proc
         finally:
-            # Released even when the fork raises, or the claim would silently refuse every later
-            # attempt for this library -- but only while this attempt still holds it. A reset drops
-            # the claims so a reload can spawn again, so a spawn suspended across one resumes to
-            # find the key belonging to the reload's spawn, and freeing that admits a third fork.
             if self._spawns_in_flight.get(worker_key) is claim:
                 del self._spawns_in_flight[worker_key]
         logger.info("Spawned worker for key '%s' (pid %s)", worker_key, proc.pid)
@@ -792,11 +768,7 @@ class WorkerManager(EngineScoped):
             logger.error("Session event set but no session ID available for library '%s'.", library_name)
             self.note_worker_unavailable(library_name, "no session was available to start its worker process.")
             return
-        # The worker is handed its library's execution environment as PYTHONPATH, so that directory
-        # has to exist before the process starts. It does: the orchestrator builds it while
-        # registering the library, and a library whose build failed is never asked for a worker --
-        # LibraryManager knows its own build result and does not request one.
-        args = [
+        base_args = [
             sys.executable,
             "-m",
             "griptape_nodes_app",
@@ -806,18 +778,35 @@ class WorkerManager(EngineScoped):
             "--library-name",
             library_name,
         ]
+
+        if is_rez_enabled() and is_library_rez_package_available(library_name):
+            args = self._build_rez_worker_args(library_name, base_args)
+        else:
+            args = base_args
+
         await self.spawn_worker(args, library_name)
 
-    def _log_spawn_error(self, task: asyncio.Task, library_name: str) -> None:
-        """Record a spawn that raised before producing a worker.
+    def _build_rez_worker_args(self, library_name: str, base_args: list[str]) -> list[str]:
+        """Wrap base_args with a rez-env prefix for the given library."""
+        library_info = self.engine.library_manager.get_library_info_by_library_name(library_name)
+        if library_info is None or not library_info.library_path:
+            logger.warning(
+                "[Rez][execution] Cannot find library path for '%s' -- skipping rez wrap",
+                library_name,
+            )
+            return base_args
 
-        `handle_start_worker_request` schedules the spawn and returns Success immediately, so its
-        caller cannot tell that a bad interpreter or an OSError stopped the worker ever existing.
-        Refusals that return rather than raise are invisible here and record themselves.
-        """
-        # Asked before `task.exception()`, which raises on a cancelled task. From a done-callback
-        # that surfaces as loop-level "Exception in callback" noise and skips the refusal below.
-        # Cancellation reaches here at loop teardown, where no run is waiting on a worker.
+        rez_family = library_file_path_to_rez_family(Path(library_info.library_path))
+        logger.info("[Rez][execution] wrapping worker for '%s' (family: %s)", library_name, rez_family)
+        resolve_and_log_rez_context([rez_family])
+
+        rez_prefix = build_rez_env_prefix([rez_family])
+        wrapped = [*rez_prefix, *base_args]
+        logger.info("[Rez][execution]   wrapped cmd: %s", " ".join(wrapped))
+        return wrapped
+
+    def _log_spawn_error(self, task: asyncio.Task, library_name: str) -> None:
+        """Record a spawn that raised before producing a worker."""
         if task.cancelled():
             return
         exc = task.exception()
