@@ -30,6 +30,8 @@ from dataclasses import dataclass, field
 from email.parser import HeaderParser
 from pathlib import Path
 
+from packaging.markers import InvalidMarker, Marker
+
 from griptape_nodes.utils.uv_utils import find_uv_bin
 
 logger = logging.getLogger(__name__)
@@ -312,16 +314,27 @@ def _current_rez_platform() -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 
+def _marker_applies(marker_str: str) -> bool:
+    """Evaluate a PEP 508 environment marker against the current platform."""
+    try:
+        return Marker(marker_str).evaluate()
+    except (InvalidMarker, ValueError):
+        return False
+
+
 def _parse_requires_dist(req_str: str) -> tuple[str, str] | None:
     """Parse a Requires-Dist string into (pip_name, specifier_str).
 
-    Returns None for conditional deps (those with environment markers) since
-    they may not apply to the current platform and rez cannot express them.
+    Conditional deps (those with environment markers) are evaluated against
+    the current platform — included when the marker matches, dropped otherwise.
     Extras in the package name (e.g. ``requests[security]``) are stripped.
     """
     req = req_str.strip()
     if ";" in req:
-        return None
+        spec_part, _, marker_str = req.partition(";")
+        if not _marker_applies(marker_str.strip()):
+            return None
+        req = spec_part.strip()
     req = re.sub(r"\[.*?\]", "", req)  # strip extras
     # "name (>=1.0,<2)" form
     m = re.match(r"^([A-Za-z0-9][A-Za-z0-9._-]*)\s*\(([^)]*)\)\s*$", req)
@@ -381,12 +394,14 @@ def _pep440_spec_to_rez(pip_dep_name: str, specifier_str: str) -> str:  # noqa: 
                 # ~=X.Y.Z → >=X.Y.Z, <X.Y+1
                 lower = ver
                 upper_parts = parts[:-1]
-                upper_parts[-1] = str(int(upper_parts[-1]) + 1)
+                num_match = re.match(r"^(\d+)", upper_parts[-1])
+                upper_parts[-1] = str(int(num_match.group(1)) + 1) if num_match else upper_parts[-1]
                 upper = ".".join(upper_parts)
             else:
                 # ~=X.Y → >=X.Y, <X+1
                 lower = ver
-                upper = str(int(parts[0]) + 1)
+                num_match = re.match(r"^(\d+)", parts[0])
+                upper = str(int(num_match.group(1)) + 1) if num_match else parts[0]
         elif op in (">=", ">"):
             lower = ver
         elif op in ("<=", "<"):

@@ -4802,7 +4802,7 @@ class LibraryManager(EngineScoped):
     async def _run_app_initialization(self, payload: AppInitializationComplete) -> None:
         logger.info("Rez integration: %s", "enabled" if is_rez_enabled() else "disabled")
         if is_rez_enabled():
-            self.engine.rez_manager.run_startup_health_check()
+            await asyncio.to_thread(self.engine.rez_manager.run_startup_health_check)
         if payload.skip_library_loading:
             # Register all secrets even in headless mode
             self.engine.secrets_manager.register_all_secrets()

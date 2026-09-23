@@ -9,6 +9,10 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
+import tempfile
+import tomllib
+from datetime import UTC, datetime
 from pathlib import Path
 
 import typer
@@ -16,7 +20,24 @@ from rich.panel import Panel
 from rich.table import Table
 
 from griptape_nodes.cli.shared import console
-from griptape_nodes.utils.rez_utils import REZ_PACKAGE_COPY_EXCLUDE_PATTERNS
+from griptape_nodes.files.path_utils import canonicalize_for_io
+from griptape_nodes.utils.git_utils import clone_repository
+from griptape_nodes.utils.rez_utils import (
+    REZ_PACKAGE_COPY_EXCLUDE_PATTERNS,
+    _rez_executable,
+    build_direct_requires,
+    current_platform_key,
+    find_library_manifest,
+    get_library_rez_package_version,
+    install_library_as_rez_package,
+    library_file_path_to_rez_family,
+    read_library_dependencies,
+    read_library_manifest,
+    rez_local_packages_path,
+    rez_path_map,
+    rez_root,
+)
+from griptape_nodes.utils.rez_uv import install as rez_uv_install
 
 app = typer.Typer(help="Rez package management.")
 
@@ -103,7 +124,7 @@ def _resolve_and_validate_repo(engine_repo_path: str | None) -> tuple[Path, Path
         console.print("The engine repo contains pyproject.toml and src/griptape_nodes/.")
         console.print()
         user_path = typer.prompt("Enter the path to your griptape-nodes-engine checkout")
-        repo_path = Path(user_path).expanduser().resolve()
+        repo_path = canonicalize_for_io(user_path)
         if not repo_path.is_dir():
             console.print(f"[red]Directory not found: {repo_path}[/red]")
             raise typer.Exit(1)
@@ -141,10 +162,8 @@ _DEFAULT_REZ_PATHS: dict[str, str] = {
 
 def _resolve_studio_root_from_env_or_option(packages_path: str | None) -> tuple[Path, dict[str, str]]:
     """Non-interactive fallback: derive studio root from env or CLI option."""
-    from griptape_nodes.utils.rez_utils import rez_root
-
     if packages_path:
-        packages_root = Path(packages_path).expanduser().resolve()
+        packages_root = canonicalize_for_io(packages_path)
         return packages_root, {**_DEFAULT_REZ_PATHS, "local_packages": "local"}
 
     root = rez_root()
@@ -163,8 +182,6 @@ def _prompt_studio_setup() -> tuple[dict[str, str] | None, Path, dict[str, str]]
     - studio_root is the resolved root Path for this platform
     - rez_paths is a dict of relative paths for downstream vars
     """
-    from griptape_nodes.utils.rez_utils import rez_path_map, rez_root
-
     existing_root = rez_root()
     existing_map = rez_path_map()
 
@@ -204,8 +221,6 @@ def _prompt_studio_setup() -> tuple[dict[str, str] | None, Path, dict[str, str]]
             console.print("[yellow]No platform roots provided.[/yellow]")
             raise typer.Exit(1)
 
-        from griptape_nodes.utils.rez_utils import current_platform_key
-
         platform = current_platform_key()
         if platform not in roots:
             console.print(f"[yellow]Current platform '{platform}' not in mapping — using first entry.[/yellow]")
@@ -217,7 +232,7 @@ def _prompt_studio_setup() -> tuple[dict[str, str] | None, Path, dict[str, str]]
     else:
         console.print()
         root_str = typer.prompt("Enter the studio root path (GTN_REZ_ROOT)")
-        studio_root = Path(root_str).expanduser().resolve()
+        studio_root = canonicalize_for_io(root_str)
         cross_platform_roots = None
 
     console.print()
@@ -241,7 +256,7 @@ def _prompt_rez_paths() -> dict[str, str]:
             )
             if use_absolute:
                 val = typer.prompt("  local packages (absolute path)").strip()
-                val = str(Path(val).expanduser().resolve())
+                val = str(canonicalize_for_io(val))
             else:
                 val = typer.prompt(f"  {label}", default=default).strip()
         else:
@@ -258,8 +273,6 @@ def _install_deps(dependencies: list[str], packages_root: Path, *, skip_installe
 
     console.print("[bold]Installing dependencies as rez packages...[/bold]")
     try:
-        from griptape_nodes.utils.rez_uv import install as rez_uv_install
-
         rez_uv_install(
             dependencies,
             packages_dir=packages_root,
@@ -301,11 +314,7 @@ def _write_engine_package(
     _copy_engine_source(src_dir, python_dest)
     _copy_dist_info(python_dest, version)
 
-    from griptape_nodes.utils.rez_utils import build_direct_requires
-
     requires = build_direct_requires(dependencies)
-
-    from datetime import UTC, datetime
 
     timestamp = datetime.now(UTC).isoformat()
     req_entries = "".join(f"    '{r}',\n" for r in sorted(requires))
@@ -424,7 +433,7 @@ def _print_env_var_guidance(
 def _resolve_engine_repo(explicit_path: str | None) -> Path | None:
     """Find the engine repo, checking explicit path, then common locations."""
     if explicit_path:
-        p = Path(explicit_path).expanduser().resolve()
+        p = canonicalize_for_io(explicit_path)
         if p.is_dir():
             return p
         console.print(f"[red]Engine repo not found at: {p}[/red]")
@@ -461,8 +470,6 @@ def _resolve_engine_repo(explicit_path: str | None) -> Path | None:
 
 def _read_version(pyproject_path: Path) -> str | None:
     """Read the version from pyproject.toml."""
-    import tomllib
-
     with pyproject_path.open("rb") as f:
         data = tomllib.load(f)
 
@@ -479,8 +486,6 @@ def _read_version(pyproject_path: Path) -> str | None:
 
 def _read_dependencies(pyproject_path: Path) -> list[str]:
     """Read pip dependencies from pyproject.toml."""
-    import tomllib
-
     with pyproject_path.open("rb") as f:
         data = tomllib.load(f)
 
@@ -559,8 +564,6 @@ def build_library_package(
         console.print("[red]Provide --git-url or --local-path.[/red]")
         raise typer.Exit(1)
 
-    from griptape_nodes.utils.rez_utils import rez_local_packages_path
-
     if packages_path:
         packages_root = Path(packages_path)
     else:
@@ -585,8 +588,6 @@ def _build_library_from_git(
     skip_installed: bool,
 ) -> None:
     """Clone a git repo and build a rez package from its library manifest."""
-    import tempfile
-
     console.print(Panel("[bold cyan]Rez Library Package Builder (git)[/bold cyan]", expand=False))
     console.print()
     console.print(f"  Git URL: [cyan]{git_url}[/cyan]")
@@ -599,8 +600,6 @@ def _build_library_from_git(
 
     try:
         console.print("[bold]Cloning repository...[/bold]")
-        from griptape_nodes.utils.git_utils import clone_repository
-
         clone_repository(git_url, clone_target, branch)
         console.print("[green]Clone complete.[/green]")
         console.print()
@@ -617,7 +616,7 @@ def _build_library_from_local(
     skip_installed: bool,
 ) -> None:
     """Build a rez package from a local library directory."""
-    library_dir = Path(local_path).expanduser().resolve()
+    library_dir = canonicalize_for_io(local_path)
     if not library_dir.is_dir():
         console.print(f"[red]Directory not found: {library_dir}[/red]")
         raise typer.Exit(1)
@@ -637,15 +636,6 @@ def _build_library_from_dir(  # noqa: C901
 
     Also recursively builds rez packages for any declared library dependencies.
     """
-    from griptape_nodes.utils.rez_utils import (
-        find_library_manifest,
-        get_library_rez_package_version,
-        install_library_as_rez_package,
-        library_file_path_to_rez_family,
-        read_library_dependencies,
-        read_library_manifest,
-    )
-
     library_json = find_library_manifest(library_dir)
     if library_json is None:
         console.print(f"[red]No library manifest found in {library_dir}[/red]")
@@ -722,10 +712,6 @@ def _build_library_from_dir(  # noqa: C901
 
 def _validate_rez_package(family: str, version: str | None) -> None:
     """Validate a generated package by querying the rez binary."""
-    import subprocess
-
-    from griptape_nodes.utils.rez_utils import _rez_executable
-
     rez_search = _rez_executable("rez-search")
     console.print("[bold]Validating rez package...[/bold]")
 

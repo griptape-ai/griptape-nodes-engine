@@ -196,6 +196,23 @@ def _log_rez_env_context() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _version_sort_key(p: Path) -> tuple[int, ...]:
+    """Parse a version directory name into a numerically-sortable key.
+
+    Splits on '.' and converts each component to int so that '1.10.0'
+    sorts after '1.9.0' (unlike lexicographic string sort). Non-numeric
+    components (pre-release suffixes) get -1 so they sort before their
+    numeric counterpart.
+    """
+    result = []
+    for part in p.name.split("."):
+        try:
+            result.append(int(part))
+        except ValueError:
+            result.append(-1)
+    return tuple(result)
+
+
 def _rez_packages_root() -> Path | None:
     """Return the root of the rez package store, derived from GTN_REZ_LOCAL_PACKAGES_PATH.
 
@@ -231,7 +248,7 @@ def list_available_library_packages() -> list[dict[str, str]]:
             continue
         versions = sorted(
             (d for d in family_dir.iterdir() if d.is_dir() and (d / "package.py").exists()),
-            key=lambda p: p.name,
+            key=_version_sort_key,
             reverse=True,
         )
         if not versions:
@@ -250,12 +267,14 @@ def list_available_library_packages() -> list[dict[str, str]]:
 
 
 def pip_spec_name(spec: str) -> str:
-    """Extract the bare package name from a pip requirement spec.
+    """Extract the bare package name from a pip requirement spec, PEP 503 normalized.
 
     ``'torch>=2.0,<3'`` → ``'torch'``
     ``'diffusers[torch]==0.39.0'`` → ``'diffusers'``
+    ``'ruamel_yaml>=0.18'`` → ``'ruamel-yaml'``
     """
-    return re.split(r"[>=<!~\[\s;]", spec)[0].strip().lower()
+    name = re.split(r"[>=<!~\[\s;]", spec)[0].strip()
+    return re.sub(r"[-._]+", "-", name).lower()
 
 
 def find_library_manifest(directory: Path) -> Path | None:
@@ -284,7 +303,7 @@ def read_library_manifest(library_json: Path) -> tuple[str, list[str], list[str]
     try:
         with library_json.open(encoding="utf-8") as f:
             data = json.load(f)
-    except Exception:
+    except (json.JSONDecodeError, OSError):
         logger.warning("[Rez] failed to read library manifest: %s", library_json)
         return "", [], []
 
@@ -316,7 +335,7 @@ def read_library_dependencies(library_json: Path) -> list[dict[str, str | bool]]
     try:
         with library_json.open(encoding="utf-8") as f:
             data = json.load(f)
-    except Exception:
+    except (json.JSONDecodeError, OSError):
         return []
 
     declarations = data.get("metadata", {}).get("declarations", [])
@@ -341,7 +360,9 @@ def build_direct_requires(pip_dependencies: list[str]) -> list[str]:
 
     resolved = resolve_full(pip_dependencies)
     direct_names = {pip_spec_name(spec) for spec in pip_dependencies}
-    return [f"{rez_name(pkg.pip_name)}-{pkg.version}" for pkg in resolved if pkg.pip_name.lower() in direct_names]
+    return [
+        f"{rez_name(pkg.pip_name)}-{pkg.version}" for pkg in resolved if pip_spec_name(pkg.pip_name) in direct_names
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -428,7 +449,7 @@ def resolve_rez_library_json_path(rez_family: str, version: str | None = None) -
     else:
         versions = sorted(
             (d for d in family_dir.iterdir() if d.is_dir() and (d / "package.py").exists()),
-            key=lambda p: p.name,
+            key=_version_sort_key,
             reverse=True,
         )
         if not versions:
@@ -480,7 +501,7 @@ def get_library_rez_package_version(library_name: str, library_file_path: Path |
 
     versions = sorted(
         (d for d in family_dir.iterdir() if d.is_dir() and (d / "package.py").exists()),
-        key=lambda p: p.name,
+        key=_version_sort_key,
         reverse=True,
     )
     if not versions:
@@ -545,7 +566,7 @@ def library_file_path_to_rez_family(library_file_path: Path) -> str:
                 library_file_path,
             )
             return family
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         logger.debug("[Rez] naming: git lookup failed for %s, falling back to parent dir", library_dir)
 
     family = _library_rez_name(library_dir.name)
@@ -656,7 +677,7 @@ def resolve_and_log_rez_context(package_specs: list[str]) -> list[str]:
         for pkg in resolved:
             logger.info("[Rez][execution]   resolved: %s", pkg)
         logger.info("[Rez][execution] total resolved packages: %d", len(resolved))
-    except Exception as exc:
+    except (OSError, subprocess.SubprocessError) as exc:
         logger.warning("[Rez][execution] rez probe error: %s", exc)
         return []
     else:
@@ -698,7 +719,7 @@ def resolve_rez_pythonpath(package_specs: list[str]) -> list[str]:
         for p in paths:
             logger.debug("[Rez]   PYTHONPATH entry: %s", p)
         logger.info("[Rez] resolved %d PYTHONPATH entries for %s", len(paths), package_specs)
-    except Exception as exc:
+    except (OSError, subprocess.SubprocessError) as exc:
         logger.warning("[Rez] PYTHONPATH resolve error: %s", exc)
         return []
     else:
@@ -722,9 +743,9 @@ def _read_pyproject_version(pyproject_path: Path) -> str | None:
     Checks ``[project] version`` (PEP 517/518) then ``[tool.poetry] version``.
     Returns None when the file cannot be read or contains no version.
     """
-    try:
-        import tomllib
+    import tomllib
 
+    try:
         with pyproject_path.open("rb") as f:
             data = tomllib.load(f)
 
@@ -736,7 +757,7 @@ def _read_pyproject_version(pyproject_path: Path) -> str | None:
         if version:
             return str(version)
 
-    except Exception:  # noqa: S110
+    except (OSError, tomllib.TOMLDecodeError):
         pass
 
     return None
@@ -970,7 +991,7 @@ def install_library_as_rez_package(  # noqa: PLR0913
 
     direct_names = {pip_spec_name(spec) for spec in pip_dependencies}
     resolved_requires = [
-        f"{rez_name(pkg.pip_name)}-{pkg.version}" for pkg in resolved if pkg.pip_name.lower() in direct_names
+        f"{rez_name(pkg.pip_name)}-{pkg.version}" for pkg in resolved if pip_spec_name(pkg.pip_name) in direct_names
     ]
 
     rez_uv_install(
@@ -1106,7 +1127,7 @@ def check_rez_health_detailed() -> RezHealthResult:
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, env=env, check=False, timeout=30)  # noqa: S603
-    except Exception as exc:
+    except (OSError, subprocess.SubprocessError) as exc:
         elapsed_ms = (time.monotonic() - start) * 1000
         logger.warning("[Rez] health check error: %s", exc)
         return RezHealthResult(
