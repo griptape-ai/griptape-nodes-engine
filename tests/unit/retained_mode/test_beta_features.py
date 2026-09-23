@@ -252,6 +252,14 @@ class TestLibraryBetaFeatures:
         assert list(parsed.features) == ["fast_upscale"]
         assert parsed.issues == []
 
+    @pytest.mark.parametrize("library_name", ["!!!", "日本語ツール"])
+    def test_a_name_with_no_letters_or_digits_drops_every_feature(self, library_name: str) -> None:
+        parsed = parse_library_beta_features(library_name, [_library_entry("one"), "not an object"])
+
+        assert parsed.features == {}
+        assert [issue.feature_id for issue in parsed.issues] == ["one", "#2"]
+        assert "no letters or digits" in parsed.issues[0].reason
+
     def test_date_issues(self) -> None:
         features = [
             _make_feature("fine"),

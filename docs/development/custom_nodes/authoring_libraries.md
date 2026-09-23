@@ -411,7 +411,9 @@ A few rules worth knowing:
     A `remove_by` more than 180 days away is also reported.
 - **Users' choices are stored per library** under `library_beta_features` in their config, keyed by
     your library's name in lowercase with spaces and punctuation turned into underscores. "Acme
-    Image Tools" becomes `library_beta_features.acme_image_tools.sharpen_after_upscale`.
+    Image Tools" becomes `library_beta_features.acme_image_tools.sharpen_after_upscale`. Only the
+    letters a to z and digits carry over, so a library name without any can't have beta features,
+    and two loaded libraries whose names become the same key are reported as a library problem.
 - **Engines released before library schema `0.14.0` ignore `beta_features`.** Set
     `library_schema_version` to `0.14.0` or later when you add them.
 

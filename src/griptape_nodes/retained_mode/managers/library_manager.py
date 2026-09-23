@@ -70,6 +70,7 @@ from griptape_nodes.retained_mode.beta_features import (
     LIBRARY_BETA_FEATURES_KEY,
     find_library_config_slug_collision,
     library_config_slug,
+    parse_library_beta_features,
 )
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import (
@@ -3030,10 +3031,10 @@ class LibraryManager(EngineScoped):
         Runs after registration, because the fitness check runs before any library is registered
         and so can't see the others. Only libraries that both declare beta features can collide.
         """
-        if not library_data.beta_features:
+        library_name = library_data.name
+        if not parse_library_beta_features(library_name, library_data.beta_features or []).features:
             return []
 
-        library_name = library_data.name
         other_names_with_features = [
             name
             for name in LibraryRegistry.list_libraries()

@@ -168,6 +168,21 @@ def parse_library_beta_features(library_name: str, entries: list[Any]) -> Parsed
     """
     features: dict[str, BetaFeature] = {}
     issues: list[LibraryBetaFeatureIssue] = []
+    if not library_config_slug(library_name):
+        # Without letters or digits in the name there is no key to store the user's choices under.
+        for index, entry in enumerate(entries):
+            feature_id = f"#{index + 1}"
+            if isinstance(entry, dict) and entry.get("id"):
+                feature_id = str(entry["id"])
+            issues.append(
+                LibraryBetaFeatureIssue(
+                    feature_id,
+                    "can't be used, because the library's name has no letters or digits to store its settings "
+                    "under. Add some to the library name",
+                )
+            )
+        return ParsedLibraryBetaFeatures(features=features, issues=issues)
+
     for index, entry in enumerate(entries):
         if not isinstance(entry, dict):
             issues.append(
