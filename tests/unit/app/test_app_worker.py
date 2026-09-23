@@ -97,7 +97,6 @@ def worker_manager() -> WorkerManager:
     gtn.library_manager.wait_for_execution_env = AsyncMock()
     wm = WorkerManager(engine=gtn, event_manager=MagicMock())
     wm.attach_transport(
-        ws_outgoing_queue=asyncio.Queue(),
         send_message=AsyncMock(),
         subscribe_to_topic=AsyncMock(),
         unsubscribe_from_topic=AsyncMock(),
@@ -126,15 +125,6 @@ class TestHandleRegisterWorkerRequest:
 
         assert _ENGINE in worker_manager._workers
         assert worker_manager._workers[_ENGINE].request_topic == _WORKER_REQUEST_TOPIC
-
-    @pytest.mark.asyncio
-    async def test_seeds_last_seen_timestamp(self, worker_manager: WorkerManager) -> None:
-        request = worker_events.RegisterWorkerRequest(worker_engine_id=_ENGINE, engine_version=engine_version)
-
-        await worker_manager.handle_register_worker_request(request)
-
-        assert _ENGINE in worker_manager._worker_last_seen
-        assert worker_manager._worker_last_seen[_ENGINE] > 0
 
     @pytest.mark.asyncio
     async def test_subscribes_to_worker_response_topic(self, worker_manager: WorkerManager) -> None:
@@ -369,7 +359,6 @@ class TestHandleRegisterWorkerRequestEngineVersion:
         await worker_manager.handle_register_worker_request(request)
 
         assert _ENGINE not in worker_manager._workers
-        assert _ENGINE not in worker_manager._worker_last_seen
         worker_manager._tx.subscribe_to_topic.assert_not_called()  # type: ignore[union-attr]
 
     @pytest.mark.asyncio
@@ -437,7 +426,6 @@ class TestHandleUnregisterWorkerRequest:
     @pytest.mark.asyncio
     async def test_removes_worker_from_registered_workers(self, worker_manager: WorkerManager) -> None:
         worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
-        worker_manager._worker_last_seen[_ENGINE] = 999.0
 
         request = worker_events.UnregisterWorkerRequest(worker_engine_id=_ENGINE)
         await worker_manager.handle_unregister_worker_request(request)
@@ -445,19 +433,8 @@ class TestHandleUnregisterWorkerRequest:
         assert _ENGINE not in worker_manager._workers
 
     @pytest.mark.asyncio
-    async def test_removes_worker_from_last_seen(self, worker_manager: WorkerManager) -> None:
-        worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
-        worker_manager._worker_last_seen[_ENGINE] = 999.0
-
-        request = worker_events.UnregisterWorkerRequest(worker_engine_id=_ENGINE)
-        await worker_manager.handle_unregister_worker_request(request)
-
-        assert _ENGINE not in worker_manager._worker_last_seen
-
-    @pytest.mark.asyncio
     async def test_unsubscribes_from_worker_response_topic(self, worker_manager: WorkerManager) -> None:
         worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
-        worker_manager._worker_last_seen[_ENGINE] = 999.0
 
         request = worker_events.UnregisterWorkerRequest(worker_engine_id=_ENGINE)
         await worker_manager.handle_unregister_worker_request(request)
@@ -467,7 +444,6 @@ class TestHandleUnregisterWorkerRequest:
     @pytest.mark.asyncio
     async def test_returns_success_with_engine_id(self, worker_manager: WorkerManager) -> None:
         worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
-        worker_manager._worker_last_seen[_ENGINE] = 999.0
 
         request = worker_events.UnregisterWorkerRequest(worker_engine_id=_ENGINE)
         result = await worker_manager.handle_unregister_worker_request(request)
@@ -490,7 +466,6 @@ class TestHandleUnregisterWorkerRequest:
         worker_manager._workers[_ENGINE] = WorkerRegistration(
             request_topic=_WORKER_REQUEST_TOPIC, worker_key="My Library"
         )
-        worker_manager._worker_last_seen[_ENGINE] = 999.0
         worker_manager._managed_worker_processes["My Library"] = proc
 
         await worker_manager.handle_unregister_worker_request(
@@ -511,11 +486,10 @@ class TestEvictionCountsUnansweredChallenges:
     async def test_a_worker_it_has_not_challenged_enough_survives(
         self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """`_worker_last_seen` is ancient here, which is exactly what used to evict it."""
+        """A worker past its challenge allowance is evicted."""
         monkeypatch.setattr(worker_manager, "heartbeat_interval_s", 0.01)
         monkeypatch.setattr(worker_manager, "heartbeat_timeout_s", 0.05)
         worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
-        worker_manager._worker_last_seen[_ENGINE] = 0.0
 
         task = asyncio.create_task(worker_manager.orchestrator_heartbeat_loop())
         await asyncio.sleep(0.025)
@@ -532,7 +506,6 @@ class TestEvictionCountsUnansweredChallenges:
         monkeypatch.setattr(worker_manager, "heartbeat_interval_s", 0.01)
         monkeypatch.setattr(worker_manager, "heartbeat_timeout_s", 0.01)
         worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
-        worker_manager._worker_last_seen[_ENGINE] = time.monotonic()
 
         task = asyncio.create_task(worker_manager.orchestrator_heartbeat_loop())
         await asyncio.sleep(0.05)
@@ -620,7 +593,6 @@ class TestRelayWorkerResult:
         await worker_manager.relay_worker_result(payload)
 
         worker_manager._tx.send_message.assert_not_called()  # type: ignore[union-attr]
-        assert _ENGINE in worker_manager._worker_last_seen
 
     @pytest.mark.asyncio
     async def test_heartbeat_with_malformed_topic_does_not_crash(self, worker_manager: WorkerManager) -> None:
@@ -680,17 +652,14 @@ class TestEvictWorker:
     @pytest.mark.asyncio
     async def test_removes_worker_from_state(self, worker_manager: WorkerManager) -> None:
         worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
-        worker_manager._worker_last_seen[_ENGINE] = 100.0
 
         await worker_manager.evict_worker(_ENGINE)
 
         assert _ENGINE not in worker_manager._workers
-        assert _ENGINE not in worker_manager._worker_last_seen
 
     @pytest.mark.asyncio
     async def test_calls_unsubscribe_for_response_topic(self, worker_manager: WorkerManager) -> None:
         worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
-        worker_manager._worker_last_seen[_ENGINE] = 100.0
 
         await worker_manager.evict_worker(_ENGINE)
 
@@ -707,7 +676,6 @@ class TestEvictWorker:
         worker_manager._workers[_ENGINE] = WorkerRegistration(
             request_topic=_WORKER_REQUEST_TOPIC, worker_key="My Library"
         )
-        worker_manager._worker_last_seen[_ENGINE] = 100.0
         worker_manager._managed_worker_processes["My Library"] = proc
 
         await worker_manager.evict_worker(_ENGINE)
@@ -776,7 +744,6 @@ class TestLibraryWorkerCleanup:
         worker_manager._workers[_ENGINE] = WorkerRegistration(
             request_topic=_WORKER_REQUEST_TOPIC, worker_key="My Library"
         )
-        worker_manager._worker_last_seen[_ENGINE] = 999.0
 
     @pytest.mark.asyncio
     async def test_unregister_removes_worker(self, worker_manager: WorkerManager) -> None:
@@ -1107,13 +1074,11 @@ class TestResetWorkers:
     async def test_clears_all_tracking_state(self, worker_manager: WorkerManager) -> None:
         worker_manager._managed_worker_processes["Lib A"] = _managed_proc_mock()
         worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key="Lib A")
-        worker_manager._worker_last_seen[_ENGINE] = 999.0
 
         await worker_manager.reset_workers()
 
         assert worker_manager._managed_worker_processes == {}
         assert worker_manager._workers == {}
-        assert worker_manager._worker_last_seen == {}
 
     @pytest.mark.asyncio
     async def test_does_not_clear_session_ready_event(self, worker_manager: WorkerManager) -> None:
@@ -1677,7 +1642,6 @@ class TestOrchestratorHeartbeatLoop:
         monkeypatch.setattr(worker_manager, "heartbeat_interval_s", 0.01)
         monkeypatch.setattr(worker_manager, "heartbeat_timeout_s", 0.0)
         worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
-        worker_manager._worker_last_seen[_ENGINE] = 0.0
 
         task = asyncio.create_task(worker_manager.orchestrator_heartbeat_loop())
         await asyncio.sleep(0.05)
@@ -1693,15 +1657,13 @@ class TestOrchestratorHeartbeatLoop:
         monkeypatch.setattr(worker_manager, "heartbeat_interval_s", 0.01)
         monkeypatch.setattr(worker_manager, "heartbeat_timeout_s", 60.0)
         worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
-        worker_manager._worker_last_seen[_ENGINE] = time.monotonic()
 
         task = asyncio.create_task(worker_manager.orchestrator_heartbeat_loop())
         await asyncio.sleep(0.05)
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 
-        # Sent directly rather than queued: a challenge left in a queue another task drains
-        # cannot be counted against the worker that never received it.
+        # A challenge is counted only once it has actually been sent.
         worker_manager._tx.send_message.assert_called()  # type: ignore[union-attr]
 
     @pytest.mark.asyncio
@@ -1711,7 +1673,6 @@ class TestOrchestratorHeartbeatLoop:
         monkeypatch.setattr(worker_manager, "heartbeat_interval_s", 0.01)
         monkeypatch.setattr(worker_manager, "heartbeat_timeout_s", 60.0)
         worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
-        worker_manager._worker_last_seen[_ENGINE] = time.monotonic()
 
         task = asyncio.create_task(worker_manager.orchestrator_heartbeat_loop())
         await asyncio.sleep(0.05)
@@ -1813,8 +1774,7 @@ class TestWorkerManagerDomainEventListeners:
         gtn.config_manager.get_config_value.side_effect = lambda _key, default, cast_type=float: cast_type(default)
         wm = WorkerManager(engine=gtn, event_manager=EventManager())
         wm.attach_transport(
-            ws_outgoing_queue=asyncio.Queue(),
-            send_message=AsyncMock(),
+                send_message=AsyncMock(),
             subscribe_to_topic=AsyncMock(),
             unsubscribe_from_topic=AsyncMock(),
             request_client=_FakeRequestClient(),  # type: ignore[arg-type]
@@ -2024,3 +1984,67 @@ class TestHeartbeatIntervalFloor:
 
         assert manager.heartbeat_interval_s == 2.5
         assert "cannot be used" not in caplog.text
+
+
+class TestChallengeSendFailure:
+    """A send that fails is the orchestrator's problem, not the worker's.
+
+    The counter decides eviction, so a challenge that never left must not be counted, and the
+    loop must survive a transport that raises while a connection is re-establishing.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_failed_send_is_not_counted_against_the_worker(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(worker_manager, "heartbeat_interval_s", 0.01)
+        worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
+        worker_manager._tx.send_message.side_effect = ConnectionError("no socket")  # type: ignore[union-attr]
+
+        task = asyncio.create_task(worker_manager.orchestrator_heartbeat_loop())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+        assert worker_manager._workers[_ENGINE].unanswered_challenges == 0
+
+    @pytest.mark.asyncio
+    async def test_a_failed_send_does_not_end_the_loop(
+        self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If the loop exits, nothing evicts a worker for the rest of the process's life."""
+        monkeypatch.setattr(worker_manager, "heartbeat_interval_s", 0.01)
+        worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
+        worker_manager._tx.send_message.side_effect = ConnectionError("no socket")  # type: ignore[union-attr]
+
+        task = asyncio.create_task(worker_manager.orchestrator_heartbeat_loop())
+        await asyncio.sleep(0.05)
+        still_running = not task.done()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+        assert still_running
+
+
+class TestChallengeAllowanceRounding:
+    """The allowance must not tolerate less silence than the configured timeout."""
+
+    def test_a_fractional_ratio_rounds_up(self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(worker_manager, "heartbeat_timeout_s", 12.0)
+        monkeypatch.setattr(worker_manager, "heartbeat_interval_s", 5.0)
+
+        # Nearest would give 2, evicting after ~10s against a 12s timeout.
+        assert worker_manager.unanswered_challenges_allowed == 3
+
+    def test_a_half_ratio_rounds_up(self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Banker's rounding makes `round(2.5)` 2, which is below the configured tolerance."""
+        monkeypatch.setattr(worker_manager, "heartbeat_timeout_s", 12.5)
+        monkeypatch.setattr(worker_manager, "heartbeat_interval_s", 5.0)
+
+        assert worker_manager.unanswered_challenges_allowed == 3
+
+    def test_an_exact_ratio_is_unchanged(self, worker_manager: WorkerManager, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(worker_manager, "heartbeat_timeout_s", 15.0)
+        monkeypatch.setattr(worker_manager, "heartbeat_interval_s", 5.0)
+
+        assert worker_manager.unanswered_challenges_allowed == 3

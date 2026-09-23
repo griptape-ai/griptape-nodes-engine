@@ -4,6 +4,7 @@ import asyncio
 import functools
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -70,7 +71,6 @@ class _WorkerTransport:
     the WebSocket client and request client exist.
     """
 
-    ws_outgoing_queue: asyncio.Queue
     send_message: Callable[[str, str, str | None], Awaitable[None]]
     subscribe_to_topic: Callable[[str], Awaitable[None]]
     unsubscribe_from_topic: Callable[[str], Awaitable[None]]
@@ -142,9 +142,6 @@ class WorkerManager(EngineScoped):
         # why termination is hopped back here. Captured in spawn_worker.
         self._spawn_loop: asyncio.AbstractEventLoop | None = None
 
-        # Orchestrator-side: worker_engine_id → monotonic timestamp of last heartbeat response
-        self._worker_last_seen: dict[str, float] = {}
-
         # Worker-side: monotonic timestamp of last heartbeat received from the orchestrator
         self._worker_heartbeat_last_received_at: float = 0.0
 
@@ -209,17 +206,17 @@ class WorkerManager(EngineScoped):
     def unanswered_challenges_allowed(self) -> int:
         """How many challenges a worker may leave unanswered before it is evicted.
 
-        Derived from the two configured values rather than stored, so tuning either keeps its
-        meaning and takes effect without a restart: the timeout still says how much silence is
-        tolerated, expressed in challenges rather than seconds. At least one, so a configuration
-        that rounds to zero cannot evict a worker the first time it is asked.
+        Derived from the two configured values rather than stored, so tuning either takes effect
+        without a restart. Rounded up, not nearest: with a 12s timeout and a 5s interval, nearest
+        gives 2 challenges and evicts after about 10s, tolerating less silence than the timeout
+        asks for. At least one, so no configuration evicts a worker the first time it is asked.
 
         Note that the timeout is read two ways. Here it sizes an allowance in challenges, which is
         why a slow sweep cannot evict a worker that was never asked. On the worker,
         `worker_heartbeat_monitor` compares it against elapsed time, because a worker can only
         measure silence from a peer it cannot poll.
         """
-        return max(1, round(self.heartbeat_timeout_s / self.heartbeat_interval_s))
+        return max(1, math.ceil(self.heartbeat_timeout_s / self.heartbeat_interval_s))
 
     @property
     def _tx(self) -> _WorkerTransport:
@@ -231,7 +228,6 @@ class WorkerManager(EngineScoped):
     def attach_transport(
         self,
         *,
-        ws_outgoing_queue: asyncio.Queue,
         send_message: Callable[[str, str, str | None], Awaitable[None]],
         subscribe_to_topic: Callable[[str], Awaitable[None]],
         unsubscribe_from_topic: Callable[[str], Awaitable[None]],
@@ -243,7 +239,6 @@ class WorkerManager(EngineScoped):
         called, methods that depend on the transport will raise RuntimeError.
         """
         self._transport = _WorkerTransport(
-            ws_outgoing_queue=ws_outgoing_queue,
             send_message=send_message,
             subscribe_to_topic=subscribe_to_topic,
             unsubscribe_from_topic=unsubscribe_from_topic,
@@ -269,7 +264,6 @@ class WorkerManager(EngineScoped):
         session_id = self.engine.get_session_id()
         request_topic = f"sessions/{session_id}/workers/{wid}/request"
         self._workers[wid] = WorkerRegistration(request_topic=request_topic, worker_key=request.library_name)
-        self._worker_last_seen[wid] = time.monotonic()
 
         if request.library_name:
             logger.info("Worker registered: %s → library '%s'", wid, request.library_name)
@@ -329,7 +323,6 @@ class WorkerManager(EngineScoped):
         wid = request.worker_engine_id
         session_id = self.engine.get_session_id()
         registration = self._workers.pop(wid, None)
-        self._worker_last_seen.pop(wid, None)
         worker_key = registration.worker_key if registration else None
         response_topic = f"sessions/{session_id}/workers/{wid}/response"
         await self._tx.unsubscribe_from_topic(response_topic)
@@ -363,10 +356,20 @@ class WorkerManager(EngineScoped):
                     request=worker_events.WorkerHeartbeatRequest(heartbeat_id=str(uuid.uuid4())),
                     response_topic=f"sessions/{session_id}/workers/{wid}/response",
                 )
-                # Sent, not enqueued: the queue is drained by another task, so counting the
-                # `put` charges a worker for challenges that may still be sitting in it. An
-                # orchestrator too busy to drain must not read as a worker too dead to answer.
-                await self._tx.send_message("EventRequest", hb.json(), registration.request_topic)
+                # Only a challenge that went out counts against the worker, and a send that fails
+                # must not end the loop: the transport raises while a connection is re-establishing,
+                # and both charging that to the worker and leaving nothing to evict it are the
+                # orchestrator's problem becoming the worker's.
+                try:
+                    await self._tx.send_message("EventRequest", hb.json(), registration.request_topic)
+                except Exception:
+                    logger.warning(
+                        "Could not challenge worker %s on '%s'; not counting it against the worker.",
+                        wid,
+                        registration.request_topic,
+                        exc_info=True,
+                    )
+                    continue
                 registration.unanswered_challenges += 1
                 logger.debug(
                     "Challenged worker %s on '%s'; %d unanswered of %d allowed.",
@@ -541,7 +544,6 @@ class WorkerManager(EngineScoped):
         # library's claim, and a claim surviving the reset refuses the reload's own spawn for it.
         self._spawns_in_flight.clear()
         self._workers.clear()
-        self._worker_last_seen.clear()
 
     async def route_to_worker(
         self,
@@ -641,7 +643,6 @@ class WorkerManager(EngineScoped):
         """Remove a worker from the registry and unsubscribe from its response topic."""
         session_id = self.engine.get_session_id()
         registration = self._workers.pop(worker_engine_id, None)
-        self._worker_last_seen.pop(worker_engine_id, None)
         lib_name = registration.worker_key if registration else None
         topic = f"sessions/{session_id}/workers/{worker_engine_id}/response"
         await self._tx.unsubscribe_from_topic(topic)
@@ -996,7 +997,7 @@ class WorkerManager(EngineScoped):
 
         The companion to `get_topics_to_subscribe`: that decides which messages arrive, this decides
         who claims them. Keyed on the role in one place so a filter cannot be installed for one role
-        and forgotten for the other, which is how a worker came to have none.
+        and forgotten for the other.
 
         Install these AFTER the RequestClient's own filter. They claim every result, so running one
         ahead of it would swallow the reply a caller is awaiting.
@@ -1343,7 +1344,6 @@ class WorkerManager(EngineScoped):
                 )
                 return
             worker_engine_id = m.group("worker_engine_id")
-            self._worker_last_seen[worker_engine_id] = time.monotonic()
             registration = self._workers.get(worker_engine_id)
             if registration is not None:
                 registration.unanswered_challenges = 0
