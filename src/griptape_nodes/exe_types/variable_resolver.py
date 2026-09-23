@@ -125,7 +125,7 @@ class VariableResolver:
         )
 
     @staticmethod
-    def resolve_value(
+    def resolve_value(  # noqa: PLR0911
         value: Any,
         variables: dict[str, str | int],
         node_name: str | None = None,
@@ -298,6 +298,7 @@ class VariableResolver:
         ``{VAR?}`` counts as a rewrite whether or not the variable exists, because
         the resolver substitutes "" for it either way.
         """
+
         def rewrites(text: str) -> bool:
             return any(
                 VariableResolver.resolve_macro_token(match.group(0), variables) != match.group(0)
