@@ -859,6 +859,35 @@ class TestParseFileUri:
         """An unterminated "[" makes urlparse raise ValueError; this must return None, not propagate."""
         assert parse_file_uri("file://[oops/path") is None
 
+    def test_rejects_unc_host_with_leading_dot(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A host must start on an alphanumeric character, so a leading dot is rejected."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        assert parse_file_uri("file://.server/share/f") is None
+
+    def test_rejects_unc_host_with_trailing_dot(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A host must end on an alphanumeric character, so a trailing dot is rejected."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        assert parse_file_uri("file://server./share/f") is None
+
+    def test_rejects_unc_host_with_leading_hyphen(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A host must start on an alphanumeric character, so a leading hyphen is rejected."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        assert parse_file_uri("file://-server/share/f") is None
+
+    def test_parses_unc_host_as_ip_literal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A bare (unbracketed) IPv4 address is a valid UNC host, unlike a bracketed IPv6 literal."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        uri = "file://192.168.1.5/share/f.txt"
+        result = parse_file_uri(uri)
+        assert result == "//192.168.1.5/share/f.txt"
+
+    def test_parses_unc_host_with_hyphen(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A hyphenated hostname (not at the start/end) is a valid UNC host."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        uri = "file://my-server/share/f.txt"
+        result = parse_file_uri(uri)
+        assert result == "//my-server/share/f.txt"
+
     def test_rejects_non_file_scheme(self) -> None:
         """Test that non-file:// URIs are rejected."""
         uri = "http://example.com/file.txt"
