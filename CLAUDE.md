@@ -79,7 +79,7 @@ Instance methods come first because they can call anything. Class methods come n
 
 ## Changelog
 
-`CHANGELOG.md` follows [Keep a Changelog 2.0.0](https://keepachangelog.com/en/2.0.0/). It is the record people read to learn what changed between versions, and each version's section leads its GitHub release. Its readers are artists using the editor, node library authors, and clients of the request API.
+`CHANGELOG.md` follows [Keep a Changelog 2.0.0](https://keepachangelog.com/en/2.0.0/). It is the record people read to learn what changed between versions, and each version's section is its GitHub release notes. Its readers are artists using the editor, node library authors, and clients of the request API.
 
 **Add an entry for every user-facing change** - In the same PR, add a bullet under `## [Unreleased]`. User-facing means anything a user notices after upgrading: node behavior, editor-visible behavior, saved workflow files, the node library API (`exe_types/core_types.py`, `GriptapeNodes`), request/response events, settings, CLI commands, and supported platforms or Python versions. After adding one, tell the user so they can review the wording. Machines draft, humans curate.
 

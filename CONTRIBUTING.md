@@ -251,7 +251,7 @@ This will start a local webserver (usually at `http://127.0.0.1:8000/`). The sit
 
 ## Changelog
 
-[`CHANGELOG.md`](CHANGELOG.md) follows [Keep a Changelog 2.0.0](https://keepachangelog.com/en/2.0.0/). Each version's section leads its GitHub release.
+[`CHANGELOG.md`](CHANGELOG.md) follows [Keep a Changelog 2.0.0](https://keepachangelog.com/en/2.0.0/). Each version's section is its GitHub release notes.
 
 A PR with a user-facing change adds a bullet under `## [Unreleased]`, grouped under one of `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, or `Security`:
 
@@ -395,6 +395,6 @@ Use this process to release bug fixes for a specific version without including n
 - Version tags follow the format `v{major}.{minor}.{patch}` (e.g., `v0.65.3`)
 - The `stable` tag always points to the latest stable release across all versions
 - The `version-bump-next-on-release.yml` GitHub Actions workflow opens a PR advancing `main` to the next minor version and rolling its changelog, and only for minor and major releases
-- The `stable-release.yml` workflow opens each GitHub release with that version's `CHANGELOG.md` section, followed by GitHub's generated list of merged PRs
+- The `stable-release.yml` workflow uses that version's `CHANGELOG.md` section as the GitHub release notes
 
 Thank you for contributing!
