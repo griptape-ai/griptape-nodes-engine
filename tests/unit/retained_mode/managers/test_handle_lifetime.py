@@ -753,11 +753,11 @@ class TestBatchTeardownIsOncePerObject:
                 owner=_owner(engine),
                 source="S",
                 key=key,
-                library="Lib",
+                group="Lib",
                 on_drop=lambda value: released.append(value.label),
             )
 
-        manager.drop_objects_for_library("Lib")
+        manager.drop_objects_for_group("Lib")
 
         assert released == ["shared"]
 

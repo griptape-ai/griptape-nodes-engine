@@ -82,7 +82,7 @@ class TestRemoteHandlerRouting:
         event_manager = EventManager()
         handler = _make_handler_with_fake_forward(event_manager)
 
-        with event_manager.worker_node_execution_scope():
+        with event_manager.node_execution_scope():
             result = await handler(_ProbeRequest(marker="m1"))
 
         assert isinstance(result, _ProbeResult)
@@ -110,14 +110,14 @@ class TestRemoteHandlerRouting:
     async def test_forwards_during_hydration_not_only_aprocess(self) -> None:
         """The gate is deliberately wider than ``aprocess``.
 
-        ``worker_node_execution_scope`` is opened by ``_hydrate_and_run_node_inner`` around BOTH
+        ``node_execution_scope`` is opened by ``_hydrate_and_run_node_inner`` around BOTH
         hydration and aprocess, so a request issued from ``before/after_value_set`` forwards too.
         No ``aprocess_scope()`` is entered here; only the refcount is active.
         """
         event_manager = EventManager()
         handler = _make_handler_with_fake_forward(event_manager)
 
-        with event_manager.worker_node_execution_scope():
+        with event_manager.node_execution_scope():
             result = await handler(_ProbeRequest(marker="hydrate"))
 
         assert isinstance(result, _ProbeResult)
@@ -144,7 +144,7 @@ class TestRemoteHandlerRouting:
         event_manager.forward_to_orchestrator = fake_forward  # type: ignore[method-assign]
         handler = RemoteHandler(original=original, event_manager=event_manager)
 
-        with event_manager.worker_node_execution_scope():
+        with event_manager.node_execution_scope():
             await handler(_ProbeRequest(marker="first"))
             await handler(_ProbeRequest(marker="second"))
 
@@ -196,7 +196,7 @@ class TestRemoteHandlerRouting:
         installed = event_manager.get_manager_for_request_type(ListConnectionsForNodeRequest)
         assert isinstance(installed, RemoteHandler)
 
-        with event_manager.worker_node_execution_scope():
+        with event_manager.node_execution_scope():
             result = await installed(ListConnectionsForNodeRequest(node_name="some-node"))
 
         assert isinstance(result, ListConnectionsForNodeResultSuccess)

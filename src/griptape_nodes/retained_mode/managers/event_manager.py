@@ -237,7 +237,7 @@ class EventManager(EngineScoped):
         self._worker_response_topic: str | None = None
         self._websocket_event_loop: asyncio.AbstractEventLoop | None = None
         self._forward_timeout_ms: int | None = None
-        # Node-execution refcount. Incremented on worker_node_execution_scope entry,
+        # Node-execution refcount. Incremented on node_execution_scope entry,
         # decremented on exit. Plain instance state guarded by a lock so any thread
         # -- including threads spawned inside third-party libraries (diffusers,
         # transformers, etc.) during node execution -- can observe it via
@@ -874,14 +874,17 @@ class EventManager(EngineScoped):
         self._worker_forwarding_enabled = True
 
     @contextmanager
-    def worker_node_execution_scope(self) -> Iterator[None]:
-        """Mark this worker as actively executing a node.
+    def node_execution_scope(self) -> Iterator[None]:
+        """Mark this process as actively executing a node.
 
         Increments a thread-safe refcount on entry and decrements on exit.
-        While the refcount is > 0, in_node_execution() returns True; the
-        worker-side RemoteHandler consults that flag to decide whether to
-        forward a request to the orchestrator or delegate to the original
-        local handler.
+        While the refcount is > 0, in_node_execution() returns True. Two
+        things read that flag: the worker-side RemoteHandler, to decide
+        whether to forward a request to the orchestrator or delegate to the
+        original local handler, and ResourceManager, which holds a release
+        hook back rather than freeing an object a running node may be using.
+        The second applies in-process too, which is why this is opened
+        wherever a node runs and not only on a worker.
 
         The refcount is plain instance state guarded by a lock, so any
         thread -- including threads spawned internally by third-party
@@ -904,7 +907,7 @@ class EventManager(EngineScoped):
                 self._node_execution_depth -= 1
 
     def in_node_execution(self) -> bool:
-        """Return True when this worker is currently inside a node-execution scope."""
+        """Return True when this process is currently inside a node-execution scope."""
         with self._node_execution_lock:
             return self._node_execution_depth > 0
 

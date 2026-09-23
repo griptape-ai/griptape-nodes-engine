@@ -384,7 +384,7 @@ class TestHandleRequestForwardingFromRunningLoop:
         event_manager.forward_to_orchestrator = fake_forward  # type: ignore[method-assign]
 
         try:
-            with event_manager.worker_node_execution_scope():
+            with event_manager.node_execution_scope():
                 result = event_manager.handle_request(_ForwardableProbeRequest())
         finally:
             ws_loop.call_soon_threadsafe(ws_loop.stop)
