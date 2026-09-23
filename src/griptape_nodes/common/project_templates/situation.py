@@ -47,6 +47,7 @@ class BuiltInSituation(StrEnum):
     SAVE_GRIPTAPE_NODES_PREVIEW = "save_griptape_nodes_preview"
     SAVE_STATIC_FILE = "save_static_file"
     SAVE_GRIPTAPE_NODES_METADATA = "save_griptape_nodes_metadata"
+    SAVE_ARTIFACT_PROVENANCE = "save_artifact_provenance"
     SAVE_WORKFLOW = "save_workflow"
     CREATE_VERSIONED_WORKFLOW = "create_versioned_workflow"
     SAVE_WORKFLOW_THUMBNAIL = "save_workflow_thumbnail"

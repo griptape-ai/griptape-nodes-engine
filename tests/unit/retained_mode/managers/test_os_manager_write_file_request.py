@@ -651,7 +651,9 @@ class TestSidecarMetadata:
         # clobbered by that pin; setting the configured value makes the pin land on temp_dir.
         config_manager.set_config_value("workspace_directory", str(temp_dir))
 
-        # Create a project template file so sidecar path resolution has a project to use
+        # Create a project template file so record path resolution has a project to
+        # use. The format gate widens to ALL_FILES so plain-text writes exercise the
+        # legacy-shim mechanics; the shipped default is covered in the provenance tests.
         project_yml = temp_dir / "project_template.yml"
         project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
         load_result = engine.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
@@ -663,8 +665,8 @@ class TestSidecarMetadata:
         engine.handle_request(SetCurrentProjectRequest(project_id=None))
         config_manager.set_config_value("workspace_directory", str(original_workspace))
 
-    def test_sidecar_not_written_without_file_metadata(self, engine: Engine, temp_dir: Path) -> None:
-        """Test that no sidecar is written when file_metadata is not provided."""
+    def test_nothing_recorded_without_file_metadata_or_provenance(self, engine: Engine, temp_dir: Path) -> None:
+        """No sidecar and no provenance record when neither election field is provided."""
         os_manager = engine.os_manager
         file_path = temp_dir / "output.txt"
 
@@ -672,33 +674,33 @@ class TestSidecarMetadata:
         result = os_manager.on_write_file_request(request)
 
         assert isinstance(result, WriteFileResultSuccess)
-        sidecar_path = temp_dir / ".griptape-nodes-metadata" / "output.txt.json"
-        assert not sidecar_path.exists(), "Sidecar should not be written when file_metadata is not provided"
+        assert result.provenance is None
+        assert not (temp_dir / ".griptape-nodes-metadata").exists()
+        assert not (temp_dir / "griptape-nodes-provenance").exists()
 
-    def test_sidecar_written_when_file_metadata_provided(self, engine: Engine, temp_dir: Path) -> None:
-        """Test that a sidecar is written when file_metadata is explicitly provided."""
-        import json as _json
-
+    def test_legacy_file_metadata_shims_to_provenance_record(self, engine: Engine, temp_dir: Path) -> None:
+        """Deprecated file_metadata callers get a provenance record instead of a sidecar."""
+        engine.handle_request(RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider))
         os_manager = engine.os_manager
-        file_path = temp_dir / "output.txt"
+        file_path = temp_dir / "output.png"
         file_metadata = SidecarContent(
-            situation=SituationMetadata(name="save_node_output", macro="{outputs}/output.txt"),
+            situation=SituationMetadata(name="save_node_output", macro="{outputs}/output.png"),
         )
 
-        request = WriteFileRequest(file_path=str(file_path), content="hello", file_metadata=file_metadata)
+        request = WriteFileRequest(file_path=str(file_path), content=_png_bytes(), file_metadata=file_metadata)
         result = os_manager.on_write_file_request(request)
 
         assert isinstance(result, WriteFileResultSuccess)
-        sidecar_path = temp_dir / ".griptape-nodes-metadata" / "output.txt.json"
-        assert sidecar_path.exists()
-        data = _json.loads(sidecar_path.read_text())
-        assert data["schema_version"] == "0.2.0"
-        assert "saved_at" in data
+        # The old mutable sidecar is retired.
+        assert not (temp_dir / ".griptape-nodes-metadata").exists()
+        # A provenance record was synthesized from the legacy metadata.
+        assert result.provenance is not None
+        record_files = list((temp_dir / "griptape-nodes-provenance" / "by-path" / "output.png").glob("*.yaml"))
+        assert len(record_files) == 1
 
-    def test_sidecar_contains_situation_info_when_provided(self, engine: Engine, temp_dir: Path) -> None:
-        """Test sidecar includes situation block when file_metadata has situation info."""
-        import json as _json
-
+    def test_shimmed_record_carries_situation_info(self, engine: Engine, temp_dir: Path) -> None:
+        """The synthesized record preserves the legacy caller's situation block."""
+        engine.handle_request(RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider))
         os_manager = engine.os_manager
         file_path = temp_dir / "image.png"
         file_metadata = SidecarContent(
@@ -709,31 +711,33 @@ class TestSidecarMetadata:
             ),
         )
 
-        request = WriteFileRequest(file_path=str(file_path), content=b"", file_metadata=file_metadata)
+        request = WriteFileRequest(file_path=str(file_path), content=_png_bytes(), file_metadata=file_metadata)
         result = os_manager.on_write_file_request(request)
 
         assert isinstance(result, WriteFileResultSuccess)
-        sidecar_path = temp_dir / ".griptape-nodes-metadata" / "image.png.json"
-        data = _json.loads(sidecar_path.read_text())
+        assert result.provenance is not None
+        record_dir = temp_dir / "griptape-nodes-provenance" / "by-path" / "image.png"
+        record_files = list(record_dir.glob("*.yaml"))
+        assert len(record_files) == 1
+        data = _yaml_load(record_files[0].read_text())
         assert data["situation"]["name"] == "save_node_output"
         assert data["situation"]["macro"] == "{outputs}/{node_name}.png"
         assert data["situation"]["policy"]["on_collision"] == "create_new"
         assert data["situation"]["policy"]["create_dirs"] is True
 
-    def test_sidecar_written_for_indexed_fallback_path(self, engine: Engine, temp_dir: Path) -> None:
-        """Test sidecar is written at the actual indexed fallback path, not the requested path."""
-        import json as _json
-
+    def test_record_keyed_on_indexed_fallback_path(self, engine: Engine, temp_dir: Path) -> None:
+        """The record keys on the actual walked name, not the requested path."""
+        engine.handle_request(RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider))
         os_manager = engine.os_manager
-        file_path = temp_dir / "output.txt"
-        file_path.write_text("Original")
+        file_path = temp_dir / "output.png"
+        file_path.write_bytes(b"prior bytes")
         file_metadata = SidecarContent(
-            situation=SituationMetadata(name="save_node_output", macro="{outputs}/output.txt"),
+            situation=SituationMetadata(name="save_node_output", macro="{outputs}/output.png"),
         )
 
         request = WriteFileRequest(
             file_path=str(file_path),
-            content="New content",
+            content=_png_bytes(),
             existing_file_policy=ExistingFilePolicy.CREATE_NEW,
             file_metadata=file_metadata,
         )
@@ -741,24 +745,26 @@ class TestSidecarMetadata:
 
         assert isinstance(result, WriteFileResultSuccess)
         actual_path = Path(result.final_file_path)
-        sidecar_path = actual_path.parent / ".griptape-nodes-metadata" / (actual_path.name + ".json")
-        assert sidecar_path.exists(), "Sidecar should be created at the actual indexed fallback path"
-        data = _json.loads(sidecar_path.read_text())
-        assert data["schema_version"] == "0.2.0"
+        assert actual_path.name == "output_1.png"
+        record_dir = temp_dir / "griptape-nodes-provenance" / "by-path" / actual_path.name
+        record_files = list(record_dir.glob("*.yaml"))
+        assert len(record_files) == 1
+        data = _yaml_load(record_files[0].read_text())
+        assert data["artifact"]["file_name"] == "output_1.png"
+        assert data["artifact"]["requested_path"] == str(file_path)
 
-    def test_sidecar_file_extension_unchanged_for_alias_extensions(self, engine: Engine, temp_dir: Path) -> None:
-        """Sidecar's ``file_extension`` variable must reflect the on-disk name, not the raw sniff.
+    def test_record_file_extension_unchanged_for_alias_extensions(self, engine: Engine, temp_dir: Path) -> None:
+        """The record situation's ``file_extension`` must reflect the on-disk name, not the raw sniff.
 
         Regression for the alias-extension case (jpg/jpeg, tif/tiff, m4v/mp4):
         the image provider sniffs JPEG bytes as ``"jpg"``, but writing to
         ``output.jpeg`` leaves the file at ``.jpeg`` on disk (no swap:
         ``canonical_extension("jpg") == canonical_extension("jpeg")``). The
-        sidecar's ``file_extension`` variable must therefore stay at what the
-        caller supplied (``"jpeg"``), not get rewritten to the raw sniff
-        (``"jpg"``).
+        record situation's ``file_extension`` variable must therefore stay at
+        what the caller supplied (``"jpeg"``), not get rewritten to the raw
+        sniff (``"jpg"``).
         """
-        import json as _json
-
+        engine.handle_request(RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider))
         os_manager = engine.os_manager
         file_path = temp_dir / "photo.jpeg"
         # Bind file_extension in the sidecar's situation variables so the
@@ -783,12 +789,20 @@ class TestSidecarMetadata:
         assert Path(result.final_file_path) == file_path
         assert file_path.exists()
 
-        sidecar_path = temp_dir / ".griptape-nodes-metadata" / "photo.jpeg.json"
-        assert sidecar_path.exists()
-        data = _json.loads(sidecar_path.read_text())
-        # The critical assertion: sidecar variable stayed at "jpeg" (the caller's
-        # value), not "jpg" (the raw sniff). Before the fix this returned "jpg".
+        record_dir = temp_dir / "griptape-nodes-provenance" / "by-path" / "photo.jpeg"
+        record_files = list(record_dir.glob("*.yaml"))
+        assert len(record_files) == 1
+        data = _yaml_load(record_files[0].read_text())
+        # The critical assertion: the situation variable stayed at "jpeg" (the
+        # caller's value), not "jpg" (the raw sniff). Before the fix this
+        # returned "jpg".
         assert data["situation"]["variables"]["file_extension"] == "jpeg"
+
+
+def _yaml_load(text: str) -> dict:
+    from ruamel.yaml import YAML
+
+    return YAML(typ="safe").load(text)
 
 
 def _png_bytes() -> bytes:

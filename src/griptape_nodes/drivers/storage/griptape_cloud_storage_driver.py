@@ -18,6 +18,7 @@ from griptape_nodes.utils.http_utils import request_with_retry, retry_on_transie
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from griptape_nodes.retained_mode.file_metadata.provenance_record import ProvenanceContent
     from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import SidecarContent
     from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 
@@ -171,7 +172,7 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
 
         return response_data["url"]
 
-    def save_file(
+    def save_file(  # noqa: PLR0913
         self,
         path: Path,
         file_content: bytes,
@@ -179,6 +180,7 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
         *,
         skip_metadata_injection: bool = False,  # noqa: ARG002
         file_metadata: SidecarContent | None = None,  # noqa: ARG002
+        provenance: ProvenanceContent | None = None,  # noqa: ARG002
     ) -> str:
         """Save a file to cloud storage via HTTP upload.
 
@@ -188,6 +190,7 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
             existing_file_policy: How to handle existing files. Defaults to OVERWRITE.
             skip_metadata_injection: Unused; cloud storage does not perform metadata injection.
             file_metadata: Ignored by cloud storage driver (sidecar metadata is local-only).
+            provenance: Ignored by cloud storage driver (provenance capture is local-only for now).
 
         Returns:
             The full asset URL for the saved file.

@@ -15,8 +15,11 @@ from griptape_nodes.retained_mode.events.project_events import (
     GetSituationResultSuccess,
     MacroPath,
 )
+from griptape_nodes.retained_mode.file_metadata.provenance_record import (
+    ProducingNodeIdentity,
+    ProvenanceContent,
+)
 from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import (
-    SidecarContent,
     SituationMetadata,
     SituationPolicy,
 )
@@ -91,6 +94,7 @@ class ProjectFileDestination(FileDestination):
         cls,
         filename: str,
         situation: str,
+        producing_node: ProducingNodeIdentity | None = None,
         **extra_vars: str | int,
     ) -> "ProjectFileDestination":
         """Build a ProjectFileDestination from a project situation template.
@@ -104,6 +108,9 @@ class ProjectFileDestination(FileDestination):
         Args:
             filename: Filename to parse into base and extension components.
             situation: Situation name to look up in the current project.
+            producing_node: Explicit identity of the node performing the save,
+                recorded in the provenance record. When omitted, the engine
+                infers the node from flow state and flags the record as inferred.
             **extra_vars: Additional macro variables (e.g., node_name="MyNode", _index=1).
         """
         result = GriptapeNodes.handle_request(GetSituationRequest(situation_name=situation))
@@ -144,17 +151,15 @@ class ProjectFileDestination(FileDestination):
         # same derived values the write used.
         macro_path = MacroPath(ParsedMacro(macro_template), variables)
 
-        file_metadata = (
-            SidecarContent(
-                situation=SituationMetadata(
-                    name=situation,
-                    macro=situation_obj.macro,
-                    policy=SituationPolicy(
-                        on_collision=situation_obj.policy.on_collision,
-                        create_dirs=situation_obj.policy.create_dirs,
-                    ),
-                    variables={k: str(v) for k, v in macro_path.variables.items()},
+        situation_metadata = (
+            SituationMetadata(
+                name=situation,
+                macro=situation_obj.macro,
+                policy=SituationPolicy(
+                    on_collision=situation_obj.policy.on_collision,
+                    create_dirs=situation_obj.policy.create_dirs,
                 ),
+                variables={k: str(v) for k, v in macro_path.variables.items()},
             )
             if situation_obj is not None
             else None
@@ -162,21 +167,22 @@ class ProjectFileDestination(FileDestination):
 
         # Absolute filenames bypass the situation macro: the caller is declaring
         # an explicit on-disk location, so honor it verbatim rather than treating
-        # the leading-slash directory as sub_dirs within {outputs}/etc. Drop the
-        # sidecar metadata too -- the situation macro + variables we computed
-        # above won't re-resolve to the actual on-disk location, so recording
-        # them would produce a dishonest provenance trail.
+        # the leading-slash directory as sub_dirs within {outputs}/etc. Provenance
+        # still captures (the record's path, hash, and node are the on-disk truth),
+        # but its situation block is dropped -- the situation macro + variables we
+        # computed above won't re-resolve to the actual on-disk location, so
+        # recording them would produce a dishonest provenance trail.
         if parts.directory.is_absolute():
             return cls(
                 filename,
                 existing_file_policy=existing_file_policy,
                 create_parents=create_dirs,
-                file_metadata=None,
+                provenance=ProvenanceContent(producing_node=producing_node, situation=None),
             )
 
         return cls(
             macro_path,
             existing_file_policy=existing_file_policy,
             create_parents=create_dirs,
-            file_metadata=file_metadata,
+            provenance=ProvenanceContent(producing_node=producing_node, situation=situation_metadata),
         )

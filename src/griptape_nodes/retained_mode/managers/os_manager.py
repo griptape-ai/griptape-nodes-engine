@@ -33,6 +33,7 @@ from griptape_nodes.common.macro_parser.exceptions import MacroResolutionFailure
 from griptape_nodes.common.macro_parser.formats import NumericPaddingFormat, SequenceFormat
 from griptape_nodes.common.macro_parser.resolution import partial_resolve
 from griptape_nodes.common.macro_parser.segments import ParsedStaticValue, ParsedVariable
+from griptape_nodes.common.project_templates.provenance_settings import ProvenanceFailurePolicy
 from griptape_nodes.common.project_templates.situation import BuiltInSituation
 from griptape_nodes.common.sequences import (
     InvalidSubsetBoundsError,
@@ -142,14 +143,16 @@ from griptape_nodes.retained_mode.events.resource_events import (
     RegisterResourceTypeRequest,
     RegisterResourceTypeResultSuccess,
 )
-from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import write_sidecar
+from griptape_nodes.retained_mode.file_metadata.provenance_record import ProvenanceContent
 from griptape_nodes.retained_mode.managers.artifact_providers import WriteVettingPolicy
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
+from griptape_nodes.retained_mode.managers.provenance_manager import ArtifactWriteFacts, ProvenanceCapturePlan
 from griptape_nodes.retained_mode.managers.resource_types.compute_resource import ComputeBackend, ComputeResourceType
 from griptape_nodes.retained_mode.managers.resource_types.cpu_resource import CPUResourceType
 from griptape_nodes.retained_mode.managers.resource_types.os_resource import Architecture, OSResourceType, Platform
 
 if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.file_metadata.provenance_record import ProvenanceWriteDetails
     from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
 
 # File is not in static directory (or not a local file), create small preview
@@ -2501,6 +2504,9 @@ class OSManager(EngineScoped):
         # the rename clobbers the prior save.
         # (https://github.com/griptape-ai/griptape-nodes-engine/issues/4924)
         # Strict mode fails here before touching the disk.
+        # Remember the requested suffix so a provenance record can report what
+        # the sniff-and-swap renamed the file FROM.
+        requested_suffix_before_alignment = file_path.suffix.lstrip(".").lower() or None
         alignment = self._apply_extension_coercion(request, file_path, sniffed_ext)
         if isinstance(alignment, WriteFileResultFailure):
             return alignment
@@ -2526,6 +2532,63 @@ class OSManager(EngineScoped):
         ):
             content = self.engine.artifact_manager.prepare_content_for_write(content, file_path.name)
 
+        # Provenance: resolve the capture/failure policies before any bytes move.
+        # The plan decides sequencing -- appends get a pre-flight (they cannot be
+        # rolled back), atomic overwrites capture BEFORE the replace (a record
+        # failure under fail_artifact_save then leaves the prior file untouched),
+        # and the exclusive-create modes capture after the write with unlink as
+        # the rollback. An inactive plan (no record elected, or legacy template)
+        # is dropped so every later check is a single None test.
+        provenance_content = request.provenance
+        if provenance_content is None and request.file_metadata is not None:
+            # Deprecated shim: legacy callers that still supply file_metadata get a
+            # provenance record synthesized from it. WARN_AND_CONTINUE, never the
+            # project default -- a legacy caller must not start hard-failing saves.
+            logger.debug(
+                "WriteFileRequest.file_metadata is deprecated; synthesizing a provenance election "
+                "(warn_and_continue). Migrate the caller to WriteFileRequest.provenance."
+            )
+            provenance_content = ProvenanceContent(
+                failure_policy=ProvenanceFailurePolicy.WARN_AND_CONTINUE,
+                situation=request.file_metadata.situation,
+            )
+
+        provenance_plan: ProvenanceCapturePlan | None = None
+        if provenance_content is not None:
+            plan = self.engine.provenance_manager.plan_capture(provenance_content, file_path)
+            if plan.active:
+                provenance_plan = plan
+        provenance_details: ProvenanceWriteDetails | None = None
+        provenance_warning: str | None = None
+        fail_save_on_provenance_error = (
+            provenance_plan is not None and provenance_plan.failure_policy == ProvenanceFailurePolicy.FAIL_ARTIFACT_SAVE
+        )
+
+        # Keep the provenance situation's file_extension consistent with the
+        # on-disk name after a sniff-and-swap, mirroring the sidecar fixup below.
+        if (
+            swapped_ext is not None
+            and provenance_content is not None
+            and provenance_content.situation is not None
+            and provenance_content.situation.variables is not None
+            and "file_extension" in provenance_content.situation.variables
+        ):
+            provenance_content.situation.variables["file_extension"] = swapped_ext
+
+        if provenance_plan is not None and request.append and fail_save_on_provenance_error:
+            preflight_error = self.engine.provenance_manager.preflight_record_dir(file_path)
+            if preflight_error is not None:
+                msg = (
+                    f"Attempted to write to file '{file_path}'. The save was stopped before changing the file "
+                    f"because this project requires provenance and the record location could not be prepared: "
+                    f"{preflight_error} Set the provenance failure policy to 'warn_and_continue' to save "
+                    f"without records."
+                )
+                return WriteFileResultFailure(
+                    failure_reason=FileIOFailureReason.PROVENANCE_WRITE_FAILED,
+                    result_details=msg,
+                )
+
         # Now attempt the write, based on our collision (existing file) policy.
         match request.existing_file_policy:
             case ExistingFilePolicy.FAIL | ExistingFilePolicy.OVERWRITE:
@@ -2538,6 +2601,38 @@ class OSManager(EngineScoped):
                     mode = "a" if request.append else "w"  # Append or overwrite
 
                 if mode == "w":
+                    # Atomic-overwrite provenance ordering: capture BEFORE the
+                    # replace when a record failure must fail the save. The final
+                    # path is already fixed (overwrites never collision-walk), so
+                    # a record failure here returns with the prior file untouched;
+                    # if the replace itself then fails, the just-written record is
+                    # rolled back so no record describes a save that never happened.
+                    if provenance_plan is not None and fail_save_on_provenance_error:
+                        pre_capture_bytes = self._content_bytes_for_provenance(content, request.encoding)
+                        if pre_capture_bytes is not None:
+                            capture = self.engine.provenance_manager.record_artifact_save(
+                                ArtifactWriteFacts(
+                                    final_file_path=file_path,
+                                    final_content_bytes=pre_capture_bytes,
+                                    extension_coerced_from=(
+                                        requested_suffix_before_alignment if swapped_ext is not None else None
+                                    ),
+                                ),
+                                provenance_content,  # type: ignore[arg-type]  # plan is active => content is set
+                            )
+                            if capture.failed:
+                                msg = (
+                                    f"Attempted to write to file '{file_path}'. The save was stopped (the previous "
+                                    f"file is unchanged) because this project requires provenance and the record "
+                                    f"could not be written: {capture.error_message} Set the provenance failure "
+                                    f"policy to 'warn_and_continue' to save without records."
+                                )
+                                return WriteFileResultFailure(
+                                    failure_reason=FileIOFailureReason.PROVENANCE_WRITE_FAILED,
+                                    result_details=msg,
+                                )
+                            provenance_details = capture.details
+
                     # Whole-file overwrites go through a sibling temp file + rename
                     # instead of truncating in place, so a concurrent reader (e.g. the
                     # static server streaming a preview to a browser) never observes a
@@ -2569,6 +2664,10 @@ class OSManager(EngineScoped):
                         fail_if_file_locked=True,
                     )
                 if result.failure_reason is not None:
+                    # A pre-captured record must not outlive a failed write.
+                    if provenance_details is not None:
+                        self.engine.provenance_manager.rollback_record(provenance_details)
+                        provenance_details = None
                     # error_message is guaranteed to be set when failure_reason is set
                     return WriteFileResultFailure(
                         failure_reason=result.failure_reason,
@@ -2817,26 +2916,51 @@ class OSManager(EngineScoped):
             msg = "Internal error: success path reached but file path or bytes not set"
             raise RuntimeError(msg)
 
-        # Sidecar provenance must reflect the on-disk extension, not the requested one.
-        # The actual reconciliation already happened at the top of the handler via
-        # the sniff-and-swap; this just keeps the sidecar's file_extension variable
-        # (when present) consistent with what the bytes turned out to be. Use
-        # ``swapped_ext`` (non-None only when a genuine swap happened) rather
-        # than the raw sniff: for alias pairs (jpg/jpeg, tif/tiff, m4v/mp4) the
-        # file lands at the caller's requested suffix, and the sidecar's
-        # ``file_extension`` should stay whatever the caller supplied.
-        if (
-            swapped_ext is not None
-            and request.file_metadata is not None
-            and request.file_metadata.situation is not None
-        ):
-            sidecar_variables = request.file_metadata.situation.variables
-            if sidecar_variables is not None and "file_extension" in sidecar_variables:
-                sidecar_variables["file_extension"] = swapped_ext
-
-        # Write sidecar metadata file if caller opted in by providing file_metadata
-        if request.file_metadata is not None:
-            write_sidecar(final_file_path, request.file_metadata, self.engine)
+        # Provenance capture for the modes that could not pre-capture (exclusive
+        # create, collision walk, append) -- the final path is only known here.
+        if provenance_plan is not None and provenance_details is None:
+            if request.append:
+                # The record hash covers the whole resulting file, not this
+                # save's appended chunk.
+                final_bytes_for_record = Path(final_file_path).read_bytes()
+            else:
+                final_bytes_for_record = self._content_bytes_for_provenance(content, request.encoding)
+            if final_bytes_for_record is None:
+                capture = None
+            else:
+                capture = self.engine.provenance_manager.record_artifact_save(
+                    ArtifactWriteFacts(
+                        final_file_path=Path(final_file_path),
+                        final_content_bytes=final_bytes_for_record,
+                        append=request.append,
+                        requested_path=str(file_path) if used_indexed_fallback else None,
+                        extension_coerced_from=(requested_suffix_before_alignment if swapped_ext is not None else None),
+                    ),
+                    provenance_content,  # type: ignore[arg-type]  # plan is active => content is set
+                )
+            if capture is not None and capture.failed:
+                if fail_save_on_provenance_error and not request.append:
+                    # FAIL/CREATE_NEW exclusively created this file; no prior
+                    # content existed, so unlinking is a true rollback.
+                    with contextlib.suppress(OSError):
+                        Path(final_file_path).unlink(missing_ok=True)
+                    msg = (
+                        f"Attempted to write to file '{final_file_path}'. The file could not keep its required "
+                        f"provenance record, so the save was rolled back: {capture.error_message} Set the "
+                        f"provenance failure policy to 'warn_and_continue' to save without records."
+                    )
+                    return WriteFileResultFailure(
+                        failure_reason=FileIOFailureReason.PROVENANCE_WRITE_FAILED,
+                        result_details=msg,
+                    )
+                # warn_and_continue, or an append (pre-flighted; cannot be rolled
+                # back): the save stands, the record failure is surfaced.
+                provenance_warning = capture.error_message
+                logger.warning(
+                    "Provenance record failed for '%s' (save kept): %s", final_file_path, capture.error_message
+                )
+            elif capture is not None:
+                provenance_details = capture.details
 
         if used_indexed_fallback:
             msg = f"File written to indexed path: {final_file_path} (original path '{path_display}' already existed)"
@@ -2844,9 +2968,14 @@ class OSManager(EngineScoped):
         else:
             result_details = f"File written successfully: {final_file_path}"
 
+        if provenance_warning is not None:
+            warned_msg = f"File written successfully: {final_file_path}. Provenance record failed: {provenance_warning}"
+            result_details = ResultDetails(message=warned_msg, level=logging.WARNING)
+
         return WriteFileResultSuccess(
             final_file_path=str(final_file_path),
             bytes_written=final_bytes_written,
+            provenance=provenance_details,
             result_details=result_details,
         )
 
@@ -3160,6 +3289,25 @@ class OSManager(EngineScoped):
             return FileIOFailureReason.POLICY_NO_CREATE_PARENT_DIRS
 
         return None
+
+    @staticmethod
+    def _content_bytes_for_provenance(content: str | bytes, encoding: str) -> bytes | None:
+        """The exact bytes the write pipeline puts on disk, for record hashing.
+
+        Mirrors the text-mode newline translation the write helpers apply so a
+        record's content hash matches the on-disk bytes on every platform.
+        Returns None when the text cannot be encoded -- the write itself fails
+        with ENCODING_ERROR moments later, so no record should exist for it.
+        """
+        if isinstance(content, bytes):
+            return content
+        text = content
+        if os.linesep != "\n":
+            text = text.replace("\n", os.linesep)
+        try:
+            return text.encode(encoding)
+        except UnicodeEncodeError:
+            return None
 
     def _attempt_atomic_file_write(  # noqa: PLR0911
         self,

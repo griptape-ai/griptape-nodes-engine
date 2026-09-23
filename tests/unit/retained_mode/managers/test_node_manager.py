@@ -1145,3 +1145,54 @@ class TestNodeCreationFailureDescription:
         )
 
         assert description == "boom"
+
+
+class TestFlowLookupDuringNodeConstruction:
+    """A node __init__ asking for its flow is an expected miss and must not log at ERROR.
+
+    Regression: serialization constructs an ephemeral 'REFERENCE NODE' instance per node;
+    node types whose __init__ issues GetFlowForNodeRequest (e.g. variable nodes populating
+    dropdowns) flooded the log with one ERROR per node per flow serialization once
+    provenance capture began serializing on every artifact save.
+    """
+
+    def test_miss_inside_constructing_node_logs_debug_not_error(
+        self, engine: Engine, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging as _logging
+
+        from griptape_nodes.node_library.library_registry import LibraryRegistry
+        from griptape_nodes.retained_mode.events.node_events import (
+            GetFlowForNodeRequest,
+            GetFlowForNodeResultFailure,
+        )
+
+        with caplog.at_level(_logging.DEBUG), LibraryRegistry.constructing_node():
+            result = engine.handle_request(GetFlowForNodeRequest(node_name="REFERENCE NODE"))
+
+        assert isinstance(result, GetFlowForNodeResultFailure)
+        error_logs = [
+            record
+            for record in caplog.records
+            if record.levelno >= _logging.ERROR and "REFERENCE NODE" in record.getMessage()
+        ]
+        assert not error_logs
+
+    def test_miss_outside_construction_still_logs_error(self, engine: Engine, caplog: pytest.LogCaptureFixture) -> None:
+        import logging as _logging
+
+        from griptape_nodes.retained_mode.events.node_events import (
+            GetFlowForNodeRequest,
+            GetFlowForNodeResultFailure,
+        )
+
+        with caplog.at_level(_logging.DEBUG):
+            result = engine.handle_request(GetFlowForNodeRequest(node_name="TrulyMissingNode"))
+
+        assert isinstance(result, GetFlowForNodeResultFailure)
+        error_logs = [
+            record
+            for record in caplog.records
+            if record.levelno >= _logging.ERROR and "TrulyMissingNode" in record.getMessage()
+        ]
+        assert error_logs

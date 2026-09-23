@@ -10,8 +10,10 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from griptape_nodes.common.project_templates.provenance_settings import ProvenanceCapturePolicy
 from griptape_nodes.files.path_utils import parse_static_server_url
 from griptape_nodes.retained_mode.engine import current_engine
+from griptape_nodes.retained_mode.file_metadata.provenance_record import ProvenanceContent
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +120,16 @@ def _upload_file_to_static_storage(file_path: Path, artifact_type: type[Any]) ->
         file_data = file_path.read_bytes()
         file_name = file_path.name
         static_files_manager = current_engine().static_files_manager
-        url = static_files_manager.save_static_file(file_data, file_name)
+        # Ingestion copies are deliberately provenance-free: this write is the
+        # engine normalizing an INPUT into servable form, not producing an
+        # artifact. The consumer's record still links this copy as a parent by
+        # path and content hash (with record_id null -- a documented ingestion
+        # boundary), so lineage keeps the input's identity without a record.
+        url = static_files_manager.save_static_file(
+            file_data,
+            file_name,
+            provenance=ProvenanceContent(capture_policy=ProvenanceCapturePolicy.NO_PROVENANCE_RECORDED),
+        )
         return artifact_type(url)
     except Exception as e:
         logger.debug("Failed to upload file '%s' to static storage: %s", file_path, e)

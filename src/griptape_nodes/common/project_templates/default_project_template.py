@@ -230,7 +230,7 @@ DEFAULT_PROJECT_TEMPLATE_V0 = ProjectTemplate(
 # and routed by file_extension_directory; adds 3d/splat extension categories. New
 # projects get this baseline; v0 projects are unaffected (they merge onto V0 above).
 DEFAULT_PROJECT_TEMPLATE_V1 = ProjectTemplate(
-    project_template_schema_version="1.0.0",
+    project_template_schema_version="1.1.0",
     name="Default Project",
     description="System default configuration",
     directories={
@@ -267,7 +267,14 @@ DEFAULT_PROJECT_TEMPLATE_V1 = ProjectTemplate(
         "griptape-nodes-metadata": DirectoryDefinition(
             name="griptape-nodes-metadata",
             path_macro="{workflow_dir?:/}.griptape-nodes-metadata",
-            description="Sidecar metadata for project files; mirrors source-file hierarchy.",
+            description="Sidecar metadata for project files; mirrors source-file hierarchy. Deprecated: superseded by griptape-nodes-provenance.",
+        ),
+        # Deliberately visible (no dot prefix): provenance records are canonical
+        # work product users commit and ship, unlike the regenerable caches above.
+        "griptape-nodes-provenance": DirectoryDefinition(
+            name="griptape-nodes-provenance",
+            path_macro="{workflow_dir?:/}griptape-nodes-provenance",
+            description="Immutable per-save provenance records; canonical records under by-path/, content-hash pointers under by-hash/, flow snapshots under snapshots/.",
         ),
         "griptape-nodes-thumbnails": DirectoryDefinition(
             name="griptape-nodes-thumbnails",
@@ -383,6 +390,17 @@ DEFAULT_PROJECT_TEMPLATE_V1 = ProjectTemplate(
                 create_dirs=True,
             ),
             fallback=BuiltInSituation.SAVE_FILE,
+        ),
+        BuiltInSituation.SAVE_ARTIFACT_PROVENANCE: SituationTemplate(
+            name=BuiltInSituation.SAVE_ARTIFACT_PROVENANCE,
+            description="Save an immutable provenance record with preserved directory hierarchy",
+            macro="{griptape-nodes-provenance}/by-path/{drive_volume_mount?:/}{source_relative_path?:/}{source_file_name}/{provenance_record_id}.yaml",
+            policy=SituationPolicy(
+                # Record IDs are unique by construction; a collision is a bug that must surface.
+                on_collision=SituationFilePolicy.FAIL,
+                create_dirs=True,
+            ),
+            fallback=None,
         ),
         BuiltInSituation.SAVE_WORKFLOW: SituationTemplate(
             name=BuiltInSituation.SAVE_WORKFLOW,

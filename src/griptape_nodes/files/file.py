@@ -36,6 +36,7 @@ from griptape_nodes.retained_mode.events.project_events import (
     MacroPath,
     PathResolutionFailureReason,
 )
+from griptape_nodes.retained_mode.file_metadata.provenance_record import ProvenanceContent
 from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import (
     SidecarContent,
     SituationMetadata,
@@ -277,6 +278,7 @@ class File:
         file_path: str | MacroPath,
         *,
         file_metadata: SidecarContent | None = None,
+        provenance: ProvenanceContent | None = None,
     ) -> None:
         """Store file reference. No I/O is performed.
 
@@ -288,10 +290,16 @@ class File:
         Args:
             file_path: Path to the file. Can be a plain string or a MacroPath
                 (which contains macro variables).
-            file_metadata: Optional caller-provided context to include in the sidecar
-                metadata file alongside auto-collected workflow metadata.
+            file_metadata: Deprecated: superseded by ``provenance``. Retained one
+                release so legacy callers keep producing (warn-level) records via
+                the OSManager shim.
+            provenance: Optional provenance election for writes through this file.
+                When omitted, a MacroPath-backed file elects capture with a
+                minimal situation context (mirroring the old sidecar behavior);
+                a plain-string path elects nothing.
         """
         self._file_metadata = file_metadata
+        self._provenance = provenance
         if isinstance(file_path, str):
             try:
                 parsed = ParsedMacro(file_path)
@@ -725,7 +733,7 @@ class File:
             existing_file_policy=existing_file_policy,
             append=append,
             create_parents=create_parents,
-            file_metadata=self._build_file_metadata(),
+            provenance=self._build_provenance(),
             coerce_extension_to_match_bytes=coerce_extension_to_match_bytes,
         )
         result = GriptapeNodes.handle_request(request)
@@ -777,7 +785,7 @@ class File:
             existing_file_policy=existing_file_policy,
             append=append,
             create_parents=create_parents,
-            file_metadata=self._build_file_metadata(),
+            provenance=self._build_provenance(),
             coerce_extension_to_match_bytes=coerce_extension_to_match_bytes,
         )
         result = await GriptapeNodes.ahandle_request(request)
@@ -791,17 +799,21 @@ class File:
 
         return Path(cast("WriteFileResultSuccess", result).final_file_path)
 
-    def _build_file_metadata(self) -> SidecarContent | None:
-        """Build SidecarContent from MacroPath variables and caller-provided metadata.
+    def _build_provenance(self) -> ProvenanceContent | None:
+        """Build the provenance election for writes through this file.
 
-        Caller-provided metadata takes full precedence. If only a MacroPath is present
-        (no caller metadata), the macro template and variables are captured as a minimal
-        SituationMetadata.
+        Caller-provided provenance takes full precedence. A legacy caller that
+        supplied only ``file_metadata`` gets its situation carried into a
+        default election. Otherwise a MacroPath-backed file elects capture with
+        a minimal situation context (macro template + variables, mirroring the
+        old sidecar behavior); a plain-string path elects nothing.
         """
+        if self._provenance is not None:
+            return self._provenance
         if self._file_metadata is not None:
-            return self._file_metadata
+            return ProvenanceContent(situation=self._file_metadata.situation)
         if isinstance(self._file_path, MacroPath):
-            return SidecarContent(
+            return ProvenanceContent(
                 situation=SituationMetadata(
                     macro=self._file_path.parsed_macro.template,
                     variables={k: str(v) for k, v in self._file_path.variables.items()},
@@ -828,6 +840,7 @@ class FileDestination:
         append: bool = False,
         create_parents: bool = True,
         file_metadata: SidecarContent | None = None,
+        provenance: ProvenanceContent | None = None,
         coerce_extension_to_match_bytes: bool = True,
     ) -> None:
         """Store file path and write configuration. No I/O is performed.
@@ -840,14 +853,16 @@ class FileDestination:
             append: If True, append to an existing file. Defaults to False.
             create_parents: If True, create parent directories if missing.
                 Defaults to True.
-            file_metadata: Optional caller-provided context to include in the sidecar
-                metadata file alongside auto-collected workflow metadata.
+            file_metadata: Deprecated: superseded by ``provenance``. Retained one
+                release for legacy callers.
+            provenance: Optional provenance election for writes through this
+                destination; see ``File`` for the defaulting behavior.
             coerce_extension_to_match_bytes: If True (default), the OSManager
                 rewrites the on-disk suffix to match the sniffed bytes when
                 they disagree. If False, the write fails with an
                 ``EXTENSION_MISMATCH`` error and no file is left on disk.
         """
-        self._file = File(file_path, file_metadata=file_metadata)
+        self._file = File(file_path, file_metadata=file_metadata, provenance=provenance)
         self._existing_file_policy = existing_file_policy
         self._append = append
         self._create_parents = create_parents

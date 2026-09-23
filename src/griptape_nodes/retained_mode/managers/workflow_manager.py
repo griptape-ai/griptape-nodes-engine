@@ -2432,11 +2432,10 @@ class WorkflowManager(EngineScoped):
         semantics). Pass ``create_versioned_workflow`` for the versioned-save
         flow that bumps the padded index every save (issue #4945).
         """
-        extra_vars: dict[str, str | int] = {}
         if sub_dirs:
-            extra_vars["sub_dirs"] = sub_dirs
-
-        destination = ProjectFileDestination.from_situation(file_name, situation_name, **extra_vars)
+            destination = ProjectFileDestination.from_situation(file_name, situation_name, sub_dirs=sub_dirs)
+        else:
+            destination = ProjectFileDestination.from_situation(file_name, situation_name)
         relative_file_path = str(Path(sub_dirs) / file_name) if sub_dirs else file_name
         return WorkflowManager.WorkflowSavePath(
             destination=destination,
@@ -3488,6 +3487,36 @@ class WorkflowManager(EngineScoped):
             file_path=save_file_result.file_path,
             workflow_metadata=workflow_metadata,
             result_details=ResultDetails(message=details, level=logging.INFO),
+        )
+
+    def render_workflow_file_content(
+        self,
+        *,
+        serialized_flow_commands: SerializedFlowCommands,
+        file_name: str,
+        creation_date: datetime | None = None,
+    ) -> str:
+        """Render the exact workflow .py content a save would write, without touching disk or the registry.
+
+        Used by provenance capture to embed a durable workflow snapshot in
+        records: the .py format is the engine's versioned, migration-supported
+        container, so the rendered text can be extracted and loaded years later.
+        No version stamps roll and nothing is registered.
+
+        Raises:
+            TypeError: If the engine version cannot be determined.
+            ValueError: If the metadata header cannot be generated.
+        """
+        if creation_date is None:
+            creation_date = datetime.now(tz=UTC)
+        workflow_metadata = self._generate_workflow_metadata_from_commands(
+            serialized_flow_commands=serialized_flow_commands,
+            file_name=file_name,
+            creation_date=creation_date,
+        )
+        return self._generate_workflow_file_content(
+            serialized_flow_commands=serialized_flow_commands,
+            workflow_metadata=workflow_metadata,
         )
 
     def _generate_workflow_metadata_from_commands(  # noqa: PLR0913

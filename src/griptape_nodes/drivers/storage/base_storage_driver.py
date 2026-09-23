@@ -11,6 +11,7 @@ from griptape_nodes.retained_mode.events.os_events import ExistingFilePolicy
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from griptape_nodes.retained_mode.file_metadata.provenance_record import ProvenanceContent
     from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import SidecarContent
     from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 
@@ -118,7 +119,7 @@ class BaseStorageDriver(ABC):
         ...
 
     @abstractmethod
-    def save_file(
+    def save_file(  # noqa: PLR0913
         self,
         path: Path,
         file_content: bytes,
@@ -126,6 +127,7 @@ class BaseStorageDriver(ABC):
         *,
         skip_metadata_injection: bool = False,
         file_metadata: SidecarContent | None = None,
+        provenance: ProvenanceContent | None = None,
     ) -> str:
         """Save a file to storage.
 
@@ -135,6 +137,7 @@ class BaseStorageDriver(ABC):
             existing_file_policy: How to handle existing files. Defaults to OVERWRITE.
             skip_metadata_injection: If True, skip automatic workflow metadata injection.
             file_metadata: Optional caller-provided context for sidecar metadata generation.
+            provenance: Optional provenance election forwarded to the write; None preserves the legacy shim behavior.
                            Passed through to WriteFileRequest; ignored by cloud storage drivers.
 
         Returns:

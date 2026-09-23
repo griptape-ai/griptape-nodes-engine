@@ -5250,9 +5250,19 @@ class NodeManager(EngineScoped):
                 result_details=f"Successfully retrieved flow '{flow_name}' for node '{request.node_name}'.",
             )
         except KeyError:
-            return GetFlowForNodeResultFailure(
-                result_details=f"Node '{request.node_name}' not found or not assigned to any flow.",
-            )
+            message = f"Node '{request.node_name}' not found or not assigned to any flow."
+            if LibraryRegistry.is_constructing_node():
+                # A node __init__ asking for its own flow is an EXPECTED miss:
+                # the instance isn't placed in a flow yet (and may never be --
+                # serialization constructs ephemeral reference instances, one
+                # per node per flow serialization). The failure result is
+                # unchanged; only the log level drops, so real lookups gone
+                # wrong still surface as errors without flooding every
+                # serialization-heavy path (e.g. provenance capture on save).
+                return GetFlowForNodeResultFailure(
+                    result_details=ResultDetails(message=message, level=logging.DEBUG),
+                )
+            return GetFlowForNodeResultFailure(result_details=message)
 
     def on_migrate_parameter_request(
         self, request: MigrateParameterRequest

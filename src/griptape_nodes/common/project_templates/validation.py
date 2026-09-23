@@ -34,6 +34,7 @@ class ProjectOverrideCategory(StrEnum):
     METADATA = "metadata"
     FILE_EXTENSION_DIRECTORY = "file_extension_directory"
     VARIABLE = "variable"
+    PROVENANCE = "provenance"
 
 
 class ProjectOverrideAction(StrEnum):

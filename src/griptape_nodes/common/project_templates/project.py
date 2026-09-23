@@ -11,6 +11,7 @@ from ruamel.yaml import YAML
 
 from griptape_nodes.common.project_templates.directory import DirectoryDefinition
 from griptape_nodes.common.project_templates.project_path import PerPlatformProjectPath
+from griptape_nodes.common.project_templates.provenance_settings import ProvenanceSettings
 from griptape_nodes.common.project_templates.situation import SituationTemplate
 from griptape_nodes.common.project_templates.validation import (
     ProjectOverrideAction,
@@ -45,7 +46,7 @@ def build_project_yaml() -> YAML:
 class ProjectTemplate(BaseModel):
     """Complete project template loaded from project.yml."""
 
-    LATEST_SCHEMA_VERSION: ClassVar[str] = "1.0.0"
+    LATEST_SCHEMA_VERSION: ClassVar[str] = "1.1.0"
 
     project_template_schema_version: str = Field(description="Schema version for the project template")
     name: str = Field(description="Name of the project")
@@ -133,6 +134,16 @@ class ProjectTemplate(BaseModel):
         default_factory=dict,
         description="Mapping of file extension (without leading dot) to a macro (plain name or `{...}` template) used to populate the {file_extension_directory} macro variable. This variable is only available inside situation macros (the filename layer, resolved per-file at write time), not in directory or environment path_macros.",
     )
+    provenance: ProvenanceSettings | None = Field(
+        default=None,
+        description=(
+            "Project-level provenance defaults. Saves whose provenance policies are "
+            "'inherit_project_policy' resolve against this block; when absent, engine "
+            "defaults apply. Merged atomically like a situation policy: an overlay "
+            "block replaces the base wholesale, an explicit null clears an inherited "
+            "block, and an omitted key inherits the base."
+        ),
+    )
 
     def get_situation(self, situation_name: str) -> SituationTemplate | None:
         """Get a situation by name, returns None if not found."""
@@ -142,7 +153,7 @@ class ProjectTemplate(BaseModel):
         """Get a directory definition by logical name."""
         return self.directories.get(directory_name)
 
-    def to_overlay_yaml(self, base: ProjectTemplate) -> str:  # noqa: C901
+    def to_overlay_yaml(self, base: ProjectTemplate) -> str:  # noqa: C901, PLR0912
         """Export only user customizations relative to a base template as YAML.
 
         Per-item atomicity: if a situation or directory differs from the base
@@ -232,6 +243,12 @@ class ProjectTemplate(BaseModel):
         )
         if file_extension_directories_overlay:
             output["file_extension_directories"] = file_extension_directories_overlay
+
+        # Provenance settings: per-block atomic like SituationPolicy. Emit the full
+        # block when it diverges from base; an explicit null tombstones an inherited
+        # block on round-trip.
+        if self_dump.get("provenance") != base_dump.get("provenance"):
+            output["provenance"] = self_dump.get("provenance")
 
         return self._dump_yaml(output)
 
@@ -569,6 +586,40 @@ class ProjectTemplate(BaseModel):
                 action=action,
             )
 
+        # Provenance settings: per-block atomic (like SituationPolicy). An overlay
+        # block replaces the base wholesale after validation; an explicit null
+        # tombstones an inherited block; an omitted key inherits the base. A block
+        # that fails validation is reported and the base is kept (fault-tolerant,
+        # matching situations/directories).
+        merged_provenance = base.provenance
+        if overlay.clears_provenance:
+            merged_provenance = None
+            validation_info.add_override(
+                category=ProjectOverrideCategory.PROVENANCE,
+                name="provenance",
+                action=ProjectOverrideAction.REMOVED,
+            )
+        elif overlay.provenance is not None:
+            try:
+                merged_provenance = ProvenanceSettings.model_validate(overlay.provenance)
+                validation_info.add_override(
+                    category=ProjectOverrideCategory.PROVENANCE,
+                    name="provenance",
+                    action=ProjectOverrideAction.MODIFIED
+                    if base.provenance is not None
+                    else ProjectOverrideAction.ADDED,
+                )
+            except ValidationError as e:
+                for error in e.errors():
+                    error_field_path = ".".join(str(loc) for loc in error["loc"])
+                    full_field_path = f"provenance.{error_field_path}" if error_field_path else "provenance"
+                    validation_info.add_error(
+                        field_path=full_field_path,
+                        message=error["msg"],
+                        line_number=overlay.line_info.get_line(full_field_path)
+                        or overlay.line_info.get_line("provenance"),
+                    )
+
         # Description: overlay value wins; explicit null clears; absent inherits base.
         if overlay.clears_description:
             merged_description = None
@@ -620,5 +671,6 @@ class ProjectTemplate(BaseModel):
             environment=merged_environment,
             variables=merged_variables,
             file_extension_directories=merged_file_extension_directories,
+            provenance=merged_provenance,
             description=merged_description,
         )
