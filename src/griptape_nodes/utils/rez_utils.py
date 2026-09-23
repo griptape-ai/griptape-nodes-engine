@@ -761,7 +761,7 @@ def _read_pyproject_version(pyproject_path: Path) -> str | None:
             return str(version)
 
     except (OSError, tomllib.TOMLDecodeError):
-        pass
+        logger.debug("Unable to read version from %s", pyproject_path, exc_info=True)
 
     return None
 
