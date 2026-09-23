@@ -109,6 +109,22 @@ class TestParameterNumberSoftLimits:
         assert param.soft_limits is True
         run_validators(param, 250.0)
 
+    def test_soft_limits_keeps_a_slider_passed_via_traits(self) -> None:
+        param = ParameterFloat(name="defocus", traits={Slider(min_val=MIN_VAL, max_val=MAX_VAL)})
+
+        param.soft_limits = True
+
+        assert param.slider is True
+        assert param.soft_limits is True
+        assert (param.min_val, param.max_val) == (MIN_VAL, MAX_VAL)
+        run_validators(param, 250.0)
+
+        param.soft_limits = False
+
+        assert param.slider is True
+        with pytest.raises(ValueError, match=OUT_OF_RANGE_ERROR):
+            run_validators(param, 250.0)
+
     def test_soft_limits_requires_a_slider(self) -> None:
         with pytest.raises(ValueError, match="soft_limits only applies to sliders"):
             ParameterFloat(name="defocus", min_val=MIN_VAL, max_val=MAX_VAL, soft_limits=True)

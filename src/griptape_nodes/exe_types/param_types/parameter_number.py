@@ -326,7 +326,10 @@ class ParameterNumber(Parameter):
             msg = f"{self.name}: Cannot enable soft_limits without a slider"
             raise ValueError(msg)
         self._soft_limits = value
-        self._update_constraint_traits()
+        # Rebuild from each trait's own range: a Slider passed via traits= never sets _min_val/_max_val.
+        for trait in self.find_elements_by_type(Slider):
+            self.remove_trait(trait)
+            self.add_trait(Slider(min_val=trait.min, max_val=trait.max, soft_limits=value))
 
     @property
     def min_val(self) -> float | None:
