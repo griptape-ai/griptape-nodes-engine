@@ -148,6 +148,16 @@ class TestSensitiveConfigKeys:
         assert redacted["secrets_to_register"] == ["OPENAI_API_KEY", "HF_TOKEN"]
         assert redactor.total_redactions() == 0
 
+    def test_removes_every_entry_of_a_credential_named_list(self) -> None:
+        """The plural form of a credential key holds several credentials, not a description."""
+        config = {"api_keys": ["sk-realvalue", "sk-otherrealvalue"]}
+        redactor = Redactor(normalize_identity=False)
+
+        redacted = redactor.redact_config(config)
+
+        assert redacted == {"api_keys": [REDACTED, REDACTED]}
+        assert redactor.counts() == {RedactionReason.CONFIG_KEY: 2}
+
     def test_normalizes_a_home_directory_hiding_in_a_dict_key(self) -> None:
         """A library is free to key a settings subtree by absolute path."""
         config = {str(Path.home() / "projects"): {"enabled": True}}
@@ -177,6 +187,14 @@ class TestSensitiveConfigKeys:
         normalized_key = f"~{os.sep}cert.pem"
         assert list(redacted["headers"]) == [normalized_key]
         assert redacted["headers"][normalized_key] == REDACTED
+
+    def test_leaves_a_key_that_is_not_text_alone(self) -> None:
+        """Nothing can hide in a key with no characters, and rewriting one would lose it."""
+        config = {"headers": {8080: "realvalue"}}
+
+        redacted = Redactor().redact_config(config)
+
+        assert redacted == {"headers": {8080: REDACTED}}
 
 
 class TestKnownSecretValues:
