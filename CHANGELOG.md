@@ -51,6 +51,12 @@ the engine's request API from working without edits. Migration steps live in
   at most one unresolved variable" when its path uses a project directory such as `{outputs}`.
   `GetNextVersionIndexRequest` now fills in project directories and built-in variables itself, so
   callers only supply their own variables.
+- A parameter that a node both shows and passes on, such as the text on a text node, keeps an edit
+  made after the node has run. Before, reopening the workflow or refreshing the page showed the
+  value from the last run instead of the edit.
+- Renaming a parameter that holds an output value now reports that the old name no longer has one,
+  alongside the new name's value. Before, only the new name was reported, so anything tracking
+  output values by parameter name kept the old name's value.
 
 ### Added
 
