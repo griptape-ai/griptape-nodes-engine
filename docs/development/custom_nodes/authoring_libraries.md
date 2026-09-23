@@ -375,6 +375,7 @@ class UpscaleImage(DataNode):
         self.add_parameter(
             Parameter(name="image", input_types=["ImageArtifact"], type="ImageArtifact", tooltip="Image to upscale")
         )
+        self.add_parameter(Parameter(name="upscaled_image", output_type="ImageArtifact", tooltip="The upscaled image"))
 
         # Created for everyone, shown only to users who turned the beta feature on.
         self.add_parameter(
@@ -396,7 +397,7 @@ class UpscaleImage(DataNode):
         if self.is_beta_feature_enabled("sharpen_after_upscale"):
             upscaled = sharpen(upscaled, self.get_parameter_value("sharpen"))
 
-        self.parameter_output_values["image"] = upscaled
+        self.parameter_output_values["upscaled_image"] = upscaled
 ```
 
 A few rules worth knowing:

@@ -616,6 +616,9 @@ class Library:
     # the class on demand -- see NodeTypeEntry) and to its metadata.
     _node_types: dict[str, NodeTypeEntry]
     _node_metadata: dict[str, NodeMetadata]
+    # Valid beta features from the manifest, parsed on first use and kept because the manifest
+    # can't change while loaded.
+    _beta_features: dict[str, BetaFeature] | None
     _advanced_library: AdvancedNodeLibrary | None
     # Tracks handlers registered on behalf of this library so they can be
     # deregistered automatically when the library is unloaded.
@@ -641,6 +644,7 @@ class Library:
 
         self._node_types = {}
         self._node_metadata = {}
+        self._beta_features = None
         self._advanced_library = advanced_library
         self._registered_app_event_listeners = []
         self._registered_pre_dispatch_hooks = []
@@ -649,7 +653,11 @@ class Library:
 
     def get_beta_features(self) -> dict[str, BetaFeature]:
         """The valid beta features this library declares, keyed by id, including expired ones."""
-        return parse_library_beta_features(self._library_data.name, self._library_data.beta_features or []).features
+        if self._beta_features is None:
+            self._beta_features = parse_library_beta_features(
+                self._library_data.name, self._library_data.beta_features or []
+            ).features
+        return dict(self._beta_features)
 
     def get_registered_app_event_listeners(self) -> list[tuple[type, Callable]]:
         return list(self._registered_app_event_listeners)

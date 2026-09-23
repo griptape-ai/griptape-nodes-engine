@@ -66,6 +66,11 @@ from griptape_nodes.node_library.library_validation import (
     validate_library_declarations,
 )
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadataError, read_workflow_metadata
+from griptape_nodes.retained_mode.beta_features import (
+    LIBRARY_BETA_FEATURES_KEY,
+    find_library_config_slug_collision,
+    library_config_slug,
+)
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import (
     AppInitializationComplete,
@@ -210,6 +215,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     AdvancedLibraryLoadFailureProblem,
     AfterLibraryCallbackProblem,
     BeforeLibraryCallbackProblem,
+    BetaFeatureSettingsCollisionProblem,
     CreateConfigCategoryProblem,
     DependencyInstallationFailedProblem,
     DuplicateLibraryProblem,
@@ -2915,6 +2921,8 @@ class LibraryManager(EngineScoped):
                         if library_data.settings is not None:
                             library_info.problems.extend(self._persist_library_settings(library_data))
 
+                        library_info.problems.extend(self._check_beta_feature_settings_collision(library_data))
+
                         # For worker-delegated libraries on the orchestrator, skip node module
                         # imports entirely -- importing them would pull heavy deps (torch, triton,
                         # etc.) into the orchestrator process.  The library is already registered
@@ -3015,6 +3023,28 @@ class LibraryManager(EngineScoped):
         library_info.problems.extend(metadata_result.problems)
         library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.FAILURE
         self._library_file_path_to_info[library_info.library_path] = library_info
+
+    def _check_beta_feature_settings_collision(self, library_data: LibrarySchema) -> list[LibraryProblem]:
+        """Report another loaded library that would store its beta feature choices in the same place.
+
+        Runs after registration, because the fitness check runs before any library is registered
+        and so can't see the others. Only libraries that both declare beta features can collide.
+        """
+        if not library_data.beta_features:
+            return []
+
+        library_name = library_data.name
+        other_names_with_features = [
+            name
+            for name in LibraryRegistry.list_libraries()
+            if name != library_name and LibraryRegistry.get_library(name).get_beta_features()
+        ]
+        other_name = find_library_config_slug_collision(library_name, other_names_with_features)
+        if other_name is None:
+            return []
+
+        config_key = f"{LIBRARY_BETA_FEATURES_KEY}.{library_config_slug(library_name)}"
+        return [BetaFeatureSettingsCollisionProblem(other_library_name=other_name, config_key=config_key)]
 
     def _persist_library_settings(self, library_data: LibrarySchema) -> list[LibraryProblem]:
         """Inject a library's declared settings into the user config, returning any problems.

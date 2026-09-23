@@ -126,6 +126,10 @@ class ParsedLibraryBetaFeatures(NamedTuple):
     issues: list[LibraryBetaFeatureIssue]
 
 
+# Keys a library JSON entry may set. `library` is left out because the engine fills it in.
+_LIBRARY_ENTRY_FIELDS = frozenset(BetaFeature.model_fields) - {"library"}
+
+
 _registry: dict[str, BetaFeature] = {}
 
 
@@ -158,6 +162,9 @@ def parse_library_beta_features(library_name: str, entries: list[Any]) -> Parsed
 
     Each entry is checked on its own, so one mistake drops that entry and leaves the rest of the
     library, and its other features, working. Callers report the issues as library problems.
+
+    Keys this engine doesn't know are ignored rather than rejected, so a library that uses a field
+    added in a later engine still loads its features here.
     """
     features: dict[str, BetaFeature] = {}
     issues: list[LibraryBetaFeatureIssue] = []
@@ -169,8 +176,17 @@ def parse_library_beta_features(library_name: str, entries: list[Any]) -> Parsed
             continue
 
         feature_id = str(entry.get("id") or f"#{index + 1}")
+        unknown_keys = sorted(key for key in entry if key not in _LIBRARY_ENTRY_FIELDS)
+        if unknown_keys:
+            logger.debug(
+                "Ignoring unrecognized keys %s on beta feature '%s' of library '%s'.",
+                unknown_keys,
+                feature_id,
+                library_name,
+            )
+        known = {key: value for key, value in entry.items() if key in _LIBRARY_ENTRY_FIELDS}
         try:
-            feature = BetaFeature.model_validate({**entry, "library": library_name})
+            feature = BetaFeature.model_validate({**known, "library": library_name})
         except ValidationError as e:
             fields = ", ".join(sorted({".".join(str(part) for part in error["loc"]) for error in e.errors()}))
             issues.append(LibraryBetaFeatureIssue(feature_id, f"has missing or invalid fields: {fields}"))
@@ -182,6 +198,46 @@ def parse_library_beta_features(library_name: str, entries: list[Any]) -> Parsed
 
         features[feature.id] = feature
     return ParsedLibraryBetaFeatures(features=features, issues=issues)
+
+
+def find_beta_feature_date_issues(features: list[BetaFeature]) -> list[LibraryBetaFeatureIssue]:
+    """Report features past their `remove_by` date, or with one more than MAX_BETA_DAYS away.
+
+    Engine features are held to the same rules by a unit test. Library features are checked when
+    the library loads, because the engine's tests never see them.
+    """
+    issues: list[LibraryBetaFeatureIssue] = []
+    for feature in features:
+        if feature.is_expired():
+            issues.append(
+                LibraryBetaFeatureIssue(
+                    feature.id,
+                    f"passed its remove_by date of {feature.remove_by}. It is hidden from the Beta Features page "
+                    "and uses its default. Make it a standard feature or remove it",
+                )
+            )
+        elif feature.is_remove_by_too_far_out():
+            issues.append(
+                LibraryBetaFeatureIssue(
+                    feature.id,
+                    f"has a remove_by date of {feature.remove_by}, more than {MAX_BETA_DAYS} days away. "
+                    "Pick a nearer date",
+                )
+            )
+    return issues
+
+
+def find_library_config_slug_collision(library_name: str, other_library_names: list[str]) -> str | None:
+    """The first other library whose beta feature settings would share `library_name`'s config key.
+
+    "My Library" and "my-library" both store their values under `library_beta_features.my_library`,
+    so a feature id they both declare would share one toggle.
+    """
+    slug = library_config_slug(library_name)
+    for other_name in other_library_names:
+        if other_name != library_name and library_config_slug(other_name) == slug:
+            return other_name
+    return None
 
 
 def is_beta_enabled(feature: BetaFeature, config_manager: ConfigManager) -> bool:

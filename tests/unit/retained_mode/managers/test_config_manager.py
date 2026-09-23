@@ -253,6 +253,18 @@ class TestConfigManager:
                 for m in messages
             )
 
+    def test_library_beta_features_env_var_that_is_not_a_map_reported_as_bad_value(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with patch.dict(os.environ, {"GTN_CONFIG_LIBRARY_BETA_FEATURES__MY_LIBRARY": "true"}, clear=True):
+            with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+                manager = ConfigManager()
+                env_config = manager._load_config_from_env_vars()
+
+            assert env_config == {}
+            messages = [record.message for record in caplog.records]
+            assert any("is not a valid value for the 'library_beta_features.my_library' setting" in m for m in messages)
+
     def test_invalid_library_beta_features_do_not_reset_the_rest_of_the_config(
         self, isolate_user_config: Path, caplog: pytest.LogCaptureFixture
     ) -> None:

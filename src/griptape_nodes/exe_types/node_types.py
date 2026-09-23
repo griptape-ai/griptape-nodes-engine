@@ -1408,8 +1408,12 @@ class BaseNode(ABC):
             )
             return False
 
+        # A failure here is an author mistake this method reports itself, so keep the dispatcher
+        # from also logging it as an error on every node created and every run.
         result = self.engine.handle_request(
-            IsBetaFeatureEnabledRequest(feature_id=feature_id, library_name=library_name)
+            IsBetaFeatureEnabledRequest(
+                feature_id=feature_id, library_name=library_name, failure_log_level=logging.DEBUG
+            )
         )
         if not isinstance(result, IsBetaFeatureEnabledResultSuccess):
             logger.warning("%s The feature is treated as off for node '%s'.", result.result_details, self.name)

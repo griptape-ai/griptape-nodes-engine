@@ -51,8 +51,13 @@ def _validate_beta_feature_map(map_key: str, v: Any, *, from_env: bool) -> dict[
         map_key: Dot-notation key of the map, used in warnings (e.g. "beta_features").
         v: The raw value found under that key.
         from_env: Whether the value came from a GTN_CONFIG_ variable. Its strings are converted
-            to booleans, and one that can't be converted raises.
+            to booleans, and a value that can't be converted, or isn't a map, raises so the env
+            loader reports the variable as invalid.
     """
+    if not isinstance(v, dict) and from_env:
+        msg = f"{map_key} must be a map of feature ids to true or false, got {v!r}"
+        raise ValueError(msg)
+
     if not isinstance(v, dict):
         _warn_once(
             (map_key, repr(v)),
@@ -625,6 +630,10 @@ class Settings(BaseModel):
     def validate_library_beta_features(cls, v: Any, info: ValidationInfo) -> dict[str, dict[str, bool]]:
         """Apply the `beta_features` rules to each library's map, one library at a time."""
         from_env = bool(info.context and info.context.get(BETA_FEATURES_FROM_ENV_CONTEXT))
+        if not isinstance(v, dict) and from_env:
+            msg = f"{LIBRARY_BETA_FEATURES_KEY} must be a map of library names to feature maps, got {v!r}"
+            raise ValueError(msg)
+
         if not isinstance(v, dict):
             _warn_once(
                 (LIBRARY_BETA_FEATURES_KEY, repr(v)),

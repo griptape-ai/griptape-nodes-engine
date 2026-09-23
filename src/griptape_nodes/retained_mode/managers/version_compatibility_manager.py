@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 import semver
 
-from griptape_nodes.retained_mode.beta_features import MAX_BETA_DAYS, parse_library_beta_features
+from griptape_nodes.retained_mode.beta_features import find_beta_feature_date_issues, parse_library_beta_features
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import (
     GetEngineVersionRequest,
@@ -241,34 +241,13 @@ class VersionCompatibilityManager(EngineScoped):
         out are warnings. The library still loads, and a problem feature uses its default.
         """
         parsed = parse_library_beta_features(library_data.name, library_data.beta_features or [])
-        problems = [
-            InvalidBetaFeatureProblem(feature_id=issue.feature_id, reason=issue.reason) for issue in parsed.issues
-        ]
-        for feature in parsed.features.values():
-            if feature.is_expired():
-                problems.append(
-                    InvalidBetaFeatureProblem(
-                        feature_id=feature.id,
-                        reason=(
-                            f"passed its remove_by date of {feature.remove_by}. It is hidden from the Beta Features "
-                            "page and uses its default. Make it a standard feature or remove it"
-                        ),
-                    )
-                )
-            elif feature.is_remove_by_too_far_out():
-                problems.append(
-                    InvalidBetaFeatureProblem(
-                        feature_id=feature.id,
-                        reason=(
-                            f"has a remove_by date of {feature.remove_by}, more than {MAX_BETA_DAYS} days away. "
-                            "Pick a nearer date"
-                        ),
-                    )
-                )
-
+        issues = parsed.issues + find_beta_feature_date_issues(list(parsed.features.values()))
         return [
-            LibraryVersionCompatibilityIssue(problem=problem, severity=LibraryManager.LibraryFitness.FLAWED)
-            for problem in problems
+            LibraryVersionCompatibilityIssue(
+                problem=InvalidBetaFeatureProblem(feature_id=issue.feature_id, reason=issue.reason),
+                severity=LibraryManager.LibraryFitness.FLAWED,
+            )
+            for issue in issues
         ]
 
     def check_library_version_compatibility(

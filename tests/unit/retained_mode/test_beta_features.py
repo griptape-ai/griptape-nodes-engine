@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import platform
 from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -14,6 +15,8 @@ from griptape_nodes.retained_mode import beta_features as beta_features_module
 from griptape_nodes.retained_mode.beta_features import (
     MAX_BETA_DAYS,
     BetaFeature,
+    find_beta_feature_date_issues,
+    find_library_config_slug_collision,
     is_beta_enabled,
     library_config_slug,
     list_beta_features,
@@ -242,6 +245,36 @@ class TestLibraryBetaFeatures:
 
         assert parsed.features["fast_upscale"].library == LIBRARY_NAME
 
+    def test_unknown_keys_are_ignored(self) -> None:
+        """A manifest written for a newer engine can carry fields this engine doesn't know yet."""
+        parsed = parse_library_beta_features(LIBRARY_NAME, [_library_entry(added_in_a_later_engine="x")])
+
+        assert list(parsed.features) == ["fast_upscale"]
+        assert parsed.issues == []
+
+    def test_date_issues(self) -> None:
+        features = [
+            _make_feature("fine"),
+            _make_feature("expired", remove_by=_in_days(-1)),
+            _make_feature("too_far", remove_by=_in_days(MAX_BETA_DAYS + 1)),
+        ]
+
+        issues = find_beta_feature_date_issues(features)
+
+        assert [issue.feature_id for issue in issues] == ["expired", "too_far"]
+
+    @pytest.mark.parametrize(
+        ("others", "collision"),
+        [
+            ([], None),
+            (["Other Library"], None),
+            (["beta-test library"], "beta-test library"),
+            ([LIBRARY_NAME], None),
+        ],
+    )
+    def test_slug_collision(self, others: list[str], collision: str | None) -> None:
+        assert find_library_config_slug_collision(LIBRARY_NAME, others) == collision
+
     def test_a_bad_entry_is_dropped_and_the_rest_kept(self) -> None:
         entries = [
             _library_entry("good"),
@@ -371,5 +404,8 @@ class TestIsBetaFeatureEnabled:
         _register_library([])
         node = _BetaProbeNode(name="probe", metadata={"library": LIBRARY_NAME})
 
-        assert node.is_beta_feature_enabled("fast_upscale") is False
+        with caplog.at_level(logging.DEBUG):
+            assert node.is_beta_feature_enabled("fast_upscale") is False
+
         assert "doesn't declare a valid beta feature" in caplog.text
+        assert not [record for record in caplog.records if record.levelno >= logging.ERROR]

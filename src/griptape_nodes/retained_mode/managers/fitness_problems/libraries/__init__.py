@@ -4,6 +4,7 @@ from .advanced_library_load_failure_problem import AdvancedLibraryLoadFailurePro
 from .after_library_callback_problem import AfterLibraryCallbackProblem
 from .app_event_listener_registration_problem import AppEventListenerRegistrationProblem
 from .before_library_callback_problem import BeforeLibraryCallbackProblem
+from .beta_feature_settings_collision_problem import BetaFeatureSettingsCollisionProblem
 from .create_config_category_problem import CreateConfigCategoryProblem
 from .dependency_installation_failed_problem import DependencyInstallationFailedProblem
 from .deprecated_node_warning_problem import DeprecatedNodeWarningProblem
@@ -51,6 +52,7 @@ __all__ = [
     "AfterLibraryCallbackProblem",
     "AppEventListenerRegistrationProblem",
     "BeforeLibraryCallbackProblem",
+    "BetaFeatureSettingsCollisionProblem",
     "CreateConfigCategoryProblem",
     "DependencyInstallationFailedProblem",
     "DeprecatedNodeWarningProblem",
