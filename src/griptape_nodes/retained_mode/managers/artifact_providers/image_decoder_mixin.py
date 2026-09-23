@@ -31,12 +31,18 @@ class DecodedImageArtifact:
         that's colour management's job, done centrally by ArtifactManager after decode.
     bit_depth: Bits per channel in ``pixel_data`` (e.g. 8, 16, 32).
     channel_layout: The channel composition and order (e.g. "RGB", "RGBA", "Grayscale").
+    is_display_referred: True when ``pixel_data`` has already been mapped into the
+        intended display range (e.g. by a colour-management transform) -- encoders
+        should clip to [0, 1] rather than stretch. False (the default) means the
+        range is uncalibrated, as with a raw decode that hasn't been colour-managed,
+        and encoders should min-max stretch to find a displayable range.
     """
 
     pixel_data: np.ndarray
     source_color_space: str
     bit_depth: int
     channel_layout: str
+    is_display_referred: bool = False
 
 
 class ImageArtifactDecoderMixin(ABC):

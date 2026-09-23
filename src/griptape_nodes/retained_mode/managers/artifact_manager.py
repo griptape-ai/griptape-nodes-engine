@@ -530,7 +530,12 @@ class ArtifactManager(EngineScoped):
             )
             return decoded
 
-        return dataclasses.replace(decoded, pixel_data=result.pixels, source_color_space=result.color_space)
+        return dataclasses.replace(
+            decoded,
+            pixel_data=result.pixels,
+            source_color_space=result.color_space,
+            is_display_referred=True,
+        )
 
     def _provider_for_format(self, fmt: str) -> BaseArtifactProvider | None:
         """Resolve the registered provider that handles ``fmt`` (empty → None).

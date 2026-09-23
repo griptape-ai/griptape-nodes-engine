@@ -1380,6 +1380,65 @@ class TestColorManagementInDisplayableImagePipeline:
         assert len(result.image_bytes) > 0
 
     @pytest.mark.asyncio
+    async def test_successful_transform_marks_result_display_referred(self, artifact_manager: ArtifactManager) -> None:
+        from griptape_nodes.retained_mode.events.artifact_events import TransformImageColorResultSuccess
+        from griptape_nodes.retained_mode.managers.artifact_providers.image_decoder_mixin import (
+            DecodedImageArtifact,
+        )
+
+        class _TransformRequest(RequestPayload):
+            pass
+
+        class _RecordingColorManagementProvider(BaseColorManagementProvider):
+            @classmethod
+            def get_friendly_name(cls) -> str:
+                return "RecordingProvider"
+
+            @classmethod
+            def build_transform_request(
+                cls,
+                _pixels: np.ndarray,
+                _source_colorspace: str,
+                _situation: ImageArtifactSituation,
+                *,
+                provider_data: dict[str, Any] | None = None,  # noqa: ARG003
+            ) -> RequestPayload:
+                return _TransformRequest()
+
+            @classmethod
+            def list_colorspaces(cls, _provider_data: dict[str, Any] | None = None) -> list[str]:
+                return []
+
+            @classmethod
+            def list_transform_targets(cls, _provider_data: dict[str, Any] | None = None) -> list[ColorTransformTarget]:
+                return []
+
+        original_handle_request = Engine.handle_request
+
+        def fake_handle_request(self: Engine, request: RequestPayload) -> ResultPayload:
+            if isinstance(request, _TransformRequest):
+                return TransformImageColorResultSuccess(
+                    result_details="ok", pixels=np.zeros((1, 1, 3), dtype=np.float32), color_space="ACEScg"
+                )
+            return original_handle_request(self, request)
+
+        artifact_manager.on_handle_register_color_management_provider_request(
+            RegisterColorManagementProviderRequest(provider_class=_RecordingColorManagementProvider)
+        )
+        decoded = DecodedImageArtifact(
+            pixel_data=np.zeros((1, 1, 3), dtype=np.uint8),
+            source_color_space="sRGB",
+            bit_depth=8,
+            channel_layout="RGB",
+        )
+
+        with patch.object(Engine, "handle_request", fake_handle_request):
+            result = await artifact_manager._apply_color_management(decoded, ImageArtifactSituation.VIEWER)
+
+        assert result.is_display_referred is True
+        assert result.source_color_space == "ACEScg"
+
+    @pytest.mark.asyncio
     async def test_registered_provider_transform_is_applied(
         self, artifact_manager: ArtifactManager, test_image_path: Path
     ) -> None:

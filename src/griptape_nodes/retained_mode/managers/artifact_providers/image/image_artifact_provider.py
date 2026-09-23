@@ -258,7 +258,7 @@ class ImageArtifactProvider(BaseArtifactProvider, ImageArtifactDecoderMixin, Ima
         format, or get_default_preview_format() when format is None.
         """
         output_format = format or self.get_default_preview_format()
-        pixel_data = self._normalize_to_uint8(decoded_artifact.pixel_data)
+        pixel_data = self._normalize_to_uint8(decoded_artifact.pixel_data, decoded_artifact.is_display_referred)
         img = Image.fromarray(pixel_data)
 
         output_buffer = BytesIO()
@@ -266,19 +266,32 @@ class ImageArtifactProvider(BaseArtifactProvider, ImageArtifactDecoderMixin, Ima
         return output_buffer.getvalue()
 
     @staticmethod
-    def _normalize_to_uint8(pixel_data: np.ndarray) -> np.ndarray:
+    def _normalize_to_uint8(pixel_data: np.ndarray, is_display_referred: bool) -> np.ndarray:  # noqa: FBT001
         """Flatten arbitrary-dtype pixel data to a displayable 8-bit raster.
 
         decode() preserves native dtype (_PIL_MODE_BIT_DEPTH: I/F -> 32-bit), so
         pixel_data from a PIL "I"/"F"-mode source is int32/float32, not uint8.
         Image.fromarray() won't save that cleanly to webp/png without this. uint8
-        arrays pass through untouched. Min-max normalization is used rather than a
-        fixed scale: "F" mode has no fixed value range at all, and assuming "I"
-        mode is always 0-65535 would be an unverified assumption about this
-        provider's actual inputs.
+        arrays pass through untouched regardless of ``is_display_referred``.
+
+        For non-uint8 arrays, the two callers need different treatment:
+
+        - ``is_display_referred=False`` (an uncalibrated raw decode, e.g. PIL "I"/"F"
+          mode): there's no fixed value range to assume -- "F" mode has none at all,
+          and assuming "I" mode is always 0-65535 would be an unverified assumption
+          about this provider's actual inputs -- so min-max normalization is used to
+          find a displayable range.
+        - ``is_display_referred=True`` (pixels already mapped into display range by a
+          colour-management transform, e.g. OCIO's display/view transform): min-max
+          stretching would defeat that transform, flattening or blowing out contrast
+          based on incidental per-image pixel values instead of the transform's
+          intended [0, 1] display mapping. Clip to [0, 1] and scale instead.
         """
         if pixel_data.dtype == np.uint8:
             return pixel_data
+
+        if is_display_referred:
+            return (np.clip(pixel_data, 0.0, 1.0) * 255).astype(np.uint8)
 
         minimum = float(pixel_data.min())
         maximum = float(pixel_data.max())

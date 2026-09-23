@@ -18,12 +18,15 @@ from griptape_nodes.retained_mode.managers.artifact_providers.image_situation im
 from griptape_nodes.retained_mode.managers.artifact_providers.provider_registry import ProviderRegistry
 
 
-def _make_decoded(pixel_data: np.ndarray, *, channel_layout: str = "RGB") -> DecodedImageArtifact:
+def _make_decoded(
+    pixel_data: np.ndarray, *, channel_layout: str = "RGB", is_display_referred: bool = False
+) -> DecodedImageArtifact:
     return DecodedImageArtifact(
         pixel_data=pixel_data,
         source_color_space="sRGB",
         bit_depth=8,
         channel_layout=channel_layout,
+        is_display_referred=is_display_referred,
     )
 
 
@@ -88,11 +91,28 @@ class TestImageArtifactProviderEncode:
 
     def test_encode_uint8_passthrough_does_not_rescale(self) -> None:
         pixel_data = np.array([[50, 200], [100, 150]], dtype=np.uint8)
-        normalized = ImageArtifactProvider._normalize_to_uint8(pixel_data)
+        normalized = ImageArtifactProvider._normalize_to_uint8(pixel_data, is_display_referred=False)
 
         assert normalized is pixel_data
         assert normalized.min() == 50  # noqa: PLR2004
         assert normalized.max() == 200  # noqa: PLR2004
+
+    def test_encode_display_referred_float32_clips_instead_of_stretching(
+        self, image_provider: ImageArtifactProvider
+    ) -> None:
+        pixel_data = np.array([[-0.2, 0.5], [1.3, 0.5]], dtype=np.float32)
+        decoded = _make_decoded(pixel_data, channel_layout="Grayscale", is_display_referred=True)
+
+        encoded = image_provider.encode(decoded, ImageArtifactSituation.VIEWER)
+
+        with Image.open(BytesIO(encoded)) as img:
+            # WEBP round-trips grayscale input back out as RGB; channels are equal since
+            # the source was single-channel, so compare against any one of them.
+            reopened = np.asarray(img)[..., 0]
+            assert reopened[0, 0] == 0
+            assert reopened[1, 0] == 255  # noqa: PLR2004
+            assert reopened[0, 1] == pytest.approx(128, abs=10)
+            assert reopened[1, 1] == pytest.approx(128, abs=10)
 
     def test_encode_constant_value_image_does_not_divide_by_zero(self, image_provider: ImageArtifactProvider) -> None:
         pixel_data = np.zeros((2, 2), dtype=np.float32)
