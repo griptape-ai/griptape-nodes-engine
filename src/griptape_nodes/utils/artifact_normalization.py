@@ -187,7 +187,8 @@ def normalize_artifact_input(
             For example, for images, both ImageUrlArtifact and ImageArtifact are valid.
 
     Returns:
-        Artifact of the specified type if input was a string path, otherwise returns input unchanged
+        Artifact of the specified type if the input was a string path, or a serialized dict
+        naming that same type, otherwise returns the input unchanged
     """
     # Return unchanged if already the correct artifact type
     if isinstance(artifact_input, artifact_type):
@@ -200,6 +201,24 @@ def normalize_artifact_input(
     # Process string paths
     if isinstance(artifact_input, str) and artifact_input:
         return _normalize_string_input(artifact_input, artifact_type)
+
+    # A serialized *Url* artifact dict carries the path or URL in its ``value``; the rest is
+    # display metadata the editor tracks alongside it. Hand that string to the branch above
+    # rather than rebuilding the artifact from the dict: it resolves and uploads the path,
+    # and builds the type this parameter declared. The declared type is what tells a path
+    # apart from a payload -- a raw ``ImageArtifact`` dict holds base64 bytes in ``value``,
+    # which is not a path and must be left alone.
+    if isinstance(artifact_input, dict) and artifact_input.get("type") == artifact_type.__name__:
+        inner = artifact_input.get("value")
+        if isinstance(inner, str) and inner:
+            normalized = _normalize_string_input(inner, artifact_type)
+            # That branch hands back its own input when a path cannot be resolved or
+            # uploaded -- a macro path, or a file outside the workspace. The dict already
+            # declared the artifact type, so build it from the value instead of letting a
+            # dict degrade into a bare string.
+            if isinstance(normalized, str):
+                return artifact_type(normalized)
+            return normalized
 
     return artifact_input
 
