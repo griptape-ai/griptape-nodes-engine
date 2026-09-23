@@ -419,7 +419,7 @@ class RemoteHandler:
 
     Registered in place of the original manager handler for every registered type except
     LOCAL_ONLY_REQUEST_TYPES. Forwards to the orchestrator while the worker is
-    inside a ``worker_node_execution_scope``; delegates to the original
+    inside a ``node_execution_scope``; delegates to the original
     handler otherwise (so bootstrap / library-load paths keep running locally).
 
     ``original`` is the handler this shim replaced and MUST be retained so the
@@ -462,7 +462,7 @@ def register_remote_handlers(event_manager: EventManager) -> None:
 
     Swaps a RemoteHandler in for every registered request type except those in
     LOCAL_ONLY_REQUEST_TYPES. The handler forwards only while the worker is inside a
-    ``worker_node_execution_scope`` and delegates to the original handler otherwise, so
+    ``node_execution_scope`` and delegates to the original handler otherwise, so
     engine boot and library load -- which legitimately need this process's own managers --
     are unaffected.
 
@@ -488,19 +488,15 @@ async def _handle_drop_all_local_objects(
 ) -> ResultPayload:
     """Release every object this process is holding for its libraries.
 
+    Accepted while a node is executing, like its targeted sibling: the store takes the entries out now and
+    holds their release hooks back until nothing is running, so a forward pass mid-flight keeps the object
+    it is already holding. The cost is that a node which has not run yet asks for a library-named key and is
+    told no, and pays to rebuild -- on a workflow that is being torn down.
+
     Takes the event manager because that is how it reaches this engine; the process-global engine would
     silently no-op for an engine an embedder built directly.
     """
     resource_manager = event_manager.engine.resource_manager
-
-    # Refuse while this worker is executing a node: this request skips the line, so releasing here
-    # would free the pipeline under a forward pass already running on a worker thread. Reachable by
-    # closing a workflow mid-render, since a torch inference does not cancel. Nothing re-issues the
-    # drop afterwards, so what is skipped stays until a later teardown.
-    if event_manager.in_node_execution():
-        details = "Declined to release held objects: this worker is executing a node. They will be released at a later teardown."
-        logger.info(details)
-        return DropAllLocalObjectsResultSuccess(result_details=details)
 
     try:
         # Off the loop: a release hook is `del model` plus a CUDA cache flush, and blocking the
@@ -522,10 +518,10 @@ async def _handle_drop_local_objects(
 ) -> ResultPayload:
     """Release the named objects, whichever of them this process is holding.
 
-    Accepted mid-execution rather than declined like its drop-all sibling, but the release itself still
-    waits for the running node: the only thing that reaches a worker this way is node deletion, and a
-    consumer can be mid-forward-pass holding the very object being destroyed. The store holds the hook back
-    and runs it when nothing is executing, so the pin is one node rather than a whole render.
+    Accepted mid-execution, with the release itself waiting for the running node: the only thing that
+    reaches a worker this way is node deletion, and a consumer can be mid-forward-pass holding the very
+    object being destroyed. The store holds the hook back and runs it when nothing is executing, so the pin
+    is one node rather than a whole render.
 
     Drops parked entries only. The orchestrator broadcasts keys it cannot check locally -- the entry lives
     here -- so the never-release-a-library-named-key rule is enforced on this side.
@@ -655,11 +651,7 @@ def register_broadcast_handlers(
 
 
 def _register_local_object_handlers(event_manager: EventManager) -> None:
-    """Wire the two teardown requests that free objects this worker is holding.
-
-    Separate from the rest so the registrations sit with each other rather than adding two more branches
-    to a function that already carries every other broadcast.
-    """
+    """Wire the two teardown requests that free objects this worker is holding."""
 
     async def handle_drop_all_local_objects(request: DropAllLocalObjectsRequest) -> ResultPayload:
         return await _handle_drop_all_local_objects(request, event_manager=event_manager)

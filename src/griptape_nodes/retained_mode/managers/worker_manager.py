@@ -1083,8 +1083,7 @@ class WorkerManager(EngineScoped):
 
         Sync because the releases happen on sync paths: a parameter value being written, a node being
         deleted. Fire-and-forget like `schedule_broadcast`, and for the same reason it is acceptable here --
-        losing the message leaves a worker holding an object until a later teardown, which is the bound the
-        mid-execution decline already has.
+        losing the message leaves a worker holding an object until a later teardown.
 
         With no running loop the keys stay queued and the next drain sends them, so a release issued from a
         thread or a sync test is not lost.
@@ -1111,10 +1110,8 @@ class WorkerManager(EngineScoped):
         loop -- the case `broadcast_drop_all_local_objects` documents below -- would take them with it and
         nothing would ever retry.
 
-        The awaited sibling `broadcast_pending_local_object_releases` deliberately does NOT re-queue: it
-        runs on the teardown path, where the drop-all that follows covers its keys, and re-queuing there
-        would leave keys from a deleted workflow cycling forever with nothing left to drain them. Do not
-        unify the two policies.
+        `broadcast_pending_local_object_releases` does not re-queue, because the drop-all after teardown
+        covers its keys.
         """
         from griptape_nodes.app.worker_routing import DropLocalObjectsRequest
 
@@ -1161,10 +1158,9 @@ class WorkerManager(EngineScoped):
     async def broadcast_local_object_teardown(self) -> None:
         """Tell every worker to release named pending keys, then everything its libraries hold.
 
-        One method because the ordering is an invariant, not a convenience: the drop-all declines while a
-        worker is mid-node-execution, and the named-key path deliberately does not, so sending the pending
-        keys first is the only thing that gets displaced objects released during a render. Two teardown
-        sites call this; neither may take half of it.
+        One method because both halves are required: the named-key broadcast is what drains the
+        orchestrator's pending-release queue, and the drop-all is what covers whatever a worker still holds.
+        Two teardown sites call this; neither may take half of it.
         """
         await self.broadcast_pending_local_object_releases()
         await self.broadcast_drop_all_local_objects()
