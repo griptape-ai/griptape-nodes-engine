@@ -5,7 +5,7 @@ import asyncio
 import contextvars
 import json
 import logging
-import pickle
+import pickle  # noqa: TID251 not yet moved to griptape_nodes.serialization
 import re
 import sys
 from collections import defaultdict
