@@ -533,7 +533,7 @@ is_pure_python = {info.is_pure_python}
 format_version = 2
 """
 
-    _robust_mkdir(pkg_file.parent)
+    pkg_file.parent.mkdir(parents=True, exist_ok=True)
     pkg_file.write_text(content, encoding="utf-8")
     if len(merged) > 1:
         logger.info("[Rez][uv]   wrote %s (%d platform variants)", pkg_file, len(merged))
@@ -544,26 +544,6 @@ format_version = 2
 # ---------------------------------------------------------------------------
 # Package store helpers
 # ---------------------------------------------------------------------------
-
-
-def _robust_mkdir(path: Path) -> None:
-    """Create directories with retry for cloud/network filesystems.
-
-    Workaround for LucidLink propagation delay where a child mkdir fails
-    because the parent isn't visible yet. May be removable once the
-    file_lock_type=mkdir rezconfig fix is confirmed sufficient.
-    """
-    import time
-
-    for attempt in range(3):
-        try:
-            path.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            if attempt == 2:  # noqa: PLR2004
-                raise
-            time.sleep(0.5)
-        else:
-            return
 
 
 def is_installed(pip_name: str, version: str, packages_dir: Path) -> bool:
@@ -579,7 +559,7 @@ def _copy_payload(install_dir: Path, payload_root: Path, console_scripts: list[s
     Console scripts → ``payload_root/bin/``
     """
     python_dir = payload_root / "python"
-    _robust_mkdir(python_dir)
+    python_dir.mkdir(parents=True, exist_ok=True)
 
     for src in install_dir.iterdir():
         name = src.name
@@ -681,11 +661,16 @@ def _install_one(  # noqa: PLR0913
             )
             _copy_payload(tmp, payload_root, info.console_scripts)
             logger.info("[Rez][uv] installed %s==%s → %s", pkg.pip_name, pkg.version, version_dir)
-        except Exception:
-            logger.warning(
-                "[Rez][uv] failed to create rez package for %s==%s",
+        except OSError as exc:
+            # Package-store writes fail on permissions, full disks, and network filesystems
+            # that have not yet made a freshly created parent directory visible. Name the path
+            # and the OS reason so the failure is actionable without re-running at DEBUG.
+            logger.error(
+                "[Rez][uv] failed to write rez package for %s==%s at %s: %s",
                 pkg.pip_name,
                 pkg.version,
+                exc.filename or version_dir,
+                exc.strerror or exc,
                 exc_info=logger.isEnabledFor(logging.DEBUG),
             )
             return False

@@ -17,7 +17,6 @@ from griptape_nodes.utils.rez_utils import (
     is_rez_enabled,
     is_rez_library_path,
     library_file_path_to_rez_family,
-    list_available_library_packages,
     pip_spec_name,
     read_library_dependencies,
     read_library_manifest,
@@ -283,45 +282,6 @@ class TestReadLibraryDependencies:
         manifest = tmp_path / "lib.json"
         manifest.write_text(json.dumps({"name": "Test", "metadata": {}}))
         assert read_library_dependencies(manifest) == []
-
-
-# ---------------------------------------------------------------------------
-# Package store browsing
-# ---------------------------------------------------------------------------
-
-
-class TestListAvailableLibraryPackages:
-    def test_lists_library_packages(self, tmp_path: Path) -> None:
-        local_dir = tmp_path / "local"
-        for name, ver in [("griptape_nodes_library_standard", "0.81.0"), ("griptape_nodes_library_diffusers", "0.5.0")]:
-            pkg_dir = local_dir / name / ver
-            pkg_dir.mkdir(parents=True)
-            (pkg_dir / "package.py").write_text(f"name = '{name}'")
-
-        # Also create a non-library package (should be excluded)
-        torch_dir = local_dir / "torch" / "2.7.0"
-        torch_dir.mkdir(parents=True)
-        (torch_dir / "package.py").write_text("name = 'torch'")
-
-        with patch.dict(os.environ, {"GTN_REZ_LOCAL_PACKAGES_PATH": str(local_dir)}):
-            packages = list_available_library_packages()
-
-        assert len(packages) == 2  # noqa: PLR2004
-        families = {p["family"] for p in packages}
-        assert "griptape_nodes_library_standard" in families
-        assert "griptape_nodes_library_diffusers" in families
-        assert "torch" not in families
-
-    def test_empty_store(self, tmp_path: Path) -> None:
-        local_dir = tmp_path / "local"
-        local_dir.mkdir()
-        with patch.dict(os.environ, {"GTN_REZ_LOCAL_PACKAGES_PATH": str(local_dir)}):
-            assert list_available_library_packages() == []
-
-    def test_no_packages_path(self) -> None:
-        with patch.dict(os.environ, {}, clear=True):
-            os.environ.pop("GTN_REZ_LOCAL_PACKAGES_PATH", None)
-            assert list_available_library_packages() == []
 
 
 # ---------------------------------------------------------------------------

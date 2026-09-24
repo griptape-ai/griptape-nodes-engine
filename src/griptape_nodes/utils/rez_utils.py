@@ -1,14 +1,22 @@
 """Utilities for Rez environment integration."""
 
+import json
 import logging
 import os
 import re
 import shutil
 import subprocess
+import sys
 import time
+import tomllib
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+
+from griptape_nodes.utils.file_utils import find_file_in_directory
+from griptape_nodes.utils.git_utils import get_git_repository_root
+from griptape_nodes.utils.rez_uv import install as rez_uv_install
+from griptape_nodes.utils.rez_uv import resolve_full, rez_name
 
 logger = logging.getLogger(__name__)
 
@@ -39,9 +47,6 @@ logger = logging.getLogger(__name__)
 #
 # GTN_REZ_RELEASE_PACKAGES_PATH — Release package directory, relative
 #                          to GTN_REZ_ROOT.
-#
-# GTN_REZ_PACKAGE_PREFIX — Optional prefix for rez package names.
-#                          Example: gtn_  maps "my_lib" → "gtn_my_lib"
 
 # ---------------------------------------------------------------------------
 # Platform mapping
@@ -52,8 +57,6 @@ _PLATFORM_MAP = {"linux": "linux", "darwin": "osx", "win32": "windows"}
 
 def current_platform_key() -> str:
     """Map ``sys.platform`` to rez's platform key (linux/osx/windows)."""
-    import sys
-
     return _PLATFORM_MAP.get(sys.platform, "linux")
 
 
@@ -135,12 +138,6 @@ def rez_release_packages_path() -> Path | None:
     return _resolve_rez_path("GTN_REZ_RELEASE_PACKAGES_PATH")
 
 
-def library_name_to_rez_package(library_name: str) -> str:
-    """Map a Griptape library name to its Rez package name using GTN_REZ_PACKAGE_PREFIX."""
-    prefix = os.getenv("GTN_REZ_PACKAGE_PREFIX", "")
-    return f"{prefix}{library_name}"
-
-
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -188,7 +185,6 @@ def _log_rez_env_context() -> None:
     logger.debug("[Rez] config_file=%s", rez_config_file() or "(rez default)")
     logger.debug("[Rez] local_packages_path=%s", rez_local_packages_path() or "(rez default)")
     logger.debug("[Rez] release_packages_path=%s", rez_release_packages_path() or "(rez default)")
-    logger.debug("[Rez] package_prefix=%r", os.getenv("GTN_REZ_PACKAGE_PREFIX", ""))
 
 
 # ---------------------------------------------------------------------------
@@ -224,48 +220,6 @@ def _rez_packages_root() -> Path | None:
     return local_path.parent if local_path is not None else None
 
 
-def list_available_library_packages() -> list[dict[str, str]]:
-    """Scan the rez local package store for ``griptape_nodes_library_*`` families.
-
-    Returns a list of dicts with ``family``, ``version``, and ``path`` for each
-    installed library package. Only returns the latest version per family.
-    Used by the CLI and GUI to list available library packages.
-    """
-    packages_root = _rez_packages_root()
-    if packages_root is None:
-        return []
-
-    local_dir = packages_root / "local"
-    if not local_dir.is_dir():
-        return []
-
-    prefix = os.getenv("GTN_REZ_PACKAGE_PREFIX", "")
-    pattern = f"{prefix}griptape_nodes_library_" if prefix else "griptape_nodes_library_"
-
-    results: list[dict[str, str]] = []
-    for family_dir in sorted(local_dir.iterdir()):
-        if not family_dir.is_dir() or not family_dir.name.startswith(pattern):
-            continue
-        versions = sorted(
-            (d for d in family_dir.iterdir() if d.is_dir() and (d / "package.py").exists()),
-            key=_version_sort_key,
-            reverse=True,
-        )
-        if not versions:
-            continue
-        latest = versions[0]
-        results.append(
-            {
-                "family": family_dir.name,
-                "version": latest.name,
-                "path": str(latest),
-            }
-        )
-
-    logger.debug("[Rez] found %d library packages in store", len(results))
-    return results
-
-
 def pip_spec_name(spec: str) -> str:
     """Extract the bare package name from a pip requirement spec, PEP 503 normalized.
 
@@ -284,8 +238,6 @@ def find_library_manifest(directory: Path) -> Path | None:
     ``griptape_nodes_library.json`` (underscore) and
     ``griptape-nodes-library.json`` (hyphen).
     """
-    from griptape_nodes.utils.file_utils import find_file_in_directory
-
     return find_file_in_directory(directory, "griptape[-_]nodes[-_]library.json")
 
 
@@ -301,8 +253,6 @@ def read_library_manifest(library_json: Path) -> tuple[str, list[str], list[str]
 
     Returns ``("", [], [], [])`` if the file cannot be read.
     """
-    import json
-
     try:
         with library_json.open(encoding="utf-8") as f:
             data = json.load(f)
@@ -333,8 +283,6 @@ def read_library_dependencies(library_json: Path) -> list[dict[str, str | bool]]
     libraries that this library depends on (e.g. OpenEXR depends on
     OpenColorIO).
     """
-    import json
-
     try:
         with library_json.open(encoding="utf-8") as f:
             data = json.load(f)
@@ -358,8 +306,6 @@ def build_direct_requires(pip_dependencies: list[str]) -> list[str]:
     """
     if not pip_dependencies:
         return []
-
-    from griptape_nodes.utils.rez_uv import resolve_full, rez_name
 
     resolved = resolve_full(pip_dependencies)
     direct_names = {pip_spec_name(spec) for spec in pip_dependencies}
@@ -546,8 +492,6 @@ def library_file_path_to_rez_family(library_file_path: Path) -> str:
         return store_family
 
     try:
-        from griptape_nodes.utils.git_utils import get_git_repository_root
-
         git_root = get_git_repository_root(library_dir)
         if git_root is not None:
             remote_name = _git_remote_repo_name(library_dir)
@@ -746,8 +690,6 @@ def _read_pyproject_version(pyproject_path: Path) -> str | None:
     Checks ``[project] version`` (PEP 517/518) then ``[tool.poetry] version``.
     Returns None when the file cannot be read or contains no version.
     """
-    import tomllib
-
     try:
         with pyproject_path.open("rb") as f:
             data = tomllib.load(f)
@@ -990,9 +932,6 @@ def install_library_as_rez_package(  # noqa: PLR0913
         return
 
     library_version = _derive_library_version(library_file_path) if library_file_path else "1.0.0"
-
-    from griptape_nodes.utils.rez_uv import install as rez_uv_install
-    from griptape_nodes.utils.rez_uv import resolve_full, rez_name
 
     logger.info(
         "[Rez] resolving deps for library '%s' (%d edit + %d exec specs) ...",
