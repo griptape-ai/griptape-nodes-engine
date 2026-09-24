@@ -153,6 +153,35 @@ class _ModelHttpError(Exception):
         self.body = body
 
 
+class _RequestsResponse:
+    """Stands in for a `requests.Response`, which is duck-typed for the same reason.
+
+    ``requests`` is not an engine dependency -- it arrives through the griptape SDK, which the
+    library's Cloud drivers use -- so the recognition matches on shape and the test supplies
+    the shape. ``json`` is a method here and an attribute on httpx's response, which is the
+    difference the structural check exists to absorb.
+    """
+
+    def __init__(self, status_code: int, body: object, *, host: str = CLOUD_HOST) -> None:
+        self.status_code = status_code
+        self.url = f"https://{host}/api/chat/messages"
+        self._body = body
+
+    def json(self) -> object:
+        if isinstance(self._body, (dict, list)):
+            return self._body
+        msg = "Expecting value"
+        raise ValueError(msg)
+
+
+class _RequestsHttpError(Exception):
+    """Stands in for `requests.exceptions.HTTPError`: status and body live on `.response`."""
+
+    def __init__(self, response: _RequestsResponse) -> None:
+        super().__init__(f"{response.status_code} Client Error for url: {response.url}")
+        self.response = response
+
+
 class TestTheWireFormatWeParse:
     """Tripwires against Cloud changing the shape out from under this parser."""
 
@@ -211,6 +240,25 @@ class TestRecognizingARefusal:
         error = a_cloud_error(a_refusal_body(), host="api.example.com")
 
         assert refusal_from_exception(error, cloud_host=CLOUD_HOST) is None
+
+    def test_the_host_is_only_resolved_when_a_response_could_make_it_matter(self) -> None:
+        """Resolving the host reads a secret, and most failures never need one.
+
+        The engine asks this about every node failure, the overwhelming majority of which
+        carry no HTTP response at all. Resolving eagerly turned one secret read per refusal
+        into one per failed node.
+        """
+        reads = []
+
+        def resolve() -> str:
+            reads.append(None)
+            return CLOUD_HOST
+
+        assert refusal_from_exception(RuntimeError("process exploded"), cloud_host=resolve) is None
+        assert reads == [], "The host was resolved for a failure that carries no response at all."
+
+        assert refusal_from_exception(a_cloud_error(a_refusal_body()), cloud_host=resolve) is not None
+        assert len(reads) == 1, f"The host was resolved {len(reads)} times for one exception."
 
     def test_a_non_403_is_not_a_budget_refusal(self) -> None:
         assert refusal_from_exception(a_cloud_error(a_refusal_body(), status=500), cloud_host=CLOUD_HOST) is None
@@ -272,6 +320,30 @@ class TestTheExceptionChain:
     def test_a_model_http_error_with_an_empty_body_is_not_a_refusal(self) -> None:
         """A body of None is still an HTTP failure; it just does not describe a budget."""
         assert refusal_from_exception(_ModelHttpError(403, None), cloud_host=CLOUD_HOST) is None
+
+    def test_a_requests_style_error_is_recognized(self) -> None:
+        """The SDK's Cloud drivers raise this shape, and it agrees with the others on nothing.
+
+        Status and body hang off `.response` rather than the exception, the URL is a plain
+        string rather than a parsed object, and `json` is a method rather than an attribute.
+        """
+        exc = _RequestsHttpError(_RequestsResponse(403, a_refusal_body()))
+
+        refusal = refusal_from_exception(exc, cloud_host=CLOUD_HOST)
+
+        assert refusal is not None
+        assert [budget.budget_name for budget in refusal.budgets] == ["tight"]
+
+    def test_a_requests_style_403_from_another_host_is_not_ours_to_explain(self) -> None:
+        exc = _RequestsHttpError(_RequestsResponse(403, a_refusal_body(), host="api.example-vendor.com"))
+
+        assert refusal_from_exception(exc, cloud_host=CLOUD_HOST) is None
+
+    def test_a_requests_style_response_with_no_readable_body_is_not_a_refusal(self) -> None:
+        """A streamed refusal whose connection closed reads as empty rather than raising out."""
+        exc = _RequestsHttpError(_RequestsResponse(403, "not json"))
+
+        assert refusal_from_exception(exc, cloud_host=CLOUD_HOST) is None
 
     def test_an_ordinary_exception_is_not_a_refusal(self) -> None:
         assert refusal_from_exception(ValueError("something else"), cloud_host=CLOUD_HOST) is None

@@ -32,6 +32,24 @@
         "description": "a call to Griptape Cloud that may be refused over budget",
         "display_name": "Cloud Call"
       }
+    },
+    {
+      "class_name": "UnhandledCloudCallNode",
+      "file_path": "budget_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "a call to Griptape Cloud whose failure the node does not catch",
+        "display_name": "Unhandled Cloud Call"
+      }
+    },
+    {
+      "class_name": "DriverHaltNode",
+      "file_path": "budget_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "a Griptape Cloud driver raising a refusal it cannot attribute to a node",
+        "display_name": "Driver Halt"
+      }
     }
   ]
 }

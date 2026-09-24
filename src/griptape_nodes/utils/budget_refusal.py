@@ -29,11 +29,12 @@ import json
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, NamedTuple
+from urllib.parse import urlsplit
 
 import httpx
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping
 
 BUDGET_EXCEEDED_CODE = "budget_exceeded"
 """The machine-readable code Cloud sets on every budget refusal.
@@ -123,11 +124,18 @@ class BudgetExceededError(Exception):
     Carries the parsed refusal for a same-process caller. The attribute does not
     survive a worker boundary -- see :func:`is_budget_halt` -- so the message is
     built before raising rather than derived by whoever catches it.
+
+    ``node_name`` records whether the message already names the node whose call
+    was refused. A Griptape Cloud driver recognizes a refusal deep inside a
+    request it made on some node's behalf and has no idea which node that is, so
+    it raises without a name; the node executor knows, and re-words rather than
+    letting the artist read a halt that does not say where to look.
     """
 
-    def __init__(self, message: str, refusal: BudgetRefusal) -> None:
+    def __init__(self, message: str, refusal: BudgetRefusal, *, node_name: str | None = None) -> None:
         super().__init__(message)
         self.refusal = refusal
+        self.node_name = node_name
 
 
 class CloudHttpFailure(NamedTuple):
@@ -137,19 +145,23 @@ class CloudHttpFailure(NamedTuple):
     body: object | None
 
 
-def refusal_from_exception(exc: BaseException, *, cloud_host: str) -> BudgetRefusal | None:
+def refusal_from_exception(exc: BaseException, *, cloud_host: str | Callable[[], str]) -> BudgetRefusal | None:
     """Return the budget refusal an exception is carrying, or None if it is not one.
 
     Args:
         exc: The exception to inspect, including anything it was raised from.
         cloud_host: Hostname of the Griptape Cloud deployment in use, from
             ``resolve_cloud_host``. An HTTP error from any other host is not ours
-            to interpret.
+            to interpret. Pass the function itself rather than its result where
+            this is asked about failures indiscriminately: resolving the host
+            reads a secret, and most failures are answered without ever needing
+            one. It is called at most once per exception, and not at all for a
+            failure carrying no response.
 
     Returns:
         The refusal, or None when this is not a budget refusal from Cloud.
     """
-    failure = _cloud_http_failure(exc, cloud_host)
+    failure = _cloud_http_failure(exc, _host_resolver(cloud_host))
     if failure is None:
         return None
     if failure.status != HTTPStatus.FORBIDDEN:
@@ -322,20 +334,46 @@ def is_budget_halt(exception: BaseException | None = None, message: str | None =
     return halt_message(exception, message) is not None
 
 
-def _cloud_http_failure(exc: BaseException, cloud_host: str) -> CloudHttpFailure | None:
+def _host_resolver(cloud_host: str | Callable[[], str]) -> Callable[[], str]:
+    """Return a one-shot reader for the Cloud host, from either a value or a function."""
+    if not callable(cloud_host):
+        return lambda: cloud_host
+
+    resolved: list[str] = []
+
+    def read_once() -> str:
+        if not resolved:
+            resolved.append(cloud_host())
+        return resolved[0]
+
+    return read_once
+
+
+def _cloud_http_failure(exc: BaseException, resolve_host: Callable[[], str]) -> CloudHttpFailure | None:
     """Find the Griptape Cloud HTTP failure on an exception chain.
 
-    Two unrelated shapes reach this code. ``httpx.HTTPStatusError`` keeps the
-    status on ``response`` and knows the URL it called, so it can be host-scoped:
-    a workflow also talks to remote MCP servers and third-party APIs that raise
-    the same error, and attributing their 403 to a Griptape budget would send the
-    artist hunting for a budget that is not the problem.
+    Three unrelated shapes reach this code, one per HTTP client that spends
+    credits, and they agree on nothing -- not the attribute holding the status,
+    not whether the body arrives parsed, not whether the URL survives at all.
 
-    The other shape carries ``status_code`` and ``body`` directly and knows no
-    URL -- Pydantic AI's ``ModelHTTPError`` is the one that reaches us. It is
-    duck-typed rather than imported so that ``pydantic_ai`` stays out of the
-    import graph of a module that node libraries bind to. Unable to check the
-    host, it relies on the ``budget_exceeded`` code, which no third party sends.
+    ``httpx.HTTPStatusError`` keeps the status on ``response`` and knows the URL
+    it called, so it can be host-scoped: a workflow also talks to remote MCP
+    servers and third-party APIs that raise the same error, and attributing
+    their 403 to a Griptape budget would send the artist hunting for a budget
+    that is not the problem.
+
+    ``requests.exceptions.HTTPError`` is what the Griptape SDK's Cloud drivers
+    raise -- the prompt driver behind every agent node, and the image-generation
+    driver. It also carries a response and a URL, but under a different shape:
+    the status is on the response rather than the exception, and the body is a
+    method rather than an attribute. Duck-typed rather than imported because
+    ``requests`` is not an engine dependency; it arrives through the SDK.
+
+    The third carries ``status_code`` and ``body`` directly and knows no URL --
+    Pydantic AI's ``ModelHTTPError``, from the sidebar's chat model. It is
+    duck-typed too, so that ``pydantic_ai`` stays out of the import graph of a
+    module that node libraries bind to. Unable to check the host, it relies on
+    the ``budget_exceeded`` code, which no third party sends.
 
     Callers wrap and re-raise -- the image toolset raises ``ModelRetry`` from the
     original -- so follow the cause chain rather than only inspecting the top.
@@ -345,15 +383,55 @@ def _cloud_http_failure(exc: BaseException, cloud_host: str) -> CloudHttpFailure
     while current is not None and id(current) not in seen:
         seen.add(id(current))
         if isinstance(current, httpx.HTTPStatusError):
-            if current.request.url.host != cloud_host:
+            if current.request.url.host != resolve_host():
                 return None
             return CloudHttpFailure(status=current.response.status_code, body=_body_of(current.response))
         status = getattr(current, "status_code", None)
         body = getattr(current, "body", _MISSING)
         if isinstance(status, int) and body is not _MISSING:
             return CloudHttpFailure(status=status, body=_coerce_body(body))
+        response_failure = _response_failure(getattr(current, "response", None), resolve_host)
+        if response_failure is not None:
+            return response_failure
         current = current.__cause__
     return None
+
+
+def _response_failure(response: object, resolve_host: Callable[[], str]) -> CloudHttpFailure | None:
+    """Read a ``requests``-style response off an exception, host-scoped.
+
+    Structural checks rather than an ``isinstance``, since the type is not
+    importable here. Anything failing them is not a response this code can read,
+    and is left to the rest of the chain rather than guessed at. The host is
+    resolved last, after those checks have established there is a response worth
+    scoping.
+    """
+    status = getattr(response, "status_code", None)
+    if not isinstance(status, int):
+        return None
+    url = getattr(response, "url", None)
+    if not isinstance(url, str):
+        return None
+    if urlsplit(url).hostname != resolve_host():
+        return None
+    parse = getattr(response, "json", None)
+    if not callable(parse):
+        return None
+
+    return CloudHttpFailure(status=status, body=_parsed_body(parse))
+
+
+def _parsed_body(parse: Callable[[], object]) -> object | None:
+    """Call a response's JSON parser, tolerating a body that is not JSON.
+
+    ``requests`` raises its own decode error, which subclasses ``ValueError``;
+    an empty body raises the same way. Either means there is nothing here to
+    read a refusal out of, which is an answer rather than a failure.
+    """
+    try:
+        return parse()
+    except ValueError:
+        return None
 
 
 def _body_of(response: httpx.Response) -> object | None:

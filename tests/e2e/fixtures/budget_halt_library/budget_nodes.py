@@ -1,5 +1,7 @@
 """Fixture nodes for the budget-halt e2e tests.
 
+Three node types, for the three ways a refusal reaches the engine.
+
 ``CloudCallNode`` is a ``SuccessFailureNode`` that makes one HTTP call to a URL the test supplies
 and hands whatever it raises to the same two functions a real credit-spending node uses:
 ``refusal_from_exception`` to decide whether Griptape Cloud refused it over budget, and
@@ -11,6 +13,13 @@ network and no Cloud account.
 Two instances of the one node type make the test: the first is refused, the second hangs off its
 Failed output and writes a file if it ever runs. That file is how a run that routed down Failed
 past a budget block becomes visible.
+
+``UnhandledCloudCallNode`` and ``DriverHaltNode`` cover the nodes that do *not* do that work
+themselves, which is most of them. The first lets the raw HTTP error out, the way any node
+spending through a Cloud driver does; the second raises a halt that names no node, the way a
+driver several frames below the node does when it recognizes the refusal itself. Both rely on
+``NodeManager`` recognizing and wording the halt at the one point every node failure crosses --
+without which the first reads as a bare 403 and the second never says where to look.
 
 Kept to ``httpx``, which the engine already requires, so the library registers cleanly in an
 isolated engine.
@@ -107,3 +116,47 @@ class CloudCallNode(SuccessFailureNode):
         details = f"The call failed: {exc}"
         self._set_status_results(was_successful=False, result_details=details)
         self._handle_failure_exception(RuntimeError(details))
+
+
+class UnhandledCloudCallNode(CloudCallNode):
+    """Calls the URL and lets the HTTP error out, the way a node that catches nothing does.
+
+    There are ~50 node types and only a handful catch a refusal for themselves. This is what the
+    rest look like, and the halt has to arrive worded anyway.
+    """
+
+    def process(self) -> None:
+        self._clear_execution_status()
+        self._record_that_it_ran()
+
+        url = self.get_parameter_value("url") or ""
+        response = httpx.get(url, timeout=_REQUEST_TIMEOUT_SECONDS)
+        response.raise_for_status()
+
+        self.parameter_output_values["result"] = response.text
+        self._set_status_results(was_successful=True, result_details="The call went through.")
+
+
+class DriverHaltNode(CloudCallNode):
+    """Raises a recognized refusal that names no node, the way a Cloud driver does.
+
+    A driver sits several frames below whichever node is spending through it and cannot know
+    whose call it is serving, so it raises the halt unnamed and leaves the naming to the engine.
+    """
+
+    def process(self) -> None:
+        self._clear_execution_status()
+        self._record_that_it_ran()
+
+        url = self.get_parameter_value("url") or ""
+        try:
+            response = httpx.get(url, timeout=_REQUEST_TIMEOUT_SECONDS)
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            cloud_host = resolve_cloud_host(self.engine.secrets_manager)
+            refusal = refusal_from_exception(exc, cloud_host=cloud_host)
+            if refusal is None:
+                raise
+            raise BudgetExceededError(describe_budget_refusal(refusal), refusal) from exc
+
+        self.parameter_output_values["result"] = response.text

@@ -60,6 +60,8 @@ FIXTURE_LIBRARY_JSON_TEMPLATE = FIXTURE_LIBRARY_DIR / "griptape_nodes_library.js
 FIXTURE_NODE_FILE = FIXTURE_LIBRARY_DIR / "budget_nodes.py"
 LIBRARY_NAME = "Budget Halt Library"
 NODE_TYPE = "CloudCallNode"
+UNHANDLED_NODE_TYPE = "UnhandledCloudCallNode"
+DRIVER_HALT_NODE_TYPE = "DriverHaltNode"
 
 REFUSED_PATH = "/api/refused"
 """Stub route that answers the way Cloud does when a HARD budget has no room."""
@@ -370,3 +372,86 @@ async def test_an_ordinary_failure_still_takes_the_failure_branch(
     assert receipt.exists(), (
         "An ordinary HTTP failure stopped taking the Failed output, which every node that wires it relies on."
     )
+
+
+@requires_fixture_library
+@pytest.mark.usefixtures("registered_library", "execution_mode")
+@pytest.mark.asyncio
+async def test_a_node_that_catches_nothing_still_halts_with_the_budgets_named(
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    create_node: Callable[..., str],
+    stub_cloud: str,
+) -> None:
+    """Most node types catch nothing, and the refusal has to be recognized for them.
+
+    Asking each of the ~50 to handle it would mean the one that was missed fails as a bare 403.
+    Every node failure crosses ``NodeManager``, so that is where this is answered.
+    """
+    flow_name = _new_flow(engine, "budget_halt_unhandled_wf")
+    create_node(UNHANDLED_NODE_TYPE, "Refused", flow_name, library_name=LIBRARY_NAME)
+    _set_parameter(engine, "Refused", "url", f"{stub_cloud}{REFUSED_PATH}")
+
+    node_errors = _record_published(engine, monkeypatch, NodeErrorEvent, lambda payload: payload.error_message)
+
+    result = await _run(engine, flow_name)
+
+    assert isinstance(result, StartFlowResultFailure), (
+        f"Cloud refused the call and the run reported success anyway: {result}"
+    )
+    details = str(result.result_details)
+    assert BUDGET_HALT_PREFIX in details, f"The run failed generically instead of as a budget halt: {details}"
+    for budget_name in ("tight", "frozen-one"):
+        assert budget_name in details, (
+            f"The halt named some of the budgets that refused but not '{budget_name}': {details}"
+        )
+    assert "Refused" in details, f"The halt does not say which node was refused: {details}"
+
+    assert node_errors, "The node failed and the editor was told nothing about it."
+    assert node_errors[0].startswith(BUDGET_HALT_PREFIX), (
+        f"The node-level error the editor pins to the node is generic: {node_errors[0]}"
+    )
+
+
+@requires_fixture_library
+@pytest.mark.usefixtures("registered_library", "execution_mode")
+@pytest.mark.asyncio
+async def test_a_halt_raised_without_a_node_name_is_worded_with_one(
+    engine: Engine,
+    create_node: Callable[..., str],
+    stub_cloud: str,
+) -> None:
+    """A driver knows the refusal but not whose call it was; the engine supplies the name.
+
+    Otherwise the artist reads that a budget stopped the run and is left to find the node
+    themselves -- which on a large canvas is the whole of the problem.
+    """
+    flow_name = _new_flow(engine, "budget_halt_driver_wf")
+    create_node(DRIVER_HALT_NODE_TYPE, "Spender", flow_name, library_name=LIBRARY_NAME)
+    _set_parameter(engine, "Spender", "url", f"{stub_cloud}{REFUSED_PATH}")
+
+    result = await _run(engine, flow_name)
+
+    assert isinstance(result, StartFlowResultFailure), result
+    details = str(result.result_details)
+    assert BUDGET_HALT_PREFIX in details, f"The driver's halt was not recognized as one: {details}"
+    assert "Spender" in details, f"The halt reached the artist without naming the node: {details}"
+
+
+@requires_fixture_library
+@pytest.mark.usefixtures("registered_library", "execution_mode")
+@pytest.mark.asyncio
+async def test_a_node_that_worded_its_own_halt_keeps_it(
+    engine: Engine,
+    create_node: Callable[..., str],
+    stub_cloud: str,
+) -> None:
+    """A node that already named itself is left alone, so the wording is never applied twice."""
+    flow_name = _new_flow(engine, "budget_halt_selfworded_wf")
+    create_node(NODE_TYPE, "Refused", flow_name, library_name=LIBRARY_NAME)
+    _set_parameter(engine, "Refused", "url", f"{stub_cloud}{REFUSED_PATH}")
+
+    result = await _run(engine, flow_name)
+
+    details = str(result.result_details)
+    assert details.count(BUDGET_HALT_PREFIX) == 1, f"The halt was worded more than once: {details}"
