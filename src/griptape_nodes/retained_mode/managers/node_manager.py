@@ -1495,13 +1495,10 @@ class NodeManager(EngineScoped):
                         )
                         return DeleteNodeResultFailure(result_details=details)
 
-        # Check if it's in a node group
-        if isinstance(node.parent_group, SubflowNodeGroup):
-            try:
-                node.parent_group.delete_nodes_from_group([node])
-            except ValueError as e:
-                details = f"Attempted to delete a Node '{node_name}'. Failed to remove it from the node group: {e}"
-                return DeleteNodeResultFailure(result_details=details)
+        # Every kind of group has to give up a node being deleted, not just a SubflowNodeGroup:
+        # a group that keeps naming a deleted child reports it as involved in the next run.
+        if isinstance(node.parent_group, BaseNodeGroup):
+            node.parent_group.delete_nodes_from_group([node])
 
         parent_flow.remove_node(node.name)
 
@@ -3676,6 +3673,25 @@ class NodeManager(EngineScoped):
                 node.parameter_values[param.name] = param.default_value
             if self.engine.library_manager.is_worker:
                 self._resolve_cached_inputs_in_place(node)
+
+            # After hydration and after cached inputs have become objects again, so a check here reads
+            # what `aprocess` will read. Before `aprocess`, so a node that cannot run does not half-run.
+            try:
+                validation_exceptions = node.validate_in_execution_environment()
+            except Exception as e:
+                # The check is a library's own code, and it runs where the execution dependencies are, so
+                # an ImportError out of it says the same thing as a returned exception: this node cannot
+                # run here. Letting it escape would report a node that declined as an engine crash.
+                validation_exceptions = [e]
+            if validation_exceptions:
+                return ExecuteNodeResultFailure(
+                    result_details=(
+                        f"Attempted to execute node '{node_name}'. It declined to run: "
+                        f"{'; '.join(str(exception) for exception in validation_exceptions)}"
+                    ),
+                    validation_exceptions=validation_exceptions,
+                )
+
             try:
                 with aprocess_scope(request.variables):
                     await node.aprocess()

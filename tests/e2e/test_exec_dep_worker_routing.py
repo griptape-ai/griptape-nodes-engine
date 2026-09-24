@@ -28,7 +28,7 @@ import pytest
 
 from griptape_nodes.node_library.library_registry import LibraryRegistry, LibrarySchema
 from griptape_nodes.retained_mode.engine import current_engine
-from griptape_nodes.retained_mode.events.app_events import LibraryLoadedNotification
+from griptape_nodes.retained_mode.events.app_events import ReportLibraryLoadedRequest
 from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileRequest,
     RegisterLibraryFromFileResultSuccess,
@@ -256,7 +256,7 @@ class TestParameterBehaviorsSurviveOnRealClasses:
 
         The tests above load a library in-process, which is true of any library and never
         reaches the gate. The clobber happens later and elsewhere: the worker sends a
-        LibraryLoadedNotification carrying serialized schemas, and the ORCHESTRATOR decides
+        ReportLibraryLoadedRequest carrying serialized schemas, and the ORCHESTRATOR decides
         whether to build stub classes from them. `Library.register_new_node_type` overwrites
         unconditionally, so a gate keyed on the wrong flag silently swaps this library's real
         classes -- traits and all -- for stubs after load.
@@ -268,10 +268,10 @@ class TestParameterBehaviorsSurviveOnRealClasses:
         assert library_info.executes_in_worker is True, "the library must be worker-routed for this to mean anything"
         assert library_info.requires_worker is False, "...but not via the legacy stub path"
 
-        # Exactly what a worker broadcasts after loading the library.
+        # Exactly what a worker reports after loading the library.
         schemas = await library_manager._serialize_library_node_schemas("Behavior Library")
-        await library_manager._on_library_loaded_notification(
-            LibraryLoadedNotification(
+        await library_manager.on_report_library_loaded_request(
+            ReportLibraryLoadedRequest(
                 library_name="Behavior Library",
                 fitness=LibraryManager.LibraryFitness.GOOD,
                 node_schemas=schemas,

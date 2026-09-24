@@ -116,7 +116,9 @@ class StartLocalSubflowRequest(RequestPayload):
     Args:
         flow_name: Name of the flow to start as a subflow
         start_node: The node to start execution from (None to auto-detect start node)
-        pickle_control_flow_result: Whether to pickle the result for subprocess retrieval
+        pickle_control_flow_result: Ignored. Pickling happens while broadcasting
+            ControlFlowResolvedEvent, and a local subflow always runs isolated, which does not
+            broadcast that event -- so there is no result to pickle for this request.
 
     Results: StartLocalSubflowResultSuccess | StartLocalSubflowResultFailure
     """
@@ -551,7 +553,16 @@ class ExecuteNodeResultSuccess(ResultPayloadSuccess):
 @dataclass
 @PayloadRegistry.register
 class ExecuteNodeResultFailure(ResultPayloadFailure):
-    """Failed result from executing a node directly."""
+    """Failed result from executing a node directly.
+
+    Args:
+        validation_exceptions: Set when the node refused to run, rather than failing while running --
+            `validate_in_execution_environment` returned or raised these. A caller can tell the two apart
+            without reading the message, because they mean different things to whoever is looking:
+            nothing ran, versus something ran and broke.
+    """
+
+    validation_exceptions: list[Exception] | None = None
 
 
 @dataclass
