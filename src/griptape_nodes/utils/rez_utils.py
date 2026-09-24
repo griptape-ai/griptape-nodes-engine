@@ -1,5 +1,6 @@
 """Utilities for Rez environment integration."""
 
+import ast
 import json
 import logging
 import os
@@ -365,6 +366,22 @@ def _parse_rez_spec(spec: str) -> tuple[str, str | None]:
     return spec, None
 
 
+def rez_version_from_git_ref(ref: str | None) -> str | None:
+    """Read a library dependency's ``@ref`` as a rez version, or None if it is not one.
+
+    Library packages are versioned from ``pyproject.toml`` / release tags, so a tag
+    such as ``1.2.0`` or ``v1.2.0`` names a package version. Branches and commit
+    hashes do not, and only dotted numeric refs are accepted so a hash like
+    ``3f9c2e1`` is not mistaken for one.
+    """
+    if not ref:
+        return None
+    candidate = ref[1:] if ref[:1] in ("v", "V") else ref
+    if re.match(r"^\d+(\.\d+)+", candidate) is None:
+        return None
+    return candidate
+
+
 def rez_library_package_name(path: str) -> str:
     """Extract the rez family name from a ``REZ:<family>[-<version>]`` path string.
 
@@ -436,29 +453,24 @@ def resolve_rez_library_json_path(rez_family: str, version: str | None = None) -
     return None
 
 
-def is_library_rez_package_available(library_name: str, library_file_path: Path | None = None) -> bool:
+def is_library_rez_package_available(library_file_path: Path) -> bool:
     """Check whether a rez meta-package already exists for a library.
 
     Looks for any version directory with a ``package.py`` under the library's
-    rez family name in the local package store.
+    rez family (see ``library_file_path_to_rez_family``) in the local package store.
     """
-    return get_library_rez_package_version(library_name, library_file_path=library_file_path) is not None
+    return get_library_rez_package_version(library_file_path) is not None
 
 
-def get_library_rez_package_version(
-    library_name: str,
-    library_file_path: Path | None = None,
-    *,
-    packages_root: Path | None = None,
-) -> str | None:
+def get_library_rez_package_version(library_file_path: Path, *, packages_root: Path | None = None) -> str | None:
     """Return the latest version of a library's rez package, or None if unavailable.
 
     Searches the local package store for version directories containing a
     ``package.py`` and returns the highest version string found.
 
     Args:
-        library_name: Human-readable library name, used when no file path is given.
-        library_file_path: Library JSON path, used to derive the rez family name.
+        library_file_path: Library JSON path. The rez family is derived from the
+            library's repo or folder name (see ``library_file_path_to_rez_family``).
         packages_root: Root of the rez package store (parent of ``local/``).
             Defaults to the parent of ``GTN_REZ_LOCAL_PACKAGES_PATH``.
     """
@@ -467,10 +479,7 @@ def get_library_rez_package_version(
     if packages_root is None:
         return None
 
-    if library_file_path is not None:
-        rez_family = library_file_path_to_rez_family(library_file_path)
-    else:
-        rez_family = _library_rez_name(library_name)
+    rez_family = library_file_path_to_rez_family(library_file_path)
 
     family_dir = packages_root / "local" / rez_family
     if not family_dir.is_dir():
@@ -485,7 +494,7 @@ def get_library_rez_package_version(
         return None
 
     version = versions[0].name
-    logger.debug("[Rez] found rez package for '%s': %s-%s", library_name, rez_family, version)
+    logger.debug("[Rez] found rez package for '%s': %s-%s", library_file_path, rez_family, version)
     return version
 
 
@@ -592,6 +601,96 @@ def _detect_rez_store_family(library_file_path: Path) -> str | None:
     # family dir is parts[-4]
     family = parts[-4]
     return family
+
+
+def _library_package_dir(library_file_path: Path) -> Path | None:
+    """Return the version directory of the rez package that provides a library, or None.
+
+    A manifest registered from the store (``REZ:`` entries) sits inside that directory
+    already; a manifest in a local checkout is matched to the latest store version of
+    its repo/folder-named family.
+    """
+    if _detect_rez_store_family(library_file_path) is not None:
+        return library_file_path.parent.parent
+
+    packages_root = _rez_packages_root()
+    version = get_library_rez_package_version(library_file_path)
+    if packages_root is None or version is None:
+        return None
+    return packages_root / "local" / library_file_path_to_rez_family(library_file_path) / version
+
+
+def read_library_package_requires(library_file_path: Path) -> list[str]:
+    """Return the ``requires`` list of the rez package that provides a library.
+
+    The library meta-package pins every direct dependency (``torch-2.7.0``), so these
+    are the versions a worker's ``rez env <family>`` resolves. Returns an empty list
+    when the package or its ``requires`` cannot be read.
+    """
+    package_dir = _library_package_dir(library_file_path)
+    if package_dir is None:
+        return []
+
+    package_file = package_dir / "package.py"
+    try:
+        tree = ast.parse(package_file.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError):
+        logger.debug("[Rez] could not read requires from %s", package_file, exc_info=True)
+        return []
+
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(target, ast.Name) and target.id == "requires" for target in node.targets):
+            continue
+        try:
+            value = ast.literal_eval(node.value)
+        except ValueError:
+            logger.debug("[Rez] requires in %s is not a literal list", package_file)
+            return []
+        if not isinstance(value, list):
+            return []
+        return [str(entry) for entry in value]
+
+    return []
+
+
+def library_edit_rez_requests(library_file_path: Path, edit_dependencies: list[str]) -> list[str]:
+    """Build rez requests for a library's edit-time dependencies, pinned as its package pins them.
+
+    Resolving bare names would let rez pick the newest version in the store, which
+    can differ from the version the library package (and so the worker) uses. A
+    dependency missing from the package's ``requires`` falls back to its bare name.
+    """
+    pinned: dict[str, str] = {}
+    for requirement in read_library_package_requires(library_file_path):
+        family, version = _parse_rez_spec(requirement)
+        if version is not None:
+            pinned[family] = requirement
+
+    requests: list[str] = []
+    for dependency in edit_dependencies:
+        family = rez_name(pip_spec_name(dependency))
+        request = pinned.get(family)
+        if request is None:
+            logger.debug("[Rez] no pinned version for '%s' in %s's package — using latest", family, library_file_path)
+            request = family
+        requests.append(request)
+    return requests
+
+
+def is_in_rez_context(rez_family: str) -> bool:
+    """Return True when this process runs inside a rez context that resolved *rez_family*.
+
+    ``rez env`` records the resolved packages as ``family-version`` tokens in
+    ``REZ_USED_RESOLVE``. A library's worker runs inside ``rez env <family>``, so its
+    dependencies are already on PYTHONPATH in the versions rez chose.
+    """
+    for token in os.environ.get("REZ_USED_RESOLVE", "").split():
+        family, _ = _parse_rez_spec(token)
+        if family == rez_family:
+            return True
+    return False
 
 
 def build_rez_env_prefix(package_specs: list[str]) -> list[str]:
@@ -702,12 +801,12 @@ def resolve_rez_pythonpath(package_specs: list[str]) -> list[str]:
 
 
 def _library_rez_name(library_name: str) -> str:
-    """Normalise a human-readable library display name to a valid rez family name.
+    """Normalise a repo or folder name to a valid rez family name.
 
-    Unlike the pip-oriented ``rez_name()`` in rez_uv, this also collapses
-    spaces so that names like 'Griptape Modular Diffusion Nodes Library'
-    produce ``griptape_modular_diffusion_nodes_library`` rather than
-    preserving illegal whitespace.
+    Library packages are named after the repo or folder they were built from
+    (see ``library_file_path_to_rez_family``), never the manifest's display name.
+    Unlike the pip-oriented ``rez_name()`` in rez_uv, this also collapses spaces,
+    which folder names may contain.
     """
     return re.sub(r"[-._\s]+", "_", library_name).lower()
 
@@ -818,10 +917,10 @@ def _write_library_meta_package(  # noqa: PLR0913
     resolved_requires: list[str],
     packages_root: Path,
     *,
+    rez_family: str,
+    library_source_dir: Path,
+    library_json_name: str,
     skip_installed: bool = True,
-    rez_family: str | None = None,
-    library_source_dir: Path | None = None,
-    library_json_name: str = "griptape_nodes_library.json",
 ) -> None:
     """Write a rez meta-package that bundles the library source alongside its dep declarations.
 
@@ -836,8 +935,7 @@ def _write_library_meta_package(  # noqa: PLR0913
         library_version: Version string for the meta-package (e.g. "1.0.0").
         resolved_requires: Pinned rez requires strings (e.g. ["torch-2.7.0", ...]).
         packages_root: Root of the rez package store (parent of ``local/``).
-        rez_family: Rez family name override. If None, derived from library_name.
-            Pass the git repo / directory name for correct rez naming.
+        rez_family: Rez family name, derived from the library's repo or folder name.
         library_source_dir: Directory containing the library's Python source
             (parent of the griptape_nodes_library.json file). Copied into the
             rez package so the package is self-contained and portable.
@@ -847,8 +945,7 @@ def _write_library_meta_package(  # noqa: PLR0913
         skip_installed: When True, skip writing if the meta-package already
             exists. When False, overwrite.
     """
-    family = rez_family if rez_family is not None else _library_rez_name(library_name)
-    version_dir = packages_root / "local" / family / library_version
+    version_dir = packages_root / "local" / rez_family / library_version
     version_dir.mkdir(parents=True, exist_ok=True)
 
     pkg_file = version_dir / "package.py"
@@ -859,28 +956,21 @@ def _write_library_meta_package(  # noqa: PLR0913
     escaped_name = library_name.replace("'", "\\'")
     req_entries = "".join(f"    '{r}',\n" for r in sorted(resolved_requires))
 
-    if library_source_dir is not None:
-        python_dest = version_dir / "python"
-        logger.info("[Rez] copying library source into rez package: %s → %s", library_source_dir, python_dest)
-        shutil.copytree(
-            library_source_dir,
-            python_dest,
-            ignore=_LIBRARY_COPY_EXCLUDES,
-            dirs_exist_ok=True,
-        )
-        escaped_json_name = library_json_name.replace("'", "\\'")
-        commands_block = f"""
+    python_dest = version_dir / "python"
+    logger.info("[Rez] copying library source into rez package: %s → %s", library_source_dir, python_dest)
+    shutil.copytree(
+        library_source_dir,
+        python_dest,
+        ignore=_LIBRARY_COPY_EXCLUDES,
+        dirs_exist_ok=True,
+    )
+    escaped_json_name = library_json_name.replace("'", "\\'")
+    commands_block = f"""
 
 def commands():
     env.PYTHONPATH.append('{{root}}/python')
     env.GTN_REZ_LIBRARY_JSON = '{{root}}/python/{escaped_json_name}'
 """
-    else:
-        commands_block = ""
-        logger.warning(
-            "[Rez] no library_source_dir provided for '%s' — library nodes will NOT be importable via rez",
-            library_name,
-        )
 
     build_timestamp = datetime.now(UTC).isoformat()
     source_dir_str = str(library_source_dir) if library_source_dir else "(none)"
@@ -893,7 +983,7 @@ def commands():
 # Library JSON:    {library_json_name}
 # Built:           {build_timestamp}
 
-name = '{family}'
+name = '{rez_family}'
 
 version = '{library_version}'
 
@@ -905,15 +995,17 @@ requires = [
 format_version = 2
 {commands_block}"""
     pkg_file.write_text(content, encoding="utf-8")
-    logger.info("[Rez] wrote meta-package '%s-%s' with %d requires", family, library_version, len(resolved_requires))
+    logger.info(
+        "[Rez] wrote meta-package '%s-%s' with %d requires", rez_family, library_version, len(resolved_requires)
+    )
 
 
 def install_library_as_rez_package(  # noqa: PLR0913
     library_name: str,
     pip_dependencies: list[str],
     *,
+    library_file_path: Path,
     pip_dependencies_exec: list[str] | None = None,
-    library_file_path: Path | None = None,
     extra_index_url: str | None = None,
     pip_install_flags: list[str] | None = None,
     python_version: str | None = None,
@@ -934,8 +1026,10 @@ def install_library_as_rez_package(  # noqa: PLR0913
         pip_dependencies_exec: Execution-time pip dependency specs.  Installed as
             rez packages alongside edit deps but kept separate so the orchestrator
             can resolve only what it needs.
-        library_file_path: Path to the library JSON file; used to locate
-            ``pyproject.toml`` and git metadata for version derivation.
+        library_file_path: Path to the library JSON file. The package is named
+            after the library's repo or folder, its source is copied from this
+            file's directory, and ``pyproject.toml`` / git metadata next to it
+            supply the version.
         extra_index_url: Additional pip index URL (e.g. a PyTorch CUDA mirror).
         pip_install_flags: Extra flags for uv resolution and install (e.g.
             ``["--torch-backend=auto"]``). Read from the library manifest's
@@ -959,7 +1053,7 @@ def install_library_as_rez_package(  # noqa: PLR0913
     if pip_dependencies_exec:
         all_pip_dependencies.extend(pip_dependencies_exec)
 
-    library_version = _derive_library_version(library_file_path) if library_file_path else "1.0.0"
+    library_version = _derive_library_version(library_file_path)
 
     # A library without pip dependencies still needs its meta-package: it carries the
     # library source and manifest, which is what makes the library registrable via REZ:.
@@ -995,56 +1089,19 @@ def install_library_as_rez_package(  # noqa: PLR0913
     else:
         logger.info("[Rez] library '%s' has no pip dependencies — writing its package only", library_name)
 
-    # Derive rez family name from the git repo / installation directory so the rez
-    # package name matches the repo (e.g. griptape_nodes_library_diffusers) rather
-    # than the human-readable display name from the library JSON.
-    if library_file_path is not None:
-        rez_family = library_file_path_to_rez_family(library_file_path)
-        library_source_dir = library_file_path.parent
-        library_json_name = library_file_path.name
-    else:
-        rez_family = _library_rez_name(library_name)
-        library_source_dir = None
-        library_json_name = "griptape_nodes_library.json"
-
+    # Name the package after the repo / folder it was built from (e.g.
+    # griptape_nodes_library_diffusers), not the manifest's display name, so a rez
+    # admin can match installed packages to their sources.
     _write_library_meta_package(
         library_name,
         library_version,
         resolved_requires,
         packages_root,
+        rez_family=library_file_path_to_rez_family(library_file_path),
+        library_source_dir=library_file_path.parent,
+        library_json_name=library_file_path.name,
         skip_installed=skip_installed,
-        rez_family=rez_family,
-        library_source_dir=library_source_dir,
-        library_json_name=library_json_name,
     )
-
-
-# ---------------------------------------------------------------------------
-# Runtime operations
-# ---------------------------------------------------------------------------
-
-
-def resolve_library_environment(library_name: str, library_file_path: Path | None = None) -> list[str]:
-    """Resolve a Rez environment for a Griptape library and return resolved package specs.
-
-    Uses ``library_file_path`` to derive the canonical rez family name from the
-    git repo / installation directory when available; falls back to normalising
-    ``library_name`` (the JSON display name) otherwise.
-
-    Args:
-        library_name: Human-readable library name (for logging).
-        library_file_path: Path to the library JSON file (preferred for naming).
-
-    Returns:
-        List of resolved ``"name-version"`` strings, or empty list on failure.
-    """
-    if library_file_path is not None:
-        rez_family = library_file_path_to_rez_family(library_file_path)
-    else:
-        rez_family = _library_rez_name(library_name)
-
-    logger.info("[Rez] resolve_library_environment: library='%s'  rez_family='%s'", library_name, rez_family)
-    return resolve_and_log_rez_context([rez_family])
 
 
 # ---------------------------------------------------------------------------

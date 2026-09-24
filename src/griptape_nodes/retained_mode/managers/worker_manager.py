@@ -863,7 +863,7 @@ class WorkerManager(EngineScoped):
             library_name,
         ]
 
-        if is_rez_enabled() and is_library_rez_package_available(library_name):
+        if is_rez_enabled():
             args = self._build_rez_worker_args(library_name, base_args)
         else:
             args = base_args
@@ -871,7 +871,11 @@ class WorkerManager(EngineScoped):
         await self.spawn_worker(args, library_name)
 
     def _build_rez_worker_args(self, library_name: str, base_args: list[str]) -> list[str]:
-        """Wrap base_args with a rez-env prefix for the given library."""
+        """Wrap base_args with a rez-env prefix when the library has a rez package.
+
+        The package lookup and the wrap both derive the rez family from the library's
+        path, so they always agree on the repo/folder-named package.
+        """
         library_info = self.engine.library_manager.get_library_info_by_library_name(library_name)
         if library_info is None or not library_info.library_path:
             logger.warning(
@@ -880,7 +884,12 @@ class WorkerManager(EngineScoped):
             )
             return base_args
 
-        rez_family = library_file_path_to_rez_family(Path(library_info.library_path))
+        library_file_path = Path(library_info.library_path)
+        if not is_library_rez_package_available(library_file_path):
+            logger.debug("[Rez][execution] no rez package for '%s' -- spawning without rez wrap", library_name)
+            return base_args
+
+        rez_family = library_file_path_to_rez_family(library_file_path)
         logger.info("[Rez][execution] wrapping worker for '%s' (family: %s)", library_name, rez_family)
         resolve_and_log_rez_context([rez_family])
 

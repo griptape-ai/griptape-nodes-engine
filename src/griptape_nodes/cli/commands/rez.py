@@ -792,7 +792,7 @@ def _build_library_from_dir(  # noqa: C901
         raise typer.Exit(1) from exc
 
     family = library_file_path_to_rez_family(library_json)
-    version = get_library_rez_package_version(library_name, library_file_path=library_json, packages_root=packages_root)
+    version = get_library_rez_package_version(library_json, packages_root=packages_root)
 
     console.print()
     console.print(

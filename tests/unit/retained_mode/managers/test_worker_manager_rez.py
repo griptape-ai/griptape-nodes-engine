@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -11,6 +12,7 @@ import pytest
 from griptape_nodes.retained_mode.managers.worker_manager import WorkerManager
 
 WORKER_MANAGER_MODULE = "griptape_nodes.retained_mode.managers.worker_manager"
+REZ_UTILS_MODULE = "griptape_nodes.utils.rez_utils"
 SESSION = "sess-rez"
 LIBRARY = "Demo Library"
 FAMILY = "griptape_nodes_library_demo"
@@ -40,6 +42,7 @@ def _base_args() -> list[str]:
 class TestBuildRezWorkerArgs:
     def test_wraps_base_args_with_rez_env_prefix(self, worker_manager: WorkerManager) -> None:
         with (
+            patch(f"{WORKER_MANAGER_MODULE}.is_library_rez_package_available", return_value=True) as mock_available,
             patch(f"{WORKER_MANAGER_MODULE}.library_file_path_to_rez_family", return_value=FAMILY) as mock_family,
             patch(f"{WORKER_MANAGER_MODULE}.resolve_and_log_rez_context", return_value=[]) as mock_resolve,
             patch(f"{WORKER_MANAGER_MODULE}.build_rez_env_prefix", return_value=REZ_PREFIX) as mock_prefix,
@@ -47,9 +50,48 @@ class TestBuildRezWorkerArgs:
             wrapped = worker_manager._build_rez_worker_args(LIBRARY, _base_args())
 
         assert wrapped == [*REZ_PREFIX, *_base_args()]
-        assert str(mock_family.call_args.args[0]).endswith("griptape_nodes_library.json")
+        # The package check and the wrap both use the library's path, never its display name.
+        assert mock_available.call_args.args[0] == Path("/libs/demo/griptape_nodes_library.json")
+        assert mock_family.call_args.args[0] == Path("/libs/demo/griptape_nodes_library.json")
         mock_resolve.assert_called_once_with([FAMILY])
         mock_prefix.assert_called_once_with([FAMILY])
+
+    def test_no_rez_package_leaves_args_alone(self, worker_manager: WorkerManager) -> None:
+        with (
+            patch(f"{WORKER_MANAGER_MODULE}.is_library_rez_package_available", return_value=False),
+            patch(f"{WORKER_MANAGER_MODULE}.build_rez_env_prefix") as mock_prefix,
+        ):
+            result = worker_manager._build_rez_worker_args(LIBRARY, _base_args())
+
+        assert result == _base_args()
+        mock_prefix.assert_not_called()
+
+    def test_finds_repo_named_package_when_display_name_differs(
+        self, worker_manager: WorkerManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Real family lookup, no mocks for it: the manifest's display name ("Demo Library")
+        # differs from the folder the package was built from.
+        library_dir = tmp_path / "griptape-nodes-library-demo"
+        library_dir.mkdir()
+        manifest = library_dir / "griptape_nodes_library.json"
+        manifest.write_text('{"name": "Demo Library"}')
+        version_dir = tmp_path / "store" / "local" / FAMILY / "1.0.0"
+        version_dir.mkdir(parents=True)
+        (version_dir / "package.py").write_text(f"name = '{FAMILY}'\n")
+        monkeypatch.setenv("GTN_REZ_LOCAL_PACKAGES_PATH", str(tmp_path / "store" / "local"))
+        worker_manager.engine.library_manager.get_library_info_by_library_name.return_value = SimpleNamespace(  # type: ignore[union-attr]
+            library_path=str(manifest)
+        )
+
+        with (
+            patch(f"{REZ_UTILS_MODULE}.get_git_repository_root", return_value=None),
+            patch(f"{WORKER_MANAGER_MODULE}.resolve_and_log_rez_context", return_value=[]),
+            patch(f"{WORKER_MANAGER_MODULE}.build_rez_env_prefix", return_value=REZ_PREFIX) as mock_prefix,
+        ):
+            wrapped = worker_manager._build_rez_worker_args(LIBRARY, _base_args())
+
+        mock_prefix.assert_called_once_with([FAMILY])
+        assert wrapped == [*REZ_PREFIX, *_base_args()]
 
     @pytest.mark.parametrize("library_info", [None, SimpleNamespace(library_path=None)])
     def test_leaves_args_alone_without_a_library_path(
@@ -66,10 +108,9 @@ class TestBuildRezWorkerArgs:
 
 class TestSpawnWhenSessionReady:
     @pytest.mark.asyncio
-    async def test_rez_library_spawns_wrapped(self, worker_manager: WorkerManager) -> None:
+    async def test_rez_enabled_builds_rez_args(self, worker_manager: WorkerManager) -> None:
         with (
             patch(f"{WORKER_MANAGER_MODULE}.is_rez_enabled", return_value=True),
-            patch(f"{WORKER_MANAGER_MODULE}.is_library_rez_package_available", return_value=True),
             patch.object(worker_manager, "_build_rez_worker_args", return_value=["wrapped"]) as mock_wrap,
             patch.object(worker_manager, "spawn_worker", AsyncMock()) as mock_spawn,
         ):
@@ -79,13 +120,9 @@ class TestSpawnWhenSessionReady:
         mock_spawn.assert_awaited_once_with(["wrapped"], LIBRARY)
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(("rez_enabled", "package_available"), [(False, True), (True, False)])
-    async def test_non_rez_library_spawns_unwrapped(
-        self, worker_manager: WorkerManager, *, rez_enabled: bool, package_available: bool
-    ) -> None:
+    async def test_rez_disabled_spawns_unwrapped(self, worker_manager: WorkerManager) -> None:
         with (
-            patch(f"{WORKER_MANAGER_MODULE}.is_rez_enabled", return_value=rez_enabled),
-            patch(f"{WORKER_MANAGER_MODULE}.is_library_rez_package_available", return_value=package_available),
+            patch(f"{WORKER_MANAGER_MODULE}.is_rez_enabled", return_value=False),
             patch.object(worker_manager, "_build_rez_worker_args") as mock_wrap,
             patch.object(worker_manager, "spawn_worker", AsyncMock()) as mock_spawn,
         ):

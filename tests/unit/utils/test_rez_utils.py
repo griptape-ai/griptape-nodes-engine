@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
+import pytest
+
 from griptape_nodes.utils.rez_utils import (
     _anchor_drive_letter,
     _derive_library_version,
@@ -32,15 +34,17 @@ from griptape_nodes.utils.rez_utils import (
     get_library_rez_package_version,
     get_rez_context_string,
     install_library_as_rez_package,
+    is_in_rez_context,
     is_library_rez_package_available,
     is_rez_enabled,
     is_rez_library_path,
+    library_edit_rez_requests,
     library_file_path_to_rez_family,
     pip_spec_name,
     read_library_dependencies,
     read_library_manifest,
+    read_library_package_requires,
     resolve_and_log_rez_context,
-    resolve_library_environment,
     resolve_rez_library_json_path,
     resolve_rez_pythonpath,
     rez_bin_path,
@@ -51,11 +55,12 @@ from griptape_nodes.utils.rez_utils import (
     rez_path_map,
     rez_release_packages_path,
     rez_root,
+    rez_version_from_git_ref,
 )
 from griptape_nodes.utils.rez_uv import ResolvedPackage
 
 if TYPE_CHECKING:
-    import pytest
+    from collections.abc import Iterator
 
 # ---------------------------------------------------------------------------
 # Rez enabled detection
@@ -640,55 +645,78 @@ class TestResolveRezLibraryJsonPath:
             assert resolve_rez_library_json_path("my_lib") is None
 
 
-class TestLibraryRezPackageVersion:
-    def test_no_store(self) -> None:
-        with patch.dict(os.environ, {}, clear=True):
-            assert get_library_rez_package_version("My Lib") is None
-            assert not is_library_rez_package_available("My Lib")
+def _library_manifest_in(folder: Path, display_name: str = "Some Display Name") -> Path:
+    """Create a non-git library folder whose manifest display name differs from the folder name."""
+    folder.mkdir(parents=True)
+    manifest = folder / "griptape_nodes_library.json"
+    manifest.write_text(json.dumps({"name": display_name}))
+    return manifest
 
-    def test_by_library_name(self, tmp_path: Path) -> None:
-        local = tmp_path / "local"
+
+class TestLibraryRezPackageVersion:
+    @pytest.fixture(autouse=True)
+    def _no_git(self) -> Iterator[None]:
+        with patch(f"{_RU}.get_git_repository_root", return_value=None):
+            yield
+
+    def test_no_store(self, tmp_path: Path) -> None:
+        manifest = _library_manifest_in(tmp_path / "my-lib")
+        with patch.dict(os.environ, {}, clear=True):
+            assert get_library_rez_package_version(manifest) is None
+            assert not is_library_rez_package_available(manifest)
+
+    def test_latest_version_under_folder_family(self, tmp_path: Path) -> None:
+        local = tmp_path / "store" / "local"
         _make_rez_version(local, "my_lib", "0.9.0")
         _make_rez_version(local, "my_lib", "0.10.0")
+        manifest = _library_manifest_in(tmp_path / "my-lib")
         with patch.dict(os.environ, {"GTN_REZ_LOCAL_PACKAGES_PATH": str(local)}, clear=True):
-            assert get_library_rez_package_version("My Lib") == "0.10.0"
-            assert is_library_rez_package_available("My Lib")
+            assert get_library_rez_package_version(manifest) == "0.10.0"
+            assert is_library_rez_package_available(manifest)
 
-    def test_by_library_file_path(self, tmp_path: Path) -> None:
-        local = tmp_path / "local"
-        _make_rez_version(local, "repo_family", "3.0.0")
-        manifest = tmp_path / "src" / "griptape_nodes_library.json"
-        with (
-            patch.dict(os.environ, {"GTN_REZ_LOCAL_PACKAGES_PATH": str(local)}, clear=True),
-            patch(f"{_RU}.library_file_path_to_rez_family", return_value="repo_family"),
-        ):
-            assert get_library_rez_package_version("Display Name", library_file_path=manifest) == "3.0.0"
+    def test_display_name_is_never_used_as_family(self, tmp_path: Path) -> None:
+        # A package named after the manifest's display name must not satisfy the lookup;
+        # only the repo/folder-named package counts.
+        local = tmp_path / "store" / "local"
+        _make_rez_version(local, "griptape_modular_diffusion_nodes_library", "1.0.0")
+        manifest = _library_manifest_in(
+            tmp_path / "griptape-nodes-library-diffusers", display_name="Griptape Modular Diffusion Nodes Library"
+        )
+        with patch.dict(os.environ, {"GTN_REZ_LOCAL_PACKAGES_PATH": str(local)}, clear=True):
+            assert get_library_rez_package_version(manifest) is None
+
+            _make_rez_version(local, "griptape_nodes_library_diffusers", "2.0.0")
+            assert get_library_rez_package_version(manifest) == "2.0.0"
 
     def test_family_missing(self, tmp_path: Path) -> None:
-        local = tmp_path / "local"
-        local.mkdir()
+        local = tmp_path / "store" / "local"
+        local.mkdir(parents=True)
+        manifest = _library_manifest_in(tmp_path / "nothing-here")
         with patch.dict(os.environ, {"GTN_REZ_LOCAL_PACKAGES_PATH": str(local)}, clear=True):
-            assert get_library_rez_package_version("Nothing Here") is None
+            assert get_library_rez_package_version(manifest) is None
 
     def test_explicit_packages_root_overrides_env(self, tmp_path: Path) -> None:
         explicit_store = tmp_path / "explicit"
         _make_rez_version(explicit_store / "local", "my_lib", "2.0.0")
         env_local = tmp_path / "env" / "local"
         _make_rez_version(env_local, "my_lib", "1.0.0")
+        manifest = _library_manifest_in(tmp_path / "my-lib")
         with patch.dict(os.environ, {"GTN_REZ_LOCAL_PACKAGES_PATH": str(env_local)}, clear=True):
-            assert get_library_rez_package_version("My Lib", packages_root=explicit_store) == "2.0.0"
+            assert get_library_rez_package_version(manifest, packages_root=explicit_store) == "2.0.0"
 
     def test_explicit_packages_root_without_env(self, tmp_path: Path) -> None:
         store = tmp_path / "store"
         _make_rez_version(store / "local", "my_lib", "1.5.0")
+        manifest = _library_manifest_in(tmp_path / "my-lib")
         with patch.dict(os.environ, {}, clear=True):
-            assert get_library_rez_package_version("My Lib", packages_root=store) == "1.5.0"
+            assert get_library_rez_package_version(manifest, packages_root=store) == "1.5.0"
 
     def test_family_without_versions(self, tmp_path: Path) -> None:
-        local = tmp_path / "local"
+        local = tmp_path / "store" / "local"
         (local / "my_lib" / "empty").mkdir(parents=True)
+        manifest = _library_manifest_in(tmp_path / "my-lib")
         with patch.dict(os.environ, {"GTN_REZ_LOCAL_PACKAGES_PATH": str(local)}, clear=True):
-            assert get_library_rez_package_version("my_lib") is None
+            assert get_library_rez_package_version(manifest) is None
 
 
 # ---------------------------------------------------------------------------
@@ -899,26 +927,6 @@ class TestResolveRezPythonpath:
             assert resolve_rez_pythonpath(["lib_a"]) == []
 
 
-class TestResolveLibraryEnvironment:
-    def test_uses_file_path_family(self, tmp_path: Path) -> None:
-        with (
-            patch(f"{_RU}.library_file_path_to_rez_family", return_value="from_path"),
-            patch(f"{_RU}.resolve_and_log_rez_context", return_value=["from_path-1.0"]) as probe,
-        ):
-            assert resolve_library_environment("Name", tmp_path / "lib.json") == ["from_path-1.0"]
-        probe.assert_called_once_with(["from_path"])
-
-    def test_uses_library_name(self) -> None:
-        with patch(f"{_RU}.resolve_and_log_rez_context", return_value=[]) as probe:
-            resolve_library_environment("My Cool Library")
-        probe.assert_called_once_with(["my_cool_library"])
-
-
-# ---------------------------------------------------------------------------
-# Health checks
-# ---------------------------------------------------------------------------
-
-
 class TestCheckRezHealth:
     def test_healthy_sets_config_file(self, tmp_path: Path) -> None:
         config = tmp_path / "rezconfig.py"
@@ -1036,22 +1044,22 @@ class TestWriteLibraryMetaPackage:
         for excluded in (".venv", ".venv-exec", ".git", "__pycache__"):
             assert not (python_dir / excluded).exists()
 
-    def test_family_derived_from_name_without_source(self, tmp_path: Path) -> None:
-        _write_library_meta_package("Luma Labs Library", "1.0.0", [], tmp_path)
-
-        content = (tmp_path / "local" / "luma_labs_library" / "1.0.0" / "package.py").read_text()
-        assert "name = 'luma_labs_library'" in content
-        assert "def commands" not in content
-
     def test_skip_installed_keeps_existing(self, tmp_path: Path) -> None:
-        pkg_file = tmp_path / "local" / "fam" / "1.0.0" / "package.py"
+        manifest = _make_library_source(tmp_path / "src" / "lib")
+        store = tmp_path / "store"
+        pkg_file = store / "local" / "fam" / "1.0.0" / "package.py"
         pkg_file.parent.mkdir(parents=True)
         pkg_file.write_text("original")
+        source = {
+            "rez_family": "fam",
+            "library_source_dir": manifest.parent,
+            "library_json_name": manifest.name,
+        }
 
-        _write_library_meta_package("Lib", "1.0.0", ["a-1"], tmp_path, rez_family="fam", skip_installed=True)
+        _write_library_meta_package("Lib", "1.0.0", ["a-1"], store, **source, skip_installed=True)
         assert pkg_file.read_text() == "original"
 
-        _write_library_meta_package("Lib", "1.0.0", ["a-1"], tmp_path, rez_family="fam", skip_installed=False)
+        _write_library_meta_package("Lib", "1.0.0", ["a-1"], store, **source, skip_installed=False)
         assert "'a-1'" in pkg_file.read_text()
 
 
@@ -1078,23 +1086,26 @@ class TestInstallLibraryAsRezPackage:
         assert (package_py.parent / "python" / "nodes.py").is_file()
         assert (package_py.parent / "python" / "griptape_nodes_library.json").is_file()
 
-    def test_no_store_configured(self) -> None:
+    def test_no_store_configured(self, tmp_path: Path) -> None:
+        manifest = _make_library_source(tmp_path / "src" / "lib")
         with patch.dict(os.environ, {}, clear=True), patch(f"{_RU}.rez_uv_install") as install:
-            install_library_as_rez_package("Lib", ["requests"])
+            install_library_as_rez_package("Lib", ["requests"], library_file_path=manifest)
         install.assert_not_called()
 
     def test_explicit_packages_root_used_without_env(self, tmp_path: Path) -> None:
+        manifest = _make_library_source(tmp_path / "src" / "lib")
         store = tmp_path / "store"
         with (
             patch.dict(os.environ, {}, clear=True),
             patch(f"{_RU}.resolve_full", return_value=[ResolvedPackage(pip_name="requests", version="2.32.0")]),
             patch(f"{_RU}.rez_uv_install") as install,
+            patch(f"{_RU}.get_git_repository_root", return_value=None),
         ):
-            install_library_as_rez_package("Lib", ["requests"], packages_root=store)
+            install_library_as_rez_package("Lib", ["requests"], library_file_path=manifest, packages_root=store)
             assert "GTN_REZ_LOCAL_PACKAGES_PATH" not in os.environ
 
         assert install.call_args.kwargs["packages_dir"] == store
-        assert (store / "local" / "lib" / "1.0.0" / "package.py").is_file()
+        assert (store / "local" / "lib" / "2.3.4" / "package.py").is_file()
 
     def test_installs_edit_and_exec_deps(self, tmp_path: Path) -> None:
         manifest = _make_library_source(tmp_path / "src" / "my-library")
@@ -1137,14 +1148,144 @@ class TestInstallLibraryAsRezPackage:
         assert "numpy" not in content
         assert (package_py.parent / "python" / "nodes.py").is_file()
 
-    def test_without_library_file_path_uses_name(self, tmp_path: Path) -> None:
+    def test_package_named_after_folder_not_display_name(self, tmp_path: Path) -> None:
+        # The manifest's display name is "My Library"; the package must be named after
+        # the folder the library was built from.
+        manifest = _make_library_source(tmp_path / "src" / "studio-tools")
         local = tmp_path / "store" / "local"
         with (
             patch.dict(os.environ, {"GTN_REZ_LOCAL_PACKAGES_PATH": str(local)}, clear=True),
             patch(f"{_RU}.resolve_full", return_value=[ResolvedPackage(pip_name="requests", version="2.32.0")]),
             patch(f"{_RU}.rez_uv_install"),
+            patch(f"{_RU}.get_git_repository_root", return_value=None),
         ):
-            install_library_as_rez_package("Simple Library", ["requests"])
+            install_library_as_rez_package("My Library", ["requests"], library_file_path=manifest)
 
-        content = (local / "simple_library" / "1.0.0" / "package.py").read_text()
+        content = (local / "studio_tools" / "2.3.4" / "package.py").read_text()
+        assert "name = 'studio_tools'" in content
         assert "'requests-2.32.0'" in content
+        assert not (local / "my_library").exists()
+
+
+# ---------------------------------------------------------------------------
+# Pinned requires, rez context, and dependency ref pins
+# ---------------------------------------------------------------------------
+
+
+def _write_library_package(store_local: Path, family: str, version: str, package_body: str) -> Path:
+    """Create a store library package and return the manifest inside its python/ dir."""
+    version_dir = store_local / family / version
+    (version_dir / "python").mkdir(parents=True)
+    (version_dir / "package.py").write_text(package_body)
+    manifest = version_dir / "python" / "griptape_nodes_library.json"
+    manifest.write_text(json.dumps({"name": "Display Name"}))
+    return manifest
+
+
+class TestReadLibraryPackageRequires:
+    def test_reads_requires_from_store_package(self, tmp_path: Path) -> None:
+        manifest = _write_library_package(
+            tmp_path / "local",
+            "my_lib",
+            "1.0.0",
+            "name = 'my_lib'\nrequires = [\n    'torch-2.7.0',\n    'pillow-10.0.0',\n]\n",
+        )
+        assert read_library_package_requires(manifest) == ["torch-2.7.0", "pillow-10.0.0"]
+
+    def test_local_checkout_reads_latest_store_package(self, tmp_path: Path) -> None:
+        local = tmp_path / "store" / "local"
+        _write_library_package(local, "my_lib", "1.0.0", "requires = ['torch-2.6.0']\n")
+        _write_library_package(local, "my_lib", "1.1.0", "requires = ['torch-2.7.0']\n")
+        checkout = tmp_path / "my-lib"
+        checkout.mkdir()
+        manifest = checkout / "griptape_nodes_library.json"
+        manifest.write_text("{}")
+        with (
+            patch.dict(os.environ, {"GTN_REZ_LOCAL_PACKAGES_PATH": str(local)}, clear=True),
+            patch(f"{_RU}.get_git_repository_root", return_value=None),
+        ):
+            assert read_library_package_requires(manifest) == ["torch-2.7.0"]
+
+    def test_no_package_returns_empty(self, tmp_path: Path) -> None:
+        manifest = tmp_path / "loose" / "griptape_nodes_library.json"
+        manifest.parent.mkdir()
+        manifest.write_text("{}")
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(f"{_RU}.get_git_repository_root", return_value=None),
+        ):
+            assert read_library_package_requires(manifest) == []
+
+    @pytest.mark.parametrize(
+        "package_body",
+        [
+            "name = 'my_lib'\n",
+            "requires = not valid python (\n",
+            "requires = build_requires()\n",
+            "requires = 'torch-2.7.0'\n",
+        ],
+    )
+    def test_unreadable_requires_returns_empty(self, tmp_path: Path, package_body: str) -> None:
+        manifest = _write_library_package(tmp_path / "local", "my_lib", "1.0.0", package_body)
+        assert read_library_package_requires(manifest) == []
+
+    def test_package_is_never_executed(self, tmp_path: Path) -> None:
+        marker = tmp_path / "executed"
+        body = f"open({str(marker)!r}, 'w').write('x')\nrequires = ['torch-2.7.0']\n"
+        manifest = _write_library_package(tmp_path / "local", "my_lib", "1.0.0", body)
+        assert read_library_package_requires(manifest) == ["torch-2.7.0"]
+        assert not marker.exists()
+
+
+class TestLibraryEditRezRequests:
+    def test_pins_edit_deps_from_package_requires(self, tmp_path: Path) -> None:
+        manifest = _write_library_package(
+            tmp_path / "local",
+            "my_lib",
+            "1.0.0",
+            "requires = ['pillow-10.0.0', 'ruamel_yaml-0.18.6', 'torch-2.7.0']\n",
+        )
+        requests = library_edit_rez_requests(manifest, ["Pillow>=10", "ruamel.yaml"])
+        assert requests == ["pillow-10.0.0", "ruamel_yaml-0.18.6"]
+
+    def test_unpinned_dependency_falls_back_to_family(self, tmp_path: Path) -> None:
+        manifest = _write_library_package(tmp_path / "local", "my_lib", "1.0.0", "requires = ['pillow-10.0.0']\n")
+        assert library_edit_rez_requests(manifest, ["pillow", "numpy<3"]) == ["pillow-10.0.0", "numpy"]
+
+
+class TestIsInRezContext:
+    def test_family_in_resolve(self) -> None:
+        with patch.dict(os.environ, {"REZ_USED_RESOLVE": "python-3.12.4 my_lib-1.0.0 torch-2.7.0"}):
+            assert is_in_rez_context("my_lib")
+
+    def test_family_not_in_resolve(self) -> None:
+        with patch.dict(os.environ, {"REZ_USED_RESOLVE": "python-3.12.4 griptape_launch-1.0"}):
+            assert not is_in_rez_context("my_lib")
+
+    def test_prefix_of_another_family_does_not_match(self) -> None:
+        with patch.dict(os.environ, {"REZ_USED_RESOLVE": "my_lib_extra-1.0.0"}):
+            assert not is_in_rez_context("my_lib")
+
+    def test_outside_rez(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            assert not is_in_rez_context("my_lib")
+
+
+class TestRezVersionFromGitRef:
+    @pytest.mark.parametrize(
+        ("ref", "expected"),
+        [
+            (None, None),
+            ("", None),
+            ("1.2.0", "1.2.0"),
+            ("v1.2.0", "1.2.0"),
+            ("V2.0", "2.0"),
+            ("1.2.0rc1", "1.2.0rc1"),
+            ("main", None),
+            ("feature/rez", None),
+            ("3f9c2e1", None),
+            ("1", None),
+        ],
+    )
+    def test_ref_to_version(self, ref: str | None, expected: str | None) -> None:
+        assert rez_version_from_git_ref(ref) == expected

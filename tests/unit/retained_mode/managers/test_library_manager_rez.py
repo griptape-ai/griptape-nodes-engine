@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -27,6 +28,9 @@ from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileRequest,
     RegisterLibraryFromFileResultFailure,
     RegisterLibraryFromFileResultSuccess,
+)
+from griptape_nodes.retained_mode.managers.fitness_problems.libraries.library_dependency_problem import (
+    LibraryDependencyProblem,
 )
 from griptape_nodes.retained_mode.managers.library_manager import DependencyInstallError, LibraryManager
 from griptape_nodes.retained_mode.managers.settings import LibraryRegistration
@@ -93,8 +97,7 @@ class TestRecordRezPackageInfo:
         assert info.rez_family == FAMILY
         assert info.rez_version == "1.2.0"
         assert info.has_rez_package is True
-        assert mock_version.call_args.args[0] == LIBRARY_NAME
-        assert mock_version.call_args.kwargs["library_file_path"] == Path(LIBRARY_JSON)
+        mock_version.assert_called_once_with(Path(LIBRARY_JSON))
 
     def test_records_package_not_built(self, engine: Engine) -> None:
         info = _library_info()
@@ -225,6 +228,7 @@ class TestAddLibraryPathsToSysPathRez:
     ) -> tuple[list[str], MagicMock, AsyncMock]:
         fake_sys_path: list[str] = ["/existing"]
         monkeypatch.setattr(sys, "path", fake_sys_path)
+        monkeypatch.delenv("REZ_USED_RESOLVE", raising=False)
         mgr = engine.library_manager
         with (
             patch(f"{LIBRARY_MANAGER_MODULE}.is_rez_enabled", return_value=True),
@@ -251,6 +255,44 @@ class TestAddLibraryPathsToSysPathRez:
         assert sys_path[0] == "/rez/pillow/python"
         assert str(tmp_path) in sys_path
         mock_venv.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_exec_deps_request_the_versions_the_package_pins(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        manifest = (LIBRARY_NAME, ["Pillow>=10"], ["torch==2.7.0"], [])
+
+        with patch(
+            f"{LIBRARY_MANAGER_MODULE}.library_edit_rez_requests", return_value=["pillow-10.0.0"]
+        ) as mock_requests:
+            _, mock_resolve, _ = await self._add_paths(
+                engine, monkeypatch, tmp_path, manifest=manifest, resolved=["/rez/pillow/10.0.0/python"]
+            )
+
+        mock_requests.assert_called_once_with(Path(LIBRARY_JSON), ["Pillow>=10"])
+        mock_resolve.assert_called_once_with(["pillow-10.0.0"])
+
+    @pytest.mark.asyncio
+    async def test_inside_the_library_rez_context_adds_no_dependency_paths(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # A worker runs inside `rez env <family>`; its PYTHONPATH already holds the full,
+        # pinned dependency set, which a second resolve must not shadow.
+        monkeypatch.setattr(sys, "path", ["/existing"])
+        monkeypatch.setenv("REZ_USED_RESOLVE", f"python-3.12.4 {FAMILY}-1.0.0 torch-2.7.0")
+        mgr = engine.library_manager
+        with (
+            patch(f"{LIBRARY_MANAGER_MODULE}.is_rez_enabled", return_value=True),
+            patch(f"{LIBRARY_MANAGER_MODULE}.is_library_rez_package_available", return_value=True),
+            patch(f"{LIBRARY_MANAGER_MODULE}.library_file_path_to_rez_family", return_value=FAMILY),
+            patch(f"{LIBRARY_MANAGER_MODULE}.resolve_rez_pythonpath") as mock_resolve,
+            patch.object(mgr, "_add_library_edit_venv_to_sys_path", AsyncMock()) as mock_venv,
+        ):
+            await mgr._add_library_paths_to_sys_path(LIBRARY_NAME, LIBRARY_JSON, tmp_path)
+
+        mock_resolve.assert_not_called()
+        mock_venv.assert_not_awaited()
+        assert sys.path == [str(tmp_path), "/existing"]
 
     @pytest.mark.asyncio
     async def test_exec_deps_without_edit_deps_resolve_nothing(
@@ -355,7 +397,7 @@ class TestInstallDependenciesRez:
 
         assert isinstance(result, InstallLibraryDependenciesResultSuccess)
         assert result.dependencies_installed == 0
-        assert mock_available.call_args.kwargs["library_file_path"] == Path(LIBRARY_JSON)
+        mock_available.assert_called_once_with(Path(LIBRARY_JSON))
         mock_install.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -378,59 +420,116 @@ class TestInstallDependenciesRez:
             )
 
 
+def _dependency_problems(info: LibraryManager.LibraryInfo) -> list[LibraryDependencyProblem]:
+    return [problem for problem in info.problems if isinstance(problem, LibraryDependencyProblem)]
+
+
 class TestLibraryDependencyFromRezStore:
-    """A declared library dependency found in the rez store is registered from it, never downloaded."""
+    """In rez mode a declared library dependency comes only from the rez store, never a download."""
 
     _STOP = InstallLibraryDependenciesResultFailure(result_details="stop-sentinel")
+    _DEP_JSON = Path("/rez/opencolorio/1.2.0/python/griptape_nodes_library.json")
+    _DEP_FAMILY = "griptape_nodes_library_opencolorio"
 
-    async def _progress(self, engine: Engine, *, register_result: object) -> tuple[AsyncMock, MagicMock]:
+    async def _progress(
+        self,
+        engine: Engine,
+        *,
+        url: str = "griptape-ai/griptape-nodes-library-opencolorio@v1.2.0",
+        required: bool = True,
+        store_json: Path | None = _DEP_JSON,
+        register_result: object = None,
+    ) -> SimpleNamespace:
         mgr = engine.library_manager
         info = _library_info(library_path="/mock.json", lifecycle_state=LibraryManager.LibraryLifecycleState.EVALUATED)
         schema = MagicMock()
         schema.name = LIBRARY_NAME
-        schema.metadata.declarations = [
-            LibraryDependencyDeclaration(url="griptape-ai/griptape-nodes-library-opencolorio@v1.2.0")
-        ]
-        dep_json = Path("/rez/opencolorio/1.2.0/python/griptape_nodes_library.json")
+        schema.metadata.declarations = [LibraryDependencyDeclaration(url=url, required=required)]
+        if register_result is None:
+            register_result = RegisterLibraryFromFileResultSuccess(library_name="opencolorio", result_details="ok")
 
         with (
             patch(f"{LIBRARY_MANAGER_MODULE}.is_rez_enabled", return_value=True),
-            patch(f"{LIBRARY_MANAGER_MODULE}.resolve_rez_library_json_path", return_value=dep_json),
+            patch(f"{LIBRARY_MANAGER_MODULE}.resolve_rez_library_json_path", return_value=store_json) as lookup,
             patch.object(
                 mgr, "load_library_metadata_from_file_request", return_value=_metadata_success(schema, "/mock.json")
             ),
             patch.object(mgr, "register_library_from_file_request", AsyncMock(return_value=register_result)) as reg,
-            patch.object(mgr, "download_library_request") as mock_download,
-            patch.object(mgr, "install_library_dependencies_request", return_value=self._STOP),
+            patch.object(mgr, "download_library_request") as download,
+            patch.object(mgr, "install_library_dependencies_request", return_value=self._STOP) as install,
             patch.object(mgr, "_library_file_path_to_info", {"/mock.json": info}),
         ):
-            await mgr._progress_library_through_lifecycle(
+            result = await mgr._progress_library_through_lifecycle(
                 library_info=info,
                 file_path="/mock.json",
                 request=RegisterLibraryFromFileRequest(file_path="/mock.json"),
             )
-        return reg, mock_download
+        return SimpleNamespace(
+            result=result, info=info, lookup=lookup, register=reg, download=download, install=install
+        )
 
     @pytest.mark.asyncio
-    async def test_registers_dependency_from_rez_store(self, engine: Engine) -> None:
-        success = RegisterLibraryFromFileResultSuccess(library_name="opencolorio", result_details="ok")
+    async def test_registers_dependency_from_store_at_its_pinned_version(self, engine: Engine) -> None:
+        run = await self._progress(engine)
 
-        register, download = await self._progress(engine, register_result=success)
-
-        register.assert_awaited_once()
-        assert register.await_args is not None
-        registered_path = register.await_args.args[0].file_path
-        assert Path(registered_path) == Path("/rez/opencolorio/1.2.0/python/griptape_nodes_library.json")
-        download.assert_not_called()
+        run.lookup.assert_called_once_with(self._DEP_FAMILY, version="1.2.0")
+        run.register.assert_awaited_once()
+        assert Path(run.register.await_args.args[0].file_path) == self._DEP_JSON
+        run.download.assert_not_called()
+        run.install.assert_called_once()
+        assert not _dependency_problems(run.info)
 
     @pytest.mark.asyncio
-    async def test_failed_rez_registration_still_skips_download(self, engine: Engine) -> None:
+    async def test_branch_ref_is_not_a_version_so_latest_is_used(self, engine: Engine) -> None:
+        run = await self._progress(engine, url="griptape-ai/griptape-nodes-library-opencolorio@main")
+
+        run.lookup.assert_called_once_with(self._DEP_FAMILY, version=None)
+        run.download.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_required_dependency_missing_from_store_fails_without_download(self, engine: Engine) -> None:
+        run = await self._progress(engine, store_json=None)
+
+        assert isinstance(run.result, RegisterLibraryFromFileResultFailure)
+        assert "griptape_nodes_library_opencolorio-1.2.0' is not in the rez package store" in str(
+            run.result.result_details
+        )
+        assert run.info.fitness == LibraryManager.LibraryFitness.UNUSABLE
+        assert run.info.lifecycle_state == LibraryManager.LibraryLifecycleState.FAILURE
+        assert len(_dependency_problems(run.info)) == 1
+        run.register.assert_not_awaited()
+        run.download.assert_not_called()
+        run.install.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_optional_dependency_missing_from_store_continues_without_download(self, engine: Engine) -> None:
+        run = await self._progress(engine, store_json=None, required=False)
+
+        run.download.assert_not_called()
+        run.install.assert_called_once()
+        assert not _dependency_problems(run.info)
+
+    @pytest.mark.asyncio
+    async def test_required_dependency_that_fails_to_register_fails_the_library(self, engine: Engine) -> None:
         failure = RegisterLibraryFromFileResultFailure(result_details="bad package")
 
-        register, download = await self._progress(engine, register_result=failure)
+        run = await self._progress(engine, register_result=failure)
 
-        register.assert_awaited_once()
-        download.assert_not_called()
+        assert isinstance(run.result, RegisterLibraryFromFileResultFailure)
+        assert "failed to register: bad package" in str(run.result.result_details)
+        assert run.info.fitness == LibraryManager.LibraryFitness.UNUSABLE
+        run.download.assert_not_called()
+        run.install.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_optional_dependency_that_fails_to_register_continues(self, engine: Engine) -> None:
+        failure = RegisterLibraryFromFileResultFailure(result_details="bad package")
+
+        run = await self._progress(engine, register_result=failure, required=False)
+
+        run.download.assert_not_called()
+        run.install.assert_called_once()
+        assert not _dependency_problems(run.info)
 
 
 class TestAppInitializationRezHealthCheck:
