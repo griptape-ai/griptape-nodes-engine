@@ -274,7 +274,7 @@ DEFAULT_PROJECT_TEMPLATE_V1 = ProjectTemplate(
         "griptape-nodes-provenance": DirectoryDefinition(
             name="griptape-nodes-provenance",
             path_macro="{workflow_dir?:/}griptape-nodes-provenance",
-            description="Immutable per-save provenance records; canonical records under by-path/, content-hash pointers under by-hash/, flow snapshots under snapshots/.",
+            description="Immutable per-save provenance records; canonical records under by-path/, content-hash pointers under by-hash/.",
         ),
         "griptape-nodes-thumbnails": DirectoryDefinition(
             name="griptape-nodes-thumbnails",

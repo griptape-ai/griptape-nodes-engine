@@ -13,7 +13,6 @@ Design: docs/development/designs/artifact_provenance.md (§7, §8).
 from __future__ import annotations
 
 import base64
-import json
 import logging
 import pickle
 import tempfile
@@ -24,7 +23,7 @@ from typing import TYPE_CHECKING, Any
 
 from griptape.artifacts import UrlArtifact
 
-from griptape_nodes.common.macro_parser import ParsedMacro
+from griptape_nodes.common.macro_parser import MacroSyntaxError, ParsedMacro
 from griptape_nodes.common.project_templates.provenance_settings import (
     ProvenanceCapturePolicy,
     ProvenanceFailurePolicy,
@@ -37,6 +36,7 @@ from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.files.path_utils import canonicalize_for_identity, decompose_source_path, parse_static_server_url
 from griptape_nodes.retained_mode.engine import EngineScoped
+from griptape_nodes.retained_mode.events.event_converter import safe_unstructure
 from griptape_nodes.retained_mode.events.flow_events import (
     SerializeFlowToCommandsRequest,
     SerializeFlowToCommandsResultSuccess,
@@ -61,8 +61,30 @@ from griptape_nodes.retained_mode.events.project_events import (
     GetPathForMacroResultSuccess,
     GetSituationRequest,
     GetSituationResultSuccess,
+    MacroPath,
+)
+from griptape_nodes.retained_mode.events.provenance_events import (
+    GetProvenanceForArtifactRequest,
+    GetProvenanceForArtifactResultFailure,
+    GetProvenanceForArtifactResultSuccess,
+    GetProvenancePayloadRequest,
+    GetProvenancePayloadResultFailure,
+    GetProvenancePayloadResultSuccess,
+    ListProvenancedArtifactsRequest,
+    ListProvenancedArtifactsResultFailure,
+    ListProvenancedArtifactsResultSuccess,
+    ListProvenanceRecordsForArtifactRequest,
+    ListProvenanceRecordsForArtifactResultFailure,
+    ListProvenanceRecordsForArtifactResultSuccess,
+    ListProvenanceRecordsForHashRequest,
+    ListProvenanceRecordsForHashResultFailure,
+    ListProvenanceRecordsForHashResultSuccess,
+    ProvenancedArtifactSummary,
+    ProvenanceMatchOrigin,
+    ProvenanceQueryFailureReason,
 )
 from griptape_nodes.retained_mode.file_metadata.provenance_record import (
+    BY_PATH_DIR_NAME,
     PARAMETER_VALUES_FORMAT,
     ArtifactIdentity,
     ByHashPointer,
@@ -71,6 +93,7 @@ from griptape_nodes.retained_mode.file_metadata.provenance_record import (
     ProvenanceContent,
     ProvenancePayload,
     ProvenanceRecord,
+    ProvenanceRecordHeader,
     ProvenanceRelationship,
     ProvenanceWriteDetails,
     SerializedNodePayload,
@@ -96,6 +119,7 @@ from griptape_nodes.utils.version_utils import get_current_version
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.flow import ControlFlow
     from griptape_nodes.retained_mode.engine import Engine
+    from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
 
 logger = logging.getLogger("griptape_nodes")
@@ -153,6 +177,14 @@ class ProvenanceCapturePlan:
 
 
 @dataclass
+class _ResolvedRecords:
+    """An artifact lookup's outcome: the records and how they were found."""
+
+    records: list[ProvenanceRecord]
+    matched_by: ProvenanceMatchOrigin
+
+
+@dataclass
 class _ResolvedStorePaths:
     """Absolute locations resolved for one capture: the record file and the store root."""
 
@@ -177,6 +209,22 @@ class ProvenanceManager(EngineScoped):
     def __init__(self, event_manager: EventManager | None = None, *, engine: Engine | None = None) -> None:
         super().__init__(engine=engine)
         self._event_manager = event_manager
+        if event_manager is not None:
+            event_manager.assign_manager_to_request_type(
+                GetProvenanceForArtifactRequest, self.on_get_provenance_for_artifact_request
+            )
+            event_manager.assign_manager_to_request_type(
+                ListProvenanceRecordsForArtifactRequest, self.on_list_provenance_records_for_artifact_request
+            )
+            event_manager.assign_manager_to_request_type(
+                ListProvenanceRecordsForHashRequest, self.on_list_provenance_records_for_hash_request
+            )
+            event_manager.assign_manager_to_request_type(
+                ListProvenancedArtifactsRequest, self.on_list_provenanced_artifacts_request
+            )
+            event_manager.assign_manager_to_request_type(
+                GetProvenancePayloadRequest, self.on_get_provenance_payload_request
+            )
         # One-time flag so legacy projects (templates without the provenance
         # situation) log a single info line instead of one per save.
         self._warned_no_situation = False
@@ -197,48 +245,22 @@ class ProvenanceManager(EngineScoped):
         )
         failure_policy = resolve_failure_policy(provenance.failure_policy, project_settings)
         situation_available = self._provenance_situation_macro() is not None
+        # Legacy template (v0) with no provenance situation: record nothing,
+        # never fail the save. Upgrading the project's template major enables capture.
+        capture_wanted = capture_policy != ProvenanceCapturePolicy.NO_PROVENANCE_RECORDED
+        if capture_wanted and not situation_available and not self._warned_no_situation:
+            self._warned_no_situation = True
+            logger.info(
+                "Provenance capture is unavailable in this project: its template has no "
+                "'%s' situation (legacy schema). Files will save normally without provenance records.",
+                BuiltInSituation.SAVE_ARTIFACT_PROVENANCE,
+            )
         active = (
             capture_policy != ProvenanceCapturePolicy.NO_PROVENANCE_RECORDED
             and situation_available
             and not self._is_engine_scratch_path(artifact_path)
         )
         return ProvenanceCapturePlan(capture_policy=capture_policy, failure_policy=failure_policy, active=active)
-
-    def _artifact_kind(self, artifact_path: Path) -> str | None:
-        """The claiming artifact provider's friendly name, lowercased, or None if unclaimed."""
-        extension = artifact_path.suffix.lstrip(".").lower()
-        if not extension:
-            return None
-        registry = self.engine.artifact_manager._registry
-        provider_classes = registry.get_provider_classes_by_format(extension)
-        if not provider_classes:
-            return None
-        return provider_classes[0].get_friendly_name().lower()
-
-    def _is_engine_scratch_path(self, artifact_path: Path) -> bool:
-        """Whether a save landed in the OS temp root OUTSIDE the workspace.
-
-        Scratch staging files are transient by definition, so their records
-        would be guaranteed-dangling noise. Both conditions matter: a workspace
-        deliberately placed under the temp root (ephemeral/CI setups) still
-        captures, and user-chosen out-of-workspace destinations (not in temp)
-        capture normally.
-        """
-        try:
-            temp_root = canonicalize_for_identity(Path(tempfile.gettempdir()))
-            candidate = canonicalize_for_identity(artifact_path)
-        except (OSError, RuntimeError, ValueError):
-            return False
-        if not candidate.is_relative_to(temp_root):
-            return False
-        workspace_dir = self._current_workspace_dir()
-        if workspace_dir is None:
-            return True
-        try:
-            workspace = canonicalize_for_identity(workspace_dir)
-        except (OSError, RuntimeError, ValueError):
-            return True
-        return not candidate.is_relative_to(workspace)
 
     def preflight_record_dir(self, artifact_path: Path) -> str | None:
         """Ensure the record directory for an artifact is creatable before a non-rollbackable write.
@@ -276,20 +298,25 @@ class ProvenanceManager(EngineScoped):
         except OSError as e:
             logger.warning("Provenance: could not roll back by-hash pointer '%s': %s", pointer_path, e)
 
-    def record_artifact_save(self, facts: ArtifactWriteFacts, provenance: ProvenanceContent) -> ProvenanceCaptureResult:
+    def record_artifact_save(
+        self, facts: ArtifactWriteFacts, provenance: ProvenanceContent, plan: ProvenanceCapturePlan
+    ) -> ProvenanceCaptureResult:
         """Capture a provenance record for a just-written artifact.
 
         Args:
             facts: The write's final truth: resolved path (post collision-walk,
                 post extension coercion), definitive bytes, and edge-case flags.
             provenance: The caller's election (policies, node identity, situation).
+            plan: The resolved plan from `plan_capture` for this same save; the
+                capture uses its policies rather than re-resolving, so the record
+                cannot disagree with the gates the write pipeline sequenced around.
 
         Returns:
             ProvenanceCaptureResult; never raises. The caller applies the
             resolved failure policy to a failed result.
         """
         try:
-            return self._record_artifact_save(facts, provenance)
+            return self._record_artifact_save(facts, provenance, plan)
         except Exception as e:
             logger.exception("Provenance capture failed for '%s'", facts.final_file_path)
             return ProvenanceCaptureResult(
@@ -298,29 +325,173 @@ class ProvenanceManager(EngineScoped):
                 )
             )
 
-    def _record_artifact_save(
-        self, facts: ArtifactWriteFacts, provenance: ProvenanceContent
-    ) -> ProvenanceCaptureResult:
-        project_settings = self._current_project_provenance_settings()
-        capture_policy = resolve_capture_policy(
-            provenance.capture_policy, project_settings, artifact_kind=self._artifact_kind(facts.final_file_path)
+    def find_latest_record_for_path(self, artifact_path: Path) -> ProvenanceRecord | None:
+        """Load the latest readable record for an artifact path, or None.
+
+        Latest = lexicographic max of the record directory (record IDs are
+        time-sortable). Unreadable or newer-major records are skipped rather
+        than raised: the store is user-editable.
+        """
+        record_dir = self._record_dir_for_path(artifact_path)
+        if record_dir is None or not record_dir.is_dir():
+            return None
+        for record_file in sorted(record_dir.glob("*.yaml"), reverse=True):
+            record = self._load_record(record_file)
+            if record is not None:
+                return record
+        return None
+
+    # -- query handlers (the external interface) -----------------------------
+
+    def on_get_provenance_for_artifact_request(self, request: GetProvenanceForArtifactRequest) -> ResultPayload:
+        """Get the latest (or a specific) record for an artifact, by any path spelling."""
+        artifact_path = self._resolve_artifact_path(request.macro_path)
+        if artifact_path is None:
+            return GetProvenanceForArtifactResultFailure(
+                failure_reason=ProvenanceQueryFailureReason.PATH_UNRESOLVABLE,
+                result_details=f"Attempted to look up provenance for '{request.macro_path}'. Failed because the location could not be resolved.",
+            )
+
+        resolved = self._records_for_artifact(artifact_path)
+        records = resolved.records
+        if not records:
+            return GetProvenanceForArtifactResultFailure(
+                failure_reason=ProvenanceQueryFailureReason.NO_PROVENANCE_RECORDS,
+                result_details=f"Attempted to look up provenance for '{request.macro_path}'. Failed because no provenance records exist for it.",
+            )
+
+        if request.record_id is not None:
+            matches = [record for record in records if record.record_id == request.record_id]
+            if not matches:
+                return GetProvenanceForArtifactResultFailure(
+                    failure_reason=ProvenanceQueryFailureReason.RECORD_NOT_FOUND,
+                    result_details=(
+                        f"Attempted to look up provenance record '{request.record_id}' for "
+                        f"'{request.macro_path}'. Failed because that record does not exist."
+                    ),
+                )
+            record = matches[0]
+        else:
+            record = records[0]
+
+        record_dir = self._record_dir_for_path(artifact_path)
+        record_path = str(record_dir / f"{record.record_id}.yaml") if record_dir is not None else ""
+        return GetProvenanceForArtifactResultSuccess(
+            record=ProvenanceRecordHeader.from_record(record),
+            record_path=record_path,
+            matched_by=resolved.matched_by,
+            is_stale=self._compute_is_stale(record, artifact_path),
+            result_details=f"Found provenance record '{record.record_id}' for '{request.macro_path}'.",
         )
-        if capture_policy == ProvenanceCapturePolicy.NO_PROVENANCE_RECORDED:
+
+    def on_get_provenance_payload_request(self, request: GetProvenancePayloadRequest) -> ResultPayload:
+        """Fetch one record's full payload: the explicit opt-in to the weight."""
+        artifact_path = self._resolve_artifact_path(request.macro_path)
+        if artifact_path is None:
+            return GetProvenancePayloadResultFailure(
+                failure_reason=ProvenanceQueryFailureReason.PATH_UNRESOLVABLE,
+                result_details=f"Attempted to fetch a provenance payload for '{request.macro_path}'. Failed because the location could not be resolved.",
+            )
+        records = self._records_for_artifact(artifact_path).records
+        if not records:
+            return GetProvenancePayloadResultFailure(
+                failure_reason=ProvenanceQueryFailureReason.NO_PROVENANCE_RECORDS,
+                result_details=f"Attempted to fetch a provenance payload for '{request.macro_path}'. Failed because no provenance records exist for it.",
+            )
+        if request.record_id is not None:
+            matches = [record for record in records if record.record_id == request.record_id]
+            if not matches:
+                return GetProvenancePayloadResultFailure(
+                    failure_reason=ProvenanceQueryFailureReason.RECORD_NOT_FOUND,
+                    result_details=(
+                        f"Attempted to fetch provenance payload '{request.record_id}' for "
+                        f"'{request.macro_path}'. Failed because that record does not exist."
+                    ),
+                )
+            record = matches[0]
+        else:
+            record = records[0]
+        return GetProvenancePayloadResultSuccess(
+            record_id=record.record_id,
+            payload=record.payload,
+            result_details=f"Fetched the full payload of record '{record.record_id}'.",
+        )
+
+    def on_list_provenance_records_for_artifact_request(
+        self, request: ListProvenanceRecordsForArtifactRequest
+    ) -> ResultPayload:
+        """List one artifact's save history, newest first."""
+        artifact_path = self._resolve_artifact_path(request.macro_path)
+        if artifact_path is None:
+            return ListProvenanceRecordsForArtifactResultFailure(
+                failure_reason=ProvenanceQueryFailureReason.PATH_UNRESOLVABLE,
+                result_details=f"Attempted to list provenance for '{request.macro_path}'. Failed because the location could not be resolved.",
+            )
+        resolved = self._records_for_artifact(artifact_path)
+        return ListProvenanceRecordsForArtifactResultSuccess(
+            records=[ProvenanceRecordHeader.from_record(record) for record in resolved.records],
+            matched_by=resolved.matched_by,
+            result_details=f"Found {len(resolved.records)} provenance record(s) for '{request.macro_path}'.",
+        )
+
+    def on_list_provenance_records_for_hash_request(
+        self, request: ListProvenanceRecordsForHashRequest
+    ) -> ResultPayload:
+        """List every record for exact content bytes, newest first."""
+        store_root = self._store_root_or_none()
+        if store_root is None:
+            return ListProvenanceRecordsForHashResultFailure(
+                failure_reason=ProvenanceQueryFailureReason.STORE_UNAVAILABLE,
+                result_details="Attempted to list provenance by content hash. Failed because the provenance store could not be located.",
+            )
+        try:
+            records = self._records_for_hash(request.content_hash, store_root)
+        except ValueError as e:
+            return ListProvenanceRecordsForHashResultFailure(
+                failure_reason=ProvenanceQueryFailureReason.PATH_UNRESOLVABLE,
+                result_details=f"Attempted to list provenance by content hash. Failed due to: {e}",
+            )
+        return ListProvenanceRecordsForHashResultSuccess(
+            records=[ProvenanceRecordHeader.from_record(record) for record in records],
+            result_details=f"Found {len(records)} provenance record(s) for the content hash.",
+        )
+
+    def on_list_provenanced_artifacts_request(self, request: ListProvenancedArtifactsRequest) -> ResultPayload:  # noqa: ARG002
+        """Inventory every artifact with provenance, sorted by artifact type then path."""
+        store_root = self._store_root_or_none()
+        if store_root is None:
+            return ListProvenancedArtifactsResultFailure(
+                failure_reason=ProvenanceQueryFailureReason.STORE_UNAVAILABLE,
+                result_details="Attempted to inventory provenanced artifacts. Failed because the provenance store could not be located.",
+            )
+        by_path_root = store_root / BY_PATH_DIR_NAME
+        summaries: list[ProvenancedArtifactSummary] = []
+        if by_path_root.is_dir():
+            artifact_dirs: dict[Path, list[str]] = {}
+            for record_file in by_path_root.rglob("*.yaml"):
+                artifact_dirs.setdefault(record_file.parent, []).append(record_file.stem)
+            for artifact_dir, record_ids in artifact_dirs.items():
+                summaries.append(self._summarize_artifact_dir(artifact_dir, by_path_root, record_ids))
+        summaries.sort(key=lambda s: (s.artifact_kind is None, s.artifact_kind or "", s.macro_path))
+        return ListProvenancedArtifactsResultSuccess(
+            artifacts=summaries,
+            result_details=f"Found {len(summaries)} artifact(s) with provenance.",
+        )
+
+    def _record_artifact_save(
+        self, facts: ArtifactWriteFacts, provenance: ProvenanceContent, plan: ProvenanceCapturePlan
+    ) -> ProvenanceCaptureResult:
+        # The plan already gated NO_PROVENANCE_RECORDED, scratch paths, and the
+        # legacy-template case; an inactive plan means the caller skipped capture
+        # entirely. Guard anyway so a stale plan degrades to "no record".
+        if not plan.active:
             return ProvenanceCaptureResult()
-        if self._is_engine_scratch_path(facts.final_file_path):
-            return ProvenanceCaptureResult()
+        capture_policy = plan.capture_policy
 
         situation_macro = self._provenance_situation_macro()
         if situation_macro is None:
-            # Legacy template (v0) with no provenance situation: record nothing,
-            # never fail the save. Upgrading the project's template major enables capture.
-            if not self._warned_no_situation:
-                self._warned_no_situation = True
-                logger.info(
-                    "Provenance capture is unavailable in this project: its template has no "
-                    "'%s' situation (legacy schema). Files will save normally without provenance records.",
-                    BuiltInSituation.SAVE_ARTIFACT_PROVENANCE,
-                )
+            # The situation vanished between planning and capture (project
+            # switch mid-write); record nothing rather than guess a location.
             return ProvenanceCaptureResult()
 
         record_id = generate_record_id()
@@ -352,21 +523,176 @@ class ProvenanceManager(EngineScoped):
             )
         )
 
-    def find_latest_record_for_path(self, artifact_path: Path) -> ProvenanceRecord | None:
-        """Load the latest readable record for an artifact path, or None.
-
-        Latest = lexicographic max of the record directory (record IDs are
-        time-sortable). Unreadable or newer-major records are skipped rather
-        than raised: the store is user-editable.
-        """
-        record_dir = self._record_dir_for_path(artifact_path)
-        if record_dir is None or not record_dir.is_dir():
+    def _artifact_kind(self, artifact_path: Path) -> str | None:
+        """The claiming artifact provider's friendly name, lowercased, or None if unclaimed."""
+        extension = artifact_path.suffix.lstrip(".").lower()
+        if not extension:
             return None
-        for record_file in sorted(record_dir.glob("*.yaml"), reverse=True):
-            record = self._load_record(record_file)
-            if record is not None:
-                return record
+        registry = self.engine.artifact_manager._registry
+        provider_classes = registry.get_provider_classes_by_format(extension)
+        if not provider_classes:
+            return None
+        return provider_classes[0].get_friendly_name().lower()
+
+    def _is_engine_scratch_path(self, artifact_path: Path) -> bool:
+        """Whether a save landed in the OS temp root OUTSIDE the workspace.
+
+        Scratch staging files are transient by definition, so their records
+        would be guaranteed-dangling noise. Both conditions matter: a workspace
+        deliberately placed under the temp root (ephemeral/CI setups) still
+        captures, and user-chosen out-of-workspace destinations (not in temp)
+        capture normally.
+        """
+        try:
+            temp_root = canonicalize_for_identity(Path(tempfile.gettempdir()))
+            candidate = canonicalize_for_identity(artifact_path)
+        except (OSError, RuntimeError, ValueError):
+            return False
+        if not candidate.is_relative_to(temp_root):
+            return False
+        workspace_dir = self._current_workspace_dir()
+        if workspace_dir is None:
+            return True
+        try:
+            workspace = canonicalize_for_identity(workspace_dir)
+        except (OSError, RuntimeError, ValueError):
+            return True
+        return not candidate.is_relative_to(workspace)
+
+    def _summarize_artifact_dir(
+        self, artifact_dir: Path, by_path_root: Path, record_ids: list[str]
+    ) -> ProvenancedArtifactSummary:
+        """Build an inventory entry from directory structure alone (no record parsing)."""
+        mirror_relative = artifact_dir.relative_to(by_path_root)
+        reconstructed = self._reconstruct_artifact_path(mirror_relative)
+        macro_path: str | None = None
+        if reconstructed is not None:
+            macro_path = self._macro_path_for(reconstructed)
+        best_path = macro_path or (str(reconstructed) if reconstructed is not None else mirror_relative.as_posix())
+        return ProvenancedArtifactSummary(
+            macro_path=best_path,
+            file_name=artifact_dir.name,
+            artifact_kind=self._artifact_kind(Path(artifact_dir.name)),
+            record_count=len(record_ids),
+            latest_record_id=max(record_ids),
+        )
+
+    def _reconstruct_artifact_path(self, mirror_relative: Path) -> Path | None:
+        """Best-effort inverse of the by-path mirroring for one artifact directory.
+
+        In-workspace saves mirror workspace-relative, so joining onto the
+        workspace reproduces them. Outside-workspace saves mirror under a
+        drive/volume segment; reconstruction is heuristic and returns None
+        rather than guessing wrong.
+        """
+        workspace_dir = self._current_workspace_dir()
+        if workspace_dir is not None:
+            candidate = workspace_dir / mirror_relative
+            if candidate.exists() or not mirror_relative.parts:
+                return candidate
+        first = mirror_relative.parts[0] if mirror_relative.parts else ""
+        if len(first) == 2 and first.endswith(":"):  # noqa: PLR2004
+            return Path(first + "/") / Path(*mirror_relative.parts[1:])
+        rooted = Path("/") / mirror_relative
+        if rooted.exists():
+            return rooted
+        if workspace_dir is not None:
+            # The artifact may simply have been deleted; prefer the workspace shape.
+            return workspace_dir / mirror_relative
         return None
+
+    def _resolve_artifact_path(self, macro_path: str | MacroPath) -> Path | None:
+        """Resolve a `str | MacroPath` location (the OS request surface's type) to an absolute path.
+
+        A MacroPath carries macro-ness in its type. A string is a plain path,
+        except that macro-shaped strings are upgraded exactly the way
+        File.__init__ upgrades them at its boundary: parse, don't peek -- the
+        macro parser decides. (File.resolve() itself is off limits here: it
+        routes through the GriptapeNodes facade / current_engine, and
+        engine-internal code stays scoped to self.engine.)
+        """
+        if isinstance(macro_path, MacroPath):
+            return self._resolve_macro(macro_path.parsed_macro, dict(macro_path.variables))
+        if not macro_path:
+            return None
+        try:
+            parsed = ParsedMacro(macro_path)
+        except MacroSyntaxError:
+            parsed = None
+        if parsed is not None and parsed.get_variables():
+            return self._resolve_macro(parsed, {})
+        candidate = Path(macro_path)
+        if candidate.is_absolute():
+            return candidate
+        workspace_dir = self._current_workspace_dir()
+        if workspace_dir is None:
+            return None
+        return workspace_dir / candidate
+
+    def _resolve_macro(self, parsed: ParsedMacro, variables: dict) -> Path | None:
+        path_result = self.engine.handle_request(GetPathForMacroRequest(parsed_macro=parsed, variables=variables))
+        if not isinstance(path_result, GetPathForMacroResultSuccess):
+            return None
+        return path_result.absolute_path
+
+    def _records_for_artifact(self, artifact_path: Path) -> _ResolvedRecords:
+        """All readable records for an artifact, newest first; by-hash fallback on a path miss."""
+        records: list[ProvenanceRecord] = []
+        record_dir = self._record_dir_for_path(artifact_path)
+        if record_dir is not None and record_dir.is_dir():
+            for record_file in sorted(record_dir.glob("*.yaml"), reverse=True):
+                record = self._load_record(record_file)
+                if record is not None:
+                    records.append(record)
+        if records:
+            return _ResolvedRecords(records=records, matched_by=ProvenanceMatchOrigin.PATH)
+        # Path miss: a moved/renamed/hand-copied file can still find its history
+        # by content.
+        empty = _ResolvedRecords(records=[], matched_by=ProvenanceMatchOrigin.PATH)
+        try:
+            live_hash = hash_content(artifact_path.read_bytes())
+        except OSError:
+            return empty
+        store_root = self._store_root_or_none()
+        if store_root is None:
+            return empty
+        try:
+            hash_records = self._records_for_hash(live_hash, store_root)
+        except ValueError:
+            return empty
+        return _ResolvedRecords(records=hash_records, matched_by=ProvenanceMatchOrigin.HASH)
+
+    def _records_for_hash(self, content_hash: str, store_root: Path) -> list[ProvenanceRecord]:
+        """All readable records reachable through the hash's pointers, newest first.
+
+        Raises:
+            ValueError: If the content hash is not in the expected prefixed form.
+        """
+        pointer_dir = store_root / by_hash_relative_path(content_hash, "_").rsplit("/", 1)[0]
+        records: list[ProvenanceRecord] = []
+        if not pointer_dir.is_dir():
+            return records
+        for pointer_file in sorted(pointer_dir.glob("*.yaml"), reverse=True):
+            try:
+                pointer = load_pointer_yaml(pointer_file.read_text(encoding="utf-8"))
+            except Exception as e:
+                logger.debug("Provenance: skipping unreadable by-hash pointer '%s': %s", pointer_file, e)
+                continue
+            record = self._load_record(store_root / pointer.record)
+            if record is not None:
+                records.append(record)
+        return records
+
+    def _compute_is_stale(self, record: ProvenanceRecord, artifact_path: Path) -> bool | None:
+        """Whether the artifact's live bytes still match the record; None when unjudgeable."""
+        live_path = Path(record.artifact.path_at_save)
+        if not live_path.exists():
+            live_path = artifact_path
+        try:
+            live_hash = hash_content(live_path.read_bytes())
+        except OSError:
+            return None
+        return live_hash != record.artifact.content_hash
 
     # -- capture internals -------------------------------------------------
 
@@ -499,7 +825,7 @@ class ProvenanceManager(EngineScoped):
         final_file_path = facts.final_file_path
         content_hash = hash_content(facts.final_content_bytes)
         artifact = ArtifactIdentity(
-            final_path=str(final_file_path),
+            path_at_save=str(final_file_path),
             macro_path=self._macro_path_for(final_file_path),
             file_name=final_file_path.name,
             content_hash=content_hash,
@@ -607,19 +933,25 @@ class ProvenanceManager(EngineScoped):
             logger.warning("Provenance: failed to serialize node '%s' commands", node_name)
             return ProvenancePayload()
         try:
-            result_dict = json.loads(serialize_result.to_json())
+            # TYPED access, deliberately not to_json()+dict.get(): if the
+            # serialize-node protocol renames or reshapes its outputs, this
+            # breaks loudly at type-check instead of silently storing empty
+            # payloads. See the companion note on SerializedNodeCommands.
+            commands_dict = safe_unstructure(serialize_result.serialized_node_commands)
+            set_value_dicts = safe_unstructure(serialize_result.set_parameter_value_commands)
+            # The element-modification command list is polymorphic, so the
+            # unstructured dicts are readable but not faithfully restructurable.
+            # Pickle is the faithful transport, exactly as the clipboard path does it.
+            pickled_commands = base64.b64encode(pickle.dumps(serialize_result.serialized_node_commands)).decode("ascii")
             pickled_values = base64.b64encode(pickle.dumps(unique_values)).decode("ascii")
         except Exception as e:
             logger.warning("Provenance: failed to encode node '%s' payload: %s", node_name, e)
             return ProvenancePayload()
-        serialized_node_commands = result_dict.get("serialized_node_commands")
-        if serialized_node_commands is None:
-            logger.warning("Provenance: node '%s' serialization produced no commands", node_name)
-            return ProvenancePayload()
         return ProvenancePayload(
             serialized_node=SerializedNodePayload(
-                serialized_node_commands=serialized_node_commands,
-                set_parameter_value_commands=result_dict.get("set_parameter_value_commands") or [],
+                serialized_node_commands=commands_dict,
+                pickled_node_commands=pickled_commands,
+                set_parameter_value_commands=set_value_dicts or [],
                 pickled_parameter_values=pickled_values,
                 parameter_values_format=PARAMETER_VALUES_FORMAT,
             )
@@ -713,6 +1045,7 @@ class ProvenanceManager(EngineScoped):
                 sources.append(
                     SourceLink(
                         path_at_use=str(candidate_path),
+                        macro_path=self._macro_path_for(candidate_path),
                         parameter_name=parameter.name,
                         discovery_error=f"Could not read this source's provenance: {e}",
                     )
@@ -809,11 +1142,13 @@ class ProvenanceManager(EngineScoped):
 
     def _link_source(self, source_path: Path, parameter_name: str) -> SourceLink:
         source_hash = hash_content(source_path.read_bytes())
+        source_macro = self._macro_path_for(source_path)
 
         latest = self.find_latest_record_for_path(source_path)
         if latest is not None:
             return SourceLink(
                 path_at_use=str(source_path),
+                macro_path=source_macro,
                 parameter_name=parameter_name,
                 record_id=latest.record_id,
                 content_hash=source_hash,
@@ -827,6 +1162,7 @@ class ProvenanceManager(EngineScoped):
         if by_hash_record is not None:
             return SourceLink(
                 path_at_use=str(source_path),
+                macro_path=source_macro,
                 parameter_name=parameter_name,
                 record_id=by_hash_record.record_id,
                 content_hash=source_hash,
@@ -836,6 +1172,7 @@ class ProvenanceManager(EngineScoped):
 
         return SourceLink(
             path_at_use=str(source_path),
+            macro_path=source_macro,
             parameter_name=parameter_name,
             content_hash=source_hash,
         )
@@ -956,7 +1293,10 @@ class ProvenanceManager(EngineScoped):
             # keeps an absolute path so hash lookups still resolve.
             record_relative = store_paths.record_path.as_posix()
 
-        pointer = ByHashPointer(record=record_relative, artifact_path_at_save=record.artifact.final_path)
+        pointer = ByHashPointer(
+            record=record_relative,
+            artifact_path=record.artifact.macro_path or record.artifact.path_at_save,
+        )
         pointer_path = store_paths.store_root / by_hash_relative_path(content_hash, record_id)
         pointer_result = self.engine.handle_request(
             WriteFileRequest(

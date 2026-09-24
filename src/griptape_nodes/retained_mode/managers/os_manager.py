@@ -2619,6 +2619,7 @@ class OSManager(EngineScoped):
                                     ),
                                 ),
                                 provenance_content,  # type: ignore[arg-type]  # plan is active => content is set
+                                provenance_plan,
                             )
                             if capture.failed:
                                 msg = (
@@ -2936,6 +2937,7 @@ class OSManager(EngineScoped):
                         extension_coerced_from=(requested_suffix_before_alignment if swapped_ext is not None else None),
                     ),
                     provenance_content,  # type: ignore[arg-type]  # plan is active => content is set
+                    provenance_plan,
                 )
             if capture is not None and capture.failed:
                 if fail_save_on_provenance_error and not request.append:

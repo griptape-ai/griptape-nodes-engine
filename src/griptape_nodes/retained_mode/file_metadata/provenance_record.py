@@ -98,11 +98,17 @@ class ProducingNodeIdentity(BaseModel):
 class ArtifactIdentity(BaseModel):
     """Identity of the saved artifact: the final on-disk truth for this save event."""
 
-    final_path: str = Field(description="Final resolved path, post collision-walk and extension coercion")
+    path_at_save: str = Field(
+        description=(
+            "Absolute path the bytes landed at on the capturing machine (post collision-walk "
+            "and extension coercion). Machine-local truth as of this save; macro_path is the "
+            "portable identity."
+        )
+    )
     macro_path: str | None = Field(
         default=None,
         description=(
-            "Portable macro form of final_path (e.g. '{outputs}/hero.png') when the path maps "
+            "Portable macro form of path_at_save (e.g. '{outputs}/hero.png') when the path maps "
             "into a project directory; re-resolves against the current project on any machine. "
             "Null when the location has no macro mapping."
         ),
@@ -149,7 +155,14 @@ class SourceLink(BaseModel):
     The path and hash are still recorded so the break is a fact, not a blank.
     """
 
-    path_at_use: str
+    path_at_use: str = Field(description="Absolute path the source was consumed from, on the capturing machine")
+    macro_path: str | None = Field(
+        default=None,
+        description=(
+            "Portable macro form of path_at_use when it maps into a project directory; "
+            "null for locations outside every project directory"
+        ),
+    )
     parameter_name: str | None = None
     record_id: str | None = None
     content_hash: str | None = Field(default=None, description="Hash of the source's bytes as consumed")
@@ -163,10 +176,29 @@ class SourceLink(BaseModel):
 
 
 class SerializedNodePayload(BaseModel):
-    """The producing node via the FULL serialize-node protocol: rebuildable by an engine."""
+    """The producing node via the FULL serialize-node protocol: rebuildable by an engine.
+
+    PERSISTENCE COUPLING: the dict fields hold the event-converter unstructured
+    forms of SerializedNodeCommands and its IndirectSetParameterValueCommand
+    list (node_events.py). Changes to those dataclasses must keep old records
+    structurable, or bump RECORD_SCHEMA_VERSION -- there is a round-trip
+    regression test that fails when the shapes drift apart.
+    """
 
     serialized_node_commands: dict[str, Any] = Field(
-        description="SerializedNodeCommands for the producing node, as JSON structure"
+        description=(
+            "READABLE projection of SerializedNodeCommands (node type, parameter names, "
+            "structure). Not faithfully restructurable: element commands are polymorphic; "
+            "rehydrate from pickled_node_commands instead."
+        )
+    )
+    pickled_node_commands: str | None = Field(
+        default=None,
+        description=(
+            "base64(pickle.dumps(SerializedNodeCommands)): the FAITHFUL form for rehydration, "
+            "the same transport the engine's clipboard path uses. Optional only for records "
+            "written before this field existed."
+        ),
     )
     set_parameter_value_commands: list[dict[str, Any]] = Field(
         default_factory=list,
@@ -204,8 +236,8 @@ class ProvenancePayload(BaseModel):
     serialized_workflow: SerializedWorkflowPayload | None = None
 
 
-class ProvenanceRecord(BaseModel):
-    """The immutable per-save-event provenance document (the record envelope)."""
+class _RecordEnvelopeFields(BaseModel):
+    """Shared envelope fields: everything about a save event except the payload."""
 
     schema_version: str = RECORD_SCHEMA_VERSION
     record_id: str
@@ -234,19 +266,78 @@ class ProvenanceRecord(BaseModel):
     package: PackageIdentity | None = None
     situation: SituationMetadata | None = None
     sources: list[SourceLink] = Field(default_factory=list)
+
+
+class ProvenanceRecord(_RecordEnvelopeFields):
+    """The immutable per-save-event provenance document, as stored on disk.
+
+    One self-contained file: the envelope plus the full faithful payload.
+    This shape never goes over the wire wholesale -- payloads embed entire
+    workflows and run to hundreds of KB. Query results carry
+    ProvenanceRecordHeader instead.
+    """
+
     payload: ProvenancePayload = Field(default_factory=ProvenancePayload)
+
+
+class ProvenancePayloadSummary(BaseModel):
+    """What a record's payload holds, without holding it.
+
+    Enough for a caller to decide whether fetching the full payload
+    (GetProvenancePayloadRequest) is worth the weight.
+    """
+
+    has_serialized_node: bool = False
+    has_serialized_workflow: bool = False
+    pickled_parameter_values_bytes: int | None = Field(
+        default=None, description="Encoded size of the pickled unique-values blob"
+    )
+    workflow_file_chars: int | None = Field(default=None, description="Length of the embedded workflow .py text")
+    workflow_file_hash: str | None = None
+
+    @classmethod
+    def from_payload(cls, payload: ProvenancePayload) -> ProvenancePayloadSummary:
+        """Summarize a full payload for the wire."""
+        summary = cls()
+        if payload.serialized_node is not None:
+            summary.has_serialized_node = True
+            summary.pickled_parameter_values_bytes = len(payload.serialized_node.pickled_parameter_values)
+        if payload.serialized_workflow is not None:
+            summary.has_serialized_workflow = True
+            summary.workflow_file_chars = len(payload.serialized_workflow.workflow_file_content)
+            summary.workflow_file_hash = payload.serialized_workflow.workflow_file_hash
+        return summary
+
+
+class ProvenanceRecordHeader(_RecordEnvelopeFields):
+    """The wire shape of a record: the full envelope, with the payload summarized.
+
+    Same fields as the on-disk record except `payload` carries a
+    ProvenancePayloadSummary instead of the (potentially huge) payload itself.
+    """
+
+    payload: ProvenancePayloadSummary = Field(default_factory=ProvenancePayloadSummary)
+
+    @classmethod
+    def from_record(cls, record: ProvenanceRecord) -> ProvenanceRecordHeader:
+        """Build the wire header from an on-disk record."""
+        envelope = record.model_dump(exclude={"payload"})
+        return cls(**envelope, payload=ProvenancePayloadSummary.from_payload(record.payload))
 
 
 class ByHashPointer(BaseModel):
     """Content of a by-hash pointer file: where the canonical record lives.
 
-    The path is relative to the central provenance store root so the pointer
-    survives the store being moved or committed to another machine.
+    The record path is relative to the central provenance store root so the
+    pointer survives the store being moved or committed to another machine;
+    the artifact descriptor uses the portable macro form when one exists.
     """
 
     schema_version: str = RECORD_SCHEMA_VERSION
     record: str = Field(description="Store-root-relative path to the canonical record, POSIX separators")
-    artifact_path_at_save: str
+    artifact_path: str = Field(
+        description="The artifact this hash belonged to: macro form when mappable, absolute path otherwise"
+    )
 
 
 class ProvenanceContent(BaseModel):
@@ -367,9 +458,10 @@ _RECORD_KEY_COMMENTS: dict[str, str] = {
 # sub-object it explains (the block can be hundreds of KB long).
 _PAYLOAD_KEY_COMMENTS: dict[str, str] = {
     "serialized_node": (
-        "The producing node, rebuildable by an engine: structural commands (JSON),\n"
-        "indirect set-value commands, and the pickled unique-values dict they key into\n"
-        "(base64; engine-only). Same machinery paste/workflow-load uses."
+        "The producing node, rebuildable by an engine. serialized_node_commands is the\n"
+        "READABLE projection (node type, parameter names, structure); rehydration uses\n"
+        "pickled_node_commands + set-value commands + pickled_parameter_values (base64;\n"
+        "engine-only) -- the same transport the clipboard path uses."
     ),
     "serialized_workflow": (
         "The ENTIRE workflow as a runnable .py workflow file's text.\n"
@@ -380,28 +472,6 @@ _PAYLOAD_KEY_COMMENTS: dict[str, str] = {
 _POINTER_HEADER_COMMENT = """Griptape Nodes provenance by-hash pointer.
 Maps this content hash to its canonical record under by-path/.
 'record' is relative to the provenance store root."""
-
-
-def _build_yaml() -> YAML:
-    """YAML dumper with the provenance-store conventions.
-
-    Mirrors the project-template conventions (build_project_yaml): every plain
-    string double-quoted so YAML 1.1 coercions (the Norway problem) can never
-    bite, wide lines, block style. Literal block scalars (the embedded workflow
-    file) keep their own representer.
-    """
-    yaml = YAML()
-    yaml.default_flow_style = False
-    yaml.width = 4096
-    yaml.representer.add_representer(str, lambda r, d: r.represent_scalar("tag:yaml.org,2002:str", d, style='"'))
-    return yaml
-
-
-def _dump_commented(data: CommentedMap, header_comment: str) -> str:
-    data.yaml_set_start_comment(header_comment)
-    stream = io.StringIO()
-    _build_yaml().dump(data, stream)
-    return stream.getvalue()
 
 
 def dump_record_yaml(record: ProvenanceRecord) -> str:
@@ -464,3 +534,25 @@ def load_pointer_yaml(text: str) -> ByHashPointer:
         msg = f"Not valid YAML: {e}"
         raise ValueError(msg) from e
     return ByHashPointer.model_validate(raw)
+
+
+def _build_yaml() -> YAML:
+    """YAML dumper with the provenance-store conventions.
+
+    Mirrors the project-template conventions (build_project_yaml): every plain
+    string double-quoted so YAML 1.1 coercions (the Norway problem) can never
+    bite, wide lines, block style. Literal block scalars (the embedded workflow
+    file) keep their own representer.
+    """
+    yaml = YAML()
+    yaml.default_flow_style = False
+    yaml.width = 4096
+    yaml.representer.add_representer(str, lambda r, d: r.represent_scalar("tag:yaml.org,2002:str", d, style='"'))
+    return yaml
+
+
+def _dump_commented(data: CommentedMap, header_comment: str) -> str:
+    data.yaml_set_start_comment(header_comment)
+    stream = io.StringIO()
+    _build_yaml().dump(data, stream)
+    return stream.getvalue()

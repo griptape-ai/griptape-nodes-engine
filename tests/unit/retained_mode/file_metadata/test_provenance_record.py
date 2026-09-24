@@ -95,7 +95,7 @@ class TestRecordEnvelope:
             saved_at=datetime.now(UTC).isoformat(),
             capture_policy=ProvenanceCapturePolicy.PRODUCING_NODE_ONLY,
             artifact=ArtifactIdentity(
-                final_path="/ws/renders/hero.png",
+                path_at_save="/ws/renders/hero.png",
                 file_name="hero.png",
                 content_hash=hash_content(b"pixels"),
                 size_bytes=6,
@@ -116,7 +116,7 @@ class TestRecordEnvelope:
             saved_at=datetime.now(UTC).isoformat(),
             capture_policy=ProvenanceCapturePolicy.FULL_WORKFLOW_SNAPSHOT,
             artifact=ArtifactIdentity(
-                final_path="/ws/renders/hero.png",
+                path_at_save="/ws/renders/hero.png",
                 file_name="hero.png",
                 content_hash=hash_content(b"pixels"),
                 size_bytes=6,
@@ -138,7 +138,7 @@ class TestRecordEnvelope:
         assert round_tripped.payload.serialized_workflow.workflow_file_content == workflow_text
 
     def test_pointer_round_trips_through_yaml(self) -> None:
-        pointer = ByHashPointer(record="by-path/renders/hero.png/x.yaml", artifact_path_at_save="/ws/renders/hero.png")
+        pointer = ByHashPointer(record="by-path/renders/hero.png/x.yaml", artifact_path="{outputs}/hero.png")
         assert load_pointer_yaml(dump_pointer_yaml(pointer)) == pointer
 
 
