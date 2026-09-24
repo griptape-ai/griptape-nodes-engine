@@ -4,22 +4,22 @@ import asyncio
 import functools
 import json
 import logging
+import math
 import os
 import re
 import sys
 import time
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import anyio
 
-from griptape_nodes.bootstrap.utils.subprocess_websocket_base import WebSocketMessage
 from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events import worker_events
 from griptape_nodes.retained_mode.events.app_events import ConfigChanged, CurrentProjectChanged, SecretChanged
-from griptape_nodes.retained_mode.events.base_events import EventRequest
+from griptape_nodes.retained_mode.events.base_events import RESULT_EVENT_TYPES, EventRequest
 from griptape_nodes.retained_mode.managers.settings import (
     WORKER_HEARTBEAT_INTERVAL_KEY,
     WORKER_HEARTBEAT_STARTUP_GRACE_KEY,
@@ -55,6 +55,11 @@ class WorkerRegistration:
 
     request_topic: str
     worker_key: str | None
+    # Challenges sent since this worker last answered one. Eviction counts these rather than
+    # measuring elapsed time, because the sweep shares a loop with library load: a wall-clock
+    # timeout charges the orchestrator's own latency to the worker and evicts one that was
+    # never asked.
+    unanswered_challenges: int = 0
 
 
 @dataclass
@@ -66,7 +71,6 @@ class _WorkerTransport:
     the WebSocket client and request client exist.
     """
 
-    ws_outgoing_queue: asyncio.Queue
     send_message: Callable[[str, str, str | None], Awaitable[None]]
     subscribe_to_topic: Callable[[str], Awaitable[None]]
     unsubscribe_from_topic: Callable[[str], Awaitable[None]]
@@ -86,6 +90,11 @@ class WorkerManager(EngineScoped):
 
     DEFAULT_HEARTBEAT_INTERVAL_S: float = 5.0
     DEFAULT_HEARTBEAT_TIMEOUT_S: float = 15.0
+    # Floor on the configured interval. Zero or negative is a configuration a human can write and
+    # the code cannot run: the interval divides the timeout to size the challenge allowance, and it
+    # is the sleep in both heartbeat loops, so a non-positive value is a ZeroDivisionError on one
+    # path and a hot loop on the other. Low enough that any interval meant seriously survives it.
+    MINIMUM_HEARTBEAT_INTERVAL_S: float = 0.1
     # How long after spawn to wait before enforcing heartbeat timeout.
     # Workers install venv deps and import modules before receiving heartbeats;
     # this matches the _await_pending_workers() ceiling so a worker never kills
@@ -133,9 +142,6 @@ class WorkerManager(EngineScoped):
         # why termination is hopped back here. Captured in spawn_worker.
         self._spawn_loop: asyncio.AbstractEventLoop | None = None
 
-        # Orchestrator-side: worker_engine_id → monotonic timestamp of last heartbeat response
-        self._worker_last_seen: dict[str, float] = {}
-
         # Worker-side: monotonic timestamp of last heartbeat received from the orchestrator
         self._worker_heartbeat_last_received_at: float = 0.0
 
@@ -156,9 +162,18 @@ class WorkerManager(EngineScoped):
         self._worker_unavailable: dict[str, str] = {}
 
         config = engine.config_manager
-        self.heartbeat_interval_s: float = config.get_config_value(
+        configured_interval_s: float = config.get_config_value(
             WORKER_HEARTBEAT_INTERVAL_KEY, default=WorkerManager.DEFAULT_HEARTBEAT_INTERVAL_S, cast_type=float
         )
+        self.heartbeat_interval_s: float = max(WorkerManager.MINIMUM_HEARTBEAT_INTERVAL_S, configured_interval_s)
+        if self.heartbeat_interval_s != configured_interval_s:
+            logger.warning(
+                "Worker heartbeat interval of %.3gs cannot be used; running at the %.3gs minimum instead. "
+                "Set '%s' to a positive number of seconds.",
+                configured_interval_s,
+                self.heartbeat_interval_s,
+                WORKER_HEARTBEAT_INTERVAL_KEY,
+            )
         self.heartbeat_timeout_s: float = config.get_config_value(
             WORKER_HEARTBEAT_TIMEOUT_KEY, default=WorkerManager.DEFAULT_HEARTBEAT_TIMEOUT_S, cast_type=float
         )
@@ -188,6 +203,22 @@ class WorkerManager(EngineScoped):
         event_manager.add_listener_to_app_event(CurrentProjectChanged, self._on_current_project_changed)
 
     @property
+    def unanswered_challenges_allowed(self) -> int:
+        """How many challenges a worker may leave unanswered before it is evicted.
+
+        Derived from the two configured values rather than stored, so tuning either takes effect
+        without a restart. Rounded up, not nearest: with a 12s timeout and a 5s interval, nearest
+        gives 2 challenges and evicts after about 10s, tolerating less silence than the timeout
+        asks for. At least one, so no configuration evicts a worker the first time it is asked.
+
+        Note that the timeout is read two ways. Here it sizes an allowance in challenges, which is
+        why a slow sweep cannot evict a worker that was never asked. On the worker,
+        `worker_heartbeat_monitor` compares it against elapsed time, because a worker can only
+        measure silence from a peer it cannot poll.
+        """
+        return max(1, math.ceil(self.heartbeat_timeout_s / self.heartbeat_interval_s))
+
+    @property
     def _tx(self) -> _WorkerTransport:
         if self._transport is None:
             msg = "WorkerManager transport has not been attached; call attach_transport() before use."
@@ -197,7 +228,6 @@ class WorkerManager(EngineScoped):
     def attach_transport(
         self,
         *,
-        ws_outgoing_queue: asyncio.Queue,
         send_message: Callable[[str, str, str | None], Awaitable[None]],
         subscribe_to_topic: Callable[[str], Awaitable[None]],
         unsubscribe_from_topic: Callable[[str], Awaitable[None]],
@@ -209,7 +239,6 @@ class WorkerManager(EngineScoped):
         called, methods that depend on the transport will raise RuntimeError.
         """
         self._transport = _WorkerTransport(
-            ws_outgoing_queue=ws_outgoing_queue,
             send_message=send_message,
             subscribe_to_topic=subscribe_to_topic,
             unsubscribe_from_topic=unsubscribe_from_topic,
@@ -235,7 +264,6 @@ class WorkerManager(EngineScoped):
         session_id = self.engine.get_session_id()
         request_topic = f"sessions/{session_id}/workers/{wid}/request"
         self._workers[wid] = WorkerRegistration(request_topic=request_topic, worker_key=request.library_name)
-        self._worker_last_seen[wid] = time.monotonic()
 
         if request.library_name:
             logger.info("Worker registered: %s → library '%s'", wid, request.library_name)
@@ -295,7 +323,6 @@ class WorkerManager(EngineScoped):
         wid = request.worker_engine_id
         session_id = self.engine.get_session_id()
         registration = self._workers.pop(wid, None)
-        self._worker_last_seen.pop(wid, None)
         worker_key = registration.worker_key if registration else None
         response_topic = f"sessions/{session_id}/workers/{wid}/response"
         await self._tx.unsubscribe_from_topic(response_topic)
@@ -310,19 +337,17 @@ class WorkerManager(EngineScoped):
         return worker_events.UnregisterWorkerResultSuccess(worker_engine_id=wid, result_details="Worker unregistered.")
 
     async def orchestrator_heartbeat_loop(self) -> None:
-        """Challenge each registered worker on an interval; evict those that go silent."""
+        """Challenge each registered worker on an interval; evict those that stop answering."""
         while True:
             await asyncio.sleep(self.heartbeat_interval_s)
             if not self._workers:
                 continue
 
-            now = time.monotonic()
-            stale = [
+            for wid in [
                 wid
-                for wid in list(self._workers)
-                if now - self._worker_last_seen.get(wid, 0) > self.heartbeat_timeout_s
-            ]
-            for wid in stale:
+                for wid, registration in self._workers.items()
+                if registration.unanswered_challenges >= self.unanswered_challenges_allowed
+            ]:
                 await self.evict_worker(wid)
 
             session_id = self.engine.get_session_id()
@@ -331,8 +356,27 @@ class WorkerManager(EngineScoped):
                     request=worker_events.WorkerHeartbeatRequest(heartbeat_id=str(uuid.uuid4())),
                     response_topic=f"sessions/{session_id}/workers/{wid}/response",
                 )
-                await self._tx.ws_outgoing_queue.put(
-                    WebSocketMessage("EventRequest", hb.json(), registration.request_topic)
+                # Only a challenge that went out counts against the worker, and a send that fails
+                # must not end the loop: the transport raises while a connection is re-establishing,
+                # and both charging that to the worker and leaving nothing to evict it are the
+                # orchestrator's problem becoming the worker's.
+                try:
+                    await self._tx.send_message("EventRequest", hb.json(), registration.request_topic)
+                except Exception:
+                    logger.warning(
+                        "Could not challenge worker %s on '%s'; not counting it against the worker.",
+                        wid,
+                        registration.request_topic,
+                        exc_info=True,
+                    )
+                    continue
+                registration.unanswered_challenges += 1
+                logger.debug(
+                    "Challenged worker %s on '%s'; %d unanswered of %d allowed.",
+                    wid,
+                    registration.request_topic,
+                    registration.unanswered_challenges,
+                    self.unanswered_challenges_allowed,
                 )
 
     async def worker_heartbeat_monitor(self) -> None:
@@ -500,7 +544,6 @@ class WorkerManager(EngineScoped):
         # library's claim, and a claim surviving the reset refuses the reload's own spawn for it.
         self._spawns_in_flight.clear()
         self._workers.clear()
-        self._worker_last_seen.clear()
 
     async def route_to_worker(
         self,
@@ -600,7 +643,6 @@ class WorkerManager(EngineScoped):
         """Remove a worker from the registry and unsubscribe from its response topic."""
         session_id = self.engine.get_session_id()
         registration = self._workers.pop(worker_engine_id, None)
-        self._worker_last_seen.pop(worker_engine_id, None)
         lib_name = registration.worker_key if registration else None
         topic = f"sessions/{session_id}/workers/{worker_engine_id}/response"
         await self._tx.unsubscribe_from_topic(topic)
@@ -950,6 +992,48 @@ class WorkerManager(EngineScoped):
 
         return topics
 
+    def get_message_filters(self, *, is_worker: bool) -> list[Callable[[dict[str, Any]], Awaitable[bool]]]:
+        """Build the message filters to install at connection start.
+
+        The companion to `get_topics_to_subscribe`: that decides which messages arrive, this decides
+        who claims them. Keyed on the role in one place so a filter cannot be installed for one role
+        and forgotten for the other.
+
+        Install these AFTER the RequestClient's own filter. They claim every result, so running one
+        ahead of it would swallow the reply a caller is awaiting.
+        """
+        if is_worker:
+            return [self._discard_unaddressed_result]
+        return [self._claim_worker_result]
+
+    async def _claim_worker_result(self, message: dict[str, Any]) -> bool:
+        """Claim a result no pending request wanted, and relay it to the GUI."""
+        payload = message.get("payload", {})
+        if payload.get("event_type") not in RESULT_EVENT_TYPES:
+            return False
+        try:
+            await self.relay_worker_result(payload)
+        except Exception:
+            logger.exception("Failed to relay worker result")
+        return True
+
+    async def _discard_unaddressed_result(self, message: dict[str, Any]) -> bool:
+        """Claim and drop a result this worker never asked for.
+
+        A worker has no GUI to relay to, and its own replies are claimed ahead of this by the
+        RequestClient. What reaches here is another process's answer arriving over the shared bus,
+        or a late reply to a request this worker stopped tracking.
+        """
+        payload = message.get("payload", {})
+        if payload.get("event_type") not in RESULT_EVENT_TYPES:
+            return False
+        logger.debug(
+            "Dropping a %s addressed to %s; this worker did not ask for it.",
+            payload.get("result_type") or payload.get("event_type"),
+            payload.get("response_topic"),
+        )
+        return True
+
     async def forward_event_to_worker(
         self,
         event: EventRequest,
@@ -1247,10 +1331,19 @@ class WorkerManager(EngineScoped):
         # BaseEvent.dict() adds result_type at the outer level (not inside the result dict).
         result_event_type = payload.get("result_type", "")
         if result_event_type == worker_events.WorkerHeartbeatResultSuccess.__name__:
-            if m := self._WORKER_RESPONSE_TOPIC_RE.match(payload.get("response_topic", "")):
-                worker_engine_id = m.group("worker_engine_id")
-                self._worker_last_seen[worker_engine_id] = time.monotonic()
-                logger.debug("Heartbeat received from worker %s", worker_engine_id)
+            response_topic = payload.get("response_topic", "")
+            m = self._WORKER_RESPONSE_TOPIC_RE.match(response_topic)
+            if m is None:
+                logger.warning(
+                    "Heartbeat reply arrived on '%s', which names no worker, so no worker was marked alive.",
+                    response_topic,
+                )
+                return
+            worker_engine_id = m.group("worker_engine_id")
+            registration = self._workers.get(worker_engine_id)
+            if registration is not None:
+                registration.unanswered_challenges = 0
+            logger.debug("Heartbeat received from worker %s", worker_engine_id)
             return  # Internal health check — do not forward to GUI
 
         # 1 engine = 1 session — the orchestrator's session response topic is always the right target.
