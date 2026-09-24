@@ -1,9 +1,8 @@
 """Tests for bundle assembly.
 
-Two things matter here. Every file copied in has to pass through the redactor, because a
-log line is the most likely place for a credential to be sitting in plain text. And the
-manifest has to be honest: a log that was shortened or a file that could not be read must
-say so, since a silently truncated log reads exactly like a log with nothing in it.
+Two things matter. Every file copied in has to pass through the redactor, because a log line is
+the most likely place for a credential to be sitting in plain text. And the manifest has to be
+honest: a silently truncated log reads exactly like a log with nothing in it.
 """
 
 from __future__ import annotations
@@ -99,9 +98,8 @@ def _write_source_log(path: Path, text: str) -> Path:
     r"""Write a log file for the bundle to copy, with the line endings given and no others.
 
     Bytes rather than ``write_text``, which translates every ``\n`` to the platform's line
-    ending. Log files are copied into a bundle byte for byte, so a source written that way
-    is a different file on Windows than on POSIX -- both the content a test then asserts on
-    and, since the budget is counted in bytes, how much of it fits.
+    ending. Logs are copied byte for byte, so a source written that way is a different file on
+    Windows than on POSIX -- both the content asserted on and how much of it fits the budget.
     """
     path.write_bytes(text.encode("utf-8"))
     return path
@@ -239,8 +237,7 @@ class TestLogFiles:
         """The same reason `add_workflow` canonicalizes: a `~` is not a directory name.
 
         Log paths usually arrive absolute from the directory scan, but the setting behind that
-        directory is a path the user typed, and this is the read that would fail rather than
-        report anything.
+        directory is a path the user typed, and this is the read that would fail silently.
         """
         monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.setenv("USERPROFILE", str(tmp_path))
@@ -282,13 +279,11 @@ class TestLogFiles:
         """The staging directory is on whatever filesystem `tempfile` gave us.
 
         The default one on macOS and Windows treats `Engine-1.log` and `engine-1.log` as one
-        file. Comparing the staged paths exactly let the second past the duplicate guard, and
-        the write then replaced the first one's bytes while the manifest went on listing both
-        at their own sizes -- a bundle whose own index is wrong about what is in it.
-
-        The two source files are in separate directories so they can coexist wherever this
-        runs, and the guard now fires on every platform rather than only where the collision
-        would have happened.
+        file. Comparing the staged paths exactly let the second past the duplicate guard, and the
+        write then replaced the first one's bytes while the manifest listed both at their own
+        sizes -- a bundle whose own index is wrong about what is in it. The two source files sit
+        in separate directories so they coexist wherever this runs, and the guard now fires on
+        every platform rather than only where the collision would have happened.
         """
         first_dir = tmp_path / "current"
         second_dir = tmp_path / "older"
@@ -311,12 +306,10 @@ class TestLogFiles:
     def test_a_log_written_with_windows_line_endings_is_copied_byte_for_byte(self, tmp_path: Path) -> None:
         r"""A bundle is evidence, so a copied log has to match the file it came from.
 
-        Staging a file with the default newline handling translates every `\n` to the
-        platform's line ending on the way out. On Windows that rewrites a line that already
-        ended `\r\n` as `\r\r\n`, so every log copied into a bundle collected there differed
-        from the file on disk. Asserted on the bytes rather than the text because that is
-        where the difference is, and only fails on Windows: elsewhere the translation is a
-        no-op.
+        Staging with the default newline handling translates every `\n` to the platform's line
+        ending. On Windows that rewrites a line that already ended `\r\n` as `\r\r\n`, so every
+        log copied into a bundle collected there differed from the file on disk. Asserted on the
+        bytes because that is where the difference is; only fails on Windows.
         """
         log_file = tmp_path / "engine-1.log"
         source = b"first line\r\nsecond line\r\n"
@@ -399,9 +392,9 @@ class TestWorkflow:
     ) -> None:
         """A workflow path arrives spelled the way it was configured, `~` and all.
 
-        `Path("~/flow.py").read_text()` looks for a directory literally named `~`, so read as
-        given, a workflow registered from a home-relative path was reported as one that could
-        not be read -- in the bundle collected to explain what that workflow did.
+        `Path("~/flow.py").read_text()` looks for a directory literally named `~`, so a workflow
+        registered from a home-relative path was reported as unreadable -- in the bundle
+        collected to explain what that workflow did.
         """
         monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.setenv("USERPROFILE", str(tmp_path))
@@ -479,9 +472,8 @@ class TestReadme:
     """The guide describes the bundle it is in, not the bundle a full collection would make.
 
     Every section is optional: switched off by a request flag, or skipped because there was
-    nothing to collect -- no log files on disk yet, a workflow that has never been saved.
-    Naming a file that is not here sends its reader hunting for it, and reads as though the
-    collection came back empty-handed when that part was never asked for.
+    nothing to collect. Naming a file that is not here sends its reader hunting for it, and reads
+    as though the collection came back empty-handed when that part was never asked for.
     """
 
     def test_points_at_the_health_report_when_one_was_staged(self) -> None:

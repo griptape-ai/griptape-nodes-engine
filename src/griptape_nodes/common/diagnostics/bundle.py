@@ -1,24 +1,22 @@
 """Assembles a diagnostics bundle: one zip holding everything needed to troubleshoot an engine.
 
-A bundle is the shareable artifact behind the report. It stages files in a temporary
-directory, redacts every piece of text it copies, and zips the result. Nothing is written
-to the user's workspace by this module; the caller decides where the bytes go.
+A bundle is the shareable artifact behind the report. It stages files in a temporary directory,
+redacts every piece of text it copies, and zips the result. Nothing is written to the user's
+workspace by this module; the caller decides where the bytes go.
 
 Layout of a bundle:
 
-- ``manifest.json`` -- what this bundle is and what is in it, including how many values
-  were hidden.
+- ``manifest.json`` -- what this bundle is and what is in it, including how many values were
+  hidden.
 - ``README.md`` -- a plain-language guide to the other files.
-- ``report.json`` -- the ``DiagnosticsReport``: versions, machine, settings, libraries,
-  projects, logging configuration.
-- ``doctor.json`` -- the health checks' verdict on that report, and what to do about
-  each problem found.
+- ``report.json`` -- the ``DiagnosticsReport``.
+- ``doctor.json`` -- the health checks' verdict on that report.
 - ``logs/session.log`` -- everything this engine logged since it started.
 - ``logs/<rotated>.log`` -- the log files on disk, newest first, up to a size budget.
 - ``workflow/<name>.py`` -- the workflow that was open, when there is a saved file for it.
 
-Everything copied in passes through the caller's ``Redactor`` first, so the same
-redaction counts cover the whole bundle rather than the report alone.
+Everything copied in passes through the caller's ``Redactor``, so the same redaction counts
+cover the whole bundle rather than the report alone.
 """
 
 from __future__ import annotations
@@ -80,11 +78,10 @@ class LogTail(NamedTuple):
     """The end of a log file, and whether reading it left anything out.
 
     Attributes:
-        text: The decoded tail, with a partial first line already dropped.
         bytes_read: How much of the file was read, for charging against the budget.
-        truncated: Whether the file was longer than what was read. Decided from the size
-            seen while reading, so a file that grew between being listed and being read is
-            still reported as shortened.
+        truncated: Whether the file was longer than what was read. Decided from the size seen
+            while reading, so a file that grew between being listed and being read is still
+            reported as shortened.
     """
 
     text: str
@@ -97,8 +94,6 @@ class BundleEntry(BaseModel):
 
     Attributes:
         path: Location inside the zip, using forward slashes.
-        size_bytes: Size of the file as written.
-        description: What the file is, in plain language.
     """
 
     path: str
@@ -109,18 +104,13 @@ class BundleEntry(BaseModel):
 class DiagnosticsBundleManifest(BaseModel):
     """What a bundle is and what it contains.
 
-    Read first by anything opening a bundle: it names every other file, states which
-    schema versions were used to write them, and reports how much was hidden.
+    Read first by anything opening a bundle: it names every other file, states which schema
+    versions were used to write them, and reports how much was hidden.
 
     Attributes:
-        schema_version: Version of the bundle layout.
-        report_schema_version: Version of the report envelope inside ``report.json``.
-        generated_at: ISO 8601 timestamp (UTC) of when the bundle was built.
-        engine_version: Version of the engine that produced it.
         redaction: What was removed, across every file in the bundle.
-        entries: Every file in the bundle.
-        warnings: Anything that could not be collected or had to be shortened. Always
-            read this before concluding something is absent.
+        warnings: Anything that could not be collected or had to be shortened. Always read this
+            before concluding something is absent.
     """
 
     schema_version: str = DIAGNOSTICS_BUNDLE_SCHEMA_VERSION
@@ -143,16 +133,11 @@ class DiagnosticsBundle:
             bundle.add_health_report(health)
             bundle.add_report(report)
             bundle.add_readme()
-            manifest = bundle.write_manifest(
-                generated_at=generated_at,
-                engine_version=engine_version,
-                identity_normalized=True,
-                warnings=warnings,
-            )
+            manifest = bundle.write_manifest(generated_at=..., engine_version=...)
             data = bundle.to_zip_bytes()
 
-    Add the files that carry free text before building the report, so the redaction
-    counts in the manifest cover the whole bundle. Not thread-safe.
+    Add the files that carry free text before building the report, so the redaction counts in
+    the manifest cover the whole bundle. Not thread-safe.
     """
 
     def __init__(self, redactor: Redactor, *, max_log_bytes: int = DEFAULT_MAX_LOG_BYTES) -> None:
@@ -351,24 +336,21 @@ class DiagnosticsBundle:
     def _staged_file_name(self, name: str) -> str:
         """Return a file name safe to put in the archive, with identifiers removed.
 
-        A workflow's file name is chosen by the user, so it carries whatever they put in it
-        -- often their own name. That name would otherwise reach the manifest and the
-        archive's entry list, which is the one place in a bundle nothing else redacts.
-
-        The angle brackets of ``<user>`` are taken back out. They are legal on POSIX and
-        illegal in a Windows file name, so leaving them in would make a bundle that
-        extracts here fail to extract on the machine reading it.
+        A workflow's file name is chosen by the user, so it carries whatever they put in it --
+        often their own name, which would otherwise reach the manifest and the archive's entry
+        list, the one place in a bundle nothing else redacts. The angle brackets of ``<user>``
+        are taken back out: legal on POSIX and illegal in a Windows file name, so leaving them
+        in makes a bundle that extracts here fail to extract on the machine reading it.
         """
         return self._redactor.redact_text(name).replace("<", "").replace(">", "")
 
     def _write(self, relative_path: str, text: str, description: str) -> None:
         r"""Write one staged file and record it as an entry.
 
-        ``newline=""`` because the default translates every ``\\n`` to the platform's line
-        ending on the way out. On Windows that rewrites the log lines this bundle copied
-        verbatim: a line that already ended ``\\r\\n`` in the source file is written
-        ``\\r\\r\\n``, and every file in a bundle collected on Windows differs from the file
-        it was copied from.
+        ``newline=""`` because the default translates every ``\\n`` to the platform\'s line
+        ending. On Windows that rewrites the log lines this bundle copied verbatim: a line that
+        already ended ``\\r\\n`` is written ``\\r\\r\\n``, so every file in a bundle collected
+        on Windows differs from the file it came from.
         """
         path = self._staging_dir / relative_path
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -378,13 +360,11 @@ class DiagnosticsBundle:
     def _read_log_tail(self, path: Path, max_bytes: int, warnings: list[str]) -> LogTail | None:
         """Return the last ``max_bytes`` of a log file, or None when it cannot be read.
 
-        The tail rather than the head, because the most recent lines are the ones that
-        describe whatever went wrong. Reading binary and decoding with replacement keeps a
-        log written by a library in an unexpected encoding from failing the whole bundle.
-
-        Whether anything was left out is decided here rather than by the caller, from the
-        size seen at the moment of reading. The engine keeps logging while its own bundle
-        is being built, so a size read beforehand can already be out of date.
+        The tail rather than the head, because the most recent lines describe whatever went
+        wrong. Reading binary and decoding with replacement keeps a log written in an unexpected
+        encoding from failing the whole bundle. Whether anything was left out is decided here,
+        from the size seen at the moment of reading: the engine keeps logging while its own
+        bundle is built, so a size read beforehand can already be out of date.
         """
         try:
             with canonicalize_for_io(path).open("rb") as handle:
@@ -450,11 +430,10 @@ the log level to `DEBUG`, reproduce the problem, and make a new bundle.
     def _readme_file_lines(self) -> list[str]:
         """Describe each file in the bundle, in reading order, skipping the absent ones.
 
-        Every section of a bundle is optional. Health checks are switched off by a request
-        flag, logs and the workflow the same way, and each of them is also skipped when
-        there was nothing to collect -- no log files on disk, an unsaved workflow. A guide
-        listing a file that is not here sends its reader hunting for it and, worse, reads
-        as though a bundle came back empty-handed when it never included that part at all.
+        Every section is optional -- switched off by a request flag, or skipped because there
+        was nothing to collect. A guide listing a file that is not here sends its reader hunting
+        for it and reads as though a bundle came back empty-handed when it never included that
+        part at all.
         """
         lines = [
             f"- `{MANIFEST_FILE_NAME}` -- start here. Lists every file, and says how many values were",
