@@ -230,10 +230,9 @@ def _print_logs_info(report: DiagnosticsReport) -> None:
 def _print_config_layers(report: DiagnosticsReport) -> None:
     """Print the config layer stack: each layer's file, whether it applies, and any parse error.
 
-    Complements `_print_configuration` below, which shows only the merged blob and so cannot say
-    which layer set what. The `env` and `runtime` layers have no file to point at, so their own
-    contents are printed inline instead. `env` names the variables without their values, because
-    the merged configuration already shows what each one resolved to.
+    `_print_configuration` below shows only the merged blob, so it cannot say which layer set
+    what. `env` and `runtime` have no file to point at and print their contents inline; `env`
+    names the variables without their values, which the merged configuration already shows.
     """
     config = report.config
 
@@ -258,9 +257,8 @@ def _print_config_layers(report: DiagnosticsReport) -> None:
 def _layer_status(entry: ConfigFileDiagnostics) -> str:
     """Say whether one file layer reached the merged settings, and if not, why not.
 
-    Every way a layer can contribute nothing comes first, because "applied" is the only
-    answer that needs no qualification -- and each of the others is a layer the user
-    edited and is entitled to think is in effect.
+    Every way a layer can contribute nothing comes first: "applied" is the only answer that
+    needs no qualification, and each of the others is a layer the user edited and thinks is live.
     """
     if not entry.exists:
         return "[dim](not present)[/dim]"

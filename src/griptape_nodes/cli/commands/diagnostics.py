@@ -73,11 +73,9 @@ def collect(
 async def _collect_async(output: Path, *, include_logs: bool, load_libraries: bool, normalize_identity: bool) -> None:
     """Collect a diagnostics bundle and report where it landed.
 
-    Both requests below are guarded, and guarded broadly, because either one can be the call
-    that starts the engine -- and a broken engine is the usual reason somebody is collecting
-    a bundle to attach to a bug report. A node library that raises on import, a config file
-    the engine cannot get past: left unguarded, the command that exists to package that
-    answer instead hands back a traceback, which is what the user already had.
+    Both requests are guarded broadly because either can be the call that starts the engine, and
+    a broken engine is the usual reason somebody is collecting a bundle. Unguarded, the command
+    that exists to package that answer hands back the traceback the user already had.
     """
     if load_libraries:
         # Libraries are loaded so the bundle can say which ones failed, which is usually

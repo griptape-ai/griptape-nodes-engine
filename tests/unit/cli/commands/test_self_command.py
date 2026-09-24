@@ -1,17 +1,14 @@
 """Tests for what `gtn self info` prints from a diagnostics report.
 
-The command is what a user is asked to paste into a bug report, so the report it renders is
-usually the only view of their machine anyone else gets. Two kinds of mistake matter here.
-The first is a section that quietly says nothing: a value that is None, an empty list, or a
-count of zero all render as reasonable-looking output, and the difference between "there are
-no libraries" and "the libraries could not be read" is the answer someone is looking for.
-The second is Rich markup. Nearly everything printed here is a string from the user's own
-machine -- a path, a config value, the text of an `OSError` -- and any of them may contain
-square brackets, which Rich eats as a style tag. Every test that prints borrowed text checks
-it survived.
+The command is what a user is asked to paste into a bug report, so what it renders is usually the
+only view of their machine anyone else gets. Two kinds of mistake matter. The first is a section
+that quietly says nothing: None, an empty list, and a count of zero all render as reasonable
+output, and "there are no libraries" is a different answer from "the libraries could not be read".
+The second is Rich markup: nearly everything printed here is a string from the user's own machine
+-- a path, a config value, the text of an `OSError` -- and any of it may contain square brackets,
+which Rich eats as a style tag.
 
-Nothing here builds a report from a real engine; `test_diagnostics_manager_requests.py` does
-that. These hand the printing code a report and read what came out.
+Nothing here builds a report from a real engine; `test_diagnostics_manager_requests.py` does that.
 """
 
 from __future__ import annotations
@@ -92,9 +89,8 @@ def _host(**overrides: Any) -> HostDiagnostics:
 def _report(**overrides: Any) -> DiagnosticsReport:
     """A report with every section filled in, so a test only has to state what it is about.
 
-    The defaults are deliberately unremarkable: nothing missing, nothing disabled, no
-    problems, no warnings, nothing hidden. A test about any of those says so itself, and a
-    test asserting that a section was left out is not fighting a default that filled it in.
+    The defaults are deliberately unremarkable: nothing missing, disabled, broken, or hidden. A
+    test asserting a section was left out is then not fighting a default that filled it in.
     """
     fields: dict[str, Any] = {
         "generated_at": "2026-01-01T00:00:00+00:00",
@@ -141,9 +137,8 @@ class _Run:
     Attributes:
         requests: Every request the command dispatched, in order.
         printed: Everything it printed, as the text a user would see.
-        exit_code: The code the command exited with, or None when it returned normally.
-            Recorded rather than left to propagate so the printed text is still readable
-            after a failure -- a nonzero exit with nothing said is the thing being tested.
+        exit_code: The code it exited with, or None when it returned normally. Recorded rather
+            than left to propagate, since a nonzero exit with nothing said is what is tested.
     """
 
     def __init__(self, requests: list[object], printed: str, exit_code: int | None) -> None:
@@ -164,10 +159,9 @@ class _Run:
 def _run(result: object, *, show_identity: bool = False) -> _Run:
     """Invoke `gtn self info` against a stubbed engine and capture what it did.
 
-    `info` is called as a plain function rather than through Typer's runner: its default is
-    a Typer `OptionInfo` object, so the flag has to be passed explicitly either way, and
-    calling it directly keeps the request objects themselves within reach instead of only
-    their effect on an exit code.
+    `info` is called as a plain function rather than through Typer's runner: its default is a
+    Typer `OptionInfo`, so the flag is passed explicitly either way, and this keeps the request
+    objects within reach instead of only their effect on an exit code.
     """
     console = _recording_console()
 
@@ -367,9 +361,8 @@ class TestConfigLayers:
     def test_a_layer_that_failed_to_parse_says_why_and_is_not_called_applied(self) -> None:
         """A broken file is skipped by the merge, so the settings alone never reveal it.
 
-        The file exists, which is the whole trap: calling it applied and then printing a
-        parse error under it tells the user both that their edit took effect and that it
-        could not be read.
+        The file exists, which is the trap: calling it applied and then printing a parse error
+        under it tells the user both that their edit took effect and that it could not be read.
         """
         files = [
             ConfigFileDiagnostics(

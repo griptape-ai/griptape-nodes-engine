@@ -1,8 +1,8 @@
 """Tests for the doctor CLI command.
 
-The command is a view over `RunHealthChecksRequest`, so these pin what a view can get
-wrong: the exit code it chooses, whether it survives a failed request, and whether the
-verdict it prints under the table agrees with the table.
+The command is a view over `RunHealthChecksRequest`, so these pin what a view can get wrong: the
+exit code it chooses, whether it survives a failed request, and whether its printed verdict
+agrees with the table above it.
 """
 
 from __future__ import annotations
@@ -49,10 +49,9 @@ def _health_report(status: HealthStatus, *, remedy: str | None = "what to do") -
 def _printed(health: HealthReport) -> str:
     """Return everything the command printed for a report, as the text a user would see.
 
-    A real recording ``Console`` rather than a Mock whose calls are stringified: most of
-    what this command prints is a ``Table``, and ``str()`` on one of those is its repr, so
-    a Mock cannot see a single check name, status, or summary. Wide enough that a cell is
-    not wrapped mid-word, which would break a substring assertion on text that is present.
+    A real recording ``Console`` rather than a Mock whose calls are stringified: most of what this
+    command prints is a ``Table``, and ``str()`` on one is its repr, so a Mock cannot see a single
+    check name or status. Wide enough that a cell is not wrapped mid-word, breaking an assertion.
     """
     console = Console(record=True, width=_WIDE_ENOUGH_NOT_TO_WRAP, no_color=True, legacy_windows=False)
     with patch(f"{_MODULE}.console", console):
@@ -70,9 +69,8 @@ class _Run:
     Attributes:
         requests: Every request the command dispatched, in order.
         printed: Everything it printed, as the text a user would see.
-        exit_code: The code the command exited with, or None when it returned normally.
-            None is the zero exit: Typer takes a normal return as success and only a
-            `typer.Exit` carries a code, so "exits zero" is asserted as the absence of one.
+        exit_code: The code it exited with, or None when it returned normally. None is the zero
+            exit: only a `typer.Exit` carries a code, so "exits zero" is the absence of one.
     """
 
     def __init__(self, requests: list[object], printed: str, exit_code: int | None) -> None:
@@ -87,13 +85,9 @@ class _Run:
 def _run(result: object, *, library_load: object = None) -> _Run:
     """Invoke the command with a stubbed engine and capture what it did.
 
-    Printed into a string buffer rather than a Mock console, so a test can assert the
-    command got as far as printing its verdict instead of only that it did not raise.
-
     Args:
-        result: What the health-check request returns, or an exception for it to raise.
-            Raising stands for an engine that could not be built at all, since dispatching
-            the request is what builds one.
+        result: What the health-check request returns, or an exception for it to raise. Raising
+            stands for an engine that could not be built, since dispatching is what builds one.
         library_load: The same, for the library load that runs before it.
     """
     console = Console(
@@ -166,11 +160,9 @@ class TestDoctorCommand:
 class TestAnEngineThatWillNotStart:
     """The most likely reason somebody is running this command is that something is broken.
 
-    Both of the requests it makes are what build the engine in the first place, so a config
-    file the engine cannot get past, or a node library that raises on import, surfaces as an
-    exception out of a dispatch. Unguarded, the tool that exists to explain that answered
-    with a traceback -- the same thing the user had already seen, and the reason they came
-    here.
+    Both requests are what build the engine, so a config file it cannot get past, or a library
+    that raises on import, surfaces as an exception out of a dispatch. Unguarded, the tool that
+    exists to explain that answered with the traceback they came here about.
     """
 
     def test_an_engine_that_cannot_be_built_is_explained_rather_than_traced(self) -> None:
@@ -183,9 +175,8 @@ class TestAnEngineThatWillNotStart:
     def test_libraries_that_will_not_load_do_not_stop_the_checks(self) -> None:
         """Which libraries are broken is one of the checks, so this is a finding, not a stop.
 
-        The library check reports what failed to arrive, which is more use than the import
-        error on its own -- and every other check still has something to say about a machine
-        whose libraries are broken.
+        The library check reports what failed to arrive, which is more use than the import error
+        alone -- and every other check still has something to say about that machine.
         """
         run = _run(_success(HealthStatus.PASS), library_load=RuntimeError("a node library raised on import"))
 
@@ -196,9 +187,8 @@ class TestAnEngineThatWillNotStart:
     def test_the_text_of_a_failure_holding_markup_is_shown_as_written(self) -> None:
         """These messages quote an exception raised while reading the user's own files.
 
-        A config path or a library name can hold square brackets, which Rich reads as a style
-        tag: unescaped, the part of the message that names what broke is dropped silently, or
-        an unknown tag raises a second error on top of the first.
+        A config path or library name can hold square brackets, which Rich reads as a style tag:
+        unescaped, the part naming what broke is dropped silently, or an unknown tag raises.
         """
         run = _run(RuntimeError("could not read [beta] settings"))
 
@@ -254,9 +244,8 @@ class TestPrintedTable:
     def test_a_check_name_holding_markup_is_shown_as_written(self) -> None:
         """Check names come from library and project names, so a user's own text lands here.
 
-        Rich reads `[...]` as a style tag: unescaped, a project called `[beta] pipeline`
-        prints as `pipeline` with the reader never told anything was dropped, and a tag that
-        is not a real style raises instead.
+        Rich reads `[...]` as a style tag: unescaped, a project called `[beta] pipeline` prints as
+        `pipeline` with nothing said about the loss, and a tag that is not a real style raises.
         """
         health = HealthReport(
             generated_at="2026-01-01T00:00:00+00:00",

@@ -1,10 +1,9 @@
 """Tests for the `gtn diagnostics collect` CLI command.
 
-The command is a view over `CollectDiagnosticsRequest`, so what it can get wrong is the
-request it builds from its flags and what it does when collection fails. Both matter more
-here than for most commands: every flag turns a piece of the bundle *off*, so a flag wired
-to the wrong field silently produces a bundle missing the part someone is waiting for, and
-the failure path is the one a user hits when the destination is not writable.
+The command is a view over `CollectDiagnosticsRequest`, so what it can get wrong is the request
+it builds from its flags and what it does when collection fails. Every flag turns a piece of the
+bundle *off*, so one wired to the wrong field silently produces a bundle missing the part someone
+is waiting for; the failure path is what a user hits when the destination is not writable.
 """
 
 from __future__ import annotations
@@ -76,9 +75,8 @@ class _Run:
     Attributes:
         requests: Every request the command dispatched, in order.
         printed: Everything it printed, as the text a user would see.
-        exit_code: The code the command exited with, or None when it returned normally.
-            Recorded rather than left to propagate so the printed text is still readable
-            after a failure -- a nonzero exit with nothing said is the thing being tested.
+        exit_code: The code it exited with, or None when it returned normally. Recorded rather
+            than left to propagate, since a nonzero exit with nothing said is what is tested.
     """
 
     def __init__(self, requests: list[object], printed: str, exit_code: int | None) -> None:
@@ -99,15 +97,13 @@ class _Run:
 def _run(result: object, *, library_load: object = None, **kwargs: object) -> _Run:
     """Invoke the command with a stubbed engine and capture what it did.
 
-    ``collect`` is called as a plain function rather than through Typer's runner: the
-    defaults are Typer ``OptionInfo`` objects, so every keyword the test does not set has to
-    be passed explicitly anyway, and calling it directly keeps the request objects
-    themselves within reach instead of only their effect on an exit code.
+    ``collect`` is called as a plain function rather than through Typer's runner: the defaults are
+    ``OptionInfo`` objects, so every unset keyword has to be passed anyway, and this keeps the
+    request objects within reach instead of only their effect on an exit code.
 
     Args:
-        result: What the collection request returns, or an exception for it to raise.
-            Raising stands for an engine that could not be built at all, since dispatching
-            the request is what builds one.
+        result: What the collection request returns, or an exception for it to raise. Raising
+            stands for an engine that could not be built, since dispatching is what builds one.
         library_load: The same, for the library load that runs before it.
         kwargs: Flags to override on the command.
     """
@@ -174,9 +170,8 @@ class TestRequestBuiltFromFlags:
     def test_writes_to_the_requested_path_rather_than_uploading(self, tmp_path: Path) -> None:
         """An output path is what keeps the bundle on this machine; None uploads it.
 
-        Compared against `tmp_path` rather than a literal because the command hands the
-        request a string: spelled `/tmp/somewhere`, the expected value would be written with
-        the other platform's separator on Windows.
+        Compared against `tmp_path` rather than a literal because the command hands the request a
+        string: spelled `/tmp/somewhere`, the expected value gets the wrong separator on Windows.
         """
         request = _run(_success(), output=tmp_path).collect_request()
 
@@ -254,10 +249,9 @@ class TestFailure:
 class TestAnEngineThatWillNotStart:
     """A broken engine is the usual reason somebody is collecting a bundle at all.
 
-    Either request the command makes can be the one that builds the engine, so a config file
-    it cannot get past, or a node library that raises on import, surfaces as an exception out
-    of a dispatch. Unguarded, the command that exists to package that answer for a bug report
-    answered with a traceback -- the thing the user already had.
+    Either request can be the one that builds the engine, so a config file it cannot get past, or
+    a library that raises on import, surfaces as an exception out of a dispatch. Unguarded, the
+    command answered with a traceback -- the thing the user already had.
     """
 
     def test_an_engine_that_cannot_be_built_is_explained_rather_than_traced(self) -> None:
@@ -270,9 +264,8 @@ class TestAnEngineThatWillNotStart:
     def test_libraries_that_will_not_load_do_not_stop_the_collection(self) -> None:
         """Which libraries are broken is what the bundle is being collected to show.
 
-        A library that raises on import is recorded in the bundle, and every other section
-        still describes the machine somebody is asking about, so the load is reported and
-        the collection goes ahead.
+        The failure is recorded in the bundle, every other section still describes the machine
+        somebody is asking about, and the collection goes ahead.
         """
         run = _run(_success(), library_load=RuntimeError("a node library raised on import"))
 
@@ -283,9 +276,8 @@ class TestAnEngineThatWillNotStart:
     def test_the_text_of_a_failure_holding_markup_is_shown_as_written(self) -> None:
         """These messages quote an exception raised while reading the user's own files.
 
-        A config path or a library name can hold square brackets, which Rich reads as a style
-        tag: unescaped, the part of the message naming what broke is dropped silently, or an
-        unknown tag raises a second error on top of the first.
+        A config path or library name can hold square brackets, which Rich reads as a style tag:
+        unescaped, the part naming what broke is dropped silently, or an unknown tag raises.
         """
         run = _run(RuntimeError("could not read [beta] settings"))
 
