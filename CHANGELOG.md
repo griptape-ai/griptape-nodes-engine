@@ -22,6 +22,11 @@ the engine's request API from working without edits. Migration steps live in
 - `gtn rez build-engine-package` and `gtn rez build-library-package` build the engine or a node
   library, with every pip dependency, as Rez packages. Both stop with a warning when the store is
   missing the `platform`, `os`, or `python` packages that `rez bind` creates.
+- A node in a library that runs isolated in a worker can hand an unserializable value, such as a
+  diffusers pipeline or a latent tensor, to the next node. Mark the producing output
+  `serializable=False` and the engine holds the object in the worker, sending an opaque key in its
+  place that the consuming node's read resolves. See
+  [MIGRATION.md](MIGRATION.md#serializablefalse-outputs-are-held-in-their-own-process-across-a-worker-boundary).
 - Claude Opus 5.5, GPT-6 Sol, and GPT-6 Luna are in the model catalog.
 - The `Slider` trait, and `ParameterInt` and `ParameterFloat` with `slider=True`, take
   `soft_limits=True`. The slider then spans its range, but a value typed outside it is accepted

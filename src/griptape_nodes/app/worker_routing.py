@@ -72,7 +72,7 @@ from griptape_nodes.retained_mode.events.worker_events import (
     WorkerHeartbeatRequest,
 )
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
-from griptape_nodes.utils.async_utils import call_function
+from griptape_nodes.utils.async_utils import call_function, to_thread
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -115,6 +115,60 @@ class ReloadConfigResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
 @PayloadRegistry.register
 class ReloadConfigResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Worker failed to reload its config from disk."""
+
+
+@dataclass
+@PayloadRegistry.register
+class DropAllLocalObjectsRequest(RequestPayload, SkipTheLineMixin):
+    """Sent by the orchestrator to each registered worker when workflow object state is cleared.
+
+    Clearing workflow state deletes every node and so every key referring to a held object, leaving
+    those objects unreachable while still holding what they hold. A broadcast rather than a local hook
+    because the worker, not the orchestrator, is the process holding them.
+
+    SkipTheLineMixin for the same reason as its siblings: the alternative is a queued ExecuteNodeRequest
+    running against objects belonging to a workflow that is already gone.
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class DropLocalObjectsRequest(RequestPayload, SkipTheLineMixin):
+    """Sent by the orchestrator when named held objects stop being referenced.
+
+    A handle parameter's value is a key. When that value is replaced or the node carrying it is deleted,
+    the object behind the old key is unreachable, and the process holding it is usually a worker.
+
+    Carries a list because releases queue up on sync paths and drain together, and SkipTheLineMixin for
+    the same reason as its sibling: a queued execution would otherwise run first and could rebuild what
+    this is about to release.
+    """
+
+    keys: list[str]
+
+
+@dataclass
+@PayloadRegistry.register
+class DropLocalObjectsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Worker released whichever of the named objects it was holding."""
+
+
+@dataclass
+@PayloadRegistry.register
+class DropLocalObjectsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Worker failed while releasing the named objects."""
+
+
+@dataclass
+@PayloadRegistry.register
+class DropAllLocalObjectsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Worker released every object it was holding for its libraries."""
+
+
+@dataclass
+@PayloadRegistry.register
+class DropAllLocalObjectsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Worker failed to release the objects it was holding."""
 
 
 @dataclass
@@ -295,6 +349,12 @@ LOCAL_ONLY_REQUEST_TYPES: frozenset[type[RequestPayload]] = frozenset(
         # worker that asked, mid-node. Reachable because in_node_execution() is a process-wide
         # refcount, so a broadcast handler forwards whenever any node happens to be running.
         ReloadAllLibrariesRequest,
+        # Addressed to this worker: release objects ITS cache is holding. The orchestrator's store never
+        # held them, so a forwarded drop succeeds having freed nothing and the worker keeps a pipeline
+        # that may be gigabytes. Both skip the line, so they arrive mid-execution, which is exactly when
+        # a RemoteHandler forwards.
+        DropAllLocalObjectsRequest,
+        DropLocalObjectsRequest,
         #
         # --- 2. The worker's own answer is the correct one ---------------------------------------
         #
@@ -359,7 +419,7 @@ class RemoteHandler:
 
     Registered in place of the original manager handler for every registered type except
     LOCAL_ONLY_REQUEST_TYPES. Forwards to the orchestrator while the worker is
-    inside a ``worker_node_execution_scope``; delegates to the original
+    inside a ``node_execution_scope``; delegates to the original
     handler otherwise (so bootstrap / library-load paths keep running locally).
 
     ``original`` is the handler this shim replaced and MUST be retained so the
@@ -402,7 +462,7 @@ def register_remote_handlers(event_manager: EventManager) -> None:
 
     Swaps a RemoteHandler in for every registered request type except those in
     LOCAL_ONLY_REQUEST_TYPES. The handler forwards only while the worker is inside a
-    ``worker_node_execution_scope`` and delegates to the original handler otherwise, so
+    ``node_execution_scope`` and delegates to the original handler otherwise, so
     engine boot and library load -- which legitimately need this process's own managers --
     are unaffected.
 
@@ -419,6 +479,69 @@ def register_remote_handlers(event_manager: EventManager) -> None:
         remote = RemoteHandler(original=original, event_manager=event_manager)
         event_manager.remove_manager_from_request_type(request_type)
         event_manager.assign_manager_to_request_type(request_type, remote)
+
+
+async def _handle_drop_all_local_objects(
+    request: DropAllLocalObjectsRequest,  # noqa: ARG001
+    *,
+    event_manager: EventManager,
+) -> ResultPayload:
+    """Release every object this process is holding for its libraries.
+
+    Accepted while a node is executing, like its targeted sibling: the store takes the entries out now and
+    holds their release hooks back until nothing is running, so a forward pass mid-flight keeps the object
+    it is already holding. The cost is that a node which has not run yet asks for a library-named key and is
+    told no, and pays to rebuild -- on a workflow that is being torn down.
+
+    Takes the event manager because that is how it reaches this engine; the process-global engine would
+    silently no-op for an engine an embedder built directly.
+    """
+    resource_manager = event_manager.engine.resource_manager
+
+    try:
+        # Off the loop: a release hook is `del model` plus a CUDA cache flush, and blocking the
+        # worker's loop past the heartbeat timeout gets it evicted mid-load.
+        dropped = await to_thread(resource_manager.drop_all_local_objects)
+    except Exception as e:
+        details = (
+            f"Attempted to release objects held for this worker's libraries. Failed because of {type(e).__name__}: {e}."
+        )
+        logger.error(details)
+        return DropAllLocalObjectsResultFailure(result_details=details)
+    return DropAllLocalObjectsResultSuccess(result_details=f"Released {dropped} held object(s).")
+
+
+async def _handle_drop_local_objects(
+    request: DropLocalObjectsRequest,
+    *,
+    event_manager: EventManager,
+) -> ResultPayload:
+    """Release the named objects, whichever of them this process is holding.
+
+    Accepted mid-execution, with the release itself waiting for the running node: the only thing that
+    reaches a worker this way is node deletion, and a consumer can be mid-forward-pass holding the very
+    object being destroyed. The store holds the hook back and runs it when nothing is executing, so the pin
+    is one node rather than a whole render.
+
+    Drops parked entries only. The orchestrator broadcasts keys it cannot check locally -- the entry lives
+    here -- so the never-release-a-library-named-key rule is enforced on this side.
+    """
+    resource_manager = event_manager.engine.resource_manager
+
+    def release_all() -> int:
+        # Parked entries only: the orchestrator broadcasts keys it holds no entry for, so provenance is
+        # checked here, in the process with the entry. A key a library named itself is never dropped.
+        return sum(1 for key in request.keys if resource_manager.drop_parked_local_object(key))
+
+    try:
+        # Off the loop for the same reason as its sibling: a release hook is `del model` plus a CUDA cache
+        # flush, and a worker whose loop is blocked past the heartbeat timeout is evicted mid-load.
+        dropped = await to_thread(release_all)
+    except Exception as e:
+        details = f"Attempted to release {len(request.keys)} held object(s). Failed because of {type(e).__name__}: {e}."
+        logger.error(details)
+        return DropLocalObjectsResultFailure(result_details=details)
+    return DropLocalObjectsResultSuccess(result_details=f"Released {dropped} of {len(request.keys)} named object(s).")
 
 
 def register_broadcast_handlers(
@@ -521,4 +644,21 @@ def register_broadcast_handlers(
     event_manager.assign_manager_to_request_type(ReloadConfigRequest, handle_reload_config)
     event_manager.assign_manager_to_request_type(RefreshSecretsRequest, handle_refresh_secrets)
     event_manager.assign_manager_to_request_type(ActivateProjectRequest, handle_activate_project)
+
+    _register_local_object_handlers(event_manager)
+
     return worker_settled
+
+
+def _register_local_object_handlers(event_manager: EventManager) -> None:
+    """Wire the two teardown requests that free objects this worker is holding."""
+
+    async def handle_drop_all_local_objects(request: DropAllLocalObjectsRequest) -> ResultPayload:
+        return await _handle_drop_all_local_objects(request, event_manager=event_manager)
+
+    event_manager.assign_manager_to_request_type(DropAllLocalObjectsRequest, handle_drop_all_local_objects)
+
+    async def handle_drop_local_objects(request: DropLocalObjectsRequest) -> ResultPayload:
+        return await _handle_drop_local_objects(request, event_manager=event_manager)
+
+    event_manager.assign_manager_to_request_type(DropLocalObjectsRequest, handle_drop_local_objects)

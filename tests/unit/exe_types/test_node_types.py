@@ -275,6 +275,42 @@ class TestLockedSuccessFailureNodeRouting:
         assert node.stop_flow is True
 
 
+class TestOutputValueChangeDetection:
+    """`__setitem__` decides whether to emit by comparing old and new values.
+
+    A node can hold an array-like whose `__ne__` returns an array rather than a bool, so the
+    comparison itself raises and the assignment never completes.
+    """
+
+    class _ArrayLike:
+        """Mimics numpy's refusal to reduce an element-wise comparison to one bool."""
+
+        __hash__ = None  # type: ignore[assignment]
+
+        def __ne__(self, other: object) -> bool:
+            message = "The truth value of an array with more than one element is ambiguous."
+            raise ValueError(message)
+
+    def test_an_uncomparable_value_is_treated_as_changed(self) -> None:
+        from griptape_nodes.exe_types.node_types import _values_differ
+
+        assert _values_differ(self._ArrayLike(), self._ArrayLike()) is True
+
+    def test_the_same_object_is_not_a_change(self) -> None:
+        """Identity is checked first, so re-assigning the same array-like never touches `__ne__`."""
+        from griptape_nodes.exe_types.node_types import _values_differ
+
+        value = self._ArrayLike()
+
+        assert _values_differ(value, value) is False
+
+    def test_ordinary_values_compare_normally(self) -> None:
+        from griptape_nodes.exe_types.node_types import _values_differ
+
+        assert _values_differ(1, 2) is True
+        assert _values_differ("a", "a") is False
+
+
 class TestParameterVisibilityKeepsTraitStateLive:
     def test_hiding_a_parameter_with_a_trait_stores_no_trait_copy(self) -> None:
         node = MockNode()

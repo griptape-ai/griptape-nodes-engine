@@ -1,5 +1,27 @@
 # Unreleased
 
+## `serializable=False` outputs are held in their own process across a worker boundary
+
+`Parameter(serializable=False)` has always kept a value out of saved workflow files. On an **output** it
+now also means "hold this object in the process that produced it": when the value would cross a worker
+process boundary, the engine keeps the object where it is and sends an opaque key in its place, and the
+consuming node's read turns the key back into the object. This is how a library isolated in a worker hands
+a pipeline or a latent tensor to its next node. See
+[Passing Values That Cannot Be Serialized](docs/development/custom_nodes/passing_unserializable_values.md).
+
+Nothing changes for a graph that stays in one process, for values that are already data, or for values on
+a parameter that declares nothing: a string, a number or a dict of them on a declared parameter still
+travels as itself, because a key would be unresolvable on the far side.
+
+The cache belongs to the **worker**, not to a library. One worker can host several libraries, and they
+share it: a co-hosted library handed a key can resolve it, because they genuinely share a process. Keys a
+library chooses through `local_objects.put` are namespaced by that library inside the worker, so
+co-tenants cannot collide. What an object cannot do is leave the process that built it.
+
+A list or dictionary parameter is unaffected: declaring `serializable=False` on one still keeps it out of
+saved workflows. It adds no holding, because a container builds its value from its children. Put the value
+on an ordinary parameter marked `serializable=False` if you want it cached.
+
 ## Traits can save runtime state
 
 A trait keeps its existing constructor. To persist runtime changes, implement `to_state()` and
