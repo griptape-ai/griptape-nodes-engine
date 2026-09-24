@@ -54,7 +54,10 @@ def build_engine_package(
     packages_path: str = typer.Option(
         None,
         "--packages-path",
-        help="Rez local packages directory. Falls back to GTN_REZ_LOCAL_PACKAGES_PATH.",
+        help=(
+            "Rez package store root; packages are written to <path>/local. "
+            "Used with --yes; falls back to GTN_REZ_ROOT. The interactive wizard asks instead."
+        ),
     ),
     skip_installed: bool = typer.Option(  # noqa: FBT001
         True,
@@ -343,12 +346,28 @@ def _install_deps(dependencies: list[str], packages_root: Path, *, skip_installe
             packages_dir=packages_root,
             skip_installed=skip_installed,
         )
-        console.print("[green]Dependencies installed.[/green]")
-    except Exception as exc:
-        console.print(f"[red]Failed to install dependencies: {exc}[/red]")
+    except subprocess.CalledProcessError as exc:
+        console.print("[red]Attempted to install the engine's dependencies as rez packages. Failed due to:[/red]")
+        _print_uv_error(exc)
+        raise typer.Exit(1) from exc
+    except OSError as exc:
+        console.print(
+            f"[red]Attempted to install the engine's dependencies as rez packages. Failed due to: {exc}[/red]"
+        )
         raise typer.Exit(1) from exc
 
+    console.print("[green]Dependencies installed.[/green]")
     console.print()
+
+
+def _print_uv_error(exc: subprocess.CalledProcessError) -> None:
+    """Print the tail of uv's error output, which names the package it could not resolve."""
+    stderr = (exc.stderr or "").strip()
+    if not stderr:
+        console.print(f"  [dim]uv exited with status {exc.returncode}[/dim]")
+        return
+    for line in stderr.splitlines()[-10:]:
+        console.print(f"  [dim]{line}[/dim]")
 
 
 def _write_engine_package(
@@ -602,7 +621,10 @@ def build_library_package(
     packages_path: str = typer.Option(
         None,
         "--packages-path",
-        help="Rez packages root directory. Falls back to GTN_REZ_LOCAL_PACKAGES_PATH.",
+        help=(
+            "Rez package store root; packages are written to <path>/local. "
+            "Defaults to the parent of GTN_REZ_LOCAL_PACKAGES_PATH."
+        ),
     ),
     skip_installed: bool = typer.Option(  # noqa: FBT001
         True,
@@ -626,7 +648,7 @@ def build_library_package(
         raise typer.Exit(1)
 
     if packages_path:
-        packages_root = Path(packages_path)
+        packages_root = canonicalize_for_io(packages_path)
     else:
         local_path_resolved = rez_local_packages_path()
         if local_path_resolved:
@@ -739,10 +761,6 @@ def _build_library_from_dir(  # noqa: C901
     if not pip_dependencies:
         console.print("[yellow]No pip dependencies found — skipping dependency install.[/yellow]")
 
-    # Set the packages path so install_library_as_rez_package picks it up
-    local_dir = packages_root / "local"
-    os.environ["GTN_REZ_LOCAL_PACKAGES_PATH"] = str(local_dir)
-
     console.print(f"[bold]Building rez package for '{library_name}'...[/bold]")
     try:
         install_library_as_rez_package(
@@ -752,26 +770,31 @@ def _build_library_from_dir(  # noqa: C901
             library_file_path=library_json,
             pip_install_flags=pip_install_flags or None,
             skip_installed=skip_installed,
+            packages_root=packages_root,
         )
-
-        family = library_file_path_to_rez_family(library_json)
-        version = get_library_rez_package_version(library_name, library_file_path=library_json)
-
-        console.print()
-        console.print(
-            Panel(
-                f"[bold green]Library package built successfully![/bold green]\n\n"
-                f"  Package: [cyan]{family}-{version}[/cyan]\n"
-                f"  REZ ref: [cyan]REZ:{family}-{version}[/cyan]",
-                title="Success",
-                expand=False,
-            )
-        )
-        _validate_rez_package(family, version)
-        _print_library_next_steps(family, version)
-    except Exception as exc:
-        console.print(f"[red]Build failed: {exc}[/red]")
+    except subprocess.CalledProcessError as exc:
+        console.print(f"[red]Attempted to build a rez package for '{library_name}'. Failed due to:[/red]")
+        _print_uv_error(exc)
         raise typer.Exit(1) from exc
+    except OSError as exc:
+        console.print(f"[red]Attempted to build a rez package for '{library_name}'. Failed due to: {exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    family = library_file_path_to_rez_family(library_json)
+    version = get_library_rez_package_version(library_name, library_file_path=library_json, packages_root=packages_root)
+
+    console.print()
+    console.print(
+        Panel(
+            f"[bold green]Library package built successfully![/bold green]\n\n"
+            f"  Package: [cyan]{family}-{version}[/cyan]\n"
+            f"  REZ ref: [cyan]REZ:{family}-{version}[/cyan]",
+            title="Success",
+            expand=False,
+        )
+    )
+    _validate_rez_package(family, version)
+    _print_library_next_steps(family, version)
 
 
 def _validate_rez_package(family: str, version: str | None) -> None:
@@ -786,7 +809,7 @@ def _validate_rez_package(family: str, version: str | None) -> None:
             console.print(f"  [green]rez-search {family}: found[/green]")
         else:
             console.print(f"  [yellow]rez-search {family}: not found (rez may need PACKAGES_PATH configured)[/yellow]")
-    except Exception as exc:
+    except (OSError, subprocess.SubprocessError) as exc:
         console.print(f"  [yellow]rez-search failed: {exc}[/yellow]")
 
     if version:
@@ -802,7 +825,7 @@ def _validate_rez_package(family: str, version: str | None) -> None:
                 if result.stderr.strip():
                     for line in result.stderr.strip().splitlines()[-3:]:
                         console.print(f"    [dim]{line}[/dim]")
-        except Exception as exc:
+        except (OSError, subprocess.SubprocessError) as exc:
             console.print(f"  [yellow]rez-env resolve failed: {exc}[/yellow]")
 
     console.print()

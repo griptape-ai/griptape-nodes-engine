@@ -351,7 +351,7 @@ def _parse_requires_dist(req_str: str) -> tuple[str, str] | None:
 _COMPATIBLE_RELEASE_PATCH_PARTS = 3
 
 
-def _pep440_spec_to_rez(pip_dep_name: str, specifier_str: str) -> str:  # noqa: C901, PLR0912
+def _pep440_spec_to_rez(pip_dep_name: str, specifier_str: str) -> str:  # noqa: C901, PLR0911, PLR0912
     """Convert a pip package name + PEP 440 specifier string to a rez range token.
 
     Mapping rules:
@@ -376,6 +376,7 @@ def _pep440_spec_to_rez(pip_dep_name: str, specifier_str: str) -> str:  # noqa: 
     lower: str | None = None
     upper: str | None = None
     exact: str | None = None
+    series: str | None = None
 
     for spec in specs:
         m = re.match(r"^(~=|==|!=|>=|<=|>|<)\s*(.+)$", spec)
@@ -385,7 +386,7 @@ def _pep440_spec_to_rez(pip_dep_name: str, specifier_str: str) -> str:  # noqa: 
 
         if op == "==":
             if ver.endswith(".*"):
-                lower = ver[:-2]  # "1.2.*" → lower bound "1.2"
+                series = ver[:-2]  # "1.2.*" → the 1.2 series; rez "pkg-1.2" matches 1.2.x only
             else:
                 exact = ver
         elif op == "~=":
@@ -410,6 +411,8 @@ def _pep440_spec_to_rez(pip_dep_name: str, specifier_str: str) -> str:  # noqa: 
 
     if exact is not None:
         return f"{rez_pkg}=={exact}"
+    if series is not None:
+        return f"{rez_pkg}-{series}"
     if lower is not None and upper is not None:
         return f"{rez_pkg}-{lower}+<{upper}"
     if lower is not None:

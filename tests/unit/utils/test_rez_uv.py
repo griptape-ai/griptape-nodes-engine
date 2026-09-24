@@ -429,14 +429,7 @@ class TestPep440SpecToRez:
             ("!=1.5", "foo"),
             (">=1.0,!=1.5", "foo-1.0+"),
             ("garbage", "foo"),
-            pytest.param(
-                "==1.2.*",
-                "foo-1.2",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    reason="==X.Y.* is converted to an open lower bound (foo-1.2+), not the X.Y series",
-                ),
-            ),
+            ("==1.2.*", "foo-1.2"),
         ],
     )
     def test_mapping(self, specifier: str, expected: str) -> None:

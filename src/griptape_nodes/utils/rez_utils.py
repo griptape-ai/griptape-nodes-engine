@@ -445,13 +445,25 @@ def is_library_rez_package_available(library_name: str, library_file_path: Path 
     return get_library_rez_package_version(library_name, library_file_path=library_file_path) is not None
 
 
-def get_library_rez_package_version(library_name: str, library_file_path: Path | None = None) -> str | None:
+def get_library_rez_package_version(
+    library_name: str,
+    library_file_path: Path | None = None,
+    *,
+    packages_root: Path | None = None,
+) -> str | None:
     """Return the latest version of a library's rez package, or None if unavailable.
 
     Searches the local package store for version directories containing a
     ``package.py`` and returns the highest version string found.
+
+    Args:
+        library_name: Human-readable library name, used when no file path is given.
+        library_file_path: Library JSON path, used to derive the rez family name.
+        packages_root: Root of the rez package store (parent of ``local/``).
+            Defaults to the parent of ``GTN_REZ_LOCAL_PACKAGES_PATH``.
     """
-    packages_root = _rez_packages_root()
+    if packages_root is None:
+        packages_root = _rez_packages_root()
     if packages_root is None:
         return None
 
@@ -906,6 +918,7 @@ def install_library_as_rez_package(  # noqa: PLR0913
     pip_install_flags: list[str] | None = None,
     python_version: str | None = None,
     skip_installed: bool = True,
+    packages_root: Path | None = None,
 ) -> None:
     """Install a library's pip dependencies as rez packages and write a library meta-package.
 
@@ -930,16 +943,11 @@ def install_library_as_rez_package(  # noqa: PLR0913
         python_version: Python version string (``"3.12"``). Defaults to current interpreter.
         skip_installed: When True (default), skip packages whose rez package
             already exists. When False, overwrite everything.
+        packages_root: Root of the rez package store (parent of ``local/``).
+            Defaults to the parent of ``GTN_REZ_LOCAL_PACKAGES_PATH``.
     """
-    all_pip_dependencies = list(pip_dependencies)
-    if pip_dependencies_exec:
-        all_pip_dependencies.extend(pip_dependencies_exec)
-
-    if not all_pip_dependencies:
-        logger.debug("[Rez] library '%s' has no pip dependencies — skipping rez install", library_name)
-        return
-
-    packages_root = _rez_packages_root()
+    if packages_root is None:
+        packages_root = _rez_packages_root()
     if packages_root is None:
         logger.warning(
             "[Rez] GTN_REZ_LOCAL_PACKAGES_PATH is not set — cannot install library '%s' as a rez package",
@@ -947,35 +955,45 @@ def install_library_as_rez_package(  # noqa: PLR0913
         )
         return
 
+    all_pip_dependencies = list(pip_dependencies)
+    if pip_dependencies_exec:
+        all_pip_dependencies.extend(pip_dependencies_exec)
+
     library_version = _derive_library_version(library_file_path) if library_file_path else "1.0.0"
 
-    logger.info(
-        "[Rez] resolving deps for library '%s' (%d edit + %d exec specs) ...",
-        library_name,
-        len(pip_dependencies),
-        len(pip_dependencies_exec or []),
-    )
+    # A library without pip dependencies still needs its meta-package: it carries the
+    # library source and manifest, which is what makes the library registrable via REZ:.
+    resolved_requires: list[str] = []
+    if all_pip_dependencies:
+        logger.info(
+            "[Rez] resolving deps for library '%s' (%d edit + %d exec specs) ...",
+            library_name,
+            len(pip_dependencies),
+            len(pip_dependencies_exec or []),
+        )
 
-    resolved = resolve_full(
-        all_pip_dependencies,
-        extra_index_url=extra_index_url,
-        extra_flags=pip_install_flags,
-        python_version=python_version,
-    )
+        resolved = resolve_full(
+            all_pip_dependencies,
+            extra_index_url=extra_index_url,
+            extra_flags=pip_install_flags,
+            python_version=python_version,
+        )
 
-    direct_names = {pip_spec_name(spec) for spec in all_pip_dependencies}
-    resolved_requires = [
-        f"{rez_name(pkg.pip_name)}-{pkg.version}" for pkg in resolved if pip_spec_name(pkg.pip_name) in direct_names
-    ]
+        direct_names = {pip_spec_name(spec) for spec in all_pip_dependencies}
+        resolved_requires = [
+            f"{rez_name(pkg.pip_name)}-{pkg.version}" for pkg in resolved if pip_spec_name(pkg.pip_name) in direct_names
+        ]
 
-    rez_uv_install(
-        all_pip_dependencies,
-        packages_dir=packages_root,
-        extra_index_url=extra_index_url,
-        extra_flags=pip_install_flags,
-        python_version=python_version,
-        skip_installed=skip_installed,
-    )
+        rez_uv_install(
+            all_pip_dependencies,
+            packages_dir=packages_root,
+            extra_index_url=extra_index_url,
+            extra_flags=pip_install_flags,
+            python_version=python_version,
+            skip_installed=skip_installed,
+        )
+    else:
+        logger.info("[Rez] library '%s' has no pip dependencies — writing its package only", library_name)
 
     # Derive rez family name from the git repo / installation directory so the rez
     # package name matches the repo (e.g. griptape_nodes_library_diffusers) rather

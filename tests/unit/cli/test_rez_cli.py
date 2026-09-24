@@ -426,13 +426,32 @@ class TestInstallDeps:
             _install_deps(["requests"], tmp_path, skip_installed=False)
         install.assert_called_once_with(["requests"], packages_dir=tmp_path, skip_installed=False)
 
-    def test_failure_exits(self, tmp_path: Path, output: io.StringIO) -> None:
+    def test_resolve_failure_shows_uv_error_and_exits(self, tmp_path: Path, output: io.StringIO) -> None:
+        error = subprocess.CalledProcessError(1, "uv", stderr="No solution found when resolving requests")
         with (
-            patch(f"{MODULE}.rez_uv_install", side_effect=subprocess.CalledProcessError(1, "uv")),
+            patch(f"{MODULE}.rez_uv_install", side_effect=error),
             pytest.raises(typer.Exit),
         ):
             _install_deps(["requests"], tmp_path, skip_installed=True)
-        assert "Failed to install dependencies" in output.getvalue()
+        text = output.getvalue()
+        assert "Attempted to install the engine's dependencies as rez packages" in text
+        assert "No solution found when resolving requests" in text
+
+    def test_resolve_failure_without_stderr_shows_exit_status(self, tmp_path: Path, output: io.StringIO) -> None:
+        with (
+            patch(f"{MODULE}.rez_uv_install", side_effect=subprocess.CalledProcessError(2, "uv")),
+            pytest.raises(typer.Exit),
+        ):
+            _install_deps(["requests"], tmp_path, skip_installed=True)
+        assert "uv exited with status 2" in output.getvalue()
+
+    def test_filesystem_failure_exits(self, tmp_path: Path, output: io.StringIO) -> None:
+        with (
+            patch(f"{MODULE}.rez_uv_install", side_effect=PermissionError("store is read-only")),
+            pytest.raises(typer.Exit),
+        ):
+            _install_deps(["requests"], tmp_path, skip_installed=True)
+        assert "Failed due to: store is read-only" in output.getvalue()
 
 
 class TestWriteEnginePackage:
@@ -593,12 +612,13 @@ class TestBuildLibraryFromDir:
         store = tmp_path / "store"
         with (
             patch(f"{MODULE}.install_library_as_rez_package") as install,
-            patch(f"{MODULE}.get_library_rez_package_version", return_value="1.0.0"),
+            patch(f"{MODULE}.get_library_rez_package_version", return_value="1.0.0") as get_version,
             patch(f"{MODULE}._validate_rez_package") as validate,
         ):
             _build_library_from_dir(library_dir, store, skip_installed=False)
 
-            assert os.environ["GTN_REZ_LOCAL_PACKAGES_PATH"] == str(store / "local")
+            # The store root is passed explicitly; the process environment is left untouched.
+            assert "GTN_REZ_LOCAL_PACKAGES_PATH" not in os.environ
 
         install.assert_called_once()
         args, kwargs = install.call_args
@@ -607,6 +627,8 @@ class TestBuildLibraryFromDir:
         assert kwargs["pip_install_flags"] == ["--torch-backend=auto"]
         assert kwargs["library_file_path"] == library_dir / "griptape_nodes_library.json"
         assert kwargs["skip_installed"] is False
+        assert kwargs["packages_root"] == store
+        assert get_version.call_args.kwargs["packages_root"] == store
         validate.assert_called_once_with("my_library", "1.0.0")
 
     @pytest.mark.usefixtures("clean_env")
@@ -634,14 +656,26 @@ class TestBuildLibraryFromDir:
             _build_library_from_dir(library_dir, tmp_path / "store", skip_installed=True)
 
     @pytest.mark.usefixtures("clean_env")
-    def test_build_failure_exits(self, tmp_path: Path, output: io.StringIO) -> None:
+    def test_resolve_failure_shows_uv_error_and_exits(self, tmp_path: Path, output: io.StringIO) -> None:
         library_dir = _make_library(tmp_path, {"name": "Broken"})
+        error = subprocess.CalledProcessError(1, "uv", stderr="Because torch==99 was not found")
         with (
-            patch(f"{MODULE}.install_library_as_rez_package", side_effect=RuntimeError("uv exploded")),
+            patch(f"{MODULE}.install_library_as_rez_package", side_effect=error),
             pytest.raises(typer.Exit),
         ):
             _build_library_from_dir(library_dir, tmp_path / "store", skip_installed=True)
-        assert "Build failed: uv exploded" in output.getvalue()
+        text = output.getvalue()
+        assert "Attempted to build a rez package for 'Broken'" in text
+        assert "Because torch==99 was not found" in text
+
+    def test_filesystem_failure_exits(self, tmp_path: Path, output: io.StringIO) -> None:
+        library_dir = _make_library(tmp_path, {"name": "Broken"})
+        with (
+            patch(f"{MODULE}.install_library_as_rez_package", side_effect=OSError("disk full")),
+            pytest.raises(typer.Exit),
+        ):
+            _build_library_from_dir(library_dir, tmp_path / "store", skip_installed=True)
+        assert "Attempted to build a rez package for 'Broken'. Failed due to: disk full" in output.getvalue()
 
     @pytest.mark.usefixtures("output", "clean_env")
     def test_builds_library_dependencies_first(self, tmp_path: Path) -> None:

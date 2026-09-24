@@ -670,6 +670,20 @@ class TestLibraryRezPackageVersion:
         with patch.dict(os.environ, {"GTN_REZ_LOCAL_PACKAGES_PATH": str(local)}, clear=True):
             assert get_library_rez_package_version("Nothing Here") is None
 
+    def test_explicit_packages_root_overrides_env(self, tmp_path: Path) -> None:
+        explicit_store = tmp_path / "explicit"
+        _make_rez_version(explicit_store / "local", "my_lib", "2.0.0")
+        env_local = tmp_path / "env" / "local"
+        _make_rez_version(env_local, "my_lib", "1.0.0")
+        with patch.dict(os.environ, {"GTN_REZ_LOCAL_PACKAGES_PATH": str(env_local)}, clear=True):
+            assert get_library_rez_package_version("My Lib", packages_root=explicit_store) == "2.0.0"
+
+    def test_explicit_packages_root_without_env(self, tmp_path: Path) -> None:
+        store = tmp_path / "store"
+        _make_rez_version(store / "local", "my_lib", "1.5.0")
+        with patch.dict(os.environ, {}, clear=True):
+            assert get_library_rez_package_version("My Lib", packages_root=store) == "1.5.0"
+
     def test_family_without_versions(self, tmp_path: Path) -> None:
         local = tmp_path / "local"
         (local / "my_lib" / "empty").mkdir(parents=True)
@@ -1042,15 +1056,45 @@ class TestWriteLibraryMetaPackage:
 
 
 class TestInstallLibraryAsRezPackage:
-    def test_no_dependencies_is_a_no_op(self) -> None:
-        with patch(f"{_RU}.rez_uv_install") as install:
-            install_library_as_rez_package("Lib", [])
+    def test_no_dependencies_writes_package_only(self, tmp_path: Path) -> None:
+        manifest = _make_library_source(tmp_path / "src" / "my-library")
+        local = tmp_path / "store" / "local"
+        with (
+            patch.dict(os.environ, {"GTN_REZ_LOCAL_PACKAGES_PATH": str(local)}, clear=True),
+            patch(f"{_RU}.resolve_full") as resolve,
+            patch(f"{_RU}.rez_uv_install") as install,
+            patch(f"{_RU}.get_git_repository_root", return_value=None),
+        ):
+            install_library_as_rez_package("My Library", [], library_file_path=manifest)
+
+        resolve.assert_not_called()
         install.assert_not_called()
+        package_py = local / "my_library" / "2.3.4" / "package.py"
+        namespace: dict = {}
+        exec(compile(package_py.read_text(), str(package_py), "exec"), namespace)  # noqa: S102
+        assert namespace["name"] == "my_library"
+        assert namespace["requires"] == []
+        assert callable(namespace["commands"])
+        assert (package_py.parent / "python" / "nodes.py").is_file()
+        assert (package_py.parent / "python" / "griptape_nodes_library.json").is_file()
 
     def test_no_store_configured(self) -> None:
         with patch.dict(os.environ, {}, clear=True), patch(f"{_RU}.rez_uv_install") as install:
             install_library_as_rez_package("Lib", ["requests"])
         install.assert_not_called()
+
+    def test_explicit_packages_root_used_without_env(self, tmp_path: Path) -> None:
+        store = tmp_path / "store"
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(f"{_RU}.resolve_full", return_value=[ResolvedPackage(pip_name="requests", version="2.32.0")]),
+            patch(f"{_RU}.rez_uv_install") as install,
+        ):
+            install_library_as_rez_package("Lib", ["requests"], packages_root=store)
+            assert "GTN_REZ_LOCAL_PACKAGES_PATH" not in os.environ
+
+        assert install.call_args.kwargs["packages_dir"] == store
+        assert (store / "local" / "lib" / "1.0.0" / "package.py").is_file()
 
     def test_installs_edit_and_exec_deps(self, tmp_path: Path) -> None:
         manifest = _make_library_source(tmp_path / "src" / "my-library")
