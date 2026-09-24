@@ -12,7 +12,7 @@ import sys
 import types
 import uuid
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any, NamedTuple, Self
 
 import attrs
 import pytest
@@ -42,6 +42,11 @@ class Color(enum.Enum):
 
 class Size(enum.IntEnum):
     SMALL = 1
+
+
+class Span(NamedTuple):
+    start: int
+    end: int
 
 
 class Point(BaseModel):
@@ -168,6 +173,7 @@ class TestAdapters:
             uuid.UUID("12345678-1234-5678-1234-567812345678"),
             decimal.Decimal("1.10"),
             Point(x=1, y=2),
+            Span(1, 2),
             Temperature(21.5),
         ],
     )
