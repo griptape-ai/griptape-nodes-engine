@@ -25,7 +25,7 @@ from griptape_nodes.serialization.type_names import forget_stable_module_name, r
 from griptape_nodes.serialization.values import (
     TYPE_KEY,
     VALUE_KEY,
-    ValueDecodeError,
+    UndecodedValue,
     ValueEncodeError,
     decode_value,
     encode_value,
@@ -308,11 +308,13 @@ class TestEncodeFailures:
             encode_value(Broken())
 
 
-class TestDecodeFailures:
+class TestUndecodedValues:
+    """Data this process cannot build is kept as-is, so passing it on loses nothing."""
+
     @pytest.mark.parametrize(
-        ("data", "match"),
+        ("data", "reason"),
         [
-            ({TYPE_KEY: "no_such_module_xyz:Thing"}, "failed to import"),
+            ({TYPE_KEY: "no_such_module_xyz:Thing", "a": 1}, "failed to import"),
             ({TYPE_KEY: "builtins:NoSuchThing"}, "has no"),
             ({TYPE_KEY: "os:getcwd"}, "does not name a class"),
             ({TYPE_KEY: "builtins:object"}, "no plain-data form"),
@@ -322,9 +324,22 @@ class TestDecodeFailures:
             ({TYPE_KEY: f"{__name__}:Point", "x": "not a number"}, "could not be rebuilt"),
         ],
     )
-    def test_bad_data_fails_with_a_decode_error(self, data: dict, match: str) -> None:
-        with pytest.raises(ValueDecodeError, match=match):
-            decode_value(data)
+    def test_data_this_process_cannot_build_is_kept(self, data: dict, reason: str) -> None:
+        decoded = decode_value(data)
+
+        assert type(decoded) is UndecodedValue
+        assert decoded == data
+        assert reason in decoded.reason
+
+    def test_kept_value_encodes_back_to_the_same_data(self) -> None:
+        data = {TYPE_KEY: "other_process_library:Artifact", "value": "https://example.com/a.png", "meta": {}}
+
+        assert encode_value(decode_value(data)) == data
+
+    def test_kept_value_inside_a_container_passes_through(self) -> None:
+        data = [{TYPE_KEY: "other_process_library:Artifact", "pair": {TYPE_KEY: "builtins:tuple", VALUE_KEY: [1]}}]
+
+        assert encode_value(decode_value(data)) == data
 
     def test_live_objects_pass_through(self) -> None:
         live = Opaque()
