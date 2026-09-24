@@ -1314,12 +1314,11 @@ class EventManager(EngineScoped):
     def add_listener_to_app_event(
         self, app_event_type: type[AP], callback: Callable[[AP], None] | Callable[[AP], Awaitable[None]]
     ) -> None:
-        """Subscribe to an app event.
+        """Subscribe to an app event raised in this process.
 
-        A listener sees another process's copy only for a payload type whose
-        ``adoptable_from_peers`` is set. Almost every app-event listener configures the process it
+        A listener never sees another process's copy. An app-event listener configures the process it
         lives in, and a peer's payload describes the peer, so acting on it would corrupt the
-        receiver; the default keeps those events local.
+        receiver. A worker that has something to tell the orchestrator sends it a request.
         """
         listener_set = self._app_event_listeners.get(app_event_type)
         if listener_set is None:
@@ -1461,20 +1460,6 @@ class EventManager(EngineScoped):
             async with asyncio.TaskGroup() as tg:
                 for listener_callback in listener_set:
                     tg.create_task(self._call_app_event_listener(listener_callback, app_event))
-
-    async def abroadcast_adopted_app_event(self, app_event: AP) -> None:
-        """Broadcast an app event another process raised, if its type opts into being adopted.
-
-        Dropped otherwise: a listener registered for the type configures this process, and the
-        payload describes the peer. See ``AppPayload.adoptable_from_peers``.
-
-        Args:
-            app_event: The app event another process raised
-        """
-        if not type(app_event).adoptable_from_peers:
-            return
-
-        await self.abroadcast_app_event(app_event)
 
     async def _call_app_event_listener(
         self, listener_callback: Callable[[AP], None] | Callable[[AP], Awaitable[None]], app_event: AP
