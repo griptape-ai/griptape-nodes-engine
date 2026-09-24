@@ -463,6 +463,15 @@ class TestBuildVersionedSequenceDestination:
         assert "_index" in dest._macro_path.variables
         assert "extra" in dest._macro_path.variables
 
+    def test_template_without_version_slot_is_returned_unversioned(self) -> None:
+        macro = project_events.MacroPath(macro_parser.ParsedMacro("{outputs}/frames/frames.####.png"), {})
+
+        with mock.patch(HANDLE_REQUEST_PATH) as mock_handle:
+            dest = file_sequence.build_versioned_sequence_destination(macro)
+
+        mock_handle.assert_not_called()
+        assert dest._macro_path is macro
+
     def test_existing_file_policy_forwarded(self) -> None:
         index_result = os_events.GetNextVersionIndexResultSuccess(result_details="OK", index=1)
         macro = project_events.MacroPath(macro_parser.ParsedMacro("{outputs}/seq_v{_index:03}/frame_####.exr"), {})

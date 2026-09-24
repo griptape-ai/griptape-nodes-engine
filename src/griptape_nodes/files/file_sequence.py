@@ -364,13 +364,25 @@ def build_versioned_sequence_destination(
         create_parents: Whether to create parent directories. Defaults to True.
 
     Returns:
-        FileSequenceDestination with a locked _index version.
+        FileSequenceDestination with a locked _index version. When the template has no
+        ``{_index}`` slot, such as a project situation that writes to a fixed folder, the
+        destination is returned unversioned.
 
     Raises:
         FileSequenceError: If the engine cannot determine the next available version index.
     """
     dir_template = str(pathlib.PurePosixPath(macro_path.parsed_macro.template).parent)
     dir_macro = project_events.MacroPath(macro_parser.ParsedMacro(dir_template), macro_path.variables)
+
+    has_version_slot = any(
+        variable.name == macro_parser.SEQUENCE_VARIABLE_NAME for variable in dir_macro.parsed_macro.get_variables()
+    )
+    if not has_version_slot:
+        return FileSequenceDestination(
+            macro_path,
+            existing_file_policy=existing_file_policy,
+            create_parents=create_parents,
+        )
 
     index_result = griptape_nodes_mod.GriptapeNodes.handle_request(
         os_events.GetNextVersionIndexRequest(macro_path=dir_macro)
