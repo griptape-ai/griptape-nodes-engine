@@ -1,13 +1,9 @@
 """Tests for the redactor.
 
-This is the security boundary of the whole diagnostics feature: a bundle is written to be
-handed to someone else, and the redactor is the only thing standing between a user's API
-keys and a support engineer's inbox. So these tests are written from the leak's point of
-view — for each rule, does the secret still appear anywhere in the output?
-
-The other half is the counts. A reader who cannot tell "this setting is empty" from "this
-setting was hidden from you" will debug the wrong problem, so every removal has to be
-counted under a reason.
+This is the security boundary of the whole diagnostics feature: a bundle is handed to
+someone else, so every rule is tested from the leak's point of view -- does the secret still
+appear anywhere in the output? The other half is the counts: a reader who cannot tell "this
+setting is empty" from "this setting was hidden from you" debugs the wrong problem.
 """
 
 from __future__ import annotations
@@ -125,8 +121,7 @@ class TestSensitiveConfigKeys:
         """A default value beside a declared name is a real credential, not documentation.
 
         The mapping form of `secrets_to_register` carries values as well as names, and
-        `SecretsManager.register_all_secrets` writes one as a secret. The names stay,
-        because they are the setting's whole diagnostic signal; the values cannot.
+        `SecretsManager.register_all_secrets` writes one as a secret.
         """
         config = {"secrets_to_register": {"OPENAI_API_KEY": "sk-realvalue", "HF_TOKEN": ""}}
         redactor = Redactor(normalize_identity=False)
@@ -392,9 +387,8 @@ class TestCredentialPatterns:
     def test_keeps_a_parameter_that_merely_contains_an_abbreviation(self, url: str) -> None:
         """An abbreviation is only a credential when it is the whole name.
 
-        Looked for anywhere inside a name, `code` hides `errorcode=500` and `sig` hides
-        `assignee` -- values holding nothing secret and carrying the answer somebody opened
-        the report to find.
+        As a substring, `code` hides `errorcode=500` and `sig` hides `assignee` -- values
+        holding nothing secret and carrying the answer the report was opened to find.
         """
         redactor = Redactor(normalize_identity=False)
 
@@ -437,10 +431,9 @@ class TestPasswordsInUrls:
     def test_removes_all_of_a_password_containing_an_at_sign(self, url: str, expected: str) -> None:
         """The whole password goes, not the part of it before its first `@`.
 
-        A password class that stopped at the first `@` matched only `p` of `p@ssw0rd` and
-        wrote the rest into the bundle verbatim -- and an `@` is exactly the kind of
-        character a password policy asks for, so this is the likely spelling, not the exotic
-        one.
+        A password class stopping at the first `@` matched only `p` of `p@ssw0rd` and wrote
+        the rest into the bundle verbatim. An `@` is what a password policy asks for, so this
+        is the likely spelling, not the exotic one.
         """
         redactor = Redactor(normalize_identity=False)
 
@@ -498,11 +491,9 @@ class TestIdentityNormalization:
         """`/Users/sam` matching inside `/Users/samantha` rewrote a colleague's path to `~antha`.
 
         Nothing leaks either way, but the result reads as this user's own home when it is
-        somebody else's, and a shared-machine path is exactly what support is looking at.
-
-        Both paths are built under `tmp_path` rather than written out, so the separator is
-        this platform's. Spelled `/Users/sam`, the home directory would not appear in the
-        text at all on Windows and nothing would be replaced either way.
+        somebody else's, and a shared-machine path is what support is looking at. Both paths
+        are built under `tmp_path` so the separator is this platform's: spelled `/Users/sam`,
+        the home directory would not appear in the text at all on Windows.
         """
         home = tmp_path / "sam"
         # A colleague's home, sharing the first three characters of this user's.
@@ -523,9 +514,8 @@ class TestIdentityNormalization:
     ) -> None:
         """A suffix is punctuation away from the home path, and punctuation ends it.
 
-        `-` was missing from the set that `_` and `.` were already in, so `/Users/sam-2` was
-        the one spelling written into a report verbatim. Over-redacting a sibling directory is
-        the safe way to be wrong here; leaving the home path readable is not.
+        `-` was missing from the set `_` and `.` were already in, so `/Users/sam-2` was the one
+        spelling written into a report verbatim.
         """
         home = tmp_path / "sam"
         monkeypatch.setattr(Path, "home", lambda: home)
@@ -561,9 +551,8 @@ class TestIdentityNormalization:
     def test_ignores_a_username_too_short_to_search_for(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A two-character username is left alone even where it stands as its own word.
 
-        The username appears in the text as a whole word on purpose. Word-boundary matching
-        would spare `alpha` whatever the length threshold did, so a text of only `alpha`
-        would pass with the threshold removed and prove nothing about it.
+        The username is a whole word on purpose: word-boundary matching would spare `alpha`
+        whatever the length threshold did, so a text of only `alpha` would prove nothing.
         """
         monkeypatch.setattr("getpass.getuser", lambda: "al")
         redactor = Redactor()
@@ -583,9 +572,8 @@ class TestIdentityNormalization:
     ) -> None:
         """Not knowing the username is not a failure; a report still has to be produced.
 
-        Asserted on a secret the redactor can find rather than on a string nothing matches:
-        a text with nothing to remove comes back unchanged from a redactor that gave up on
-        every rule it has, so it would pass either way.
+        Asserted on a secret the redactor can find, not on a string nothing matches: a text
+        with nothing to remove comes back unchanged from a redactor that gave up entirely.
         """
 
         def raise_os_error() -> str:

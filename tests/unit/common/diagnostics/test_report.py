@@ -1,14 +1,12 @@
 """Tests for the diagnostics report model.
 
-A report is written to a file by one engine and read back by something else -- a support
-tool, a newer engine, a person -- so the model's defaults are not cosmetic. Two of them
-carry a claim: `identity_normalized` says the home directory was taken out, and
-`worker_ready` says whether a worker is up. If either one defaults the wrong way, a report
-that never checked asserts something anyway, and the reader believes it.
+A report is written by one engine and read back by something else -- a support tool, a newer
+engine, a person -- so the defaults are not cosmetic. Two carry a claim: `identity_normalized`
+says the home directory was taken out, and `worker_ready` says whether a worker is up. Default
+either one the wrong way and a report that never checked asserts it anyway.
 
-The rest of the defaults exist so a report is still produced when a section could not be
-gathered. That is the whole reason `collection_warnings` is there, and it only works if
-every section can be left out without the envelope refusing to build.
+The rest exist so a report is still produced when a section could not be gathered, which is
+what `collection_warnings` is for.
 """
 
 from __future__ import annotations

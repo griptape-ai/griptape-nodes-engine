@@ -1,19 +1,12 @@
 """Removes secrets and personal identifiers from anything bound for a diagnostics report.
 
-A diagnostics report exists to be sent to someone else, so everything in it passes
-through a ``Redactor`` first. Three things are removed:
+A report exists to be sent to someone else, so everything in it passes through a ``Redactor``
+first. Three things go: config values whose key says they hold a credential (keys kept, values
+dropped), values the engine knows are secrets from a ``.env`` file, and anything shaped like a
+credential plus the home directory and username.
 
-- Config values whose key says they hold a credential (``api_key``, ``env``,
-  ``headers``, ...). The keys are kept, only the values go.
-- Values the engine knows are secrets, because it read them from a ``.env`` file.
-  Removing them from free text is the only way to catch a credential that a
-  library logged into an error message.
-- Patterns that look like credentials regardless of where they came from, plus the
-  home directory and username, which identify a person rather than a machine.
-
-Redaction counts are recorded per reason so a report can state that something was
-removed. Support reading "0 values redacted" versus "3 values redacted" is the
-difference between "this setting is empty" and "this setting was hidden from you".
+Counts are recorded per reason, so a reader can tell "this setting is empty" from "this setting
+was hidden from you".
 """
 
 from __future__ import annotations
@@ -194,9 +187,9 @@ class Redactor:
     def redact_config(self, config: Any) -> Any:
         """Return a copy of a config tree with credential values removed.
 
-        Walks dicts and lists. Values under a credential-shaped key are replaced;
-        every other string is still run through ``redact_text``, because a credential
-        pasted into an innocently named setting is exactly the case that would leak.
+        Walks dicts and lists. Values under a credential-shaped key are replaced; every other
+        string still goes through ``redact_text``, because a credential pasted into an innocently
+        named setting is the case that would leak.
         """
         return self._redact_config_value(config, key=None)
 
@@ -238,10 +231,9 @@ class Redactor:
     def _redact_declared_secrets(self, value: Any) -> Any:
         """Keep the secret names a library declared, and drop any default values beside them.
 
-        ``secrets_to_register`` is either a list of names or a mapping of name to default
-        value. The names are the whole diagnostic signal and are not themselves secret. A
-        default value in the mapping form is a credential, though: the engine writes it as
-        one, so it is masked like any other.
+        ``secrets_to_register`` is either a list of names or a mapping of name to default value.
+        The names are the diagnostic signal and are not secret; a default value in the mapping
+        form is a credential, so it is masked.
         """
         if isinstance(value, dict):
             return self._mask(value)
@@ -327,10 +319,9 @@ class Redactor:
     def _home_directory_spellings() -> list[str]:
         """Return every spelling of the home directory that could appear in text.
 
-        Windows paths reach logs with both separators depending on whether pathlib or a
-        string built them, so both are matched, plus the doubled-backslash spelling a
-        Windows path takes once something has been through JSON. Longest first, so the more
-        specific spelling wins when one is a prefix of another.
+        Windows paths reach logs with either separator depending on whether pathlib or a string
+        built them, plus the doubled-backslash spelling one takes through JSON. Longest first, so
+        the more specific spelling wins when one is a prefix of another.
         """
         try:
             home = Path.home()
