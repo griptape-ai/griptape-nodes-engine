@@ -37,11 +37,9 @@ ENV_VAR_PATH = xdg_config_home() / "griptape_nodes" / ".env"
 def merge_env_file_values(*, global_values: Mapping[str, str], workspace_values: Mapping[str, str]) -> dict[str, str]:
     """Merge the two ``.env`` layers in the precedence ``get_secret`` documents.
 
-    Workspace beats global. Stated once, here, and shared with the diagnostics report,
-    which reads the same two files itself so it can say which one each key came from. Two
-    hand-written copies of this line meant a later change to the layering could be applied
-    to secret resolution and not to the report of it, leaving the report quietly wrong
-    about which file a support engineer should be looking at.
+    Workspace beats global. Stated once and shared with the diagnostics report, which reads the
+    same two files to say which one a key came from: two hand-written copies meant a change to
+    the layering could leave the report wrong about the file to look in.
     """
     return {**global_values, **workspace_values}
 
@@ -284,14 +282,10 @@ class SecretsManager:
     def read_merged_env_files(self) -> dict[str, str]:
         """Return the merged contents of both .env files with workspace winning.
 
-        Workspace overrides global because that is the precedence order
-        ``get_secret`` documents. Empty values (``FOO=`` in the file) are
-        kept as empty strings; missing files are skipped. ``None`` values
-        from ``dotenv_values`` are filtered out so callers can rely on
-        ``dict[str, str]`` shape.
-
-        Public because the diagnostics report needs the same values this
-        manager resolves from, in order to scrub them out of log text.
+        The precedence ``get_secret`` documents. Empty values (``FOO=`` in the file) are kept as
+        empty strings, missing files are skipped, and ``None`` from ``dotenv_values`` is filtered
+        out so callers can rely on a ``dict[str, str]``. Public because the diagnostics report
+        needs the same values, to scrub them out of log text.
         """
         return merge_env_file_values(
             global_values=self._read_env_file(ENV_VAR_PATH),

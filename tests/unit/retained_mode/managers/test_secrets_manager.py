@@ -798,11 +798,9 @@ class TestGetAllSecretValuesRequest:
 class TestMergeEnvFileValues:
     """The precedence between the two `.env` files, stated in exactly one place.
 
-    `get_secret` resolves from these files and the diagnostics report says which file each
-    key came from, and the two have to agree -- forever, not just today. Written out by hand
-    in both, a later change to the layering could be applied to secret resolution and not to
-    the report of it, leaving the report quietly wrong about the file a support engineer
-    should be looking at.
+    `get_secret` resolves from these files and the diagnostics report says which file each key
+    came from, and the two have to agree -- forever, not just today. Written by hand in both, a
+    later change to the layering could leave the report wrong about where to look.
     """
 
     def test_the_workspace_file_wins(self) -> None:
