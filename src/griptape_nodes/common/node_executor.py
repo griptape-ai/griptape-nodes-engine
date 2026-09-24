@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import pickle
+import pickle  # noqa: TID251 not yet moved to griptape_nodes.serialization
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import StrEnum

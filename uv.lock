@@ -586,6 +586,7 @@ source = { editable = "." }
 dependencies = [
     { name = "anyio" },
     { name = "asyncio-thread-runner" },
+    { name = "attrs" },
     { name = "binaryornot" },
     { name = "cattrs" },
     { name = "fastapi" },
@@ -659,6 +660,7 @@ test = [
 requires-dist = [
     { name = "anyio", specifier = ">=4.0" },
     { name = "asyncio-thread-runner", specifier = ">=1.0" },
+    { name = "attrs", specifier = ">=25.4.0" },
     { name = "austin-dist", marker = "extra == 'profiling'", specifier = ">=3.7.0" },
     { name = "binaryornot", specifier = ">=0.4.4" },
     { name = "cattrs", specifier = ">=26.1.0" },

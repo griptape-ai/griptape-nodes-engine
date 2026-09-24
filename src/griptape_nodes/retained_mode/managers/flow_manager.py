@@ -4,7 +4,7 @@ import asyncio
 import base64
 import copy
 import logging
-import pickle
+import pickle  # noqa: TID251 not yet moved to griptape_nodes.serialization
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from io import BytesIO
